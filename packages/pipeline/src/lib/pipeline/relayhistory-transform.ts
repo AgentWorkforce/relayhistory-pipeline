@@ -247,7 +247,8 @@ export function parseRelayhistoryRecord(
   };
 }
 
-function eventTime(record: RelayhistoryStreamRecord): number {
+/** The epoch milliseconds the fold orders a record by: its payload's time, else received_at. */
+export function relayhistoryEventTime(record: RelayhistoryStreamRecord): number {
   const payload = record.payload ?? {};
   for (const field of [
     "ts_ms",
@@ -272,14 +273,18 @@ function eventTime(record: RelayhistoryStreamRecord): number {
 const LEGACY_RECORD_KINDS = new Set([
   "legacy_conversation_turn", "legacy_session_link", "legacy_session_outcome", "legacy_scope",
 ]);
-export const isLegacyRelayhistoryRecord = (record: RelayhistoryStreamRecord) => LEGACY_RECORD_KINDS.has(record.kind);
-function recordKey(record: RelayhistoryStreamRecord): string {
+export const isLegacyRelayhistoryRecord = (record: Pick<RelayhistoryStreamRecord, "kind">) => LEGACY_RECORD_KINDS.has(record.kind);
+/** The record's revision seat: origin and record id, plus the kind for legacy kinds. */
+export function relayhistoryRecordKey(
+  record: Pick<RelayhistoryStreamRecord, "kind" | "origin_id" | "record_id">,
+): string {
   return JSON.stringify(isLegacyRelayhistoryRecord(record)
     ? [record.origin_id, record.record_id, record.kind]
     : [record.origin_id, record.record_id]);
 }
 
-function compareText(left: string, right: string): number {
+/** Code-point order of two strings, the fold's tie-break order. */
+export function compareRelayhistoryText(left: string, right: string): number {
   const leftPoints = left[Symbol.iterator]();
   const rightPoints = right[Symbol.iterator]();
   while (true) {
@@ -298,7 +303,7 @@ function canonical(value: unknown): unknown {
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([a], [b]) => compareText(a, b))
+        .sort(([a], [b]) => compareRelayhistoryText(a, b))
         .map(([key, child]) => [key, canonical(child)]),
     );
   return value;
@@ -326,10 +331,16 @@ function receivedFirst(
 ): boolean {
   return (
     (Date.parse(left.received_at) - Date.parse(right.received_at) ||
-      compareText(left.received_at, right.received_at)) < 0
+      compareRelayhistoryText(left.received_at, right.received_at)) < 0
   );
 }
 
+/** What the cross-origin fold reads of a record (or of a payload-free summary of one). */
+export interface RelayhistoryContender {
+  kind: string;
+  record_id: string;
+  accepted_seq?: string;
+}
 /**
  * record_id is origin-independent, and the live projection keeps one row for it:
  * the last write accepted from any origin, so a tombstone accepted last removes
@@ -338,11 +349,11 @@ function receivedFirst(
  * lock carries an older stamp than the write it follows. Contenders without
  * `accepted_seq` are refused rather than guessed at.
  */
-function newestAcrossOrigins(
-  records: Iterable<RelayhistoryStreamRecord>,
-): RelayhistoryStreamRecord[] {
-  const out: RelayhistoryStreamRecord[] = [];
-  const contenders = new Map<string, RelayhistoryStreamRecord[]>();
+export function relayhistoryNewestAcrossOrigins<T extends RelayhistoryContender>(
+  records: Iterable<T>,
+): T[] {
+  const out: T[] = [];
+  const contenders = new Map<string, T[]>();
   for (const record of records) {
     // Server-exported legacy tables have independent primary-key domains and
     // no delivery acceptance ledger. Never make them contend with delivery IDs.
@@ -354,15 +365,15 @@ function newestAcrossOrigins(
     if (group) group.push(record);
     else contenders.set(record.record_id, [record]);
   }
-  for (const group of contenders.values()) out.push(group.reduce(lastAccepted));
+  for (const group of contenders.values()) out.push(group.reduce((left, right) => lastAccepted(left, right)));
   return out;
 }
 
 /** The later accepted of two contenders, by the source's ledger alone. */
-export function lastAccepted(
-  left: RelayhistoryStreamRecord,
-  right: RelayhistoryStreamRecord,
-): RelayhistoryStreamRecord {
+export function lastAccepted<T extends Pick<RelayhistoryContender, "accepted_seq">>(
+  left: T,
+  right: T,
+): T {
   if (left.accepted_seq === undefined || right.accepted_seq === undefined)
     fail(
       "relayhistory_acceptance_missing",
@@ -404,13 +415,28 @@ export function normalizeRelayhistoryRecords(
 ): RelayhistoryStreamRecord[] {
   const latest = new Map<string, RelayhistoryStreamRecord>();
   for (const record of records) {
-    const key = recordKey(record);
+    const key = relayhistoryRecordKey(record);
     latest.set(key, chooseRelayhistoryRevision(latest.get(key), record, sameRecord));
   }
-  return newestAcrossOrigins(latest.values())
+  return relayhistoryNewestAcrossOrigins(latest.values())
     .filter((record) => record.operation === "upsert" && record.payload !== null)
-    .sort((left, right) => eventTime(left) - eventTime(right) ||
-      compareText(left.origin_id, right.origin_id) || compareText(left.record_id, right.record_id));
+    .sort((left, right) => compareRelayhistoryOrder(
+      relayhistoryEventTime(left), left, relayhistoryEventTime(right), right));
+}
+
+/**
+ * The fold's output order: event time, then origin, then record id. Takes the
+ * times apart so a streaming fold can keep them without the payloads.
+ */
+export function compareRelayhistoryOrder(
+  leftTime: number,
+  left: Pick<RelayhistoryStreamRecord, "origin_id" | "record_id">,
+  rightTime: number,
+  right: Pick<RelayhistoryStreamRecord, "origin_id" | "record_id">,
+): number {
+  return leftTime - rightTime ||
+    compareRelayhistoryText(left.origin_id, right.origin_id) ||
+    compareRelayhistoryText(left.record_id, right.record_id);
 }
 
 async function defaultDecompress(

@@ -2,6 +2,7 @@
  * Call only after all live manifests were verified/folded. Never aggregate the
  * ClickHouse window or pointer counters: both can be a strict subset of truth.
  */
+import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { canonicalTimestamp } from "@rhc/lib/pipeline/relayhistory-projection.ts";
 import type { SessionDirectoryKey } from "./session-directory-summary.ts";
@@ -64,11 +65,6 @@ function count(value: unknown): bigint {
   if (n > MAX_COUNT) invalid();
   return n;
 }
-function sum(values: bigint[]): string {
-  const n = values.reduce((a, b) => a + b, 0n);
-  if (n > MAX_COUNT) invalid();
-  return String(n);
-}
 function canonical(value: unknown, depth = 0): unknown {
   if (depth > 12) invalid();
   if (Array.isArray(value)) return value.map((v) => canonical(v, depth + 1));
@@ -112,183 +108,364 @@ function status(row: Event): DirectoryEvents["workStatus"] {
     return "active";
   return row.kind === "task" ? null : "active";
 }
+/** Position of a row in the canonical `(ts, event_id bytes)` order; `ordinal` is
+ * the first-arrival index, the stable sort's tie-break. */
+interface Position {
+  ts: string;
+  eventId: Buffer;
+  ordinal: number;
+}
+function comparePosition(a: Position, b: Position): number {
+  return (
+    a.ts.length - b.ts.length ||
+    (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0) ||
+    Buffer.compare(a.eventId, b.eventId) ||
+    a.ordinal - b.ordinal
+  );
+}
+/** What `locator` reads of a chosen row, kept instead of the row. */
+type LocatorFields = Pick<
+  Event,
+  | "_index_fingerprint"
+  | "session_id"
+  | "event_id"
+  | "machine_id"
+  | "kind"
+  | "source"
+> & { ts: string };
+function locatorFields(row: Event, ts: string): LocatorFields {
+  return {
+    _index_fingerprint: row._index_fingerprint,
+    session_id: row.session_id,
+    event_id: row.event_id,
+    machine_id: row.machine_id,
+    kind: row.kind,
+    source: row.source,
+    ts,
+  };
+}
+function locator(row: LocatorFields): EventLocator {
+  if (
+    typeof row._index_fingerprint !== "string" ||
+    !/^s3[0-9a-f]{14}$/u.test(row._index_fingerprint)
+  )
+    invalid();
+  for (const field of [
+    "session_id",
+    "event_id",
+    "machine_id",
+    "kind",
+    "source",
+  ] as const)
+    if (typeof row[field] !== "string" || !row[field]) invalid();
+  return {
+    session_id: String(row.session_id),
+    event_id: String(row.event_id),
+    machine_id: String(row.machine_id),
+    kind: String(row.kind),
+    source: String(row.source),
+    ts: row.ts,
+    fingerprint: row._index_fingerprint,
+  };
+}
+/** sha256 of a value's canonical JSON, or the error computing it raised. */
+function contentDigest(row: Event): { digest: string } | { error: unknown } {
+  try {
+    return {
+      digest: createHash("sha256")
+        .update(JSON.stringify(canonical(row)))
+        .digest("base64"),
+    };
+  } catch (error) {
+    return { error };
+  }
+}
+function textValue(row: Event, field: string): string | null {
+  return typeof row[field] === "string" && row[field] !== ""
+    ? (row[field] as string)
+    : null;
+}
+const TOKEN_FIELDS = [
+  "input_tokens",
+  "output_tokens",
+  "reasoning_tokens",
+  "cache_read_tokens",
+  "cache_create_tokens",
+] as const;
+
+/**
+ * The directory's event metadata, built one convergence row at a time: a reader
+ * that streams a session adds its rows chunk by chunk and never holds them all.
+ * It keeps a digest per distinct row, the distinct times, kinds, task refs, user,
+ * machine and model sets, running token sums and the few rows the metadata
+ * points at; never a row's content.
+ *
+ * The rows may arrive in any order. `finish` returns exactly what
+ * `directoryEventsFromProjection` returns for the same rows, and the builder
+ * fails (`directory_event_metadata_invalid`, or the timestamp's own error) on
+ * exactly the inputs that function fails on. A check that holds for every row
+ * fails in `add`; one that depends on which row the order selects fails in
+ * `finish`. With more than one fault in the input, which fault is reported can
+ * depend on arrival order. Build once: `finish` ends the builder.
+ */
+export class DirectoryEventsBuilder {
+  /** sha256(identity key) -> the first row's canonical digest, or its error. */
+  readonly #seen = new Map<string, { digest: string } | { error: unknown }>();
+  readonly #times = new Set<string>();
+  readonly #kinds = new Set<string>();
+  readonly #refs = new Map<string, unknown>();
+  readonly #texts = {
+    user_id: new Set<string>(),
+    machine_id: new Set<string>(),
+    model: new Set<string>(),
+  };
+  readonly #sums = new Map<string, bigint>();
+  #count = 0;
+  #first: Position | null = null;
+  #last: Position | null = null;
+  #opening: { at: Position; row: LocatorFields } | null = null;
+  #project: {
+    id: string;
+    bytes: Buffer;
+    at: Position;
+    row: LocatorFields;
+  } | null = null;
+  #work: { at: Position; status: NonNullable<DirectoryEvents["workStatus"]> } | null = null;
+  #title: { at: Position; value: unknown } | null = null;
+  /** Earliest row whose split check is false, and earliest whose check fails. */
+  #splitFalse: Position | null = null;
+  #splitThrows: Position | null = null;
+  /** Some row's 5m or 1h counter is malformed: fatal only with a complete split. */
+  #splitInvalid = false;
+  #anyCost = false;
+  #finished = false;
+
+  add(row: Event): void {
+    if (this.#finished) throw new Error("directory_events_builder_finished");
+    const key = createHash("sha256")
+      .update(
+        JSON.stringify([
+          row.machine_id,
+          row.source,
+          row.session_id,
+          row.kind,
+          row.event_id,
+          row.ts,
+        ]),
+      )
+      .digest("base64");
+    const content = contentDigest(row);
+    const prior = this.#seen.get(key);
+    if (prior) {
+      // A repeat must be the same row: then it adds nothing.
+      if ("error" in prior) throw prior.error;
+      if ("error" in content) throw content.error;
+      if (prior.digest !== content.digest) invalid();
+      return;
+    }
+    this.#seen.set(key, content);
+    const ts = canonicalTimestamp(String(row.ts));
+    const at: Position = {
+      ts,
+      eventId: Buffer.from(String(row.event_id)),
+      ordinal: this.#count++,
+    };
+    this.#times.add(ts);
+    if (!this.#first || comparePosition(at, this.#first) < 0) this.#first = at;
+    if (!this.#last || comparePosition(at, this.#last) > 0) this.#last = at;
+
+    const kind = String(row.kind);
+    this.#kinds.add(kind);
+    if (
+      this.#kinds.size > 64 ||
+      !kind ||
+      kind.length > 128 ||
+      /[\u0000-\u001f\u007f]/u.test(kind)
+    )
+      invalid();
+
+    const ref = row.task_ref;
+    if (!(ref == null || JSON.stringify(ref) === "{}")) {
+      if (typeof ref !== "object") invalid();
+      const clean = canonical(ref);
+      const refKey = JSON.stringify(clean);
+      if (refKey.length > 16384) invalid();
+      this.#refs.set(refKey, clean);
+      if (this.#refs.size > 1000) invalid();
+    }
+
+    for (const [field, values] of Object.entries(this.#texts)) {
+      const value = textValue(row, field);
+      if (value === null) continue;
+      if (value.length > 1024 || /[\u0000-\u001f\u007f]/u.test(value))
+        invalid();
+      values.add(value);
+      if (values.size > 1000) invalid();
+    }
+
+    if (typeof row.project_id === "string") {
+      const bytes = Buffer.from(row.project_id);
+      const order = this.#project
+        ? Buffer.compare(bytes, this.#project.bytes) ||
+          comparePosition(at, this.#project.at)
+        : 1;
+      if (order > 0)
+        this.#project = {
+          id: row.project_id,
+          bytes,
+          at,
+          row: locatorFields(row, ts),
+        };
+    }
+
+    if (
+      (["history", "prompt", "user"].includes(kind) ||
+        (row.kind === "session_event" && row.actor_role === "user")) &&
+      typeof row.content === "string" &&
+      row.content.replace(/^ +| +$/gu, "").length > 0 &&
+      (!this.#opening || comparePosition(at, this.#opening.at) < 0)
+    )
+      this.#opening = { at, row: locatorFields(row, ts) };
+
+    for (const field of TOKEN_FIELDS)
+      this.#sums.set(field, (this.#sums.get(field) ?? 0n) + count(row[field]));
+    if (row.cost_usd_micros != null) {
+      this.#anyCost = true;
+      this.#sums.set(
+        "cost_usd_micros",
+        (this.#sums.get("cost_usd_micros") ?? 0n) + count(row.cost_usd_micros),
+      );
+    }
+    let split5m = 0n;
+    let split1h = 0n;
+    let splitOk = true;
+    try {
+      split5m = count(row.cache_create_5m_tokens);
+      split1h = count(row.cache_create_1h_tokens);
+    } catch {
+      splitOk = false;
+      this.#splitInvalid = true;
+    }
+    if (splitOk) {
+      this.#sums.set(
+        "cache_create_5m_tokens",
+        (this.#sums.get("cache_create_5m_tokens") ?? 0n) + split5m,
+      );
+      this.#sums.set(
+        "cache_create_1h_tokens",
+        (this.#sums.get("cache_create_1h_tokens") ?? 0n) + split1h,
+      );
+    }
+    const create = count(row.cache_create_tokens);
+    if (create !== 0n) {
+      if (
+        row.cache_create_5m_tokens == null &&
+        row.cache_create_1h_tokens == null
+      ) {
+        if (!this.#splitFalse || comparePosition(at, this.#splitFalse) < 0)
+          this.#splitFalse = at;
+      } else if (!splitOk) {
+        if (!this.#splitThrows || comparePosition(at, this.#splitThrows) < 0)
+          this.#splitThrows = at;
+      } else if (split5m + split1h !== create) {
+        if (!this.#splitFalse || comparePosition(at, this.#splitFalse) < 0)
+          this.#splitFalse = at;
+      }
+    }
+
+    const work = status(row);
+    if (work !== null && (!this.#work || comparePosition(at, this.#work.at) > 0))
+      this.#work = { at, status: work };
+    if (
+      row.task_title != null &&
+      (!this.#title || comparePosition(at, this.#title.at) > 0)
+    )
+      this.#title = { at, value: row.task_title };
+  }
+
+  finish(): DirectoryEvents {
+    if (this.#finished) throw new Error("directory_events_builder_finished");
+    this.#finished = true;
+    const taskRefs = [...this.#refs.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([, v]) => v);
+    if (JSON.stringify(taskRefs).length > 131072) invalid();
+    const projectId = this.#project?.id ?? null;
+    const isPath =
+      projectId !== null &&
+      (/^(?:[\\/]|~|\.{1,2}[\\/]|file:)/iu.test(projectId) ||
+        /^[A-Za-z]:[\\/]/u.test(projectId));
+    if (
+      projectId !== null &&
+      !isPath &&
+      (projectId.length > 1024 || /[\u0000-\u001f\u007f]/u.test(projectId))
+    )
+      invalid();
+    const projectEvent =
+      isPath && this.#project ? locator(this.#project.row) : null;
+    const openingEvent = this.#opening ? locator(this.#opening.row) : null;
+    // `every` stops at the first row, in canonical order, that is not a complete split.
+    if (
+      this.#splitThrows &&
+      (!this.#splitFalse ||
+        comparePosition(this.#splitThrows, this.#splitFalse) < 0)
+    )
+      invalid();
+    const completeSplit = !this.#splitFalse && !this.#splitThrows;
+    if (completeSplit && this.#splitInvalid) invalid();
+    const total = (field: string) => {
+      const n = this.#sums.get(field) ?? 0n;
+      if (n > MAX_COUNT) invalid();
+      return String(n);
+    };
+    const taskTitle = this.#title?.value ?? null;
+    if (
+      taskTitle !== null &&
+      (typeof taskTitle !== "string" || [...taskTitle].length > 200)
+    )
+      invalid();
+    const sorted = (values: Set<string>) => [...values].sort();
+    return {
+      eventCount: String(this.#count),
+      eventTimes: [...this.#times].sort(
+        (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0),
+      ),
+      openingEvent,
+      userIds: sorted(this.#texts.user_id),
+      machineIds: sorted(this.#texts.machine_id),
+      models: sorted(this.#texts.model),
+      projectId: isPath ? null : projectId,
+      projectEvent,
+      firstTs: this.#first?.ts ?? null,
+      lastTs: this.#last?.ts ?? null,
+      kinds: sorted(this.#kinds),
+      taskRefs,
+      taskTitle: taskTitle as string | null,
+      inputTokens: total("input_tokens"),
+      outputTokens: total("output_tokens"),
+      reasoningTokens: total("reasoning_tokens"),
+      cacheReadTokens: total("cache_read_tokens"),
+      cacheCreateTokens: total("cache_create_tokens"),
+      cacheCreate5mTokens: completeSplit
+        ? total("cache_create_5m_tokens")
+        : null,
+      cacheCreate1hTokens: completeSplit
+        ? total("cache_create_1h_tokens")
+        : null,
+      costUsdMicros: this.#anyCost ? total("cost_usd_micros") : null,
+      workStatus: this.#work?.status ?? null,
+      workStatusAt: this.#work?.at.ts ?? null,
+    };
+  }
+}
+
 /** Takes the complete surviving convergence rows, never catalog/content text. */
 export function directoryEventsFromProjection(
   input: readonly Event[],
 ): DirectoryEvents {
-  const unique = new Map<string, Event>();
-  for (const row of input) {
-    const key = JSON.stringify([
-      row.machine_id,
-      row.source,
-      row.session_id,
-      row.kind,
-      row.event_id,
-      row.ts,
-    ]);
-    const prior = unique.get(key);
-    if (
-      prior &&
-      JSON.stringify(canonical(prior)) !== JSON.stringify(canonical(row))
-    )
-      invalid();
-    unique.set(key, row);
-  }
-  const rows = [...unique.values()]
-    .map<
-      Event & { ts: string }
-    >((row) => ({ ...row, ts: canonicalTimestamp(String(row.ts)) }))
-    .sort(
-      (a, b) =>
-        a.ts.length - b.ts.length ||
-        (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0) ||
-        Buffer.compare(
-          Buffer.from(String(a.event_id)),
-          Buffer.from(String(b.event_id)),
-        ),
-    );
-  const kinds = [...new Set(rows.map((r) => String(r.kind)))].sort();
-  if (
-    kinds.length > 64 ||
-    kinds.some((k) => !k || k.length > 128 || /[\u0000-\u001f\u007f]/u.test(k))
-  )
-    invalid();
-  const refs = new Map<string, unknown>();
-  for (const row of rows) {
-    const ref = row.task_ref;
-    if (ref == null || JSON.stringify(ref) === "{}") continue;
-    if (typeof ref !== "object") invalid();
-    const clean = canonical(ref);
-    const key = JSON.stringify(clean);
-    if (key.length > 16384) invalid();
-    refs.set(key, clean);
-  }
-  const taskRefs = [...refs.entries()]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([, v]) => v);
-  if (taskRefs.length > 1000 || JSON.stringify(taskRefs).length > 131072)
-    invalid();
-  const textSet = (field: string) => {
-    const values = [
-      ...new Set(
-        rows.flatMap((row) =>
-          typeof row[field] === "string" && row[field] !== ""
-            ? [row[field] as string]
-            : [],
-        ),
-      ),
-    ].sort();
-    if (
-      values.length > 1000 ||
-      values.some(
-        (value) => value.length > 1024 || /[\u0000-\u001f\u007f]/u.test(value),
-      )
-    )
-      invalid();
-    return values;
-  };
-  const compareText = (left: string, right: string) =>
-    Buffer.compare(Buffer.from(left), Buffer.from(right));
-  const projectRows = rows
-    .filter((row) => typeof row.project_id === "string")
-    .sort((a, b) => compareText(String(a.project_id), String(b.project_id)));
-  const project = projectRows.at(-1);
-  const projectId = project ? String(project.project_id) : null;
-  const isPath =
-    projectId !== null &&
-    (/^(?:[\\/]|~|\.{1,2}[\\/]|file:)/iu.test(projectId) ||
-      /^[A-Za-z]:[\\/]/u.test(projectId));
-  function locator(row: Event & { ts: string }): EventLocator {
-    if (
-      typeof row._index_fingerprint !== "string" ||
-      !/^s3[0-9a-f]{14}$/u.test(row._index_fingerprint)
-    )
-      invalid();
-    for (const field of [
-      "session_id",
-      "event_id",
-      "machine_id",
-      "kind",
-      "source",
-    ])
-      if (typeof row[field] !== "string" || !row[field]) invalid();
-    return {
-      session_id: String(row.session_id),
-      event_id: String(row.event_id),
-      machine_id: String(row.machine_id),
-      kind: String(row.kind),
-      source: String(row.source),
-      ts: row.ts,
-      fingerprint: row._index_fingerprint,
-    };
-  }
-  if (
-    projectId !== null &&
-    !isPath &&
-    (projectId.length > 1024 || /[\u0000-\u001f\u007f]/u.test(projectId))
-  )
-    invalid();
-  const projectEvent = isPath && project ? locator(project) : null;
-  const opening = rows.find(
-    (row) =>
-      (["history", "prompt", "user"].includes(String(row.kind)) ||
-        (row.kind === "session_event" && row.actor_role === "user")) &&
-      typeof row.content === "string" &&
-      row.content.replace(/^ +| +$/gu, "").length > 0,
-  );
-  const openingEvent = opening ? locator(opening) : null;
-  const totals = (key: string) => sum(rows.map((row) => count(row[key])));
-  const completeSplit = rows.every(
-    (row) =>
-      count(row.cache_create_tokens) === 0n ||
-      ((row.cache_create_5m_tokens != null ||
-        row.cache_create_1h_tokens != null) &&
-        count(row.cache_create_5m_tokens) +
-          count(row.cache_create_1h_tokens) ===
-          count(row.cache_create_tokens)),
-  );
-  const work = [...rows].reverse().find((row) => status(row) !== null);
-  const taskTitle =
-    [...rows]
-      .reverse()
-      .map((r) => r.task_title)
-      .find((t) => t != null) ?? null;
-  if (
-    taskTitle !== null &&
-    (typeof taskTitle !== "string" || [...taskTitle].length > 200)
-  )
-    invalid();
-  return {
-    eventCount: String(rows.length),
-    eventTimes: [...new Set(rows.map((row) => row.ts))],
-    openingEvent,
-    userIds: textSet("user_id"),
-    machineIds: textSet("machine_id"),
-    models: textSet("model"),
-    projectId: isPath ? null : projectId,
-    projectEvent,
-    firstTs: rows[0]?.ts ?? null,
-    lastTs: rows.at(-1)?.ts ?? null,
-    kinds,
-    taskRefs,
-    taskTitle: taskTitle as string | null,
-    inputTokens: totals("input_tokens"),
-    outputTokens: totals("output_tokens"),
-    reasoningTokens: totals("reasoning_tokens"),
-    cacheReadTokens: totals("cache_read_tokens"),
-    cacheCreateTokens: totals("cache_create_tokens"),
-    cacheCreate5mTokens: completeSplit
-      ? totals("cache_create_5m_tokens")
-      : null,
-    cacheCreate1hTokens: completeSplit
-      ? totals("cache_create_1h_tokens")
-      : null,
-    costUsdMicros: rows.some((r) => r.cost_usd_micros != null)
-      ? totals("cost_usd_micros")
-      : null,
-    workStatus: work ? status(work) : null,
-    workStatusAt: work?.ts ?? null,
-  };
+  const builder = new DirectoryEventsBuilder();
+  for (const row of input) builder.add(row);
+  return builder.finish();
 }
 /** Lock/fence against tombstones and compare the entire live source set. A
  * concurrent pointer change invalidates readiness in its own transaction. */

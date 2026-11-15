@@ -51,7 +51,8 @@ export interface ProjectionContext {
 }
 
 export const CONVERGENCE_EVENT_KIND = "convergence_event";
-const ACTIVITY_KINDS = new Set([
+/** Kinds projected by project_delivery_activity_row. */
+export const RELAYHISTORY_ACTIVITY_KINDS: ReadonlySet<string> = new Set([
   "history",
   "session_event",
   "tool_call",
@@ -820,17 +821,77 @@ function activityEvent(
 
 const payloadOf = (event: Json) => (event.record as { payload: Json }).payload;
 
-/** sessions.settle_delivery_tool_ts, for every tool at once. */
-function settleToolTimes(events: Json[]) {
-  const parents = new Map<string, string>();
-  for (const event of events) {
-    const toolUse = text(payloadOf(event), "tool_use_id");
-    if (event.kind !== "session_event" || toolUse === null) continue;
-    const seen = parents.get(toolUse);
-    if (seen === undefined || compareTimes(event.ts as string, seen) < 0)
-      parents.set(toolUse, event.ts as string);
+interface RequestFacts {
+  /** The one token_json blob seen so far; `undefined` while none was seen. */
+  blob: string | undefined;
+  /** More than one distinct token_json blob: settle_delivery_request skips the request. */
+  conflict: boolean;
+  /** Ordinal (in `add` order) of the carrier: the smallest delivery_record_id, first on ties. */
+  carrier: number;
+  carrierRecordId: string;
+  usage: Usage | null | undefined;
+}
+
+/**
+ * The cross-event facts that settle a session's activity events: the earliest
+ * `session_event` time per tool_use_id (sessions.settle_delivery_tool_ts) and the
+ * token blob and carrier per request (sessions.settle_delivery_request).
+ *
+ * `add` every activity event in one order, then `settle` each event, passing the
+ * same ordinal `add` returned for it. The facts hold no event bodies, so a
+ * streaming reader can add events in one pass and settle them in a second pass
+ * over the same records in the same order; `projectRelayhistorySession` does both
+ * passes over its in-memory events and gets the rows it always did.
+ */
+export class ProjectionSettlement {
+  readonly #source: string;
+  readonly #parents = new Map<string, string>();
+  readonly #requests = new Map<string, RequestFacts>();
+  #added = 0;
+
+  constructor(source: string) {
+    this.#source = source;
   }
-  for (const event of events) {
+
+  /** Records one activity event's facts; returns its ordinal for `settle`. */
+  add(event: Json): number {
+    const ordinal = this.#added++;
+    const payload = payloadOf(event);
+    const toolUse = text(payload, "tool_use_id");
+    if (event.kind === "session_event" && toolUse !== null) {
+      const seen = this.#parents.get(toolUse);
+      if (seen === undefined || compareTimes(event.ts as string, seen) < 0)
+        this.#parents.set(toolUse, event.ts as string);
+    }
+    const key = event.request_key as string | null;
+    if (key !== null) {
+      const recordId = event.delivery_record_id as string;
+      const blob = text(payload, "token_json");
+      const held = this.#requests.get(key);
+      if (!held)
+        this.#requests.set(key, {
+          blob: blob ?? undefined,
+          conflict: false,
+          carrier: ordinal,
+          carrierRecordId: recordId,
+          usage: undefined,
+        });
+      else {
+        if (blob !== null) {
+          if (held.blob === undefined) held.blob = blob;
+          else if (held.blob !== blob) held.conflict = true;
+        }
+        if (recordId < held.carrierRecordId) {
+          held.carrier = ordinal;
+          held.carrierRecordId = recordId;
+        }
+      }
+    }
+    return ordinal;
+  }
+
+  /** Settles the event `add` numbered `ordinal`, in place, once every event was added. */
+  settle(event: Json, ordinal: number): void {
     const payload = payloadOf(event);
     const toolUse = nullIfEmpty(text(payload, "tool_use_id"));
     if (
@@ -838,46 +899,25 @@ function settleToolTimes(events: Json[]) {
       toolUse !== null &&
       activityMs(payload) === null
     )
-      event.ts = parents.get(toolUse) ?? event.ingested_at;
-  }
-}
-
-/**
- * sessions.settle_delivery_request, for every request at once. The carrier is
- * the smallest record id; SQL's `min` takes the database collation and this the
- * code-unit order, which can pick another member but not change the totals.
- */
-function settleRequests(events: Json[], source: string) {
-  const groups = new Map<string, Json[]>();
-  for (const event of events) {
+      event.ts = this.#parents.get(toolUse) ?? event.ingested_at;
     const key = event.request_key as string | null;
-    if (key === null) continue;
-    const group = groups.get(key);
-    if (group) group.push(event);
-    else groups.set(key, [event]);
-  }
-  for (const [key, group] of groups) {
-    const blobs = new Set(
-      group
-        .map((event) => text(payloadOf(event), "token_json"))
-        .filter((blob) => blob !== null),
-    );
+    if (key === null) return;
+    const facts = this.#requests.get(key);
     if (
-      blobs.size !== 1 ||
-      (source === "claude" && key.startsWith("record-id:"))
+      !facts ||
+      facts.carrier !== ordinal ||
+      facts.conflict ||
+      facts.blob === undefined ||
+      (this.#source === "claude" && key.startsWith("record-id:"))
     )
-      continue;
-    const usage = normalizedUsage(source, [...blobs][0]!);
-    if (!usage) continue;
-    const carrier = group.reduce((least, event) =>
-      (event.delivery_record_id as string) <
-      (least.delivery_record_id as string)
-        ? event
-        : least,
-    );
+      return;
+    if (facts.usage === undefined)
+      facts.usage = normalizedUsage(this.#source, facts.blob);
+    const usage = facts.usage;
+    if (!usage) return;
     const nullable = (value: bigint | null) =>
       value === null ? null : exact(value);
-    Object.assign(carrier, {
+    Object.assign(event, {
       input_tokens: exact(usage.input),
       output_tokens: exact(usage.output),
       reasoning_tokens: exact(usage.reasoning),
@@ -891,7 +931,7 @@ function settleRequests(events: Json[], source: string) {
 }
 
 /** sessions.delivery_catalog_key: the row's key within the session, or null. */
-function catalogKey(record: RelayhistoryStreamRecord): string | null {
+export function relayhistoryCatalogKey(record: RelayhistoryStreamRecord): string | null {
   const p = record.payload!;
   const parts = {
     session: [],
@@ -905,7 +945,7 @@ function catalogKey(record: RelayhistoryStreamRecord): string | null {
 }
 
 /** sessions.project_delivery_catalog_row */
-function catalogRows(
+export function relayhistoryCatalogRows(
   record: RelayhistoryStreamRecord,
   context: ProjectionContext,
 ): ProjectionRow[] {
@@ -1042,7 +1082,7 @@ function catalogRows(
  * its identity must be the session the manifest and its provenance name. Only
  * its times are canonicalized.
  */
-function directEvent(
+export function relayhistoryDirectEvent(
   record: RelayhistoryStreamRecord,
   context: ProjectionContext,
 ): Json {
@@ -1087,6 +1127,29 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+/** The readers' `(ts, event_id)` order of two projected events. */
+export function compareProjectedEvents(left: Json, right: Json): number {
+  return (
+    compareTimes(left.ts as string, right.ts as string) ||
+    compareStrings(left.event_id as string, right.event_id as string)
+  );
+}
+
+/**
+ * One activity record's unsettled event (project_delivery_activity_row), or null
+ * for the control and sidechain-user rows the live projection skips. The record
+ * must be one of RELAYHISTORY_ACTIVITY_KINDS; settle it with ProjectionSettlement.
+ */
+export function relayhistoryActivityEvent(
+  record: RelayhistoryStreamRecord,
+  context: ProjectionContext,
+): Json | null {
+  const p = record.payload!;
+  return controlRow(record.kind, p) || sidechainUserRow(record.kind, p)
+    ? null
+    : activityEvent(record, context);
+}
+
 /**
  * Project one session's surviving records (`normalizeRelayhistoryRecords`):
  * catalog rows first, then its events in the readers' `(ts, event_id)` order.
@@ -1100,14 +1163,13 @@ export function projectRelayhistorySession(
   const catalog = new Map<string, RelayhistoryStreamRecord>();
   let unprojected = 0;
   for (const record of records) {
-    const p = record.payload!;
     if (record.kind === CONVERGENCE_EVENT_KIND)
-      direct.push(directEvent(record, context));
-    else if (ACTIVITY_KINDS.has(record.kind)) {
-      if (!controlRow(record.kind, p) && !sidechainUserRow(record.kind, p))
-        events.push(activityEvent(record, context));
+      direct.push(relayhistoryDirectEvent(record, context));
+    else if (RELAYHISTORY_ACTIVITY_KINDS.has(record.kind)) {
+      const event = relayhistoryActivityEvent(record, context);
+      if (event) events.push(event);
     } else {
-      const key = catalogKey(record);
+      const key = relayhistoryCatalogKey(record);
       if (key === null) {
         unprojected += 1;
         continue;
@@ -1116,17 +1178,14 @@ export function projectRelayhistorySession(
       catalog.set(key, held ? lastAccepted(held, record) : record);
     }
   }
-  settleToolTimes(events);
-  settleRequests(events, context.source);
-  const ordered = [...events, ...direct].sort(
-    (a, b) =>
-      compareTimes(a.ts as string, b.ts as string) ||
-      compareStrings(a.event_id as string, b.event_id as string),
-  );
+  const settlement = new ProjectionSettlement(context.source);
+  const ordinals = events.map((event) => settlement.add(event));
+  events.forEach((event, index) => settlement.settle(event, ordinals[index]!));
+  const ordered = [...events, ...direct].sort(compareProjectedEvents);
   return {
     rows: [
       ...[...catalog.values()].flatMap((record) =>
-        catalogRows(record, context),
+        relayhistoryCatalogRows(record, context),
       ),
       ...ordered.map((row) => ({ table: "convergence_events" as const, row })),
     ],
