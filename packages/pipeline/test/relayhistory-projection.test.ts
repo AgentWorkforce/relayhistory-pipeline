@@ -853,7 +853,9 @@ describe("timestamps at Postgres's edge", () => {
     const { rows } = await expectLiveEqual([
       line("edge", "session_event", { role: "user", ts_ms: MAX_MS }),
       line("past", "session_event", { role: "user", ts_ms: MAX_MS + 1 }),
-      line("zero", "session_event", { role: "user", ts_ms: 0 }),
+      // The lower edge is 1 ms: 0 is "not reported" (relayhistory-zero-ms.test.ts, which applies the
+      // proposed upstream fix; the pinned chain here still takes 0 as the epoch).
+      line("one", "session_event", { role: "user", ts_ms: 1 }),
       line("now", "session_event", { role: "user", ts_ms: T }),
       line("s", "session", {
         first_activity_ms: MAX_MS,
@@ -862,7 +864,7 @@ describe("timestamps at Postgres's edge", () => {
     ]);
     const events = byTable(rows, "convergence_events");
     expect(events.map((row) => row.delivery_record_id)).toEqual([
-      "zero",
+      "one",
       "now",
       "past",
       "edge",

@@ -143,9 +143,12 @@ function catalogInteger(value: unknown): number | null {
     : null;
 }
 
-/** sessions.delivery_catalog_time */
+/**
+ * sessions.delivery_catalog_time. 0 is "not reported", never 1970-01-01: the
+ * relayhistory client parsers write 0 for a record that carries no time.
+ */
 function catalogTime(value: unknown): string | null {
-  return typeof value === "number" && value >= 0 && value <= MAX_TIME_MS
+  return typeof value === "number" && value >= 1 && value <= MAX_TIME_MS
     ? timeFromMs(value)
     : null;
 }
@@ -210,7 +213,14 @@ function exact(value: bigint): number | bigint {
   return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
 }
 
-/** sessions.delivery_activity_ms */
+/**
+ * sessions.delivery_activity_ms. A key whose value is 0 is "not reported" and
+ * the next key is tried: the relayhistory client parsers write ts_ms 0 for a
+ * record that carries no time, and taking it as 1970-01-01 put the event (and,
+ * through `settle`, every timeless tool call under it) at the epoch. With no
+ * key reported the event falls back to its delivery time. Any other number
+ * outside 1..MAX_TIME_MS still ends the search with no time (the lower bound is 1 ms).
+ */
 function activityMs(payload: Json): number | null {
   for (const key of [
     "updated_ms",
@@ -220,8 +230,8 @@ function activityMs(payload: Json): number | null {
   ]) {
     const value = payload[key];
     if (typeof value === "bigint") return null;
-    if (typeof value === "number")
-      return value >= 0 && value <= MAX_TIME_MS ? value : null;
+    if (typeof value === "number" && value !== 0)
+      return value >= 1 && value <= MAX_TIME_MS ? value : null;
   }
   return null;
 }
