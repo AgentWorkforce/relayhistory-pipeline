@@ -97,10 +97,25 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
   };
 }
 
+const dbConnectionLost = (e: unknown): boolean => {
+  const m = (e as Error)?.message;
+  return typeof m === "string" && /Connection terminated|not queryable|connection error/i.test(m);
+};
+
+/**
+ * The revisions pass merges a whole buffer (minutes of S3 work) between two SQL reads, so the one connection can sit
+ * idle far longer than a network path keeps an idle TCP flow (GitHub's hosted runners drop idle outbound flows after
+ * about 4 minutes). TCP keepalive plus a SELECT 1 every 30 s while the tool runs keep it in use. A heartbeat can
+ * interleave inside a read-only transaction, which is harmless.
+ */
+export const DB_HEARTBEAT_MS = 30_000;
+
 // A closed, redacted reason only: a pg or S3 error message can carry a host, key or tenant id.
-const redactedReason = (e: unknown): string => {
+export const redactedReason = (e: unknown): string => {
   const code = (e as { code?: unknown } | null)?.code;
   if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return "sqlstate_" + code;
+  // A dropped database connection (network idle drop, server-side termination): pg's messages, never quoted.
+  if (code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT" || dbConnectionLost(e)) return "db_connection_lost";
   if ((e as { name?: unknown })?.name === "OwnerUrlError" && typeof code === "string") return "db_url_" + code;
   const m = (e as Error)?.message;
   return typeof m === "string" && /^[a-z0-9_]{1,64}$/.test(m) ? m : "internal_error";
@@ -115,6 +130,7 @@ if (import.meta.main) {
     process.exit(2);
   }
   let client: pg.Client | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   try {
     const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     if (!accessKeyId || !secretAccessKey) throw new Error("aws_credentials_required");
@@ -125,10 +141,14 @@ if (import.meta.main) {
     let dbUrl = (parsed as { dbUrl?: unknown } | null)?.dbUrl;
     if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== 1) throw new Error("db_url_required");
     // Discrete pinned fields only (verified TLS, no PG* env or .pgpass fallback), and read-only by default.
-    client = new pg.Client({ ...ownerClientConfig(dbUrl, "96bulls-upload-fence-backfill"), options: "-c default_transaction_read_only=on" });
+    client = new pg.Client({ ...ownerClientConfig(dbUrl, "96bulls-upload-fence-backfill"), options: "-c default_transaction_read_only=on",
+      keepAlive: true, keepAliveInitialDelayMillis: 10_000 });
     dbUrl = "";
     client.on("error", () => {});
     await client.connect();
+    const beat = client;
+    heartbeat = setInterval(() => { beat.query("SELECT 1").catch(() => {}); }, DB_HEARTBEAT_MS);
+    heartbeat.unref?.();
     const store = createS3Store({
       bucket: args.bucket, region: args.region,
       credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
@@ -146,6 +166,7 @@ if (import.meta.main) {
     process.stdout.write(JSON.stringify({ refused: redactedReason(e) }) + "\n");
     process.exitCode = 1;
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
     await client?.end().catch(() => {});
   }
 }

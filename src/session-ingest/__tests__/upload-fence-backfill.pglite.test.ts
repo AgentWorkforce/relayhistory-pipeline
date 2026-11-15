@@ -7,7 +7,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
-import { parseBackfillArgs } from "../../../scripts/upload-fence-backfill.ts";
+import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { scratchStore } from "./support.ts";
 
@@ -340,6 +340,15 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     return { store, puts, gets };
   };
   const shardPuts = (puts: Map<string, number>) => [...puts].filter(([k]) => /\/r=[0-9a-f]{3}\.json$/.test(k));
+
+  test("CLI: a dropped database connection is reported as db_connection_lost; the heartbeat beats well inside 4 minutes", () => {
+    expect(redactedReason(new Error("Connection terminated unexpectedly"))).toBe("db_connection_lost");
+    expect(redactedReason(new Error("Client has encountered a connection error and is not queryable"))).toBe("db_connection_lost");
+    expect(redactedReason(Object.assign(new Error("read ECONNRESET at 10.0.0.1"), { code: "ECONNRESET" }))).toBe("db_connection_lost");
+    expect(redactedReason(Object.assign(new Error("x"), { code: "57P01" }))).toBe("sqlstate_57P01");
+    expect(redactedReason(new Error("password for user x@host failed"))).toBe("internal_error"); // never quoted
+    expect(DB_HEARTBEAT_MS).toBeLessThanOrEqual(60_000);
+  });
 
   test("merge buffer: block windows and pages are merged together, each shard written once per pass", async () => {
     for (let i = 0; i < 150; i++) {
