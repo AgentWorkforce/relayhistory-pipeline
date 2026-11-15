@@ -884,7 +884,7 @@ accepts only the exact 13 transcript-store resources in the initial create,
 known three-resource recovery, one capture-bound post-merge remediation
 (`trail-key` and `trail-logs` update with every other resource `noop`), the
 srv-writer addition (`transcript-srv-writer` create and `transcripts-key`
-update, everything else `noop`), the backlog-ops key grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
+update, everything else `noop`), the backlog-ops key grants (below), the inbox bridge grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
 match the exact paths and sha256 values in the approval-bound provenance. The
 capture command refuses an invalid shape before replacing the reviewed files,
 and deploy checks it again. Any other update count or resource, replacement,
@@ -923,6 +923,26 @@ The statements were first added to prod by hand (2026-11-13). Alchemy's state do
 plan with the input set still shows the `transcripts-key` update adding them, which this phase accepts; applying
 it writes the same statements that are already live. Until that phase is applied, any deploy that updates
 `transcripts-key` (for example a pipeline role cascade) drops them; re-add them by hand or set the input first.
+
+**Inbox bridge grants.** The relayhistory-cloud old-desktop inbox bridge (relayhistory-cloud#347) writes
+Desktop <= 2026.11.3 batches into the upload inbox as an IAM user created outside the stack, at path `/`:
+`96bulls-<stage>-inbox-bridge`. The inbox wall denies every unlisted principal, and the key delegates nothing to
+IAM. So with the upload inbox on, set `transcriptStore.inboxBridgeUserArn:
+"arn:aws:iam::<account>:user/96bulls-<stage>-inbox-bridge"` (exactly that ARN, nothing else is accepted).
+- **The wall:** its `ArnNotEquals` list gains the user as its last entry. The delete wall is unchanged.
+- **The key:** gains `InboxBridgeEncryptsInboxViaS3` (`kms:GenerateDataKey`), `InboxBridgeReadsJournalsViaS3` and
+  `InboxBridgeReadsFenceAuthorityViaS3` (`kms:Decrypt`), each via S3 in this account and for its objects'
+  encryption context (`stacks/aws/upload-inbox.ts`).
+- **Unset:** both policies are byte-identical.
+- **The plan contract** accepts the change only as its own "inbox bridge grants" phase:
+  - only `transcripts` and `transcripts-key` update;
+  - the wall gains (or, to revoke, loses) exactly that entry, and every other bucket statement stays
+    byte-identical;
+  - the key adds (or removes) exactly the three statements as built;
+  - both move together.
+
+  A plan that changes the bridge's wall entry or key statements in any other phase is refused. Like every phase
+  it is judged against Alchemy's state, not the live policies.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
