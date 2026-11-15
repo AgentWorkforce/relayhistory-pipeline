@@ -118,7 +118,11 @@ if (import.meta.main) {
     try { parsed = JSON.parse(line); } catch { throw new Error("stdin_invalid"); }
     let dbUrl = (parsed as { dbUrl?: unknown } | null)?.dbUrl;
     if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== 1) throw new Error("db_url_required");
-    client = new pg.Client({ ...ownerClientConfig(dbUrl, "96bulls-accepted-stage-export"), options: "-c default_transaction_read_only=on" });
+    // Keep the base options (idle_in_transaction_session_timeout) and add read-only by default; TCP keepalives so a
+    // NAT or pooler does not idle the socket out between pages (as upload-fence-backfill.ts).
+    const base = ownerClientConfig(dbUrl, "96bulls-accepted-stage-export");
+    client = new pg.Client({ ...base, options: `${base.options ?? ""} -c default_transaction_read_only=on`.trim(),
+      keepAlive: true, keepAliveInitialDelayMillis: 10_000 });
     dbUrl = "";
     client.on("error", () => {});
     await client.connect();
