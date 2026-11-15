@@ -580,6 +580,13 @@ components:
         userId: {type: string}
         orgId: {type: string}
         workspaceId: {type: string}
+        role:
+          type: string
+          enum: [owner, admin, member]
+          description: >-
+            Optional. The caller's org role as Control authorized it (Control's
+            SESSION_READ_MINT_INCLUDE_ROLE). Validated, then neither stored nor
+            echoed; a gateway in front of this API may record it.
         audience: {type: string, description: Must normalize to this service's origin, else 403 audience_mismatch.}
         scopes: {type: array, const: ["rth:read"]}
         label: {type: string, maxLength: 128}
