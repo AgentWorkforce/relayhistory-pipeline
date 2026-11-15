@@ -46,7 +46,7 @@
  *                                    service builds it (src/shared/locker.ts)
  *   INGEST_KEY_ROOT                  object key root, default "96bulls" (same as the Worker)
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker). With
- *                                    INGEST_LEDGER=s3: an in-memory limit PER REPLICA (tenant-limiter.ts), no SQL
+ *                                    INGEST_LEDGER=s3 they bound nothing unless INGEST_S3_TENANT_LIMIT=on
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
  *   INGEST_CLAIM_LOCK_BUSY           unset/off (default) | on (any case, trimmed; the Worker's routingFlag, so any
  *                                    other value is off, as on the Worker): a claim that loses its lock wait
@@ -101,6 +101,16 @@
  *                                    first, reconciled to the fence; ledger-s3.ts withSqlControlMirror). No
  *                                    admission on ANY path (sync, async, direct upload) until the fence-authority
  *                                    marker exists (FenceAuthorityDoc).
+ *   INGEST_S3_TENANT_LIMIT           unset | "" | "off" (default: no tenant limit on the S3 ledger, unchanged) |
+ *                                    exactly "on" (anything else refuses startup). Needs INGEST_LEDGER=s3. An
+ *                                    in-memory limit PER REPLICA (tenant-limiter.ts, no SQL): the synchronous path
+ *                                    takes INGEST_MAX_PER_USER / _ORG slots (429 delivery_busy at the cap); the
+ *                                    async consumer has its own pool, INGEST_MAX_PER_USER per user and
+ *                                    INGEST_ASYNC_MAX_PER_ORG per org, and defers (never dead-letters) at the cap.
+ *   INGEST_ASYNC_MAX_PER_ORG         the async consumer's per-org cap with INGEST_S3_TENANT_LIMIT=on and
+ *                                    SELFHOST_INGEST_ADMISSION=async|drain: 1..SELFHOST_ADMISSION_CONCURRENCY,
+ *                                    default max(1, floor(concurrency / 2)), so one org never holds more than half
+ *                                    the consumer. Set without the flag (or without async admission): refused.
  */
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
@@ -176,6 +186,39 @@ export interface SelfhostIngestSettings {
   analytics?: AnalyticsConfig;
   /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
   claimLockBusy?: true;
+  /** INGEST_S3_TENANT_LIMIT=on (INGEST_LEDGER=s3 only). Absent (the default): no tenant limit on the S3 ledger. */
+  s3TenantLimit?: SelfhostS3TenantLimitSettings;
+}
+
+/** INGEST_S3_TENANT_LIMIT=on. `asyncMaxPerOrg` (INGEST_ASYNC_MAX_PER_ORG): present only with async/drain admission. */
+export interface SelfhostS3TenantLimitSettings {
+  asyncMaxPerOrg?: number;
+}
+
+export const S3_TENANT_LIMIT_VAR = "INGEST_S3_TENANT_LIMIT";
+export const ASYNC_MAX_PER_ORG_VAR = "INGEST_ASYNC_MAX_PER_ORG";
+
+/** The async consumer's default per-org cap: half the consumer, at least one. */
+export const defaultAsyncMaxPerOrg = (concurrency: number) => Math.max(1, Math.floor(concurrency / 2));
+
+/**
+ * INGEST_S3_TENANT_LIMIT: unset, "" or "off" is off (and INGEST_ASYNC_MAX_PER_ORG must be unset); exactly "on" is on;
+ * anything else refuses startup. On needs INGEST_LEDGER=s3. Errors name the variable, never the value.
+ */
+export function selfhostS3TenantLimit(env: NodeJS.ProcessEnv, ledger: "s3" | undefined, admission: SelfhostAdmissionSettings | undefined): SelfhostS3TenantLimitSettings | undefined {
+  const raw = env[S3_TENANT_LIMIT_VAR];
+  const asyncSet = (env[ASYNC_MAX_PER_ORG_VAR]?.trim() ?? "") !== "";
+  if (raw === undefined || raw === "" || raw === "off") {
+    if (asyncSet) throw new Error(`96bulls: ${ASYNC_MAX_PER_ORG_VAR} needs ${S3_TENANT_LIMIT_VAR}=on`);
+    return undefined;
+  }
+  if (raw !== "on") throw new Error(`96bulls: ${S3_TENANT_LIMIT_VAR} must be off or on`);
+  if (ledger !== "s3") throw new Error(`96bulls: ${S3_TENANT_LIMIT_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
+  if (!admission) {
+    if (asyncSet) throw new Error(`96bulls: ${ASYNC_MAX_PER_ORG_VAR} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
+    return {};
+  }
+  return { asyncMaxPerOrg: bounded(env, ASYNC_MAX_PER_ORG_VAR, defaultAsyncMaxPerOrg(admission.concurrency), 1, admission.concurrency) };
 }
 
 /** HISTORY_UPLOAD_DIRECT=allowlist|on. `witnessKey` is passed through raw: promoteUpload treats missing or malformed as retry. */
@@ -362,6 +405,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime });
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
+  const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
   return {
     enabled: true,
     port: port(env),
@@ -384,5 +428,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
     ...(ledger ? { ledger } : {}),
+    ...(s3TenantLimit ? { s3TenantLimit } : {}),
   };
 }
