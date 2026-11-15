@@ -119,7 +119,7 @@ export interface BackfillSummary {
  * rewritten ownership or slot row moves its hash).
  *
  * Every value is a non-negative safe integer (receipts are counts only). `slots_revision_sum` is taken modulo 2^53
- * and the two hashes are sums of Postgres's hashtext (a signed int4) normalised into [0, 2^40); all are equality
+ * and the three hashes are sums of Postgres's hashtext (a signed int4) normalised into [0, 2^40); all are equality
  * checks, so the wrap loses only changes of an exact multiple of the modulus. hashtext is a server-internal hash,
  * stable within one server but not a cross-version contract: the fingerprint is compared only between two receipts
  * at the same commit from the same database, under 24 h apart, and is never stored outside the receipts.
@@ -127,6 +127,7 @@ export interface BackfillSummary {
 export interface BackfillFingerprint {
   revisions_count: number;
   revisions_max_updated_ms: number;
+  revisions_hash: number;
   ownership_count: number;
   ownership_hash: number;
   slots_owned_count: number;
@@ -240,12 +241,16 @@ ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
 
 /** The fingerprint's three reads (BackfillFingerprint), run in one read-only transaction, so one snapshot. */
-const FINGERPRINT_REVISIONS = `
-SELECT count(*)::bigint AS n, coalesce(floor(extract(epoch FROM max(updated_at)) * 1000), 0)::bigint AS max_ms
-FROM sessions.ingest_record_revisions WHERE ${SCOPE}`;
 /** A row-content hash sum in [0, 2^40): hashtext is a signed int4 and % keeps the sign, so it is normalised. */
 const hashSum = (row: string) =>
   `(((coalesce(sum(hashtext(${row})::bigint), 0) % ${FINGERPRINT_HASH_MODULUS}) + ${FINGERPRINT_HASH_MODULUS}) % ${FINGERPRINT_HASH_MODULUS})::bigint`;
+// The revisions' content hash as well as count + max(updated_at): a writer whose transaction began before the full
+// run's snapshot commits rows stamped at or below that max, and two updates in one floored millisecond are invisible
+// to the max; the content hash sees both.
+const FINGERPRINT_REVISIONS = `
+SELECT count(*)::bigint AS n, coalesce(floor(extract(epoch FROM max(updated_at)) * 1000), 0)::bigint AS max_ms,
+       ${hashSum("concat_ws(E'\\t', org_id, workspace_id, origin_id, record_id, revision::text, coalesce(revision_id, '~'), coalesce(digest, '~'), user_id, source, coalesce(session_id, '~'))")} AS h
+FROM sessions.ingest_record_revisions WHERE ${SCOPE}`;
 const FINGERPRINT_OWNERSHIP = `
 SELECT count(*)::bigint AS n,
        ${hashSum("concat_ws(E'\\t', org_id, workspace_id, user_id, origin_id, source, session_id)")} AS h
@@ -387,7 +392,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0, failed_codes: {} },
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0, failed_codes: {} },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
-    fingerprint: { revisions_count: 0, revisions_max_updated_ms: 0, ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 },
+    fingerprint: { revisions_count: 0, revisions_max_updated_ms: 0, revisions_hash: 0, ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 },
   };
   const { sql } = opts;
 
@@ -497,10 +502,10 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   // ---- input fingerprint: before any section, one snapshot, every value a safe integer or the run refuses ----
   {
     const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]], [FINGERPRINT_SLOTS, [orgs]]]);
-    const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(owns![0]?.n), int(owns![0]?.h), int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)];
+    const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(revs![0]?.h), int(owns![0]?.n), int(owns![0]?.h), int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)];
     if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
-    const [revisionsCount, maxMs, ownershipCount, ownershipHash, slotsCount, revisionSum, slotsHash] = values as number[];
-    summary.fingerprint = { revisions_count: revisionsCount!, revisions_max_updated_ms: maxMs!, ownership_count: ownershipCount!,
+    const [revisionsCount, maxMs, revisionsHash, ownershipCount, ownershipHash, slotsCount, revisionSum, slotsHash] = values as number[];
+    summary.fingerprint = { revisions_count: revisionsCount!, revisions_max_updated_ms: maxMs!, revisions_hash: revisionsHash!, ownership_count: ownershipCount!,
       ownership_hash: ownershipHash!, slots_owned_count: slotsCount!, slots_revision_sum: revisionSum!, slots_hash: slotsHash! };
   }
 

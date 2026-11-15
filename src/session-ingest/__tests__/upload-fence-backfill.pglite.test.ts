@@ -702,10 +702,10 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const first = await run(store, {}, log);
     const maxMs = Number((await db.query<{ ms: string }>(
       "SELECT floor(extract(epoch FROM max(updated_at)) * 1000)::bigint::text AS ms FROM sessions.ingest_record_revisions")).rows[0]!.ms);
-    expect(first.fingerprint).toEqual({ revisions_count: 2, revisions_max_updated_ms: maxMs, ownership_count: 1, ownership_hash: expect.any(Number),
+    expect(first.fingerprint).toEqual({ revisions_count: 2, revisions_max_updated_ms: maxMs, revisions_hash: expect.any(Number), ownership_count: 1, ownership_hash: expect.any(Number),
       slots_owned_count: 2, slots_revision_sum: 9, slots_hash: expect.any(Number) });
     for (const v of Object.values(first.fingerprint)) expect(Number.isSafeInteger(v) && v >= 0).toBe(true);
-    for (const h of [first.fingerprint.ownership_hash, first.fingerprint.slots_hash]) expect(h).toBeLessThan(2 ** 40);
+    for (const h of [first.fingerprint.revisions_hash, first.fingerprint.ownership_hash, first.fingerprint.slots_hash]) expect(h).toBeLessThan(2 ** 40);
     // Read before any section: the run's first transaction holds the three counts.
     expect(log.slice(0, 7).filter((l) => l.includes("count(*)")).length).toBe(3);
     // Dry and execute, full and fences+ownership only: the same inputs give the same fingerprint.
@@ -713,7 +713,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect((await run(store, { dryRun: true })).fingerprint).toEqual(first.fingerprint);
     expect((await run(store, { sections: ["fences", "ownership"] })).fingerprint).toEqual(first.fingerprint);
     // Scoped: only the scope's rows.
-    expect((await run(store, { orgs: ["org-b"] })).fingerprint).toEqual({ revisions_count: 1, revisions_max_updated_ms: expect.any(Number),
+    expect((await run(store, { orgs: ["org-b"] })).fingerprint).toEqual({ revisions_count: 1, revisions_max_updated_ms: expect.any(Number), revisions_hash: expect.any(Number),
       ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 });
   });
 
@@ -757,6 +757,14 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const afterRev = await fp();
     expect(afterRev.revisions_max_updated_ms).toBeGreaterThan(base.revisions_max_updated_ms);
     expect(afterRev.revisions_count).toBe(base.revisions_count);
+    expect(afterRev.revisions_hash).not.toBe(base.revisions_hash);
+    // The reviewer's case: a row rewritten with updated_at NOT moving (a writer whose tx began before the snapshot, or
+    // two updates in one floored millisecond): count and max are unchanged, only the content hash sees it.
+    await db.exec("UPDATE sessions.ingest_record_revisions SET digest = md5(coalesce(digest, '') || 'x') || md5('y')");
+    const afterSameStamp = await fp();
+    expect(afterSameStamp.revisions_count).toBe(afterRev.revisions_count);
+    expect(afterSameStamp.revisions_max_updated_ms).toBe(afterRev.revisions_max_updated_ms);
+    expect(afterSameStamp.revisions_hash).not.toBe(afterRev.revisions_hash);
     // A new revision row.
     await rev(A, "origin-1", "rec-5", 1, "claude", "sess-1");
     const afterNewRev = await fp();

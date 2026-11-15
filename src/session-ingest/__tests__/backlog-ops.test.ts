@@ -595,7 +595,7 @@ test("target: multi-region (mrk-) KMS key ids are accepted, other key-id shapes 
 
 // ---- refresh: backfill-refresh-dry / backfill-refresh-execute, and the drain's FULL binding ----
 
-const fingerprint = { revisions_count: 10, revisions_max_updated_ms: 1_700_000_000_000, ownership_count: 4, ownership_hash: 123_456_789,
+const fingerprint = { revisions_count: 10, revisions_max_updated_ms: 1_700_000_000_000, revisions_hash: 55_555, ownership_count: 4, ownership_hash: 123_456_789,
   slots_owned_count: 7, slots_revision_sum: 21, slots_hash: 987_654_321 };
 const fullOk = { ...backfillOk, fingerprint };
 const refreshOk = { mode: "execute", sections: { fences: "complete", ownership: "complete", revisions: "not_run" }, fingerprint };
@@ -667,7 +667,7 @@ test("refresh fingerprints: equal passes; each field differing, missing, null or
   const ok = (full: unknown, refresh: unknown) => codeSync(() => checkRefreshFingerprint(JSON.stringify(full), JSON.stringify(refresh)));
   const wrap = (summary: unknown, scope?: string) => ({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: "backfill-execute", sha, run: FULL, exitCode: 0, summary, ...(scope ? { scope } : {}) });
   expect(ok(wrap(fullOk), wrap(refreshOk))).toBeNull();
-  expect(BACKLOG_OPS_FINGERPRINT_FIELDS.length).toBe(7);
+  expect(BACKLOG_OPS_FINGERPRINT_FIELDS.length).toBe(8);
   for (const k of BACKLOG_OPS_FINGERPRINT_FIELDS) {
     expect(ok(wrap(fullOk), wrap({ ...refreshOk, fingerprint: { ...fingerprint, [k]: fingerprint[k] + 1 } }))).toBe("backlog_ops_backfill_stale");
     const { [k]: _drop, ...without } = fingerprint;

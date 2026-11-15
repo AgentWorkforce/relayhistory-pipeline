@@ -19,7 +19,8 @@
  * binding. Why that is safe: after the scope's Worker HTTP admission stop no new upload reaches SQL for those orgs,
  * so SQL's revisions, ownership rows and owned lazy slots should not advance, and the full run's revision shards and
  * owner stubs stay valid for its 24 h window; only the fences (deletions and resets) and ownership can still move,
- * and the refresh re-runs exactly those. The credential step proves the rest unchanged before any credential is read
+ * and the refresh re-runs exactly those. A control also deletes revision/ownership rows, so one landing between FULL
+ * and the refresh makes the fingerprints differ and the drain refuses stale (a new full run is then needed). The credential step proves the rest unchanged before any credential is read
  * (a writer that still moved one of those rows changes it): the two receipts' input fingerprints must be equal
  * (checkRefreshFingerprint, backlog_ops_backfill_stale).
  */

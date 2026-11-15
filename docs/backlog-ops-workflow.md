@@ -69,9 +69,12 @@ sections complete.
 so nothing should write a revision, an ownership row or an owned lazy slot for them (admission, and the SQL publish
 and seed paths that follow from what it admitted, write them), and the full run's revision shards and owner stubs stay
 valid for its 24 hour binding window. If any writer still moves one of those rows, the fingerprint below changes and
-the drain refuses. Only the controls can still move (deletions and resets,
-which also clear slots and revisions), and they reach the drain only through the fences. The refresh re-runs exactly
-the fences and ownership sections.
+the drain refuses. Only the controls can still move (deletions and resets), and they reach the drain only through the
+fences, which the refresh re-runs together with ownership. **But a control is not invisible to the fingerprint:**
+`ingest_apply_selection` and `ingest_apply_reset` also DELETE the affected rows from `ingest_record_revisions` and
+`ingest_session_ownership` (and clear slots). So a deletion or reset in scope between FULL and the refresh changes the
+fingerprint and the drain refuses `backlog_ops_backfill_stale`: run a new full backfill-execute (and a new export after
+the refresh) before draining. Fail-safe, and the operator should expect it.
 
 **The fingerprint proves the rest is unchanged.** Every backfill run (dry and execute, full and refresh) first reads,
 in one `REPEATABLE READ READ ONLY` transaction, an input `fingerprint` of its scope, all non-negative safe integers:
@@ -80,6 +83,7 @@ in one `REPEATABLE READ READ ONLY` transaction, an input `fingerprint` of its sc
 | --- | --- |
 | `revisions_count` | `ingest_record_revisions` rows |
 | `revisions_max_updated_ms` | the latest `updated_at` of those rows, epoch milliseconds (every revision upsert sets it); 0 when none |
+| `revisions_hash` | sum of `hashtext` over each revision row's content (ids, revision, revision id, digest, owner, source, session), normalised into [0, 2^40); catches a rewrite that leaves the count and the latest `updated_at` unchanged |
 | `ownership_count`, `ownership_hash` | `ingest_session_ownership` rows, and the sum of `hashtext` of each row's key, in [0, 2^40) |
 | `slots_owned_count`, `slots_revision_sum` | owned `ingest_lazy_native_slots` rows, and the sum of `current_revision` modulo 2^53 |
 | `slots_hash` | the sum of `hashtext` of each owned slot's key and current custody (owner, source, session, revision, digest; a NULL column hashed as a fixed sentinel), in [0, 2^40) |

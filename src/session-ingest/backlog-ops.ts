@@ -28,8 +28,9 @@
  * (admission, and the SQL publish and seed paths that follow from what it admitted, write them); the full run's
  * revision shards and owner stubs then stay valid for its 24 h binding window. If any writer still moves one of those
  * rows, the fingerprint changes and the drain refuses: the argument is checked, not assumed. Only the controls can still move
- * (deletions and resets, which also clear slots and revisions), and they reach the drain only through the fences; the
- * refresh re-runs exactly the fences and ownership sections. The input fingerprint (upload-fence-backfill.ts
+ * (deletions and resets), reaching the drain through the fences, which the refresh re-runs with ownership; but they also
+ * DELETE revision and ownership rows (ingest_apply_selection / ingest_apply_reset), so a control between FULL and the
+ * refresh changes the fingerprint and the drain refuses stale: a new full run is then needed (fail-safe). The input fingerprint (upload-fence-backfill.ts
  * BackfillFingerprint: counts, the revisions' latest updated_at, the revision sum and content hashes of the ownership
  * and owned-slot rows, read at each run's start in one snapshot) proves that assumption: FULL's and the refresh's must
  * be equal, field by field, or the drain refuses with backlog_ops_backfill_stale before any credential is read (also
@@ -76,7 +77,7 @@ export type BacklogOpsMode = (typeof BACKLOG_OPS_MODES)[number];
 export const isRefresh = (mode: BacklogOpsMode) => mode.startsWith("backfill-refresh-");
 /** The input fingerprint every backfill receipt carries (upload-fence-backfill.ts BackfillFingerprint), field by field. */
 export const BACKLOG_OPS_FINGERPRINT_FIELDS = [
-  "revisions_count", "revisions_max_updated_ms", "ownership_count", "ownership_hash",
+  "revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash",
   "slots_owned_count", "slots_revision_sum", "slots_hash",
 ] as const;
 export type BacklogOpsTool = "backfill" | "export" | "drain" | "presence";
