@@ -73,11 +73,11 @@ const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: stri
   code(() => indexPrebuildGithubGate(e, githubGet(f, seen), true, { enabled }));
 
 test("dormant: prebuild refuses before any GitHub read while disabled; census and readback pass every gate", async () => {
-  expect(INDEX_PREBUILD_ENABLED).toBe(false);
+  expect(INDEX_PREBUILD_ENABLED).toBe(true); // enabled for the 047010-062000 release; dormancy still proven with enabled=false
   const seen: string[] = [];
   expect(await gate(prebuildEnv, githubFixture(), false, seen)).toBe("index_prebuild_dormant");
   expect(seen).toEqual([]);
-  expect(await code(() => indexPrebuildGithubGate(prebuildEnv, githubGet(githubFixture())))).toBe("index_prebuild_dormant");
+  expect(await code(() => indexPrebuildGithubGate(prebuildEnv, githubGet(githubFixture()), false, { enabled: false }))).toBe("index_prebuild_dormant");
   expect(await gate(env("census"), githubFixture(), false)).toBeNull();
   expect(await gate(env("readback"), githubFixture(), false)).toBeNull();
   expect(await gate(prebuildEnv, githubFixture())).toBeNull();
@@ -194,7 +194,7 @@ test("credential hand-off: the child gets the URL on stdin only, never argv or e
     expect(() => refuseIndexPrebuildCredentialEnv({ ...spec.env, ...extra })).toThrow();
 });
 
-test("parent process: a dormant prebuild refuses before the secret is used; nothing secret is printed or written", () => {
+test("parent process: a prebuild without its census refuses before the secret is used; nothing secret is printed or written", () => {
   const temp = mkdtempSync(join(tmpdir(), "index-prebuild-"));
   try {
     const url = "postgresql://fixture-user:fixture-secret@db.fixture.invalid:5432/postgres";
@@ -204,7 +204,8 @@ test("parent process: a dormant prebuild refuses before the secret is used; noth
     });
     const dormant = run({ PREBUILD_MODE: "prebuild", PREBUILD_CENSUS_RUN: censusRun, PREBUILD_CONFIRMATION: phrase });
     expect(dormant.status).toBe(1);
-    expect(dormant.stdout).toContain("\"code\":\"index_prebuild_dormant\"");
+    // Enabled (INDEX_PREBUILD_ENABLED): no census artifact on disk, so it refuses at the census check, still before the secret.
+    expect(dormant.stdout).toContain("\"code\":\"index_prebuild_census_invalid\"");
     const bad = run({ PREBUILD_MODE: "drop" });
     expect(bad.status).toBe(1);
     expect(bad.stdout).toContain("\"code\":\"index_prebuild_inputs\"");

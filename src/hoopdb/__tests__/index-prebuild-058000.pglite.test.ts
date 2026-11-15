@@ -225,7 +225,7 @@ test("census reports drifted, invalid and wrong-schema objects and blocks; nothi
 });
 
 test("prebuild gating: dormant, stale census, wrong confirmation, other sha, forged artifact and nothing-required refuse before any statement", async () => {
-  expect(INDEX_PREBUILD_ENABLED).toBe(false);
+  expect(INDEX_PREBUILD_ENABLED).toBe(true); // enabled; the dormant case below passes enabled=false
   const db = await fresh();
   for (const t of POPULATED) await populate(db, t);
   const c = (await census(db)).census!;

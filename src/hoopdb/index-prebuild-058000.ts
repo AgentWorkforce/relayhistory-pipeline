@@ -58,7 +58,7 @@ import { ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE } from "../shared/db.ts";
  * TCP keepalive alone cannot tell a pooler statement/lifetime cap from a dead peer, and a guarded read-only
  * census/readback run proving the protected-environment stdin handoff.
  */
-export const INDEX_PREBUILD_ENABLED: boolean = false;
+export const INDEX_PREBUILD_ENABLED: boolean = true;
 
 export const INDEX_PREBUILD_STEP = "upstream:20261105058000_operator_user_erase_indexes.sql";
 export const INDEX_PREBUILD_COUNT = 16;
