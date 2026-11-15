@@ -286,6 +286,109 @@ describe("flag off renders the stack byte-identical", () => {
     }
   });
 
+  describe("transcriptStore.rearmSweeperRoleArn", () => {
+    // Synthetic role in another synthetic account; the stage's bucket ARN is read back from the render.
+    const rearmRole = "arn:aws:iam::444455556666:role/synthetic-rearm-sweeper";
+    const bridgeArn = `arn:aws:iam::${accountId}:user/96bulls-${stage}-inbox-bridge`;
+    const rearmScript = script.replace(/const res=\{\};[\s\S]*$/, `const rearm=${JSON.stringify(rearmRole)}, bridge=${JSON.stringify(bridgeArn)}; const res={};
+      for(const [k,store] of Object.entries(scenarios)){
+        res[k]={off:await render({...base,transcriptStore:store}),undef:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:undefined}}),on:await render({...base,transcriptStore:{...store,rearmSweeperRoleArn:rearm}})};
+        if(store.sessionPipeline){
+          const up={...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true};
+          res[k].inboxOff=await render({...base,historyUploadDirectInfra:true,transcriptStore:up});
+          res[k].inboxOn=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...up,rearmSweeperRoleArn:rearm}});
+          res[k].bridgeOff=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...up,inboxBridgeUserArn:bridge}});
+          res[k].bridgeOn=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...up,inboxBridgeUserArn:bridge,rearmSweeperRoleArn:rearm}});
+        }
+      }
+      console.log(JSON.stringify(res));`);
+    const r = spawnSync(process.execPath, ["--eval", rearmScript], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
+    if (r.status !== 0) throw new Error(r.stderr);
+    type Pair = { off: string; on: string };
+    const rr = JSON.parse(r.stdout) as Record<string, Pair & { undef: string; inboxOff?: string; inboxOn?: string; bridgeOff?: string; bridgeOn?: string }>;
+    const pairs = Object.entries(rr).flatMap(([k, v]) => [
+      [k, { off: v.off, on: v.on }],
+      ...(v.inboxOff ? [[`${k} inbox`, { off: v.inboxOff, on: v.inboxOn! }], [`${k} inbox+bridge`, { off: v.bridgeOff!, on: v.bridgeOn! }]] : []),
+    ] as [string, Pair][]);
+    const props = (render: any, name: string) => render.resources.find((x: any) => x.name === name).props;
+    const isRearm = (st: any) => typeof st.Sid === "string" && st.Sid.startsWith("RearmSweeper");
+    const expected = (b: string) => {
+      const P = { AWS: rearmRole }, a = `arn:aws:s3:::${b}`, t = `${a}/96bulls`;
+      return {
+        bucket: [
+          { Sid: "RearmSweeperLists", Effect: "Allow", Principal: P, Action: ["s3:ListBucket", "s3:ListBucketVersions"], Resource: a },
+          { Sid: "RearmSweeperReads", Effect: "Allow", Principal: P, Action: "s3:GetObject", Resource: [`${t}/.admission-inbox/*/ledger/rearm/*`, `${t}/.admission-inbox/*/ledger/owners/*`, `${t}/.admission-inbox/*/upload-fences.json`, `${t}/.ledger/rearm-sweeper/*`, `${t}/*/v1/ws=*/manifest.json`] },
+          { Sid: "RearmSweeperWritesProgress", Effect: "Allow", Principal: P, Action: "s3:PutObject", Resource: [`${t}/.admission-inbox/*/ledger/rearm/*.done/*`, `${t}/.admission-inbox/*/ledger/rearm/*.corrupt/*`, `${t}/.ledger/rearm-sweeper/*`] },
+          { Sid: "RearmSweeperDeletesCanonicalVersions", Effect: "Allow", Principal: P, Action: "s3:DeleteObjectVersion", Resource: [`${t}/*/v1/ws=*`, `${t}/*/live-sessions/v1/ws=*`] },
+          { Sid: "RearmSweeperNeverDotPrefixes", Effect: "Deny", Principal: P, Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: `${t}/.*` },
+        ],
+        key: {
+          Sid: "RearmSweeperReadsViaS3", Effect: "Allow", Principal: P, Action: ["kms:Decrypt", "kms:GenerateDataKey"], Resource: "*",
+          Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com`, "kms:CallerAccount": "444455556666" }, StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${b}/96bulls/*` } },
+        },
+      };
+    };
+
+    it("off (absent or undefined) renders no rearm statement, and is byte-identical to on minus exactly the six statements and the deny's last principal", () => {
+      for (const v of Object.values(rr)) expect(v.undef).toBe(v.off);
+      for (const [name, { off, on }] of pairs) {
+        expect(off, name).not.toContain("RearmSweeper");
+        expect(off, name).not.toContain("444455556666");
+        const stripped = JSON.parse(on);
+        props(stripped, "transcripts").policy = props(stripped, "transcripts").policy.filter((st: any) => !isRearm(st));
+        // OnlyTheEraserDeletes gained exactly the sweeper, once, last, after the eraser and the GC.
+        const denyOn = props(stripped, "transcripts").policy.find((st: any) => st.Sid === "OnlyTheEraserDeletes");
+        const denyOff = props(JSON.parse(off), "transcripts").policy.find((st: any) => st.Sid === "OnlyTheEraserDeletes");
+        const list = denyOn.Condition.ArnNotEquals["aws:PrincipalArn"];
+        expect(Array.isArray(list), name).toBe(true);
+        expect(list, name).toEqual([...[denyOff.Condition.ArnNotEquals["aws:PrincipalArn"]].flat(), rearmRole]);
+        expect(list.length, name).toBe(3);
+        expect(list.filter((x: string) => x === rearmRole).length, name).toBe(1);
+        expect(on.split(rearmRole).length - 1, name).toBe(7);
+        const rest = list.slice(0, -1);
+        denyOn.Condition.ArnNotEquals["aws:PrincipalArn"] = rest.length === 1 ? rest[0] : rest;
+        props(stripped, "transcripts-key").policy.Statement = props(stripped, "transcripts-key").policy.Statement.filter((st: any) => !isRearm(st));
+        expect(JSON.stringify(stripped), name).toBe(off);
+      }
+    });
+
+    it("on: exactly the six statements, the bucket's five last and in order", () => {
+      for (const [name, { on }] of pairs) {
+        const o = JSON.parse(on);
+        const want = expected(props(o, "transcripts").bucketName);
+        const bucket = props(o, "transcripts").policy;
+        expect(bucket.filter(isRearm), name).toEqual(want.bucket);
+        expect(bucket.slice(-5), name).toEqual(want.bucket);
+        expect(props(o, "transcripts-key").policy.Statement.filter(isRearm), name).toEqual([want.key]);
+        expect(on.match(/RearmSweeper[A-Za-z]*/g)?.length, name).toBe(6);
+      }
+    });
+
+    it("on: the key statement sits after the presign issuer's and before the inbox bridge's, last without the bridge", () => {
+      for (const [name, { on }] of pairs) {
+        const sids = props(JSON.parse(on), "transcripts-key").policy.Statement.map((st: any) => st.Sid);
+        const at = sids.indexOf("RearmSweeperReadsViaS3");
+        if (name.endsWith("inbox+bridge")) {
+          expect(sids[at - 1], name).toBe("PresignIssuerReadsJournalsViaS3");
+          expect(sids[at + 1], name).toBe("InboxBridgeEncryptsInboxViaS3");
+        } else {
+          if (name.endsWith("inbox")) expect(sids[at - 1], name).toBe("PresignIssuerReadsJournalsViaS3");
+          expect(at, name).toBe(sids.length - 1);
+        }
+      }
+    });
+
+    it("refuses a user, a wildcard or a non-string before declaring anything", () => {
+      for (const bad of ["'arn:aws:iam::444455556666:user/synthetic-rearm-sweeper'", "'*'", "''", "7"]) {
+        const x = spawnSync(process.execPath, ["--eval", script.replace(/const res=\{\};[\s\S]*$/, `try{await E.runPromise(transcriptStoreStage({...base,transcriptStore:{...scenarios.store,rearmSweeperRoleArn:${bad}}}));console.log(JSON.stringify({ok:true}));}catch(e){console.log(JSON.stringify({ok:false,declared:seen.length,message:String(e?.message??e)}));}`)], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 60_000 });
+        if (x.status !== 0) throw new Error(x.stderr);
+        const out = JSON.parse(x.stdout.trim().split("\n").at(-1)!);
+        expect(out, bad).toMatchObject({ ok: false, declared: 0 });
+        expect(out.message, bad).toContain("rearmSweeperRoleArn");
+      }
+    });
+  });
+
   it("on: refuses without a control role or without the session pipeline", () => {
     const refuse = (store: string) => spawnSync(process.execPath, ["--eval", script.replace(/const res=\{\};[\s\S]*$/, `await E.runPromise(transcriptStoreStage({...base,historyUploadDirectInfra:true,transcriptStore:${store}}));`)], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 60_000 });
     const noControl = refuse("scenarios.full");

@@ -884,7 +884,7 @@ accepts only the exact 13 transcript-store resources in the initial create,
 known three-resource recovery, one capture-bound post-merge remediation
 (`trail-key` and `trail-logs` update with every other resource `noop`), the
 srv-writer addition (`transcript-srv-writer` create and `transcripts-key`
-update, everything else `noop`), the backlog-ops key grants (below), the inbox bridge grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
+update, everything else `noop`), the backlog-ops key grants (below), the inbox bridge grants (below), the rearm sweeper grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
 match the exact paths and sha256 values in the approval-bound provenance. The
 capture command refuses an invalid shape before replacing the reviewed files,
 and deploy checks it again. Any other update count or resource, replacement,
@@ -943,6 +943,49 @@ IAM. So with the upload inbox on, set `transcriptStore.inboxBridgeUserArn:
 
   A plan that changes the bridge's wall entry or key statements in any other phase is refused. Like every phase
   it is judged against Alchemy's state, not the live policies.
+
+**Rearm sweeper role.** The rearm sweeper runs as an IAM role created outside the stack. Its bucket and key grants
+were first applied to prod by hand, and the stack owns both policies, so they are declared here like the
+cross-account worker's (docs/cross-account-sessions-worker.md). Set `transcriptStore.rearmSweeperRoleArn:
+"arn:aws:iam::<account>:role/[path/]<name>"`: an exact role ARN; a user, a wildcard, an assumed-role session, an
+empty string or a non-string refuses at input validation. Set, the policies also carry
+(`stacks/aws/rearm-sweeper-policy.ts`, the live statements byte-for-byte):
+- **The bucket, last, in this order:**
+  - `RearmSweeperLists`: `s3:ListBucket` and `s3:ListBucketVersions` on the bucket.
+  - `RearmSweeperReads`: `s3:GetObject` on the admission inbox's `ledger/rearm/*`, `ledger/owners/*` and
+    `upload-fences.json`, on `96bulls/.ledger/rearm-sweeper/*`, and on `96bulls/*/v1/ws=*/manifest.json`.
+  - `RearmSweeperWritesProgress`: `s3:PutObject` on the inbox's `ledger/rearm/*.done/*` and `*.corrupt/*`, and on
+    `96bulls/.ledger/rearm-sweeper/*`.
+  - `RearmSweeperDeletesCanonicalVersions`: `s3:DeleteObjectVersion` on `96bulls/*/v1/ws=*` and
+    `96bulls/*/live-sessions/v1/ws=*`.
+  - `RearmSweeperNeverDotPrefixes`: Deny `s3:DeleteObject` and `s3:DeleteObjectVersion` on `96bulls/.*`.
+- **The key:** `RearmSweeperReadsViaS3` (`kms:Decrypt`, `kms:GenerateDataKey`), via S3 in the stage's region, from
+  the role's own account, for objects under `96bulls/`. It sits after the presign issuer's statements and before
+  the inbox bridge's (last in the upload inbox's block without the bridge). Statement order is not significant.
+- **Unset:** both policies are byte-identical.
+- **The plan contract** accepts the change only as its own "rearm sweeper grants" phase: only `transcripts` and
+  `transcripts-key` update, every other statement stays byte-identical, the bucket adds exactly the five
+  statements (and `OnlyTheEraserDeletes` its one line, below) and the key exactly the one, as built for the role
+  `rearmSweeperRoleArn` names. A plan that adds them while the input is unset or names another role, or that
+  changes a rearm statement in any other phase or with any other change, is refused. To revoke, unset the input: the same phase then accepts removing exactly those Sids.
+
+**The eraser-only deny exempts the sweeper too.** `OnlyTheEraserDeletes` denies every delete outside its
+carve-outs to everyone it does not list, so without an exemption `RearmSweeperDeletesCanonicalVersions` would never
+take effect. Set, its `ArnNotEquals` `aws:PrincipalArn` list carries the sweeper's role too, last, after the eraser
+and the GC, as it is live (always a list then). The "rearm sweeper grants" phase accepts exactly that one-line
+delta on the bucket: the deny's planned text is its previous text with one `- <role>` item inserted right after the
+last `aws:PrincipalArn` item, for the same role the rearm statements and the inputs name. Revoking, it must lose
+exactly that line. Adding the statements without the deny change, a deny change without them (refused overall: no
+phase accepts it), any other change to the deny, the role elsewhere in the list or another role is refused. Both
+sides of the plan come from this repo's rendering (Alchemy's state holds what the stack last rendered), and prod
+always has the GC, so the list form holds on both sides; a stage without the GC would see the value turn from a
+string into a list, which this phase refuses. Unset, the deny is unchanged.
+
+**Once set, the input is required.** Alchemy's state does not hold the hand-applied statements, so the first plan
+with the input set shows them added and `OnlyTheEraserDeletes` gaining one line, the sweeper's role (this phase);
+applying it writes what is already live. From then on, a stage whose inputs omit `rearmSweeperRoleArn` plans their
+removal (and the deny's line), and until the phase is first applied any deploy that updates `transcripts` or
+`transcripts-key` DROPS the live statements and the deny's exemption. Set the input before the next such deploy.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

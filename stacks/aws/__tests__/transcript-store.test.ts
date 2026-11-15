@@ -126,6 +126,25 @@ describe("transcript store: bucket hardening", () => {
     expect(d.Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": eraserArn } });
   });
 
+  it("the rearm sweeper, set, is exempt from the eraser-only deny too, last after the eraser and the GC (every variant); unset, unchanged", () => {
+    const gc = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`, sweeper = "arn:aws:iam::444455556666:role/test-rearm-sweeper";
+    const uploadInbox = { consumerRoleArn: `arn:aws:iam::${ACCOUNT}:role/test-consumer` };
+    const deny = (p: unknown[]) => (p as Stmt[]).find((s) => s.Sid === "OnlyTheEraserDeletes")!;
+    for (const variant of [{}, { uploadInbox }, { analysisDeleterArn: `arn:aws:iam::${ACCOUNT}:role/test-pipeline` }]) {
+      const base = { bucketArn: n.bucketArn, keyArn: KEY, eraserArn, accountId: ACCOUNT, ...variant };
+      for (const extra of [{ bufferedGcRoleArn: gc }, {}]) {
+        const off = transcriptBucketPolicy({ ...base, ...extra });
+        expect(transcriptBucketPolicy({ ...base, ...extra, rearmSweeperRoleArn: undefined })).toEqual(off);
+        const on = transcriptBucketPolicy({ ...base, ...extra, rearmSweeperRoleArn: sweeper });
+        const want = "bufferedGcRoleArn" in extra ? [eraserArn, gc, sweeper] : [eraserArn, sweeper];
+        expect(deny(on).Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": want } });
+        // Nothing else changes: not the deny's other keys, not any other statement.
+        expect(on.map((s: any) => s.Sid === "OnlyTheEraserDeletes" ? { ...s, Condition: deny(off).Condition } : s)).toEqual(off);
+      }
+    }
+    expect(() => transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: KEY, eraserArn, rearmSweeperRoleArn: "arn:aws:iam::444455556666:user/x" })).toThrow(/rearmSweeperRoleArn/);
+  });
+
   it("refuses a PUT that names other encryption, another KMS key, or aws:kms with no key id (aws/s3)", () => {
     expect(sid("DenyOtherEncryption").Condition).toEqual({ StringNotEquals: { "s3:x-amz-server-side-encryption": "aws:kms" }, Null: { "s3:x-amz-server-side-encryption": "false" } });
     const k = sid("SseHeaderMustNameThisKey");
@@ -830,5 +849,37 @@ describe("transcript store: inputs", () => {
     expect(() => validateAwsInputs(STAGE, filled((i) => ((i.transcriptStore as Record<string, unknown>).auditPrincipalArn = `arn:aws:iam::${ACCOUNT}:role/security/auditor`)))).not.toThrow();
     for (const arn of [`arn:aws:iam::111111111111:role/auditor`, `arn:aws-us-gov:iam::${ACCOUNT}:role/auditor`, `arn:aws:iam::${ACCOUNT}:user/auditor`, "*"])
       expect(() => validateAwsInputs(STAGE, filled((i) => ((i.transcriptStore as Record<string, unknown>).auditPrincipalArn = arn)))).toThrow(/named IAM role/);
+  });
+
+  it("keeps the rearm sweeper off by default and accepts only an exact role ARN for it", () => {
+    expect((filled().transcriptStore as Record<string, unknown>).rearmSweeperRoleArn).toBeUndefined();
+    const set = (v: unknown) => filled((i) => ((i.transcriptStore as Record<string, unknown>).rearmSweeperRoleArn = v));
+    for (const good of ["arn:aws:iam::444455556666:role/test-rearm-sweeper", "arn:aws:iam::444455556666:role/ops/test-rearm-sweeper", `arn:aws:iam::${ACCOUNT}:role/test-rearm-sweeper`])
+      expect(() => validateAwsInputs(STAGE, set(good))).not.toThrow();
+    for (const bad of [
+      "arn:aws:iam::444455556666:user/test-rearm-sweeper",
+      "*",
+      "arn:aws:iam::444455556666:role/*",
+      "arn:aws-us-gov:iam::444455556666:role/test-rearm-sweeper",
+      "arn:aws:iam::44445555666:role/test-rearm-sweeper",
+      "arn:aws:sts::444455556666:assumed-role/test-rearm-sweeper/session",
+      "",
+      123456789012,
+      null,
+      ["arn:aws:iam::444455556666:role/test-rearm-sweeper"],
+    ])
+      expect(() => validateAwsInputs(STAGE, set(bad))).toThrow(/rearmSweeperRoleArn must be an exact named IAM role/);
+  });
+
+  it("refuses an invalid rearm sweeper role before a direct stage caller can request a provider", async () => {
+    await expect(Effect.runPromise(transcriptStoreStage({
+      stage: STAGE,
+      accountId: ACCOUNT,
+      region: REGION,
+      budgetUsd: 1,
+      budgetEmail: "test@example.invalid",
+      transcriptStore: { bufferedGcRoleArn: `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`, rearmSweeperRoleArn: "arn:aws:iam::444455556666:user/test-rearm-sweeper" },
+      tags: () => ({}),
+    }))).rejects.toThrow(/rearmSweeperRoleArn/);
   });
 });

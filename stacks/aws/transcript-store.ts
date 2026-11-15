@@ -70,6 +70,14 @@
  *                              change only alone, as its own "cross-account worker grants" phase, with the
  *                              statements byte-for-byte as built (docs/cross-account-sessions-worker.md).
  *
+ * The rearm sweeper (stacks/aws/rearm-sweeper-policy.ts), default OFF:
+ *
+ *   transcriptStore.rearmSweeperRoleArn  the rearm sweeper's exact role (created outside the stack). Unset:
+ *                              byte-identical policies. Set: the bucket policy also carries its five statements
+ *                              (last), OnlyTheEraserDeletes exempts it too (last in its principal list), and the
+ *                              key policy carries its via-S3 statement. The plan contract accepts the change
+ *                              only alone, as its own "rearm sweeper grants" phase (docs/aws-stage.md).
+ *
  * Backlog-ops workflow roles (decision 0005; stacks/aws/backlog-ops-key-policy.ts), default OFF:
  *
  *   transcriptStore.backlogOpsRoles  { readRoleArn, writeRoleArn }: this account's exact
@@ -99,6 +107,7 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
 import { BACKLOG_OPS_KEY_SIDS, assertBacklogOpsRoles, backlogOpsKeyStatements, backlogOpsRoleArns, type BacklogOpsRoles } from "./backlog-ops-key-policy.ts";
 import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
+import { REARM_SWEEPER_BUCKET_SIDS, REARM_SWEEPER_KEY_SIDS, assertRearmSweeperRoleArn, rearmSweeperBucketStatements, rearmSweeperKeyStatement } from "./rearm-sweeper-policy.ts";
 import {
   UPLOAD_ADMISSION_DLQ_RETENTION,
   UPLOAD_ADMISSION_MAX_RECEIVE_COUNT,
@@ -185,6 +194,13 @@ export interface TranscriptStoreInputs {
    * policies are byte-for-byte as without it.
    */
   crossAccountWorkerRoleArn?: string;
+  /**
+   * Default off. The rearm sweeper's exact IAM role (created outside the stack). Present: the bucket policy also
+   * carries exactly its five statements, last, OnlyTheEraserDeletes exempts the role too (listed last), and the key
+   * policy carries its via-S3 statement (rearm-sweeper-policy.ts).
+   * Omit: both policies are byte-for-byte as without it. Once the statements are live, omitting it drops them.
+   */
+  rearmSweeperRoleArn?: string;
   /**
    * Default off. The guarded `backlog ops` workflow's two roles in THIS account (created outside the stack;
    * docs/backlog-ops-workflow.md). Present: the key policy also carries exactly their via-S3 statements
@@ -335,9 +351,10 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "rearmSweeperRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
+  if (store.rearmSweeperRoleArn !== undefined) assertRearmSweeperRoleArn(store.rearmSweeperRoleArn);
   if (store.backlogOpsRoles !== undefined) assertBacklogOpsRoles(store.backlogOpsRoles, inputs.accountId, stage);
   if (store.inboxBridgeUserArn !== undefined) {
     assertInboxBridgeUserArn(store.inboxBridgeUserArn, inputs.accountId, stage);
@@ -394,6 +411,7 @@ export type TranscriptStorePlanPhase =
   | "upload inbox rollout"
   | "upload inbox update"
   | "cross-account worker grants"
+  | "rearm sweeper grants"
   | "backlog ops key grants"
   | "inbox bridge grants";
 
@@ -671,9 +689,10 @@ export interface TranscriptStorePlanCapture {
   stateSnapshotText?: string;
   /**
    * The stage's upload inputs (transcriptStore). A plan with the upload inbox but without `desktop-upload-role` is
-   * accepted only when these say it should be: uploadPresignIssuer true and uploadControlRoleArn unset.
+   * accepted only when these say it should be: uploadPresignIssuer true and uploadControlRoleArn unset. The rearm
+   * sweeper grants are accepted only for the rearmSweeperRoleArn set here (and removed only while it is unset).
    */
-  uploadInputs?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown };
+  uploadInputs?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown; rearmSweeperRoleArn?: unknown };
 }
 
 /**
@@ -875,6 +894,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   // and key policies update, and only by appending exactly its reviewed statements.
   const workerGrantPhase = crossAccountWorkerGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
   if (workerGrantPhase) return workerGrantPhase;
+  // The rearm sweeper's grants (rearmSweeperRoleArn) are added alone too, and only for the role the inputs name.
+  const rearmPhase = rearmSweeperGrantsPhase(compact.operations, capture.detailedPlanText, capture.uploadInputs?.rearmSweeperRoleArn, refuse);
+  if (rearmPhase) return rearmPhase;
   // The backlog-ops roles' key statements (backlogOpsRoles) are added alone too: only the key policy updates.
   const backlogOpsPhase = backlogOpsKeyGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
   if (backlogOpsPhase) return backlogOpsPhase;
@@ -1063,6 +1085,110 @@ function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKE
   const want = resource === "transcripts"
     ? crossAccountWorkerBucketStatements({ bucketAccountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: n.bucketArn, roleArn })
     : crossAccountWorkerKeyStatements({ bucketAccountId: TRANSCRIPT_ACCOUNT_ID, region: TRANSCRIPT_REGION, bucketName: n.bucket, roleArn });
+  for (const statement of want) {
+    const got = planned.bySid.get(statement.Sid)!;
+    if (unquoteYaml(got) !== planYaml([statement], planned.itemIndent).join("\n")) refuse(`${statement.Sid} must be exactly the reviewed statement`);
+  }
+  return roleArn;
+}
+
+/**
+ * The rearm sweeper grants phase, the worker grants' shape: everything noop except `transcripts` and/or
+ * `transcripts-key` updates, every other statement unchanged, and the only difference that resource's rearm Sids,
+ * all of them, added or removed, plus, in the bucket, OnlyTheEraserDeletes gaining (or, revoking, losing) exactly
+ * one line: the same role as the last `aws:PrincipalArn` item (denyGainsExactlyTheSweeper). Adds are accepted only
+ * when the stage's rearmSweeperRoleArn is set and names the same role, byte-for-byte as rearm-sweeper-policy.ts
+ * builds them; removals (the revocation path) only while it is unset. Guards every other phase like the worker grants: a plan that touches a rearm statement is refused unless it
+ * is exactly this phase. Undefined when the plan does not touch the rearm statements at all.
+ */
+function rearmSweeperGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, inputRoleArn: unknown, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const lines = detailedPlanText.split(/\r?\n/);
+  const say = (r: string) => (why: string): never => refuse(`rearm sweeper grants: ${r}: ${why}`);
+  const updated = WORKER_POLICY_RESOURCES.filter((r) => operations.get(r) === "update");
+  const touched = updated.filter((r) => {
+    const block = planResourceBlock(lines, r);
+    if (!block.some((l) => REARM_SID_LINE.test(l))) return false;
+    const { live, planned } = policyDiffSides(block, say(r));
+    const rearm = (m: Map<string, string>) => [...m].filter(([sid]) => sid.startsWith(REARM_SID_PREFIX)).sort(([a], [b]) => (a < b ? -1 : 1));
+    // Rearm statements re-rendered unchanged on both sides (another phase's cascade): not touched.
+    return JSON.stringify(rearm(live.bySid)) !== JSON.stringify(rearm(planned.bySid));
+  });
+  if (touched.length === 0) return undefined;
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!changed.every(([r, a]) => (WORKER_POLICY_RESOURCES as readonly string[]).includes(r) && a === "update"))
+    return refuse(`rearm sweeper grants must deploy alone (only transcripts and transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (inputRoleArn !== undefined) {
+    try { assertRearmSweeperRoleArn(inputRoleArn); } catch { return refuse("rearm sweeper grants: the inputs' rearmSweeperRoleArn is not an exact role ARN"); }
+  }
+  for (const r of updated) {
+    const role = assertRearmSweeperGrantDiff(planResourceBlock(lines, r), r, say(r));
+    if (role === undefined) {
+      if (inputRoleArn !== undefined) say(r)("removes the rearm statements while transcriptStore.rearmSweeperRoleArn is set");
+    } else if (inputRoleArn === undefined) say(r)("adds the rearm statements but transcriptStore.rearmSweeperRoleArn is unset");
+    else if (role !== inputRoleArn) say(r)("the rearm statements must name exactly transcriptStore.rearmSweeperRoleArn");
+  }
+  return "rearm sweeper grants";
+}
+
+const REARM_SID_PREFIX = "RearmSweeper";
+const REARM_DENY_SID = "OnlyTheEraserDeletes";
+
+/**
+ * True when `after` is exactly `before` with one `- <roleArn>` list item inserted right after the last item of
+ * its one `aws:PrincipalArn` list. Every other line is compared byte for byte; only the inserted value is
+ * unquoted. A single-string `aws:PrincipalArn` (no list) never matches: the stage always has the GC, a list.
+ */
+function denyGainsExactlyTheSweeper(before: string, after: string, roleArn: string): boolean {
+  const b = before.split("\n"), a = after.split("\n");
+  const keys = b.flatMap((l, i) => (/^\s*aws:PrincipalArn:\s*$/.test(l) ? [i] : []));
+  if (keys.length !== 1 || a.length !== b.length + 1) return false;
+  const keyIndent = /^ */.exec(b[keys[0]!]!)![0].length;
+  let end = keys[0]! + 1;
+  while (end < b.length && /^ */.exec(b[end]!)![0].length > keyIndent && /^\s*- /.test(b[end]!)) end++;
+  if (end === keys[0]! + 1) return false;
+  const itemPrefix = /^\s*- /.exec(b[end - 1]!)![0];
+  const same = (x: readonly string[], y: readonly string[]) => x.length === y.length && x.every((l, i) => l === y[i]);
+  return same(a.slice(0, end), b.slice(0, end)) && same(a.slice(end + 1), b.slice(end)) && unquoteYaml(a[end]!) === `${itemPrefix}${roleArn}`;
+}
+const REARM_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*RearmSweeper/;
+
+/** Returns the role an added rearm grant names (undefined for a revocation, whose deny line is checked too). */
+function assertRearmSweeperGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never): string | undefined {
+  const expected: readonly string[] = resource === "transcripts" ? REARM_SWEEPER_BUCKET_SIDS : REARM_SWEEPER_KEY_SIDS;
+  const { live, planned } = policyDiffSides(block, refuse);
+  if (live.header !== planned.header) refuse("only policy statements may change");
+  const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
+  const removed = [...live.bySid.keys()].filter((sid) => !planned.bySid.has(sid)).sort();
+  // The bucket's eraser-only deny exempts the sweeper too: it changes, by exactly one line, checked below.
+  const deny = resource === "transcripts" && live.bySid.has(REARM_DENY_SID) && planned.bySid.has(REARM_DENY_SID) ? REARM_DENY_SID : undefined;
+  for (const [sid, text] of live.bySid) {
+    if (sid === deny) continue;
+    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !expected.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
+  }
+  const exact = JSON.stringify([...expected].sort());
+  const adds = removed.length === 0 && JSON.stringify(added) === exact;
+  const removes = added.length === 0 && JSON.stringify(removed) === exact;
+  if (!adds && !removes) refuse(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
+  // The one role the added (or, revoking, removed) statements name.
+  const side = adds ? planned : live;
+  const principals = new Set((adds ? added : removed).map((sid) => [...side.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => m[1]!)).flat());
+  if (principals.size !== 1) refuse("the rearm statements must name exactly one role");
+  const roleArn = unquoteYaml(`AWS: ${[...principals][0]!}`).slice(5);
+  try { assertRearmSweeperRoleArn(roleArn); } catch { refuse("the rearm statements must name an exact role"); }
+  if (resource === "transcripts") {
+    if (deny === undefined) refuse(`${REARM_DENY_SID} must be in the bucket policy on both sides`);
+    // Adding, the deny gains exactly the role's list item, last; revoking, it loses exactly that line.
+    const [before, after] = adds ? [live.bySid.get(deny)!, planned.bySid.get(deny)!] : [planned.bySid.get(deny)!, live.bySid.get(deny)!];
+    if (!denyGainsExactlyTheSweeper(before, after, roleArn))
+      refuse(adds
+        ? `${REARM_DENY_SID} must change by exactly one added line, the rearm sweeper role as the last aws:PrincipalArn item`
+        : `${REARM_DENY_SID} must lose exactly one line, the rearm sweeper role as the last aws:PrincipalArn item`);
+  }
+  if (!adds) return undefined;
+  const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+  const want = resource === "transcripts"
+    ? rearmSweeperBucketStatements({ bucketArn: n.bucketArn, roleArn })
+    : [rearmSweeperKeyStatement({ region: TRANSCRIPT_REGION, bucketName: n.bucket, roleArn })];
   for (const statement of want) {
     const got = planned.bySid.get(statement.Sid)!;
     if (unquoteYaml(got) !== planYaml([statement], planned.itemIndent).join("\n")) refuse(`${statement.Sid} must be exactly the reviewed statement`);
@@ -1689,16 +1815,21 @@ export function trailLifecycleRules() {
 /**
  * Bucket policy for the transcripts bucket (statements only, as AWS.S3.Bucket takes them):
  * TLS (1.2+) only; the eraser deletes objects/versions and configured GC may delete
- * buffered versions only, preserving its current barrier. A PUT that sends
+ * buffered versions only, preserving its current barrier. A configured rearm sweeper is
+ * exempt from the eraser-only deny too (its own grants bound it to canonical versions). A PUT that sends
  * any encryption header other than SSE-KMS naming this bucket's key is refused,
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; rearmSweeperRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
+  if (i.rearmSweeperRoleArn !== undefined) assertRearmSweeperRoleArn(i.rearmSweeperRoleArn);
   // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
   // the eraser-only deny below: a single control point, covered by the hardening mutations.
-  const eraserAndGcPrincipals = i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn;
+  const eraserGcOnly = i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn;
+  // The rearm sweeper deletes canonical versions (RearmSweeperDeletesCanonicalVersions), so set, it is exempt
+  // too: always a list, the sweeper last after the eraser and the GC, as live. Unset: byte-identical.
+  const eraserAndGcPrincipals = i.rearmSweeperRoleArn !== undefined ? [...[eraserGcOnly].flat(), i.rearmSweeperRoleArn] : eraserGcOnly;
   // historyUploadDirectInfra on: the upload inbox leaves the eraser-only deny and gets its own
   // (uploadInboxBucketStatements: eraser or consumer). Off: the deny below is unchanged.
   const inboxCarveOut = i.uploadInbox ? [uploadInboxObjects(i.bucketArn)] : [];
@@ -1825,12 +1956,19 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; backlogOps?: { stage: string; roles: BacklogOpsRoles }; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; rearmSweeperRoleArn?: string; backlogOps?: { stage: string; roles: BacklogOpsRoles }; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
   };
+  // The rearm sweeper's statement sits after the upload inbox's own and before the inbox bridge's (or last in that
+  // block without the bridge), as it is live; unset, the policy is byte-identical.
+  const uploadKey = i.uploadInbox ? uploadInboxKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, ...i.uploadInbox }) : [];
+  if (i.rearmSweeperRoleArn !== undefined) {
+    const bridgeAt = uploadKey.findIndex((s) => (INBOX_BRIDGE_KEY_SIDS as readonly string[]).includes(s.Sid));
+    uploadKey.splice(bridgeAt < 0 ? uploadKey.length : bridgeAt, 0, rearmSweeperKeyStatement({ region: i.region, bucketName: i.bucketName, roleArn: i.rearmSweeperRoleArn }) as never);
+  }
   return {
     Version: "2012-10-17" as const,
     Statement: [
@@ -1842,7 +1980,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       ...(i.pipelineRoleArn && i.analysisResults ? [pipelineAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
       ...(i.readApiRoleArn ? [readApiAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
-      ...(i.uploadInbox ? uploadInboxKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, ...i.uploadInbox }) : []),
+      ...uploadKey,
       ...(i.crossAccountWorkerRoleArn !== undefined ? crossAccountWorkerKeyStatements({ bucketAccountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.crossAccountWorkerRoleArn }) : []),
       ...(i.backlogOps !== undefined ? backlogOpsKeyStatements({ accountId: i.accountId, stage: i.backlogOps.stage, region: i.region, roles: i.backlogOps.roles }) : []),
     ],
@@ -2009,6 +2147,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
     if (i.transcriptStore.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(i.transcriptStore.crossAccountWorkerRoleArn, i.accountId);
+    if (i.transcriptStore.rearmSweeperRoleArn !== undefined) assertRearmSweeperRoleArn(i.transcriptStore.rearmSweeperRoleArn);
     if (i.transcriptStore.backlogOpsRoles !== undefined) assertBacklogOpsRoles(i.transcriptStore.backlogOpsRoles, i.accountId, i.stage);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
     const uploadDirect = i.historyUploadDirectInfra === true;
@@ -2166,6 +2305,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         readerArn: reader.userArn as unknown as string,
         bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
         ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}),
+        ...(i.transcriptStore.rearmSweeperRoleArn !== undefined ? { rearmSweeperRoleArn: i.transcriptStore.rearmSweeperRoleArn } : {}),
         ...(i.transcriptStore.backlogOpsRoles !== undefined ? { backlogOps: { stage: i.stage, roles: i.transcriptStore.backlogOpsRoles } } : {}),
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
         ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
@@ -2199,10 +2339,12 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}), ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}), ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}) }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}), ...(i.transcriptStore.rearmSweeperRoleArn !== undefined ? { rearmSweeperRoleArn: i.transcriptStore.rearmSweeperRoleArn } : {}), ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}), ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
         ...(readApiRoleArn ? [readApiAnalysisBucketStatement({ bucketArn: n.bucketArn, roleArn: readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
         ...(uploadInboxRoles ? uploadAdmissionBucketStatements({ bucketArn: n.bucketArn, consumerRoleArn: uploadInboxRoles.consumerRoleArn, promotionObjects: srvWriterObjects(n.bucketArn, i.transcriptStore.inboxAuthorityKeyRoot) }) : []),
+        // Last, as live: the rearm sweeper's five statements (unset, the policy is byte-identical).
+        ...(i.transcriptStore.rearmSweeperRoleArn !== undefined ? rearmSweeperBucketStatements({ bucketArn: n.bucketArn, roleArn: i.transcriptStore.rearmSweeperRoleArn }) : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
