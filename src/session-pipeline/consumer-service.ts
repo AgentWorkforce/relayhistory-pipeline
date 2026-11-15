@@ -1109,8 +1109,6 @@ export function refuseStartupOptions(url: string): void {
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
   const maximum = readerMaxRuleset(env);
-  // Checked before any connection opens: a bad limit fails startup.
-  const searchLimits = searchIndexLimitsFromEnv(env);
   const config = consumerServiceConfig(env);
   if (!config.enabled) {
     // Dormant but observable, like the read API: no database, no polling, a
@@ -1132,6 +1130,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     await new Promise(() => {});
     throw new Error("unreachable");
   }
+  // Enabled only (dormant reads nothing else), and before any connection opens:
+  // a malformed or out-of-range SEARCH_INDEX_MAX_* fails startup. All unset is {}
+  // and the search deps below carry no `limits`, exactly as before.
+  const searchLimits = searchIndexLimitsFromEnv(env);
   // Dormant never opens a database, so smuggled startup options there are
   // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);

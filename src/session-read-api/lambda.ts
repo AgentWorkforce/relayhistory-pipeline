@@ -45,6 +45,8 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true", either entry) serves the opt-in
  * includeShortSummary=recorded on GET /v1/sessions; otherwise that param is 501
  * `param_includeShortSummary` and the list shape is unchanged.
+ * READ_API_SEARCH_PARTIAL_SESSIONS (self-host service only; unset/""/"refuse" here, "skip"
+ * fails startup on this entry, see searchSkipsPartialSessions).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -174,17 +176,20 @@ export function sessionQueryEnabled(env: NodeJS.ProcessEnv): boolean {
 export const READ_API_SEARCH_PARTIAL_SESSIONS_VAR = "READ_API_SEARCH_PARTIAL_SESSIONS";
 
 /**
- * READ_API_SEARCH_PARTIAL_SESSIONS (default "refuse"): what a workspace search does while a
- * session of its workspace is partial. "refuse" (also unset or "") keeps the 501
- * `session_partial`, for a caller that falls back to relayhistory. "skip" answers from the
- * index and reports the partial sessions in the reply: for an install with no fallback, where
- * the refusal turns search off for the whole workspace. Anything else refuses startup, naming
- * the variable and never its value.
+ * READ_API_SEARCH_PARTIAL_SESSIONS (default "refuse"; self-host SERVICE only): what a workspace
+ * search does while a session of its workspace is partial. "refuse" (also unset or "") keeps the
+ * 501 `session_partial` / `session_partial_unbounded`, for a caller that falls back to
+ * relayhistory. "skip" answers the first page from the index and reports the partial sessions in
+ * `incomplete` (and X-Sessions-Read-Incomplete): for an install with no fallback, where the
+ * refusal turns search off for the whole workspace. The hosted Lambda has that fallback, so
+ * "skip" there refuses startup rather than being ignored (as factsBackends does for postgres).
+ * Anything else refuses startup, naming the variable and never its value.
  */
-export function searchSkipsPartialSessions(env: NodeJS.ProcessEnv): boolean {
+export function searchSkipsPartialSessions(env: NodeJS.ProcessEnv, entry: ReadAppEntry): boolean {
   const raw = env[READ_API_SEARCH_PARTIAL_SESSIONS_VAR];
   if (raw === undefined || raw === "" || raw === "refuse") return false;
   if (raw !== "skip") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} must be unset, "", "refuse" or "skip"`);
+  if (entry !== "service") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} other than "refuse" is served only by the self-host service`);
   return true;
 }
 
@@ -521,6 +526,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   parseSelfhostReadApi(env);
   parseSelfhostLoginSync(env);
   factsBackends(env, "lambda");
+  searchSkipsPartialSessions(env, "lambda");
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -560,7 +566,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
   const sessionQuery = sessionQueryEnabled(env);
-  const searchSkipPartial = searchSkipsPartialSessions(env);
+  const searchSkipPartial = searchSkipsPartialSessions(env, entry);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);

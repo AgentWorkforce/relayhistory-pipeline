@@ -67,6 +67,14 @@
  *                                   and refuses to start on a mismatch, so the live
  *                                   gates can never evaluate a different identity
  *                                   than the one that writes
+ *   SEARCH_INDEX_MAX_SCOPE_BYTES              enabled only: the search index pass's scope
+ *   SEARCH_INDEX_MAX_SCOPE_EVENTS             limits (search-index.ts searchIndexLimitsFromEnv):
+ *   SEARCH_INDEX_MAX_ROWS                     bytes (MiB / GiB suffix allowed) 64 MiB..256 MiB,
+ *                                   events 100000..1000000, rows 500000..1000000. Unset
+ *                                   or "" keeps SEARCH_INDEX_DEFAULT_LIMITS; anything
+ *                                   else fails startup before any connection opens.
+ *                                   A scope above them is indexed partial. Never read
+ *                                   by the hosted Lambda
  *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |
  *                                   "collector" (one installation-scoped
  *                                   session_pipeline.index_tick_completed per completed

@@ -64,3 +64,26 @@ test("a stuck provider query is bounded and receives an abort signal", async () 
   await expect(readEventPage({ adapter, liveness, timeoutMs: 5 }, { ...tenant, order: "asc", limit: 1 })).rejects.toThrow("timeout");
   expect(signal?.aborted).toBe(true);
 });
+
+test("READ_API_SEARCH_PARTIAL_SESSIONS=skip on the adapter path: overflow answers unbounded with no sessions list", async () => {
+  let queried = 0;
+  const adapter = binding(async () => { queried++; return { hits: [hit(1)] }; });
+  const skip = createReadApi({ adapter, liveness, completeSinceMs: 0, searchSkipsPartialSessions: true, verify: async () => ({ ...tenant, userId: "u", scopes: ["rth:read"] }), log: () => {} });
+  const get = (path: string) => skip.request(path, { headers: { authorization: "Bearer synthetic" } });
+  // Overflow with a (truncated) list still names none: the list is not the whole set.
+  adapter.state.partials = async () => ({ sessions: ["s-a", "s-b"], overflow: true });
+  let r = await get("/v1/events?workspace=ws-a&q=hello&limit=10");
+  expect(r.status).toBe(200);
+  expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial_unbounded");
+  expect((await r.json() as any).incomplete).toEqual({ reason: "session_partial_unbounded" });
+  expect(queried).toBe(1);
+  // A bounded list is named.
+  adapter.state.partials = async () => ({ sessions: ["s-a"], overflow: false });
+  r = await get("/v1/events?workspace=ws-a&q=hello&limit=10");
+  expect((await r.json() as any).incomplete).toEqual({ reason: "session_partial", sessions: ["s-a"] });
+  // A session-scoped read of a partial session still refuses.
+  r = await get("/v1/sessions/s-a/events?workspace=ws-a");
+  expect(r.status).toBe(501);
+  expect((await r.json() as any).error.reason).toBe("session_partial");
+  expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+});

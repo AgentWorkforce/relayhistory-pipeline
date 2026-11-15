@@ -284,8 +284,9 @@ export interface ReadApiDeps {
   /**
    * READ_API_SEARCH_PARTIAL_SESSIONS=skip: a workspace search answers from the index while a
    * session of its workspace is partial, and names what it could not cover in `incomplete`
-   * (and the X-Sessions-Read-Incomplete header). Absent/false: the 501 `session_partial` /
-   * `session_partial_unbounded`, unchanged. A session-scoped read is never affected.
+   * (and the X-Sessions-Read-Incomplete header), on the first page only. Absent/false: the 501
+   * `session_partial` / `session_partial_unbounded`, unchanged. A session-scoped read is never
+   * affected. Wired by the self-host service only (lambda.ts searchSkipsPartialSessions).
    */
   searchSkipsPartialSessions?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
@@ -387,6 +388,18 @@ export interface Continuation {
   backend: "relayhistory";
   reason: "history_floor";
   until: string;
+}
+
+/**
+ * READ_API_SEARCH_PARTIAL_SESSIONS=skip only (ReadApiDeps.searchSkipsPartialSessions): the first
+ * page of a workspace search answered while partial sessions belong to the workspace. `sessions`
+ * names them (at most PARTIAL_SESSIONS_CAP); `session_partial_unbounded` means the check found more
+ * than it lists and carries no `sessions`. Cursor pages never carry it; the response also has
+ * `X-Sessions-Read-Incomplete: <reason>`.
+ */
+export interface SearchIncomplete {
+  reason: "session_partial" | "session_partial_unbounded";
+  sessions?: string[];
 }
 
 /** One microsecond below `floorMs`, as an ISO timestamp relayhistory accepts (six fractional digits). */
@@ -586,7 +599,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
+        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}`);
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -978,7 +991,7 @@ export function createReadApi(deps: ReadApiDeps) {
       // With searchSkipsPartialSessions the search answers anyway and says so:
       // an install with no relayhistory has nowhere to fall back to, and one
       // partial session would otherwise turn search off for the workspace.
-      let incomplete: { reason: "session_partial" | "session_partial_unbounded"; sessions?: string[] } | undefined;
+      let incomplete: SearchIncomplete | undefined;
       if (cursor === undefined) {
         const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
         if (deps.searchSkipsPartialSessions === true) {
@@ -988,10 +1001,6 @@ export function createReadApi(deps: ReadApiDeps) {
           if (partials.overflow) throw unsupported("session_partial_unbounded");
           if (partials.sessions.length > 0) throw unsupported("session_partial");
         }
-      }
-      if (incomplete) {
-        log({ route: c.req.routePath, reason: `${incomplete.reason}_skipped`, status: 200, correlation_id: c.get("correlationId") });
-        c.header("X-Sessions-Read-Incomplete", incomplete.reason);
       }
       const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
@@ -1004,7 +1013,13 @@ export function createReadApi(deps: ReadApiDeps) {
         c.header("X-Sessions-Read-Continuation", "history_floor");
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
-      return c.json({ events: page.events, nextCursor: page.nextCursor, ...(incomplete ? { incomplete } : {}), correlationId: c.get("correlationId") });
+      if (incomplete) {
+        // Only on the answered page: an error after the check (history floor, backend) carries neither.
+        log({ route: c.req.routePath, reason: `${incomplete.reason}_skipped`, status: 200, ...(incomplete.sessions ? { partial_sessions: incomplete.sessions.length } : {}), correlation_id: c.get("correlationId") });
+        c.header("X-Sessions-Read-Incomplete", incomplete.reason);
+        return c.json({ events: page.events, nextCursor: page.nextCursor, incomplete, correlationId: c.get("correlationId") });
+      }
+      return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);
     }

@@ -144,32 +144,43 @@ export function searchIndexLimits(replayPagesEnabled: boolean): SearchIndexLimit
 }
 
 /**
- * Operator overrides for the indexer SERVICE (consumer-service.ts), which has no
- * large-read handoff: a scope above `maxScopeBytes` / `maxScopeEvents` is marked partial,
- * and one partial session makes the read API refuse every workspace search (501
- * `session_partial`) with no fallback on a self-host install. Raising the limits lets an
- * operator who sized the pod's memory for it index such a session.
+ * Operator overrides for the indexer SERVICE (consumer-service.ts serve() only; the hosted
+ * Lambda never reads them), which has no large-read handoff: a scope above `maxScopeBytes` /
+ * `maxScopeEvents` is marked partial (`scope_too_large`), and one partial session makes the
+ * read API refuse every workspace search (501 `session_partial`) with no fallback on a
+ * self-host install. Raising the limits lets an operator who sized the pod's memory for it
+ * index such a session on its next index pass.
  *
- *   SEARCH_INDEX_MAX_SCOPE_BYTES   raw bytes of one scope, default 64 MiB
- *   SEARCH_INDEX_MAX_SCOPE_EVENTS  records of one scope, default 100000
- *   SEARCH_INDEX_MAX_ROWS          index rows compared for one scope, default 500000
+ *   SEARCH_INDEX_MAX_SCOPE_BYTES   raw bytes of one scope: a whole number, or one with a MiB / GiB
+ *                                  suffix (as READ_API_CANONICAL_SCOPE_BYTES); default 64 MiB,
+ *                                  accepted 64 MiB..256 MiB
+ *   SEARCH_INDEX_MAX_SCOPE_EVENTS  records of one scope, a whole number; default 100000, accepted
+ *                                  100000..1000000
+ *   SEARCH_INDEX_MAX_ROWS          index rows compared for one scope, a whole number; default 500000,
+ *                                  accepted 500000..1000000
  *
- * Each is a positive integer no larger than the replay bound (256 MiB / 1M / 1M), the
- * largest scope the index pass is written for. Unset or empty keeps the default. Any
- * other value fails startup: a typo must not silently mean the default.
+ * The floor is SEARCH_INDEX_DEFAULT_LIMITS (a lower limit only marks more sessions partial)
+ * and the ceiling REPLAY_SEARCH_INDEX_LIMITS, the largest scope the index pass is written
+ * for. Unset or empty keeps the default, and an all-unset environment returns `{}` so the
+ * pass is byte-identical to before. Anything else fails startup naming the variable and its
+ * range, never the value, and is never clamped: a typo must not silently mean the default.
  */
 export function searchIndexLimitsFromEnv(env: Record<string, string | undefined>): Partial<SearchIndexLimits> {
-  const read = (name: string, ceiling: number): number | undefined => {
+  const MiB = 1024 * 1024;
+  const fmt = (bytes: boolean, n: number) => (bytes ? `${n / MiB}MiB` : String(n));
+  const read = (name: string, bytes: boolean, min: number, max: number): number | undefined => {
     const raw = env[name];
     if (raw === undefined || raw === "") return undefined;
-    if (!/^[1-9][0-9]{0,15}$/.test(raw)) throw new Error(`${name} must be a positive integer`);
-    const value = Number(raw);
-    if (value > ceiling) throw new Error(`${name} must be at most ${ceiling}`);
+    const m = (bytes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
+    const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      throw new Error(`pipeline consumer: ${name} must be ${bytes ? "a whole number of bytes (optional MiB or GiB suffix)" : "a whole number"} in ${fmt(bytes, min)}..${fmt(bytes, max)}`);
     return value;
   };
-  const maxScopeBytes = read("SEARCH_INDEX_MAX_SCOPE_BYTES", REPLAY_SEARCH_INDEX_LIMITS.maxScopeBytes);
-  const maxScopeEvents = read("SEARCH_INDEX_MAX_SCOPE_EVENTS", REPLAY_SEARCH_INDEX_LIMITS.maxScopeEvents);
-  const maxRows = read("SEARCH_INDEX_MAX_ROWS", REPLAY_SEARCH_INDEX_LIMITS.maxRows);
+  const lo = SEARCH_INDEX_DEFAULT_LIMITS, hi = REPLAY_SEARCH_INDEX_LIMITS;
+  const maxScopeBytes = read("SEARCH_INDEX_MAX_SCOPE_BYTES", true, lo.maxScopeBytes, hi.maxScopeBytes);
+  const maxScopeEvents = read("SEARCH_INDEX_MAX_SCOPE_EVENTS", false, lo.maxScopeEvents, hi.maxScopeEvents);
+  const maxRows = read("SEARCH_INDEX_MAX_ROWS", false, lo.maxRows, hi.maxRows);
   return {
     ...(maxScopeBytes === undefined ? {} : { maxScopeBytes }),
     ...(maxScopeEvents === undefined ? {} : { maxScopeEvents }),

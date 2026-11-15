@@ -248,7 +248,12 @@ paths:
       description: >-
         Workspace search is newest first and at most 100 per page. A page that
         reaches the history floor carries `X-Sessions-Read-Continuation:
-        history_floor` and a `continuation` object.
+        history_floor` and a `continuation` object. Self-host service with
+        `READ_API_SEARCH_PARTIAL_SESSIONS=skip` only: the first page of a
+        workspace search answered while sessions of the workspace are partial
+        carries `X-Sessions-Read-Incomplete: <reason>` and an `incomplete`
+        object; cursor pages never do. Otherwise (the default) that first page
+        is 501 `session_partial` / `session_partial_unbounded`.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}
@@ -280,6 +285,13 @@ paths:
                       backend: {type: string}
                       reason: {type: string}
                       until: {type: string}
+                  incomplete:
+                    type: object
+                    description: Self-host `READ_API_SEARCH_PARTIAL_SESSIONS=skip`, first search page only. `sessions` is absent for `session_partial_unbounded`.
+                    required: [reason]
+                    properties:
+                      reason: {type: string, enum: [session_partial, session_partial_unbounded]}
+                      sessions: {type: array, maxItems: 1000, items: {type: string}}
                   correlationId: {type: string}
         default: {$ref: "#/components/responses/Error"}
   /v1/cli/login:

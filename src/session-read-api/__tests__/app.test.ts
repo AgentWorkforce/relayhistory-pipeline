@@ -44,7 +44,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   return { ch, queries, eventQueries };
 }
 
-function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean } = {}) {
+function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string> } = {}) {
   const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: over.verify ?? (async (t) => {
@@ -55,6 +55,7 @@ function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?:
     liveness: over.liveness ?? memoryLiveness({ createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } }).liveness,
     completeSinceMs: over.completeSinceMs ?? 0,
     ...(over.searchSkipsPartialSessions ? { searchSkipsPartialSessions: true } : {}),
+    ...(over.corsAllowedOrigins ? { corsAllowedOrigins: over.corsAllowedOrigins } : {}),
     log: (f) => logs.push(f),
   });
   const get = (path: string, token: string | null = "good") =>
@@ -247,6 +248,107 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     r = await api({ ch: stubCh({ partial: ["s-1"] }).ch, searchSkipsPartialSessions: true }).get("/v1/sessions/s-1/events?workspace=ws-a");
     expect(r.status).toBe(501);
     expect((await body(r)).error.reason).toBe("session_partial");
+  });
+
+  describe("READ_API_SEARCH_PARTIAL_SESSIONS=skip (searchSkipsPartialSessions)", () => {
+    const SEARCH = "/v1/events?workspace=ws-a&q=needle&limit=20";
+    const skip = (ch: ClickHouseClient, extra: Parameters<typeof api>[0] = {}) => api({ ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true, ...extra });
+
+    test("unset and false keep the 501, with neither the header nor the field", async () => {
+      for (const over of [{}, { searchSkipsPartialSessions: false }]) {
+        for (const [partial, reason] of [[["s-row"], "session_partial"], [Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-${i}`), "session_partial_unbounded"]] as const) {
+          const stub = stubCh({ partial: [...partial], partialInWorkspace: ["s-row"] });
+          const { get, logs } = api({ ch: stub.ch, liveness: memoryLiveness().liveness, ...over });
+          const r = await get(SEARCH);
+          expect(r.status).toBe(501);
+          expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+          const b = await body(r);
+          expect(b.error.reason).toBe(reason);
+          expect("incomplete" in b).toBe(false);
+          expect(stub.eventQueries()).toHaveLength(0);
+          expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+        }
+      }
+    });
+
+    test("the answered first page logs the skip with a count, never the session ids", async () => {
+      const { get, logs } = skip(stubCh({ partial: ["s-row", "s-two"], partialInWorkspace: ["s-row", "s-two"] }).ch);
+      const r = await get(SEARCH);
+      expect(r.status).toBe(200);
+      expect((await body(r)).incomplete).toEqual({ reason: "session_partial", sessions: ["s-row", "s-two"] });
+      const entry = logs.find((l) => l.reason === "session_partial_skipped");
+      expect(entry).toMatchObject({ status: 200, partial_sessions: 2 });
+      expect(JSON.stringify(logs)).not.toContain("s-row");
+    });
+
+    test("overflow answers session_partial_unbounded with no sessions list", async () => {
+      const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-other-${i}`);
+      const { get, logs } = skip(stubCh({ partial: many, partialInWorkspace: many }).ch);
+      const r = await get(SEARCH);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial_unbounded");
+      const b = await body(r);
+      expect(b.incomplete).toEqual({ reason: "session_partial_unbounded" });
+      expect("sessions" in b.incomplete).toBe(false);
+      const entry = logs.find((l) => l.reason === "session_partial_unbounded_skipped");
+      expect(entry).toMatchObject({ status: 200 });
+      expect("partial_sessions" in entry!).toBe(false);
+    });
+
+    test("cursor pages are unaffected: no check, no field, no header", async () => {
+      const stub = stubCh({ partial: ["s-1"], partialInWorkspace: ["s-1"] });
+      const { get, logs } = skip(stub.ch);
+      const cursor = encodeCursor({ tsMs: 5, sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-1" });
+      const r = await get(`${SEARCH}&cursor=${cursor}`);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+      expect("incomplete" in (await body(r))).toBe(false);
+      expect(stub.queries.some((q) => q.includes("search_ingest_session_state"))).toBe(false);
+      expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+    });
+
+    test("a session-scoped read of a partial session is still 501", async () => {
+      for (const path of ["/v1/sessions/s-1/events?workspace=ws-a", "/v1/events?workspace=ws-a&session=s-1", "/v1/events?workspace=ws-a&session=s-1&q=needle&limit=20"]) {
+        const stub = stubCh({ partial: ["s-1"], partialInWorkspace: ["s-1"] });
+        const r = await api({ ch: stub.ch, searchSkipsPartialSessions: true }).get(path);
+        expect(r.status).toBe(501);
+        expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+        expect((await body(r)).error.reason).toBe("session_partial");
+        expect(stub.eventQueries()).toHaveLength(0);
+      }
+    });
+
+    test("an error after the check carries neither the header nor the skip log", async () => {
+      // First page that reaches the history floor without filling: 501 history_floor, not an incomplete 200.
+      const { get, logs } = skip(stubCh({ partial: ["s-row"], partialInWorkspace: ["s-row"], candidates: [] }).ch, { completeSinceMs: Date.parse("2026-09-01T00:00:00Z") });
+      let r = await get(SEARCH);
+      expect(r.status).toBe(501);
+      expect((await body(r)).error.reason).toBe("history_floor");
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+      expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+      // A backend failure while reading the page.
+      let calls = 0;
+      const flaky = stubCh({ partial: ["s-row"], partialInWorkspace: ["s-row"] });
+      const select = flaky.ch.select.bind(flaky.ch);
+      flaky.ch.select = (async (q: string, o?: { params?: Record<string, unknown> }) => {
+        if (!q.includes("search_ingest_session_state") && calls++ === 0) throw new Error("backend down");
+        return select(q, o);
+      }) as ClickHouseClient["select"];
+      const failing = skip(flaky.ch);
+      r = await failing.get(SEARCH);
+      expect(r.status).toBeGreaterThanOrEqual(500);
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+      expect(failing.logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+    });
+
+    test("CORS exposes X-Sessions-Read-Incomplete only with the setting on", async () => {
+      const origins = new Set(["https://app.example.test"]);
+      const headers = { authorization: "Bearer good", origin: "https://app.example.test" };
+      const off = await api({ corsAllowedOrigins: origins }).app.request("/v1/sessions/s-1/events?workspace=ws-a", { headers });
+      expect(off.headers.get("access-control-expose-headers")).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
+      const on = await api({ corsAllowedOrigins: origins, searchSkipsPartialSessions: true }).app.request("/v1/sessions/s-1/events?workspace=ws-a", { headers });
+      expect(on.headers.get("access-control-expose-headers")).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Incomplete");
+    });
   });
 
   test("partial sessions of other workspaces of the org do not stop this workspace's search", async () => {
