@@ -55,5 +55,35 @@ describe("bob costas digest of a Codex rollout", () => {
     expect(d.userTurns).toEqual(["hi"]);
     expect(d.assistantTurns).toBe(0);
   });
+  test("malformed Codex records and non-text parts are skipped, not counted", () => {
+    const rec = (payload: unknown) => JSON.stringify({ type: "response_item", payload });
+    const d = digestRecords("codex", [
+      rec(null),
+      rec({ type: "message", role: "user", content: "not an array" }),
+      rec({ type: "message", role: "user", content: { type: "input_text", text: "an object" } }),
+      rec({ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] }),
+      rec({ type: "message", role: "user", content: [null, { type: "input_text", text: 7 }] }),
+      rec({ type: "function_call", arguments: "{}" }),
+      JSON.stringify({ type: "turn_context", payload: null }),
+      "null",
+      "[1,2]",
+      rec({ type: "message", role: "user", content: [{ type: "input_image", image_url: "x" }, { type: "input_text", text: "what is in this image?" }] }),
+    ]);
+    // A string content is the message text (as for Claude); everything else malformed is dropped.
+    expect(d.userTurns).toEqual(["not an array", "what is in this image?"]);
+    expect(d.assistantTurns).toBe(0);
+    expect(Object.keys(d.toolCalls)).toEqual([]);
+    expect(d.models).toEqual([]);
+    expect(d.records).toBe(10);
+  });
+  test("tool names that collide with Object.prototype are counted like any other", async () => {
+    const d = digestRecords("codex", [
+      JSON.stringify({ type: "response_item", payload: { type: "function_call", name: "constructor" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "custom_tool_call", name: "__proto__" } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "toString" }, { type: "tool_use", name: "__proto__" }] } }),
+    ]);
+    expect(Object.entries(d.toolCalls)).toEqual([["constructor", 1], ["__proto__", 2], ["toString", 1]]);
+    const s = await extractiveSummarizer.summarize("short", d);
+    expect(s.text).toContain("tools: __proto__×2, constructor×1, toString×1.");
+  });
 });
-

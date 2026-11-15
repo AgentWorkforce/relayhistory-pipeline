@@ -47,7 +47,9 @@ export interface Summarizer {
 
 /** Parses scrubbed JSONL transcript records into a digest. Harness-agnostic best effort. */
 export function digestRecords(harness: string, lines: string[]): SessionDigest {
-  const d: SessionDigest = { harness, records: 0, userTurns: [], assistantTurns: 0, toolCalls: {}, models: [] };
+  const d: SessionDigest = { harness, records: 0, userTurns: [], assistantTurns: 0,
+    // No prototype: a tool named "constructor" or "__proto__" is counted like any other.
+    toolCalls: Object.create(null) as Record<string, number>, models: [] };
   for (const line of lines) {
     if (!line.trim()) continue;
     d.records += 1;
@@ -57,6 +59,7 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
     } catch {
       continue;
     }
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue;
     const ts = typeof rec.timestamp === "string" ? rec.timestamp : undefined;
     if (ts) {
       d.firstTs ??= ts;
