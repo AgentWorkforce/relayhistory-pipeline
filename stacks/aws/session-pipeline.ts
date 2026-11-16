@@ -99,6 +99,8 @@ export interface SessionPipelineInputs {
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
   analysisCache?: boolean;
+  /** Explicit provenance for analysis_source_readonly_url. Omit for the legacy source. */
+  legacyReadSource?: "frozen-supabase";
   /**
    * Default off. `true` is refused until the forget/reproject fix (migration 20261105031000)
    * lands and is reviewed (docs/session-desktop-catalog.md); SESSION_DESKTOP_CATALOG_ENABLED stays "0".
@@ -112,8 +114,8 @@ export interface SessionPipelineInputs {
   briefs?: SessionBriefInputs;
   /**
    * SESSIONS_NEON_EXIT: the Neon-exit release profile (src/shared/neon-exit.ts, docs/neon-exit-edge-map.md).
-   * `true` renders SESSIONS_NEON_EXIT="true" and is refused together with `analysisCache: true` or
-   * `semanticCopy.enabled: true` (both read the legacy Neon readonly source; lambda.ts refuses them at init).
+   * `true` renders SESSIONS_NEON_EXIT="true". Analysis-cache and semantic-copy readers additionally
+   * require `legacyReadSource: "frozen-supabase"`; runtime validates the Supabase relayhistory_legacy URL.
    * Omit for off (no var rendered, env byte-identical to before). Only `true` is accepted.
    */
   neonExit?: true;
@@ -245,16 +247,17 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
-  // Mirrors lambda.ts lambdaEnv: the Neon-exit Lambda refuses both readers of the legacy Neon readonly source.
-  // Before the analysisCache gap refusal below, so the Neon-exit conflict is refused by name.
+  if(v.legacyReadSource!==undefined&&v.legacyReadSource!=="frozen-supabase")refuse('transcriptStore.sessionPipeline.legacyReadSource must be "frozen-supabase" (omit for legacy)');
+  // Mirrors lambda.ts lambdaEnv: Neon exit admits readers only with explicit frozen-copy provenance.
+  // Before the analysisCache grant refusal below, so a missing source is refused by name.
   if (v.neonExit !== undefined) {
     if (v.neonExit !== true) refuse("transcriptStore.sessionPipeline.neonExit must be true (omit for off)");
-    if (v.analysisCache === true) refuse("transcriptStore.sessionPipeline.neonExit refuses analysisCache: true (SESSION_ANALYSIS_CACHE_ENABLED reads the Neon readonly source)");
-    if ((v.semanticCopy as { enabled?: unknown } | null | undefined)?.enabled === true) refuse("transcriptStore.sessionPipeline.neonExit refuses semanticCopy.enabled: true (SESSION_SEMANTIC_COPY_ENABLED reads the Neon readonly source)");
+    if (v.analysisCache === true && v.legacyReadSource !== "frozen-supabase") refuse('transcriptStore.sessionPipeline.neonExit with analysisCache: true requires legacyReadSource: "frozen-supabase"');
+    if ((v.semanticCopy as { enabled?: unknown } | null | undefined)?.enabled === true && v.legacyReadSource !== "frozen-supabase") refuse('transcriptStore.sessionPipeline.neonExit with semanticCopy.enabled: true requires legacyReadSource: "frozen-supabase"');
   }
   // The pipeline role has only s3:ListBucket/GetObject: enabling the stage now would fail every replay put.
   if (v.replayPages === true) refuse("transcriptStore.sessionPipeline.replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
@@ -529,6 +532,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_DESKTOP_CATALOG_ENABLED: "0",
     SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
+    ...(i.p.legacyReadSource === "frozen-supabase" ? { SESSION_LEGACY_READ_SOURCE: "frozen-supabase" } : {}),
     SESSION_ANALYSIS_ENABLED:i.p.analysisJobs?.enabled?"true":"false",
     // Only when armed, so a default deploy leaves the feed and the erasure lane at their source default of off.
     ...(i.p.bufferedSearchFeed?.enabled === true ? { INGEST_BUFFERED_SEARCH_FEED: "on" } : {}),

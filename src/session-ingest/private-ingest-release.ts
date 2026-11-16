@@ -228,6 +228,15 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   }, true);
 }
 
+function liveNeonExit(version: CloudflareWorkerVersion): "on" | undefined {
+  const bindings = Array.isArray(version.resources?.bindings) ? version.resources.bindings : [];
+  const rows = bindings.filter((binding) => binding.name === "SESSIONS_NEON_EXIT");
+  if (rows.length === 0) return undefined;
+  if (rows.length !== 1 || rows[0]!.type !== "plain_text" || rows[0]!.text !== "true")
+    privateIngestRefuse("private_ingest_live_neon_exit");
+  return "on";
+}
+
 const KMS_ARN = /^arn:aws:kms:us-east-1:[0-9]{12}:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /** Exact tracked production profile. A newly added stack option is off until this contract reviews it. */
@@ -251,11 +260,16 @@ export function privateIngestReleasePhase(
     "asyncAdmission",
     "syncAdmissionFrozenReceipt",
     "overlapGeneration",
+    "neonExit",
     ...PRIVATE_INGEST_CUTOVER_KEYS,
   ]);
   if (Object.keys(profile).some((key) => !allowed.has(key)))
     privateIngestRefuse("private_ingest_profile_extra");
   checkedCutover(profile);
+  if (profile.neonExit !== undefined &&
+      (profile.neonExit !== "on" || profile.acceptanceMode !== "buffered" ||
+       profile.custodySource !== "frozen-supabase" || profile.replicaMode !== "off"))
+    privateIngestRefuse("private_ingest_profile_neon_exit");
   if (overlap !== undefined) {
     if (c.overlap === null) privateIngestRefuse("private_ingest_profile_overlap_unreviewed");
     // The pair is only offered while the reviewed expected generation is still G.
@@ -398,6 +412,8 @@ function privateIngestVersionEvidence(
   ]);
   if (names.some((name) => name.startsWith("INGEST_") && !expectedIngest.has(name)))
     privateIngestRefuse("private_ingest_live_unknown_flag");
+  if (input.sessionIngest.neonExit !== "on" && names.includes("SESSIONS_NEON_EXIT"))
+    privateIngestRefuse("private_ingest_live_neon_exit");
   expectTarget(named(bindings, "HYPERDRIVE"), { type: "hyperdrive", id: input.sessionIngest.hyperdriveId });
   expectTarget(named(bindings, "INGEST_FANOUT"), { type: "queue", queue_name: FANOUT_QUEUE });
   if (resolvedAsyncAdmission(input.sessionIngest) !== "off")
@@ -506,18 +522,18 @@ export function privateIngestTransitionReadback(
     privateIngestRefuse("private_ingest_live_undeclared_overlap");
   const label = (generation: string): PrivateIngestGenerationState =>
     c.overlap === null || generation === c.overlap.from ? "G" : "H";
-  // The cutover controls are orthogonal to the rollout phase: the live ones join every candidate, so the
-  // phase is read the same with or without them, and a deploy may add, change or remove them freely.
-  const cutover = liveCutover(version);
-  const withCutover = (profile: CloudflareStageInputs): CloudflareStageInputs =>
-    ({ ...profile, sessionIngest: { ...profile.sessionIngest, ...cutover } });
+  // Live orthogonal controls join every candidate, so the rollout phase is read independently of them.
+  const cutover = liveCutover(version), currentNeonExit = liveNeonExit(version);
+  const withLiveAxes = (profile: CloudflareStageInputs): CloudflareStageInputs =>
+    ({ ...profile, sessionIngest: { ...profile.sessionIngest, ...cutover,
+      ...(currentNeonExit === "on" ? { neonExit: "on" as const } : {}) } });
   const candidates: Array<[PrivateIngestBasePhase, PrivateIngestGenerationState, boolean, CloudflareStageInputs]> = [];
   for (const base of BASE_PHASES) {
-    candidates.push([base, label(c.generation), false, withCutover(profileFor(base, kmsKeyArn, c.generation))]);
+    candidates.push([base, label(c.generation), false, withLiveAxes(profileFor(base, kmsKeyArn, c.generation))]);
     if (c.overlap !== null) {
       const other = c.generation === c.overlap.from ? c.overlap.to : c.overlap.from;
-      candidates.push([base, label(other), false, withCutover(profileFor(base, kmsKeyArn, other))]);
-      candidates.push([base, "G+H", true, withCutover(profileFor(base, kmsKeyArn, c.overlap.from, c.overlap.to))]);
+      candidates.push([base, label(other), false, withLiveAxes(profileFor(base, kmsKeyArn, other))]);
+      candidates.push([base, "G+H", true, withLiveAxes(profileFor(base, kmsKeyArn, c.overlap.from, c.overlap.to))]);
     }
   }
   const matches = candidates.filter(([, , , candidate]) => {
@@ -528,6 +544,9 @@ export function privateIngestTransitionReadback(
   const [fromBase, generationFrom, fromOverlap] = matches[0]!;
   const generationTo: PrivateIngestGenerationState = target.overlap ? "G+H" : label(c.generation);
   const from: PrivateIngestReleasePhase = fromOverlap ? `${fromBase}-overlap` : fromBase;
+  // Toggle the release profile in its own observed deploy; never combine it with a phase move.
+  if (currentNeonExit !== input.sessionIngest.neonExit && fromBase !== target.base)
+    privateIngestRefuse("private_ingest_live_transition");
   // step-0-shadow is mandatory between baseline-drain and step-1-custody in both directions.
   const allowed: Record<PrivateIngestBasePhase, readonly PrivateIngestBasePhase[]> = {
     "baseline-drain": ["baseline-drain", "step-0-shadow"],
