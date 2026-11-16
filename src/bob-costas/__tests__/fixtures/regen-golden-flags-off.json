@@ -1,0 +1,747 @@
+{
+  "steps": [
+    {
+      "name": "long fresh write",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            2,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "ready",
+            "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc",
+            "<volatile>",
+            "hkdf1:k1",
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-long",
+          "kind": "long",
+          "status": "ready",
+          "model_id": "extractive/v1",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 2,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "name": "long current skip",
+      "result": {
+        "status": "skipped",
+        "reason": "summary_current"
+      },
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        }
+      ],
+      "logs": []
+    },
+    {
+      "name": "short fresh write",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "short"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/short.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "short"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "short",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            2,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "ready",
+            "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/short.json.enc",
+            "<volatile>",
+            "hkdf1:k1",
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-short",
+          "kind": "short",
+          "status": "ready",
+          "model_id": "extractive/v1",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 2,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "name": "short current reconcile",
+      "result": {
+        "status": "skipped",
+        "reason": "summary_current"
+      },
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "short"
+          ]
+        }
+      ],
+      "logs": []
+    },
+    {
+      "name": "long newer revision",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            3,
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            "ready",
+            "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s1/summary/long.json.enc",
+            "<volatile>",
+            "hkdf1:k1",
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-long",
+          "kind": "long",
+          "status": "ready",
+          "model_id": "extractive/v1",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 3,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "name": "long stale revision",
+      "result": {
+        "status": "skipped",
+        "reason": "stale_revision"
+      },
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s1",
+            "m",
+            "long"
+          ]
+        }
+      ],
+      "logs": []
+    },
+    {
+      "name": "long model_failed fallback",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s2",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s2/summary/long.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s2",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s2",
+            "m",
+            "long",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            2,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "ready",
+            "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s2/summary/long.json.enc",
+            "<volatile>",
+            "hkdf1:k1",
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "warn",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas model summary fallback",
+          "stage": "summary-long",
+          "kind": "long",
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "outcome": "fallback",
+          "reason": "model_failed",
+          "model_id": "gpt-test-mini",
+          "attempt": 1,
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "error_code": "model_unavailable",
+          "retryable": true
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-long",
+          "kind": "long",
+          "status": "ready",
+          "model_id": "extractive/v1",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 2,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "name": "long no_api_key fallback",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s3",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s3/summary/long.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s3",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s3",
+            "m",
+            "long",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            2,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "ready",
+            "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s3/summary/long.json.enc",
+            "<volatile>",
+            "hkdf1:k1",
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas model summary fallback",
+          "stage": "summary-long",
+          "kind": "long",
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "outcome": "fallback",
+          "reason": "no_api_key",
+          "model_id": "gpt-test-mini",
+          "attempt": 0,
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-long",
+          "kind": "long",
+          "status": "ready",
+          "model_id": "extractive/v1",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 2,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "name": "long quarantined",
+      "result": null,
+      "queries": [
+        {
+          "text": "SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries\n        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s4",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:summary:v1/ws=w/m=m/h=claude/d=2026/10/29/s=s4/summary/long.json.enc"
+          ]
+        },
+        {
+          "text": "SELECT revision FROM sessions.session_summaries\n          WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s4",
+            "m",
+            "long"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_summaries\n           (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,\n            content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)\n         VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET\n           session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),\n           trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,\n           status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,\n           key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()",
+          "params": [
+            "o",
+            "w",
+            "claude",
+            "s4",
+            "m",
+            "long",
+            "01a188e1-ef86-7892-9389-39149894eeec",
+            "01a188e1-ef86-7b16-938a-e91b6b78643b",
+            2,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "quarantined",
+            null,
+            null,
+            null,
+            0,
+            0
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "bob costas summary",
+          "stage": "summary-long",
+          "kind": "long",
+          "status": "quarantined",
+          "tokens_in": 0,
+          "tokens_out": 0,
+          "trace_id": "01a188e1-ef86-7b16-938a-e91b6b78643b",
+          "revision": 2,
+          "session_uuid": "01a188e1-ef86-7892-9389-39149894eeec",
+          "count": 0
+        }
+      ]
+    },
+    {
+      "name": "summary sweep",
+      "queries": [
+        {
+          "text": "SELECT i.org_id, i.workspace_id, i.harness, i.session_id, i.machine_id, i.manifest_key,\n            i.trace_id::text AS trace_id, i.revision::text AS revision, e.session_uuid::text AS session_uuid\n       FROM sessions.session_index i\n       LEFT JOIN sessions.session_index_ext e USING (org_id, workspace_id, harness, session_id, machine_id)\n      WHERE i.deleted_at IS NULL AND i.manifest_key IS NOT NULL\n        -- Needs work: no row, or a ready row still under an older key (rotation).\n        AND NOT EXISTS (SELECT 1 FROM sessions.session_summaries s\n                         WHERE s.org_id=i.org_id AND s.workspace_id=i.workspace_id AND s.harness=i.harness\n                           AND s.session_id=i.session_id AND s.machine_id=i.machine_id AND s.kind=$1\n                           AND (s.status <> 'ready' OR s.key_id = $4))\n        -- Not already queued.\n        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_jobs j\n                         WHERE j.stage=$2 AND NOT j.dlq AND j.org_id=i.org_id AND j.workspace_id=i.workspace_id\n                           AND j.session_id=i.session_id AND j.machine_id=i.machine_id)\n        -- Not dead-lettered: a permanent failure waits for a person (replay), not every sweep.\n        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_dead_letters d\n                         WHERE d.stage=$2 AND d.resolved_at IS NULL AND d.org_id=i.org_id AND d.workspace_id=i.workspace_id\n                           AND d.session_id=i.session_id AND d.machine_id=i.machine_id)\n      ORDER BY i.indexed_at DESC NULLS LAST\n      LIMIT $3",
+          "params": [
+            "short",
+            "summary-short",
+            100,
+            "hkdf1:k1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.pipeline_jobs (stage, work_key, trace_id, org_id, workspace_id,\n                            session_id, machine_id, message, visible_at)\n       SELECT m->>'stage', m->>'workKey', (m->'ctx'->>'traceId')::uuid,\n              m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',\n              m->'ctx'->>'sessionId', m->'ctx'->>'machineId', m,\n              now() + make_interval(secs => $2::integer)\n         FROM jsonb_array_elements($1::jsonb) AS m",
+          "params": [
+            "[{\"v\":1,\"stage\":\"summary-short\",\"ctx\":{\"traceId\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"orgId\":\"o\",\"workspaceId\":\"w\",\"machineId\":\"m\",\"sessionId\":\"s9\",\"harness\":\"claude\",\"tenant_id\":\"o\",\"traceparent\":\"00-019a1f3c8e2b7c419d3a5b6f0e2a7c18-<span>-01\"},\"workKey\":\"v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json@summary-sweep:3\",\"revision\":3,\"payload\":{\"traceId\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"workspaceId\":\"w\",\"machineId\":\"m\",\"harness\":\"claude\",\"sessionId\":\"s9\",\"manifestKey\":\"v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json\"}}]",
+            0
+          ]
+        },
+        {
+          "text": "SELECT i.org_id, i.workspace_id, i.harness, i.session_id, i.machine_id, i.manifest_key,\n            i.trace_id::text AS trace_id, i.revision::text AS revision, e.session_uuid::text AS session_uuid\n       FROM sessions.session_index i\n       LEFT JOIN sessions.session_index_ext e USING (org_id, workspace_id, harness, session_id, machine_id)\n      WHERE i.deleted_at IS NULL AND i.manifest_key IS NOT NULL\n        -- Needs work: no row, or a ready row still under an older key (rotation).\n        AND NOT EXISTS (SELECT 1 FROM sessions.session_summaries s\n                         WHERE s.org_id=i.org_id AND s.workspace_id=i.workspace_id AND s.harness=i.harness\n                           AND s.session_id=i.session_id AND s.machine_id=i.machine_id AND s.kind=$1\n                           AND (s.status <> 'ready' OR s.key_id = $4))\n        -- Not already queued.\n        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_jobs j\n                         WHERE j.stage=$2 AND NOT j.dlq AND j.org_id=i.org_id AND j.workspace_id=i.workspace_id\n                           AND j.session_id=i.session_id AND j.machine_id=i.machine_id)\n        -- Not dead-lettered: a permanent failure waits for a person (replay), not every sweep.\n        AND NOT EXISTS (SELECT 1 FROM sessions.pipeline_dead_letters d\n                         WHERE d.stage=$2 AND d.resolved_at IS NULL AND d.org_id=i.org_id AND d.workspace_id=i.workspace_id\n                           AND d.session_id=i.session_id AND d.machine_id=i.machine_id)\n      ORDER BY i.indexed_at DESC NULLS LAST\n      LIMIT $3",
+          "params": [
+            "long",
+            "summary-long",
+            100,
+            "hkdf1:k1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.pipeline_jobs (stage, work_key, trace_id, org_id, workspace_id,\n                            session_id, machine_id, message, visible_at)\n       SELECT m->>'stage', m->>'workKey', (m->'ctx'->>'traceId')::uuid,\n              m->'ctx'->>'orgId', m->'ctx'->>'workspaceId',\n              m->'ctx'->>'sessionId', m->'ctx'->>'machineId', m,\n              now() + make_interval(secs => $2::integer)\n         FROM jsonb_array_elements($1::jsonb) AS m",
+          "params": [
+            "[{\"v\":1,\"stage\":\"summary-long\",\"ctx\":{\"traceId\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"orgId\":\"o\",\"workspaceId\":\"w\",\"machineId\":\"m\",\"sessionId\":\"s9\",\"harness\":\"claude\",\"tenant_id\":\"o\",\"traceparent\":\"00-019a1f3c8e2b7c419d3a5b6f0e2a7c18-<span>-01\"},\"workKey\":\"v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json@summary-sweep:3\",\"revision\":3,\"payload\":{\"traceId\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"workspaceId\":\"w\",\"machineId\":\"m\",\"harness\":\"claude\",\"sessionId\":\"s9\",\"manifestKey\":\"v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json\"}}]",
+            0
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "summary sweep queued",
+          "stage": "summary-short",
+          "count": 1
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "summary sweep queued",
+          "stage": "summary-long",
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "directoryCalls": [
+    {
+      "write": {
+        "orgId": "o",
+        "workspaceId": "w",
+        "harness": "claude",
+        "sessionId": "s1",
+        "summary": "claude: \"fix the build s1\" — 2 user turns, 0 assistant turns, tools: none.",
+        "source": "bob-costas/extractive/v1",
+        "generatedAt": "<date>"
+      }
+    },
+    {
+      "write": {
+        "orgId": "o",
+        "workspaceId": "w",
+        "harness": "claude",
+        "sessionId": "s1",
+        "summary": "claude: \"fix the build s1\" — 2 user turns, 0 assistant turns, tools: none.",
+        "source": "bob-costas/extractive/v1",
+        "generatedAt": "<date>"
+      }
+    }
+  ],
+  "recorderLines": [
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "long",
+        "status": "ready",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    },
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "short",
+        "status": "ready",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    },
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "long",
+        "status": "ready",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    },
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "long",
+        "status": "ready",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    },
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "long",
+        "status": "ready",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    },
+    {
+      "msg": "summary written",
+      "f": {
+        "kind": "long",
+        "status": "quarantined",
+        "tokens_in": 0,
+        "tokens_out": 0
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "stage": "summary-long",
+      "work_key": "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json@summary-sweep:3",
+      "org_id": "o",
+      "workspace_id": "w",
+      "session_id": "s9",
+      "machine_id": "m"
+    },
+    {
+      "stage": "summary-short",
+      "work_key": "v1/ws=w/m=m/h=claude/d=2026/10/29/s=s9/manifest.json@summary-sweep:3",
+      "org_id": "o",
+      "workspace_id": "w",
+      "session_id": "s9",
+      "machine_id": "m"
+    }
+  ]
+}

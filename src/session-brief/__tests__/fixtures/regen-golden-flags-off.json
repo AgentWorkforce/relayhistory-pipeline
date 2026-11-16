@@ -1,0 +1,752 @@
+{
+  "steps": [
+    {
+      "name": "tick generated",
+      "result": {
+        "generated": 1
+      },
+      "queries": [
+        {
+          "text": "WITH gone AS (\n       DELETE FROM sessions.session_brief_wakeups AS w\n        USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n                WHERE evidence_at < now() - make_interval(hours => $1::integer)\n                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n                  AND (lease_expires_at IS NULL OR lease_expires_at < now())\n                ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s\n        WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id\n          AND w.harness = s.harness AND w.session_id = s.session_id\n        RETURNING 1)\n     SELECT count(*)::int AS n FROM gone",
+          "params": [
+            72,
+            5000,
+            null
+          ]
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1\n       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))",
+          "params": [
+            null
+          ]
+        },
+        {
+          "text": "WITH due AS (\n       SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n        WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())\n          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n        ORDER BY due_at, org_id, workspace_id, harness, session_id\n        LIMIT $1 FOR UPDATE SKIP LOCKED)\n     UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),\n            attempts = w.attempts + 1\n       FROM due\n      WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id\n        AND w.harness = due.harness AND w.session_id = due.session_id\n      RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,\n                w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id",
+          "params": [
+            5,
+            300,
+            null
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,\n            brief_fingerprint, model,\n            generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago\n       FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT coalesce((SELECT attempts FROM sessions.session_brief_attempts\n                       WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                         AND workspace_id = $2 AND harness = $3 AND session_id = $4), 0)::int AS mine,\n            (SELECT count(*) FROM sessions.session_brief_attempts\n              WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others,\n            (SELECT coalesce(sum(attempts), 0) FROM sessions.session_brief_attempts\n              WHERE day = (now() AT TIME ZONE 'UTC')::date)::int AS total",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)\n     VALUES ($1, $2, $3, $4, (now() AT TIME ZONE 'UTC')::date, 1)\n     ON CONFLICT (org_id, day, workspace_id, harness, session_id)\n     DO UPDATE SET attempts = sessions.session_brief_attempts.attempts + 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:brief:[\"org-a\",\"ws-a\",\"claude\",\"s-1\"]"
+          ]
+        },
+        {
+          "text": "SELECT revision::text AS revision FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 FOR UPDATE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_briefs AS b\n           (org_id, workspace_id, harness, session_id, status, revision, source_revisions,\n            source_fingerprint, title, description, state, brief_revision, brief_source_revisions,\n            brief_fingerprint, scrub_ruleset, scrub_version, prompt_version, engine_version,\n            model, message_count, shortened_messages, input_tokens, output_tokens, duration_ms,\n            error, generated_at, attempted_at, updated_at)\n         VALUES ($1, $2, $3, $4, 'ready', $5, $6::jsonb, $7, $8, $9, $21, $5, $6::jsonb, $7, $10, $11,\n                 $12, $13, $14, $15, $16, $17, $18, $19, NULL, $20::timestamptz, now(), now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET\n           status = 'ready', revision = excluded.revision, source_revisions = excluded.source_revisions,\n           source_fingerprint = excluded.source_fingerprint, title = excluded.title,\n           description = excluded.description, state = excluded.state,\n           brief_revision = excluded.brief_revision,\n           brief_source_revisions = excluded.brief_source_revisions,\n           brief_fingerprint = excluded.brief_fingerprint, scrub_ruleset = excluded.scrub_ruleset,\n           scrub_version = excluded.scrub_version, prompt_version = excluded.prompt_version,\n           engine_version = excluded.engine_version, model = excluded.model,\n           message_count = excluded.message_count, shortened_messages = excluded.shortened_messages,\n           input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,\n           duration_ms = excluded.duration_ms, generated_at = excluded.generated_at,\n           error = NULL, attempted_at = now(), updated_at = now()",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            1,
+            "{\"m-1\":1}",
+            "4c1f0ffa414bf343a0b86cf3f1a55c96f216aba7066a76adc319ceb184df2ba7",
+            "Fix the flaky queue test",
+            "Diagnosed a race in the pipeline queue test. Awaiting the lease renewal before asserting the ack count fixed it.",
+            "relayhistory-scrub",
+            8,
+            "session-summary-v3",
+            "session-summary-v3:96bulls-v1",
+            "gpt-5.6-luna",
+            1,
+            0,
+            1234,
+            56,
+            0,
+            "<iso>",
+            "completed"
+          ]
+        },
+        {
+          "text": "WITH target AS (\n       SELECT d.session_id\n         FROM sessions.session_directory AS d\n        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3\n          AND (d.session_id = $4 OR EXISTS (\n            SELECT 1 FROM sessions.session_index AS p\n             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n               AND p.harness = d.harness AND p.session_id = $4\n               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))\n        ORDER BY (d.session_id <> $4) DESC LIMIT 1\n     ), title_value AS (\n       SELECT coalesce($5::text, (\n         SELECT p.title FROM sessions.session_index AS p\n          WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4\n            AND p.deleted_at IS NULL\n          ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1)) AS title\n     )\n     UPDATE sessions.session_directory AS d\n        SET title = coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END),\n            search_text = sessions.session_directory_search_text(\n              coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch,\n              d.model, d.short_summary),\n            projected_at = now()\n       FROM title_value AS t CROSS JOIN target AS target\n      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3\n        AND d.session_id = target.session_id\n        AND d.deleted_at IS NULL AND d.title IS DISTINCT FROM\n          coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END)",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "Fix the flaky queue test"
+          ]
+        },
+        {
+          "text": "WITH target AS (\n       SELECT d.session_id\n         FROM sessions.session_directory AS d\n        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3\n          AND (d.session_id = $4 OR EXISTS (\n            SELECT 1 FROM sessions.session_index AS p\n             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n               AND p.harness = d.harness AND p.session_id = $4\n               AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))\n        ORDER BY (d.session_id <> $4) DESC LIMIT 1\n     )\n     UPDATE sessions.session_directory AS d\n        SET short_summary = $5,\n            short_summary_scrub_ruleset = $6,\n            short_summary_scrub_version = $7,\n            short_summary_source = $8,\n            short_summary_generated_at = $9::timestamptz,\n            search_text = sessions.session_directory_search_text(\n              d.title, d.task_title, d.agent_name, d.project_id,\n              d.git_repo, d.git_branch, d.model, $5),\n            projected_at = now()\n       FROM target AS t\n      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id\n        AND d.deleted_at IS NULL\n        AND (d.short_summary_generated_at IS NULL OR d.short_summary_generated_at <= $9::timestamptz)\n        AND (d.short_summary_source IS NULL OR left(d.short_summary_source, $10) <> $11\n             OR left($8, $10) = $11)\n      RETURNING true AS written",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "Diagnosed a race in the pipeline queue test. Awaiting the lease renewal before asserting the ack count fixed it.",
+            "relayhistory-scrub",
+            8,
+            "session-brief/gpt-5.6-luna",
+            "<iso>",
+            14,
+            "session-brief/"
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_wakeups\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND lease_id = $5::uuid AND generation = $6::bigint RETURNING 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "<uuid-v4>",
+            "1"
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief generated",
+          "stage": "session-brief",
+          "org_id": "org-a",
+          "workspace_id": "ws-a",
+          "harness": "claude",
+          "session_id": "s-1",
+          "model_id": "gpt-5.6-luna",
+          "tokens_in": 1234,
+          "tokens_out": 56,
+          "count": 1,
+          "ok": true
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief tick",
+          "stage": "session-brief",
+          "claimed": 1,
+          "failed": 0,
+          "skipped": 0
+        }
+      ]
+    },
+    {
+      "name": "tick retrying",
+      "result": {
+        "retrying": 1
+      },
+      "queries": [
+        {
+          "text": "WITH gone AS (\n       DELETE FROM sessions.session_brief_wakeups AS w\n        USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n                WHERE evidence_at < now() - make_interval(hours => $1::integer)\n                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n                  AND (lease_expires_at IS NULL OR lease_expires_at < now())\n                ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s\n        WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id\n          AND w.harness = s.harness AND w.session_id = s.session_id\n        RETURNING 1)\n     SELECT count(*)::int AS n FROM gone",
+          "params": [
+            72,
+            5000,
+            null
+          ]
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1\n       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))",
+          "params": [
+            null
+          ]
+        },
+        {
+          "text": "WITH due AS (\n       SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n        WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())\n          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n        ORDER BY due_at, org_id, workspace_id, harness, session_id\n        LIMIT $1 FOR UPDATE SKIP LOCKED)\n     UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),\n            attempts = w.attempts + 1\n       FROM due\n      WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id\n        AND w.harness = due.harness AND w.session_id = due.session_id\n      RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,\n                w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id",
+          "params": [
+            5,
+            300,
+            null
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,\n            brief_fingerprint, model,\n            generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago\n       FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT coalesce((SELECT attempts FROM sessions.session_brief_attempts\n                       WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                         AND workspace_id = $2 AND harness = $3 AND session_id = $4), 0)::int AS mine,\n            (SELECT count(*) FROM sessions.session_brief_attempts\n              WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others,\n            (SELECT coalesce(sum(attempts), 0) FROM sessions.session_brief_attempts\n              WHERE day = (now() AT TIME ZONE 'UTC')::date)::int AS total",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)\n     VALUES ($1, $2, $3, $4, (now() AT TIME ZONE 'UTC')::date, 1)\n     ON CONFLICT (org_id, day, workspace_id, harness, session_id)\n     DO UPDATE SET attempts = sessions.session_brief_attempts.attempts + 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = NULL, lease_expires_at = NULL,\n            -- Re-armed meanwhile: the new evidence keeps its own (earlier) due time.\n            due_at = CASE WHEN w.generation = $6::bigint THEN now() + make_interval(secs => $7::integer)\n                          ELSE least(w.due_at, now() + make_interval(secs => $7::integer)) END,\n            attempts = CASE WHEN $9::boolean THEN greatest(w.attempts - 1, 0) ELSE w.attempts END,\n            last_error = coalesce($8::text, w.last_error)\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND w.lease_id = $5::uuid AND $7::integer >= 0",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "<uuid-v4>",
+            "1",
+            60,
+            "model_rate_limited",
+            false
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "warn",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief retrying",
+          "stage": "session-brief",
+          "session_id": "s-1",
+          "error_code": "model_rate_limited",
+          "retryable": true,
+          "attempt": 1
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief tick",
+          "stage": "session-brief",
+          "claimed": 1,
+          "failed": 0,
+          "skipped": 0
+        }
+      ]
+    },
+    {
+      "name": "tick failed",
+      "result": {
+        "failed": 1
+      },
+      "queries": [
+        {
+          "text": "WITH gone AS (\n       DELETE FROM sessions.session_brief_wakeups AS w\n        USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n                WHERE evidence_at < now() - make_interval(hours => $1::integer)\n                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n                  AND (lease_expires_at IS NULL OR lease_expires_at < now())\n                ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s\n        WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id\n          AND w.harness = s.harness AND w.session_id = s.session_id\n        RETURNING 1)\n     SELECT count(*)::int AS n FROM gone",
+          "params": [
+            72,
+            5000,
+            null
+          ]
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1\n       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))",
+          "params": [
+            null
+          ]
+        },
+        {
+          "text": "WITH due AS (\n       SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n        WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())\n          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n        ORDER BY due_at, org_id, workspace_id, harness, session_id\n        LIMIT $1 FOR UPDATE SKIP LOCKED)\n     UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),\n            attempts = w.attempts + 1\n       FROM due\n      WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id\n        AND w.harness = due.harness AND w.session_id = due.session_id\n      RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,\n                w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id",
+          "params": [
+            5,
+            300,
+            null
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,\n            brief_fingerprint, model,\n            generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago\n       FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT coalesce((SELECT attempts FROM sessions.session_brief_attempts\n                       WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                         AND workspace_id = $2 AND harness = $3 AND session_id = $4), 0)::int AS mine,\n            (SELECT count(*) FROM sessions.session_brief_attempts\n              WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others,\n            (SELECT coalesce(sum(attempts), 0) FROM sessions.session_brief_attempts\n              WHERE day = (now() AT TIME ZONE 'UTC')::date)::int AS total",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)\n     VALUES ($1, $2, $3, $4, (now() AT TIME ZONE 'UTC')::date, 1)\n     ON CONFLICT (org_id, day, workspace_id, harness, session_id)\n     DO UPDATE SET attempts = sessions.session_brief_attempts.attempts + 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:brief:[\"org-a\",\"ws-a\",\"claude\",\"s-1\"]"
+          ]
+        },
+        {
+          "text": "SELECT revision::text AS revision FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 FOR UPDATE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_briefs AS b\n           (org_id, workspace_id, harness, session_id, status, revision, source_revisions, error,\n            attempted_at, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET\n           status = excluded.status, revision = excluded.revision,\n           source_revisions = excluded.source_revisions, error = excluded.error,\n           attempted_at = now(), updated_at = now()\n           ",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "failed",
+            2,
+            "{\"m-1\":2}",
+            "model_unavailable"
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_wakeups\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND lease_id = $5::uuid AND generation = $6::bigint RETURNING 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "<uuid-v4>",
+            "1"
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "warn",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief failed",
+          "stage": "session-brief",
+          "session_id": "s-1",
+          "error_code": "model_unavailable",
+          "retryable": true,
+          "attempt": 2
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief tick",
+          "stage": "session-brief",
+          "claimed": 1,
+          "failed": 1,
+          "skipped": 0
+        }
+      ]
+    },
+    {
+      "name": "tick final non-retryable",
+      "result": {
+        "failed": 1
+      },
+      "queries": [
+        {
+          "text": "WITH gone AS (\n       DELETE FROM sessions.session_brief_wakeups AS w\n        USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n                WHERE evidence_at < now() - make_interval(hours => $1::integer)\n                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n                  AND (lease_expires_at IS NULL OR lease_expires_at < now())\n                ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s\n        WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id\n          AND w.harness = s.harness AND w.session_id = s.session_id\n        RETURNING 1)\n     SELECT count(*)::int AS n FROM gone",
+          "params": [
+            72,
+            5000,
+            null
+          ]
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1\n       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))",
+          "params": [
+            null
+          ]
+        },
+        {
+          "text": "WITH due AS (\n       SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n        WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())\n          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n        ORDER BY due_at, org_id, workspace_id, harness, session_id\n        LIMIT $1 FOR UPDATE SKIP LOCKED)\n     UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),\n            attempts = w.attempts + 1\n       FROM due\n      WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id\n        AND w.harness = due.harness AND w.session_id = due.session_id\n      RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,\n                w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id",
+          "params": [
+            5,
+            300,
+            null
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,\n            brief_fingerprint, model,\n            generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago\n       FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT coalesce((SELECT attempts FROM sessions.session_brief_attempts\n                       WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                         AND workspace_id = $2 AND harness = $3 AND session_id = $4), 0)::int AS mine,\n            (SELECT count(*) FROM sessions.session_brief_attempts\n              WHERE org_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date\n                AND NOT (workspace_id = $2 AND harness = $3 AND session_id = $4))::int AS others,\n            (SELECT coalesce(sum(attempts), 0) FROM sessions.session_brief_attempts\n              WHERE day = (now() AT TIME ZONE 'UTC')::date)::int AS total",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)\n     VALUES ($1, $2, $3, $4, (now() AT TIME ZONE 'UTC')::date, 1)\n     ON CONFLICT (org_id, day, workspace_id, harness, session_id)\n     DO UPDATE SET attempts = sessions.session_brief_attempts.attempts + 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "BEGIN",
+          "params": []
+        },
+        {
+          "text": "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          "params": [
+            "96bulls:brief:[\"org-a\",\"ws-a\",\"claude\",\"s-1\"]"
+          ]
+        },
+        {
+          "text": "SELECT revision::text AS revision FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 FOR UPDATE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64 FOR SHARE",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1"
+          ]
+        },
+        {
+          "text": "INSERT INTO sessions.session_briefs AS b\n           (org_id, workspace_id, harness, session_id, status, revision, source_revisions, error,\n            attempted_at, updated_at)\n         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now())\n         ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET\n           status = excluded.status, revision = excluded.revision,\n           source_revisions = excluded.source_revisions, error = excluded.error,\n           attempted_at = now(), updated_at = now()\n           ",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "failed",
+            3,
+            "{\"m-1\":3}",
+            "model_auth_failed"
+          ]
+        },
+        {
+          "text": "COMMIT",
+          "params": []
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_wakeups\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND lease_id = $5::uuid AND generation = $6::bigint RETURNING 1",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-1",
+            "<uuid-v4>",
+            "1"
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "warn",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief failed",
+          "stage": "session-brief",
+          "session_id": "s-1",
+          "error_code": "model_auth_failed",
+          "retryable": false,
+          "attempt": 1
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief tick",
+          "stage": "session-brief",
+          "claimed": 1,
+          "failed": 1,
+          "skipped": 0
+        }
+      ]
+    },
+    {
+      "name": "sweepUnbriefed default",
+      "result": 1,
+      "queries": [
+        {
+          "text": "WITH missing AS (\n       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id\n         FROM sessions.session_directory AS d\n         CROSS JOIN LATERAL (\n           SELECT p.session_id\n             FROM sessions.session_index AS p\n            WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n              AND p.harness = d.harness AND p.deleted_at IS NULL\n              AND (p.session_id = d.session_id\n                   OR coalesce(p.canonical_session_id, p.session_id) = d.session_id)\n            ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1\n         ) AS physical\n        WHERE d.deleted_at IS NULL\n          AND ($3::text[] IS NULL OR d.workspace_id=ANY($3::text[]))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b\n                           WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id\n                             AND b.harness = d.harness AND b.session_id = physical.session_id\n                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (\n                               SELECT jsonb_object_agg(p.machine_id, p.revision)\n                                 FROM sessions.session_index AS p\n                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                  AND p.harness = d.harness AND p.session_id = physical.session_id\n                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL))\n                             -- Canonical mode: a rate_limited brief is not coverage. Its parked\n                             -- wakeup can be pruned after SESSION_WAKE_MAX_AGE_HOURS; re-arm it.\n                             AND NOT ($7::boolean AND b.status = 'rate_limited')\n                             AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'\n                                  OR b.engine_version LIKE 'neon-backfill:%'\n                                  OR (b.engine_version IS NOT DISTINCT FROM $4::text\n                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text))\n                             AND NOT ($6::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'\n                               AND EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)\n                               AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL\n                                   AND (p.raw_format IS DISTINCT FROM 'jsonl' OR p.manifest_key IS NULL))))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w\n                           WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id\n                             AND w.harness = d.harness AND w.session_id = physical.session_id)\n        ORDER BY d.last_activity_at DESC LIMIT $1),\n     armed AS (\n       INSERT INTO sessions.session_brief_wakeups\n         (org_id, workspace_id, harness, session_id, admission, due_at)\n       SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing\n       ON CONFLICT DO NOTHING RETURNING 1)\n     SELECT count(*)::int AS n FROM armed",
+          "params": [
+            100,
+            false,
+            null,
+            null,
+            "session-summary-v3",
+            false,
+            false
+          ]
+        }
+      ],
+      "logs": []
+    },
+    {
+      "name": "sweepUnbriefed canonical",
+      "result": 1,
+      "queries": [
+        {
+          "text": "WITH missing AS (\n       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id\n         FROM sessions.session_directory AS d\n         CROSS JOIN LATERAL (\n           SELECT p.session_id\n             FROM sessions.session_index AS p\n            WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n              AND p.harness = d.harness AND p.deleted_at IS NULL\n              AND (p.session_id = d.session_id\n                   OR coalesce(p.canonical_session_id, p.session_id) = d.session_id)\n            ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1\n         ) AS physical\n        WHERE d.deleted_at IS NULL\n          AND ($3::text[] IS NULL OR d.workspace_id=ANY($3::text[]))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b\n                           WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id\n                             AND b.harness = d.harness AND b.session_id = physical.session_id\n                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (\n                               SELECT jsonb_object_agg(p.machine_id, p.revision)\n                                 FROM sessions.session_index AS p\n                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                  AND p.harness = d.harness AND p.session_id = physical.session_id\n                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL))\n                             -- Canonical mode: a rate_limited brief is not coverage. Its parked\n                             -- wakeup can be pruned after SESSION_WAKE_MAX_AGE_HOURS; re-arm it.\n                             AND NOT ($7::boolean AND b.status = 'rate_limited')\n                             AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'\n                                  OR b.engine_version LIKE 'neon-backfill:%'\n                                  OR (b.engine_version IS NOT DISTINCT FROM $4::text\n                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text))\n                             AND NOT ($6::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'\n                               AND EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)\n                               AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL\n                                   AND (p.raw_format IS DISTINCT FROM 'jsonl' OR p.manifest_key IS NULL))))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w\n                           WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id\n                             AND w.harness = d.harness AND w.session_id = physical.session_id)\n        ORDER BY d.last_activity_at DESC LIMIT $1),\n     armed AS (\n       INSERT INTO sessions.session_brief_wakeups\n         (org_id, workspace_id, harness, session_id, admission, due_at)\n       SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing\n       ON CONFLICT DO NOTHING RETURNING 1)\n     SELECT count(*)::int AS n FROM armed",
+          "params": [
+            100,
+            true,
+            [
+              "ws-a"
+            ],
+            "session-summary-v3:96bulls-canonical-v2",
+            "session-summary-v3",
+            true,
+            true
+          ]
+        }
+      ],
+      "logs": []
+    },
+    {
+      "name": "tick with sweep",
+      "result": {
+        "retrying": 1
+      },
+      "queries": [
+        {
+          "text": "WITH gone AS (\n       DELETE FROM sessions.session_brief_wakeups AS w\n        USING (SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n                WHERE evidence_at < now() - make_interval(hours => $1::integer)\n                  AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n                  AND (lease_expires_at IS NULL OR lease_expires_at < now())\n                ORDER BY evidence_at LIMIT $2 FOR UPDATE SKIP LOCKED) AS s\n        WHERE w.org_id = s.org_id AND w.workspace_id = s.workspace_id\n          AND w.harness = s.harness AND w.session_id = s.session_id\n        RETURNING 1)\n     SELECT count(*)::int AS n FROM gone",
+          "params": [
+            72,
+            5000,
+            null
+          ]
+        },
+        {
+          "text": "DELETE FROM sessions.session_brief_attempts WHERE day < (now() AT TIME ZONE 'UTC')::date - 1\n       AND ($1::text[] IS NULL OR workspace_id=ANY($1::text[]))",
+          "params": [
+            null
+          ]
+        },
+        {
+          "text": "WITH missing AS (\n       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id\n         FROM sessions.session_directory AS d\n         CROSS JOIN LATERAL (\n           SELECT p.session_id\n             FROM sessions.session_index AS p\n            WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n              AND p.harness = d.harness AND p.deleted_at IS NULL\n              AND (p.session_id = d.session_id\n                   OR coalesce(p.canonical_session_id, p.session_id) = d.session_id)\n            ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1\n         ) AS physical\n        WHERE d.deleted_at IS NULL\n          AND ($3::text[] IS NULL OR d.workspace_id=ANY($3::text[]))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b\n                           WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id\n                             AND b.harness = d.harness AND b.session_id = physical.session_id\n                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (\n                               SELECT jsonb_object_agg(p.machine_id, p.revision)\n                                 FROM sessions.session_index AS p\n                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                  AND p.harness = d.harness AND p.session_id = physical.session_id\n                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL))\n                             -- Canonical mode: a rate_limited brief is not coverage. Its parked\n                             -- wakeup can be pruned after SESSION_WAKE_MAX_AGE_HOURS; re-arm it.\n                             AND NOT ($7::boolean AND b.status = 'rate_limited')\n                             AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'\n                                  OR b.engine_version LIKE 'neon-backfill:%'\n                                  OR (b.engine_version IS NOT DISTINCT FROM $4::text\n                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text))\n                             AND NOT ($6::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'\n                               AND EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)\n                               AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p\n                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id\n                                   AND p.harness = d.harness AND p.session_id = physical.session_id\n                                   AND p.deleted_at IS NULL\n                                   AND (p.raw_format IS DISTINCT FROM 'jsonl' OR p.manifest_key IS NULL))))\n          AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w\n                           WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id\n                             AND w.harness = d.harness AND w.session_id = physical.session_id)\n        ORDER BY d.last_activity_at DESC LIMIT $1),\n     armed AS (\n       INSERT INTO sessions.session_brief_wakeups\n         (org_id, workspace_id, harness, session_id, admission, due_at)\n       SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing\n       ON CONFLICT DO NOTHING RETURNING 1)\n     SELECT count(*)::int AS n FROM armed",
+          "params": [
+            100,
+            false,
+            null,
+            null,
+            "session-summary-v3",
+            false,
+            false
+          ]
+        },
+        {
+          "text": "WITH due AS (\n       SELECT org_id, workspace_id, harness, session_id FROM sessions.session_brief_wakeups\n        WHERE due_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now())\n          AND ($3::text[] IS NULL OR workspace_id=ANY($3::text[]))\n        ORDER BY due_at, org_id, workspace_id, harness, session_id\n        LIMIT $1 FOR UPDATE SKIP LOCKED)\n     UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = gen_random_uuid(), lease_expires_at = now() + make_interval(secs => $2::integer),\n            attempts = w.attempts + 1\n       FROM due\n      WHERE w.org_id = due.org_id AND w.workspace_id = due.workspace_id\n        AND w.harness = due.harness AND w.session_id = due.session_id\n      RETURNING w.org_id, w.workspace_id, w.harness, w.session_id, w.admission,\n                w.generation::text AS generation, w.attempts, w.lease_id::text AS lease_id",
+          "params": [
+            5,
+            300,
+            null
+          ]
+        },
+        {
+          "text": "SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id LIMIT 64",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-2"
+          ]
+        },
+        {
+          "text": "SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,\n            brief_fingerprint, model,\n            generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago\n       FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-2"
+          ]
+        },
+        {
+          "text": "UPDATE sessions.session_brief_wakeups AS w\n        SET lease_id = NULL, lease_expires_at = NULL,\n            -- Re-armed meanwhile: the new evidence keeps its own (earlier) due time.\n            due_at = CASE WHEN w.generation = $6::bigint THEN now() + make_interval(secs => $7::integer)\n                          ELSE least(w.due_at, now() + make_interval(secs => $7::integer)) END,\n            attempts = CASE WHEN $9::boolean THEN greatest(w.attempts - 1, 0) ELSE w.attempts END,\n            last_error = coalesce($8::text, w.last_error)\n      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND w.lease_id = $5::uuid AND $7::integer >= 0",
+          "params": [
+            "org-a",
+            "ws-a",
+            "claude",
+            "s-2",
+            "<uuid-v4>",
+            "1",
+            60,
+            "manifest_missing",
+            false
+          ]
+        }
+      ],
+      "logs": [
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief sweep armed",
+          "stage": "session-brief",
+          "count": 1
+        },
+        {
+          "level": "warn",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief retrying",
+          "stage": "session-brief",
+          "session_id": "s-2",
+          "error_code": "manifest_missing",
+          "retryable": true,
+          "attempt": 1
+        },
+        {
+          "level": "info",
+          "service": "96bulls",
+          "deployment": "selfhost",
+          "deployment_id": "local",
+          "message": "session brief tick",
+          "stage": "session-brief",
+          "claimed": 1,
+          "failed": 0,
+          "skipped": 0
+        }
+      ]
+    }
+  ],
+  "briefs": [
+    {
+      "session_id": "s-1",
+      "status": "failed",
+      "error": "model_auth_failed",
+      "source_revisions": {
+        "m-1": 3
+      }
+    }
+  ]
+}
