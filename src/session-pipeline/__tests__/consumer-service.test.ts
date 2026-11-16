@@ -1278,8 +1278,8 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
   });
 
   test("startup refuses a set PGOPTIONS environment fallback", () => {
-    // node-pg resolves a missing pool options from PGOPTIONS, so a set
-    // variable fails loudly instead of being silently shadowed by the pin.
+    // node-pg resolves missing pool options from PGOPTIONS, so a set variable
+    // fails loudly instead of relying on startup options Supavisor drops.
     expect(() => refuseEnvOptions({ PGOPTIONS: "-c role=search_consumer_runtime" })).toThrow(
       "PGOPTIONS",
     );
@@ -1287,19 +1287,15 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
     expect(() => refuseEnvOptions({})).not.toThrow();
   });
 
-  test("the writer pool pins options and refuses PGOPTIONS", async () => {
-    // Structural half: a non-empty options shadows the environment in
-    // node-pg's resolution, so ambient PGOPTIONS can never reach a pooled
-    // connection. save/restore the variable: the factory reads the ambient
-    // process environment, not the injectable serve env.
+  test("the writer pool omits false startup GUCs and refuses PGOPTIONS", async () => {
+    // Supavisor drops startup options. The factory emits none and rejects the
+    // ambient fallback before construction.
     const saved = process.env.PGOPTIONS;
     try {
       delete process.env.PGOPTIONS;
       const db = supabasePool("postgres://writer:secret@db:5432/hoop", 1);
       try {
-        expect((db.pool as unknown as { options?: { options?: unknown } }).options?.options).toContain(
-          "idle_in_transaction_session_timeout",
-        );
+        expect((db.pool as unknown as { options?: { options?: unknown } }).options?.options).toBeUndefined();
       } finally {
         await db.end();
       }

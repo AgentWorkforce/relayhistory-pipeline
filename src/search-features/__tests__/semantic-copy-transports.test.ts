@@ -1,6 +1,7 @@
 import {expect,test} from "bun:test";
 import net from "node:net";import pg from "pg";
 import {SemanticPostgresExecutor,scopeSemanticSql} from "../semantic-copy-postgres.ts";
+import {semanticReadonlyPool} from "../semantic-copy-source-pool.ts";
 import {scopedSemanticCh,createSemanticClickHouseClient} from "../semantic-copy-ch.ts";
 import {createClickHouseClient} from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 test.each(["command","select","insert"] as const)("job abort cancels actual CH %s HTTP request and keeps parameters",async method=>{
@@ -19,6 +20,7 @@ test("metadata acquisition is bounded against a real silent TCP peer and dispatc
  try{const start=performance.now(),db=new SemanticPostgresExecutor(pool);await expect(db.queryBounded("SELECT 1",undefined,{signal:AbortSignal.timeout(50),deadline:Date.now()+50})).rejects.toThrow();expect(performance.now()-start).toBeLessThan(1000);expect(accepted).toBe(1);expect(querySeen).toBe(false)}
  finally{await pool.end();for(const socket of sockets)socket.destroy();await new Promise<void>(r=>server.close(()=>r()))}
 });
+test("semantic source pool does not rely on startup GUCs",async()=>{const pool=semanticReadonlyPool("postgresql://reader:secret@pooler.invalid/relayhistory_legacy");try{expect((pool as unknown as {options?:{options?:unknown}}).options?.options).toBeUndefined()}finally{await pool.end()}});
 test("scoped heartbeat cancellation uses its own signal without aborting sibling metadata",async()=>{
  const parent=new AbortController(),beat=new AbortController(),signals:AbortSignal[]=[];
  const raw={query:async<T>()=>({rows:[] as T[]}),queryBounded:async<T>(_sql:string,_args:unknown[]|undefined,c:any)=>{signals.push(c.signal);return{rows:[] as T[]}}};

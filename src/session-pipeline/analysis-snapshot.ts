@@ -54,9 +54,11 @@ export async function readLegacyAnalysisSnapshot(source:ReadonlyAnalysisSource,i
 })}
 
 /** Separate public-CA TLS source pool; never reuse Supabase's pinned-root pool.
- * Drop URL TLS/options overrides so credentials cannot weaken this boundary. */
+ * Drop URL TLS/options overrides so credentials cannot weaken this boundary.
+ * Supavisor drops startup options; the snapshot transaction above explicitly
+ * establishes READ ONLY and its transaction-local statement timeout. */
 export function readonlyAnalysisPool(url:string,onError:(code:string)=>void=()=>{}):Pool {
  const parsed=new URL(url);if(!/^postgres(?:ql)?:$/u.test(parsed.protocol))throw new Error("analysis source: invalid postgres URL");
  for(const key of ["sslmode","sslrootcert","sslcert","sslkey","ssl","options"])parsed.searchParams.delete(key);
- const pool=new pg.Pool({connectionString:parsed.toString(),max:1,application_name:"96bulls-analysis-cache-readonly",ssl:{rejectUnauthorized:true},options:"-c default_transaction_read_only=on -c statement_timeout=15000",idleTimeoutMillis:60000});pool.on("error",error=>onError(/^[A-Z0-9_]{1,40}$/u.test(String((error as {code?:unknown}).code??""))?String((error as {code?:unknown}).code):"source_pool_error"));return pool;
+ const pool=new pg.Pool({connectionString:parsed.toString(),max:1,application_name:"96bulls-analysis-cache-readonly",ssl:{rejectUnauthorized:true},idleTimeoutMillis:60000});pool.on("error",error=>onError(/^[A-Z0-9_]{1,40}$/u.test(String((error as {code?:unknown}).code??""))?String((error as {code?:unknown}).code):"source_pool_error"));return pool;
 }
