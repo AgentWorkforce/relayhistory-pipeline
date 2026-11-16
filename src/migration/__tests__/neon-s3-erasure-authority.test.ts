@@ -406,7 +406,7 @@ describe("supabase privacy authority as the eraser's source", () => {
   test("legacy export readiness requires a fresh heartbeat from a healthy real Supabase sweep", async () => {
     const w = await world();
     // 062010 is separately owned and absent from this standalone fixture; a
-    // release stack always has it before 062020.
+    // release stack always has it before 062030.
     await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
       org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
       first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
