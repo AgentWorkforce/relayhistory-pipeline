@@ -5,7 +5,7 @@
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { isObjectStoreError } from "../../packages/object-store/src/errors.ts";
 import type { ObjectStore, ObjectVersion } from "../../packages/object-store/src/types.ts";
-import { bigObjectOpCap } from "./caps.ts";
+import { objectOpCap } from "./caps.ts";
 import type { TargetId } from "./config.ts";
 import { cell, jsonDoc, key, KIB, need, randomBytes, readBody, readOptional, type Ctx } from "./context.ts";
 import { errorClass, mapLimit } from "./load.ts";
@@ -58,8 +58,8 @@ export async function step1(ctx: Ctx, target: BucketId): Promise<void> {
   for (const concurrency of ctx.profile.concurrencies) {
     for (const kib of sizes) {
       const body = randomBytes(kib * KIB);
-      await cell(ctx, { step: 1, cell: "put", target, params: { concurrency, kib, sse: "kms" } }, { concurrency, op: async (w, i) => void (await store.put(key(root, `put-${kib}k-c${concurrency}`, (w * 7919 + i) % PUT_RING), body)) });
-      await cell(ctx, { step: 1, cell: "get", target, params: { concurrency, kib, sse: "kms" } }, { concurrency, op: async (w, i) => void (await readBody(store, key(`${root}/pool-${kib}k`, (w + i) % READ_POOL))) });
+      await cell(ctx, { step: 1, cell: "put", target, params: { concurrency, kib, sse: "kms" } }, { concurrency, maxOps: objectOpCap(ctx.profile, kib), op: async (w, i) => void (await store.put(key(root, `put-${kib}k-c${concurrency}`, (w * 7919 + i) % PUT_RING), body)) });
+      await cell(ctx, { step: 1, cell: "get", target, params: { concurrency, kib, sse: "kms" } }, { concurrency, maxOps: objectOpCap(ctx.profile, kib), op: async (w, i) => void (await readBody(store, key(`${root}/pool-${kib}k`, (w + i) % READ_POOL))) });
     }
     await cell(ctx, { step: 1, cell: "head", target, params: { concurrency } }, { concurrency, op: async (w, i) => void (await store.head(key(`${root}/pool-1k`, (w + i) % READ_POOL))) });
     await cell(ctx, { step: 1, cell: "list", target, params: { concurrency, keys: LIST_KEYS } }, {
@@ -74,8 +74,8 @@ export async function step1(ctx: Ctx, target: BucketId): Promise<void> {
   // 256 KiB only at concurrency 8, as the plan says.
   await seed(store, `${root}/pool-256k`, 16, 256 * KIB);
   const big = randomBytes(256 * KIB);
-  await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: bigObjectOpCap(ctx.profile), op: async (w, i) => void (await store.put(key(root, "put-256k-c8", (w * 7919 + i) % 256), big)) });
-  await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: bigObjectOpCap(ctx.profile), op: async (w, i) => void (await readBody(store, key(`${root}/pool-256k`, (w + i) % 16))) });
+  await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: objectOpCap(ctx.profile, 256), op: async (w, i) => void (await store.put(key(root, "put-256k-c8", (w * 7919 + i) % 256), big)) });
+  await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: objectOpCap(ctx.profile, 256), op: async (w, i) => void (await readBody(store, key(`${root}/pool-256k`, (w + i) % 16))) });
 
   // The KMS share: the same requests against SSE-S3 objects in the same bucket (R1 and R2 only).
   const plain = target === "R1" || target === "R2" ? ctx.sseS3[target] : undefined;
@@ -83,8 +83,8 @@ export async function step1(ctx: Ctx, target: BucketId): Promise<void> {
     for (const kib of sizes) {
       await seed(plain, `${root}/sse-s3-pool-${kib}k`, READ_POOL, kib * KIB);
       const body = randomBytes(kib * KIB);
-      await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib, sse: "s3" } }, { concurrency: 8, op: async (w, i) => void (await plain.put(key(root, `sse-s3-put-${kib}k`, (w * 7919 + i) % PUT_RING), body)) });
-      await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib, sse: "s3" } }, { concurrency: 8, op: async (w, i) => void (await readBody(plain, key(`${root}/sse-s3-pool-${kib}k`, (w + i) % READ_POOL))) });
+      await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib, sse: "s3" } }, { concurrency: 8, maxOps: objectOpCap(ctx.profile, kib), op: async (w, i) => void (await plain.put(key(root, `sse-s3-put-${kib}k`, (w * 7919 + i) % PUT_RING), body)) });
+      await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib, sse: "s3" } }, { concurrency: 8, maxOps: objectOpCap(ctx.profile, kib), op: async (w, i) => void (await readBody(plain, key(`${root}/sse-s3-pool-${kib}k`, (w + i) % READ_POOL))) });
     }
   }
 }

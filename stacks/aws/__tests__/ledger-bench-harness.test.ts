@@ -4,6 +4,7 @@ import type { ObjectStore } from "../../../packages/object-store/src/types.ts";
 import { assumeRole, BudgetExhausted, Dynamo, expressStore, expressZone, meteredFetch, RequestMeter } from "../../../benchmarks/ledger-bench/aws.ts";
 import { LANES, parseConfig, SMOKE, STANDARD, type Profile } from "../../../benchmarks/ledger-bench/config.ts";
 import { key, type Cell, type Ctx } from "../../../benchmarks/ledger-bench/context.ts";
+import { GROUP_SIZES, logOpCap, objectOpCap, STREAM_COUNTS } from "../../../benchmarks/ledger-bench/caps.ts";
 import { costBound, FIXED_USD, laneCostBound, PRICE, PRICE_GIB, PRICE_PER_GIB } from "../../../benchmarks/ledger-bench/cost.ts";
 import { errorClass, runLoad } from "../../../benchmarks/ledger-bench/load.ts";
 import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../../../benchmarks/ledger-bench/protocols.ts";
@@ -136,6 +137,18 @@ describe("config and cost", () => {
     // The per-GiB price is the sum of the named list prices, never less.
     expect(PRICE_PER_GIB).toBeGreaterThanOrEqual(PRICE_GIB.natProcessing + PRICE_GIB.interRegion + PRICE_GIB.expressData);
     expect(PRICE.s3Read).toBeLessThan(PRICE.s3Write);
+    // A lane's cells must fit its byte budget even on a backend that never slows them down: every capped
+    // cell at its cap, for the two widest lanes (the plan's steps on R2 with PLOG and PDDB; Express with step 4).
+    const gib = (ops: number, kib: number, writes = 1) => (ops * kib * writes) / 1024 ** 2;
+    const step1 = STANDARD.concurrencies.length * 2 * (gib(objectOpCap(STANDARD, 64), 64) + gib(objectOpCap(STANDARD, 1), 1)) + 2 * gib(objectOpCap(STANDARD, 256), 256);
+    const logs = GROUP_SIZES.reduce((a, g) => a + STREAM_COUNTS.length * gib(logOpCap(STANDARD, g), 64 * g), 0);
+    const sse = 2 * (gib(objectOpCap(STANDARD, 64), 64) + gib(objectOpCap(STANDARD, 1), 1));
+    const step4 = gib(objectOpCap(STANDARD, 64), 64) + gib(Math.ceil(objectOpCap(STANDARD, 64) / 3), 64, 3) + 2;
+    const budget = STANDARD.byteBudgetPerLane / 1024 ** 3;
+    expect(step1 + sse + 2 * logs + 3).toBeLessThan(budget * 0.75);
+    expect(step1 + logs + step4 + 3).toBeLessThan(budget * 0.75);
+    expect(objectOpCap(STANDARD, 256)).toBe(3000);
+    expect(objectOpCap(STANDARD, 1)).toBe(STANDARD.maxOpsPerCell);
     // The byte budget is priced into the bound: a larger one must show.
     expect(costBound({ ...STANDARD, byteBudgetPerLane: STANDARD.byteBudgetPerLane * 10 }, 3).total_usd).toBeGreaterThan(300);
   });

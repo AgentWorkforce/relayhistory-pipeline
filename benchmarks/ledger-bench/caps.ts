@@ -12,8 +12,12 @@ export const HOT_HEAD_LEVELS = [64, 128, 256, 512];
 /** A group of 30 is a 1.9 MiB PUT; the cap keeps a cell under about 0.75 GiB written. */
 export const logOpCap = (profile: Profile, group: number) => Math.min(profile.maxOpsPerCell, Math.ceil(12_000 / group));
 
-/** The 256 KiB cells: about 2 GiB each at most. */
-export const bigObjectOpCap = (profile: Profile) => Math.min(profile.maxOpsPerCell, 8_000);
+/**
+ * A latency cell on objects of `kib` KiB stops after about 0.75 GiB: 12,000 operations at 64 KiB, 3,000 at
+ * 256 KiB. A fast backend (S3 Express) otherwise spends the lane's byte budget in step 1 and never reaches
+ * its later steps. Small objects keep the profile's cap.
+ */
+export const objectOpCap = (profile: Profile, kib: number) => Math.min(profile.maxOpsPerCell, kib < 64 ? profile.maxOpsPerCell : Math.ceil((12_000 * 64) / kib));
 
 /** A 100-item transaction is 200 write units; the cap keeps a cell near a million units. */
 export const transactOpCap = (profile: Profile, items: number) => Math.min(profile.maxOpsPerCell, Math.ceil(600_000 / items));
