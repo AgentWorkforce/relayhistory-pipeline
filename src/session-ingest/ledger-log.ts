@@ -75,7 +75,8 @@ export interface LogBatch {
   sessions: [string, string][];
   payloads: LogPayloadRef[];
 }
-interface EntryBase { v: 1; seq: number; prev: string | null; epoch: number; writer: string; atMs: number }
+/** `stream`: the stream's key root, so an entry copied to another stream never validates there. */
+interface EntryBase { v: 1; stream: string; seq: number; prev: string | null; epoch: number; writer: string; atMs: number }
 export type LogEntry =
   | (EntryBase & { kind: "open"; legacyCutover: string | null })
   | (EntryBase & { kind: "epoch" })
@@ -86,6 +87,9 @@ export interface LogCheckpoint {
   /** sha256 of entry `seq`'s exact bytes: a checkpoint is valid only if it matches the entry it names. */
   hash: string;
   epoch: number;
+  /** The writer whose open or epoch entry set `epoch`: the only one that may append batches. */
+  epochWriter: string;
+  legacyCutover: string | null;
   inboxCursor: string | null;
   /** Oldest first: [batchId, digest]. */
   remembered: [string, string][];
@@ -112,6 +116,10 @@ export interface LogState {
   head: number;
   headHash: string;
   epoch: number;
+  /** The writer that holds `epoch` (its open or epoch entry landed): appendBatches refuses any other writer. */
+  epochWriter: string;
+  /** Entry 0's legacy cutover: the last legacy batch committed before the stream switched. */
+  legacyCutover: string | null;
   inboxCursor: string | null;
   remembered: Map<string, string>;
   /** An entry whose landing is unresolved: the next append must resend exactly these bytes first. */
@@ -130,8 +138,8 @@ function validBatch(b: unknown): b is LogBatch {
 }
 export function validEntry(v: unknown): v is LogEntry {
   const e = v as LogEntry;
-  if (!e || e.v !== 1 || !isNat(e.seq) || !(e.prev === null || isStr(e.prev)) || !isNat(e.epoch) || !isStr(e.writer) || !isNat(e.atMs)) return false;
-  if (e.kind === "open") return e.seq === 0 && e.prev === null && (e.legacyCutover === null || isStr(e.legacyCutover));
+  if (!e || e.v !== 1 || !isStr(e.stream) || !isNat(e.seq) || !(e.prev === null || isStr(e.prev)) || !isNat(e.epoch) || !isStr(e.writer) || !isNat(e.atMs)) return false;
+  if (e.kind === "open") return e.seq === 0 && e.prev === null && e.epoch === 1 && (e.legacyCutover === null || isStr(e.legacyCutover));
   if (e.kind === "epoch") return e.seq > 0 && isStr(e.prev);
   if (e.kind === "batches") return e.seq > 0 && isStr(e.prev) && Array.isArray(e.batches) && e.batches.length > 0 && e.batches.every(validBatch) &&
     (e.inboxCursor === null || isStr(e.inboxCursor));
@@ -139,7 +147,8 @@ export function validEntry(v: unknown): v is LogEntry {
 }
 function validCheckpoint(v: unknown): v is LogCheckpoint {
   const c = v as LogCheckpoint;
-  return !!c && c.v === 1 && isNat(c.seq) && isStr(c.hash) && isNat(c.epoch) && (c.inboxCursor === null || isStr(c.inboxCursor)) &&
+  return !!c && c.v === 1 && isNat(c.seq) && isStr(c.hash) && isNat(c.epoch) && isStr(c.epochWriter) && (c.legacyCutover === null || isStr(c.legacyCutover)) &&
+    (c.inboxCursor === null || isStr(c.inboxCursor)) &&
     Array.isArray(c.remembered) && c.remembered.every((r) => Array.isArray(r) && r.length === 2 && isStr(r[0]) && isStr(r[1]));
 }
 
@@ -152,8 +161,8 @@ async function readBytes(store: ObjectStore, key: string): Promise<Uint8Array | 
 }
 const parse = (bytes: Uint8Array): unknown => { try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; } };
 const equalBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
-/** Retried: the store's own `transient` (network, 408, 429, 5xx) and anything thrown below the store (an abort). */
-const transient = (error: unknown) => !isObjectStoreError(error) || error.code === "transient";
+/** Retried: only the store's own `transient` (network, 408, 429, 5xx). Any other error is not a store fault: rethrown. */
+const transient = (error: unknown) => isObjectStoreError(error) && error.code === "transient";
 /** A create found a different object at the key ("already_exists"; some backends answer a 412 for it). */
 const taken = (error: unknown) => isObjectStoreError(error) && (error.code === "already_exists" || error.code === "precondition_failed");
 
@@ -193,41 +202,82 @@ async function createEntry(store: ObjectStore, keys: LogKeys, seq: number, bytes
   return equalBytes(there, bytes) ? "landed" : "taken";
 }
 
+/** Every entry seq stored for the stream (a listing of e/). Used to prove there is nothing past a head. */
+async function storedSeqs(store: ObjectStore, keys: LogKeys): Promise<number[]> {
+  const prefix = `${keys.root}/e/`, out: number[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.list(objectKey(`${keys.root}/e`), cursor);
+    for (const item of page.items) {
+      const k = String(item.key);
+      if (!k.startsWith(prefix)) continue;
+      const m = /^(\d{20})\.json$/.exec(k.slice(prefix.length));
+      if (m) out.push(Number(m[1]));
+    }
+    cursor = page.nextCursor;
+  } while (cursor);
+  return out;
+}
+/**
+ * A dense chain ends at `head`: anything stored past it is a deleted or lost entry in the middle (LogCorrupt), never a
+ * shorter log. With no entry 0, any stored entry means entry 0 was lost: the stream must not read as legacy.
+ */
+async function assertNothingPast(store: ObjectStore, keys: LogKeys, head: number | null): Promise<void> {
+  const seqs = await storedSeqs(store, keys);
+  if (head === null ? seqs.length > 0 : seqs.some((s) => s > head)) throw new LogCorrupt(head === null ? "log_open_missing" : "log_entry_gap");
+}
+
 // ---- open / replay ----
 
-/** `undefined`: the stream is not in log mode (no entry 0), so it is a legacy stream. */
+function opened(keys: LogKeys, zero: Uint8Array): LogState {
+  const open = parse(zero);
+  if (!validEntry(open) || open.kind !== "open" || open.stream !== keys.root) throw new LogCorrupt("log_open_invalid");
+  return { keys, head: 0, headHash: sha256(zero), epoch: open.epoch, epochWriter: open.writer, legacyCutover: open.legacyCutover, inboxCursor: null, remembered: new Map() };
+}
+
+/** `undefined`: the stream is not in log mode (no entry 0, and no entry at all), so it is a legacy stream. */
 export async function openStream(store: ObjectStore, keys: LogKeys): Promise<LogState | undefined> {
   const zero = await readBytes(store, keys.entry(0));
-  if (zero === undefined) return undefined;
-  const open = parse(zero);
-  if (!validEntry(open) || open.kind !== "open") throw new LogCorrupt("log_open_invalid");
-  let state: LogState = { keys, head: 0, headHash: sha256(zero), epoch: open.epoch, inboxCursor: null, remembered: new Map() };
-  // Start from the newest checkpoint the hint names, if it verifies against its entry; else from entry 0.
-  const hint = parse((await readBytes(store, keys.head)) ?? new Uint8Array()) as { seq?: unknown } | undefined;
-  if (hint && isNat(hint.seq) && hint.seq > 0) {
-    const cp = parse((await readBytes(store, keys.checkpoint(hint.seq))) ?? new Uint8Array());
-    const at = await readBytes(store, keys.entry(hint.seq));
-    if (validCheckpoint(cp) && cp.seq === hint.seq && at !== undefined && sha256(at) === cp.hash)
-      state = { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
+  if (zero === undefined) { await assertNothingPast(store, keys, null); return undefined; }
+  let state = opened(keys, zero);
+  // Start from the newest checkpoint the hint names, if it verifies against its entry; else from entry 0. The hint
+  // and the checkpoint are optional: a missing, malformed or unreadable one (a transient store error) falls back.
+  try {
+    const hint = parse((await readBytes(store, keys.head)) ?? new Uint8Array()) as { seq?: unknown } | undefined;
+    if (hint && isNat(hint.seq) && hint.seq > 0) {
+      const cp = parse((await readBytes(store, keys.checkpoint(hint.seq))) ?? new Uint8Array());
+      const at = await readBytes(store, keys.entry(hint.seq));
+      if (validCheckpoint(cp) && cp.seq === hint.seq && at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover)
+        state = { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, epochWriter: cp.epochWriter, legacyCutover: cp.legacyCutover,
+          inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
+    }
+  } catch (error) {
+    if (!isObjectStoreError(error)) throw error;
   }
   for (;;) {
     const bytes = await readBytes(store, keys.entry(state.head + 1));
-    if (bytes === undefined) return state;
+    if (bytes === undefined) break;
     applyEntry(state, bytes);
   }
+  await assertNothingPast(store, keys, state.head);
+  return state;
 }
 
 /** Advance `state` over the next entry's exact bytes, or throw LogCorrupt. */
 export function applyEntry(state: LogState, bytes: Uint8Array): LogEntry {
   const e = parse(bytes);
   if (!validEntry(e)) throw new LogCorrupt("log_entry_invalid");
+  if (e.stream !== state.keys.root) throw new LogCorrupt("log_entry_other_stream");
   if (e.seq !== state.head + 1) throw new LogCorrupt("log_entry_gap");
   if (e.prev !== state.headHash) throw new LogCorrupt("log_entry_chain");
   if (e.kind === "epoch") {
-    if (e.epoch <= state.epoch) throw new LogCorrupt("log_epoch_not_increasing");
+    if (e.epoch !== state.epoch + 1) throw new LogCorrupt("log_epoch_not_next");
     state.epoch = e.epoch;
+    state.epochWriter = e.writer;
   } else if (e.kind === "batches") {
-    if (e.epoch !== state.epoch) throw new LogCorrupt("log_entry_stale_epoch");
+    if (e.epoch !== state.epoch || e.writer !== state.epochWriter) throw new LogCorrupt("log_entry_stale_epoch");
+    // A payload is named by its content and lives in this stream: never another stream's or an arbitrary key.
+    if (!e.batches.every((b) => b.payloads.every((p) => p.key === state.keys.payload(p.sha256)))) throw new LogCorrupt("log_payload_foreign");
     for (const b of e.batches) remember(state.remembered, b.batchId, b.digest);
     state.inboxCursor = e.inboxCursor;
   } else throw new LogCorrupt("log_open_repeated");
@@ -242,20 +292,23 @@ function remember(m: Map<string, string>, batchId: string, digest: string) {
   while (m.size > LOG_REMEMBERED_BATCHES) m.delete(m.keys().next().value as string);
 }
 
-/** Every entry after `fromSeq`, in order, validated as a chain (for consumers that materialize from the log). */
+/**
+ * Every entry after `fromSeq`, in order, validated as a chain (for consumers that materialize from the log). It
+ * replays from entry 0 (checkpoints are not a starting point here yet), so compaction must not delete any entry a
+ * reader may still replay through; entry 0 is never deleted.
+ */
 export async function* readEntries(store: ObjectStore, keys: LogKeys, fromSeq = 0): AsyncGenerator<LogEntry> {
   const zero = await readBytes(store, keys.entry(0));
-  if (zero === undefined) return;
-  const open = parse(zero);
-  if (!validEntry(open) || open.kind !== "open") throw new LogCorrupt("log_open_invalid");
-  const state: LogState = { keys, head: 0, headHash: sha256(zero), epoch: open.epoch, inboxCursor: null, remembered: new Map() };
-  if (fromSeq === 0) yield open;
+  if (zero === undefined) { await assertNothingPast(store, keys, null); return; }
+  const state = opened(keys, zero);
+  if (fromSeq === 0) yield parse(zero) as LogEntry;
   for (;;) {
     const bytes = await readBytes(store, keys.entry(state.head + 1));
-    if (bytes === undefined) return;
+    if (bytes === undefined) break;
     const e = applyEntry(state, bytes);
     if (e.seq > fromSeq) yield e;
   }
+  await assertNothingPast(store, keys, state.head);
 }
 
 // ---- writing ----
@@ -264,33 +317,47 @@ export interface WriteDeps { writer: string; now?: () => number; sleep?: (ms: nu
 const deps = (d: WriteDeps) => ({ now: d.now ?? Date.now, sleep: d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))) });
 
 /**
- * Put a stream into log mode (entry 0). Idempotent for the same `legacyCutover` and writer. Returns the opened
- * state, with the writer holding epoch 1 (entry 0 carries it, so the opener is the first owner).
+ * Put a stream into log mode (entry 0). Idempotent for the same `legacyCutover`. The writer whose entry 0 landed
+ * holds epoch 1; every other opener gets the same state but does not own it (appendBatches refuses it until it
+ * takes the stream). A stream already opened with a DIFFERENT legacyCutover is refused (LogFenced): two operators
+ * disagreeing about the cutover is never silently resolved.
  */
 export async function enableLogMode(store: ObjectStore, keys: LogKeys, legacyCutover: string | null, d: WriteDeps): Promise<LogState> {
   const { now, sleep } = deps(d);
   const existing = await openStream(store, keys);
-  if (existing) return existing;
-  const entry: LogEntry = { v: 1, seq: 0, prev: null, kind: "open", epoch: 1, writer: d.writer, atMs: now(), legacyCutover };
+  if (existing) {
+    if (existing.legacyCutover !== legacyCutover) throw new LogFenced("log_open_other_cutover", 0);
+    return existing;
+  }
+  const entry: LogEntry = { v: 1, stream: keys.root, seq: 0, prev: null, kind: "open", epoch: 1, writer: d.writer, atMs: now(), legacyCutover };
   await createEntry(store, keys, 0, encode(entry), sleep); // taken: another opener won; read it either way
   const state = await openStream(store, keys);
   if (!state) throw new LogUnavailable("log_open_unreadable");
+  if (state.legacyCutover !== legacyCutover) throw new LogFenced("log_open_other_cutover", 0);
   return state;
 }
 
-/** Take ownership: append an epoch entry. The previous owner's next append is refused (LogFenced). */
+/**
+ * Take ownership: append an epoch entry. Any unresolved entry is resolved first, and the epoch entry itself is kept
+ * pending until it resolves, exactly as a batches entry. Losing the race (another writer appended first) does NOT
+ * retry: the state is caught up and LogFenced("log_take_lost") is thrown, so two takers back off (the caller's
+ * retry decides) instead of fencing each other in a loop. The previous owner's next append is refused.
+ */
 export async function takeStream(store: ObjectStore, state: LogState, d: WriteDeps): Promise<LogState> {
-  const { now } = deps(d);
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const entry: LogEntry = { v: 1, seq: state.head + 1, prev: state.headHash, kind: "epoch", epoch: state.epoch + 1, writer: d.writer, atMs: now() };
-    const bytes = encode(entry);
-    if (await createEntry(store, state.keys, entry.seq, bytes, deps(d).sleep) === "landed") { applyEntry(state, bytes); return state; }
-    // Someone appended first: catch up and try again on top of it.
+  const { now, sleep } = deps(d);
+  if (state.pending) await resolvePending(store, state, sleep);
+  const entry: LogEntry = { v: 1, stream: state.keys.root, seq: state.head + 1, prev: state.headHash, kind: "epoch", epoch: state.epoch + 1, writer: d.writer, atMs: now() };
+  state.pending = { seq: entry.seq, bytes: encode(entry), entry };
+  try {
+    await resolvePending(store, state, sleep);
+  } catch (error) {
+    if (!(error instanceof LogFenced)) throw error;
     const fresh = await openStream(store, state.keys);
     if (!fresh) throw new LogCorrupt("log_open_vanished");
     Object.assign(state, fresh, { pending: undefined });
+    throw new LogFenced("log_take_lost", entry.seq);
   }
-  throw new LogUnavailable("log_take_contended");
+  return state;
 }
 
 export interface AppendResult {
@@ -303,24 +370,27 @@ export interface AppendResult {
 }
 
 /**
- * Commit `batches` (whose payloads the caller already wrote with putPayload) as ONE entry at head+1. The caller
- * must hold the stream (takeStream or enableLogMode). On LogFenced the caller stops; on LogUnavailable it retries
- * appendBatches later with the same state, which resends the pending entry first.
+ * Commit `batches` (whose payloads the caller already wrote with putPayload) as ONE entry at head+1. Only the
+ * writer that holds the current epoch may append (LogFenced "log_not_owner" otherwise). On LogFenced the caller
+ * stops; on LogUnavailable it retries appendBatches later with the same state, which resends the pending entry first.
  */
 export async function appendBatches(store: ObjectStore, state: LogState, batches: LogBatch[], inboxCursor: string | null, d: WriteDeps): Promise<AppendResult> {
   const { now, sleep } = deps(d);
   if (state.pending) await resolvePending(store, state, sleep);
+  if (state.epochWriter !== d.writer) throw new LogFenced("log_not_owner", state.head + 1);
   const admitted: LogBatch[] = [], replays: string[] = [], conflicts: string[] = [];
-  const seen = new Map(state.remembered);
+  // Dedupe against the window plus this call's own batches (only the call's ids are added, not a window copy).
+  const inCall = new Map<string, string>();
   for (const b of batches) {
     if (!validBatch(b)) throw new LogCorrupt("log_batch_invalid");
-    const known = seen.get(b.batchId);
-    if (known === undefined) { admitted.push(b); seen.set(b.batchId, b.digest); }
+    if (!b.payloads.every((p) => p.key === state.keys.payload(p.sha256))) throw new LogCorrupt("log_payload_foreign");
+    const known = inCall.get(b.batchId) ?? state.remembered.get(b.batchId);
+    if (known === undefined) { admitted.push(b); inCall.set(b.batchId, b.digest); }
     else if (known === b.digest) replays.push(b.batchId);
     else conflicts.push(b.batchId);
   }
   if (admitted.length === 0) return { seq: null, admitted, replays, conflicts };
-  const entry: LogEntry = { v: 1, seq: state.head + 1, prev: state.headHash, kind: "batches", epoch: state.epoch, writer: d.writer, atMs: now(), batches: admitted, inboxCursor };
+  const entry: LogEntry = { v: 1, stream: state.keys.root, seq: state.head + 1, prev: state.headHash, kind: "batches", epoch: state.epoch, writer: d.writer, atMs: now(), batches: admitted, inboxCursor };
   const bytes = encode(entry);
   state.pending = { seq: entry.seq, bytes, entry };
   await resolvePending(store, state, sleep);
@@ -338,7 +408,8 @@ async function resolvePending(store: ObjectStore, state: LogState, sleep: (ms: n
 
 async function maybeCheckpoint(store: ObjectStore, state: LogState) {
   if (state.head % LOG_CHECKPOINT_EVERY !== 0) return;
-  const cp: LogCheckpoint = { v: 1, seq: state.head, hash: state.headHash, epoch: state.epoch, inboxCursor: state.inboxCursor, remembered: [...state.remembered] };
+  const cp: LogCheckpoint = { v: 1, seq: state.head, hash: state.headHash, epoch: state.epoch, epochWriter: state.epochWriter, legacyCutover: state.legacyCutover,
+    inboxCursor: state.inboxCursor, remembered: [...state.remembered] };
   try {
     await store.put(objectKey(state.keys.checkpoint(state.head)), encode(cp), { ifNoneMatch: true, contentType: "application/json" });
     await store.put(objectKey(state.keys.head), encode({ v: 1, seq: state.head }), { contentType: "application/json" });
