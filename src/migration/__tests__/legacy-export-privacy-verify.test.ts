@@ -1125,6 +1125,21 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
     }
   });
 
+  test("ROLLBACK ORDER: the down migration ACCESS EXCLUSIVE-locks the authority table before its populated-row guard, inside one transaction", () => {
+    // Static order (a one-connection PGlite cannot run the true race; that is the reviewer's real-PG lane): a registration
+    // committing between the row check and the DROP would otherwise be destroyed. The lock must precede the check.
+    const file = AUTHORITY_MIGRATION.pathname.split("/").pop()!;
+    const down = readFileSync(new URL(`../../../supabase/rollbacks/${file.replace(/\.sql$/u, ".down.sql")}`, import.meta.url), "utf8")
+      .replace(/--[^\n]*/gu, ""); // ignore comments
+    const begin = down.search(/\bBEGIN\s*;/u);
+    const lock = down.search(/LOCK\s+TABLE\s+(ONLY\s+)?sessions\.legacy_export_scope_authority\s+IN\s+ACCESS\s+EXCLUSIVE\s+MODE/iu);
+    const guard = down.search(/EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+sessions\.legacy_export_scope_authority\b/iu);
+    const drop = down.search(/DROP\s+TABLE\s+sessions\.legacy_export_scope_authority\b/iu);
+    const commit = down.search(/\bCOMMIT\s*;/u);
+    expect({ begin: begin >= 0, lock: lock >= 0, guard: guard >= 0, drop: drop >= 0, commit: commit >= 0 }).toEqual({ begin: true, lock: true, guard: true, drop: true, commit: true });
+    expect(begin < lock && lock < guard && guard < drop && drop < commit).toBe(true);
+  });
+
   test("ALARM: under the neon authority a legacy fence makes the sweep's summary line carry a non-zero legacy failure count", async () => {
     // The neon path already fails loud per scope (legacy_erasure_requires_supabase_authority, counters.legacyFenceFailed).
     // An operator alert keys on the per-sweep summary, so the failure must be visible there too, not only in a detail line.
