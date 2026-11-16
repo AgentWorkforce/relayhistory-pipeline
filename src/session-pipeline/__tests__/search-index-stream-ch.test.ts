@@ -10,7 +10,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { indexSearchScope, legacyProjectionIo, type SearchIndexDeps } from "../search-index.ts";
+import { clickhouseScopePage, indexSearchScope, legacyProjectionIo, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_DEADLINE, STREAM_READ_EVENTS_BUDGET, type StreamDeadline } from "../../session-read-api/canonical-stream-projection.ts";
 import { SCOPE, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line } from "../../session-read-api/__tests__/stream-fixture.ts";
 
@@ -75,8 +75,11 @@ function fakeClickHouse() {
       const p = options!.params!;
       const keyset = query.includes("ORDER BY ts, session_id, machine_id, kind, event_id");
       const after = query.includes("{after_ts:Int64}");
+      // The later page's redundant sort-key bound, applied as ClickHouse would (it never changes the rows).
+      const tsBound = query.includes("AND ts >= fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC')");
       let found = final().filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from));
       if (keyset) found.sort((a, b) => cmp(key(a), key(b)));
+      if (tsBound) found = found.filter((r) => tsMs(r) >= Number(p.after_ts));
       if (after) {
         const last = [Number(p.after_ts), String(p.after_session), String(p.after_machine), String(p.after_kind), String(p.after_event)];
         found = found.filter((r) => cmp(key(r), last) > 0);
@@ -213,6 +216,38 @@ test("keyset scan: every row exactly once across page boundaries, ties on ts inc
   expect(over.rows.length).toBe(10);
   expect(fake.selects.map((q) => q.limit)).toEqual([3, 3, 3, 1]);
   await expect(io.scanPages(SCOPE, "canonical", 0, 0, 5, async () => {})).rejects.toThrow("bounds invalid");
+});
+
+test("keyset page SQL is exact: the first page, and a later page whose ts bound lets the sort key prune", async () => {
+  const seen: { sql: string; params: Record<string, unknown> }[] = [];
+  const ch = {
+    database: "test",
+    async select(query: string, options: { params: Record<string, unknown> }) {
+      seen.push({ sql: query.replace(/\s+/g, " ").trim(), params: options.params });
+      return [];
+    },
+  } as unknown as ClickHouseClient;
+  await clickhouseScopePage(ch, SCOPE, "canonical", 1_000, 3);
+  await clickhouseScopePage(ch, SCOPE, "canonical", 1_000, 3, { tsMs: 1_002, sessionId: "s_last", machineId: "m_last", kind: "k_last", eventId: "e_last" });
+  const head =
+    "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint" +
+    ` FROM ${EVENTS_TABLE} FINAL` +
+    " WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String})" +
+    " AND workspace_id = {workspace:String} AND source = {source:String}" +
+    " AND toUnixTimestamp64Milli(ts) >= {from:Int64}";
+  const tail = " ORDER BY ts, session_id, machine_id, kind, event_id LIMIT {limit:UInt32}";
+  expect(seen.map((q) => q.sql)).toEqual([
+    head + tail,
+    head +
+      " AND ts >= fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC')" +
+      " AND (ts, session_id, machine_id, kind, event_id) > (fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC'), {after_session:String}, {after_machine:String}, {after_kind:String}, {after_event:String})" +
+      tail,
+  ]);
+  const scope = { org: SCOPE.orgId, session: SCOPE.sessionId, canonical: "canonical", workspace: SCOPE.workspaceId, source: SCOPE.harness, from: 1_000, limit: 3 };
+  expect(seen.map((q) => q.params)).toEqual([
+    scope,
+    { ...scope, after_ts: 1_002, after_session: "s_last", after_machine: "m_last", after_kind: "k_last", after_event: "e_last" },
+  ]);
 });
 
 test("ClickHouse binding, streaming on: index rows past the events budget leave the scope partial and delete nothing", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, searchIndexLimitsFromEnv, searchIndexStreamChFromEnv } from "../search-index.ts";
+import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STREAM_READ_CEILING, searchIndexLimitsFromEnv, searchIndexStreamChFromEnv } from "../search-index.ts";
 
 const MiB = 1024 * 1024;
 const NAMES = ["SEARCH_INDEX_MAX_SCOPE_BYTES", "SEARCH_INDEX_MAX_SCOPE_EVENTS", "SEARCH_INDEX_MAX_ROWS"] as const;
@@ -94,24 +94,28 @@ describe("SEARCH_INDEX_STREAMING_CH (hosted Lambda streaming reconcile)", () => 
       expect(message({ SEARCH_INDEX_STREAMING_CH: flag })).toBe("session pipeline: SEARCH_INDEX_STREAMING_CH must be 1 or 0");
   });
 
-  test("defaults 1 GiB / 1,000,000 / 60 s; set values within the floor and the 2 GiB / 2,000,000 cap", () => {
+  test("defaults 1 GiB / 1,000,000 / 60 s; set values within the floor and the 2 GiB / 1,000,000 hosted cap", () => {
     expect(searchIndexStreamChFromEnv(on, SEARCH_INDEX_DEFAULT_LIMITS)).toEqual({ maxReadBytes: 1024 * MiB, maxReadEvents: 1_000_000, deadlineMarginMs: 60_000 });
     // Set to the self-host names: still the defaults.
     expect(searchIndexStreamChFromEnv({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" }, SEARCH_INDEX_DEFAULT_LIMITS)).toEqual({ maxReadBytes: 1024 * MiB, maxReadEvents: 1_000_000, deadlineMarginMs: 60_000 });
-    expect(searchIndexStreamChFromEnv({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "2000000", SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "240000" }, SEARCH_INDEX_DEFAULT_LIMITS))
-      .toEqual({ maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000, deadlineMarginMs: 240_000 });
+    expect(searchIndexStreamChFromEnv({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "1000000", SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "240000" }, SEARCH_INDEX_DEFAULT_LIMITS))
+      .toEqual({ maxReadBytes: 2048 * MiB, maxReadEvents: 1_000_000, deadlineMarginMs: 240_000 });
+    // The hosted events cap is memory-bound (SEARCH_INDEX_STREAM_CH_CEILING), below the self-host 2,000,000.
+    expect(SEARCH_INDEX_STREAM_CH_CEILING).toEqual({ maxReadBytes: STREAM_READ_CEILING.maxReadBytes, maxReadEvents: 1_000_000 });
+    expect(STREAM_READ_CEILING.maxReadEvents).toBe(2_000_000);
     // The floor is four whole reads (256 MiB / 400,000 at the default limits).
     expect(searchIndexStreamChFromEnv({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "400000", SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "10000" }, SEARCH_INDEX_DEFAULT_LIMITS))
       .toEqual({ maxReadBytes: 256 * MiB, maxReadEvents: 400_000, deadlineMarginMs: 10_000 });
     expect(searchIndexStreamChFromEnv({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "268435456" }, SEARCH_INDEX_DEFAULT_LIMITS)!.maxReadBytes).toBe(256 * MiB);
-    // The replay profile's floor (1 GiB / 2,000,000 capped) lifts the events default to the cap.
-    expect(searchIndexStreamChFromEnv(on, REPLAY_SEARCH_INDEX_LIMITS)).toEqual({ maxReadBytes: 1024 * MiB, maxReadEvents: 2_000_000, deadlineMarginMs: 60_000 });
-    expect(message({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "1000000" }, REPLAY_SEARCH_INDEX_LIMITS)).toBe("session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS must be a whole number in 2000000..2000000");
+    // The replay profile's events floor is past the hosted cap: it is clamped to the cap.
+    expect(searchIndexStreamChFromEnv(on, REPLAY_SEARCH_INDEX_LIMITS)).toEqual({ maxReadBytes: 1024 * MiB, maxReadEvents: 1_000_000, deadlineMarginMs: 60_000 });
+    expect(message({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "999999" }, REPLAY_SEARCH_INDEX_LIMITS)).toBe("session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS must be a whole number in 1000000..1000000");
+    expect(message({ ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "2000000" }, REPLAY_SEARCH_INDEX_LIMITS)).toBe("session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS must be a whole number in 1000000..1000000");
   });
 
   test("out-of-range and malformed values refuse with a fixed message that never carries the value", () => {
     const BYTES = "session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES must be a whole number of bytes (optional MiB or GiB suffix) in 256MiB..2048MiB";
-    const EVENTS = "session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS must be a whole number in 400000..2000000";
+    const EVENTS = "session pipeline: SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS must be a whole number in 400000..1000000";
     const MARGIN = "session pipeline: SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS must be a whole number of milliseconds in 10000..240000";
     for (const [name, value, expected] of [
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", "255MiB", BYTES],
@@ -120,7 +124,8 @@ describe("SEARCH_INDEX_STREAMING_CH (hosted Lambda streaming reconcile)", () => 
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", "1.5GiB", BYTES],
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", "1gib", BYTES],
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "399999", EVENTS],
-      ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "2000001", EVENTS],
+      ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "1000001", EVENTS],
+      ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "2000000", EVENTS],
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "1MiB", EVENTS],
       ["SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "0x7a120", EVENTS],
       ["SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS", "9999", MARGIN],

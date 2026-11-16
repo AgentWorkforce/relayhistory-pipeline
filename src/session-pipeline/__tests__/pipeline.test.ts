@@ -30,7 +30,7 @@ import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
-import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent, runtimeFromSecret } from "../lambda.ts";
+import { RECONCILE_DEADLINE_MS, createPipelineLambdaHandler, lambdaEnv, reconcileRecent, runtimeFromSecret, type Runtime } from "../lambda.ts";
 import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
@@ -865,6 +865,81 @@ describe("search index: a busy session is requeued, not waited on (review #2 N2)
     await processBatch([{ messageId: "m2", body: put }], deps);
     expect(ch.final()).toHaveLength(1);
   });
+});
+
+describe("streamed reconcile on the Lambda: one streamed scope per invocation, within the context's deadline (issue 610 L3 D1)", () => {
+  const T0 = Date.parse("2026-11-01T10:00:01Z");
+  const put = (key: string) => JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: "01" } } }] });
+  /** sess_1 and sess_2 past the whole-read bound (3 events > 2), sess_3 within it; SEARCH_INDEX_STREAMING_CH armed, 60 s margin. */
+  async function lambda() {
+    const keys: Record<string, string> = {
+      sess_1: await writeSession("srv_s1", [1, 2, 3].map((i) => event(`a${i}`, "1", T0 + i, `a${i}`))),
+      sess_2: await writeSession("srv_s2", [1, 2, 3].map((i) => event(`b${i}`, "1", T0 + i, `b${i}`)), 1, { physicalSessionId: "sess_2" }),
+      sess_3: await writeSession("srv_s3", [event("c1", "1", T0, "c1")], 1, { physicalSessionId: "sess_3" }),
+    };
+    const ch = fakeClickHouse();
+    // As fakeSupabase, but each scope sees only its own live pointer ($4 is the session).
+    const tx: SqlExecutor = {
+      async query<R>(text: string, params: unknown[] = []) {
+        if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title")) return { rows: [{ supported: false }] as R[] };
+        if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: true }] as R[] };
+        if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
+        const session = String(params[3]);
+        if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
+          return { rows: (keys[session] ? [{ manifest_key: keys[session], canonical_id: session }] : []) as R[] };
+        if (text.includes("AS canonical_id FROM sessions.session_index")) return { rows: [{ canonical_id: session }] as R[] };
+        if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
+        return { rows: [] as R[] };
+      },
+    };
+    const transact = async <T>(work: (t: SqlExecutor) => Promise<T>) => work(tx);
+    const requeued: string[] = [];
+    const db = { ...tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const deps: ConsumerDeps = {
+      pointer: { db, lock: memoryLock(), reader, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+      search: { ...searchDeps(ch.ch, transact, { maxScopeEvents: 2 }), stream: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } },
+      requeue: async (k) => void requeued.push(k),
+    };
+    const rt = { env: { searchStreamCh: { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24, deadlineMarginMs: 60_000 } }, deps } as unknown as Runtime;
+    const handler = createPipelineLambdaHandler({ loadRuntime: async () => rt });
+    let reads = 0;
+    const context = (remainingMs: number) => ({ getRemainingTimeInMillis: () => { reads++; return remainingMs; } });
+    const invoke = (sessions: string[], ctx?: ReturnType<typeof context>) =>
+      handler({ Records: sessions.map((s, i) => ({ messageId: `m${i}`, body: put(keys[s]!) })) } as never, ctx as never) as Promise<{ batchItemFailures: unknown[] }>;
+    const indexed = () => [...new Set(ch.final().map((r) => r.session_id))].sort();
+    return { keys, ch, requeued, invoke, indexed, reads: () => reads, context };
+  }
+
+  test("a batch with two too-large scopes streams the first, requeues the second, and still indexes the small one", async () => {
+    const l = await lambda();
+    expect((await l.invoke(["sess_1", "sess_2", "sess_3"], l.context(300_000))).batchItemFailures).toEqual([]);
+    expect(l.reads()).toBe(1); // the context's remaining time is read once per invocation
+    expect(l.requeued).toEqual([l.keys.sess_2]);
+    expect(l.indexed()).toEqual(["sess_1", "sess_3"]); // sess_1 only by streaming: its whole read is refused
+    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 0], ["sess_3", 0]]); // sess_2: no state written
+    // The redelivered event is the next invocation's one streamed scope.
+    expect((await l.invoke(["sess_2"], l.context(300_000))).batchItemFailures).toEqual([]);
+    expect(l.indexed()).toEqual(["sess_1", "sess_2", "sess_3"]);
+    expect(l.requeued).toEqual([l.keys.sess_2]);
+  }, 60_000);
+
+  test("the Lambda context's remaining time less the margin is the deadline; the slot is taken even when the deadline stops the stream", async () => {
+    const l = await lambda();
+    // 30 s left, 60 s margin: the deadline has passed before the first chunk.
+    expect((await l.invoke(["sess_1", "sess_2"], l.context(30_000))).batchItemFailures).toEqual([]);
+    expect(l.reads()).toBe(1);
+    expect(l.indexed()).toEqual([]);
+    expect(l.ch.state.map((s) => [s.session_id, s.needs_full])).toEqual([["sess_1", 1]]);
+    expect(l.requeued).toEqual([l.keys.sess_2]);
+  }, 60_000);
+
+  test("no Lambda context: no deadline and no per-invocation slot, so both scopes stream as before", async () => {
+    const l = await lambda();
+    expect((await l.invoke(["sess_1", "sess_2"])).batchItemFailures).toEqual([]);
+    expect(l.indexed()).toEqual(["sess_1", "sess_2"]);
+    expect(l.requeued).toEqual([]);
+  }, 60_000);
 });
 
 describe("consumer events carry the Locker's provider into session_index (GCS self-host)", () => {

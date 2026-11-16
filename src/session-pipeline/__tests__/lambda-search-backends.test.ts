@@ -71,8 +71,8 @@ describe("SEARCH_INDEX_STREAMING_CH on the hosted Lambda (default off)", () => {
 
   test("armed: the parsed budgets and margin; dependencies refused at startup with a clear error", () => {
     expect(pipelineEntry.lambdaEnv({ ...base, ...on }).searchStreamCh).toEqual({ maxReadBytes: 1024 * MiB, maxReadEvents: 1_000_000, deadlineMarginMs: 60_000 });
-    expect(pipelineEntry.lambdaEnv({ ...base, ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "512MiB", SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "1500000", SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "90000" }).searchStreamCh)
-      .toEqual({ maxReadBytes: 512 * MiB, maxReadEvents: 1_500_000, deadlineMarginMs: 90_000 });
+    expect(pipelineEntry.lambdaEnv({ ...base, ...on, SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "512MiB", SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "750000", SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "90000" }).searchStreamCh)
+      .toEqual({ maxReadBytes: 512 * MiB, maxReadEvents: 750_000, deadlineMarginMs: 90_000 });
     expect(refusal({ SEARCH_INDEX_STREAMING_CH: "1" })).toBe("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs SEARCH_INDEX_ENABLED=1");
     expect(refusal({ ...on, SEARCH_INDEX_BACKEND: "postgres" }, shipped[1]![1])).toBe("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs the clickhouse search backend");
     expect(refusal({ ...on, SEARCH_INDEX_OUTPUT_FACTS: "1" })).toBe("session pipeline: SEARCH_INDEX_STREAMING_CH=1 cannot be combined with SEARCH_INDEX_OUTPUT_FACTS=1");

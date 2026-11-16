@@ -749,7 +749,9 @@ export interface LambdaInvocationContext {
 
 /**
  * The consumer deps for one SQS batch: unchanged unless streaming is armed and the invocation has a
- * context, then the search stage stops streaming at the remaining time less the configured margin.
+ * context, then the search stage stops streaming at the remaining time less the configured margin,
+ * and streams at most one scope of the batch (`streamSlot`): a second scope that would stream is
+ * requeued, so the margin only has to cover the batch's whole reads and replay, never another stream.
  */
 export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
   const search = rt.deps.search;
@@ -757,7 +759,7 @@ export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: Lamb
   if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
   const remaining = context.getRemainingTimeInMillis();
   if (!Number.isFinite(remaining)) return rt.deps;
-  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin } } };
+  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin }, streamSlot: { used: false } } };
 }
 
 async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {

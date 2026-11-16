@@ -344,7 +344,8 @@ complete verifying pass, and each insert batch commits on its own. Nothing is de
 current unless the streamed read was complete. A last pass that fails (a store error, or a source change seen while
 regenerating) may leave rows already written; they are rows the verify pass checked, nothing is deleted, the
 session stays partial and keeps owing a pass, and the next reconcile repairs it. The hosted pipeline Lambda never
-reads these settings.
+reads these settings. With streaming and `MESSAGE_ORIGIN_LABELS_ENABLED=true` both on, self-host streamed output
+carries origin labels exactly as the whole read does; this is intended.
 
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 
@@ -354,12 +355,18 @@ streams. `SEARCH_INDEX_STREAMING_CH` must be exactly `1` (unset, `""` or `0` is 
 startup) and needs `SEARCH_INDEX_ENABLED=1` and the `clickhouse` search backend from the pipeline secret; it is
 refused together with `SEARCH_INDEX_OUTPUT_FACTS=1`. Only with it on, `SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES`
 (default 1 GiB, accepted 256 MiB to 2 GiB, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS`
-(default 1000000, accepted 400000 to 2000000) bound the read as above, and `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS`
+(default 1000000, accepted 400000 to 1000000) bound the read as above, and `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS`
 (default 60000, accepted 10000 to 240000) sets a deadline of the invocation's remaining time minus the margin. The
 index scan reads the ClickHouse scope in keyset pages under the events budget; going past it leaves the scope
 partial with `stream_read_events_budget`. The deadline is checked between chunk reads, between scan pages, before
 the regenerating pass and before deletes; once passed, the scope stays partial with `scope_too_large` and
-`stream_deadline`, keeps owing a pass, and nothing is deleted (rows already written stay). The stack renders these
+`stream_deadline`, keeps owing a pass, and nothing is deleted (rows already written stay). The deadline bounds the
+streamed scope only, so at most one scope streams per invocation: a later scope in the same SQS batch that would
+also stream is not started and is requeued (with the same delay as a busy scope, `stream_deferred` in the log) for
+a later invocation, and the margin needs to cover only the rest of the batch's whole reads. The events cap is set by
+memory: the index scan holds about 0.8 KB of keys per record (measured on Node 24: about 0.75 GiB of heap at
+1000000 records), against a default heap limit of about 1.65 GiB at the stack's 3008 MiB `memorySize`, which also
+has to hold one decompressed chunk and the whole reads; raise the cap only together with `memorySize`. The stack renders these
 only from `transcriptStore.sessionPipeline.streamReconcile` with `enabled: true` (and `searchIndex: true`); its
 `maxReadBytes`, `maxReadEvents` and `deadlineMarginMs` take the same ranges in plain numbers. Streamed output facts
 (D2) and the large-scope worker (D3) are not in this cut.
