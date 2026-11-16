@@ -17,7 +17,7 @@ import type { Cell, Ctx } from "./context.ts";
 import { costBound } from "./cost.ts";
 import { errorClass } from "./load.ts";
 import { step3Log, step3P13, step3Race, step4, step5 } from "./steps-protocols.ts";
-import { ambiguousChild, step1, step2, step6, type SpawnAmbiguousChild } from "./steps-s3.ts";
+import { ambiguousChild, endpointRoundTrips, step1, step2, step6, type SpawnAmbiguousChild } from "./steps-s3.ts";
 
 type BucketId = Exclude<TargetId, "R6">;
 
@@ -150,10 +150,12 @@ async function runLane(config: RunConfig): Promise<boolean> {
 
   switch (config.lane) {
     case "r1":
+      await stage(1, "endpoints R1", () => endpointRoundTrips(ctx, "R1", [{ service: "s3", region: targets.R1!.region }, { service: "kms", region: targets.R1!.region }], meteredFetch(meter, "endpoint")));
       await stage(1, "step1 R1", () => step1(ctx, "R1"));
       await stage(3, "p13 R1", () => step3P13(ctx, "R1"));
       break;
     case "r2":
+      await stage(1, "endpoints R2", () => endpointRoundTrips(ctx, "R2", ["s3", "kms", "dynamodb", "sts"].map((service) => ({ service, region: targets.R2!.region })), meteredFetch(meter, "endpoint")));
       await stage(1, "step1 R2", () => step1(ctx, "R2"));
       await stage(2, "step2 R2", () => step2(ctx, "R2", spawnChild));
       await stage(3, "p13 R2", () => step3P13(ctx, "R2"));

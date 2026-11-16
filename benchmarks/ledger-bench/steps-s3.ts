@@ -22,6 +22,31 @@ async function seed(store: ObjectStore, prefix: string, count: number, size: num
   await mapLimit(Array.from({ length: count }, (_, i) => i), 32, (i) => store.put(key(prefix, i), randomBytes(size)));
 }
 
+/**
+ * The bare round trip to a service endpoint: an anonymous GET of its root on one kept-alive connection, no
+ * signing, no object. It is what the 2026-11-16 production figures measured (66 ms cross-region against 5 ms
+ * in-region), so it ties this run to them and separates network time from what S3 adds per request.
+ */
+export async function endpointRoundTrips(ctx: Ctx, target: BucketId, endpoints: { service: string; region: string }[], fetcher: typeof fetch): Promise<void> {
+  for (const { service, region } of endpoints) {
+    const url = `https://${service}.${region}.amazonaws.com/`;
+    const once = async () => {
+      const res = await fetcher(url, { method: "GET" });
+      await res.arrayBuffer();
+    };
+    // The first request pays DNS, TCP and TLS; it is reported on its own.
+    const t0 = performance.now();
+    let first: number | string;
+    try {
+      await once();
+      first = Math.round((performance.now() - t0) * 100) / 100;
+    } catch (error) {
+      first = errorClass(error);
+    }
+    await cell(ctx, { step: 1, cell: "endpoint_round_trip", target, params: { service, region } }, { concurrency: 1, seconds: Math.min(10, ctx.profile.cellSeconds), maxOps: 500, op: once }, () => ({ first_request_ms: first }));
+  }
+}
+
 /** Step 1: unconditioned GET, PUT, HEAD and LIST at every concurrency and size, plus the SSE-S3 comparison. */
 export async function step1(ctx: Ctx, target: BucketId): Promise<void> {
   const store = need(ctx, target);

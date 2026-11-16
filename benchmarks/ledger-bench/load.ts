@@ -40,6 +40,10 @@ export interface LoadOptions {
 /** The closed class of a thrown error, safe to print: never a message, a key or a URL. */
 export function errorClass(error: unknown): string {
   if (isObjectStoreError(error)) {
+    // The store wraps whatever its fetch threw as a transport failure; the harness's own stop (the spent
+    // budget) must keep its name instead of reading as a store fault.
+    const cause = (error as { cause?: { errorClass?: unknown } }).cause;
+    if (cause && typeof cause.errorClass === "string" && /^[A-Za-z0-9_.#-]{1,96}$/.test(cause.errorClass)) return cause.errorClass;
     if (error.status !== undefined) return `http_${error.status}`;
     if (error.transportCause !== undefined) return `store_cause_${error.transportCause}`;
     return error.code;
