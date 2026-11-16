@@ -211,9 +211,10 @@ is affected: `buffer_intent` and `buffer_receipt` run after the claim has commit
 a short lock wait there would throw away a successful claim and force a resume; they keep the role
 `lock_timeout` and stay 503 on a lock or statement timeout.
 
-No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
-yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
-`sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin
+The rules above are still on paper: none of them has a sink. The one alert wired in code is the
+coarser "Ingest DB-error alert" below (DB-error 503s above 20% over 2 minutes). The lock-wait rules can
+be added later as more custom alerts of the same kind, using the fields `route`, `stage`, `sqlstate`,
+`outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin
 lock holder is expected same-origin serialization (see the lock order above): check the
 uploader for overlapping same-origin uploads before treating it as an incident.
 
@@ -239,6 +240,96 @@ outcome line, and the capture-policy and upload-consent lines emitted from that 
 `linux`, `windows` or `other`, and `client_version` only when it is a release version such as
 `2026.11.12` or `2026.11.12-beta.1`. Any other User-Agent is `client_kind` `other` and nothing more;
 User-Agent text is never logged. Use it to split refusals and busy answers by Desktop release.
+
+## Ingest DB-error alert (DB-error deliveries above 20% for 2 minutes)
+
+Defined in code: `src/session-ingest/ingest-error-alert.ts` (query, policy body, plan/apply), applied by
+`.github/workflows/ingest-error-alert.yml` (`scripts/ingest-error-alert.ts`, gate
+`scripts/ingest-error-alert-github.ts`), tests `src/session-ingest/__tests__/ingest-error-alert.test.ts`.
+It only reads the Worker's existing log lines. The Worker, its tracked profile, the private-ingest release
+contract and its readback digests are untouched, and the private-ingest deploy never applies it.
+
+- **Signal.** Workers Logs of the private Worker `96bulls-session-ingest`, one terminal line per request on
+  `route` `delivery.batches`, `turns.batches` or `delivery.recovery`. Numerator: `outcome`
+  `delivery_unavailable` (the 503) with a `db_error_class` from the closed set (`terminated`, `reset`,
+  `timeout`, `pool`, `tls`, `unknown`; `src/session-ingest/db-error-class.ts`). Denominator: every line on those
+  routes except the capture-policy report lines that reuse the route (`outcome` `missing`, `stale`,
+  `session_predates`). A 503 without a DB diagnosis (object store, custody, admission) is not counted. A claim
+  turned into 429 `delivery_busy` by `INGEST_CLAIM_LOCK_BUSY` or `INGEST_CLAIM_TIMEOUT_BUSY` is designed
+  back-pressure: it counts in the denominator only.
+- **Threshold and window.** Fires when `countIf(DB-error 503) / greatest(count(), 20) > 0.2` over the last
+  2 minutes (`timestamp >= NOW() - INTERVAL '2' MINUTE`, threshold short window `2m`). It is evaluated every
+  minute and re-notifies every 30 minutes while firing. The floor of 20 means a quiet window needs at least
+  5 DB-error 503s to fire.
+- **Mechanism.** A Cloudflare Notifications custom alert (`alert_type` `custom_analytics`, `source` `sql_api`,
+  threshold trigger) named `96bulls-session-ingest-db-error-rate`. It is a SQL API "Monitor" (beta).
+  Cloudflare's built-in Workers analytics count only exceptions and exceeded resources as errors. A
+  deliberate 503 is a success there, so no built-in Worker error-rate alert can express this.
+- **Destination.** One generic webhook destination, `96bulls-ingest-alerts-agent-relay`, that posts into Agent
+  Relay. Cloudflare sends the destination secret only as the `cf-webhook-auth` header. An Agent Relay inbound
+  hook (`POST /v1/hooks/<id>`) requires `Authorization: Bearer <token>` and answers 401
+  `webhook_token_required` otherwise. Cloudflare also test-POSTs the URL when the destination is created and
+  refuses one that does not return 2xx. So a Relay hook URL cannot be the destination as-is. One of these
+  must come first, and both need Khaliq's OK:
+  - Agent Relay accepts `cf-webhook-auth` as the hook token. This is a small change in
+    relaycast `packages/engine/src/routes/inboundWebhook.ts`, in a separate repo, and is the recommended
+    path.
+  - A minimal adapter receives the Cloudflare POST, checks `cf-webhook-auth`, and forwards
+    `{text, source: "cloudflare", payload}` with the Bearer token. It is not built here.
+
+  The Cloudflare payload's `text` field becomes the Relay message text.
+
+**Deploy (guarded; Khaliq's OK for every step that creates or changes something).**
+
+1. Operator, once (Khaliq OK): create the Agent Relay inbound hook for the channel or agent that should
+   receive the alert. Use `POST /webhooks` on the desktop socket or relaycast `POST /v1/webhooks`. Store its
+   token only where the bridge needs it. Never put it in a Relay message, the repo or argv.
+2. Operator, once (Khaliq OK): resolve the auth mismatch above.
+3. Operator, once (Khaliq OK): create the Cloudflare destination `96bulls-ingest-alerts-agent-relay` with
+   `POST /accounts/<account>/alerting/v3/destinations/webhooks` (`name`, `url`, `secret`), or in the
+   dashboard under Notifications > Destinations. Cloudflare must report its type as `generic`.
+4. Operator, once (Khaliq OK): create the protected GitHub environment `ingest-alerting-production`. It allows
+   deployments only from `main`, with Khaliq as required reviewer. Add the secret
+   `CLOUDFLARE_ALERTING_API_TOKEN`: an account API token with Notifications edit and read on this account
+   only. Add the variable `INGEST_ALERT_WEBHOOK_ID`: the destination id from step 3.
+5. Before the first apply, check the query against live data. In the dashboard, open Alerts > Monitors >
+   create > custom SQL on `logs.workersLogs` and paste the query from the plan (read-only preview). Confirm
+   that `attributes['route']`, `attributes['outcome']` and `attributes['db_error_class']` resolve for this
+   Worker's lines and that `countIf`/`greatest` are accepted. The SQL API introspection endpoint with
+   `include_attributes=true` lists the indexed keys. If preview fails, adjust the query in a reviewed PR.
+   Cloudflare validates the query on save (`InvalidAlertQuery`), so a bad query fails the apply instead of
+   saving a silent alert.
+6. Dispatch `ingest error alert` with `mode=plan` and `sha=<main head>`. This is read-only. It checks that the
+   destination exists, is generic and has that name. It diffs the live policy by name and prints `action`
+   (`create`, `update` or `noop`), the drifted field names, the body `digest` and the exact confirmation.
+7. Dispatch `mode=apply` at the same sha with confirmation `APPLY-INGEST-DB-ERROR-ALERT <sha> BODY <digest>`.
+   Khaliq must approve the environment. The apply re-plans, refuses a different body, writes the one policy,
+   reads it back and refuses any drift. A later change to the threshold or the query is a reviewed PR plus
+   the same plan and apply.
+8. Verify delivery once: in the dashboard, use the policy's test notification, or temporarily lower the
+   threshold in a reviewed PR. Confirm that the message arrives in Agent Relay.
+
+Rollback: disable or delete the policy in the dashboard. The next plan will report it as drifted or missing.
+
+**When it fires.** The Worker is answering 503 to more than one delivery in five because the database is
+failing. Clients keep their batches and retry, so nothing is lost while it lasts, but uploads stall.
+
+1. Split the window by `db_error_code`, `db_error_class` and `stage` in Workers Logs:
+   - `57014` or `55P03` on `stage=claim`: lock waits or timeouts. See "Lock-wait alert" above and the
+     claim-busy flags.
+   - `pool`, `terminated` or `reset`: connection capacity or a pooler/Hyperdrive drop.
+   - `55000` on every request: generation fence (`db_refusal` `generation_not_ready` or
+     `policy_unavailable`, see "Route-line refusal class and client" above). Uploads fail closed because the
+     database generation and the Worker's accepted generations disagree. Any other `db_refusal` class is a
+     per-org or per-user state, not the fence.
+2. Generation fence after a schema apply: readiness already moved to `(H, pass)` while the Worker offers
+   only G. Follow `docs/design/zero-503-schema-windows.md` section 3.2, "Post-apply recovery": deploy the
+   Worker at G+H with `OVERLAP <H>`, then dispatch the overlap workflow `rebind-dry-run` and `rebind`.
+   Uploads resume at the rebind.
+3. Generation fence before or during a release: check the release overlap gate
+   (`runbooks/guarded-session-schema-release.md`, "Buffered ingest: required order (overlap gate)").
+   A window that expired before the rebind fails closed the same way. Recover as in step 2.
+4. Otherwise treat it as a database incident: check Supabase health, connections and `pg_stat_activity`.
 
 ## Pointer-reference tracking
 
