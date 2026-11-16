@@ -252,9 +252,12 @@ contract and its readback digests are untouched, and the private-ingest deploy n
 - **Signal.** Workers Logs of the private Worker `96bulls-session-ingest`, one terminal line per request on
   `route` `delivery.batches`, `turns.batches` or `delivery.recovery`. Numerator: `outcome`
   `delivery_unavailable` (the 503) with a `db_error_class` from the closed set (`terminated`, `reset`,
-  `timeout`, `pool`, `tls`, `unknown`; `src/session-ingest/db-error-class.ts`), and `db_refusal` absent or a
-  generation-fence class (`generation_not_ready`, `policy_unavailable`). A per-org or per-user 55000 refusal
-  (`user_seal_missing`, `org_admission_closed`, `other`, ...) is not counted, so one stuck user cannot page.
+  `timeout`, `pool`, `tls`, `unknown`; `src/session-ingest/db-error-class.ts`), unless `db_refusal` is one of
+  the known per-org or per-user 55000 classes (`user_seal_missing`, `org_admission_closed`, ...: every
+  class except `generation_not_ready`, `policy_unavailable` and `other`), so one stuck user cannot page. An
+  unrecognised 55000 (`other`, for example a reworded or new fence message) counts, so a fleet-wide fence
+  still pages. A test pins every known prefix to a 55000 `MESSAGE` in the latest function definitions in
+  `supabase/migrations`, so a reworded message fails CI instead of silently changing class.
   Denominator: every line on those routes except the capture-policy report lines that reuse the route
   (`outcome` `missing`, `stale`, `session_predates`). An absent attribute reads as `''` on both sides
   (`ifNull`), and the TS model in the module (`countsAsDbErrorDelivery`) is tested against real Worker lines.
@@ -264,11 +267,15 @@ contract and its readback digests are untouched, and the private-ingest deploy n
   `asyncAdmission` on, a queued delivery answers `accepted_queued` and its DB errors land on the consumer's
   `ingest.admission` lines, which this alert does not read. Control routes (selection, reset, custody).
 - **Workers Logs.** The query needs Workers Logs on for the Worker. `stacks/cloudflare/session-ingest.ts`
-  sets no `observability`, so Alchemy's default applies (`{ enabled: true, logs: { enabled: true,
-  invocationLogs: true } }`, no head sampling). The test pins both; an observability override in the Worker
-  profile must keep logs on and unsampled or this alert under-counts.
-- **Threshold and window.** Fires when `toFloat64(countIf(DB-error 503)) / greatest(count(), 20) > 0.2` over the last
-  2 minutes (`timestamp >= NOW() - INTERVAL '2' MINUTE`, threshold short window `2m`). It is evaluated every
+  sets no `observability`, so Alchemy's default applies (`DEFAULT_OBSERVABILITY` in
+  `@alchemy.run/cloudflare` `Workers/WorkerAsyncBindings.ts`: `{ enabled: true, logs: { enabled: true,
+  invocationLogs: true } }`, no head sampling). The test pins that the stack sets no override and that the
+  installed Alchemy's default block is still that; it does not read the live Worker's settings. An
+  observability override in the Worker profile must keep logs on and unsampled or this alert under-counts.
+  Setting it explicitly on the Worker props changes the Worker profile and its release digests: a separate
+  follow-up through the private-ingest release, not part of this alert.
+- **Threshold and window.** Fires when `toFloat64(countIf(DB-error 503)) / greatest(count(), 20) > 0.2`
+  over the last 2 minutes (`timestamp >= NOW() - INTERVAL '2' MINUTE`, threshold short window `2m`). It is evaluated every
   minute and re-notifies every 30 minutes while firing. The floor of 20 means a quiet window needs at least
   5 DB-error 503s to fire.
 - **Mechanism.** A Cloudflare Notifications custom alert (`alert_type` `custom_analytics`, `source` `sql_api`,
@@ -324,8 +331,8 @@ contract and its readback digests are untouched, and the private-ingest deploy n
 7. Dispatch `mode=apply` at the same sha with confirmation `APPLY-INGEST-DB-ERROR-ALERT <sha> BODY <digest>`.
    Khaliq must approve the environment. The apply re-plans, refuses a different body, writes the one policy,
    reads it back and refuses any drift. A refusal after the write (lost response, readback drift) can leave
-   the new or updated policy live: re-plan to learn the true state before anything else. A later change to the threshold or the query is a reviewed PR plus
-   the same plan and apply.
+   the new or updated policy live: re-plan to learn the true state before anything else. A later change to
+   the threshold or the query is a reviewed PR plus the same plan and apply.
 8. Verify delivery once: in the dashboard, use the policy's test notification, or temporarily lower the
    threshold in a reviewed PR. Confirm that the message arrives in Agent Relay.
 
@@ -341,8 +348,9 @@ failing. Clients keep their batches and retry, so nothing is lost while it lasts
    - `pool`, `terminated` or `reset`: connection capacity or a pooler/Hyperdrive drop.
    - `55000` on every request: generation fence (`db_refusal` `generation_not_ready` or
      `policy_unavailable`, see "Route-line refusal class and client" above). Uploads fail closed because the
-     database generation and the Worker's accepted generations disagree. Any other `db_refusal` class is a
-     per-org or per-user state, not the fence.
+     database generation and the Worker's accepted generations disagree. `other` on every request is
+     probably a reworded or new fence message: treat it as the fence. Any other `db_refusal` class is a
+     per-org or per-user state, not the fence (not counted).
 2. Generation fence after a schema apply: readiness already moved to `(H, pass)` while the Worker offers
    only G. Follow `docs/design/zero-503-schema-windows.md` section 3.2, "Post-apply recovery": deploy the
    Worker at G+H with `OVERLAP <H>`, then dispatch the overlap workflow `rebind-dry-run` and `rebind`.

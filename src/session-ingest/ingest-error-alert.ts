@@ -8,11 +8,14 @@
  * and the recovery route; one terminal line per request):
  *   numerator    `route` in ROUTES, `outcome` = `delivery_unavailable` (the 503) and `db_error_class` in the
  *                closed DB_ERROR_CLASSES set (src/session-ingest/db-error-class.ts), i.e. the 503 carries a
- *                database-client diagnosis, and that is not a per-org/per-user 55000 refusal: `db_refusal` absent
- *                (no 55000) or one of the generation-fence classes (GENERATION_REFUSALS, db-refusal-class.ts), so
- *                one stuck user's `user_seal_missing` (etc.) cannot page. A 503 without a DB diagnosis (object
- *                store, custody, admission) is not counted.
- *   denominator  every line with `route` in ROUTES (a missing `outcome` reads as ''), minus the capture-policy report lines that reuse the route
+ *                database-client diagnosis, and that is not a KNOWN per-org/per-user 55000 refusal: `db_refusal`
+ *                not in EXCLUDED_REFUSALS (every DB_REFUSALS class except the generation fence and `other`), so
+ *                one stuck user's `user_seal_missing` (etc.) cannot page, while an unrecognised 55000 (`other`,
+ *                e.g. a reworded or new fence message) still counts: the fleet-wide fence outage this alert
+ *                exists for must page. A 503 without a DB diagnosis (object store, custody, admission) is not
+ *                counted.
+ *   denominator  every line with `route` in ROUTES (a missing `outcome` reads as ''), minus the capture-policy
+ *                report lines that reuse the route
  *                (`outcome` missing / stale / session_predates), floored at MIN_DELIVERIES so a quiet window
  *                cannot fire on one or two failures (below the floor the value is failures / MIN_DELIVERIES).
  * A claim converted to 429 `delivery_busy` (INGEST_CLAIM_LOCK_BUSY / INGEST_CLAIM_TIMEOUT_BUSY) is designed
@@ -27,7 +30,7 @@
  */
 import { createHash } from "node:crypto";
 import { DB_ERROR_CLASSES } from "./db-error-class.ts";
-import { GENERATION_REFUSALS } from "./db-refusal-class.ts";
+import { DB_REFUSALS, GENERATION_REFUSALS } from "./db-refusal-class.ts";
 
 export const INGEST_ERROR_ALERT = Object.freeze({
   /** Deterministic policy name: the apply finds the live policy by it. */
@@ -64,8 +67,11 @@ export function refuseIngestErrorAlert(code: string): never {
 const refuse: (code: string) => never = refuseIngestErrorAlert;
 
 const list = (values: readonly string[]) => values.map((v) => `'${v}'`).join(", ");
-/** `db_refusal` values that still count (absent = '' and the generation fence), in a fixed order. */
-export const COUNTED_REFUSALS: readonly string[] = Object.freeze(["", ...[...GENERATION_REFUSALS].sort()]);
+/** `db_refusal` classes that do NOT count: the known per-org/per-user refusals. Absent (''), the generation fence
+ * and `other` (an unrecognised 55000, possibly a reworded fence) count. In DB_REFUSALS order. */
+export const EXCLUDED_REFUSALS: readonly string[] = Object.freeze(
+  DB_REFUSALS.filter((r) => r !== "other" && !GENERATION_REFUSALS.has(r)),
+);
 
 /** The SQL API query: one row, one numeric `value` column (the DB-error delivery ratio over the window). */
 export function ingestErrorAlertQuery(accountId: string): string {
@@ -75,7 +81,7 @@ export function ingestErrorAlertQuery(accountId: string): string {
     // A missing attribute reads as '' through ifNull whether the dataset returns '' or NULL for an absent key.
     `SELECT toFloat64(countIf(ifNull(attributes['outcome'], '') = '${A.outcome}'`,
     `    AND ifNull(attributes['db_error_class'], '') IN (${list(DB_ERROR_CLASSES)})`,
-    `    AND ifNull(attributes['db_refusal'], '') IN (${list(COUNTED_REFUSALS)})))`,
+    `    AND ifNull(attributes['db_refusal'], '') NOT IN (${list(EXCLUDED_REFUSALS)})))`,
     `  / greatest(count(), ${A.minDeliveries}) AS value`,
     `FROM logs.workersLogs`,
     `WHERE accountTag = '${accountId}'`,
@@ -283,7 +289,7 @@ export function countsAsDelivery(line: Record<string, unknown>): boolean {
 export function countsAsDbErrorDelivery(line: Record<string, unknown>): boolean {
   return countsAsDelivery(line) && line.outcome === INGEST_ERROR_ALERT.outcome &&
     (DB_ERROR_CLASSES as readonly unknown[]).includes(line.db_error_class) &&
-    COUNTED_REFUSALS.includes(typeof line.db_refusal === "string" ? line.db_refusal : "");
+    !EXCLUDED_REFUSALS.includes(typeof line.db_refusal === "string" ? line.db_refusal : "");
 }
 /** The value the query computes over a window's lines. */
 export function ingestErrorAlertValue(lines: readonly Record<string, unknown>[]): number {

@@ -36,7 +36,7 @@ export type DbRefusal = (typeof DB_REFUSALS)[number];
 export const GENERATION_REFUSALS: ReadonlySet<DbRefusal> = new Set<DbRefusal>(["generation_not_ready", "policy_unavailable"]);
 
 /** Exact message prefixes (lower-cased) from supabase/migrations, each with its class. First match wins. */
-const PREFIXES: readonly (readonly [string, DbRefusal])[] = [
+export const DB_REFUSAL_PREFIXES: readonly (readonly [string, DbRefusal])[] = [
   ["session ingest: generation not ready", "generation_not_ready"],
   ["ingest seed: generation not ready", "generation_not_ready"],
   ["session ingest: policy expired during operation", "policy_expired"],
@@ -61,7 +61,7 @@ const PREFIXES: readonly (readonly [string, DbRefusal])[] = [
 /** The class of a 55000 refusal from its lower-cased message (absent: `other`). Never throws. */
 export function dbRefusalFromMessage(lowerMessage: string | undefined): DbRefusal {
   if (typeof lowerMessage !== "string") return "other";
-  for (const [prefix, refusal] of PREFIXES) if (lowerMessage.startsWith(prefix)) return refusal;
+  for (const [prefix, refusal] of DB_REFUSAL_PREFIXES) if (lowerMessage.startsWith(prefix)) return refusal;
   return "other";
 }
 

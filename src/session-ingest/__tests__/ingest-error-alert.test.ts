@@ -5,7 +5,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createIngestApp, SYNC_SCOPE } from "../app.ts";
 import { DB_ERROR_CLASSES } from "../db-error-class.ts";
-import { GENERATION_REFUSALS } from "../db-refusal-class.ts";
+import { DB_REFUSAL_PREFIXES, DB_REFUSALS, GENERATION_REFUSALS } from "../db-refusal-class.ts";
+import { readdirSync } from "node:fs";
 import { sqlLedger } from "../ledger-sql.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
@@ -13,7 +14,7 @@ import { logLine } from "../../shared/log.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import {
   INGEST_ERROR_ALERT as A,
-  COUNTED_REFUSALS,
+  EXCLUDED_REFUSALS,
   applyIngestErrorAlert,
   cloudflareAlertingApi,
   countsAsDbErrorDelivery,
@@ -117,7 +118,42 @@ describe("signal: the Worker's own route lines", () => {
     expect(userLine).toHaveLength(1);
     expect(userLine[0]).toMatchObject({ outcome: "delivery_unavailable", db_error_code: "55000", db_refusal: "user_seal_missing" });
     expect(countsAsDbErrorDelivery(userLine[0]!)).toBe(false);
-    expect(COUNTED_REFUSALS).toEqual(["", ...[...GENERATION_REFUSALS].sort()]);
+    // An unrecognised 55000 (a reworded or new fence message) is `other` and counts: a fleet-wide fence pages.
+    const reworded = await ledgerError("55000", "session ingest: generation fence not admitted");
+    const o = await recovery((l) => { l.claim = async () => { throw reworded; }; });
+    expect(o.status).toBe(503);
+    const otherLine = o.lines.filter(countsAsDelivery);
+    expect(otherLine).toHaveLength(1);
+    expect(otherLine[0]).toMatchObject({ outcome: "delivery_unavailable", db_error_code: "55000", db_refusal: "other" });
+    expect(countsAsDbErrorDelivery(otherLine[0]!)).toBe(true);
+    // Excluded = exactly the known non-fence classes.
+    expect(new Set(EXCLUDED_REFUSALS)).toEqual(new Set(DB_REFUSALS.filter((r) => r !== "other" && !GENERATION_REFUSALS.has(r))));
+    for (const r of [...GENERATION_REFUSALS, "other"]) expect(EXCLUDED_REFUSALS).not.toContain(r);
+  });
+
+  test("every db_refusal prefix is a 55000 MESSAGE in the latest definition of some SQL function (reword guard)", () => {
+    // Latest definition per function signature across supabase/migrations (file order): a text that survives only
+    // in a superseded definition no longer reaches the Worker, so its prefix would silently stop matching.
+    const dir = new URL("supabase/migrations/", ROOT);
+    const latest = new Map<string, string>();
+    for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+      const sql = readFileSync(new URL(f, dir), "utf8");
+      const starts = [...sql.matchAll(/create\s+(?:or\s+replace\s+)?function\s+([\w."]+)\s*\(([\s\S]*?)\)\s*returns/giu)];
+      starts.forEach((m, i) => {
+        const key = (m[1]! + "(" + m[2]! + ")").toLowerCase().replace(/"/gu, "").replace(/\s+/gu, " ");
+        latest.set(key, sql.slice(m.index!, i + 1 < starts.length ? starts[i + 1]!.index : sql.length));
+      });
+    }
+    const messages = new Set<string>();
+    for (const body of latest.values())
+      for (const m of body.matchAll(/ERRCODE\s*=\s*'55000'\s*,\s*MESSAGE\s*=\s*'([^']*)'/giu)) messages.add(m[1]!.toLowerCase());
+    expect(messages.size).toBeGreaterThan(50);
+    for (const [prefix, refusal] of DB_REFUSAL_PREFIXES)
+      expect([...messages].some((m) => m.startsWith(prefix)) ? refusal : `reworded or removed: ${prefix}`).toBe(refusal);
+    // Every fence-class text the latest SQL raises is classified as the fence (not `other`).
+    for (const m of messages)
+      if (/generation not ready|current custody policy unavailable/u.test(m) && m.startsWith("session ingest:"))
+        expect(GENERATION_REFUSALS.has(DB_REFUSAL_PREFIXES.find(([p]) => m.startsWith(p))?.[1] ?? ("other" as never))).toBe(true);
   });
 
   test("a successful delivery counts in the denominator only", async () => {
@@ -170,7 +206,8 @@ describe("policy body", () => {
     expect(q).toContain(`attributes['route'] IN ('delivery.batches', 'turns.batches', 'delivery.recovery')`);
     expect(q).toContain(`SELECT toFloat64(countIf(ifNull(attributes['outcome'], '') = 'delivery_unavailable'`);
     expect(q).toContain(`ifNull(attributes['db_error_class'], '') IN (${DB_ERROR_CLASSES.map((c) => `'${c}'`).join(", ")})`);
-    expect(q).toContain(`ifNull(attributes['db_refusal'], '') IN ('', 'generation_not_ready', 'policy_unavailable')))`);
+    expect(q).toContain(`ifNull(attributes['db_refusal'], '') NOT IN (${EXCLUDED_REFUSALS.map((r) => `'${r}'`).join(", ")})))`);
+    expect(q).not.toMatch(/NOT IN \([^)]*'(?:other|generation_not_ready|policy_unavailable)'/u);
     expect(q).toContain(`ifNull(attributes['outcome'], '') NOT IN ('missing', 'stale', 'session_predates')`);
     expect(q).toContain(`/ greatest(count(), 20) AS value`);
     expect(q).not.toContain(";");
@@ -361,8 +398,11 @@ describe("workflow", () => {
   });
   test("Workers Logs stays on: no observability override, and Alchemy's default keeps logs on", () => {
     expect(readFileSync(new URL("stacks/cloudflare/session-ingest.ts", ROOT), "utf8")).not.toContain("observability");
-    const alchemyWorker = readFileSync(new URL("node_modules/@alchemy.run/cloudflare/src/Workers/Worker.ts", ROOT), "utf8");
-    expect(alchemyWorker).toContain("defaults to `{ enabled: true, logs: { enabled: true,");
+    // The real default (not a doc comment): WorkerAsyncBindings.ts DEFAULT_OBSERVABILITY, used when props omit it.
+    const bindings = readFileSync(new URL("node_modules/@alchemy.run/cloudflare/src/Workers/WorkerAsyncBindings.ts", ROOT), "utf8");
+    const block = bindings.match(/const DEFAULT_OBSERVABILITY: WorkerObservability = (\{[\s\S]*?\n\});/u)?.[1];
+    expect(block?.replace(/\s+/gu, "")).toBe("{enabled:true,logs:{enabled:true,invocationLogs:true,},}");
+    expect(bindings).toContain("news.observability ?? DEFAULT_OBSERVABILITY");
   });
   test("the Worker deploy contract does not reference the alert", () => {
     for (const f of ["stacks/cloudflare/session-ingest.ts", "src/session-ingest/private-ingest-release.ts", ".github/workflows/deploy-private-ingest-worker.yml"])
