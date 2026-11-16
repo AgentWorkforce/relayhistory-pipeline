@@ -46,7 +46,8 @@ spec:
             - { name: TMPDIR, value: /tmp }
           resources:
             requests: { cpu: "${CPU}", memory: "${MEMORY}" }
-            limits: { memory: "${MEMORY}" }
+            # The CPU limit keeps the client from taking more than this from a node it shares with production pods.
+            limits: { cpu: "${CPU_LIMIT}", memory: "${MEMORY}" }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

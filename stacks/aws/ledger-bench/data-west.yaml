@@ -162,6 +162,10 @@ Resources:
       LifecycleConfiguration:
         Rules:
           - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1 }
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
 
   BucketR5:
     Type: AWS::S3Express::DirectoryBucket
@@ -178,6 +182,10 @@ Resources:
       LifecycleConfiguration:
         Rules:
           - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1 }
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
 
   # R6: on demand, with a table-level ceiling so a runaway client cannot buy unbounded throughput.
   Table:
@@ -242,14 +250,18 @@ Resources:
                 Resource:
                   - !GetAtt BucketR4.Arn
                   - !GetAtt BucketR5.Arn
-              # K1 lives in the other Region's stack, so both keys are matched by their tag, not by ARN.
-              - Sid: BenchKeysThroughS3Only
+              # S3 calls KMS as the caller, so the role needs the keys themselves. K2 by ARN; K1 lives in the
+              # other Region's stack, so it is matched by its tag.
+              - Sid: BenchKeyInRegion
+                Effect: Allow
+                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+                Resource: !GetAtt Key.Arn
+              - Sid: BenchKeysByTag
                 Effect: Allow
                 Action: ["kms:GenerateDataKey", "kms:Decrypt"]
                 Resource: !Sub "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
                 Condition:
                   StringEquals: { "aws:ResourceTag/purpose": ledger-bench }
-                  StringLike: { "kms:ViaService": ["s3.*.amazonaws.com", "s3express.*.amazonaws.com"] }
               - Sid: BenchTable
                 Effect: Allow
                 Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]

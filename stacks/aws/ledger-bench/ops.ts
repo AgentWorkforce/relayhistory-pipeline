@@ -49,7 +49,9 @@ export interface Inputs {
   image: string;
   nodeSelector: Record<string, string>;
   tolerations: Record<string, unknown>[];
+  /** CPU request and limit; the limit caps what the client can take from a node it shares with production pods. */
   cpu: string;
+  cpuLimit: string;
   memory: string;
   owner: string;
   /** YYYY-MM-DD, apply date + 2 days. */
@@ -78,6 +80,7 @@ export function parseInputs(text: string): Inputs {
   // A tag can move; the benchmark must run the bytes ingest-edge runs.
   need("image", /^[a-z0-9.\-/:]+@sha256:[0-9a-f]{64}$/);
   need("cpu", /^\d+m?$/);
+  need("cpuLimit", /^\d+m?$/);
   need("memory", /^\d+(Mi|Gi)$/);
   need("owner", /^[a-z0-9-]{3,40}$/);
   need("ttl", /^\d{4}-\d{2}-\d{2}$/);
@@ -139,6 +142,7 @@ export function renderJob(template: string, i: Inputs, p: JobParams): string {
     STEPS: p.steps,
     IMAGE: i.image,
     CPU: i.cpu,
+    CPU_LIMIT: i.cpuLimit,
     MEMORY: i.memory,
     NODE_SELECTOR_JSON: JSON.stringify(i.nodeSelector),
     TOLERATIONS_JSON: JSON.stringify(i.tolerations),

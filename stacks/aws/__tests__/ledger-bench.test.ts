@@ -9,7 +9,7 @@ const read = (name: string) => readFileSync(join(DIR, name), "utf8");
 const INPUTS: Inputs = {
   dataProfile: "data", dataAccountId: "111111111111", clusterProfile: "cluster", clusterAccountId: "222222222222", clusterName: "example-cluster", kubeContext: "example",
   region: "us-west-2", eastRegion: "us-east-1", expressZoneA: "usw2-az1", expressZoneB: "usw2-az3", image: `registry.example/services@sha256:${"a".repeat(64)}`,
-  nodeSelector: { "example/role": "general" }, tolerations: [], cpu: "1", memory: "1Gi", owner: "s3-spike-finn", ttl: "2026-11-18",
+  nodeSelector: { "example/role": "general" }, tolerations: [], cpu: "500m", cpuLimit: "1", memory: "1536Mi", owner: "s3-spike-finn", ttl: "2026-11-18",
 };
 const KEYS = { east: `arn:aws:kms:us-east-1:111111111111:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`, west: `arn:aws:kms:us-west-2:111111111111:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}` };
 
@@ -68,6 +68,7 @@ describe("ledger-bench Job", () => {
     expect(job).toContain("backoffLimit: 0");
     expect(job).toContain(`image: ${INPUTS.image}`);
     expect(job).toContain('nodeSelector: {"example/role":"general"}');
+    expect(job).toContain('limits: { cpu: "1", memory: "1536Mi" }');
     expect(job).toContain("readOnlyRootFilesystem: true");
     expect(job).toContain("automountServiceAccountToken: false");
     expect(job).toContain("namespace: ledger-bench");
@@ -100,11 +101,10 @@ describe("ledger-bench templates", () => {
   test("the client role is trusted only by that pod role and reaches only bench resources", () => {
     expect(west).toContain('"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"');
     const policy = west.slice(west.indexOf("        - PolicyName: ledger-bench-targets"), west.indexOf("  # A backstop"));
-    // Every S3 object grant is under bench/, every bucket is a ledger-bench bucket, KMS is tag-scoped and S3-only.
+    // Every S3 object grant is under bench/, every bucket is a ledger-bench bucket, KMS is the bench keys only (by ARN and by tag).
     for (const line of policy.split("\n").filter((l) => l.includes("s3:::"))) expect(line).toContain("ledger-bench-r1-");
     expect(policy.match(/\/bench\/\*/g)!.length).toBe(3);
     expect(policy).toContain('"aws:ResourceTag/purpose": ledger-bench');
-    expect(policy).toContain('"kms:ViaService"');
     expect(policy).not.toMatch(/Action: "?(s3|dynamodb|kms|iam|sts):\*/);
     expect(policy).not.toContain('Resource: "*"');
   });

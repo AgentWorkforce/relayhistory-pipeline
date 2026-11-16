@@ -55,8 +55,9 @@ metadata:
 spec:
   hard:
     pods: "8"
-    requests.cpu: "8"
+    requests.cpu: "4"
     requests.memory: 8Gi
+    limits.cpu: "5"
     limits.memory: 8Gi
     services: "0"
     persistentvolumeclaims: "0"
