@@ -365,3 +365,27 @@ test("a chunk that disappears between passes stops the stream with the read's co
   const s = await streamCanonicalScope(SCOPE, a, deps, UNLIMITED, VERSION, 0);
   expect(s).toMatchObject({ complete: false, partial: false, reasons: ["chunk_decompress_failed"] });
 }, 30_000);
+
+test("D0: with origin labels on, the streamed read labels rows exactly as the whole read", async () => {
+  let labelled = 0;
+  for (const seed of [3, 11, 27]) {
+    const plain = await fixture(generate(seed));
+    const f: Fixture = {
+      ...plain,
+      readDeps: { ...plain.readDeps, originLabels: true },
+      streamDeps: { ...plain.streamDeps, originLabels: true },
+    };
+    const { w } = await expectParity(f);
+    // The labels must actually change rows, or this parity would prove nothing.
+    const unlabelled = new Map((await whole(plain)).rows.map((r) => [indexKey(r), r]));
+    labelled += w.rows.filter((r) => unlabelled.get(indexKey(r))?.fingerprint !== r.fingerprint).length;
+    // Off on the stream while the whole read labels: the fingerprints part ways (the pre-D0 bug).
+    const off = await streamCanonicalScope(SCOPE, await admitted(f), plain.streamDeps, UNLIMITED, VERSION, 0);
+    const offRows = await regenerateAll(off);
+    const want = new Map(w.rows.map((r) => [indexKey(r), r]));
+    if (w.rows.some((r) => unlabelled.get(indexKey(r))?.fingerprint !== r.fingerprint))
+      expect(offRows.some((r) => want.get(indexKey(r))?.fingerprint !== r.fingerprint)).toBe(true);
+    await cleanup.splice(0)[0]!();
+  }
+  expect(labelled).toBeGreaterThan(0);
+}, 60_000);
