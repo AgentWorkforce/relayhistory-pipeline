@@ -10,7 +10,9 @@
  *   db_error_code   a syntactically valid SQLSTATE (5 x [0-9A-Z]) or one of the finite
  *                   reviewed errno/TLS codes in SAFE_CODES, else "db_error"
  *   db_error_basis  code | message | none   (what the class was derived from)
- *   error_name      an allowlisted constructor name, else "other"
+ *   db_refusal      SQLSTATE 55000 only: the closed refusal class from the message's known
+ *                   prefix (db-refusal-class.ts DB_REFUSALS; unmatched is "other")
+ *   error_name     an allowlisted constructor name, else "other"
  * The error's message, stack, connection string/URL, query text, any other code value or
  * any user/session data are never returned, logged or interpolated.
  *
@@ -30,6 +32,8 @@
  *   tls         the reviewed TLS/certificate codes in SAFE_CODES; "certificate", "tls", "ssl", "handshake"
  *   unknown     anything else (including no usable code or message)
  */
+import { dbRefusalFromMessage, type DbRefusal } from "./db-refusal-class.ts";
+
 export type DbErrorClass = "terminated" | "reset" | "timeout" | "pool" | "tls" | "unknown";
 export type DbErrorBasis = "code" | "message" | "none";
 
@@ -79,6 +83,8 @@ export interface DbErrorDiagnosis {
   readonly db_error_class: DbErrorClass;
   readonly db_error_code: string;
   readonly db_error_basis: DbErrorBasis;
+  /** SQLSTATE 55000 only: the closed refusal class (db-refusal-class.ts). Never the message. */
+  readonly db_refusal?: DbRefusal;
 }
 
 /** One guarded read of an error's code, message (bounded, lower-cased) and name. In RAM
@@ -117,6 +123,11 @@ function safeCode(code: string | undefined): string {
 }
 
 function diagnose(s: Snapshot): DbErrorDiagnosis {
+  const d = diagnoseClass(s);
+  return d.db_error_code === "55000" ? Object.freeze({ ...d, db_refusal: dbRefusalFromMessage(s.message) }) : d;
+}
+
+function diagnoseClass(s: Snapshot): DbErrorDiagnosis {
   const code = safeCode(s.code);
   const byCode = code === DB_ERROR_CODE_FALLBACK ? undefined : closedClass(SQLSTATE_CLASS.get(code) ?? SAFE_CODES.get(code));
   if (byCode !== undefined && byCode !== "unknown") return Object.freeze({ db_error_class: byCode, db_error_code: code, db_error_basis: "code" as const });

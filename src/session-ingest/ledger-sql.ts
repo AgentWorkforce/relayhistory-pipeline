@@ -7,6 +7,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { dbErrorDiagnosisFrom, dbErrorSnapshot, type DbErrorSnapshot } from "./db-error-class.ts";
 import { acquisitionRefusalFrom } from "./acquisition-refusal.ts";
 import { log } from "../shared/log.ts";
+import { isGenerationRefusal } from "./db-refusal-class.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
  * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
@@ -315,12 +316,15 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
   const buffered=(input:unknown,generation:string=generations[0]!)=>({...input as Record<string,unknown>,generation});
   const forClaim=(token:unknown)=>(typeof token==="string"&&sticky.get(token))||order()[0]!;
   async function admitted<T>(attempt:(generation:string)=>Promise<T>):Promise<{value:T;generation:string}>{
-    const tries=order();let last:unknown;
+    // Both refused: rethrow the FIRST refusal that is not a generation refusal (db-refusal-class.ts), so a real
+    // refusal at one generation (say org admission closed) is not logged as the other one's generation_not_ready.
+    // Same error type and code either way; only the diagnostic db_refusal differs.
+    const tries=order();let last:unknown;let real:unknown;
     for(const generation of tries){
       try{const value=await attempt(generation);if(tries.length===2)admittedHint.set(setKey,generation);return{value,generation};}
-      catch(error){if(tries.length<2||!(error instanceof LedgerUnavailableError)||error.code!=="ledger_sqlstate_55000")throw error;last=error;}
+      catch(error){if(tries.length<2||!(error instanceof LedgerUnavailableError)||error.code!=="ledger_sqlstate_55000")throw error;last=error;if(real===undefined&&!isGenerationRefusal(error.db?.db_refusal))real=error;}
     }
-    throw last;
+    throw real??last;
   }
   const hex64 = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   return {

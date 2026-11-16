@@ -46,6 +46,7 @@ import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/anal
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
 import { batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { prepareForAdmission } from "./admission-core.ts";
+import { clientFields } from "./client-agent.ts";
 import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -369,7 +370,7 @@ export function lockAlertFields(error: unknown, acceptanceMode: string | undefin
 }
 
 function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
-  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis } : {};
+  return db ? { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis, ...(db.db_refusal ? { db_refusal: db.db_refusal } : {}) } : {};
 }
 
 function failure(c: Context<Env>, error: unknown) {
@@ -747,7 +748,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     const receivedAtMs = nowMs();
     const identity = c.get("identity");
     const read: BodyRead = { bytes: 0, wireBytes: 0, encoding: "identity" };
-    const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
+    // client_*: closed values from the User-Agent (client-agent.ts), never its text.
+    const fields: Record<string, unknown> = { route, org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId"), ...clientFields(c.req.header("user-agent")) };
     // Counts and the outcome class only: never a batch, record or session id, and never content.
     const completed = (native: { outcome?: string; status?: number }, records: number) => captureSafely(deps.analytics, {
       kind: "session_ingest.batch_completed", traceId: c.get("correlationId"), orgId: identity.orgId, workspaceId: identity.workspaceId,
