@@ -152,7 +152,7 @@ CREATE POLICY legacy_export_privacy_read_all ON sessions.upload_resets
  FOR SELECT TO bulls96_legacy_export_privacy USING(true);
 CREATE POLICY legacy_export_privacy_read_all ON sessions.operator_user_erasures
  FOR SELECT TO bulls96_legacy_export_privacy USING(true);
--- 062010 is a separately owned turns-forward migration and sorts before this
+-- 062020 is a separately owned turns-forward migration and sorts before this
 -- file in the combined release. The current standalone branch can still be
 -- rehearsed without it; the exporter then fails closed on the missing table.
 DO $turn_fence_grant$ BEGIN
