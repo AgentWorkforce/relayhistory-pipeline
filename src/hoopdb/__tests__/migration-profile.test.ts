@@ -2468,13 +2468,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
+    const RK = "upstream:20261105062050_read_api_token_reader_kind.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, RK]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2525,6 +2526,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062050 (read API token reader kind) is the newest: 062010's down refuses (55000) while it is applied;
+    // its checksum-pinned down drops read_api_token_issue_v2, the reader_kind column and its ledger row, and
+    // refuses on a rerun. The 044000 table and functions stay.
+    const readerKindColumn = async () =>
+      (await db.query<{ e: boolean }>("SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sessions.read_api_tokens'::regclass AND attname = 'reader_kind' AND NOT attisdropped) e")).rows[0]!.e;
+    const issueV2 = "sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)";
+    const regproc = async (sig: string) =>
+      (await db.query<{ r: string | null }>("SELECT to_regprocedure($1)::text r", [sig])).rows[0]?.r ?? null;
+    expect(await names()).toContain(RK);
+    expect(await readerKindColumn()).toBe(true);
+    expect(await regproc(issueV2)).not.toBeNull();
+    expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(OCF);
+    await rollback("20261105062050_read_api_token_reader_kind.down.sql");
+    expect(await names()).not.toContain(RK);
+    expect(await readerKindColumn()).toBe(false);
+    expect(await regproc(issueV2)).toBeNull();
+    expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
+    expect(await regproc("sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz)")).not.toBeNull();
+    expect((await failure(rollback("20261105062050_read_api_token_reader_kind.down.sql")))?.code).toBe("55000");
     // 20261105062010 (per-origin claim fence) is the newest: 062000's down refuses (55000) while it is applied; its
     // checksum-pinned down restores 058010's exact ingest_lock_fences, drops the five functions and the mark table,
     // removes its ledger row and refuses on a rerun.

@@ -465,6 +465,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_origin_claim_marks, the origin-scoped buffered entry points and the mark check in sessions.ingest_lock_fences",
     sql: "SELECT to_regclass('sessions.ingest_origin_claim_marks') IS NOT NULL AND to_regprocedure('sessions.ingest_origin_claim_buffered_batch(jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%ingest_origin_claim_marks%') AS applied",
   },
+  "upstream:20261105062050_read_api_token_reader_kind.sql": {
+    evidence: "column sessions.read_api_tokens.reader_kind and function sessions.read_api_token_issue_v2",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.read_api_tokens') AND attname = 'reader_kind' AND NOT attisdropped) AND to_regprocedure('sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

@@ -178,6 +178,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Per-origin claim fence: an owner-only mark table, two owner-only helpers and three SECURITY DEFINER origin-scoped
       // entry points; replaces ingest_lock_fences (FOR SHARE only under a mark). A G4 Worker never calls the new names.
       "20261105062010_ingest_origin_claim_fence.sql",
+      // Read API token reader kind: one nullable column on the 044000 token table and one new SECURITY DEFINER issue function; no G4 function names them.
+      "20261105062050_read_api_token_reader_kind.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

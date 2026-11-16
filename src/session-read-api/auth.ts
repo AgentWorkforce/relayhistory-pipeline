@@ -41,7 +41,7 @@ export interface AuthConfig {
    */
   mode?: "relaycontrol_only" | "self_issued";
   /** READ_API_AUTH_MODE=self_issued only: the origin (normalized), internal secrets and access TTL. */
-  selfIssued?: Pick<SelfIssuedDeps, "audience" | "internalSecrets" | "accessTtlSeconds">;
+  selfIssued?: Pick<SelfIssuedDeps, "audience" | "internalSecrets" | "accessTtlSeconds" | "mintReaderKind">;
 }
 
 /** The read path's positive introspection cache when READ_API_INTROSPECT_POSITIVE_TTL_MS is unset (the hosted behaviour). */
