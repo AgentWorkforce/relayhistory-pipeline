@@ -1190,10 +1190,15 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       }
     };
     /** The ONLY heartbeat writer used here: a real hosted sweep on the Supabase authority. */
-    const sweepSupabase = async (store: ObjectStore, opts: { dryRun?: boolean; legacyOff?: boolean } = {}) => {
+    const sweepSupabase = async (store: ObjectStore, opts: { dryRun?: boolean; legacyOff?: boolean; beforeHeartbeat?: () => Promise<void> } = {}) => {
       const state = new SyncState(join(await tmp("hb-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
       try {
-        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), () => {}, opts.legacyOff ? ERASE_CFG_LEGACY_OFF : ERASE_CFG, later, async () => {});
+        const real = supabaseAuthority(f.queryable);
+        // beforeHeartbeat runs between the sweep's work and its heartbeat RPC (the late-heartbeat window).
+        const authority = opts.beforeHeartbeat && real.recordSuccessfulSweep
+          ? { ...real, recordSuccessfulSweep: async () => { await opts.beforeHeartbeat!(); await real.recordSuccessfulSweep!(); } }
+          : real;
+        const job = new ErasureJob(authority, state, storeEraser(store), () => {}, opts.legacyOff ? ERASE_CFG_LEGACY_OFF : ERASE_CFG, later, async () => {});
         await job.sweep(opts.dryRun ? { dryRun: true } : undefined);
       } finally {
         state.close();
@@ -1232,7 +1237,15 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
         await f.db.exec("RESET ROLE");
       }
     };
-    return { f, exportAs, sweepSupabase, readyAs, seedLegacyCopy };
+    /** Same-epoch Neon release -> fence -> activate (the only re-activation the immutable lazy policy permits). */
+    const reactivate = async () => {
+      expect((await f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch })).r).toMatchObject({ authority: "neon" });
+      await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+      const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+      await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+    };
+    return { f, exportAs, sweepSupabase, readyAs, seedLegacyCopy, reactivate };
   }
   const refusedFor = (r: { thrown?: string; codes?: string[] }, re: RegExp) => (r.thrown !== undefined ? re.test(r.thrown) : (r.codes ?? []).some((c) => re.test(c)));
   // Any authority/readiness refusal code: within (g) the authority is active and the control proves an active authority
@@ -1407,6 +1420,34 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       if (GATE_TARGET === "activation") {
         await w.sweepSupabase(store);
         expect(await w.exportAs(n, store, "hb-reactivate-2")).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      }
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("LATE HEARTBEAT: a sweep that ran under activation A cannot vouch for activation B when re-activation lands before its heartbeat RPC", async () => {
+    // neonexit-reviewer P3-b race: heartbeat() must bind the activation the SWEEP ran under, not whatever is current
+    // when the RPC is finally called. The late RPC must write nothing that ready() accepts.
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-late") });
+      const a = (await w.f.db.query("SELECT activated_at::text AS t FROM sessions.ingest_privacy_authority")).rows[0] as { t: string };
+      let reactivated = false;
+      await w.sweepSupabase(store, { beforeHeartbeat: async () => { await w.reactivate(); reactivated = true; } }).catch(() => {});
+      expect(reactivated).toBe(true);
+      const b = (await w.f.db.query("SELECT activated_at::text AS t FROM sessions.ingest_privacy_authority")).rows[0] as { t: string };
+      expect(b.t).not.toBe(a.t);
+      expect(await w.readyAs()).not.toBe("ready");
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-late");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+      // Control (activation only): a sweep that runs wholly under B re-arms.
+      if (GATE_TARGET === "activation") {
+        await w.sweepSupabase(store);
+        expect(await w.exportAs(n, store, "hb-late-2")).toMatchObject({ counters: { exported: 1, failed: 0 } });
       }
     } finally {
       await w.f.close();
