@@ -312,8 +312,6 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
-  // 20261105062040: append-only regeneration audit (rows removed only by the owner-run forget and purge functions).
-  "sessions.summary_regeneration_audit": ["SELECT", "INSERT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
@@ -359,7 +357,6 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_analysis_result_tickets",
   "sessions.session_analysis_ticket_invocations",
   "sessions.session_analysis_ticket_reservations",
-  "sessions.summary_regeneration_audit",
 ] as const;
 
 /**
@@ -447,6 +444,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.session_publication_register_object(jsonb)",
   "sessions.set_session_state(text,text,text,text,text,text,timestamp with time zone)",
   "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)",
+  "sessions.summary_regeneration_audit_append_v1(jsonb)",
   "sessions.summary_regeneration_audit_purge_v1(integer)",
   "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)",
   "sessions.upsert_session_index(jsonb)",
@@ -1654,7 +1652,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "b28a6808842462b22ea25a289aaca97f14b83fb7fdd5622b1618f767d3354c23";
+  "6d36e5f9340b5564d5098740cf1243aff960db6329d168a95803aa659b937f9b";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

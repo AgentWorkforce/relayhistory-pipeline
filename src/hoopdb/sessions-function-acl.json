@@ -1684,6 +1684,10 @@
     "sessions.summary_regeneration_audit_append_only()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.summary_regeneration_audit_append_v1(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.summary_regeneration_audit_forget()": [
       "<owner>:EXECUTE"
     ],

@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { regenActive, regenSettings, REGEN_BOUNDS } from "../settings.ts";
 import { clampAttempts, maxDueAttempts, nextRetryAt } from "../backoff.ts";
 import { configHash, configHashMaterial, keyFingerprint } from "../config-hash.ts";
-import { logRegenQueued, sessionHash, writeRegenAudit, AUDIT_INSERT_SQL, type RegenAuditEntry } from "../audit.ts";
+import { logRegenQueued, sessionHash, writeRegenAudit, AUDIT_APPEND_SQL, type RegenAuditEntry } from "../audit.ts";
 import { bobCostasConfigHash, bobCostasRegenFromEnv, reasonFromWorkKey } from "../../bob-costas/regen.ts";
 import { captureLogs } from "../../shared/__tests__/golden.ts";
 
@@ -110,12 +110,15 @@ describe("audit writer", () => {
   });
   test("a prior failure code outside the code shape is dropped, not stored", async () => {
     const calls: { sql: string; params: unknown[] }[] = [];
-    const db = { query: async (sql: string, params?: unknown[]) => { calls.push({ sql, params: params ?? [] }); return { rows: [] }; } };
+    const db = { query: async (sql: string, params?: unknown[]) => { calls.push({ sql, params: params ?? [] }); return { rows: [{ n: 2 }] }; } };
     expect(await writeRegenAudit(db as never, [entry, { ...entry, priorFailureCode: "Free Text: boom", priorStatus: "READY" }])).toBe(2);
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.sql).toBe(AUDIT_INSERT_SQL);
-    expect(calls[0]!.params[8]).toEqual(["model_failed", null]);
-    expect(calls[0]!.params[7]).toEqual(["ready", null]);
+    expect(calls[0]!.sql).toBe(AUDIT_APPEND_SQL);
+    const rows = JSON.parse(calls[0]!.params[0] as string) as Record<string, unknown>[];
+    expect(rows.map((r) => r.prior_failure_code)).toEqual(["model_failed", null]);
+    expect(rows.map((r) => r.prior_status)).toEqual(["ready", null]);
+    expect(Object.keys(rows[0]!).sort()).toEqual(["harness", "kind", "org_id", "prior_failure_code", "prior_pipeline_version", "prior_status",
+      "reason", "request_id", "requested_by", "scope_hash", "session_id", "system", "workspace_id"]);
     expect(await writeRegenAudit(db as never, [])).toBe(0);
     expect(calls).toHaveLength(1);
   });

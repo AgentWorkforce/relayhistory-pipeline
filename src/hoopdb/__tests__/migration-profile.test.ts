@@ -600,7 +600,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(36); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations) + summary_regeneration_audit (20261105062040)
+    ).toBe(35); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2765,7 +2765,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     );
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_set_session_uploads_internal(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     // 20261105062040 (summary regeneration) is the newest: 062030's down refuses (55000) while it is applied; its
-    // checksum-pinned down drops the audit table, its three functions, the session_briefs columns and partial index
+    // checksum-pinned down drops the audit table, its four functions, the session_briefs columns and partial index
     // and its ledger row (96bulls 0006's session_summaries columns stay), and refuses on a rerun.
     expect(await names()).toContain(RG);
     expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
