@@ -8,7 +8,7 @@
  *
  * Secrets come ONLY on stdin, one per line, never argv, env or files:
  *   line 1  the Neon URL of a SELECT-only role (direct, not the pooler)
- *   line 2  HoopDb/Supabase SELECT-only direct URL (live erasure authority)
+ *   line 2  dedicated HoopDb/Supabase privacy-role direct URL (ledger SELECT plus narrow RPCs)
  *   line 3  S3 access key id       (--export / --verify)
  *   line 4  S3 secret access key   (--export / --verify)
  *   line 5  S3 session token       (optional)
@@ -110,7 +110,7 @@ export async function assertPrivacySelectOnly(db: Queryable) {
             has_function_privilege(current_user,'sessions.legacy_export_privacy_authority_ready()','EXECUTE') AS a`,
   );
   if (authority.rows[0]?.w !== false || authority.rows[0]?.x !== true || authority.rows[0]?.a !== true)
-    throw Object.assign(new Error("the privacy role must have only the legacy authority register RPC"), { code: "privacy_role_not_register_only" });
+    throw Object.assign(new Error("the privacy role must have only the legacy authority register/readiness RPCs"), { code: "privacy_role_not_register_only" });
   const identity = await db.query<{ who: string }>("SELECT current_user::text AS who");
   if (identity.rows[0]?.who !== "bulls96_legacy_export_privacy")
     throw Object.assign(new Error("the dedicated legacy-export privacy role is required"), { code: "privacy_role_identity" });
@@ -144,6 +144,13 @@ export function assertDirectUrl(raw: string, label: string): URL {
 export async function main() {
   const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
   if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
+  // Landing safety: this branch ships the schema and eraser plumbing, but not
+  // the activation heartbeat contract. The activation follow-up replaces this
+  // unconditional refusal with its fresh eraser-written heartbeat gate.
+  if (mode[0] === "export")
+    throw Object.assign(new Error("legacy export requires the activation heartbeat follow-up"), {
+      code: "legacy_export_requires_activation_heartbeat",
+    });
   const secrets = await readSecrets();
   assertDirectUrl(secrets.neonUrl, "Neon");
   assertDirectUrl(secrets.privacyUrl, "privacy");
@@ -172,7 +179,7 @@ export async function main() {
     if (needsS3) {
       const bucket = arg("bucket");
       if (!bucket || arg("expect-bucket") !== bucket) throw new Error("--bucket and --expect-bucket must be given and equal");
-      if (!secrets.s3) throw new Error("stdin lines 2-3 (S3 key) are required for --export/--verify");
+      if (!secrets.s3) throw new Error("stdin lines 3-4 (S3 key) are required for --export/--verify");
       const sse = arg("sse");
       if (sse && sse !== "aws:kms" && sse !== "AES256") throw new Error("--sse must be aws:kms or AES256");
       const kms = arg("kms-key");
