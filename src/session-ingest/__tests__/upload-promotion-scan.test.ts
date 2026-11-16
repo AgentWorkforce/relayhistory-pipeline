@@ -97,6 +97,82 @@ describe("the promotion pass", () => {
   });
 });
 
+describe("readiness during a long promotion pass", () => {
+  async function seed(n: number) {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    for (let i = 0; i < n; i++) await s.store.put(objectKey(key("o1", i)), new Uint8Array([1]));
+    return s.store;
+  }
+  const quiet = { info: () => {}, warn: () => {}, error: () => {} };
+  /** A consumer whose promote() advances the clock by `stepMs` per object and lets the test observe status mid-pass. */
+  function consumerWith(store: Awaited<ReturnType<typeof seed>>, promote: (k: string) => Promise<PromoteResult>, clock: { t: number }) {
+    return selfhostAdmissionConsumer({
+      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 3, nowMs: () => clock.t, log: quiet,
+      deliver: { ledger: new MemoryLedger(), acceptanceMode: "canonical", target: { store, keyRoot: ROOT } },
+      uploadInbox: { promote, batchSize: 10, concurrency: 1 },
+    });
+  }
+
+  test("a pass far longer than the stale window stays ok while it makes progress", async () => {
+    const store = await seed(10);
+    const clock = { t: 1_000_000 };
+    const states: string[] = [];
+    let consumer!: ReturnType<typeof consumerWith>;
+    consumer = consumerWith(store, async () => {
+      clock.t += 20_000; // 10 promotions x 20 s = 200 s, more than 3x the 60 s window
+      states.push(consumer.status().state);
+      return { action: "ack", outcome: "handed_off" };
+    }, clock);
+    await consumer.scan();
+    await consumer.settle();
+    expect(states).toHaveLength(10);
+    expect(states.every((s) => s === "ok")).toBe(true);
+    // After the pass the progress clock is cleared: idle behaviour is the admission-scan age again.
+    expect(consumer.status().lastProgressAgeMs).toBeNull();
+    expect(consumer.status().state).toBe("stale"); // 200 s since the scan, no pass running
+    await consumer.stop();
+  });
+
+  test("a pass stuck with no progress for the window goes stale", async () => {
+    const store = await seed(2);
+    const clock = { t: 2_000_000 };
+    let release!: () => void;
+    const stuck = new Promise<void>((r) => { release = r; });
+    let consumer!: ReturnType<typeof consumerWith>;
+    let entered!: () => void;
+    const inPromote = new Promise<void>((r) => { entered = r; });
+    consumer = consumerWith(store, async () => { entered(); await stuck; return { action: "ack", outcome: "handed_off" }; }, clock);
+    const pass = consumer.scan();
+    await inPromote;
+    clock.t += 30_000;
+    expect(consumer.status().state).toBe("ok");
+    expect(consumer.status().lastProgressAgeMs).toBe(30_000);
+    clock.t += 31_000; // 61 s with no progress
+    expect(consumer.status().state).toBe("stale");
+    expect(consumer.status().healthy).toBe(false);
+    release();
+    await pass;
+    await consumer.settle();
+    await consumer.stop();
+  });
+
+  test("idle behaviour is unchanged: ok within the window after a scan, stale beyond it, starting before any", async () => {
+    const store = await seed(0);
+    const clock = { t: 3_000_000 };
+    const consumer = consumerWith(store, async () => ({ action: "ack", outcome: "handed_off" }), clock);
+    expect(consumer.status().state).toBe("starting");
+    await consumer.scan();
+    await consumer.settle();
+    expect(consumer.status()).toMatchObject({ state: "ok", lastProgressAgeMs: null });
+    clock.t += 60_000;
+    expect(consumer.status().state).toBe("ok");
+    clock.t += 1;
+    expect(consumer.status().state).toBe("stale");
+    await consumer.stop();
+  });
+});
+
 describe("the pass's log fields", () => {
   test("counts survive the sanitizer as bounded integers; the results string carries only fixed codes", () => {
     expect(sanitizeLogField("promoted", 25)).toBe(25);

@@ -100,7 +100,10 @@ export interface SelfhostAdmissionOptions {
 }
 
 export interface SelfhostAdmissionStatus {
-  /** starting: no scan has completed yet; ok: the last scan is recent; stale: it is not; stopped. */
+  /**
+   * starting: no scan has completed yet; ok: the last scan is recent, or the pass it started is still making
+   * progress (a long upload-promotion pass is work, not a hang); stale: neither; stopped.
+   */
   state: "starting" | "ok" | "stale" | "stopped";
   healthy: boolean;
   /** Inbox objects with content this process knows of and has not finished (dead letters excluded). */
@@ -110,6 +113,12 @@ export interface SelfhostAdmissionStatus {
   deadLetters: number;
   inFlight: number;
   lastScanAgeMs: number | null;
+  /**
+   * Age of the last progress (a listed page or a finished promotion) of the pass now running, after its
+   * admission scan succeeded. Null when no such pass is running. A pass with no progress for the stale window
+   * reads stale, so a real hang stays detectable.
+   */
+  lastProgressAgeMs: number | null;
 }
 
 export interface SelfhostAdmissionConsumer {
@@ -170,6 +179,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const marked = new Set<string>();
   let deadLetters = 0;
   let lastScanOkAt: number | undefined;
+  /** Last progress of the running pass whose admission scan succeeded (undefined when no such pass runs). */
+  let lastProgressAt: number | undefined;
+  const progress = () => { if (lastProgressAt !== undefined) lastProgressAt = now(); };
   let scanning: Promise<void> | undefined;
   let started = false, stopped = false;
   let interval: ReturnType<typeof setInterval> | undefined;
@@ -193,6 +205,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         // objectKey refuses a trailing slash: list the bare prefix and keep only slash-bounded keys
         // (as pendingAdmissions does), so a sibling `.upload-inbox-x/` is never promoted.
         const page = await store.list(objectKey(root.slice(0, -1)), cursor);
+        progress();
         for (const item of page.items) {
           const key = String(item.key);
           if (!key.startsWith(root)) continue;
@@ -208,6 +221,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const promoteOne = async (key: string): Promise<void> => {
         const back = uploadBackoff.get(key);
         const r = await upload.promote(key).catch((error: unknown): PromoteResult => ({ action: "retry", code: "promote_failed", error }));
+        progress();
         const label = r.action === "ack" ? (r.code ?? r.outcome) : r.code;
         counts[label] = (counts[label] ?? 0) + 1;
         if (r.action === "ack") { uploadBackoff.delete(key); return; }
@@ -262,6 +276,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       for (const [key, e] of entries) if (!seen.has(key) && !inflight.has(key) && e.addedAt < scanAt) forget(key);
       deadLetters = live;
       lastScanOkAt = now();
+      // The promotion pass below runs inside this scan (the next cannot start until it ends): its progress keeps
+      // the consumer healthy. Only after a successful admission scan, so failing scans still go stale.
+      lastProgressAt = lastScanOkAt;
       const s = status();
       logger.info("session ingest admission consumer", { route: "ingest.admission_consumer", outcome: "ok", admission_backlog: s.backlog,
         ...(s.oldestAgeMs !== null ? { admission_oldest_age_ms: s.oldestAgeMs } : {}), admission_dead_letters: s.deadLetters, admission_in_flight: s.inFlight, duration_ms: Date.now() - t0 });
@@ -269,7 +286,11 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const code = (error as { code?: unknown })?.code;
       logger.warn("session ingest admission consumer", { route: "ingest.admission_consumer", outcome: "scan_failed", error_code: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "scan_failed", duration_ms: Date.now() - t0 });
     }
-    await promoteUploads(scanAt);
+    try {
+      await promoteUploads(scanAt);
+    } finally {
+      lastProgressAt = undefined;
+    }
   }
 
   function scan(): Promise<void> {
@@ -382,7 +403,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const at = now();
     let oldest = Infinity;
     for (const e of entries.values()) if (Number.isFinite(e.receivedAtMs)) oldest = Math.min(oldest, e.receivedAtMs);
-    const state = stopped ? "stopped" : lastScanOkAt === undefined ? "starting" : at - lastScanOkAt > staleAfterMs ? "stale" : "ok";
+    const freshest = Math.max(lastScanOkAt ?? -Infinity, lastProgressAt ?? -Infinity);
+    const state = stopped ? "stopped" : lastScanOkAt === undefined ? "starting" : at - freshest > staleAfterMs ? "stale" : "ok";
     return {
       state,
       healthy: state === "ok",
@@ -391,6 +413,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       deadLetters,
       inFlight: inflight.size,
       lastScanAgeMs: lastScanOkAt === undefined ? null : Math.max(0, at - lastScanOkAt),
+      lastProgressAgeMs: lastProgressAt === undefined ? null : Math.max(0, at - lastProgressAt),
     };
   }
 

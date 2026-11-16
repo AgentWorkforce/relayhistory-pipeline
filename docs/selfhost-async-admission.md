@@ -164,8 +164,12 @@ cannot delete, one small probe object per pod start remains.
     `consumer: {ok, state, backlog, oldestAgeMs, deadLettered, inFlight, lastScanAgeMs}`, which holds
     numbers and a closed `state` (`starting`, `ok`, `stale`, `stopped`) only.
   - `/readyz` in `async` is 200 only while the consumer's last scan succeeded within
-    max(3 × scan interval, 60 s). The database is deliberately not part of it: a database outage shows
-    as backlog, and uploads keep succeeding.
+    max(3 × scan interval, 60 s), or the upload-promotion pass that scan started is still making
+    progress (a listed page or a finished promotion) within that window. A long pass is work, not a
+    hang; a pass with no progress for the window still reads `stale`. `lastScanAgeMs` keeps its
+    meaning (the age of the last successful admission scan), so it can exceed the window while the
+    consumer is `ok`. The database is deliberately not part of it: a database outage shows as backlog,
+    and uploads keep succeeding.
   - `/readyz` in `drain` needs the consumer AND the database (`SELECT 1`), since the request path is
     synchronous again.
   - In `sync`, `/readyz` is unchanged apart from the added `admission: "sync"`.
