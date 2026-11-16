@@ -47,8 +47,17 @@ import {
   scrubBrief,
   storedBrief,
   sweepUnbriefed,
+  sweepUnbriefedRegen,
+  briefCoverage,
+  briefSessionQuiet,
+  type BriefCoverageWrite,
   type ClaimedWakeup,
 } from "./store.ts";
+import type { BriefRegen } from "./regen.ts";
+import { AUDIT_RELATION, BRIEF_COVERAGE_COLUMNS, hasColumns, hasRelation } from "../summary-regen/detect.ts";
+import { logRegenQueued, purgeRegenAudit, writeRegenAudit, type RegenAuditEntry } from "../summary-regen/audit.ts";
+import { maxDueAttempts } from "../summary-regen/backoff.ts";
+import { regenActive, type RegenReason } from "../summary-regen/settings.ts";
 import {
   SESSION_BRIEF_CANONICAL_ENGINE_VERSION,
   SESSION_BRIEF_ENGINE_VERSION,
@@ -64,6 +73,18 @@ export interface BriefDeps {
   config: BriefConfig;
   /** Explicit self-host canonical-object input. Absent preserves the raw/export reader. */
   canonicalInput?: import("./canonical-input.ts").CanonicalBriefInput;
+  /**
+   * Summaries regeneration flags (src/session-brief/regen.ts). Absent or null: today's behaviour,
+   * with no extra query and no new column written.
+   */
+  regen?: BriefRegen | null;
+}
+
+/** The regeneration settings when a coverage flag is on and the session_briefs columns exist. */
+async function activeRegen(deps: BriefDeps): Promise<BriefRegen | null> {
+  const r = deps.regen;
+  if (!r || !regenActive(r.settings)) return null;
+  return (await hasColumns(deps.db, "sessions.session_briefs", BRIEF_COVERAGE_COLUMNS)) ? r : null;
 }
 
 export type BriefResult =
@@ -77,7 +98,9 @@ export type BriefResult =
   | "retrying"
   | "failed"
   | "gone"
-  | "stale";
+  | "stale"
+  /** SUMMARY_REGEN_TURNS_ENABLED: fewer than N new turns while the session is active; due again after idle. */
+  | "deferred";
 
 const fingerprint = (input: unknown) =>
   createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -103,8 +126,8 @@ function failureOf(error: unknown): { code: string; retryable: boolean } {
 export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<BriefResult> {
   const { db, config } = deps;
   let canonicalSessionId: string | undefined;
-  const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3]) =>
-    recordBrief(db, w, revisions, outcome, { canonicalSessionId });
+  const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3], coverage?: BriefCoverageWrite) =>
+    recordBrief(db, w, revisions, outcome, coverage ? { canonicalSessionId, coverage } : { canonicalSessionId });
   const pointers = await livePointers(db, w);
   if (!pointers.length) {
     await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
@@ -121,6 +144,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     return "throttled";
   }
   const sourceRevisions = Object.fromEntries(pointers.map((p) => [p.machineId, p.revision]));
+  const regen = await activeRegen(deps);
   const window = { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds };
   // After a committed outcome, cleanup is separate: a cleanup failure never rewrites the
   // committed brief (the lease lapses and the wakeup is reclaimed, then reused or throttled).
@@ -150,9 +174,30 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       const { written } = await publish(built.sourceRevisions, {
         status: "reused",
         fingerprint: print,
-      });
+      }, regen ? { configHash: regen.configHash } : undefined);
       await finish();
       return written ? "reused" : "stale";
+    }
+    // Summaries regeneration (1): a brief that already covers a known number of user turns is
+    // regenerated before idle only when N more arrived; otherwise the wakeup waits for the idle
+    // window. An ended or idle session, a first brief or a legacy row (covered_turns NULL) goes
+    // ahead as today. Placed before admission, so a deferral never spends a cap or the budget.
+    const turnsNow = built.input.messages.filter((m) => m.role === "user").length;
+    let regenerationReason: RegenReason | undefined;
+    if (regen?.settings.turns.enabled && stored?.title && stored.status === "ready") {
+      const prior = await briefCoverage(db, w);
+      if (prior && prior.coveredTurns !== null) {
+        if (turnsNow - prior.coveredTurns >= regen.settings.turns.threshold) regenerationReason = "turns_gained";
+        else {
+          const quiet = await briefSessionQuiet(db, w, regen.settings.turns.idleSeconds);
+          if (!quiet) {
+            await rescheduleWakeup(db, w, { seconds: regen.settings.turns.idleSeconds }, { refundAttempt: true });
+            log.info("session brief deferred", { stage: "session-brief", session_id: w.sessionId, count: turnsNow - prior.coveredTurns });
+            return "deferred";
+          }
+          regenerationReason = quiet;
+        }
+      }
     }
     // Only a real model call is admitted and counted: empty, ineligible and reused
     // outcomes above never spend the per-session cap, the org budget or the global ceiling.
@@ -185,13 +230,14 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     const scrubbed = scrubBrief(summary.summary);
     // The provider's reported model id, unless it is not one the column accepts.
     const model = MODEL_PATTERN.test(summary.model) ? summary.model : config.model;
+    const engineVersion = deps.canonicalInput ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : SESSION_BRIEF_ENGINE_VERSION;
     const { written } = await publish(built.sourceRevisions, {
       status: "ready",
       text: {
         ...scrubbed,
         fingerprint: print,
         promptVersion: SESSION_BRIEF_PROMPT_VERSION,
-        engineVersion: deps.canonicalInput ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : SESSION_BRIEF_ENGINE_VERSION,
+        engineVersion,
         model,
         messageCount: built.input.messages.length,
         shortenedMessages: built.input.messages.filter((m) => m.truncated).length,
@@ -200,7 +246,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
         durationMs: Date.now() - startedAt,
         generatedAt: new Date(),
       },
-    });
+    }, regen ? { configHash: regen.configHash, coveredTurns: turnsNow, pipelineVersion: engineVersion } : undefined);
     await finish();
     log.info("session brief generated", {
       stage: "session-brief",
@@ -213,6 +259,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       tokens_out: summary.outputTokens,
       count: built.input.messages.length,
       ok: written,
+      ...(regenerationReason ? { regeneration_reason: regenerationReason } : {}),
     });
     return written ? "generated" : "stale";
   } catch (error) {
@@ -228,7 +275,13 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       });
       return "retrying";
     }
-    await publish(sourceRevisions, { status: "failed", error: failure.code });
+    // Summaries regeneration (2): a final failure goes on the backoff ladder (retry_attempts,
+    // next_retry_at) for sweepUnbriefed. The transport's retryable flag is not consulted here, so a
+    // model_auth_failed (non-retryable in the transport) is retried at this layer only.
+    await publish(sourceRevisions, { status: "failed", error: failure.code }, regen
+      ? { configHash: regen.configHash, ...(regen.settings.retry.enabled
+        ? { retry: { backoffSeconds: regen.settings.retry.backoffSeconds, configReset: regen.settings.retry.configReset } } : {}) }
+      : undefined);
     await finish();
     log.warn("session brief failed", {
       stage: "session-brief",
@@ -239,6 +292,43 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     });
     return "failed";
   }
+}
+
+/**
+ * sweepUnbriefed with the regeneration predicates ((2) retry ladder, (2b) config change): one log
+ * line per regeneration (session id hashed) and, with SUMMARY_REGEN_AUDIT_ENABLED and the table
+ * present, one batch audit insert. Returns the number armed, as sweepUnbriefed does.
+ */
+async function sweepRegen(db: HoopDb, regen: BriefRegen, options: Parameters<typeof sweepUnbriefed>[2]): Promise<number> {
+  const { retry, audit } = regen.settings;
+  const rows = await sweepUnbriefedRegen(db, 100, {
+    ...options,
+    regen: { configHash: regen.configHash, configReset: retry.configReset, retry: retry.enabled, maxAttempts: maxDueAttempts(retry.backoffSeconds) },
+  });
+  const entries: RegenAuditEntry[] = [];
+  for (const row of rows) {
+    if (!row.reason) continue;
+    const entry: RegenAuditEntry = {
+      orgId: row.org_id,
+      workspaceId: row.workspace_id,
+      harness: row.harness,
+      sessionId: row.session_id,
+      system: "brief",
+      kind: "brief",
+      reason: row.reason,
+      priorStatus: row.prior_status,
+      priorFailureCode: row.prior_failure_code,
+      priorPipelineVersion: row.prior_pipeline_version,
+    };
+    logRegenQueued(entry, "session-brief");
+    entries.push(entry);
+  }
+  // The wakeups are armed and logged; a failed audit write is logged and never stops the tick.
+  if (audit.enabled && entries.length && (await hasRelation(db, AUDIT_RELATION))) {
+    await writeRegenAudit(db, entries).catch((error: unknown) =>
+      log.warn("summary regeneration audit write failed", { stage: "session-brief", count: entries.length, error_code: error instanceof Error ? error.name : "unknown" }));
+  }
+  return rows.length;
 }
 
 /**
@@ -256,6 +346,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
 export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort) {
   let lastSweep = 0;
   let lastPrune = 0;
+  let lastAuditPurge = 0;
   const canonical = deps.canonicalInput !== undefined;
   return async (db: HoopDb, now: Date): Promise<Record<BriefResult, number> | null> => {
     if (!deps.config.enabled) return null;
@@ -265,6 +356,13 @@ export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort
       const pruned = await pruneStaleWakeups(db, deps.config.wakeMaxAgeHours, 5000, deps.config.workspaceIds);
       await pruneAttempts(db, deps.config.workspaceIds);
       if (pruned) log.info("stale session brief wakeups dropped", { stage: "session-brief", count: pruned });
+      // Summaries regeneration (4): audit retention, at most hourly, bounded per call by the SQL function.
+      const auditRetention = deps.regen?.settings.audit.enabled ? deps.regen.settings.audit.retentionDays : 0;
+      if (auditRetention && now.getTime() - lastAuditPurge >= 3_600_000 && (await hasRelation(db, AUDIT_RELATION))) {
+        lastAuditPurge = now.getTime();
+        const purged = await purgeRegenAudit(db, auditRetention);
+        if (purged) log.info("summary regeneration audit purged", { stage: "session-brief", count: purged });
+      }
       // Canonical mode only (no indexer arms wakeups there): recover wakeups parked until
       // the next UTC midnight by a rate_limited refusal (issue #494). Counts only are logged.
       if (canonical) {
@@ -280,9 +378,13 @@ export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100, { includeChanged: canonical,
+      const sweepOptions = { includeChanged: canonical,
         refreshCanonicalInput: canonical, recoverJsonlInputFailures: canonical,
-        recoverRateLimited: canonical, workspaceIds: deps.config.workspaceIds });
+        recoverRateLimited: canonical, workspaceIds: deps.config.workspaceIds };
+      const regen = await activeRegen(full);
+      const armed = regen
+        ? await sweepRegen(db, regen, sweepOptions)
+        : await sweepUnbriefed(db, 100, sweepOptions);
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;
@@ -310,7 +412,7 @@ export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort
         stage: "session-brief",
         claimed: claimed.length,
         failed: counts.failed ?? 0,
-        skipped: (counts.throttled ?? 0) + (counts.rate_limited ?? 0),
+        skipped: (counts.throttled ?? 0) + (counts.rate_limited ?? 0) + (counts.deferred ?? 0),
       });
     }
     return counts;
