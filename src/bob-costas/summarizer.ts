@@ -101,18 +101,38 @@ export interface Summarizer {
   summarize(kind: "short" | "long", digest: SessionDigest, ctx?: SummaryContext): Promise<Summary>;
 }
 
+/** The model summariser's `clean` before its bound: scrub, then collapse whitespace runs. */
+const scrubCollapse = (t: string) => scrubText(t).replace(/\s+/g, " ");
+const bound = (t: string) => (t.length > TURN_TEXT_CHARS ? t.slice(0, TURN_TEXT_CHARS) : t);
+/** Rounds of scrub-and-collapse a turn may take to settle before it is given up. */
+const SETTLE_ROUNDS = 8;
+
 /**
- * A fresh string holding `s` scrubbed, with whitespace runs collapsed, clipped to
- * TURN_TEXT_CHARS: the summarisers' own order (scrub, collapse, bound), so the clip only ever
- * cuts text that is already scrubbed and collapsed. Re-scrubbing it later cannot shrink
- * the part before the cut, so a token the clip cuts stays thousands of characters past
- * anything a summariser reads, however the turn was padded or what the scrub redacted.
- * The copy (Buffer round trip) keeps a slice from holding its parent alive.
+ * A fresh string holding `s` scrubbed, whitespace collapsed and clipped to TURN_TEXT_CHARS,
+ * and settled: the result is a fixed point of scrub-then-collapse, the very step the model
+ * summariser's `clean` applies before it bounds to 400/800. So that step changes nothing
+ * in it, and a value the 8,192 clip cuts (too short for its rule to match any more) stays
+ * where the clip left it, thousands of characters past anything a summariser reads,
+ * whatever a scrub redacted or a collapse glued together before it. Settling runs both
+ * before the clip (a collapse can glue a value that a second scrub then matches) and after
+ * it (a re-scrub of the clipped text must not shrink it). A turn that does not settle in
+ * SETTLE_ROUNDS rounds is dropped to "". The copy (Buffer round trip) keeps a slice from
+ * holding its parent alive.
  */
 export function clipTurn(s: string): string {
-  const collapsed = scrubText(s).replace(/\s+/g, " ");
-  const clipped = collapsed.length > TURN_TEXT_CHARS ? collapsed.slice(0, TURN_TEXT_CHARS) : collapsed;
-  return Buffer.from(clipped, "utf16le").toString("utf16le");
+  let t = scrubCollapse(s);
+  for (let round = 0; round < SETTLE_ROUNDS; round++) {
+    const next = scrubCollapse(t);
+    if (next === t) break;
+    t = next;
+  }
+  t = bound(t);
+  for (let round = 0; round < SETTLE_ROUNDS; round++) {
+    const next = scrubCollapse(t);
+    if (next === t) return Buffer.from(t, "utf16le").toString("utf16le");
+    t = bound(next);
+  }
+  return "";
 }
 
 /** Where the digest keeps user turns: all of them, or a bounded sample. */

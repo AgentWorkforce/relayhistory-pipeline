@@ -178,7 +178,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     expect(rec?.summary).toContain("prompt 11");
   });
 
-  it("a capped read that yields no record fails non-retryably and never clears a ready summary", async () => {
+  it("a capped read that yields no record clears the summary, fails non-retryably, and a replay reads again", async () => {
     const { pg, db } = await setup();
     const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
     const line = JSON.stringify({ type: "user", message: { role: "user", content: "PLANTED-PROMPT first" } });
@@ -198,18 +198,32 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     // Revision 3: one chunk that inflates past the per-chunk cap, so the read finds nothing.
     await store.put(rawChunkKey(loc, 1, 0, "abcdef13", "jsonl"), zstdCompressSync(Buffer.from("x".repeat(200 * 1024) + "\n")));
     const next = { ...manifest(true, [{ seq: 1, start_offset: 0, sha256_8: "abcdef13" }]), revision: 3 };
-    await expect(bobCostasHandler("long", {
+    const capped = bobCostasHandler("long", {
       ...deps,
       reader: { provider: "fs", read: async () => ({ manifest: next }) } as never,
       inputCaps: { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 },
-    })(message, recorder)).rejects.toMatchObject({ code: "summary_input_unreadable", retryable: false });
-    const after = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256, revision FROM sessions.session_summaries`)).rows[0]!;
-    expect(after).toMatchObject({ status: "ready", object_key: before.object_key, object_sha256: before.object_sha256 });
-    const rec = await readSummaryObject({
+    });
+    await expect(capped(message, recorder)).rejects.toMatchObject({ code: "summary_input_unreadable", retryable: false });
+    const after = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, revision, content_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(after).toMatchObject({ status: "quarantined", object_key: null });
+    expect(Number(after.revision)).toBe(3);
+    // The earlier ready summary is gone: the object at its key no longer opens.
+    expect(await readSummaryObject({
       store, keyring, ids: { orgId: "o", workspaceId: "w" },
       key: String(before.object_key), sha256: String(before.object_sha256), kind: "long", revision: 2,
-    });
-    expect(rec?.summary).toContain("PLANTED-PROMPT");
+    })).toBeNull();
+    // N2: a replay of the same revision is not taken as current; it reads again (and fails again)...
+    expect(after.content_sha256).not.toBe(next.raw.content_sha256);
+    await expect(capped(message, recorder)).rejects.toMatchObject({ code: "summary_input_unreadable" });
+    // ...and once the input reads (here the cap is raised) the same revision publishes.
+    await bobCostasHandler("long", {
+      ...deps,
+      reader: { provider: "fs", read: async () => ({ manifest: next }) } as never,
+      inputCaps: { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 1 << 20 },
+    })(message, recorder);
+    const healed = (await pg.query<Record<string, unknown>>(`SELECT status, revision, content_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(healed).toMatchObject({ status: "ready", content_sha256: next.raw.content_sha256 });
+    expect(Number(healed.revision)).toBe(3);
   });
 
   it("an envelope session that cannot be read whole has its summary cleared, then fails non-retryably", async () => {
@@ -237,6 +251,12 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     const after = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, revision FROM sessions.session_summaries`)).rows[0]!;
     expect(after).toMatchObject({ status: "quarantined", object_key: null });
     expect(Number(after.revision)).toBe(3);
+    // A replay of the same revision is not skipped as current: it reads again.
+    await expect(bobCostasHandler("long", {
+      ...deps,
+      reader: { provider: "fs", read: async () => ({ manifest: next }) } as never,
+      inputCaps: { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 },
+    })(message, recorder)).rejects.toMatchObject({ code: "summary_input_incomplete" });
     // The object at the old key no longer holds the text.
     const head = await store.head(objectKey(String(before.object_key)));
     if (head) {

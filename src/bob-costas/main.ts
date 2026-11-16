@@ -5,7 +5,7 @@ import { summarizerFromEnv } from "./model-summarizer.ts";
 import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
-import { summaryInputCapsFromEnv } from "./session-input.ts";
+import { perChunkCap, summaryInputCapsFromEnv } from "./session-input.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const raw = lockerStore();
@@ -22,7 +22,8 @@ log.info("bob costas input caps", {
   stage: "summary",
   max_chunks: inputCaps.maxChunks,
   max_input_bytes: inputCaps.maxInputBytes,
-  max_chunk_bytes: inputCaps.maxChunkBytes,
+  // The cap in force: with sampling off, never below the 24 MiB floor.
+  max_chunk_bytes: perChunkCap(inputCaps),
   state: inputCaps.sampling ? "sampling_on" : "sampling_off",
 });
 await runWorker({

@@ -22,9 +22,10 @@
  *                               never inflated past the cap. With sampling off it is never
  *                               below 24 MiB (the ingest writes at most 16 MiB a chunk).
  *
- * Any cap that fires is recorded in `digest.input`, and the summary record carries
+ * A cap that makes the counts lower bounds is recorded in `digest.input`, and the record carries
  * `input_truncated`. A capped read that yields no record, or a session of envelopes that
- * could not be read whole, fails the summary (non-retryable) instead of publishing.
+ * could not be read whole, clears the summary and then fails (non-retryable) instead of
+ * publishing (handler.ts `failAfterPublish`).
  *
  * Sized for a 4 GiB pod: the worker handles one message at a time (`runWorker` starts each
  * claimed delivery in turn), so a summary's peak is one chunk inflated (≤ 32 MiB) and its

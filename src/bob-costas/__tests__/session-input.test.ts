@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { zstdCompressSync } from "node:zlib";
-import { rawChunkKey } from "../../shared/vendor.ts";
+import { rawChunkKey, scrubText } from "../../shared/vendor.ts";
 import {
   DEFAULT_SUMMARY_INPUT_CAPS,
   planChunks,
@@ -154,6 +154,33 @@ describe("TurnSampler and clipTurn (sampling on)", () => {
     expect(clipTurn("x".repeat(TURN_TEXT_CHARS * 3)).length).toBe(TURN_TEXT_CHARS);
     expect(clipTurn("key ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 end")).not.toContain("ghp_");
   });
+
+  test("a value the collapse glues and the clip cuts never reaches a summary or a prompt", async () => {
+    // The lander's N1 repro: a phone-like run and a card on separate lines, which the collapse
+    // glues; offsets chosen so the 8,192 clip falls inside the card.
+    const card = /4111 ?1111|1111 ?1111 ?11/;
+    let naiveLeaks = 0;
+    for (let k = 4_074; k < 4_084; k++) {
+      for (let pad = 0; pad < 12; pad++) {
+        const turn = "a".repeat(pad) + " +1\n" + "2\n".repeat(k) + "x\n4111\n1111\n1111\n1111";
+        // The round-2 clip (scrub, collapse, clip), then the model's clean: it leaks here.
+        const naive = scrubText(turn).replace(/\s+/g, " ").slice(0, TURN_TEXT_CHARS);
+        if (card.test(scrubText(naive).replace(/\s+/g, " ").trim().slice(0, 800))) naiveLeaks += 1;
+        const d = digestRecords("claude", [user(turn)], { sampling: true });
+        const outputs = [
+          (await extractiveSummarizer.summarize("short", d)).text,
+          (await extractiveSummarizer.summarize("long", d)).text,
+          buildPromptInput("short", d),
+          buildPromptInput("long", d),
+        ];
+        for (const out of outputs) expect(out).not.toMatch(card);
+        // Settled: the model's clean step changes nothing in a kept turn.
+        expect(scrubText(d.userTurns[0]!).replace(/\s+/g, " ")).toBe(d.userTurns[0]!);
+      }
+    }
+    // The grid does reach the case: the naive clip leaks on some of these offsets.
+    expect(naiveLeaks).toBeGreaterThan(0);
+  }, 60_000);
 
   test("no token cut by the clip reaches a summary or a prompt, whatever the scrub shrinks first", async () => {
     const token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";

@@ -115,6 +115,15 @@ async function publishShortSummary(
   }
 }
 
+/**
+ * The content hash a cleared-then-failed outcome (`failAfterPublish`) is recorded under: a
+ * valid SHA-256 that never equals the raw's, so a replay of the same revision does not take
+ * the summary_current shortcut and reads the session again (it may succeed once the caps or
+ * the chunks change) instead of leaving the summary cleared until the next revision.
+ */
+export const notCurrentContent = (contentSha256: string) =>
+  createHash("sha256").update(`bob-costas:not-current:${contentSha256}`).digest("hex");
+
 /** SHA-256 of the manifest as indexed: the `summary-manifest` fence for the object. */
 export function manifestSha256(m: ManifestV1): string {
   return createHash("sha256").update(JSON.stringify(m)).digest("hex");
@@ -133,8 +142,9 @@ interface Outcome {
   turnsDropped?: number;
   /**
    * Publish this (text-free) outcome, clearing any earlier summary, then fail the delivery
-   * with this code: a session of delivery envelopes that could not be read whole, where a
-   * summary kept from before might show content since deleted or revised.
+   * with this code: a session of delivery envelopes that could not be read whole (a summary
+   * kept from before might show content since deleted or revised), or a capped read that
+   * found no record. Recorded under `notCurrentContent`, so a replay reads again.
    */
   failAfterPublish?: string;
 }
@@ -190,9 +200,8 @@ async function buildOutcome(
   }
   if (digest.records === 0) {
     // A capped read that found nothing says nothing about the session: never publish it as
-    // empty, which would clear a ready summary object.
-    if (digest.input)
-      throw new PipelineError("summary_input_unreadable", "the capped summary input held no record", false);
+    // `empty`. Any earlier summary may be stale too, so it is cleared, then the delivery fails.
+    if (digest.input) return { status: "quarantined", ...none, failAfterPublish: "summary_input_unreadable" };
     return { status: "empty", ...none };
   }
   // Ids only: the model summariser's per-org budget and per-session cap key on these.
@@ -457,7 +466,7 @@ export function bobCostasHandler(
           ctx.session_uuid ?? null,
           m.trace_id,
           m.revision,
-          m.raw.content_sha256,
+          outcome.failAfterPublish ? notCurrentContent(m.raw.content_sha256) : m.raw.content_sha256,
           outcome.status,
           published ? String(key) : null,
           published?.sha256 ?? null,
@@ -530,6 +539,6 @@ export function bobCostasHandler(
       ...(outcome.failAfterPublish ? { reason: outcome.failAfterPublish, error_code: outcome.failAfterPublish, retryable: false } : {}),
     });
     if (outcome.failAfterPublish)
-      throw new PipelineError(outcome.failAfterPublish, "the summary input could not be read whole; the summary was cleared", false);
+      throw new PipelineError(outcome.failAfterPublish, "the summary input could not be read; the summary was cleared", false);
   };
 }

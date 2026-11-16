@@ -912,10 +912,11 @@ the `bob costas summary` log line adds `reason: input_truncated` with
 `chunks_read`, `chunks_total`, `bytes_read` and `names_dropped`. When only the
 user turns were sampled the counts are exact: the object carries
 `turns_sampled: true` and the log line `turns_dropped`. A capped read that
-finds no record fails the summary (non-retryable) rather than publishing an
-empty one; an envelope session with an unreadable chunk has its summary
-cleared (`quarantined`) and then fails (non-retryable), so no summary of
-content since deleted or revised stays visible.
+finds no record, or an envelope session with an unreadable chunk, never
+publishes `empty` or keeps an older summary: the summary is cleared
+(`quarantined`, so nothing deleted or revised since stays visible) and the
+delivery fails (non-retryable). The row is recorded as not current, so a
+replay of the same revision reads the session again.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
