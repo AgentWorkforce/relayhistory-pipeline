@@ -457,7 +457,9 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
    verify. Registry pointers whose user directory was erased stay behind (they carry no raw id, and the sweep skips
    them at one GET each) until retention removes them.
 6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel), reads the legacy batch doc,
-   the fence and the shards of its live records; each apply reads the fence once more.
+   the fence and the shards of its live records; each apply reads the fence once more. Since slice 6 each sweep reads
+   two objects per registered stream (the registry pointer and the identity doc), and an apply with a consent gate
+   reads the consent store once.
 7. Closed in slice 5 (the skip record, read before and after the consumer's admitted write). Kept as a number so the
    references stay stable.
 8. Closed in slice 6: a registry doc is a hash-keyed pointer to the stream root, and the ids live in the stream's
