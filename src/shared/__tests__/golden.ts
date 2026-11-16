@@ -4,8 +4,8 @@
  * of the structured log lines (src/shared/log.ts writes JSON lines to stdout/stderr), and a
  * fixture compare that writes the fixture only when GOLDEN_WRITE=1.
  *
- * The fixtures were generated from main (d83752c2) before any regeneration code existed;
- * a later change that alters the flags-off SQL text, params or log lines fails here.
+ * The fixtures were regenerated on main 4ff67765 (no regeneration code); a later change that
+ * alters the flags-off SQL text, params or log lines fails here.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { expect } from "bun:test";
