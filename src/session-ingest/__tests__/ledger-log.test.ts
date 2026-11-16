@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore, type PutOpts } from "../../shared/vendor.ts";
 import {
-  appendBatches, enableLogMode, ledgerLogCommitMode, LOG_CHECKPOINT_EVERY, LOG_REMEMBERED_BATCHES, LogFenced, logKeys, LogUnavailable,
+  appendBatches, enableLogMode, ledgerLogCommitMode, LOG_CHECKPOINT_EVERY, LOG_ENTRIES_PER_DIR, LOG_REMEMBERED_BATCHES, LogFenced, logKeys, LogUnavailable,
   openStream, putPayload, readEntries, takeStream, type LogBatch,
 } from "../ledger-log.ts";
 import { selfhostLedgerLogCommit } from "../selfhost-config.ts";
@@ -23,8 +23,13 @@ async function batch(store: ObjectStore, id: string, body = id): Promise<LogBatc
   return { batchId: id, digest: `d-${body}`, receiptId: `r-${id}`, sessions: [["claude", `s-${id}`]], payloads: [ref] };
 }
 
-/** Wraps a store; `plan` decides per entry PUT whether to fail before the write, after it, or not at all. */
-function faulty(inner: ObjectStore, plan: (key: string, n: number) => "before" | "after" | "ok") {
+/**
+ * Wraps a store; `plan` decides per entry PUT whether to fail before the write (a transient 503), after it (the write
+ * landed, then a transient 503), crash after it (the write landed, then the PROCESS dies: a non-store error that
+ * propagates, so no retry or readback runs), or not at all.
+ */
+class Crash extends Error {}
+function faulty(inner: ObjectStore, plan: (key: string, n: number) => "before" | "after" | "crash-after" | "ok") {
   let n = 0;
   const wrapped: ObjectStore = {
     backend: inner.backend,
@@ -38,7 +43,23 @@ function faulty(inner: ObjectStore, plan: (key: string, n: number) => "before" |
     if (mode === "before") throw new ObjectStoreError("transient", "fs", "injected before", { status: 503 });
     const ack = await inner.put(key, body, opts);
     if (mode === "after") throw new ObjectStoreError("transient", "fs", "injected after", { status: 503 });
+    if (mode === "crash-after") throw new Crash("process died after the write landed");
     return ack;
+  };
+  return wrapped;
+}
+
+/** Wraps a store; `onList(prefix)` runs once per list call BEFORE the listing (to interleave a concurrent writer). */
+function interleaved(inner: ObjectStore, onList: (prefix: string) => Promise<void>, failList = false) {
+  const wrapped: ObjectStore = {
+    backend: inner.backend,
+    head: (k) => inner.head(k), get: (k, r) => inner.get(k, r), getObject: (k, r) => inner.getObject(k, r),
+    presignGet: (k, t) => inner.presignGet(k, t), delete: (k) => inner.delete(k), put: inner.put.bind(inner),
+    list: async (p, c) => {
+      await onList(String(p));
+      if (failList) throw new ObjectStoreError("transient", "fs", "injected list", { status: 503 });
+      return inner.list(p, c);
+    },
   };
   return wrapped;
 }
@@ -64,7 +85,7 @@ const rawEntry = async (store: ObjectStore, seq: number) => JSON.parse(new TextD
 async function seqs(store: ObjectStore): Promise<number[]> { const out: number[] = []; for await (const e of readEntries(store, keys)) out.push(e.seq); return out; }
 
 /** A store whose entry creates wait until `n` of them are in flight, so concurrent writers genuinely race. */
-function racing(inner: ObjectStore, n: number) {
+function racing(inner: ObjectStore, n: number, includeZero = false) {
   let waiting: (() => void)[] = [];
   const store: ObjectStore = {
     backend: inner.backend,
@@ -73,7 +94,7 @@ function racing(inner: ObjectStore, n: number) {
     put: inner.put.bind(inner),
   };
   store.put = async (key: Parameters<ObjectStore["put"]>[0], body: Uint8Array, opts?: PutOpts) => {
-    if (String(key).includes("/e/") && !String(key).endsWith("/e/00000000000000000000.json")) {
+    if (String(key).includes("/e/") && (includeZero || !String(key).endsWith("/00000000000000000000.json"))) {
       await new Promise<void>((resolve) => { waiting.push(resolve); if (waiting.length >= n) { const w = waiting; waiting = []; for (const r of w) r(); } });
     }
     return inner.put(key, body, opts);
@@ -100,11 +121,24 @@ describe("log mode marker", () => {
     await enableLogMode(store, keys, "cut-1", W("w1"));
     await expect(enableLogMode(store, keys, "cut-2", W("w2"))).rejects.toMatchObject({ code: "log_open_other_cutover" });
   });
-  test("two openers racing for entry 0: exactly one owns it", async () => {
-    const store = fresh();
+  test("two openers genuinely racing for entry 0 (both creates released together): exactly one owns it, both succeed", async () => {
+    const inner = fresh();
+    const store = racing(inner, 2, true);
     const [a, b] = await Promise.all([enableLogMode(store, keys, null, W("a")), enableLogMode(store, keys, null, W("b"))]);
     expect(a.epochWriter).toBe(b.epochWriter);
     expect(["a", "b"]).toContain(a.epochWriter);
+    expect(await seqs(inner)).toEqual([0]);
+  });
+  test("entry 0 created between an opener's read and its listing is read again, never log_open_missing", async () => {
+    const inner = fresh();
+    let once = true;
+    // The opener reads entry 0 (missing), then, before its listing, another opener creates entry 0.
+    const store = interleaved(inner, async (prefix) => {
+      if (once && prefix === keys.entries) { once = false; await enableLogMode(inner, keys, "cut", W("other")); }
+    });
+    const s = await openStream(store, keys);
+    expect(s?.epochWriter).toBe("other");
+    expect(await enableLogMode(store, keys, "cut", W("me"))).toMatchObject({ epochWriter: "other" });
   });
 });
 
@@ -153,6 +187,22 @@ describe("append", () => {
     await putRaw(store, keys.head, enc({ v: 1, seq: 5 }));
     const o2 = (await openStream(store, keys))!;
     expect(o2.head).toBe(s.head); expect(o2.remembered.has("forged")).toBe(false);
+  });
+
+  test("a checkpoint with another legacyCutover, or an oversized window, is ignored (replay from entry 0)", async () => {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, "cut-1", W("w1"));
+    for (let i = 1; i <= LOG_CHECKPOINT_EVERY; i++) await appendBatches(store, s, [await batch(store, `b${i}`)], null, W("w1"));
+    const cpKey = keys.checkpoint(LOG_CHECKPOINT_EVERY);
+    const cp = JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(cpKey))).body)));
+    await putRaw(store, keys.head, enc({ v: 1, seq: LOG_CHECKPOINT_EVERY }));
+    await putRaw(store, cpKey, enc({ ...cp, legacyCutover: "cut-2", remembered: [["forged", "x"]] }));
+    const o1 = (await openStream(store, keys))!;
+    expect([o1.head, o1.legacyCutover, o1.remembered.has("forged")]).toEqual([s.head, "cut-1", false]);
+    const huge = Array.from({ length: LOG_REMEMBERED_BATCHES + 1 }, (_, i) => [`f${i}`, "x"]);
+    await putRaw(store, cpKey, enc({ ...cp, remembered: huge }));
+    const o2 = (await openStream(store, keys))!;
+    expect([o2.head, o2.remembered.size, o2.remembered.has("f0")]).toEqual([s.head, s.remembered.size, false]);
   });
 
   test("a payload key that is not the stream's content address is refused before any write", async () => {
@@ -208,6 +258,23 @@ describe("fencing: exactly one writer per stream", () => {
     expect(loserState.epochWriter).toBe(o.epochWriter);
   });
 
+  test("an owner's append and another writer's take genuinely racing for one seq: exactly one lands, the other backs off", async () => {
+    const inner = fresh();
+    await enableLogMode(inner, keys, null, W("owner"));
+    const store = racing(inner, 2);
+    const own = (await openStream(inner, keys))!, taker = (await openStream(inner, keys))!;
+    const results = await Promise.allSettled([
+      appendBatches(store, own, [await batch(inner, "x")], null, W("owner")),
+      takeStream(store, taker, W("taker")),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled").length).toBe(1);
+    const reason = (results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason;
+    expect(reason).toBeInstanceOf(LogFenced);
+    // The append lost: the owner's entry was taken (log_entry_taken); the take lost: log_take_lost, no re-take.
+    expect(["log_entry_taken", "log_take_lost"]).toContain(reason.code);
+    expect(await seqs(inner)).toEqual([0, 1]);
+  });
+
   test("an ambiguous take keeps its epoch entry pending and resends exactly it", async () => {
     const inner = fresh();
     await enableLogMode(inner, keys, null, W("first"));
@@ -247,17 +314,23 @@ describe("ambiguous commits: read back, never assume failure", () => {
     expect(ids).toEqual([["b1"], ["b2"]]);
   });
 
-  test("crash at every prefix, failing before OR after the write, with the process state dropped: the chain stays valid and every batch lands at most once", async () => {
-    for (const mode of ["before", "after"] as const) {
+  test("crash at every prefix, failing before the write OR crashing after it landed, with the process state dropped: the chain stays valid and every batch lands at most once", async () => {
+    for (const mode of ["before", "crash-after"] as const) {
       for (let crashAt = 1; crashAt <= 6; crashAt++) {
         const inner = fresh();
         const store = faulty(inner, (_k, n) => (n >= crashAt ? mode : "ok"));
+        let failed: unknown;
         try {
           const s = await enableLogMode(store, keys, null, W("w"));
           for (let i = 1; i <= 4; i++) await appendBatches(store, s, [await batch(inner, `b${i}`)], null, W("w"));
         } catch (error) {
-          expect(error instanceof LogUnavailable || error instanceof LogFenced).toBe(true);
+          failed = error;
         }
+        // 5 entry PUTs (entry 0 + 4 appends): every crashAt <= 5 MUST fail; 6 never fires.
+        if (crashAt <= 5) {
+          expect(failed).toBeDefined();
+          expect(mode === "before" ? failed instanceof LogUnavailable : failed instanceof Crash).toBe(true);
+        } else expect(failed).toBeUndefined();
         // A restart: no in-memory state survives. Reopen from the store, take the stream, finish the work.
         let o = await openStream(inner, keys);
         if (!o) o = await enableLogMode(inner, keys, null, W("w"));
@@ -283,6 +356,34 @@ describe("readers fail closed", () => {
     await store.delete(objectKey(keys.entry(2)));
     await expect(openStream(store, keys)).rejects.toMatchObject({ code: "log_entry_gap" });
     await expect(seqs(store)).rejects.toMatchObject({ code: "log_entry_gap" });
+  });
+  test("a gap whose successors sit in the NEXT entry directory is still found (bounded listing, two directories)", async () => {
+    const { store } = await fourEntries();
+    // head is 3; entry 4 is missing; an entry exists in the next 1000-seq directory.
+    await putRaw(store, keys.entry(4 + LOG_ENTRIES_PER_DIR - 1), enc({ junk: true }));
+    await expect(openStream(store, keys)).rejects.toMatchObject({ code: "log_entry_gap" });
+  });
+  test("an entry appended between a reader's last read and its listing is replayed, never log_entry_gap", async () => {
+    const inner = fresh();
+    const owner = await enableLogMode(inner, keys, null, W("w"));
+    for (let i = 1; i <= 3; i++) await appendBatches(inner, owner, [await batch(inner, `b${i}`)], null, W("w"));
+    let once = true;
+    // The reader reads entry 4 (missing); before its listing, the owner appends entry 4.
+    const store = interleaved(inner, async (prefix) => {
+      if (once && prefix === keys.entryDir(4)) { once = false; await appendBatches(inner, owner, [await batch(inner, "b4")], null, W("w")); }
+    });
+    expect((await openStream(store, keys))!.head).toBe(4);
+    once = true;
+    const view = interleaved(inner, async (prefix) => {
+      if (once && prefix === keys.entryDir(5)) { once = false; await appendBatches(inner, owner, [await batch(inner, "b5")], null, W("w")); }
+    });
+    const read: number[] = [];
+    for await (const e of readEntries(view, keys)) read.push(e.seq);
+    expect(read).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+  test("a store fault on the gap listing is LogUnavailable (retryable), never a raw store error", async () => {
+    const { store } = await fourEntries();
+    await expect(openStream(interleaved(store, async () => {}, true), keys)).rejects.toBeInstanceOf(LogUnavailable);
   });
   test("a lost entry 0 with entries present is LogCorrupt (log_open_missing): the stream never flips back to legacy", async () => {
     const { store } = await fourEntries();

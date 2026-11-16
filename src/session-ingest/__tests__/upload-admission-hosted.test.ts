@@ -43,6 +43,9 @@ describe("hostedUploadAdmissionConfig", () => {
     expect(code(() => hostedUploadAdmissionConfig({ ...env, INGEST_UPLOAD_CONSENT: "enforce" }))).toBe("upload_consent_unsupported");
     expect(code(() => hostedUploadAdmissionConfig({ ...env, INGEST_UPLOAD_CONSENT: "maybe" }))).toBe("upload_consent_invalid");
     expect(code(() => hostedUploadAdmissionConfig({ ...env, SCRUB_ENGINE: "wasm" }))).toBe("scrub_engine_unsupported");
+    expect(code(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_LOG_COMMIT: "on" }))).toBe("ledger_log_commit_unsupported");
+    expect(code(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_LOG_COMMIT: "yes" }))).toBe("ledger_log_commit_invalid");
+    expect(hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_LOG_COMMIT: "off" }).bucket).toBe(env.UPLOAD_ADMISSION_BUCKET);
     const arn = "arn:aws:secretsmanager:us-east-1:111111111111:secret:96bulls/aws-synthetic/upload-admission-AbC123";
     expect(hostedUploadAdmissionConfig({ ...env, UPLOAD_ADMISSION_SECRET_ID: arn }).secretId).toBe(arn);
     try { hostedUploadAdmissionConfig({ ...env, UPLOAD_ADMISSION_BUCKET: "Leaky_Value" }); } catch (e) { expect(String(e)).not.toContain("Leaky_Value"); }
