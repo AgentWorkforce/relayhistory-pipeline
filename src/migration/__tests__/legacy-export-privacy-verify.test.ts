@@ -137,6 +137,11 @@ const ERASE_CFG_LEGACY_OFF = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: f
 const GATE_TARGET = process.env.LEGACY_GATE_TARGET;
 /** (g) cases whose code exists only on the activation branch: PUT bound (5f7eba44), per-scope recheck (57171957), alarm summary (e68ca57f). */
 const ACTIVATION_ONLY = GATE_TARGET !== "activation";
+/**
+ * EXPORTER cases drive runOrg to a real export. Since F2 the landing runner refuses every export for the preactivation
+ * generation (asserted by (g)'s control and (s)), so these bind only on the activation target, the first code that can export.
+ */
+const exporterTest = test.skipIf(GATE_TARGET !== "activation");
 test("gate target: LEGACY_GATE_TARGET is declared as landing or activation", () => {
   expect(["landing", "activation"]).toContain(GATE_TARGET);
 });
@@ -229,7 +234,7 @@ const servedLegacy = async (store: ObjectStore, pointers: CanonicalPointer[]) =>
 
 // ---------------------------------------------------------------------------
 describe("(a) turn-specific cross-member fences block a legacy-only export", () => {
-  test("control: an unfenced legacy-only scope IS exported (the fixture is live)", async () => {
+  exporterTest("control: an unfenced legacy-only scope IS exported (the fixture is live)", async () => {
     const n = await neon(), p = await supabase();
     const store = createFsStore({ root: await tmp("a0") });
     const { counters } = await run(n.db, p.db, store, "a0");
@@ -237,7 +242,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect((await allKeys(store)).length).toBeGreaterThan(0);
   });
 
-  test("owner rule: a turns-only scope whose session_owner is unverified free text is not exported, writes nothing, and is counted unbound_turns_only (not failed)", async () => {
+  exporterTest("owner rule: a turns-only scope whose session_owner is unverified free text is not exported, writes nothing, and is counted unbound_turns_only (not failed)", async () => {
     // Lead's rule: events user, then outcomes user, then session_owner ONLY if it is a verified Cloud user id. A label
     // that appears in no authenticated user evidence is never an erasure identity; the scope stays on the frozen copy.
     const n = await neon(), p = await supabase();
@@ -251,7 +256,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect(flat.filter(([k, v]) => /unbound_?turns_?only/iu.test(k) && v === 1).length).toBe(1);
   });
 
-  test("owner rule: two distinct event users, or two distinct outcome users, are not exported, write nothing, and are counted unbound_multi_owner (not failed)", async () => {
+  exporterTest("owner rule: two distinct event users, or two distinct outcome users, are not exported, write nothing, and are counted unbound_multi_owner (not failed)", async () => {
     for (const evidence of ["events", "outcomes"] as const) {
       const n = await neon(), p = await supabase();
       if (evidence === "events")
@@ -266,7 +271,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     }
   });
 
-  test("owner rule: a turns-only session_owner that is a verified Cloud user id in the SAME tenant is exported under that owner; evidence from another org does not verify it", async () => {
+  exporterTest("owner rule: a turns-only session_owner that is a verified Cloud user id in the SAME tenant is exported under that owner; evidence from another org does not verify it", async () => {
     for (const where of ["same-tenant", "other-org"] as const) {
       const n = await neon(), p = await supabase();
       await n.pg.query("DELETE FROM sessions.session_outcomes");
@@ -288,7 +293,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     }
   });
 
-  test("Supabase turn_session_fences (legacy_import, no user) fences the scope: nothing reaches S3", async () => {
+  exporterTest("Supabase turn_session_fences (legacy_import, no user) fences the scope: nothing reaches S3", async () => {
     for (const basis of ["legacy_import", "live"]) {
       const n = await neon(), p = await supabase();
       await p.pg.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,$5)", [S.orgId, S.workspaceId, S.source, S.sessionId, basis]);
@@ -302,7 +307,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     }
   });
 
-  test("Neon conversation_turn_fences written by ANOTHER member's erasure fences the owner's legacy scope", async () => {
+  exporterTest("Neon conversation_turn_fences written by ANOTHER member's erasure fences the owner's legacy scope", async () => {
     const n = await neon(), p = await supabase();
     await n.pg.query("INSERT INTO sessions.conversation_turn_fences VALUES($1,$2,$3,$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
     const store = createFsStore({ root: await tmp("a2") });
@@ -311,7 +316,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect(await allKeys(store)).toEqual([]);
   });
 
-  test("conversation_turn_fences under the delivery spelling '' fences turns stored under 'default'", async () => {
+  exporterTest("conversation_turn_fences under the delivery spelling '' fences turns stored under 'default'", async () => {
     const n = await neon(), p = await supabase();
     await n.pg.query("DELETE FROM sessions.conversation_turns");
     await n.pg.query(
@@ -327,7 +332,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect(await allKeys(store)).toEqual([]);
   });
 
-  test("Supabase ledgers written under the delivery spelling '' fence turns stored under 'default'", async () => {
+  exporterTest("Supabase ledgers written under the delivery spelling '' fence turns stored under 'default'", async () => {
     const ledgers: [string, string][] = [
       ["turn_session_fences", "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,'',$2,$3,'live')"],
       ["session_erasure_receipts", "INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id) VALUES($1,'',$2,$3)"],
@@ -350,7 +355,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     }
   });
 
-  test("Supabase ingest_frozen_source_deletions (a Neon-era deletion copied at freeze) fences the scope", async () => {
+  exporterTest("Supabase ingest_frozen_source_deletions (a Neon-era deletion copied at freeze) fences the scope", async () => {
     // Under the Supabase privacy authority the frozen copy is the record of Neon-era deletions.
     const n = await neon(), p = await supabase();
     await p.pg.query("INSERT INTO sessions.ingest_frozen_source_deletions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
@@ -360,7 +365,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect(await allKeys(store)).toEqual([]);
   });
 
-  test("an already-exported, unchanged scope fenced later is reported fenced on the rerun (checkpoint skip path)", async () => {
+  exporterTest("an already-exported, unchanged scope fenced later is reported fenced on the rerun (checkpoint skip path)", async () => {
     const n = await neon(), p = await supabase();
     const store = createFsStore({ root: await tmp("a4") });
     const checkpoint = new Checkpoint(join(await tmp("a4c"), "c.sqlite"));
@@ -375,7 +380,7 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     checkpoint.close();
   });
 
-  test("no over-fencing: fences on a neighbouring session, source or org do not fence this scope", async () => {
+  exporterTest("no over-fencing: fences on a neighbouring session, source or org do not fence this scope", async () => {
     const n = await neon(), p = await supabase();
     await p.pg.query(
       "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,'sess:10','live'),($1,$2,'codex',$4,'live'),('org_2',$2,$3,$4,'live')",
@@ -416,7 +421,7 @@ describe("(b) the race-loser recheck sees every ledger the pre-check sees", () =
     expect(r.outcome).toEqual({ code: "legacy_privacy_race" });
   });
 
-  test("a race fails the scope in runOrg: it is never checkpointed exported", async () => {
+  exporterTest("a race fails the scope in runOrg: it is never checkpointed exported", async () => {
     const n = await neon(), p = await supabase();
     const store = createFsStore({ root: await tmp("b4") });
     // Inject the receipt at the first S3 write (inside the fence).
@@ -491,7 +496,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   }
 
-  test("the owner's own erasure removes every legacy object of the session, its pointer, and the reader serves nothing", async () => {
+  exporterTest("the owner's own erasure removes every legacy object of the session, its pointer, and the reader serves nothing", async () => {
     const r = await exportThenErase(OWNER, { neighbour: true });
     expect(r.left.filter((k) => k.startsWith(r.objectRoot) && k.includes("/s=sess_1/"))).toEqual([]);
     expect(r.left).not.toContain(r.ptrKey);
@@ -501,7 +506,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     expect(r.left.some((k) => k.startsWith(r.objectRoot) && k.includes("/s=sess_keep/"))).toBe(true);
   });
 
-  test("ANOTHER member's erasure of the session also removes the owner's legacy copy (turns are fenced for every member)", async () => {
+  exporterTest("ANOTHER member's erasure of the session also removes the owner's legacy copy (turns are fenced for every member)", async () => {
     const r = await exportThenErase(OTHER);
     expect(r.left.filter((k) => k.startsWith(r.objectRoot) && k.includes("/s=sess_1/"))).toEqual([]);
     expect(r.left).not.toContain(r.ptrKey);
@@ -532,14 +537,14 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     return { n, p, store, objectRoot };
   }
 
-  test("race loser fenced by session_erasure_receipts: the receipt-owned session eraser removes the legacy manifest and raw object", async () => {
+  exporterTest("race loser fenced by session_erasure_receipts: the receipt-owned session eraser removes the legacy manifest and raw object", async () => {
     const { store, objectRoot } = await raceLoser("session_erasure_receipts");
     // The operator session-erase byte stage (selfhost-runtime.ts) is what consumes a receipt.
     await eraseDiscoveredSessionBytes(storeEraser(store), { orgId: SR.orgId, workspaceId: SR.workspaceId, source: SR.source, sessionId: SR.sessionId }, { keyRoot: "96bulls", bucket: "bucket" });
     expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
   });
 
-  test("race loser fenced by turn_session_fences alone (no tombstone): the HOSTED deletion job under the Supabase authority removes the legacy manifest and raw object", async () => {
+  exporterTest("race loser fenced by turn_session_fences alone (no tombstone): the HOSTED deletion job under the Supabase authority removes the legacy manifest and raw object", async () => {
     // Production shape end to end, on the repo's real Supabase migration stack (authorityFixture, activated as in
     // neon-s3-erasure-authority.test.ts):
     //  - the exporter runs through runOrg on a restricted privacy role holding only the runbook's grants, using the
@@ -769,7 +774,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
-  test("owner rule: the legacy exporter REFUSES unless the Supabase eraser authority is active (no legacy copy can start under neon)", async () => {
+  exporterTest("owner rule: the legacy exporter REFUSES unless the Supabase eraser authority is active (no legacy copy can start under neon)", async () => {
     const n = await neon();
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
     await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
@@ -796,7 +801,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   });
 
 
-  test("owner rule: the hosted eraser targets the owner registered at export, even after Neon later re-derives a different one", async () => {
+  exporterTest("owner rule: the hosted eraser targets the owner registered at export, even after Neon later re-derives a different one", async () => {
     const n = await neon();
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
     await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
@@ -822,7 +827,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
-  test("F1-fix (1): a registered scope whose PUT never landed does not wedge the hosted sweep; a fenced neighbour in the same sweep is still erased", async () => {
+  exporterTest("F1-fix (1): a registered scope whose PUT never landed does not wedge the hosted sweep; a fenced neighbour in the same sweep is still erased", async () => {
     const n = await twoScopes();
     const w = await hostedWorld();
     try {
@@ -880,7 +885,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", { org_id: S.orgId, workspace_id: S.workspaceId, user_id: user, origin_id: LEGACY_EXPORT_ORIGIN_ID })) && k.includes(`/s=${sid}/`));
 
   for (const ledger of ["upload_resets", "operator_user_erasures"] as const)
-    test(`user-level ${ledger} recorded AFTER export: the hosted eraser removes that user's legacy copies and leaves another user's intact`, async () => {
+    exporterTest(`user-level ${ledger} recorded AFTER export: the hosted eraser removes that user's legacy copies and leaves another user's intact`, async () => {
       const n = await twoUsers();
       const w = await hostedWorld();
       try {
@@ -927,7 +932,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       for (const t of tables) await w.f.db.exec(`DROP TABLE IF EXISTS ${t} CASCADE`);
       for (const fn of fns) {
         const sigs = (await w.f.db.query<{ sig: string }>("SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname||'.'||p.proname=$1", [fn])).rows;
-        for (const { sig } of sigs) await w.f.db.exec(`DROP FUNCTION IF EXISTS ${sig}`);
+        for (const { sig } of sigs) await w.f.db.exec(`DROP FUNCTION IF EXISTS ${sig} CASCADE`); // CASCADE: 062030 triggers on prefix tables
       }
       expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
     } finally {
@@ -935,7 +940,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
-  test("(h2) one poison authority row (well-formed machine id NOT derived from its workspace/user) is refused loudly but never wedges erasure of other fenced scopes", async () => {
+  exporterTest("(h2) one poison authority row (well-formed machine id NOT derived from its workspace/user) is refused loudly but never wedges erasure of other fenced scopes", async () => {
     const n = await neon();
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
     await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
@@ -963,7 +968,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
-  test("(h3) runOrg refuses when the readiness probe is missing (library path, without the CLI preflight)", async () => {
+  exporterTest("(h3) runOrg refuses when the readiness probe is missing (library path, without the CLI preflight)", async () => {
     const n = await neon();
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
     await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
@@ -986,7 +991,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
-  test("F1-fix (2): an erasure committed between owner registration and the PUT leaves no legacy object", async () => {
+  exporterTest("F1-fix (2): an erasure committed between owner registration and the PUT leaves no legacy object", async () => {
     const n = await twoScopes();
     await n.pg.query("DELETE FROM sessions.conversation_turns WHERE session_id='sess_q'");
     await n.pg.query("DELETE FROM sessions.session_outcomes WHERE session_id='sess_q'");
@@ -1129,8 +1134,11 @@ const HEARTBEAT = {
   at: "last_success_at",
   /** legacy_export_privacy_authority_ready() requires a heartbeat no older than this. */
   staleAfterMinutes: 30,
-  /** A complete, valid forged row: a refusal must come from privileges, never from a constraint on a partial row. */
-  forgeInsert: "INSERT INTO sessions.legacy_export_privacy_eraser_readiness(singleton,authority,last_success_at) VALUES(true,'supabase',clock_timestamp()) ON CONFLICT (singleton) DO UPDATE SET last_success_at=EXCLUDED.last_success_at",
+  /**
+   * A complete, valid forged row: a refusal must come from privileges, never from a constraint on a partial row. $1 is a
+   * REAL eraser-written row (as jsonb), so every column the head adds (generation, authority epoch, ...) is present and valid.
+   */
+  forgeInsert: "INSERT INTO sessions.legacy_export_privacy_eraser_readiness SELECT (jsonb_populate_record(NULL::sessions.legacy_export_privacy_eraser_readiness,$1::jsonb)).* ON CONFLICT (singleton) DO UPDATE SET last_success_at=clock_timestamp()",
   forgeUpdate: "UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()",
 };
 const heartbeatAge = (f: { db: PGlite }, minutes: number) =>
@@ -1191,22 +1199,65 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
         state.close();
       }
     };
-    return { f, exportAs, sweepSupabase };
+    /**
+     * The frozen 062030 verdict, asked directly as the exporter role with THIS head's compiled generation (landing:
+     * preactivation, activation: activation). "ready" only when ready() returns true; otherwise the refusal text. On
+     * landing every exporter run refuses (F2), so these SQL verdicts are what make the (g) cases non-vacuous there.
+     */
+    const readyAs = async (): Promise<string> => {
+      const gen = (await import("../../shared/legacy-export-generation.ts")) as { LEGACY_EXPORT_GENERATION: string; LEGACY_EXPORT_GENERATION_SETTING: string };
+      await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+      try {
+        await f.db.query("SELECT set_config($1,$2,false)", [gen.LEGACY_EXPORT_GENERATION_SETTING, gen.LEGACY_EXPORT_GENERATION]);
+        const r = (await f.db.query("SELECT sessions.legacy_export_privacy_authority_ready() AS r")).rows[0] as { r: unknown };
+        return r.r === true ? "ready" : `not ready: ${JSON.stringify(r.r)}`;
+      } catch (e) {
+        return String((e as Error).message);
+      } finally {
+        await f.db.exec("RESET ROLE");
+      }
+    };
+    /**
+     * A genuine legacy copy WITHOUT runOrg (landing refuses every export): the real exportUnit + legacyUnitSource writer,
+     * then the owner mapping through the real register RPC as the exporter role, exactly the rows runOrg would register.
+     */
+    const seedLegacyCopy = async (n: { db: Queryable }, store: ObjectStore) => {
+      await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, (await legacyUnit(n.db, S))!, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+      await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+      try {
+        await f.db.query("SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)", [
+          JSON.stringify({ org_id: S.orgId, workspace_id: S.workspaceId === "" ? "default" : S.workspaceId, source: S.source, session_id: S.sessionId, legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(S.workspaceId, OWNER) }),
+        ]);
+      } finally {
+        await f.db.exec("RESET ROLE");
+      }
+    };
+    return { f, exportAs, sweepSupabase, readyAs, seedLegacyCopy };
   }
   const refusedFor = (r: { thrown?: string; codes?: string[] }, re: RegExp) => (r.thrown !== undefined ? re.test(r.thrown) : (r.codes ?? []).some((c) => re.test(c)));
   // Any authority/readiness refusal code: within (g) the authority is active and the control proves an active authority
   // plus a fresh heartbeat exports, so a refusal here can only be about the heartbeat.
   const HB = /heartbeat|stale|ready|readiness|authority_not_active/iu;
 
-  test("control: after a real Supabase eraser sweep (fresh heartbeat) the exporter exports", async () => {
+  test("control: after a real Supabase eraser sweep (fresh heartbeat) ready() accepts; activation exports, landing's runOrg still refuses", async () => {
     const n = await neon();
     const w = await world();
     try {
       const store = createFsStore({ root: await tmp("hb-fresh") });
       await w.sweepSupabase(store);
       expect(await heartbeatRows(w.f)).toBeGreaterThan(0);
-      const r = await w.exportAs(n, store, "hb-fresh");
-      expect(r).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      expect(await w.readyAs()).toBe("ready"); // a fresh, healthy, current-activation row satisfies the frozen schema
+      if (GATE_TARGET === "activation") {
+        const r = await w.exportAs(n, store, "hb-fresh");
+        expect(r).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      } else {
+        // LANDING (F2): even with a fresh eraser heartbeat, the library path (runOrg) refuses before any PUT.
+        let puts = 0;
+        const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-fresh");
+        expect(puts).toBe(0);
+        expect(await allKeys(store)).toEqual([]);
+        expect(refusedFor(r, /^legacy_export_requires_activation_heartbeat$/u)).toBe(true);
+      }
     } finally {
       await w.f.close();
     }
@@ -1222,6 +1273,7 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       expect(puts).toBe(0);
       expect(await allKeys(store)).toEqual([]);
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
     } finally {
       await w.f.close();
     }
@@ -1233,10 +1285,12 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
     try {
       const store = createFsStore({ root: await tmp("hb-dry") });
       await w.sweepSupabase(store, { dryRun: true });
+      expect(await heartbeatRows(w.f)).toBe(0); // a dry run writes no readiness row at all
       let puts = 0;
       const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-dry");
       expect(puts).toBe(0);
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
     } finally {
       await w.f.close();
     }
@@ -1248,10 +1302,12 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
     try {
       const store = createFsStore({ root: await tmp("hb-legacy-off") });
       await w.sweepSupabase(store, { legacyOff: true });
+      expect(await heartbeatRows(w.f)).toBe(0); // Supabase authority + legacy feed OFF writes no readiness row at all
       let puts = 0;
       const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-legacy-off");
       expect(puts).toBe(0);
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
     } finally {
       await w.f.close();
     }
@@ -1302,6 +1358,56 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-stale");
       expect(puts).toBe(0);
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("RE-ACTIVATION: a still-fresh heartbeat from a PRIOR Supabase activation does not arm the exporter after Neon release and re-activation", async () => {
+    // The lazy policy's control_epoch is immutable once set (20261104055000: "lazy policy identity is immutable"), so a
+    // production release -> re-activation reuses the SAME control_epoch. The binding must therefore distinguish
+    // activations (e.g. ingest_privacy_authority.activated_at, which every activation sets), not just the epoch.
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-reactivate") });
+      await w.sweepSupabase(store); // fresh heartbeat under the first activation
+      expect(await heartbeatRows(w.f)).toBe(1);
+      const before = (await w.f.db.query("SELECT activated_at::text AS t FROM sessions.ingest_privacy_authority")).rows[0] as { t: string };
+      const priorRow = JSON.stringify(((await w.f.db.query(`SELECT to_jsonb(r) AS j FROM ${HEARTBEAT.table} r`)).rows[0] as { j: unknown }).j);
+      // Release back to Neon (allowed: nothing changed since activation), then fence and activate again.
+      expect((await w.f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch })).r).toMatchObject({ authority: "neon" });
+      // Every authority transition clears the readiness singleton (owner design: a transactional trigger on
+      // ingest_privacy_authority), so no prior-activation row can survive regardless of activated_at resolution.
+      expect(await heartbeatRows(w.f)).toBe(0);
+      // No active authority: ready() refuses and a Supabase sweep writes nothing.
+      expect(await w.readyAs()).not.toBe("ready");
+      await w.sweepSupabase(store).catch(() => {});
+      expect(await heartbeatRows(w.f)).toBe(0);
+      await w.f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      expect(await heartbeatRows(w.f)).toBe(0);
+      const fp = (await w.f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+      const owned = (await w.f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+      await w.f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+      const after = (await w.f.db.query("SELECT activated_at::text AS t FROM sessions.ingest_privacy_authority")).rows[0] as { t: string };
+      expect(after.t).not.toBe(before.t); // a genuinely new activation
+      expect(await heartbeatRows(w.f)).toBe(0); // activation itself does not arm anything
+      // Even a row RE-PLANTED by the table owner with the PRIOR activation's values (fresh, right generation) must not
+      // satisfy ready(): the binding is to the current activation, not merely to row presence.
+      await w.f.db.query(HEARTBEAT.forgeInsert, [priorRow]);
+      expect(await heartbeatRows(w.f)).toBe(1);
+      await w.f.db.query(`UPDATE ${HEARTBEAT.table} SET ${HEARTBEAT.at}=clock_timestamp()`);
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-reactivate");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
+      // Control (activation target only: landing refuses every export): a real sweep under the NEW activation re-arms it.
+      if (GATE_TARGET === "activation") {
+        await w.sweepSupabase(store);
+        expect(await w.exportAs(n, store, "hb-reactivate-2")).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      }
     } finally {
       await w.f.close();
     }
@@ -1310,10 +1416,20 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
   test("NOT eraser-written: neither the exporter role nor the ingest role can write a heartbeat", async () => {
     const w = await world();
     try {
+      // A real eraser-written row is the forge template; it is then deleted so an INSERT is a genuine insert attempt.
+      await w.sweepSupabase(createFsStore({ root: await tmp("hb-forge") }));
+      const real = (await w.f.db.query(`SELECT to_jsonb(r) AS j FROM ${HEARTBEAT.table} r`)).rows as { j: unknown }[];
+      expect(real.length).toBe(1);
+      const template = JSON.stringify(real[0]!.j);
+      // Control: the template is a valid complete row (the table owner can insert it), so a role's refusal is privilege-only.
+      await w.f.db.exec(`DELETE FROM ${HEARTBEAT.table}`);
+      await w.f.db.query(HEARTBEAT.forgeInsert, [template]);
+      expect(await heartbeatRows(w.f)).toBe(1);
+      await w.f.db.exec(`DELETE FROM ${HEARTBEAT.table}`);
       for (const role of ["bulls96_legacy_export_privacy", "bulls96_session_ingest"]) {
         await w.f.db.exec(`SET ROLE ${role}`);
         try {
-          const ins = await w.f.db.query(HEARTBEAT.forgeInsert).then(() => "wrote", (e) => String((e as Error).message));
+          const ins = await w.f.db.query(HEARTBEAT.forgeInsert, [template]).then(() => "wrote", (e) => String((e as Error).message));
           const upd = await w.f.db.query(HEARTBEAT.forgeUpdate).then(() => "wrote", (e) => String((e as Error).message));
           expect({ role, ins: /permission denied/iu.test(ins), upd: /permission denied/iu.test(upd) }).toEqual({ role, ins: true, upd: true });
         } finally {
@@ -1368,6 +1484,7 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       const sessions = Object.keys(putsBySession);
       expect(sessions.length).toBe(1); // the second scope never wrote anything
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
     } finally {
       await w.f.close();
     }
@@ -1378,9 +1495,15 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
     const w = await world();
     try {
       const store = createFsStore({ root: await tmp("hb-partial") });
-      await w.sweepSupabase(store); // arm
-      const first = await w.exportAs(n, store, "hb-partial-1");
-      expect(first).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      if (GATE_TARGET === "activation") {
+        await w.sweepSupabase(store); // arm
+        const first = await w.exportAs(n, store, "hb-partial-1");
+        expect(first).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      } else {
+        await w.seedLegacyCopy(n, store); // landing refuses every export: seed the genuine copy and its mapping directly
+        await w.sweepSupabase(store); // a healthy sweep writes the row being aged below
+        expect(await heartbeatRows(w.f)).toBe(1);
+      }
       const objectRoot = liveObjectPrefix("96bulls", { org_id: S.orgId, workspace_id: S.workspaceId, user_id: OWNER, origin_id: LEGACY_EXPORT_ORIGIN_ID });
       const legacyOf = async () => (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"));
       expect((await legacyOf()).length).toBeGreaterThan(0);
@@ -1408,6 +1531,7 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-partial-2");
       expect(puts).toBe(0);
       expect(refusedFor(r, HB)).toBe(true);
+      expect(await w.readyAs()).not.toBe("ready"); // the frozen schema itself refuses (non-vacuous on landing)
     } finally {
       await w.f.close();
     }
@@ -1601,7 +1725,7 @@ describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
     expect(streamed.reasons).not.toContain("legacy_provenance_invalid");
   });
 
-  test("secret-shaped tokens in a legacy turn never appear in any stored object (raw chunks decompressed, manifests included)", async () => {
+  exporterTest("secret-shaped tokens in a legacy turn never appear in any stored object (raw chunks decompressed, manifests included)", async () => {
     // Assembled at runtime so no secret-shaped literal sits in the source (push protection, secret scanners).
     const aws = ["AK", "IA", "ZQXWVUTSRPONMLKJ"].join("");
     const slack = ["xo", "xb", "-", "1".repeat(12), "-", "2".repeat(13), "-", "AbCdEfGhIjKlMnOpQrStUvWx"].join("");
