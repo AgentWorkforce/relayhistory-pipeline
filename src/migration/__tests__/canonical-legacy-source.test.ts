@@ -637,10 +637,17 @@ test("disagreement across authenticated owner evidence is unbound_multi_owner an
   }
 });
 
-test("the Neon hosted eraser never re-derives a legacy export owner", () => {
+test("the Neon hosted eraser never re-derives a legacy export owner and fails loud on a fence", async () => {
   const authority = neonAuthority(db);
-  expect(authority.legacyFencedPage).toBeUndefined();
-  expect(authority.stillLegacyFenced).toBeUndefined();
+  expect(await authority.legacyFencedPage!(null)).toEqual([]);
+  await pg.exec("INSERT INTO sessions.deleted_upload_sessions VALUES('org_1','ws_1','claude','sess:1')");
+  try {
+    await expect(authority.legacyFencedPage!(null)).rejects.toMatchObject({
+      code: "legacy_erasure_requires_supabase_authority",
+    });
+  } finally {
+    await pg.exec("DELETE FROM sessions.deleted_upload_sessions");
+  }
 });
 
 test("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {

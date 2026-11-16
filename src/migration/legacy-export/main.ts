@@ -104,11 +104,12 @@ export async function assertPrivacySelectOnly(db: Queryable) {
         { code: "privacy_role_not_read_only" },
       );
   }
-  const authority = await db.query<{ w: boolean; x: boolean }>(
+  const authority = await db.query<{ w: boolean; x: boolean; a: boolean }>(
     `SELECT has_table_privilege(current_user,'sessions.legacy_export_scope_authority','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
-            has_function_privilege(current_user,'sessions.ingest_legacy_export_scope_authority_register(jsonb)','EXECUTE') AS x`,
+            has_function_privilege(current_user,'sessions.ingest_legacy_export_scope_authority_register(jsonb)','EXECUTE') AS x,
+            has_function_privilege(current_user,'sessions.legacy_export_privacy_authority_ready()','EXECUTE') AS a`,
   );
-  if (authority.rows[0]?.w !== false || authority.rows[0]?.x !== true)
+  if (authority.rows[0]?.w !== false || authority.rows[0]?.x !== true || authority.rows[0]?.a !== true)
     throw Object.assign(new Error("the privacy role must have only the legacy authority register RPC"), { code: "privacy_role_not_register_only" });
   const identity = await db.query<{ who: string }>("SELECT current_user::text AS who");
   if (identity.rows[0]?.who !== "bulls96_legacy_export_privacy")

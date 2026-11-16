@@ -70,6 +70,27 @@ export interface ErasureAuthority {
   stillLegacyFenced?(g: LegacyFencedGroup): Promise<boolean>;
 }
 
+/**
+ * Neon has no durable legacy-export owner mapping. A scope fence there can
+ * therefore never authorize a legacy-machine delete. Surface the condition
+ * loudly so an operator moves the sweep to the active Supabase authority;
+ * never derive an owner from mutable Neon rows.
+ */
+async function refuseNeonLegacyFences(db: Queryable): Promise<LegacyFencedGroup[]> {
+  const { rows } = await db.query(
+    `SELECT 1 WHERE
+       EXISTS(SELECT 1 FROM sessions.deleted_upload_sessions LIMIT 1)
+       OR EXISTS(SELECT 1 FROM sessions.conversation_turn_fences LIMIT 1)
+       LIMIT 1`,
+  );
+  if (rows.length > 0)
+    throw Object.assign(
+      new Error("legacy erasure requires the Supabase authority mapping"),
+      { code: "legacy_erasure_requires_supabase_authority" },
+    );
+  return [];
+}
+
 export function neonAuthority(db: Queryable): ErasureAuthority {
   return {
     kind: "neon",
@@ -90,6 +111,10 @@ export function neonAuthority(db: Queryable): ErasureAuthority {
           [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
         )
       ).rows.length > 0,
+    legacyFencedPage: () => refuseNeonLegacyFences(db),
+    // The page above can never yield a target under Neon. Supplying the pair
+    // keeps the job's authority contract complete without authorizing a row.
+    stillLegacyFenced: async () => false,
   };
 }
 

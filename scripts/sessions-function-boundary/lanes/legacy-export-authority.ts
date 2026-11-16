@@ -13,6 +13,7 @@ export const legacyExportAuthority: LaneManifest = {
   grantSources: [{ path: MIGRATION, roles: [EXPORTER, ERASER] }],
   functions: {
     "sessions.ingest_legacy_export_scope_authority_register(jsonb)": { secdef: true, grants: [EXPORTER] },
+    "sessions.legacy_export_privacy_authority_ready()": { secdef: true, grants: [EXPORTER] },
     "sessions.legacy_export_privacy_eraser_page(jsonb)": { secdef: true, grants: [ERASER] },
     "sessions.legacy_export_privacy_eraser_still_fenced(jsonb)": { secdef: true, grants: [ERASER] },
   },

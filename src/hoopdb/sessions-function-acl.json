@@ -1111,6 +1111,10 @@
       "service_role:EXECUTE",
       "authenticated:EXECUTE"
     ],
+    "sessions.legacy_export_privacy_authority_ready()": [
+      "<owner>:EXECUTE",
+      "bulls96_legacy_export_privacy:EXECUTE"
+    ],
     "sessions.legacy_export_privacy_eraser_page(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_privacy_eraser:EXECUTE"
