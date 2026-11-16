@@ -76,6 +76,16 @@ describe("telemetry allowlist", () => {
     }
   });
 
+  test("the Bob Costas summary input fields are bounded counts only", () => {
+    for (const f of ["chunks_read", "chunks_total", "bytes_read", "text_dropped", "names_dropped", "turns_dropped",
+      "max_chunks", "max_input_bytes", "max_chunk_bytes"]) {
+      expect(ALLOWED_LOG_FIELDS.has(f)).toBe(true);
+      expect(BOUNDED_COUNT_FIELDS.has(f)).toBe(true);
+      expect(sanitizeLogField(f, 3_489)).toBe(3_489);
+      for (const bad of ["3489", "prompt text", -1, 1.5, null]) expect(sanitizeLogField(f, bad)).toBeUndefined();
+    }
+  });
+
   test("storeTransportCause classifies by code / name / errno only (one cause level), never the message", () => {
     const e = (code?: string, name?: string, message = "https://bucket/96bulls/secret") => Object.assign(new Error(message), code ? { code } : {}, name ? { name } : {});
     expect(storeTransportCause(e("ECONNRESET"))).toBe("econnreset");

@@ -57,7 +57,7 @@ export interface BobCostasDeps {
   directory?: ShortSummaryDirectory;
   /** READER_MAX_RULESET; undefined (default) keeps the legacy presence-only scrub check. */
   readerMaxRuleset?: number;
-  /** The summary input caps (BOB_COSTAS_MAX_*); defaults to DEFAULT_SUMMARY_INPUT_CAPS. */
+  /** The summary input caps (BOB_COSTAS_INPUT_SAMPLING, BOB_COSTAS_MAX_*); defaults to DEFAULT_SUMMARY_INPUT_CAPS. */
   inputCaps?: SummaryInputCaps;
 }
 
@@ -127,7 +127,7 @@ interface Outcome {
   tokensIn: number;
   tokensOut: number;
   records: number;
-  /** Set when the digest read part of the session only (the input caps). */
+  /** Set when an input cap fired: the digest describes part of the session. */
   input?: DigestInputTruncation;
 }
 
@@ -172,7 +172,13 @@ async function buildOutcome(
     ...(deps.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: deps.readerMaxRuleset }),
     ...(deps.inputCaps ? { caps: deps.inputCaps } : {}),
   });
-  if (digest.records === 0) return { status: "empty", ...none, ...(digest.input ? { input: digest.input } : {}) };
+  if (digest.records === 0) {
+    // A capped read that found nothing says nothing about the session: never publish it as
+    // empty, which would clear a ready summary object.
+    if (digest.input)
+      throw new PipelineError("summary_input_unreadable", "the capped summary input held no record", false);
+    return { status: "empty", ...none };
+  }
   // Ids only: the model summariser's per-org budget and per-session cap key on these.
   // The summariser never throws for a model failure; it falls back to extractive.
   const summary = await deps.summarizer.summarize(kind, digest, {
@@ -499,8 +505,9 @@ export function bobCostasHandler(
             chunks_read: outcome.input.chunksRead,
             chunks_total: outcome.input.chunksTotal,
             bytes_read: outcome.input.bytesRead,
-            lines_skipped: outcome.input.linesSkipped,
-            envelopes_dropped: outcome.input.envelopesDropped,
+            text_dropped: outcome.input.textDropped,
+            names_dropped: outcome.input.namesDropped,
+            turns_dropped: outcome.input.turnsDropped,
           }
         : {}),
     });

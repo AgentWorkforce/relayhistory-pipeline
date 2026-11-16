@@ -1,27 +1,33 @@
 /**
- * Bob Costas's bounded read of a session's scrubbed chunks into a digest.
+ * Bob Costas's streamed read of a session's scrubbed chunks into a digest.
  *
- * The summary needs a digest (counts, the first/last/sampled user turns, tools, models,
- * span), never the whole transcript. So the chunks are streamed one at a time into a
- * `DigestBuilder` and each is let go once fed: the resident set is one chunk plus the
- * builder's bounded state, whatever the session's chunk count or size. A session past
- * the caps is read from a sample of its chunks (the first, the last, and an evenly
- * spaced selection between), and the digest says so (`digest.input`), which the summary
- * record carries as `input_truncated`.
+ * The summary needs a digest (counts, user turns, tools, models, span), never the whole
+ * transcript held at once. So the chunks are streamed one at a time into a `DigestBuilder`
+ * and each is let go once fed; delivery envelopes are folded as they arrive (one seat per
+ * record). This is always on, and with sampling off the digest is exactly the one the
+ * whole-session read built.
  *
- *   BOB_COSTAS_MAX_CHUNKS       512 chunks read per summary.
- *   BOB_COSTAS_MAX_INPUT_BYTES  256 MiB of decompressed chunk bytes read per summary.
- *   BOB_COSTAS_MAX_CHUNK_BYTES  32 MiB per chunk, decompressed (the ingest writes at most
- *                               16 MiB); a bigger chunk is skipped, never inflated.
- *   BOB_COSTAS_MAX_LINE_BYTES   2 MiB per transcript line; a longer line is counted as a
- *                               record and not parsed.
- *   BOB_COSTAS_MAX_ENVELOPES    200000 delivery envelopes held for the settle.
+ *   BOB_COSTAS_INPUT_SAMPLING   off (default) | on. Off: every chunk is read and the
+ *                               digest is unchanged. On: a transcript session past the
+ *                               caps below is read from a sample of its chunks (the first
+ *                               and the last, interleaved, then an evenly spaced selection
+ *                               between), user turns are sampled and clipped, tool names
+ *                               and models capped, and envelope text budgeted
+ *                               (`summarizer.ts`). A session of delivery envelopes is always
+ *                               read whole, so every revision and tombstone is folded.
+ *   BOB_COSTAS_MAX_CHUNKS       512 chunks read per summary (sampling on).
+ *   BOB_COSTAS_MAX_INPUT_BYTES  256 MiB of decompressed chunk bytes read per summary
+ *                               (sampling on); never below BOB_COSTAS_MAX_CHUNK_BYTES.
+ *   BOB_COSTAS_MAX_CHUNK_BYTES  32 MiB per chunk, decompressed, always (the ingest writes at
+ *                               most 16 MiB): a bigger chunk is never inflated past the cap.
+ *
+ * Any cap that fires is recorded in `digest.input`, and the summary record carries
+ * `input_truncated`. A capped read that yields no record, or a session of envelopes that
+ * could not be read whole, fails the summary (non-retryable) instead of publishing.
  *
  * Sized for a 4 GiB pod: the worker handles one message at a time (`runWorker` starts each
- * claimed delivery in turn), so a summary's peak is about one chunk inflated (≤ 32 MiB, and
- * its string and line slices), the held envelopes (compact: ids, revision, a few payload
- * fields, user text within `ENVELOPE_TEXT_BUDGET_CHARS`), and RETAINED_USER_TURNS turns:
- * a few hundred MiB at most. Values outside a cap's range fall back to the default.
+ * claimed delivery in turn), so a summary's peak is one chunk inflated (≤ 32 MiB) and its
+ * string, plus the digest's state. Values outside a cap's range fall back to the default.
  */
 import { zstdDecompressSync } from "node:zlib";
 import {
@@ -32,24 +38,22 @@ import {
   type ObjectStore,
 } from "../shared/vendor.ts";
 import { readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
-import { DigestBuilder, DEFAULT_MAX_ENVELOPES, type SessionDigest } from "./summarizer.ts";
+import { DigestBuilder, type SessionDigest } from "./summarizer.ts";
 
 export interface SummaryInputCaps {
+  sampling: boolean;
   maxChunks: number;
   maxInputBytes: number;
   maxChunkBytes: number;
-  maxLineBytes: number;
-  maxEnvelopes: number;
 }
 
 const MiB = 1024 * 1024;
 
 export const DEFAULT_SUMMARY_INPUT_CAPS: Readonly<SummaryInputCaps> = Object.freeze({
+  sampling: false,
   maxChunks: 512,
   maxInputBytes: 256 * MiB,
   maxChunkBytes: 32 * MiB,
-  maxLineBytes: 2 * MiB,
-  maxEnvelopes: DEFAULT_MAX_ENVELOPES,
 });
 
 function int(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
@@ -62,12 +66,13 @@ function int(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number
 /** The caps from env; a missing or out-of-range value keeps its default. */
 export function summaryInputCapsFromEnv(env: NodeJS.ProcessEnv = process.env): SummaryInputCaps {
   const d = DEFAULT_SUMMARY_INPUT_CAPS;
+  const maxChunkBytes = int(env, "BOB_COSTAS_MAX_CHUNK_BYTES", d.maxChunkBytes, 64 * 1024, 256 * MiB);
   return {
+    sampling: ["on", "true", "1"].includes((env.BOB_COSTAS_INPUT_SAMPLING ?? "").trim().toLowerCase()),
     maxChunks: int(env, "BOB_COSTAS_MAX_CHUNKS", d.maxChunks, 2, 100_000),
-    maxInputBytes: int(env, "BOB_COSTAS_MAX_INPUT_BYTES", d.maxInputBytes, MiB, 2_048 * MiB),
-    maxChunkBytes: int(env, "BOB_COSTAS_MAX_CHUNK_BYTES", d.maxChunkBytes, 64 * 1024, 256 * MiB),
-    maxLineBytes: int(env, "BOB_COSTAS_MAX_LINE_BYTES", d.maxLineBytes, 4 * 1024, 64 * MiB),
-    maxEnvelopes: int(env, "BOB_COSTAS_MAX_ENVELOPES", d.maxEnvelopes, 1_000, 10_000_000),
+    // A budget below one chunk would refuse every chunk the per-chunk cap admits.
+    maxInputBytes: Math.max(maxChunkBytes, int(env, "BOB_COSTAS_MAX_INPUT_BYTES", d.maxInputBytes, MiB, 2_048 * MiB)),
+    maxChunkBytes,
   };
 }
 
@@ -85,13 +90,24 @@ function spread(from: number, to: number, n: number): number[] {
   return Array.from({ length: n }, (_, i) => from + Math.round((i * (len - 1)) / (n - 1)));
 }
 
+/** `a[0], b[0], a[1], b[1], ...`, then what is left of the longer. */
+function interleave(a: number[], b: number[]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (i < a.length) out.push(a[i]!);
+    if (i < b.length) out.push(b[i]!);
+  }
+  return out;
+}
+
 /**
- * Which chunks to read, ascending by position in `chunks`. Every chunk when the session
- * is within the caps (by its declared sizes). Otherwise the first quarter of the chunk
- * budget from the head, a quarter from the tail and the rest evenly spaced between, the
- * budget being `maxChunks` or what `maxInputBytes` holds at the session's mean chunk size,
- * whichever is smaller; then, head first, tail next, middle last, only what still fits
- * the byte budget. A chunk declared over `maxChunkBytes` is never read.
+ * Which chunks to read (sampling on), ascending. Every chunk when the session is within the
+ * caps by its declared sizes. Otherwise a chunk budget of `maxChunks`, or what
+ * `maxInputBytes` holds at the session's mean chunk size if smaller: a quarter from the
+ * head and a quarter from the tail, taken alternately from the first chunk forwards and
+ * the last backwards, so the byte budget never starves the tail; then the rest evenly
+ * spaced between, alternately from each end. A chunk is taken only while its declared size
+ * fits the byte budget left; one declared over `maxChunkBytes` is never read.
  */
 export function planChunks(chunks: readonly PlannedChunk[], caps: SummaryInputCaps): { indices: number[]; sampled: boolean } {
   const eligible: number[] = [];
@@ -110,11 +126,12 @@ export function planChunks(chunks: readonly PlannedChunk[], caps: SummaryInputCa
   const k = Math.max(1, Math.min(caps.maxChunks, eligible.length, byBytes));
   const edge = Math.max(1, Math.floor(k / 4));
   const head = spread(0, Math.min(edge, eligible.length), edge);
-  const tail = spread(Math.max(head.length, eligible.length - edge), eligible.length, edge);
+  const tail = spread(Math.max(head.length, eligible.length - edge), eligible.length, edge).reverse();
   const middle = spread(head.length, eligible.length - tail.length, k - head.length - tail.length);
+  const middleFromEnds = interleave(middle.slice(0, Math.ceil(middle.length / 2)), middle.slice(Math.ceil(middle.length / 2)).reverse());
   const picked: number[] = [];
   let budget = caps.maxInputBytes;
-  for (const at of [...head, ...tail, ...middle]) {
+  for (const at of [...interleave(head, tail), ...middleFromEnds]) {
     const index = eligible[at]!;
     const size = declared(chunks[index]!);
     if (size > budget) continue;
@@ -125,58 +142,97 @@ export function planChunks(chunks: readonly PlannedChunk[], caps: SummaryInputCa
   return { indices: picked, sampled: oversized || picked.length < chunks.length };
 }
 
-/**
- * Streams the session's chunks into a digest within `caps`. Throws as the unbounded read
- * did for a missing chunk (`chunk_missing`, retryable) and for a chunk that is not zstd.
- */
-export async function readSessionDigest(args: {
+interface ReadArgs {
   manifest: ManifestV1;
   location: Parameters<typeof rawChunkKey>[0];
   store: ObjectStore;
   readerMaxRuleset?: number;
   caps?: SummaryInputCaps;
-}): Promise<SessionDigest> {
-  const { manifest: m, store } = args;
+}
+
+interface Pass {
+  builder: DigestBuilder;
+  chunksRead: number;
+  chunksSkipped: number;
+  bytesRead: number;
+}
+
+/**
+ * Streams the session's chunks into a digest within `caps`. Throws as the whole-session
+ * read did for a missing chunk (`chunk_missing`, retryable) and for a chunk that is not
+ * zstd; throws `summary_input_incomplete` (non-retryable) for a session of delivery
+ * envelopes with a chunk it could not read, since a missed tombstone or later revision
+ * could surface content the session no longer has.
+ */
+export async function readSessionDigest(args: ReadArgs): Promise<SessionDigest> {
   const caps = args.caps ?? DEFAULT_SUMMARY_INPUT_CAPS;
-  const plan = planChunks(m.raw.chunks, caps);
-  const builder = new DigestBuilder(m.session.harness, { maxEnvelopes: caps.maxEnvelopes });
-  let sampled = plan.sampled;
-  let chunksRead = 0;
-  let bytesRead = 0;
-  let linesSkipped = 0;
-  for (const index of plan.indices) {
-    const chunk = m.raw.chunks[index]!;
-    const key = rawChunkKey(args.location, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format);
-    const text = await inflateChunk(store, key, m, args.readerMaxRuleset, caps.maxChunkBytes);
-    // Over the per-chunk cap (an undeclared or misdeclared size), or past the byte budget.
-    if (text === null || bytesRead + text.bytes > caps.maxInputBytes) {
-      sampled = true;
-      continue;
-    }
-    chunksRead += 1;
-    bytesRead += text.bytes;
-    linesSkipped += feedLines(builder, text.body, caps.maxLineBytes);
-  }
+  const all = args.manifest.raw.chunks.map((_, i) => i);
+  let pass = caps.sampling ? await readPass(args, caps, planChunks(args.manifest.raw.chunks, caps).indices, true) : null;
+  // Envelopes found after the sample skipped a chunk: read the session whole instead.
+  if (pass === null || (pass.builder.hasEnvelopes && pass.chunksSkipped > 0))
+    pass = await readPass(args, caps, all, false);
+  if (pass.builder.hasEnvelopes && pass.chunksSkipped > 0)
+    throw new PipelineError("summary_input_incomplete", "a delivery-envelope session has a chunk over the per-chunk cap", false);
+  const { builder } = pass;
   const digest = builder.finish();
-  if (sampled || linesSkipped > 0 || builder.envelopesDropped > 0)
+  const turnsDropped = digest.userTurnCount - digest.userTurns.length;
+  if (pass.chunksSkipped > 0 || builder.textDropped > 0 || builder.namesDropped > 0 || turnsDropped > 0)
     digest.input = {
-      chunksTotal: m.raw.chunks.length,
-      chunksRead,
-      bytesRead,
-      linesSkipped,
-      envelopesDropped: builder.envelopesDropped,
+      chunksTotal: args.manifest.raw.chunks.length,
+      chunksRead: pass.chunksRead,
+      bytesRead: pass.bytesRead,
+      textDropped: builder.textDropped,
+      namesDropped: builder.namesDropped,
+      turnsDropped,
     };
   return digest;
 }
 
-/** One chunk, fetched and inflated; null when it inflates past `maxBytes` (not read). */
+/**
+ * One pass over the chunks in `selected` (ascending), or, once the session shows delivery
+ * envelopes before any chunk was skipped, over every chunk from there on. `budgeted`: the
+ * byte budget applies until then; a chunk whose declared size no longer fits is not
+ * fetched, and none is inflated past what is left.
+ */
+async function readPass(args: ReadArgs, caps: SummaryInputCaps, selected: number[], budgeted: boolean): Promise<Pass> {
+  const m = args.manifest;
+  const builder = new DigestBuilder(m.session.harness, { sampling: caps.sampling });
+  const pass: Pass = { builder, chunksRead: 0, chunksSkipped: 0, bytesRead: 0 };
+  const wanted = new Set(selected);
+  let whole = !budgeted;
+  // Set once a chunk overran what was left of the budget: nothing further is fetched.
+  let spent = false;
+  for (let index = 0; index < m.raw.chunks.length; index++) {
+    if (!whole && builder.hasEnvelopes && pass.chunksSkipped === 0) whole = true;
+    const remaining = caps.maxInputBytes - pass.bytesRead;
+    const chunk = m.raw.chunks[index]!;
+    if (!whole && (spent || !wanted.has(index) || remaining <= 0 || declared(chunk) > remaining)) {
+      pass.chunksSkipped += 1;
+      continue;
+    }
+    const key = rawChunkKey(args.location, chunk.seq, chunk.start_offset, chunk.sha256_8, m.raw.format);
+    const limit = whole ? caps.maxChunkBytes : Math.min(caps.maxChunkBytes, remaining);
+    const body = await inflateChunk(args.store, key, m, args.readerMaxRuleset, limit);
+    if (body === null) {
+      if (!whole && limit < caps.maxChunkBytes) spent = true;
+      pass.chunksSkipped += 1;
+      continue;
+    }
+    pass.chunksRead += 1;
+    pass.bytesRead += body.bytes;
+    feedLines(builder, body.text);
+  }
+  return pass;
+}
+
+/** One chunk, fetched and inflated; null when it would inflate past `maxBytes` (not read). */
 async function inflateChunk(
   store: ObjectStore,
   key: ReturnType<typeof rawChunkKey>,
   m: ManifestV1,
   readerMaxRuleset: number | undefined,
   maxBytes: number,
-): Promise<{ body: string; bytes: number } | null> {
+): Promise<{ text: string; bytes: number } | null> {
   let stored: Uint8Array;
   try {
     // Unset maximum: the unchanged body-only GET. Set: one GET binds the chunk's scrub metadata to its body.
@@ -195,24 +251,16 @@ async function inflateChunk(
     if ((err as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") return null;
     throw err;
   }
-  return { body: raw.toString("utf8"), bytes: raw.length };
+  return { text: raw.toString("utf8"), bytes: raw.length };
 }
 
-/** Feeds each line of `body` to the builder; returns how many were over `maxLineBytes`. */
-function feedLines(builder: DigestBuilder, body: string, maxLineBytes: number): number {
-  let skipped = 0;
+/** Feeds each line of `body` to the builder, as the whole-session read split it. */
+function feedLines(builder: DigestBuilder, body: string): void {
   let start = 0;
   while (start <= body.length) {
     let end = body.indexOf("\n", start);
     if (end === -1) end = body.length;
-    // Measured in UTF-16 code units, not UTF-8 bytes: within 3x of the byte length either way.
-    if (end - start > maxLineBytes) {
-      builder.countUnparsed();
-      skipped += 1;
-    } else if (end > start) {
-      builder.addLine(body.slice(start, end));
-    }
+    if (end > start) builder.addLine(body.slice(start, end));
     start = end + 1;
   }
-  return skipped;
 }

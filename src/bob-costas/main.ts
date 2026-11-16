@@ -16,15 +16,14 @@ log.info("bob costas summariser", { stage: "summary", model_id: summarizer.id })
 const keyring = await keyringFromEnv();
 // Unset keeps legacy reads; a malformed value fails at startup.
 const maximum = readerMaxRuleset(process.env);
-// BOB_COSTAS_MAX_*: the summary input caps (session-input.ts); an out-of-range value keeps its default.
+// BOB_COSTAS_INPUT_SAMPLING, BOB_COSTAS_MAX_*: the summary input caps (session-input.ts); an out-of-range value keeps its default.
 const inputCaps = summaryInputCapsFromEnv();
 log.info("bob costas input caps", {
   stage: "summary",
   max_chunks: inputCaps.maxChunks,
   max_input_bytes: inputCaps.maxInputBytes,
   max_chunk_bytes: inputCaps.maxChunkBytes,
-  max_line_bytes: inputCaps.maxLineBytes,
-  max_envelopes: inputCaps.maxEnvelopes,
+  state: inputCaps.sampling ? "sampling_on" : "sampling_off",
 });
 await runWorker({
   service: "bob-costas",

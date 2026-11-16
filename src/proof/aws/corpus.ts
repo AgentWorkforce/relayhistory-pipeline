@@ -115,6 +115,7 @@ function transcript(p: PlantedSession, at: number, revision: 1 | 2): string[] {
  */
 export async function expectedShortSummary(p: PlantedSession, revision: 1 | 2): Promise<string> {
   // The ingest scrubs chunks before storage (Technical Foul); Bob Costas reads the scrubbed records.
+  // digestRecords defaults to sampling off: the whole-session digest the deployment builds by default.
   const lines = p.revisions[revision - 1]!.map((l) => scrubText(l));
   return (await extractiveSummarizer.summarize("short", digestRecords(p.harness, lines))).text;
 }
