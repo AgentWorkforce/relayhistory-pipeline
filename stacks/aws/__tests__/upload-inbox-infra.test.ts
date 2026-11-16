@@ -768,12 +768,10 @@ describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written dow
     // Reads the control objects, never a payload (session records).
     for (const x of [k.entry(0), k.checkpoint(64), k.head, k.closed, `${k.root}/stream.json`]) expect(can("s3:GetObject", at(x))).toBe(true);
     expect(can("s3:GetObject", at(k.payload("f".repeat(64))))).toBe(false);
-    // Lists only under the admission inbox and the registry.
-    expect(can("s3:ListBucket", bucketArn) ).toBe(false);
-    const list = (prefix: string) => st.some((s) => s.Effect === "Allow" && matches(s, "s3:ListBucket", bucketArn, { ...octx, "s3:prefix": prefix }));
-    expect(list(`${k.root}/m/`)).toBe(true);
-    expect(list(`${TENANT_KEY_BASE}/.ledger/log-streams/`)).toBe(true);
-    expect(list(`${TENANT_KEY_BASE}/org-a/v1/`)).toBe(false);
+    // ListBucket is a plain allow (no s3:prefix condition): a GET/HEAD carries no s3:prefix, and S3 answers 404 for a
+    // missing key only to a ListBucket holder, so the request context of a read (no prefix) must match it.
+    expect(can("s3:ListBucket", bucketArn)).toBe(true);
+    expect(st.find((s) => s.Sid === "LedgerLogOperatorLists")).toEqual({ Sid: "LedgerLogOperatorLists", Effect: "Allow", Principal: { AWS: operatorRoleArn }, Action: ["s3:ListBucket"], Resource: bucketArn });
     expect(can("s3:DeleteObject", at(logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")))).toBe(true);
     expect(can("s3:DeleteObject", at(k.entry(0)))).toBe(false);
     const key = P.ledgerLogOperatorKeyStatement({ region, accountId, bucketName, operatorRoleArn });

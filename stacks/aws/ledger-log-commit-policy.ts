@@ -22,7 +22,9 @@
  *   - the operator tool (scripts/ledger-log-stream.ts, an operator role outside the stack):
  *       GET the legacy batch docs (`ledger/batches/`, the drain check) and the log's control objects (entries,
  *       checkpoints, the head hint, closed.json, the identity doc; never the payloads p/, which hold session records);
- *       LIST only under the admission inbox and the registry (an s3:prefix condition);
+ *       LIST the bucket, unconditionally: S3 answers 404 for a missing key only to a caller holding s3:ListBucket, and a
+ *       GET/HEAD carries no s3:prefix, so a prefix-conditioned ListBucket would turn every missing read (entry 0 of a
+ *       legacy stream, closed.json, the markers) into 403. Key names only; the GET grants stay narrow (never p/);
  *       PUT entry 0 (e/), closed.json, the identity doc, the registry; DELETE registry docs (the v1 registry migration);
  *       GET the deployment markers `.ledger/log-commit-on.json` and `.ledger/log-mode-nonprod.json`;
  *       KMS GenerateDataKey/Decrypt via S3 for those keys.
@@ -52,8 +54,6 @@ export const LEDGER_LOG_ADMITTED_OUTCOMES = `${TENANT_KEY_BASE}/.admission-inbox
 export const LEDGER_LOG_LEGACY_BATCHES = `${LEDGER_LOG_USER_DIR}/ledger/batches/*`;
 /** The log's control objects the operator tool reads (status, the switch, the close, the migration): never p/. */
 export const LEDGER_LOG_OPERATOR_READS = ["e/*", "c/*", "head.json", "closed.json", "stream.json"].map((x) => `${LEDGER_LOG_USER_DIR}/ledger/log/*/${x}`);
-/** The prefixes the operator tool lists (s3:prefix): the user directories (entries, markers, batch docs) and the registry. */
-export const LEDGER_LOG_OPERATOR_LIST_PREFIXES = [`${TENANT_KEY_BASE}/.admission-inbox/*`, `${TENANT_KEY_BASE}/.ledger/log-streams*`] as const;
 /** The operator-written deployment markers (ledger-log-stream-ops.ts logCommitProofKey, logModeNonProdKey). */
 export const LEDGER_LOG_MARKERS = [`${TENANT_KEY_BASE}/.ledger/log-commit-on.json`, `${TENANT_KEY_BASE}/.ledger/log-mode-nonprod.json`] as const;
 /** What OnlyTheEraserDeletes must exempt for log mode (see the header): payloads, the admitted outcome, the registry. */
@@ -78,8 +78,11 @@ export function ledgerLogOperatorStatements(i: { bucketArn: string; operatorRole
   const Principal = { AWS: i.operatorRoleArn };
   const o = (glob: string) => `${i.bucketArn}/${glob}`;
   return [
-    { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn,
-      Condition: { StringLike: { "s3:prefix": [...LEDGER_LOG_OPERATOR_LIST_PREFIXES] } } },
+    // No s3:prefix condition, on purpose: S3 returns 404 for a missing object only when the caller holds s3:ListBucket,
+    // and a GET/HEAD request carries no s3:prefix, so a conditioned grant never applies to it and every missing read
+    // would come back 403 (packages/object-store maps that to unauthorized): readZero on a legacy stream, the close
+    // marker, the non-production and proof markers, the migration's dropped path. Listing reveals key names only.
+    { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn },
     { Sid: "LedgerLogOperatorReads", Effect: "Allow" as const, Principal, Action: ["s3:GetObject"],
       Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
     { Sid: "LedgerLogOperatorWrites", Effect: "Allow" as const, Principal, Action: ["s3:PutObject"],
