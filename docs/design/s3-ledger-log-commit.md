@@ -359,13 +359,32 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
   doubled in the read-side state: the materializer applies both through the legacy core, and the second is a replay
   of the first's legacy batch doc. Only the log carries the duplicate entry.
 - **Residual (P3 3, documented).** An entry this process left unresolved is settled (resent if young) before the
-  current batch's gates run. That entry passed its own gates when it was built; a consent revocation since then is not
-  re-checked for it, as the materializer does not re-check consent at apply (Remaining 1).
+  current batch's gates run. That entry passed its own gates when it was built; a consent revocation since then is
+  re-checked at apply by the materializer (slice 6, Remaining 1).
+
+## Slice 6: the before-production items
+
+- **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
+  written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
+  malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
+  (`checkUploadConsent` with the cap as `operator` and `LogMaterializerDeps.uploadConsent`, which the self-host runtime
+  wires from the same config). It runs in the admit phase only: after the legacy claim, before any canonical write, so
+  a refusal leaves nothing written. The commit-phase re-check runs after the canonical writes, where a skip would strand
+  them; it is skipped at apply. `UploadConsentRequired` (a 503 on the request path, where the inbox keeps the bytes for
+  a redrive) is a final skip here: the batch's inbox is already retired, and holding the stream would block every later
+  entry behind a consent that may never come. The person's upload reads refused (`upload_consent_required`); a
+  re-upload after they confirm is a fresh admission. Under `INGEST_LEDGER=s3` today `INGEST_UPLOAD_CONSENT` is refused
+  (SQL only), so in practice only the operator cap applies.
+  - Tests (`ledger-log-materialize.test.ts`): the cap rides in the payload and refuses at apply with no consent store;
+    a hold that lands between the append and the apply skips the batch while an earlier allowed batch is written; a
+    consent store fault is a retry (no skip record, payload kept); a malformed cap is `payload_invalid`.
 
 ## Remaining
 
-1. Before production: the materializer does not re-check upload consent at apply time (the inbox `consentCap` is not
-   in the payload). Carry it in the payload and re-run the consent gate in the replay.
+1. Closed in slice 6: the payload carries the inbox `consentCap`, and the materializer re-runs the consent gate at apply
+   time (admit phase, after the legacy claim and before any canonical write) with that cap and its own
+   `INGEST_UPLOAD_CONSENT` config. A refusal is a final skip (`upload_consent_required`, payload deleted), as the
+   journal re-check is; a consent store fault is a retry.
 2. Before production: `readEntries` still replays from entry 0 on every materializer run of a stream with new entries
    (slice 4 only skips idle streams). It needs a start-from-checkpoint read before streams are long.
 3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (the journal
