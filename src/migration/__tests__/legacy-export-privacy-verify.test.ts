@@ -128,11 +128,15 @@ const ERASE_CFG_LEGACY_OFF = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: f
 
 /**
  * GATE TARGET (explicit runner selector, never auto-detected from the branch, so nothing is skipped silently):
- *   LEGACY_GATE_TARGET=landing     runs everything except '(g)' (the ship branch has no heartbeat) and includes '(s)'.
+ *   LEGACY_GATE_TARGET=landing     runs everything except '(g)'s ACTIVATION_ONLY cases and includes '(s)'. Since the shape-(2)
+ *                                  fold, landing ships the final 062030 bytes, the heartbeat WRITER and the runner's heartbeat
+ *                                  read, so (g)'s writer/refusal cases bind on landing too.
  *   LEGACY_GATE_TARGET=activation  runs everything except '(s)' (the activation branch must NOT refuse unconditionally).
  * Unset or any other value fails the "gate target" test, so a run without a declared target can never pass.
  */
 const GATE_TARGET = process.env.LEGACY_GATE_TARGET;
+/** (g) cases whose code exists only on the activation branch: PUT bound (5f7eba44), per-scope recheck (57171957), alarm summary (e68ca57f). */
+const ACTIVATION_ONLY = GATE_TARGET !== "activation";
 test("gate target: LEGACY_GATE_TARGET is declared as landing or activation", () => {
   expect(["landing", "activation"]).toContain(GATE_TARGET);
 });
@@ -147,7 +151,7 @@ async function supabase() {
  CREATE TABLE sessions.upload_resets(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,request_id text NOT NULL,reset_at timestamptz NOT NULL DEFAULT now(),deleted bigint NOT NULL DEFAULT 0);
  CREATE TABLE sessions.operator_user_erasures(request_id text PRIMARY KEY,org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,state text NOT NULL,origins text[] NOT NULL DEFAULT '{}');
  CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id));`);
-  // The exporter's owner registration (20261105062020), loaded verbatim from the repo when the head has it: the table,
+  // The exporter's owner registration (20261105062030), loaded verbatim from the repo when the head has it: the table,
   // the SECURITY DEFINER register RPC, and the helper it calls. Nothing is hand-written.
   for (const sql of legacyAuthoritySql()) await pg.exec(sql);
   // STAND-INS for an orthogonal concern, in this plain-ledger fixture ONLY: the Supabase eraser authority is active and the
@@ -913,9 +917,18 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       await w.f.db.exec("DROP FUNCTION sessions.legacy_export_privacy_eraser_page(jsonb); DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb);");
       expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).not.toBe("ok");
       // A real prefix database (production today): NO 062030 objects at all. The verifier must allow, not require, them.
-      await w.f.db.exec("DROP TABLE sessions.legacy_export_scope_authority CASCADE");
-      for (const fn of ["sessions.ingest_legacy_export_scope_authority_register(jsonb)", "sessions.legacy_export_privacy_authority_ready()"])
-        await w.f.db.exec(`DROP FUNCTION IF EXISTS ${fn}`);
+      // The object list is derived from the 062030 file on this head (never hand-maintained), so a later fold that adds
+      // objects to 062030 (e.g. the readiness heartbeat) is dropped here too instead of leaking into the "prefix" state.
+      const m062030 = readFileSync(new URL("../../../supabase/migrations/20261105062030_legacy_export_scope_authority.sql", import.meta.url), "utf8");
+      const created = (kind: string) => [...m062030.matchAll(new RegExp(`CREATE (?:OR REPLACE )?${kind} (sessions\\.[a-z0-9_]+)`, "giu"))].map((x) => x[1]!);
+      const tables = created("TABLE"), fns = created("FUNCTION");
+      expect(tables).toContain("sessions.legacy_export_scope_authority");
+      expect(fns.length).toBeGreaterThanOrEqual(4);
+      for (const t of tables) await w.f.db.exec(`DROP TABLE IF EXISTS ${t} CASCADE`);
+      for (const fn of fns) {
+        const sigs = (await w.f.db.query<{ sig: string }>("SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname||'.'||p.proname=$1", [fn])).rows;
+        for (const { sig } of sigs) await w.f.db.exec(`DROP FUNCTION IF EXISTS ${sig}`);
+      }
       expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
     } finally {
       await w.f.close();
@@ -1125,7 +1138,7 @@ const heartbeatAge = (f: { db: PGlite }, minutes: number) =>
 const heartbeatRows = async (f: { db: PGlite }) =>
   ((await f.db.query(`SELECT count(*)::int AS n FROM ${HEARTBEAT.table}`)).rows[0] as { n: number }).n;
 
-describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter runs only on a fresh, eraser-written Supabase heartbeat", () => {
+describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) activation gate: the exporter runs only on a fresh, eraser-written Supabase heartbeat", () => {
   const later = () => Date.now() + 10 * 60 * 1000;
   /** Real stack, ACTIVATED Supabase authority, provisioned exporter role (same seam as (c)'s hostedWorld). */
   async function world() {
@@ -1244,7 +1257,7 @@ describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter
     }
   });
 
-  test("PUT TIMEOUT: a hung S3 PUT is aborted by the exporter's put bound and surfaces as the coded legacy_export_put_timeout, writing nothing", async () => {
+  test.skipIf(ACTIVATION_ONLY)("PUT TIMEOUT: a hung S3 PUT is aborted by the exporter's put bound and surfaces as the coded legacy_export_put_timeout, writing nothing", async () => {
     const n = await neon();
     const w = await world();
     try {
@@ -1317,7 +1330,7 @@ describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter
     }
   });
 
-  test("STALE MID-RUN: the per-scope recheck refuses the next scope before its PUT", async () => {
+  test.skipIf(ACTIVATION_ONLY)("STALE MID-RUN: the per-scope recheck refuses the next scope before its PUT", async () => {
     const n = await neon();
     // A second legacy-only scope, discovered after sess:1 (keyset order).
     await n.pg.query(
@@ -1415,7 +1428,7 @@ describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter
     expect(begin < lock && lock < guard && guard < drop && drop < commit).toBe(true);
   });
 
-  test("ALARM: under the neon authority a legacy fence makes the sweep's summary line carry a non-zero legacy failure count", async () => {
+  test.skipIf(ACTIVATION_ONLY)("ALARM: under the neon authority a legacy fence makes the sweep's summary line carry a non-zero legacy failure count", async () => {
     // The neon path already fails loud per scope (legacy_erasure_requires_supabase_authority, counters.legacyFenceFailed).
     // An operator alert keys on the per-sweep summary, so the failure must be visible there too, not only in a detail line.
     const n = await neon();
