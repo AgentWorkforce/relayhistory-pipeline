@@ -342,6 +342,14 @@ export class ErasureJob {
     const startedAt = this.now();
     const dryRun = opts.dryRun ?? false;
     const authority = this.authority;
+    // The counters are process-lifetime totals. Snapshot them so both the
+    // readiness decision and summary describe this sweep, including failures
+    // caught inside a per-scope lane that do not reject the outer page walk.
+    const failuresAtStart = {
+      fence: this.counters.fenceSweepFailed,
+      live: this.counters.liveFenceFailed,
+      legacy: this.counters.legacyFenceFailed,
+    };
     try {
       await authority.ready();
     } catch (error) {
@@ -406,6 +414,16 @@ export class ErasureJob {
       this.counters.fenceSweepFailed += 1;
       this.log({ message: "fence sweep failed", error_code: errorCode(error) });
     }
+    const sweepFailures = {
+      fence: this.counters.fenceSweepFailed - failuresAtStart.fence,
+      live: this.counters.liveFenceFailed - failuresAtStart.live,
+      legacy: this.counters.legacyFenceFailed - failuresAtStart.legacy,
+    };
+    // Per-scope live/legacy failures are deliberately caught so neighbouring
+    // scopes can proceed. They still make the sweep partial and must never
+    // refresh the exporter's durable readiness heartbeat.
+    if (sweepFailures.fence > 0 || sweepFailures.live > 0 || sweepFailures.legacy > 0)
+      healthy = false;
     // The exporter's readiness signal is written only after a healthy real
     // Supabase sweep. The eraser-only RPC rechecks active authority and reads
     // the immutable legacy mapping before recording its durable timestamp.
@@ -440,7 +458,8 @@ export class ErasureJob {
       // Stable per-sweep alarm input as well as the edge metric emitted at
       // failure time. A monitor that consumes only summaries must not turn a
       // loud Neon-authority refusal into a silent successful sweep.
-      legacy_fence_failed: this.counters.legacyFenceFailed,
+      legacy_fence_failed: sweepFailures.legacy,
+      legacyFenceFailed: this.counters.legacyFenceFailed,
     });
   }
 

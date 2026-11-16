@@ -250,6 +250,39 @@ describe("hosted legacy-export scope erasure", () => {
     st.close();
   });
 
+  test("a caught per-scope legacy failure is a partial sweep: no readiness heartbeat, per-sweep and cumulative alarm counts differ", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    s.rewrite = () => "<malformed>";
+    const st = await state();
+    let heartbeats = 0;
+    const logs: Record<string, unknown>[] = [];
+    const a = legacyAuthority() as ErasureAuthority;
+    a.recordSuccessfulSweep = async () => void (heartbeats += 1);
+    const j = new ErasureJob(a, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
+    await j.sweep();
+    expect(heartbeats).toBe(0);
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+      legacyFenceFailed: 1,
+    }));
+
+    // A later healthy sweep can arm the exporter. Its delta is zero while the
+    // process-lifetime counter still records the earlier privacy failure.
+    s.rewrite = undefined;
+    await j.sweep();
+    expect(heartbeats).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 0,
+      legacyFenceFailed: 1,
+    }));
+    st.close();
+  });
+
   test("an injected authority row erases only its encoded owner-machine session and pointer, idempotently", async () => {
     const s = new FakeS3Versions();
     const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/`;
