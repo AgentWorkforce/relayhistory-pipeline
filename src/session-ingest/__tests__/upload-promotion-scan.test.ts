@@ -173,6 +173,119 @@ describe("readiness during a long promotion pass", () => {
   });
 });
 
+describe("readiness during a long admission scan", () => {
+  const quiet = { info: () => {}, warn: () => {}, error: () => {} };
+  type Hook = (page: number) => Promise<void> | void;
+  /**
+   * A store whose admission-inbox listing returns `pages` empty pages, calling `hook` before each, and which
+   * can be told to fail the listing. Every other call goes to a real scratch store.
+   */
+  function pagedStore(pages: number, hook: Hook) {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const ctl = { fail: false, pages, hook };
+    const store = new Proxy(s.store, {
+      get(target, prop, receiver) {
+        if (prop !== "list") return Reflect.get(target, prop, receiver);
+        return async (prefix: unknown, cursor?: string) => {
+          if (!String(prefix).includes(".admission-inbox")) return target.list(prefix as never, cursor);
+          const n = cursor === undefined ? 0 : Number(cursor);
+          await ctl.hook(n);
+          if (ctl.fail) throw Object.assign(new Error("listing failed"), { code: "list_failed" });
+          return { items: [], ...(n + 1 < ctl.pages ? { nextCursor: String(n + 1) } : {}) };
+        };
+      },
+    }) as typeof s.store;
+    return { store, ctl };
+  }
+  function consumerOn(store: ReturnType<typeof pagedStore>["store"], clock: { t: number }) {
+    return selfhostAdmissionConsumer({
+      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 3, nowMs: () => clock.t, log: quiet,
+      deliver: { ledger: new MemoryLedger(), acceptanceMode: "canonical", target: { store, keyRoot: ROOT } },
+    });
+  }
+
+  test("a 150 s admission scan with steady pages stays ready throughout", async () => {
+    const clock = { t: 10_000_000 };
+    let consumer!: ReturnType<typeof consumerOn>;
+    const states: string[] = [];
+    const { store, ctl } = pagedStore(1, () => {});
+    consumer = consumerOn(store, clock);
+    await consumer.scan(); // a first successful scan, so the consumer is no longer starting
+    await consumer.settle();
+    ctl.pages = 15;
+    ctl.hook = (n) => { if (n > 0) { clock.t += 10_000; states.push(consumer.status().state); } };
+    await consumer.scan(); // 15 pages, 10 s apart: 140 s of listing, more than twice the 60 s window
+    await consumer.settle();
+    expect(states).toHaveLength(14);
+    expect(states.every((s) => s === "ok")).toBe(true);
+    expect(consumer.status()).toMatchObject({ state: "ok", lastProgressAgeMs: null });
+    await consumer.stop();
+  });
+
+  test("an admission scan with no page for 61 s goes stale", async () => {
+    const clock = { t: 11_000_000 };
+    const { store, ctl } = pagedStore(1, () => {});
+    const consumer = consumerOn(store, clock);
+    await consumer.scan();
+    await consumer.settle();
+    let release!: () => void;
+    const stuck = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const inList = new Promise<void>((r) => { entered = r; });
+    ctl.pages = 3;
+    ctl.hook = async (n) => { if (n === 1) { entered(); await stuck; } };
+    const pass = consumer.scan();
+    await inList; // page 0 is listed; the listing of page 1 hangs
+    clock.t += 30_000;
+    expect(consumer.status().state).toBe("ok");
+    clock.t += 31_000; // 61 s since page 0
+    expect(consumer.status().state).toBe("stale");
+    release();
+    await pass;
+    await consumer.settle();
+    await consumer.stop();
+  });
+
+  test("a failed admission scan never counts as progress, and neither do the next scan's pages", async () => {
+    const clock = { t: 12_000_000 };
+    const { store, ctl } = pagedStore(1, () => {});
+    const consumer = consumerOn(store, clock);
+    await consumer.scan();
+    await consumer.settle();
+    // A long scan that lists pages, then fails: its pages are withdrawn when it fails.
+    ctl.pages = 10;
+    ctl.hook = (n) => { clock.t += 10_000; if (n === 9) ctl.fail = true; };
+    await consumer.scan();
+    await consumer.settle();
+    expect(consumer.status().state).toBe("stale"); // about 100 s since the last successful scan
+    expect(consumer.status().lastProgressAgeMs).toBeNull();
+    // The next scan lists pages again, but they do not count until a scan succeeds.
+    ctl.fail = false;
+    const states: string[] = [];
+    ctl.hook = (n) => { clock.t += 10_000; if (n > 0) states.push(consumer.status().state); };
+    await consumer.scan();
+    await consumer.settle();
+    expect(states.every((s) => s === "stale")).toBe(true);
+    // That scan succeeded: the consumer is ok again.
+    expect(consumer.status().state).toBe("ok");
+    await consumer.stop();
+  });
+
+  test("idle behaviour is unchanged when listings are short", async () => {
+    const clock = { t: 13_000_000 };
+    const { store } = pagedStore(2, () => {});
+    const consumer = consumerOn(store, clock);
+    expect(consumer.status().state).toBe("starting");
+    await consumer.scan();
+    await consumer.settle();
+    expect(consumer.status()).toMatchObject({ state: "ok", lastProgressAgeMs: null });
+    clock.t += 60_001;
+    expect(consumer.status().state).toBe("stale");
+    await consumer.stop();
+  });
+});
+
 describe("the pass's log fields", () => {
   test("counts survive the sanitizer as bounded integers; the results string carries only fixed codes", () => {
     expect(sanitizeLogField("promoted", 25)).toBe(25);

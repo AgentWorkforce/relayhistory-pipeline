@@ -101,8 +101,9 @@ export interface SelfhostAdmissionOptions {
 
 export interface SelfhostAdmissionStatus {
   /**
-   * starting: no scan has completed yet; ok: the last scan is recent, or the pass it started is still making
-   * progress (a long upload-promotion pass is work, not a hang); stale: neither; stopped.
+   * starting: no scan has completed yet; ok: the last scan is recent, or the admission scan now running or the
+   * pass the last one started is still making progress (a long listing or promotion pass is work, not a hang);
+   * stale: neither; stopped.
    */
   state: "starting" | "ok" | "stale" | "stopped";
   healthy: boolean;
@@ -114,9 +115,9 @@ export interface SelfhostAdmissionStatus {
   inFlight: number;
   lastScanAgeMs: number | null;
   /**
-   * Age of the last progress (a listed page or a finished promotion) of the pass now running, after its
-   * admission scan succeeded. Null when no such pass is running. A pass with no progress for the stale window
-   * reads stale, so a real hang stays detectable.
+   * Age of the last progress: a listed page of the admission scan now running (while the previous admission
+   * scan succeeded), or a listed page or finished promotion of the pass after a successful admission scan. Null
+   * when neither runs. No progress for the stale window reads stale, so a real hang stays detectable.
    */
   lastProgressAgeMs: number | null;
 }
@@ -182,6 +183,15 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   /** Last progress of the running pass whose admission scan succeeded (undefined when no such pass runs). */
   let lastProgressAt: number | undefined;
   const progress = () => { if (lastProgressAt !== undefined) lastProgressAt = now(); };
+  /**
+   * Last listed page of the admission scan now running (undefined when none runs). With a large inbox the
+   * scan's own listing outlasts the stale window, so a page is progress too, but only while the previous
+   * admission scan succeeded: after a failed scan the next one's pages do not count until one succeeds, so a
+   * scan that keeps failing goes stale and stays stale.
+   */
+  let scanPageAt: number | undefined;
+  let lastScanFailed = false;
+  const scanPage = () => { if (!lastScanFailed) scanPageAt = now(); };
   let scanning: Promise<void> | undefined;
   let started = false, stopped = false;
   let interval: ReturnType<typeof setInterval> | undefined;
@@ -250,6 +260,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     let cursor: string | undefined;
     do {
       const page = await store.list(objectKey(prefix), cursor);
+      scanPage();
       for (const item of page.items) {
         const inbox = inboxKeyOfDeadLetter(keyRoot, String(item.key));
         if (inbox && at - item.lastModified.getTime() < DEAD_LETTER_RETENTION_MS) out.set(inbox, item.lastModified.getTime());
@@ -267,7 +278,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       // No age threshold (and so no dependence on this pod's clock agreeing with the store's): every pending object.
       const seen = new Set<string>();
       let live = 0;
-      for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: Number.NEGATIVE_INFINITY })) {
+      for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: Number.NEGATIVE_INFINITY, onPage: scanPage })) {
         if (dead.has(m.key)) { live++; marked.add(m.key); if (!inflight.has(m.key)) forget(m.key); continue; }
         seen.add(m.key);
         if (!entries.has(m.key)) entries.set(m.key, { attempts: 0, notBefore: 0, addedAt: scanAt, receivedAtMs: receivedAtOf(m.key) });
@@ -276,6 +287,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       for (const [key, e] of entries) if (!seen.has(key) && !inflight.has(key) && e.addedAt < scanAt) forget(key);
       deadLetters = live;
       lastScanOkAt = now();
+      lastScanFailed = false;
+      scanPageAt = undefined;
       // The promotion pass below runs inside this scan (the next cannot start until it ends): its progress keeps
       // the consumer healthy. Only after a successful admission scan, so failing scans still go stale.
       lastProgressAt = lastScanOkAt;
@@ -283,6 +296,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       logger.info("session ingest admission consumer", { route: "ingest.admission_consumer", outcome: "ok", admission_backlog: s.backlog,
         ...(s.oldestAgeMs !== null ? { admission_oldest_age_ms: s.oldestAgeMs } : {}), admission_dead_letters: s.deadLetters, admission_in_flight: s.inFlight, duration_ms: Date.now() - t0 });
     } catch (error) {
+      // A failed scan never counts: withdraw its pages, and do not count the next scan's until one succeeds.
+      lastScanFailed = true;
+      scanPageAt = undefined;
       const code = (error as { code?: unknown })?.code;
       logger.warn("session ingest admission consumer", { route: "ingest.admission_consumer", outcome: "scan_failed", error_code: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "scan_failed", duration_ms: Date.now() - t0 });
     }
@@ -403,7 +419,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const at = now();
     let oldest = Infinity;
     for (const e of entries.values()) if (Number.isFinite(e.receivedAtMs)) oldest = Math.min(oldest, e.receivedAtMs);
-    const freshest = Math.max(lastScanOkAt ?? -Infinity, lastProgressAt ?? -Infinity);
+    const freshest = Math.max(lastScanOkAt ?? -Infinity, lastProgressAt ?? -Infinity, scanPageAt ?? -Infinity);
     const state = stopped ? "stopped" : lastScanOkAt === undefined ? "starting" : at - freshest > staleAfterMs ? "stale" : "ok";
     return {
       state,
@@ -413,7 +429,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       deadLetters,
       inFlight: inflight.size,
       lastScanAgeMs: lastScanOkAt === undefined ? null : Math.max(0, at - lastScanOkAt),
-      lastProgressAgeMs: lastProgressAt === undefined ? null : Math.max(0, at - lastProgressAt),
+      lastProgressAgeMs: lastProgressAt === undefined && scanPageAt === undefined ? null
+        : Math.max(0, at - Math.max(lastProgressAt ?? -Infinity, scanPageAt ?? -Infinity)),
     };
   }
 

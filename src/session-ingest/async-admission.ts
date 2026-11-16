@@ -511,7 +511,8 @@ const INBOX_ATTEMPT = /\/r=[0-9a-f]{64}\/a=\d{15}-[0-9a-f]{16}\.ndjson\.zst$/;
  * for an already-terminal object just acks, and a re-run admission replays the claim). `orgId`
  * narrows the scan to one tenant.
  */
-export async function* pendingAdmissions(store: ObjectStore, keyRoot: string, opts: { nowMs: number; olderThanMs: number; orgId?: string }): AsyncGenerator<AdmissionMessage> {
+/** `onPage`: called after each listed page (the self-host consumer counts it as scan progress for readiness). */
+export async function* pendingAdmissions(store: ObjectStore, keyRoot: string, opts: { nowMs: number; olderThanMs: number; orgId?: string; onPage?: () => void }): AsyncGenerator<AdmissionMessage> {
   if (opts.orgId !== undefined) assertInboxTenant(keyRoot, opts.orgId);
   const prefix = `${keyRoot}/${INBOX_NAMESPACE}${opts.orgId !== undefined ? `/${opts.orgId}` : ""}`;
   // Slash-bounded: org-a must never match org-ab (a store lists by string prefix).
@@ -519,6 +520,7 @@ export async function* pendingAdmissions(store: ObjectStore, keyRoot: string, op
   let cursor: string | undefined;
   do {
     const page = await store.list(objectKey(prefix), cursor);
+    opts.onPage?.();
     for (const item of page.items) {
       const key = String(item.key);
       if (!key.startsWith(bounded) || !INBOX_ATTEMPT.test(key) || item.size < INBOX_MIN_BYTES) continue;
