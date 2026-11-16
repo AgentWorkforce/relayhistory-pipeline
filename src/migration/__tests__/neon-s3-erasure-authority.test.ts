@@ -24,6 +24,7 @@ import {
   LEGACY_EXPORT_ACTIVATION_GENERATION,
   LEGACY_EXPORT_GENERATION,
   LEGACY_EXPORT_GENERATION_SETTING,
+  LEGACY_EXPORT_PREACTIVATION_GENERATION,
 } from "../../shared/legacy-export-generation.ts";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
@@ -446,7 +447,18 @@ describe("supabase privacy authority as the eraser's source", () => {
       authority: "supabase",
       generation: LEGACY_EXPORT_GENERATION,
     });
-    await expect(readyAs(LEGACY_EXPORT_ACTIVATION_GENERATION)).rejects.toMatchObject({ code: "55000" });
+    expect(LEGACY_EXPORT_GENERATION).toBe(LEGACY_EXPORT_ACTIVATION_GENERATION);
+    await w.f.db.query(
+      "UPDATE sessions.legacy_export_privacy_eraser_readiness SET generation=$1,last_success_at=clock_timestamp()",
+      [LEGACY_EXPORT_PREACTIVATION_GENERATION],
+    );
+    // A landing-era row can be fresh in wall-clock time when activation is
+    // deployed; generation equality still refuses it.
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+    await w.f.db.query(
+      "UPDATE sessions.legacy_export_privacy_eraser_readiness SET generation=$1",
+      [LEGACY_EXPORT_GENERATION],
+    );
     expect((await ready()).rows[0]).toEqual({ ready: true });
 
     await w.f.db.query("UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()-interval '31 minutes'");
