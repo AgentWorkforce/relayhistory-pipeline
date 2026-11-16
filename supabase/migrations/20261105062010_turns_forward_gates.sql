@@ -143,6 +143,7 @@ BEGIN
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn fence import: at most 500 rows';END IF;
  FOR x IN SELECT * FROM jsonb_to_recordset(p_rows)
   AS r(org_id text,workspace_id text,source text,session_id text)
+  ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"
  LOOP
   IF x.org_id IS NULL OR x.workspace_id IS NULL OR x.source IS NULL OR x.session_id IS NULL
   THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn fence import: incomplete row';END IF;

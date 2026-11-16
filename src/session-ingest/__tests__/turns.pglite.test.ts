@@ -182,6 +182,8 @@ test("turn-only canonical pointers stay addressable but their directory projecti
 
 test("the service-role legacy fence import is bounded, idempotent, and fences a later writer",async()=>{
  const f=await fixture();
+ const body=(await f.db.query<{s:string}>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_turn_fences_import(jsonb)'::regprocedure")).rows[0]!.s;
+ expect(body).toContain('ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"');
  const legacy="7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a7b";
  const rows=JSON.stringify([{org_id:TENANT.orgId,workspace_id:TENANT.workspaceId,source:"claude",session_id:legacy}]);
  await f.db.exec("BEGIN;SET LOCAL ROLE service_role");

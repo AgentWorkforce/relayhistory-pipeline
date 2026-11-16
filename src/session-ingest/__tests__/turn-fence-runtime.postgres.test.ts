@@ -31,7 +31,7 @@ const registerInput = (sessionId: string) =>
   JSON.stringify({ tenant, sessions: [["claude", sessionId]] });
 
 describe.skipIf(!url)("turn fence registration on real PostgreSQL", () => {
-  test("writer-first and erase-first both materialize the permanent turn-origin fence", async () => {
+  test("writer/erase races materialize the fence and reversed imports acquire locks in one order", async () => {
     const admin = new pg.Client({ connectionString: url });
     await admin.connect();
     const name = `turn_fence_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -112,6 +112,34 @@ describe.skipIf(!url)("turn fence registration on real PostgreSQL", () => {
       expect((await pendingRegister).rows[0]!.result.fenced).toEqual([["claude", "erase-first"]]);
       await writer.query("COMMIT");
       expect((await materialized("erase-first")).rows[0]!.count).toBe("1");
+
+      // Hold the first logical-session lock. A reversed input must sort before
+      // locking, so it blocks on this lock without first taking the second.
+      // The holder can therefore import both rows and release; caller-order
+      // locking deadlocks here (the reversed caller would already own B).
+      const a = "import-a", b = "import-b";
+      const rows = (ids: string[]) => JSON.stringify(ids.map((session_id) => ({
+        org_id: tenant.orgId, workspace_id: tenant.workspaceId, source: "claude", session_id,
+      })));
+      await writer.query("BEGIN;SET LOCAL ROLE service_role;SET LOCAL statement_timeout='10s'");
+      await eraser.query("BEGIN;SET LOCAL ROLE service_role;SET LOCAL statement_timeout='10s'");
+      await writer.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1||chr(31)||$2||chr(31)||'claude'||chr(31)||$3,0))",
+        [tenant.orgId, tenant.workspaceId, a],
+      );
+      const pendingReversed = eraser.query(
+        "SELECT sessions.ingest_turn_fences_import($1::jsonb)",
+        [rows([b, a])],
+      );
+      await waitForLock(eraserPid, writerPid);
+      await writer.query("SELECT sessions.ingest_turn_fences_import($1::jsonb)", [rows([a, b])]);
+      await writer.query("COMMIT");
+      await pendingReversed;
+      await eraser.query("COMMIT");
+      expect((await pool.query<{ session_id: string }>(
+        "SELECT session_id FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND session_id=ANY($3::text[]) ORDER BY session_id",
+        [tenant.orgId, tenant.workspaceId, [a, b]],
+      )).rows.map((row) => row.session_id)).toEqual([a, b]);
     } finally {
       for (const client of held) {
         await client.query("ROLLBACK").catch(() => {});
