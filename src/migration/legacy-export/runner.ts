@@ -219,16 +219,26 @@ export async function withLegacyPrivacyFence<T>(
     await db.query("SET LOCAL statement_timeout='15min'");
     await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
     await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
-    const { rows } = await db.query<{ fenced: boolean }>(
-      `SELECT (
+    const privacyQuery = `SELECT (
         EXISTS(SELECT 1 FROM sessions.session_erasure_receipts
           WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.upload_deletions
           WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
+        OR EXISTS(SELECT 1 FROM sessions.turn_session_fences
+          WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.operator_user_erasures
           WHERE org_id=$1 AND workspace_id=$2 AND user_id=$5)
-      ) AS fenced`,
-      [scope.orgId, scope.workspaceId, scope.source, scope.sessionId, userId],
+      ) AS fenced`;
+    const privacyParams = [
+      scope.orgId,
+      scope.workspaceId,
+      scope.source,
+      scope.sessionId,
+      userId,
+    ];
+    const { rows } = await db.query<{ fenced: boolean }>(
+      privacyQuery,
+      privacyParams,
     );
     if (rows[0]?.fenced !== false) {
       await db.query("COMMIT");
@@ -238,11 +248,7 @@ export async function withLegacyPrivacyFence<T>(
     // Ordinary deletion fences need not take the operator's exclusive lock.
     // Recheck before releasing; a race is a failed export, never an accepted
     // checkpoint. The user-scoped legacy machine is swept by user erasure.
-    const after = await db.query<{ fenced: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM sessions.upload_deletions
-        WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4) AS fenced`,
-      [scope.orgId, scope.workspaceId, scope.source, scope.sessionId],
-    );
+    const after = await db.query<{ fenced: boolean }>(privacyQuery, privacyParams);
     if (after.rows[0]?.fenced)
       throw Object.assign(new Error("privacy fence raced legacy export"), {
         code: "legacy_privacy_race",
