@@ -522,6 +522,16 @@ environment no longer means off. It applies only to a scope whose whole read sto
 (above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before. The hosted
 pipeline Lambda and the large-read worker never read these settings, so the default changes nothing there.
 
+Helm chart (AgentWorkforce/infra PR 414, chart `sessions-pipeline` 0.8.42): the values are
+`sessions-pipeline.searchIndexer.streaming.enabled`, `sessions-pipeline.searchIndexer.streaming.maxReadBytes` and
+`sessions-pipeline.searchIndexer.streaming.maxReadEvents`. `enabled` is tri-state: `null` (the chart default) leaves
+`SEARCH_INDEX_STREAMING_ENABLED` unset so the image's code default applies, `true` renders `"true"`, and `false`
+renders `SEARCH_INDEX_STREAMING_ENABLED="false"` explicitly. The chart never drops the variable to mean off, because
+an unset variable now means on. `enabled: true` together with `searchIndexer.outputFacts.enabled: true` fails the
+chart render (the image would fail startup the same way); `enabled: null` with output facts on renders, and the
+image turns streaming off itself (the `reason=output_facts` info line above). `maxReadBytes` / `maxReadEvents`
+render `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` when set and are subject to the startup checks below.
+
 The streaming reader reads the scope's chunks again in several passes rather than holding them: roughly four object
 reads per chunk for flagged sessions, memory bounded by one chunk plus per-record keys. It produces the same index
 rows, deletes, directory events, catalog and search state as the whole read would with unlimited limits, and
@@ -541,18 +551,28 @@ the variable and its range, never the value; lower a budget to shrink the larges
 needs. A scope is refused before any chunk is read when its declared size times four exceeds a budget, again
 after the first pass from the sizes actually read and declared, and on any chunk or record past it. A scope whose
 chunks do not declare their record counts is refused only after a full first pass, read under the scope's lock.
-With both budgets lowered to their floors every scope past the whole-read bound is refused (a streamed scope is
-by definition larger than the bound, and the floors allow four reads of it), and the consumer logs a warning at
-startup; from `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the events floor is already the 2000000 cap, so a scope
-past the events bound never streams there, while one past only the bytes bound still can. Size the consumer pod
-for one decompressed chunk plus about 1 KB of keys per record, about 0.5 GB at the default 2000000-record budget,
-on top of its usual memory limit; an image upgrade turns this on for an install that never set the variable, so
-check the pod limit or set `false` before upgrading. On the first reconcile tick after the upgrade, every session
+A scope streams only when it is strictly larger than the whole-read bound, so the smallest one needs four times
+(bound + 1) of a budget: with neither budget at or above four times (bound + 1), the floors included, every scope
+past the whole-read bound is refused and the consumer logs a warning at startup (a floor itself is still accepted,
+so values set before stay valid); from `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the events floor is already the
+2000000 cap, so a scope past the events bound never streams there, while one past only the bytes bound still can.
+
+Minimum consumer memory with streaming on: the non-streaming sizing plus about 0.5 GB. The streaming reader never
+holds the scope (up to 512 MiB at the default budgets) at once; it holds one decompressed chunk (at most 16 MiB)
+plus about 1 KB of keys per record of the scope, about 0.5 GB for the largest scope the default budgets stream
+(500000 records). Lowering `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` lowers that part in proportion. An image upgrade
+turns this on for an install that never set the variable, so check the pod limit or set `false` before upgrading
+(see "Upgrading to the default-on image" below). On the first reconcile tick after the upgrade, every session
 already partial with `scope_too_large` alone is streamed (or refused by the budgets) in turn. A refused scope stays
 partial with `scope_too_large` first and then the budget's code, `stream_read_bytes_budget` or
 `stream_read_events_budget`, and is retried every reconcile tick like any partial session; the consumer's
 `search index partial` warning names those codes and, for a streamed scope, the passes, chunks, bytes and records
-it read.
+it read. Such a scope, still truncated after a streamed pass because it is beyond `SEARCH_INDEX_STREAM_MAX_READ_*`,
+is read again, up to its budget, on every reconcile tick. That is the accepted Phase 2 scope: no wrong data (rows
+are written only after a complete verifying pass, nothing is deleted, the session stays partial), only the read
+work repeated each tick. To
+avoid that work, raise the budget it exceeds, or opt out with `enabled: false` in the chart
+(`SEARCH_INDEX_STREAMING_ENABLED="false"`).
 
 Streaming stops at the first read or fold error and reports that one code (for example `chunk_decompress_failed`),
 while the whole read may list more codes for the same scope. A chunk or record whose content changed between passes
@@ -563,6 +583,17 @@ current unless the streamed read was complete. A last pass that fails (a store e
 regenerating) may leave rows already written; they are rows the verify pass checked, nothing is deleted, the
 session stays partial and keeps owing a pass, and the next reconcile repairs it. The hosted pipeline Lambda never
 reads these settings.
+
+#### Upgrading to the default-on image
+
+Besides turning streaming on, the default-on image validates the streaming budgets at startup whenever streaming
+resolves on, which now includes an unset `SEARCH_INDEX_STREAMING_ENABLED`. An install that set
+`SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` earlier (for example while trying streaming out, then left them in
+place with the flag unset), or raised `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS` so that a set budget is now below
+its floor (four times the effective bound), gets those values checked on the next start. A stale, out-of-range or
+malformed value that the old image ignored now fails startup, naming the variable and its range. Before upgrading,
+remove or correct those values, or set `SEARCH_INDEX_STREAMING_ENABLED="false"` (chart `enabled: false`), under
+which neither budget is read.
 
 ### session-ingest admission mode (config contract)
 

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -57,6 +57,7 @@ import {
   storeReconcileCursor,
   scoreFailedAttempt,
   scoreRequeuedAttempt,
+  serve,
   writerComposition,
   outputFactsDeps,
   type ConsumerTickIo,
@@ -162,6 +163,54 @@ describe("consumer service config", () => {
     expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: "true" }))).toMatchObject({ enabled: true, originLabels: true });
     for (const raw of ["", "false", "TRUE", " true", "1", "on"])
       expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: raw }))).toMatchObject({ enabled: true, originLabels: false });
+  });
+  test("serve() logs the streaming reconcile startup line before any connection opens", async () => {
+    // serve() resolves SEARCH_INDEX_STREAMING_ENABLED and logs it before refusing a mismatched
+    // HOOPDB_URL, the first startup check after it: no pool, no network.
+    const startup = async (overrides: Record<string, string | undefined>) => {
+      const lines: Array<Record<string, unknown>> = [];
+      const capture = (chunk: string | Uint8Array) => {
+        for (const line of String(chunk).split("\n")) if (line.startsWith("{")) lines.push(JSON.parse(line) as Record<string, unknown>);
+        return true;
+      };
+      const out = spyOn(process.stdout, "write").mockImplementation(capture as typeof process.stdout.write);
+      const err = spyOn(process.stderr, "write").mockImplementation(capture as typeof process.stderr.write);
+      try {
+        await expect(serve(env({ HOOPDB_URL: "postgresql://other@postgres:5432/hoopdb", ...overrides }))).rejects.toThrow(
+          "HOOPDB_URL must match the consumer secret hoopdb_url",
+        );
+      } finally {
+        out.mockRestore();
+        err.mockRestore();
+      }
+      return lines.filter((l) => String(l.message).includes("streaming reconcile"));
+    };
+    // Unset with output facts: off, one info line naming why.
+    expect(await startup({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([
+      expect.objectContaining({
+        level: "info",
+        message: expect.stringContaining("streaming reconcile off"),
+        service: expect.any(String),
+        streaming: "off",
+        reason: "output_facts",
+      }),
+    ]);
+    // Both budgets at their floors: on, one warning with the budgets.
+    expect(await startup({ SEARCH_INDEX_STREAM_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400000" })).toEqual([
+      expect.objectContaining({
+        level: "warn",
+        message: expect.stringContaining("streaming reconcile on"),
+        max_read_bytes: 256 * 1024 * 1024,
+        max_read_events: 400_000,
+        largest_streamed_scope_bytes: 64 * 1024 * 1024,
+        largest_streamed_scope_events: 100_000,
+      }),
+    ]);
+    // On at the default budgets, and explicitly off: no streaming line.
+    expect(await startup({})).toEqual([]);
+    expect(await startup({ SEARCH_INDEX_STREAMING_ENABLED: "false", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([]);
+    // A malformed flag fails startup before the log line or any connection.
+    await expect(serve(env({ SEARCH_INDEX_STREAMING_ENABLED: "1" }))).rejects.toThrow("SEARCH_INDEX_STREAMING_ENABLED must be true or false");
   });
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());

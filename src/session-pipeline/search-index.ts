@@ -707,7 +707,7 @@ export function searchIndexStreamFlag(env: Record<string, string | undefined>, o
  * 2,000,000): a scope streams only when four times its size fits both budgets, so the
  * default streams scopes up to 512 MiB and 500,000 records. Set, a budget must lie between
  * its floor (searchIndexStreamFloor: four times the effective whole-read bound, capped at the
- * ceiling, below which no scope past that bound could stream) and the ceiling; lower it to
+ * ceiling; at or below it no scope past that bound could stream) and the ceiling; lower it to
  * shrink the largest streamed scope and the pod memory it needs (one chunk plus about 1 KB
  * of keys per record read). Off reads neither budget. Errors name the variable and its
  * range, never the value.
@@ -740,8 +740,12 @@ export function searchIndexStreamFromEnv(
 
 /**
  * The smallest accepted streaming budgets for the effective whole-read `limits`: four whole
- * reads, capped at STREAM_READ_CEILING. At the floor of both, no scope past the whole-read
- * bound fits (searchIndexStreamBudgetWarning). The defaults are the ceiling itself.
+ * reads, capped at STREAM_READ_CEILING. A scope streams only when it is strictly past the
+ * whole-read bound (canonical-projection.ts `bytes > maxScopeBytes || events > maxScopeEvents`),
+ * so the smallest one needs four times (bound + 1): a budget from the floor up to
+ * 4 * bound + 3 accepts no scope, and with both budgets there startup warns
+ * (searchIndexStreamBudgetWarning). The floor stays four whole reads so values accepted
+ * before stay valid. The defaults are the ceiling itself.
  */
 export function searchIndexStreamFloor(limits: Partial<SearchIndexLimits>): StreamReadLimits {
   const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
@@ -754,12 +758,16 @@ export function searchIndexStreamFloor(limits: Partial<SearchIndexLimits>): Stre
 /**
  * The startup warning for streaming on with budgets no scope can use, or undefined. Every
  * scope the streaming reader takes is past the whole-read bound in bytes or in records, and
- * it needs four times its size within each budget: when neither budget exceeds four times
- * its bound, no scope fits and none streams (a scope whose chunks do not declare their
- * record counts is refused only after a full first pass under the scope's locks). Never at
- * the default budgets (the ceiling is above four times the largest accepted bound in bytes);
- * only when an operator lowers both to their floor. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES
- * and/or _EVENTS toward the ceiling, or set SEARCH_INDEX_STREAMING_ENABLED=false.
+ * it needs four times its size within each budget. Past the bound is strictly above it
+ * (canonical-projection.ts `bytes > limits.maxScopeBytes || events > limits.maxScopeEvents`;
+ * canonical-stream-projection.ts refuses `size * STREAM_PASSES > budget`), so the smallest
+ * scope that can stream on one axis needs STREAM_PASSES * (bound + 1) of that budget: when
+ * neither budget reaches that, no scope fits and none streams (a scope whose chunks do not
+ * declare their record counts is refused only after a full first pass under the scope's
+ * locks). Never at the default budgets (the ceiling is above four times the largest accepted
+ * bound in bytes); only when an operator lowers both below four times (bound + 1), the floor
+ * included. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES and/or _EVENTS toward the ceiling, or
+ * set SEARCH_INDEX_STREAMING_ENABLED=false.
  */
 export function searchIndexStreamBudgetWarning(
   stream: StreamReadLimits | undefined,
@@ -767,7 +775,10 @@ export function searchIndexStreamBudgetWarning(
 ): Record<string, number> | undefined {
   if (!stream) return undefined;
   const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
-  if (stream.maxReadBytes > STREAM_PASSES * effective.maxScopeBytes || stream.maxReadEvents > STREAM_PASSES * effective.maxScopeEvents)
+  if (
+    stream.maxReadBytes >= STREAM_PASSES * (effective.maxScopeBytes + 1) ||
+    stream.maxReadEvents >= STREAM_PASSES * (effective.maxScopeEvents + 1)
+  )
     return undefined;
   return {
     max_read_bytes: stream.maxReadBytes,
