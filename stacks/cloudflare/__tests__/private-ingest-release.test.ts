@@ -29,14 +29,10 @@ test("tracked production config is H-only baseline drain; only the rollout phase
   for (const bad of [
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, custodySource: "foreign" } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, asyncAdmission: "off" } },
-    { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimTimeoutBusy: undefined } },
-    { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimLockWaitMs: 500 } },
-    { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimLockWaitMs: undefined } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimTimeoutBusy: "off" } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimLockWaitMs: 10 } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, expectedGeneration: "f".repeat(64) } },
-  ]) expect(() => privateIngestReleasePhase({ sessionIngest: { ...bad.sessionIngest, kmsKeyArn } })).toThrow();
-  // The reviewed claim lock settings (2026-11-16): claimTimeoutBusy on and a 250 ms claim lock wait, beside claimLockBusy.
-  expect(tracked.sessionIngest).toMatchObject({ claimLockBusy: "on", claimTimeoutBusy: "on", claimLockWaitMs: 250 });
-  expect(privateIngestReleasePhase({ sessionIngest: { ...tracked.sessionIngest, kmsKeyArn } })).toBe("baseline-drain");
+  ]) expect(() => privateIngestReleasePhase(bad)).toThrow();
 });
 
 test("typed release confirmation binds mode, main SHA and prior plan", () => {

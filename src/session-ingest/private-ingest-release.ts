@@ -113,11 +113,6 @@ const COMMON_PROFILE = {
   inlineMaxSessions: 0,
   replicaMode: "off",
   claimLockBusy: "on",
-  // 2026-11-16 customer incident: a user's own concurrent claims queue on their fence-owner row and add up
-  // to the 5 s statement_timeout. A claim waits at most 250 ms for that lock, then answers the 429
-  // ClaimLockBusy (claimLockBusy); a 57014 claim timeout is the same 429 (claimTimeoutBusy).
-  claimTimeoutBusy: "on",
-  claimLockWaitMs: 250,
 } as const;
 
 /**
@@ -181,23 +176,42 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             controlMirror precondition.
  *   httpAdmissionStoppedOrgs  a non-empty list of distinct lowercase org UUIDs (omit for none):
  *                             INGEST_HTTP_ADMISSION_STOPPED_ORGS, the marker's workerHttpAdmission "off" precondition.
+ *   claimTimeoutBusy          "on" only (omit for off): INGEST_CLAIM_TIMEOUT_BUSY, a 57014 claim timeout answers the
+ *                             429 ClaimLockBusy (deliver.ts).
+ *   claimLockWaitMs           an integer 25..2000 (omit for the role default): INGEST_CLAIM_LOCK_WAIT_MS, the claim's
+ *                             transaction-local lock wait (ledger-sql.ts inClaimLockWait). 2026-11-16 customer
+ *                             incident: a deploy may add, change or remove both, like the other cutover controls, so
+ *                             they live here and not in COMMON_PROFILE (a COMMON_PROFILE change can never match the
+ *                             live version it replaces, private_ingest_live_phase).
  * Neither is ever tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs"] as const;
-export type PrivateIngestCutover = { s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[] };
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "claimLockWaitMs"] as const;
+export type PrivateIngestCutover = {
+  s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; claimLockWaitMs?: number;
+};
+const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
+const claimLockWaitOk = (ms: unknown): ms is number =>
+  typeof ms === "number" && Number.isSafeInteger(ms) && ms >= 25 && ms <= 2000;
 const STOPPED_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 function checkedCutover(profile: Record<string, unknown>, live = false): PrivateIngestCutover {
   const mirror = profile.s3FenceMirror, orgs = profile.httpAdmissionStoppedOrgs;
+  const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs;
   if (mirror !== undefined && mirror !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_fence_mirror");
+  if (timeoutBusy !== undefined && timeoutBusy !== "on")
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_timeout_busy");
+  if (lockWait !== undefined && !claimLockWaitOk(lockWait))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_lock_wait");
   if (orgs !== undefined && (!Array.isArray(orgs) || orgs.length === 0 || new Set(orgs).size !== orgs.length ||
       orgs.some((org) => typeof org !== "string" || !STOPPED_ORG.test(org))))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_stopped_orgs");
   return {
     ...(mirror === "on" ? { s3FenceMirror: "on" as const } : {}),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: [...(orgs as string[])] }),
+    ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" as const } : {}),
+    ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
   };
 }
 
@@ -206,13 +220,21 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_S3_FENCE_MIRROR             "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS comma-separated org UUIDs or unset/empty; whitespace around an
  *                                              entry is not accepted, so a typo never silently drops an org.
+ *   PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY          "on" or unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS          decimal digits, 25..2000, or unset/empty; signs, spaces, exponents,
+ *                                              hex and fractions refuse.
  */
 export function privateIngestCutoverFromEnv(env: Record<string, string | undefined>): PrivateIngestCutover {
   const mirror = env.PRIVATE_INGEST_S3_FENCE_MIRROR ?? "", orgs = env.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS ?? "";
+  const timeoutBusy = env.PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY ?? "", lockWait = env.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS ?? "";
   if (mirror !== "" && mirror !== "on") privateIngestRefuse("private_ingest_profile_fence_mirror");
+  if (timeoutBusy !== "" && timeoutBusy !== "on") privateIngestRefuse("private_ingest_profile_claim_timeout_busy");
+  if (lockWait !== "" && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_profile_claim_lock_wait");
   return checkedCutover({
     ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
     ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
+    ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" } : {}),
+    ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
   });
 }
 
@@ -227,9 +249,13 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     return rows[0]!.text as string;
   };
   const mirror = text("INGEST_S3_FENCE_MIRROR"), orgs = text("INGEST_HTTP_ADMISSION_STOPPED_ORGS");
+  const timeoutBusy = text("INGEST_CLAIM_TIMEOUT_BUSY"), lockWait = text("INGEST_CLAIM_LOCK_WAIT_MS");
+  if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
   return checkedCutover({
     ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
+    ...(timeoutBusy === undefined ? {} : { claimTimeoutBusy: timeoutBusy }),
+    ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
   }, true);
 }
 

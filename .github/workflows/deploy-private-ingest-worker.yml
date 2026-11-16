@@ -85,6 +85,9 @@ jobs:
       # deploy bind the same values through the staged inputs digest.
       PRIVATE_INGEST_S3_FENCE_MIRROR: ${{ vars.PRIVATE_INGEST_S3_FENCE_MIRROR }}
       PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS: ${{ vars.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS }}
+      # 2026-11-16 claim lock controls (deliver.ts / ledger-sql.ts). Unset or empty = off / role default.
+      PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: ${{ vars.PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY }}
+      PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: ${{ vars.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS }}
     steps:
       - uses: actions/checkout@v4
         with:

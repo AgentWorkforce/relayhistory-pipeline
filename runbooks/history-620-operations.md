@@ -193,19 +193,20 @@ lock: the same claim, committed. `SET LOCAL` ends with the transaction, so it ne
 use of a pooled connection. It needs a `run` bound to one connection used sequentially (the
 Worker's per-request and per-queue-batch pg Client); a pooled `run` must not set it. Production
 sets 250 ms with `claimTimeoutBusy` and `claimLockBusy` on (2026-11-16, customer upload retries).
+`claimTimeoutBusy` and `claimLockWaitMs` are cutover controls of the private-ingest release contract
+(like the fence mirror and the stop list), never tracked in the public profile: set the
+`private-ingest-production` environment variables `PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY=on` and
+`PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS=250`, then plan and deploy the private-ingest Worker. A deploy may
+add, change or remove them at the live phase.
 Watch `outcome=delivery_busy` with `error_code=ledger_lock_timeout` per tenant: a rise is expected
 and means fast back-off, not failure. Residual risk: the claim is now a multi-statement transaction,
 so a Worker that dies between the claim and its COMMIT/ROLLBACK leaves the transaction open, holding
 the user's fence row until the server ends it; the local `idle_in_transaction_session_timeout` of
 1000 ms (instead of the role's 10 s) bounds that window, and a dropped connection ends it at once. During
-it that user's claims answer 429 and retry. Rollback is a CODE change through normal review, not a
-profile edit: `privateIngestReleasePhase` refuses any tracked profile whose keys differ from the release
-contract's `COMMON_PROFILE` (`private_ingest_profile_common`), so removing a key from the JSON alone fails
-the deploy plan. Remove `claimLockWaitMs` and/or `claimTimeoutBusy` together from `COMMON_PROFILE`
-(`src/session-ingest/private-ingest-release.ts`) and `config/cloudflare/private-ingest-production.json`,
-update the four pinned digests in `stacks/cloudflare/__tests__/private-ingest-overlap.test.ts` and the
-release test's reviewed values, land it, then plan and deploy the private-ingest Worker (no var rendered:
-the claim returns to the single autocommit statement and 57014 to the 503). Only `stage=claim`
+it that user's claims answer 429 and retry. Rollback: unset (or empty) `PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS`
+and/or `PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY` in the `private-ingest-production` environment, then plan and
+deploy the private-ingest Worker, the same steps as a stop-list change (no var rendered: the claim
+returns to the single autocommit statement and 57014 to the 503). No code change is needed. Only `stage=claim`
 is affected: `buffer_intent` and `buffer_receipt` run after the claim has committed its attempt, so
 a short lock wait there would throw away a successful claim and force a resume; they keep the role
 `lock_timeout` and stay 503 on a lock or statement timeout.

@@ -123,3 +123,39 @@ test("the retained sanitized inputs artifact reduces the stop list to a count", 
   expect(redacted).toEqual({ s3FenceMirror: "on", httpAdmissionStoppedOrgs: "redacted: 2 org(s) from the protected environment" });
   expect(redactStoppedOrgs({ asyncAdmission: "drain" })).toEqual({ asyncAdmission: "drain" });
 });
+
+// 2026-11-16 customer incident: the claim lock controls are cutover controls, so a deploy may add, change or remove
+// them at the live phase. (As COMMON_PROFILE keys they could never match the live version they replace.)
+test("claim lock controls: env shapes, and add / change / remove at a held phase", () => {
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: "on", PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: "250" }))
+    .toEqual({ claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: "", PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: "" })).toEqual({});
+  for (const v of ["off", "ON", "true", " on"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: v }))).toBe("private_ingest_profile_claim_timeout_busy");
+  for (const v of ["1e3", "0x100", "+250", "-250", "250.5", " 250", "24", "2001", "5", "abc"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: v }))).toBe("private_ingest_profile_claim_lock_wait");
+  for (const phase of ["baseline-drain", "step-4-async-on"] as const)
+    expect(privateIngestReleasePhase(at(phase, { claimTimeoutBusy: "on", claimLockWaitMs: 250 }))).toBe(phase);
+  expect(code(() => privateIngestReleasePhase(at("baseline-drain", { claimTimeoutBusy: "off" })))).toBe("private_ingest_profile_claim_timeout_busy");
+  expect(code(() => privateIngestReleasePhase(at("baseline-drain", { claimLockWaitMs: 2001 })))).toBe("private_ingest_profile_claim_lock_wait");
+
+  const plain = at("baseline-drain", { httpAdmissionStoppedOrgs: [ORG_A] });
+  const claim = at("baseline-drain", { httpAdmissionStoppedOrgs: [ORG_A], claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  const slower = at("baseline-drain", { httpAdmissionStoppedOrgs: [ORG_A], claimTimeoutBusy: "on", claimLockWaitMs: 500 });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromClaim = live(claim);
+  expect(privateIngestTransitionReadback(claim, fromPlain.active, fromPlain.version)).toMatchObject(pass);   // add (today's deploy)
+  expect(privateIngestTransitionReadback(slower, fromClaim.active, fromClaim.version)).toMatchObject(pass);  // change
+  expect(privateIngestTransitionReadback(plain, fromClaim.active, fromClaim.version)).toMatchObject(pass);   // remove (rollback)
+  expect(privateIngestVersionReadback(claim, fromClaim.active, fromClaim.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(code(() => privateIngestVersionReadback(slower, fromClaim.active, fromClaim.version))).not.toBeNull();
+  for (const bad of [
+    [{ name: "INGEST_CLAIM_TIMEOUT_BUSY", type: "plain_text", text: "off" }],
+    [{ name: "INGEST_CLAIM_LOCK_WAIT_MS", type: "plain_text", text: "1e3" }],
+    [{ name: "INGEST_CLAIM_LOCK_WAIT_MS", type: "plain_text", text: "9" }],
+    [{ name: "INGEST_CLAIM_LOCK_WAIT_MS", type: "secret_text" }],
+  ]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+});
