@@ -1484,15 +1484,20 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
   ]);
   expect(present.target).toBe(target);
   expect(present.target_sha).toBe(targetSha);
-  expect(present.required_roles).toEqual([...chainNames].sort());
-  expect([present.excluded, present.mixed, present.release_drift]).toEqual([[], [], []]);
+  // required_roles is target-relative: the legacy-export role belongs to the
+  // chain, but its first consumer (062030) is held above this 047000 target.
+  expect(present.required_roles).toEqual(targetRequiredRoles(present.target));
+  expect(present.required_roles).not.toContain("bulls96_legacy_export_privacy");
+  expect(present.excluded).toEqual(["supabase/bootstrap/legacy_export_privacy_roles.sql"]);
+  expect([present.mixed, present.release_drift]).toEqual([[], []]);
   expect(present.db_mode).toBe("supabase");
   expect(present.required).toBe(false);
   expect(present.will_create).toEqual([]);
   expect(present.next).toBe("apply");
   expect(present.files.map((f) => f.file)).toEqual([...SESSION_BOOTSTRAP_FILES]);
   expect(Object.keys(present.files[0])).toEqual(["file", "sha256_target", "sha256_release", "differs", "scope"]);
-  expect(present.files.every((f) => f.scope === "run")).toBe(true);
+  expect(present.files.find((f) => f.file === "supabase/bootstrap/legacy_export_privacy_roles.sql")?.scope).toBe("excluded");
+  expect(present.files.filter((f) => f.file !== "supabase/bootstrap/legacy_export_privacy_roles.sql").every((f) => f.scope === "run")).toBe(true);
   expect(present.files.every((f) => !f.differs)).toBe(true);
   expect(present.roles.map((r) => r.name)).toEqual(chainNames);
   expect(Object.keys(present.roles[0])).toEqual(["name", "file", "first_consumer", "required", "present", "exact", "will_create"]);
@@ -1531,7 +1536,7 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
     (v: any) => (v.target_sha = "A".repeat(40)),
     (v: any) => (v.required_roles = v.required_roles.slice(1)),
     (v: any) => (v.excluded = [readApiFile]),
-    (v: any) => (v.files[3].scope = "excluded"),
+    (v: any) => (v.files.find((f: any) => f.file === readApiFile).scope = "excluded"),
     (v: any) => (v.mixed = [readApiFile]),
     (v: any) => (v.release_drift = [readApiFile]),
     (v: any) => (v.roles[0].required = false),
@@ -1553,7 +1558,11 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
   const low = bsSection({ target: "upstream:20261105033000_canonical_project_events.sql" });
   expect(validateBootstrapSection(JSON.parse(JSON.stringify(low)))).toEqual(low);
   expect(low.required_roles).toEqual(targetRequiredRoles(low.target));
-  expect(low.excluded).toEqual([readApiFile, "supabase/bootstrap/session_consumer_roles.sql"]);
+  expect(low.excluded).toEqual([
+    "supabase/bootstrap/legacy_export_privacy_roles.sql",
+    readApiFile,
+    "supabase/bootstrap/session_consumer_roles.sql",
+  ]);
   expect(low.mixed).toEqual(["supabase/bootstrap/session_ingest_roles.sql"]);
 
   // Release-sha digests are informational: a differing or absent release file is reported.
@@ -1847,7 +1856,7 @@ test("apply guard lists absent target-required chain roles only; psql meta lines
 
 test("chain files never end or split the stage transaction", () => {
   // Every current chain file passes, as the stage sends it (psql meta lines stripped).
-  expect(SESSION_BOOTSTRAP_FILES.length).toBe(5);
+  expect(SESSION_BOOTSTRAP_FILES.length).toBe(6);
   for (const f of SESSION_BOOTSTRAP_FILES) {
     const text = stripPsqlMeta(readFileSync(new URL("../../../" + f, import.meta.url), "utf8"));
     expect(requireTransactionSafeChainSql(text)).toBe(text);
