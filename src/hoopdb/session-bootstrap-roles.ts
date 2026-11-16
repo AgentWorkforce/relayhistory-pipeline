@@ -84,6 +84,9 @@ export const SESSION_BOOTSTRAP_ROLES: {
     bulls96_acquisition_installer: bare("allowed", "none"),
     buffered_search_feed_runtime: bare("allowed", "none"),
   },
+  "supabase/bootstrap/legacy_export_privacy_roles.sql": {
+    bulls96_legacy_export_privacy: bare("allowed", "unchecked"),
+  },
   "supabase/bootstrap/session_read_api_roles.sql": {
     // Production already has it LOGIN (session_read_api_role.sql); no member.
     bulls96_read_api: bare("allowed", "none"),

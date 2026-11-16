@@ -56,7 +56,7 @@ const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
   "bulls96_canonical_feature_producer", "bulls96_read_api", "bulls96_project_events",
-  "bulls96_privacy_eraser", "bulls96_babysitter_retention",
+  "bulls96_privacy_eraser", "bulls96_legacy_export_privacy", "bulls96_babysitter_retention",
 ];
 const RDS_ENV = {
   HOOPDB_DB_MODE: "rds",
@@ -440,7 +440,7 @@ await check("drift refused: a runtime role created by a different rds_superuser 
   return [bootRt.sqlstate === "55000" && m.exit !== 0 && m.code === "runtime_role_unsafe", `bootstrap=${bootRt.sqlstate} migrate=${fmt(m)}`];
 });
 
-for (const role of ["bulls96_read_api", "bulls96_project_events", "bulls96_privacy_eraser", "bulls96_babysitter_retention"]) {
+for (const role of ["bulls96_read_api", "bulls96_project_events", "bulls96_privacy_eraser", "bulls96_legacy_export_privacy", "bulls96_babysitter_retention"]) {
   await check(`drift refused: ${role} with INHERIT, or with a member, is refused by rds_migration_roles.sql and left as found`, async () => {
     await sql(DB, `ALTER ROLE ${role} INHERIT`);
     const inherit = psql(DB, ["-f", ROLES_BOOT]);
