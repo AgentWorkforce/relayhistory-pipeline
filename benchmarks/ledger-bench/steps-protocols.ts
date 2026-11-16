@@ -1,7 +1,7 @@
 /** Steps 3, 4 and 5 of the plan: the commit protocols, S3 Express specifics and DynamoDB specifics. */
 import { DynamoError, expressStore, type CredentialProvider, type Dynamo } from "./aws.ts";
 import type { ExpressTarget } from "./aws.ts";
-import { GROUP_SIZES, HOT_HEAD_LEVELS, logOpCap, STREAM_COUNTS, TRANSACT_ITEMS, TRANSACT_WRITERS, transactOpCap } from "./caps.ts";
+import { GROUP_SIZES, HOT_HEAD_LEVELS, logOpCap, objectOpCap, STREAM_COUNTS, TRANSACT_ITEMS, TRANSACT_WRITERS, transactOpCap } from "./caps.ts";
 import type { TargetId } from "./config.ts";
 import { cell, jsonDoc, key, KIB, need, randomBytes, readBody, type Ctx } from "./context.ts";
 import { errorClass } from "./load.ts";
@@ -148,7 +148,7 @@ export async function step4(ctx: Ctx, credentials: CredentialProvider, fetcher: 
   const r2 = ctx.stores.R2;
   for (const kib of [1, 64]) {
     const payload = randomBytes(kib * KIB);
-    await cell(ctx, { step: 4, cell: "single_az_write", target: "R4", params: { concurrency: 8, kib } }, { concurrency: 8, op: async (w, i) => void (await r4.put(key(root, `single-${kib}k`, (w * 131 + i) % 1024), payload)) });
+    await cell(ctx, { step: 4, cell: "single_az_write", target: "R4", params: { concurrency: 8, kib } }, { concurrency: 8, maxOps: objectOpCap(ctx.profile, kib), op: async (w, i) => void (await r4.put(key(root, `single-${kib}k`, (w * 131 + i) % 1024), payload)) });
     let copied = 0;
     let copying = 0;
     await cell(
@@ -156,6 +156,8 @@ export async function step4(ctx: Ctx, credentials: CredentialProvider, fetcher: 
       { step: 4, cell: "dual_az_write", target: "R4+R5", params: { concurrency: 8, kib } },
       {
         concurrency: 8,
+        // Each operation writes the object two or three times (R4, R5 and the background copy).
+        maxOps: Math.ceil(objectOpCap(ctx.profile, kib) / 3),
         op: async (w, i) => {
           const k = key(root, `dual-${kib}k`, (w * 131 + i) % 1024);
           await Promise.all([r4.put(k, payload), r5.put(k, payload)]);
