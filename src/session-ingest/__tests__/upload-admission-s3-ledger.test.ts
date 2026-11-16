@@ -298,7 +298,7 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
 
   test("the synchronous runtime (no admission mode, no direct upload) is built on that gated ledger", async () => {
     const src = readFileSync(join(import.meta.dir, "../selfhost-server.ts"), "utf8");
-    expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined) : sqlLedger(');
+    expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit }) : sqlLedger(');
     expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),\n      ...(guard ? { logModeGuard: true } : {}) })');
     // The guard defaults to the flag; only the log materializer's own ledger passes logModeGuard false.
     expect(src).toContain('const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";');

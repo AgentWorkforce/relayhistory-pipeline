@@ -182,6 +182,8 @@ export interface SelfhostIngestSettings {
   admission?: SelfhostAdmissionSettings;
   /** INGEST_LEDGER=s3 (decision 0005): every admission and fence through ledger-s3.ts. Absent: the SQL ledger. */
   ledger?: "s3";
+  /** INGEST_LEDGER_LOG_COMMIT, parsed once here (selfhostLedgerLogCommit; on only with ledger s3). */
+  ledgerLogCommit?: "off" | "on";
   /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
   uploadDirect?: SelfhostUploadDirectSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
@@ -423,6 +425,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
   const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime });
+  const ledgerLogCommit = selfhostLedgerLogCommit(env);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
@@ -447,7 +450,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
-    ...(ledger ? { ledger } : {}),
+    ...(ledger ? { ledger, ledgerLogCommit } : {}),
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
   };
 }

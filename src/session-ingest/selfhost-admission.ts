@@ -296,9 +296,10 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       await promoteUploads(scanAt);
     } finally {
       lastProgressAt = undefined;
+      // Log mode: sweep the registered streams even when promotion failed (the sweep returns once the registry is
+      // listed; the materializing runs in the background; a failure retries next scan).
+      if (opts.logMaterializer) await opts.logMaterializer.sweep().catch(() => {});
     }
-    // Log mode: kick every registered stream (not awaited past the listing; a failure retries next scan).
-    if (opts.logMaterializer) await opts.logMaterializer.sweep().catch(() => {});
   }
 
   function scan(): Promise<void> {

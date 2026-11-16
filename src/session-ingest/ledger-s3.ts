@@ -574,6 +574,55 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) 
   return out;
 }
 
+// ---- claim judging (module level: the log-mode admission reuses the exact legacy rules) ----
+
+/** Every distinct (source, session) the batch names: its session list and its records' sessions (SQL's UNION). */
+export function batchPairs(sessions: [string, string][], records: LedgerRecord[]): [string, string][] {
+  const all = new Map<string, [string, string]>();
+  for (const p of sessions) all.set(pairId(p[0], p[1]), [p[0], p[1]]);
+  for (const r of records) if (r.sessionId !== null) all.set(pairId(r.source, r.sessionId), [r.source, r.sessionId]);
+  return [...all.values()].sort(pairCompare);
+}
+
+/** The batch's records whose session the fence has not deleted: the only ones claim (c) judges, so the only shards it reads. */
+export function liveRecords(input: Pick<ClaimInput, "originId" | "records">, fence: FenceDoc) {
+  const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
+  return input.records.filter((r) => r.sessionId === null || !fenced.has(pairId(r.source, r.sessionId)));
+}
+/** Claim steps (b) and (c): the deletion filter, then #250's revision rules over the origin's stored index. */
+export function judge(input: Pick<ClaimInput, "originId" | "sessions" | "records">, keys: ReturnType<typeof s3LedgerKeys>, fence: FenceDoc, shards: Map<string, IndexDoc["records"]>) {
+  const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
+  const deleted = batchPairs(input.sessions, input.records).filter(([s, id]) => fenced.has(pairId(s, id)));
+  const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
+  const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
+  // Per (origin, record id), whichever session stored it; an entry the fence has forgotten counts as absent.
+  const storedOf = (r: (typeof live)[number]) => {
+    const e = own(shards.get(keys.revisions(input.originId, r.recordId))!, r.recordId);
+    return e && !entryForgotten(fence, input.originId, e) ? e[0] : undefined;
+  };
+  // Identity order (record_id, revision, revision_id, ord); a NEW revision is judged against its first peer.
+  const sorted = [...live].sort((a, b) => byteCompare(a.recordId, b.recordId) || a.revision - b.revision || byteCompare(a.revisionId, b.revisionId) || a.ord - b.ord);
+  const peers = new Map<string, (typeof live)[number]>();
+  for (const r of sorted) { const k = JSON.stringify([r.recordId, r.revision]); if (!peers.has(k)) peers.set(k, r); }
+  const conflicts: RevisionConflict[] = [];
+  const stale: number[] = [];
+  let twins = 0;
+  for (const r of sorted) {
+    const stored = storedOf(r);
+    if (stored !== undefined && stored >= r.revision) { stale.push(r.ord); continue; }
+    const peer = peers.get(JSON.stringify([r.recordId, r.revision]))!;
+    if (peer.revisionId !== r.revisionId && peer.digest !== r.digest) {
+      twins++;
+      if (conflicts.length < MAX_DELIVERY_CONFLICTS)
+        conflicts.push({ recordId: r.recordId, submittedRevisionId: r.revisionId, submittedRevision: r.revision, submittedDigest: r.digest,
+          currentRevisionId: peer.revisionId, currentRevision: r.revision, currentDigest: peer.digest });
+    }
+  }
+  stale.sort((a, b) => a - b);
+  return { deleted, deletedSet, stale, conflicts, twins, fast: stale.length === live.length };
+}
+
+
 // ---- the ledger ----
 
 export interface S3LedgerOptions {
@@ -851,7 +900,18 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     return out;
   }
 
-  return { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, mergeIndexBatches, readOwner, registerOwner, listOwners, writeRearm, readBatch };
+  /** The revision-index shards `records` fall in (as the claim reads them), keyed by shard key. */
+  async function readShards(originId: string, keys: ReturnType<typeof s3LedgerKeys>, records: ClaimInput["records"]): Promise<Map<string, IndexDoc["records"]>> {
+    const shardKeys = [...new Set(records.map((r) => keys.revisions(originId, r.recordId)))];
+    const loaded = await mapLimit(shardKeys, parallel, async (k) => {
+      const doc = (await readIndex(k))?.doc;
+      if (doc && doc.originId !== originId) throw new LedgerUnavailableError("ledger_revision_index_invalid");
+      return [k, doc?.records ?? {}] as const;
+    });
+    return new Map(loaded.map(([k, recs]) => [k, recs]));
+  }
+
+  return { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, mergeIndexBatches, readOwner, registerOwner, listOwners, writeRearm, readBatch, readShards };
 }
 
 export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOptions = {}): Ledger {
@@ -913,24 +973,11 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       throw new LedgerUnavailableError("ledger_input_refused");
   }
 
-  /** Every distinct (source, session) the batch names: its session list and its records' sessions (SQL's UNION). */
-  function batchPairs(sessions: [string, string][], records: LedgerRecord[]): [string, string][] {
-    const all = new Map<string, [string, string]>();
-    for (const p of sessions) all.set(pairId(p[0], p[1]), [p[0], p[1]]);
-    for (const r of records) if (r.sessionId !== null) all.set(pairId(r.source, r.sessionId), [r.source, r.sessionId]);
-    return [...all.values()].sort(pairCompare);
-  }
-
   /**
    * The revision-index shards every record of the batch falls in (a superset of what judge needs: records of a
    * session the fence deletes are read too, and ignored), so they can be read at the same time as the batch record
    * and the fence. Reads only: what judge decides still depends on the fence read of the same attempt.
    */
-  /** The batch's records whose session the fence has not deleted: the only ones claim (c) judges, so the only shards it reads. */
-  function liveRecords(input: ClaimInput, fence: FenceDoc) {
-    const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
-    return input.records.filter((r) => r.sessionId === null || !fenced.has(pairId(r.source, r.sessionId)));
-  }
   async function readShards(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>, records: ClaimInput["records"]): Promise<Map<string, IndexDoc["records"]>> {
     const shardKeys = [...new Set(records.map((r) => keys.revisions(input.originId, r.recordId)))];
     const loaded = await mapLimit(shardKeys, parallel, async (k) => {
@@ -939,39 +986,6 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       return [k, doc?.records ?? {}] as const;
     });
     return new Map(loaded.map(([k, recs]) => [k, recs]));
-  }
-
-  /** Claim steps (b) and (c): the deletion filter, then #250's revision rules over the origin's stored index. */
-  function judge(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>, fence: FenceDoc, shards: Map<string, IndexDoc["records"]>) {
-    const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
-    const deleted = batchPairs(input.sessions, input.records).filter(([s, id]) => fenced.has(pairId(s, id)));
-    const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
-    const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
-    // Per (origin, record id), whichever session stored it; an entry the fence has forgotten counts as absent.
-    const storedOf = (r: (typeof live)[number]) => {
-      const e = own(shards.get(keys.revisions(input.originId, r.recordId))!, r.recordId);
-      return e && !entryForgotten(fence, input.originId, e) ? e[0] : undefined;
-    };
-    // Identity order (record_id, revision, revision_id, ord); a NEW revision is judged against its first peer.
-    const sorted = [...live].sort((a, b) => byteCompare(a.recordId, b.recordId) || a.revision - b.revision || byteCompare(a.revisionId, b.revisionId) || a.ord - b.ord);
-    const peers = new Map<string, (typeof live)[number]>();
-    for (const r of sorted) { const k = JSON.stringify([r.recordId, r.revision]); if (!peers.has(k)) peers.set(k, r); }
-    const conflicts: RevisionConflict[] = [];
-    const stale: number[] = [];
-    let twins = 0;
-    for (const r of sorted) {
-      const stored = storedOf(r);
-      if (stored !== undefined && stored >= r.revision) { stale.push(r.ord); continue; }
-      const peer = peers.get(JSON.stringify([r.recordId, r.revision]))!;
-      if (peer.revisionId !== r.revisionId && peer.digest !== r.digest) {
-        twins++;
-        if (conflicts.length < MAX_DELIVERY_CONFLICTS)
-          conflicts.push({ recordId: r.recordId, submittedRevisionId: r.revisionId, submittedRevision: r.revision, submittedDigest: r.digest,
-            currentRevisionId: peer.revisionId, currentRevision: r.revision, currentDigest: peer.digest });
-      }
-    }
-    stale.sort((a, b) => a - b);
-    return { deleted, deletedSet, stale, conflicts, twins, fast: stale.length === live.length };
   }
 
   /** A selection's fence effect (ingest_apply_selection). `mark` decides an ordered control inside the same fence edit. */

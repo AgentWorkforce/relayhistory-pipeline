@@ -150,9 +150,12 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     // Log mode is decided per stream by its durable marker, never by this message: a legacy stream stays legacy.
     if (deps.logStreams && await deps.logStreams.isLogMode(tenant, prepared.originId)) {
       const outcome = await deps.logStreams.admit(tenant, prepared, { journalSeq, ...(consentGate ? { consent: consentGate } : {}) });
-      // Durable at the append; readable once applied. Never awaited: the materializer runs off this path.
+      // Durable at the append; readable once applied. The outcome is written BEFORE the materializer is kicked, so a
+      // refusal it records at apply time (it retires the admitted outcome) is never overwritten by this one.
+      const done = await finish("admitted", outcome);
+      // Never awaited: the materializer runs off this path.
       deps.logMaterializer?.kick(tenant, prepared.originId);
-      return finish("admitted", outcome);
+      return done;
     }
     const result = await deliverPrepared({
       ...deps.deliver,

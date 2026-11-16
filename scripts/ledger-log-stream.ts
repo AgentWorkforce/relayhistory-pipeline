@@ -27,6 +27,12 @@ if (import.meta.main) {
     } }));
   } catch { values = undefined; }
   const ids = [values?.org, values?.workspace, values?.user, values?.origin];
+  // Log mode is not cleared for hosted or production buckets (docs/design/s3-ledger-log-commit.md, Remaining):
+  // switching one is refused here, whatever else is given. status stays read-only and allowed.
+  if (command === "switch" && /(^|[-_.])(prod|production|hosted)([-_.]|$)/i.test(values?.bucket ?? "")) {
+    console.error(JSON.stringify({ refused: "bucket_not_cleared_for_log_mode" }));
+    process.exit(2);
+  }
   if (!values?.bucket || !["status", "switch", "close"].includes(command ?? "") || ids.some((v) => !v || !ID.test(v))
       || (values.apply && !values["kms-key-arn"]?.startsWith("arn:aws:kms:")) || !/^[a-z0-9_.-]{1,64}$/.test(values["key-root"]!)
       || (values.credentials !== "keys" && values.credentials !== "podIdentity")) {
@@ -44,9 +50,17 @@ if (import.meta.main) {
     ...(values.apply ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: values["kms-key-arn"]! } : {}) }) as unknown as ObjectStore;
   const keyRoot = values["key-root"]!;
   const tenant = { orgId: values.org!, workspaceId: values.workspace!, userId: values.user! };
-  const result = command === "status" ? await streamStatus(store, keyRoot, tenant, values.origin!)
-    : command === "switch" ? await switchToLogMode(store, keyRoot, tenant, values.origin!, { apply: values.apply!, writer: "operator" })
-    : await closeLogStream(store, keyRoot, tenant, values.origin!, { apply: values.apply! });
+  let result;
+  try {
+    result = command === "status" ? await streamStatus(store, keyRoot, tenant, values.origin!)
+      : command === "switch" ? await switchToLogMode(store, keyRoot, tenant, values.origin!, { apply: values.apply!, writer: `operator_${crypto.randomUUID()}` })
+      : await closeLogStream(store, keyRoot, tenant, values.origin!, { apply: values.apply! });
+  } catch (error) {
+    // A code only: never a key, a bucket or a message.
+    const code = (error as { code?: unknown })?.code;
+    console.error(JSON.stringify({ failed: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "operation_failed" }));
+    process.exit(1);
+  }
   console.log(JSON.stringify(result));
   process.exit("refused" in result && result.refused ? 1 : 0);
 }
