@@ -17,6 +17,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey, parseManifest, readAll, type ObjectStore } from "../../../packages/object-store/src/index.ts";
@@ -835,6 +836,58 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       expect(counters.exported).toBe(0); // never checkpointed as exported over an erasure
       await w.sweep(store);
       expect(await legacyKeys(store, "sess_r")).toEqual([]);
+    } finally {
+      await w.f.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("(f) the owner-registration rollback never destroys a live owner mapping", () => {
+  /** Real migration stack; the migration recorded in the ledger exactly as the migrator does (name + file sha256). */
+  async function stackWithLedger() {
+    expect(existsSync(AUTHORITY_MIGRATION)).toBe(true);
+    const file = AUTHORITY_MIGRATION.pathname.split("/").pop()!;
+    const down = new URL(`../../../supabase/rollbacks/${file.replace(/\.sql$/u, ".down.sql")}`, import.meta.url);
+    expect(existsSync(down)).toBe(true);
+    const f = await authorityFixture();
+    await f.db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())");
+    const sha = createHash("sha256").update(readFileSync(AUTHORITY_MIGRATION)).digest("hex");
+    await f.db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2) ON CONFLICT (name) DO UPDATE SET sha256=EXCLUDED.sha256", [`upstream:${file}`, sha]);
+    const exists = async () => ((await f.db.query("SELECT to_regclass('sessions.legacy_export_scope_authority') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
+    const rollback = async () => {
+      try {
+        await f.db.exec(readFileSync(down, "utf8"));
+        return { ok: true as const };
+      } catch (e) {
+        await f.db.exec("ROLLBACK").catch(() => {});
+        return { ok: false as const, code: String((e as { code?: string }).code ?? "") };
+      }
+    };
+    return { f, exists, rollback };
+  }
+
+  test("control: with an EMPTY authority table the rollback succeeds (so a refusal below is about the rows, not the fixture)", async () => {
+    const w = await stackWithLedger();
+    try {
+      expect(await w.exists()).toBe(true);
+      expect(await w.rollback()).toEqual({ ok: true });
+      expect(await w.exists()).toBe(false);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("with registered owner rows the rollback refuses (SQLSTATE 55000) and every row survives", async () => {
+    const w = await stackWithLedger();
+    try {
+      for (const sid of ["sess:1", "sess_r"])
+        await w.f.db.query("SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)", [
+          JSON.stringify({ org_id: S.orgId, workspace_id: S.workspaceId, source: S.source, session_id: sid, legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(S.workspaceId, OWNER) }),
+        ]);
+      expect(await w.rollback()).toEqual({ ok: false, code: "55000" });
+      expect(await w.exists()).toBe(true);
+      expect(((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_scope_authority")).rows[0] as { n: number }).n).toBe(2);
     } finally {
       await w.f.close();
     }
