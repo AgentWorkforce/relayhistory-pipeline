@@ -330,31 +330,30 @@ export async function withLegacyPrivacyFence<T>(
         legacy_user_id: userId,
         legacy_machine_id: registration.machineId,
       };
-      const { rows } = await db.query<{ r: typeof expected }>(
-        "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb) AS r",
-        [JSON.stringify(expected)],
-      );
+      let rows: Array<{ r: typeof expected }>;
+      try {
+        ({ rows } = await db.query<{ r: typeof expected }>(
+          "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb) AS r",
+          [JSON.stringify(expected)],
+        ));
+      } catch (cause) {
+        const e = cause as { code?: unknown; message?: unknown };
+        if (
+          e.code === "privacy_authority_not_active" ||
+          e.code === "supabase_privacy_authority_not_active" ||
+          (e.code === "55000" && /privacy authority not active/iu.test(String(e.message ?? "")))
+        )
+          throw Object.assign(new Error("Supabase legacy erasure authority is not active"), {
+            code: "legacy_export_authority_not_active",
+            cause,
+          });
+        throw cause;
+      }
       const got = rows[0]?.r;
       if (!got || (Object.keys(expected) as Array<keyof typeof expected>).some((k) => got[k] !== expected[k]))
         throw Object.assign(new Error("legacy export authority registration mismatch"), { code: "legacy_authority_register_mismatch" });
     };
     const fenced = async () => {
-      // Registration is the durable proof that this scope can later be erased.
-      // Recheck the authority in every transaction, including after the PUT,
-      // so a mid-run fallback to Neon refuses the export.
-      if (registration) {
-        await db.query("SELECT set_config($1,$2,false)", [
-          LEGACY_EXPORT_GENERATION_SETTING,
-          LEGACY_EXPORT_GENERATION,
-        ]);
-        const { rows: readiness } = await db.query<{ ready: boolean }>(
-          "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
-        );
-        if (readiness[0]?.ready !== true)
-          throw Object.assign(new Error("Supabase legacy erasure authority is not active"), {
-            code: "legacy_export_authority_not_active",
-          });
-      }
       const { rows } = await db.query<{ fenced: boolean }>(
         privacyQuery,
         privacyParams,
@@ -381,6 +380,10 @@ export async function withLegacyPrivacyFence<T>(
     // precheck catches an erasure committed immediately after registration;
     // its postcheck catches one committed while the object write is running.
     await begin();
+    // The narrow register RPC is also the exporter's authorized active-
+    // authority probe. Re-registering is idempotent and validates the pinned
+    // mapping without granting the exporter the internal activation RPC.
+    if (registration) await register();
     if (await fenced()) {
       await commit();
       return { fenced: true };
@@ -389,6 +392,10 @@ export async function withLegacyPrivacyFence<T>(
     const value = await action();
     actionValue = { set: true, value };
     phase = "privacy";
+    // Recheck after the PUT. Heartbeat freshness is checked before each scope
+    // outside this transaction; doing that here could roll a concurrent
+    // heartbeat update back with the scope transaction.
+    if (registration) await register();
     // Ordinary deletion fences need not take the operator's exclusive lock.
     // Recheck before releasing; a race is a failed export, never an accepted
     // checkpoint. The user-scoped legacy machine is swept by user erasure.
@@ -411,6 +418,10 @@ export async function withLegacyPrivacyFence<T>(
         },
       );
     if ((error as { code?: unknown })?.code === "legacy_privacy_race") throw error;
+    if ((error as { code?: unknown })?.code === "legacy_export_authority_not_active") {
+      if (actionValue.set) Object.assign(error as object, { privacyValue: actionValue.value });
+      throw error;
+    }
     if (phase === "privacy" || !rollbackOk) {
       throw Object.assign(new Error("privacy fence unavailable"), {
         code: "privacy_fence_unavailable",

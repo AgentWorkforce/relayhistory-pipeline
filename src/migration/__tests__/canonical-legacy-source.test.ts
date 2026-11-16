@@ -552,12 +552,12 @@ test("the privacy transaction has a finite idle bound", async () => {
 
 test("authority deactivation after a PUT fails the scope and preserves its write evidence", async () => {
   const s = { ...scope, sessionId: "authority-deactivated" };
-  let ready = 0;
+  let registrations = 0;
   const flips: Queryable = {
     async query<T>(sql: string, params?: unknown[]) {
-      if (sql.includes("legacy_export_privacy_authority_ready")) {
-        ready += 1;
-        if (ready === 4)
+      if (sql.includes("ingest_legacy_export_scope_authority_register")) {
+        registrations += 1;
+        if (registrations === 3)
           throw Object.assign(new Error("authority deactivated"), {
             code: "privacy_authority_not_active",
           });
@@ -575,7 +575,7 @@ test("authority deactivation after a PUT fails the scope and preserves its write
         { machineId: legacyMachineId(s.workspaceId, "person"), existing: false },
       ),
     ).rejects.toMatchObject({
-      code: "privacy_fence_unavailable",
+      code: "legacy_export_authority_not_active",
       privacyValue: { manifests: [{ manifestKey: "written/authority-deactivated/manifest.json" }] },
     });
   } finally {

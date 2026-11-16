@@ -555,7 +555,18 @@ export async function exportUnit(
  * exporter never holds the eraser key (Khaliq, 2026-10-31); a delete reaching
  * here is a bug.
  */
-export function writeOnly(store: ObjectStore): ObjectStore {
+export const LEGACY_EXPORT_PUT_TIMEOUT_MS = 2 * 60_000;
+
+export function writeOnly(
+  store: ObjectStore,
+  options: { putTimeoutMs?: number } = {},
+): ObjectStore {
+  const putTimeoutMs = options.putTimeoutMs;
+  if (
+    putTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(putTimeoutMs) || putTimeoutMs <= 0)
+  )
+    throw coded("exporter_put_timeout_invalid", "the exporter PUT timeout must be a positive integer");
   return {
     backend: store.backend,
     head: (k) => store.head(k),
@@ -563,7 +574,14 @@ export function writeOnly(store: ObjectStore): ObjectStore {
     getObject: (k, r) => store.getObject(k, r),
     list: (p, c) => store.list(p, c),
     presignGet: (k, t) => store.presignGet(k, t),
-    put: (k, b, o) => store.put(k, b, o),
+    put: (k, b, o = {}) => {
+      if (putTimeoutMs === undefined) return store.put(k, b, o);
+      const deadline = AbortSignal.timeout(putTimeoutMs);
+      const signal = o.signal
+        ? AbortSignal.any([o.signal, deadline])
+        : deadline;
+      return store.put(k, b, { ...o, signal });
+    },
     delete: async () => {
       throw coded("exporter_write_only", "the exporter does not delete");
     },
