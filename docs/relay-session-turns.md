@@ -41,7 +41,9 @@ Khaliq's explicit approval. In order:
    `buffered_turn_sources_for` and the existing twice-gated stage reader. It does not depend on a
    directory row, so a just-acknowledged turn is visible before publication; when a canonical
    pointer already exists, the newer buffered revision is merged over that image by the same
-   live-revision rule.
+   live-revision rule. Cloud refuses a non-empty `forward` write before Neon or ingest unless
+   `SESSION_READ_BACKEND=canonical`, so a misordered writer flip cannot acknowledge an invisible
+   turn.
 2. **Erasure fence off Neon.** Migration `20261105062010_turns_forward_gates.sql` adds the permanent
    logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
    before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
