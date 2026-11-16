@@ -27,6 +27,10 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store } from "../../shared/vendor.ts";
+import {
+  initScrubEngine,
+  routedRawChunkSealerDeps,
+} from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { writeOnly } from "../neon-s3-sync/export-session.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
@@ -151,6 +155,9 @@ export async function main() {
     throw Object.assign(new Error("legacy export requires the activation heartbeat follow-up"), {
       code: "legacy_export_requires_activation_heartbeat",
     });
+  // Verify uses the same export target to read manifests. Bind its raw-chunk
+  // sealer exactly as export will once activation replaces the refusal above.
+  if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
   const secrets = await readSecrets();
   assertDirectUrl(secrets.neonUrl, "Neon");
   assertDirectUrl(secrets.privacyUrl, "privacy");
@@ -231,7 +238,12 @@ export async function main() {
         {
           db,
           privacyDb,
-          target: { store: store!, keyRoot: arg("key-root") ?? "96bulls", grantId: arg("grant-id") ?? "neon-legacy-export" },
+          target: {
+            store: store!,
+            keyRoot: arg("key-root") ?? "96bulls",
+            grantId: arg("grant-id") ?? "neon-legacy-export",
+            ...routedRawChunkSealerDeps(),
+          },
           checkpoint,
           hook,
           log,
