@@ -32,7 +32,7 @@ Live relay-session turns are separate records:
 
 They never contend with legacy records: the kinds differ, and the legacy fold keys include the kind.
 
-After migration `20261105062010_turns_forward_gates.sql` has landed and been
+After migration `20261105062020_turns_forward_gates.sql` has landed and been
 applied, the read-side merge (`src/session-read-api/canonical-turns.ts`) works
 per Neon row key (workspace, stored source, turn_index):
 - a live record wins over a legacy row;
@@ -61,6 +61,6 @@ This is exact only while the writer never goes back from dual/forward to Neon-on
 - **Turns written after the export.** Until relayhistory's turn writer is forward-only (PR 1), Neon keeps receiving turns. Re-run `--export --refresh` (cheap: unchanged scopes are skipped by fingerprint) after the writer flips, then `--verify`.
 - **Phantom directory rows.** A turn-only relay session becomes a
   `session_index` row. Before any legacy export, land and apply
-  `20261105062010_turns_forward_gates.sql`; it hides turn-only directory
+  `20261105062020_turns_forward_gates.sql`; it hides turn-only directory
   projections while leaving canonical pointers addressable. This is an
   activation precondition, not a claim about what is already on `main` or live.
