@@ -2511,13 +2511,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
+    const LA = "upstream:20261105062020_legacy_export_scope_authority.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2568,6 +2569,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // The durable legacy-export authority and its grants/policies must be
+    // removed before either predecessor can roll back.
+    expect(await names()).toContain(LA);
+    expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062020_legacy_export_scope_authority.down.sql");
+    expect(await names()).not.toContain(LA);
+    expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'legacy_export_privacy_eraser_%' OR pronamespace='sessions'::regnamespace AND proname='ingest_legacy_export_scope_authority_register'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062020_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
     // row with its retained upload_deletions witness is derived and safe to drop.
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
@@ -2584,6 +2594,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_capability(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_register(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    // 20261105062010 (per-origin claim fence) is now newest. Its checksum-pinned
+    // down restores 058010's exact ingest_lock_fences and drops its functions.
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
