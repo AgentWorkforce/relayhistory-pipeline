@@ -6,12 +6,15 @@ authority-registration and readiness RPCs), plus production S3 writes. Do not ru
 without Khaliq's explicit words for that exact run. Design and gate status:
 [docs/canonical-legacy-source.md](../docs/canonical-legacy-source.md).
 
-The landing branch's `--export` entry point refuses unconditionally with
-`legacy_export_requires_activation_heartbeat`. Only the separately reviewed
-activation follow-up may replace that refusal with its fresh, eraser-written
-heartbeat gate. Landing heartbeats carry a pre-activation code generation;
-activation requires its own generation, so a recent landing-era row is never
-readiness. Landing or applying 062030 alone cannot enable exports.
+The landing branch refuses every export entry point (CLI and library) with
+`legacy_export_requires_activation_heartbeat` before reading secrets,
+connecting, or writing an object. Only the separately reviewed activation
+follow-up may replace that refusal with its fresh, eraser-written heartbeat
+gate. Landing heartbeats carry a pre-activation code generation; activation
+requires its own generation and the heartbeat must belong to the current
+Supabase-authority activation instance. An authority release, fence, activate,
+or table reset transactionally clears readiness. Landing or applying 062030
+alone cannot enable exports.
 
 The reviewed landing and activation commits are one release pair even though
 their shared 062030 migration bytes are identical. Between those two Git
@@ -78,6 +81,17 @@ them.
     write. A queued exclusive erase can in turn delay later ingest/export shared
     lock requests. Run only in the approved window, keep scopes bounded, and
     stop if an erase is queued rather than increasing lock timeouts.
+  - Readiness is evidence that a non-dry-run Supabase eraser sweep completed
+    without a reported authority, fence, presence, paging, or per-scope
+    erasure failure. It is deliberately not proof that malformed or
+    unverifiable source rows were erased. A broken live scope blocks readiness
+    until repaired; a sweep longer than the 30-minute freshness bound can make
+    readiness flap and must not be worked around by extending the bound.
+  - The eraser credential is trusted to report its compiled generation through
+    the transaction-local `s3x.legacy_export_generation` setting. A holder of
+    that credential also holds the S3 delete authority and is therefore inside
+    this readiness trust boundary; do not grant it to an exporter or general
+    runtime role.
 - **S3 key.** Use the transcript **writer/exporter** key (the same one as neon-s3-sync), never the eraser key. The store is wrapped write-only.
 - **Checkpoint.** It lives at `~/.agent-tmp/legacy-export/state.sqlite` (override with `--state=`). It holds cursors, scope keys, fingerprints and manifest keys; no secrets, no content. Keep it: it makes runs resumable and is the input to `--verify`.
   A checkpoint created before user-scoped legacy machines were introduced is
@@ -147,6 +161,12 @@ present in the live privacy database and the privacy preflight confirms all
 six tables are fully visible through their reviewed SELECT policy and the register RPC is callable.
 
 ## 2. Export the canary, then all orgs
+
+Activation is a runtime-behaviour follow-up, not merely a constant switch: it
+removes the compiled CLI/library refusal, selects the activation generation,
+enables the two-minute PUT abort, performs the reviewed per-scope authority
+probes, and enables the paging alarm and activation verifier checks. Rehearse
+and review that complete delta before any export run.
 
 ```sh
 secrets | bun run migration:legacy-export --export --org=<canary org> $COMMON

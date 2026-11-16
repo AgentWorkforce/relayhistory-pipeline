@@ -11,7 +11,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062030_legacy_export_scope_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'590b62f413edad31a7d7b55b423979124d08aacc799ca5de250658d47d00bb61'
+ IF NOT FOUND OR v_sha<>'e8661de94a596aa637f3114c648f8ea33e0b2411ec7bfc6c131de467bdbb7dee'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: own applied checksum required';END IF;
  LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)
@@ -31,6 +31,8 @@ END $turn_fence_policy$;
 REVOKE SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,
  sessions.ingest_frozen_source_deletions,sessions.upload_resets,sessions.operator_user_erasures
  FROM bulls96_legacy_export_privacy;
+DROP TRIGGER legacy_export_privacy_readiness_clear ON sessions.ingest_privacy_authority;
+DROP FUNCTION sessions.legacy_export_privacy_readiness_clear();
 DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb),
  sessions.legacy_export_privacy_eraser_page(jsonb),
  sessions.legacy_export_privacy_eraser_heartbeat(),

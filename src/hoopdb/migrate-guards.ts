@@ -1644,7 +1644,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "e0e1b3771f761ed017020ffab68a30bcac1e7ffd346c63f0ccb59966692b4bff";
+  "43ac6ef1d76d26b2ebf523295c45b3e42ae8d1ef5205a9e03fd50db8e3dfa0d8";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

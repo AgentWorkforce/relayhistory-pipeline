@@ -413,7 +413,7 @@ describe("supabase privacy authority as the eraser's source", () => {
 
   test("legacy export readiness requires a fresh heartbeat from a healthy real Supabase sweep", async () => {
     const w = await world();
-    // 062010 is separately owned and absent from this standalone fixture; a
+    // 062020 is separately owned and absent from this standalone fixture; a
     // release stack always has it before 062030.
     await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
       org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
@@ -436,8 +436,8 @@ describe("supabase privacy authority as the eraser's source", () => {
     expect((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ n: 0 });
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
 
-    // The real healthy sweep reaches the eraser-only mapping probe and records
-    // a durable Supabase heartbeat which the exporter checks afresh. Production
+    // The real healthy sweep reaches the eraser-only heartbeat and records
+    // durable evidence for this exact authority activation. Production
     // keeps this connection read-only by default; only the fixed RPC's explicit
     // transaction is read-write.
     await w.f.db.query("SET default_transaction_read_only=on");

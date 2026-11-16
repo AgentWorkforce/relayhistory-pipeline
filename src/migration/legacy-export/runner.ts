@@ -35,6 +35,7 @@ import {
 } from "../neon-s3-sync/legacy-source.ts";
 import { selectedPublicTurnPredicateSql } from "../../shared/legacy-turn-source.ts";
 import {
+  LEGACY_EXPORT_ACTIVATION_GENERATION,
   LEGACY_EXPORT_GENERATION,
   LEGACY_EXPORT_GENERATION_SETTING,
 } from "../../shared/legacy-export-generation.ts";
@@ -223,12 +224,22 @@ export interface RunDeps {
 /**
  * A mapped legacy copy may exist only after Supabase is the active erasure
  * authority and its production eraser has completed a recent healthy sweep
- * through the mapping RPC. A missing probe is not compatibility: it means the
+ * for the current authority activation. A missing probe is not compatibility: it means the
  * durable authority contract is absent, so exporting must fail closed.
  */
 export async function assertLegacyErasureAuthorityReady(
   db: Queryable,
 ): Promise<void> {
+  // The landing branch deliberately ships the activation-final schema and
+  // eraser writer while keeping every library caller unable to export. This
+  // check is compiled from a constant; flags, environment and a forged DB row
+  // cannot bypass it.
+  const generation: string = LEGACY_EXPORT_GENERATION;
+  if (generation !== LEGACY_EXPORT_ACTIVATION_GENERATION)
+    throw Object.assign(
+      new Error("legacy export requires the activation heartbeat follow-up"),
+      { code: "legacy_export_requires_activation_heartbeat" },
+    );
   const installed = await db.query<{ installed: boolean }>(
     "SELECT to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AS installed",
   );

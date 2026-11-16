@@ -1127,6 +1127,9 @@
       "<owner>:EXECUTE",
       "bulls96_privacy_eraser:EXECUTE"
     ],
+    "sessions.legacy_export_privacy_readiness_clear()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.legacy_remote(text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",

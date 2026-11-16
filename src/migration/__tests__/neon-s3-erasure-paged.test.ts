@@ -30,7 +30,11 @@ __modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OB
  * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
-const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const SETTLED_CFG = {
+  ...DEFAULT_ERASURE_CONFIG,
+  legacyExportErasure: true,
+  obligationsSettled: () => true,
+};
 const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 
 setDefaultTimeout(120_000);

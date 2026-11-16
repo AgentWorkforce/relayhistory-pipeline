@@ -1,6 +1,7 @@
 import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,10 +40,18 @@ import {
 } from "../../session-read-api/canonical.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { neonAuthority } from "../neon-s3-erasure/authority.ts";
+import {
+  LEGACY_EXPORT_ACTIVATION_GENERATION,
+  LEGACY_EXPORT_GENERATION,
+} from "../../shared/legacy-export-generation.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
 // The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
 const OBLIGATIONS_MODE: "on" | "off" = "on";
+const LANDING = LEGACY_EXPORT_GENERATION !== LEGACY_EXPORT_ACTIVATION_GENERATION;
+const exporterTest = test.skipIf(LANDING);
+const landingTest = test.skipIf(!LANDING);
+const activationTest = test.skipIf(LANDING);
 const __modeBefore = process.env.S3X_OBLIGATIONS;
 process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
 __modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
@@ -189,7 +198,7 @@ test("erasure guard ignores a legacy-only group unless legacy recognition is swi
   expect(await groupExistsInNeon(db, "other-org", "sess:1", true)).toBe(false);
 });
 
-test("gate 1: an unattributable turn is counted as unbound and never stops discovery of other orgs", async () => {
+exporterTest("gate 1: an unattributable turn is counted as unbound and never stops discovery of other orgs", async () => {
   try {
     await pg.exec(`INSERT INTO sessions.conversation_turns VALUES('44444444-4444-4444-8444-444444444444','org_a','ws','alice','lonely','alice',0,'user','hello','User','owner','{}','2026-11-01T10:00:00Z'),
  ('55555555-5555-4555-8555-555555555555','org_b','ws','claude','fine','bob',0,'user','hi','User','owner','{}','2026-11-01T10:00:00Z');
@@ -225,7 +234,7 @@ test("gate 2: an ordinary unit keeps its date and key; the legacy manifest uses 
   }
 });
 
-test("gate 3: a rerun skips unchanged scopes by fingerprint, and every discovery statement is one table in one org", async () => {
+exporterTest("gate 3: a rerun skips unchanged scopes by fingerprint, and every discovery statement is one table in one org", async () => {
   const seen: string[] = [];
   const spy: Queryable = {
     query: async <T,>(sql: string, params?: unknown[]) => {
@@ -337,7 +346,7 @@ test("nonempty links and outcomes preserve exact source IDs, timestamps and meta
   }
 });
 
-test("frozen Neon delivery and conversation-turn fences both prevent export", async () => {
+exporterTest("frozen Neon delivery and conversation-turn fences both prevent export", async () => {
   for (const table of ["deleted_upload_sessions", "conversation_turn_fences"] as const) {
     const checkpoint = new Checkpoint(join(root, `fence-${table}.sqlite`));
     try {
@@ -360,7 +369,7 @@ test("frozen Neon delivery and conversation-turn fences both prevent export", as
   }
 });
 
-test("live session, upload deletion/reset, turn-session and completed-user erase ledgers fence legacy export", async () => {
+exporterTest("live session, upload deletion/reset, turn-session and completed-user erase ledgers fence legacy export", async () => {
   for (const erase of ["session", "deletion", "reset", "turn", "user"] as const) {
     const checkpoint = new Checkpoint(join(root, `live-fence-${erase}.sqlite`));
     try {
@@ -432,7 +441,45 @@ test("session, upload deletion and reset races are caught after the object write
   }
 });
 
-test("legacy authority readiness fails closed when its RPC is absent", async () => {
+landingTest("landing library readiness refuses before querying the database", async () => {
+  let queries = 0;
+  await expect(
+    assertLegacyErasureAuthorityReady({
+      async query<T>() {
+        queries += 1;
+        return { rows: [{ installed: true }] as T[] };
+      },
+    }),
+  ).rejects.toMatchObject({ code: "legacy_export_requires_activation_heartbeat" });
+  expect(queries).toBe(0);
+});
+
+landingTest("landing CLI refuses export before stdin, scrub initialization or a connection", () => {
+  const secret = "landing_cli_refusal_canary";
+  const result = spawnSync(
+    process.execPath,
+    [new URL("../legacy-export/main.ts", import.meta.url).pathname, "--export", "--org=org_1", "--bucket=b", "--expect-bucket=b"],
+    {
+      input: `postgres://u:${secret}@127.0.0.1:1/db\npostgres://u:${secret}@127.0.0.1:1/db\nAKIAFAKE\n${secret}\n`,
+      encoding: "utf8",
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        TMPDIR: process.env.TMPDIR ?? "",
+        S3X_LEGACY_EXPORT_ERASURE_ENABLED: "true",
+      },
+      timeout: 30_000,
+    },
+  );
+  expect(result.status).toBe(1);
+  expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+  const line = result.stdout.trim().split("\n").filter(Boolean)
+    .map((value) => JSON.parse(value) as Record<string, unknown>)
+    .find((value) => value.message === "exit on error");
+  expect(line?.error_code).toBe("legacy_export_requires_activation_heartbeat");
+});
+
+activationTest("legacy authority readiness fails closed when its RPC is absent", async () => {
   await expect(
     assertLegacyErasureAuthorityReady({
       async query<T>() {
@@ -505,7 +552,7 @@ test("authority deactivation after a PUT fails the scope and preserves its write
   }
 });
 
-test("a post-PUT privacy race records the written manifest and aborts the run", async () => {
+exporterTest("a post-PUT privacy race records the written manifest and aborts the run", async () => {
   const checkpoint = new Checkpoint(join(root, "privacy-race.sqlite"));
   let fenceReads = 0;
   const raceDb: Queryable = {
@@ -553,7 +600,7 @@ test("a post-PUT privacy race records the written manifest and aborts the run", 
   }
 });
 
-test("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {
+exporterTest("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {
   try {
     await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
     await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','person',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
@@ -666,7 +713,7 @@ test("turns-only free text without authenticated tenant evidence is not an erasu
   }
 });
 
-test("disagreement across authenticated owner evidence is unbound_multi_owner and is not exported", async () => {
+exporterTest("disagreement across authenticated owner evidence is unbound_multi_owner and is not exported", async () => {
   const checkpoint = new Checkpoint(join(root, "multi-owner.sqlite"));
   const store = createFsStore({ root: join(root, "multi-owner") });
   await pg.exec(`INSERT INTO sessions.session_outcomes VALUES(
@@ -725,7 +772,7 @@ test("the Neon hosted eraser never re-derives a legacy export owner and fails lo
   }
 });
 
-test("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {
+exporterTest("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {
   const checkpoint = new Checkpoint(join(root, "progress.sqlite"));
   const store = createFsStore({ root: join(root, "progress") });
   const deps = {
@@ -799,7 +846,7 @@ test("windowed cursors do not suppress a later full run, max-scopes progresses, 
   }
 });
 
-test("a re-export keeps the scope's first key even if its oldest row moves earlier, and an interrupt does not advance the cursor", async () => {
+exporterTest("a re-export keeps the scope's first key even if its oldest row moves earlier, and an interrupt does not advance the cursor", async () => {
   const id = "66666666-6666-4666-8666-666666666666";
   const checkpoint = new Checkpoint(join(root, "pin.sqlite"));
   const store = createFsStore({ root: join(root, "pin") });

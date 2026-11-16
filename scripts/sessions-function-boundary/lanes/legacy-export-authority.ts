@@ -17,6 +17,7 @@ export const legacyExportAuthority: LaneManifest = {
     "sessions.legacy_export_privacy_eraser_heartbeat()": { secdef: true, grants: [ERASER] },
     "sessions.legacy_export_privacy_eraser_page(jsonb)": { secdef: true, grants: [ERASER] },
     "sessions.legacy_export_privacy_eraser_still_fenced(jsonb)": { secdef: true, grants: [ERASER] },
+    "sessions.legacy_export_privacy_readiness_clear()": { secdef: true, grants: [] },
   },
   replaces: {},
 };
