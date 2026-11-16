@@ -1175,11 +1175,27 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
       },
     };
     /** Exporter run as the provisioned role; refusals (thrown or logged per scope) are returned, never swallowed. */
-    const exportAs = async (n: { db: Queryable }, store: ObjectStore, name: string) => {
+    const exportAs = async (n: { db: Queryable }, store: ObjectStore, name: string, opts: { beforeFirstBegin?: () => Promise<void> } = {}) => {
       await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
       try {
-        const privacyDb = await initPrivacy(raw);
-        await preflight(privacyDb);
+        const privacyDb0 = await initPrivacy(raw);
+        await preflight(privacyDb0);
+        // beforeFirstBegin runs (as the table owner, autocommit) just before the run's first privacy transaction BEGIN:
+        // the window between the per-scope readiness check and the fence transaction's shared authority lock.
+        let armed = opts.beforeFirstBegin;
+        const privacyDb: Queryable = armed
+          ? {
+              query: async <T,>(t: string, p?: unknown[]) => {
+                if (armed && /^\s*BEGIN\b/iu.test(t)) {
+                  const hook = armed;
+                  armed = undefined;
+                  await f.db.exec("RESET ROLE");
+                  try { await hook(); } finally { await f.db.exec("SET ROLE bulls96_legacy_export_privacy"); }
+                }
+                return privacyDb0.query<T>(t, p);
+              },
+            }
+          : privacyDb0;
         const r = await run(n.db, privacyDb, store, name);
         r.checkpoint.close();
         return { counters: r.counters, codes: r.logs.map((l) => String(l.error_code ?? "")) };
@@ -1449,6 +1465,75 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
         await w.sweepSupabase(store);
         expect(await w.exportAs(n, store, "hb-late-2")).toMatchObject({ counters: { exported: 1, failed: 0 } });
       }
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test.skipIf(ACTIVATION_ONLY)("RE-ACTIVATION BEFORE THE FENCE TXN: a re-activation between the per-scope readiness check and the fence transaction's lock cannot let that scope upload", async () => {
+    // layered-sessions-pipeline P3-2 (runner time-of-check gap): register() only proves the authority is ACTIVE, so
+    // readiness for the CURRENT activation must be re-proven after the fence transaction takes the shared lock.
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-toctou") });
+      await w.sweepSupabase(store); // fresh heartbeat for activation A: the run-start and per-scope checks pass
+      expect(await w.readyAs()).toBe("ready");
+      let reactivated = false;
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-toctou", {
+        beforeFirstBegin: async () => { await w.reactivate(); reactivated = true; },
+      });
+      expect(reactivated).toBe(true);
+      expect(await heartbeatRows(w.f)).toBe(0); // the transition cleared A's readiness
+      expect(puts).toBe(0);
+      expect(await allKeys(store)).toEqual([]);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("SQL EDGES: heartbeat() refuses and writes nothing with no active authority; ready()/heartbeat() refuse outside READ COMMITTED; an unrelated authority-column UPDATE keeps readiness", async () => {
+    const w = await world();
+    try {
+      const gen = (await import("../../shared/legacy-export-generation.ts")) as { LEGACY_EXPORT_GENERATION: string; LEGACY_EXPORT_GENERATION_SETTING: string };
+      const heartbeatSql = async (iso?: string) => {
+        await w.f.db.exec(iso ? `BEGIN ISOLATION LEVEL ${iso}` : "BEGIN");
+        try {
+          await w.f.db.query("SELECT set_config($1,$2,true)", [gen.LEGACY_EXPORT_GENERATION_SETTING, gen.LEGACY_EXPORT_GENERATION]);
+          await w.f.db.query("SELECT sessions.legacy_export_privacy_eraser_heartbeat()");
+          await w.f.db.exec("COMMIT");
+          return "wrote";
+        } catch (e) {
+          await w.f.db.exec("ROLLBACK");
+          return String((e as Error).message);
+        }
+      };
+      // Control: under the active authority the RPC itself writes the row.
+      expect(await heartbeatSql()).toBe("wrote");
+      expect(await heartbeatRows(w.f)).toBe(1);
+      expect(await w.readyAs()).toBe("ready");
+      // An UPDATE of a column outside the authority identity must not flap readiness (statement trigger is column-scoped).
+      await w.f.db.exec("UPDATE sessions.ingest_privacy_authority SET fenced_at=fenced_at");
+      expect(await heartbeatRows(w.f)).toBe(1);
+      expect(await w.readyAs()).toBe("ready");
+      // Outside READ COMMITTED both refuse (the shared authority lock requires it) and nothing is written.
+      await w.f.db.exec(`DELETE FROM ${HEARTBEAT.table}`);
+      expect(await heartbeatSql("REPEATABLE READ")).not.toBe("wrote");
+      expect(await heartbeatRows(w.f)).toBe(0);
+      await w.f.db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      try {
+        await w.f.db.query("SELECT set_config($1,$2,true)", [gen.LEGACY_EXPORT_GENERATION_SETTING, gen.LEGACY_EXPORT_GENERATION]);
+        expect(await w.f.db.query("SELECT sessions.legacy_export_privacy_authority_ready()").then(() => "ready", (e) => String((e as Error).message))).toMatch(/read committed/iu);
+      } finally {
+        await w.f.db.exec("ROLLBACK");
+      }
+      // No active authority: the heartbeat RPC itself refuses and writes nothing.
+      expect((await w.f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch })).r).toMatchObject({ authority: "neon" });
+      expect(await heartbeatSql()).toMatch(/not active/iu);
+      expect(await heartbeatRows(w.f)).toBe(0);
+      expect(await w.readyAs()).not.toBe("ready");
     } finally {
       await w.f.close();
     }
