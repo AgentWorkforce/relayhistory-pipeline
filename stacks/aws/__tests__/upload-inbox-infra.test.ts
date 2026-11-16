@@ -705,3 +705,69 @@ describe("hosted presigned issuer user (cloud#6244)", () => {
     for (const bad of [false, "true", 1]) expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ uploadPresignIssuer: bad }))).toThrow(/uploadPresignIssuer must be true/);
   });
 });
+
+describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written down, refused today)", async () => {
+  const { logKeys } = await import("../../../src/session-ingest/ledger-log.ts");
+  const { logStreamRegistryKey } = await import("../../../src/session-ingest/ledger-log-materialize.ts");
+  const { outcomeKey, receiptDir } = await import("../../../src/session-ingest/async-admission.ts");
+  const { logCommitProofKey, logModeNonProdKey } = await import("../../../src/session-ingest/ledger-log-stream-ops.ts");
+  const P = await import("../ledger-log-commit-policy.ts");
+  const tenant = { orgId: "org-a", workspaceId: "w1", userId: "u1" };
+  const k = logKeys(TENANT_KEY_BASE, tenant, "origin-1");
+  const at = (key: string) => `${bucketArn}/${key}`;
+  const dir = receiptDir(TENANT_KEY_BASE, tenant, "origin-1", `rhr_${"a".repeat(64)}`);
+  const logObjects = [k.entry(0), k.entry(5), k.checkpoint(64), k.head, k.payload("f".repeat(64)), k.marker(5), k.closed, k.skipped("b1"), `${k.root}/stream.json`].map(at);
+  const ctx = { ...tls, "aws:PrincipalArn": consumerRoleArn };
+  const withLog = [...transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn, uploadInbox: roles }),
+    ...uploadAdmissionBucketStatements({ bucketArn, consumerRoleArn, promotionObjects: srvWriterObjects(bucketArn), ledgerLogCommit: true })] as Statement[];
+
+  it("off (the default, and the only accepted value) renders the consumer's statements byte-for-byte as before", () => {
+    expect(uploadAdmissionBucketStatements({ bucketArn, consumerRoleArn, promotionObjects: srvWriterObjects(bucketArn), ledgerLogCommit: false })).toEqual(consumerBucket);
+    const refuse = (why: string): never => { throw new Error(why); };
+    expect(() => assertUploadAdmissionInputs({ direct: "on", ledgerLogCommit: "off" }, true, refuse)).not.toThrow();
+    for (const bad of ["on", "ON", true, ""]) expect(() => assertUploadAdmissionInputs({ direct: "on", ledgerLogCommit: bad }, true, refuse)).toThrow(/ledgerLogCommit must be "off"/);
+  });
+
+  it("the globs match the keys the code writes (ledger-log.ts, the registry, the receipt outcomes, the markers)", () => {
+    for (const key of logObjects) expect(glob(at(P.LEDGER_LOG_OBJECTS), key)).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_PAYLOADS), at(k.payload("f".repeat(64))))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_PAYLOADS), at(k.entry(1)))).toBe(false);
+    expect(glob(at(P.LEDGER_LOG_ENTRIES), at(k.entry(0)))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_REGISTRY), at(logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_ADMITTED_OUTCOMES), at(outcomeKey(dir, "admitted")))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_ADMITTED_OUTCOMES), at(outcomeKey(dir, "refused")))).toBe(false);
+    expect(glob(at(P.LEDGER_LOG_OUTCOMES), at(outcomeKey(dir, "refused")))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_LEGACY_BATCHES), at(s3LedgerKeys(TENANT_KEY_BASE, tenant).batch("origin-1", "b1")))).toBe(true);
+    expect([...P.LEDGER_LOG_MARKERS]).toEqual([logCommitProofKey(TENANT_KEY_BASE), logModeNonProdKey(TENANT_KEY_BASE)]);
+  });
+
+  it("on (were it accepted): the consumer reads and writes every log object and the registry; deletes stay walled off by OnlyTheEraserDeletes until its carve-out lands", () => {
+    for (const key of logObjects) for (const action of ["s3:GetObject", "s3:PutObject"]) expect(allowed([], withLog, action, key, ctx)).toBe(true);
+    expect(allowed([], withLog, "s3:PutObject", at(logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")), ctx)).toBe(true);
+    expect(allowed([], withLog, "s3:PutObject", at(outcomeKey(dir, "refused")), ctx)).toBe(true);
+    // Granted, but the bucket's eraser-only deny still refuses: the documented carve-out is the remaining step.
+    for (const key of [at(k.payload("f".repeat(64))), at(outcomeKey(dir, "admitted"))]) {
+      expect(withLog.some((s) => s.Effect === "Allow" && matches(s, "s3:DeleteObject", key, ctx))).toBe(true);
+      expect(allowed([], withLog, "s3:DeleteObject", key, ctx)).toBe(false);
+    }
+    // Nothing beyond the log: no entry deletes, no other principal.
+    expect(withLog.some((s) => s.Effect === "Allow" && matches(s, "s3:DeleteObject", at(k.entry(1)), ctx))).toBe(false);
+    expect(allowed([], withLog, "s3:GetObject", logObjects[0]!, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
+    expect(P.ledgerLogCommitConsumerStatements({ bucketArn, consumerRoleArn }).map((s) => s.Sid)).toEqual([...P.LEDGER_LOG_CONSUMER_SIDS]);
+  });
+
+  it("the operator statements: drain reads, entry 0 / close / identity / registry writes, registry deletes only; KMS via S3 only", () => {
+    const operatorRoleArn = `arn:aws:iam::${accountId}:role/synthetic-ledger-log-operator`;
+    const st = P.ledgerLogOperatorStatements({ bucketArn, operatorRoleArn }) as Statement[];
+    const octx = { ...tls, "aws:PrincipalArn": operatorRoleArn };
+    const can = (action: string, key: string) => st.some((s) => s.Effect === "Allow" && matches(s, action, key, octx));
+    expect(st.map((s) => s.Sid)).toEqual([...P.LEDGER_LOG_OPERATOR_SIDS]);
+    expect(can("s3:GetObject", at(s3LedgerKeys(TENANT_KEY_BASE, tenant).batch("origin-1", "b1")))).toBe(true);
+    for (const key of [k.entry(0), k.closed, `${k.root}/stream.json`, logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")]) expect(can("s3:PutObject", at(key))).toBe(true);
+    expect(can("s3:PutObject", at(k.payload("f".repeat(64))))).toBe(false);
+    expect(can("s3:DeleteObject", at(logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")))).toBe(true);
+    expect(can("s3:DeleteObject", at(k.entry(0)))).toBe(false);
+    const key = P.ledgerLogOperatorKeyStatement({ region, accountId, bucketName, operatorRoleArn });
+    expect(key.Condition.StringEquals).toEqual({ "kms:ViaService": `s3.${region}.amazonaws.com`, "kms:CallerAccount": accountId });
+  });
+});
