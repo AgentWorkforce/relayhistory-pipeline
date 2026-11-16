@@ -2511,7 +2511,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
-    const LA = "upstream:20261105062020_legacy_export_scope_authority.sql";
+    const LA = "upstream:20261105062030_legacy_export_scope_authority.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2569,15 +2569,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // The durable legacy-export authority and its grants/policies must be
-    // removed before either predecessor can roll back.
+    // 20261105062030 is newest: the per-origin claim-fence down refuses until
+    // the durable legacy-export authority and its grants/policies are removed.
     expect(await names()).toContain(LA);
     expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
-    await rollback("20261105062020_legacy_export_scope_authority.down.sql");
+    await rollback("20261105062030_legacy_export_scope_authority.down.sql");
     expect(await names()).not.toContain(LA);
     expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'legacy_export_privacy_%' OR proname='ingest_legacy_export_scope_authority_register')")).rows[0]!.n).toBe(0);
-    expect((await failure(rollback("20261105062020_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
     // row with its retained upload_deletions witness is derived and safe to drop.
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
