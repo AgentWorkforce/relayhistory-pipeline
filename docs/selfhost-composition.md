@@ -936,6 +936,28 @@ The defaults fit a 4 GiB container: the worker handles one message at a time,
 and a summary's peak is one inflated chunk plus the digest's state. A value
 that is not a whole number in the cap's range keeps the default.
 
+### Summaries regeneration flags (all default off)
+
+Read by Bob Costas and the session-brief worker (`src/summary-regen/settings.ts`).
+A flag is on only when its value is exactly `true`. The brief columns and the
+audit table come from `20261105062040_summary_regeneration`, the Bob Costas
+columns from hoopdb `0006_summary_regeneration`:
+with a flag on and the columns or the audit table missing, the worker logs
+`summary regeneration schema missing; flags behave as off` once and keeps
+today's behaviour. On AWS they come from `transcriptStore.sessionPipeline.summaryRegen`
+(`turns`, `retry`, `audit`), rendered only when set.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SUMMARY_REGEN_TURNS_ENABLED` | off | regenerate a current summary or brief when `SUMMARY_REGEN_TURN_THRESHOLD` (10) more user turns arrived, or when the session is idle for `SUMMARY_REGEN_IDLE_SECONDS` (600) or ended with any uncovered turn; a brief below the threshold on an active session is deferred to the idle window |
+| `SUMMARY_RETRY_BACKOFF_ENABLED` | off | a model fallback (Bob Costas: still extractive, marked degraded) or a final brief failure is retried after `SUMMARY_RETRY_BACKOFF_SECONDS` (`300,3600,21600`); attempts stop at the list length |
+| `SUMMARY_RETRY_CONFIG_RESET_ENABLED` | off | a degraded or failed row written under a different model configuration (model, base URL, effort, prompt version, key fingerprint) is due again once, attempts restart at 1. Turning it on revives failed rows written before the migration once, at most 100 per sweep (per stage for Bob Costas) and within the usual budgets |
+| `SUMMARY_REGEN_AUDIT_ENABLED` | off | one `summary_regeneration_audit` row and one `summary regeneration queued` log line (session id hashed) per enqueue; rows older than `SUMMARY_REGEN_AUDIT_RETENTION_DAYS` (90) are purged hourly |
+
+Out-of-bounds tuning values fall back to the defaults in code (the AWS stack
+refuses them). The config hash never contains the key: only a 16-hex
+HMAC-SHA256 fingerprint of it.
+
 ### One transport for both services
 
 Bob Costas reuses session-brief's Responses transport unchanged, so one
