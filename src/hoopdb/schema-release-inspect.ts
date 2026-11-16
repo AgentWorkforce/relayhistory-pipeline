@@ -145,18 +145,26 @@ export async function inspectIngestOverlap(
   }
 }
 /**
- * The apply's POST-apply buffered-ingest check (schema-release-post-apply-ingest.ts): READ ONLY under the
- * migrator's xact lock (so it never interleaves with a rebind), after release_apply_verified. Returns the
- * classification; it never writes, and the caller decides how a failing verdict marks the run.
+ * The apply's POST-apply buffered-ingest check (schema-release-post-apply-ingest.ts), after
+ * release_apply_verified. The migrator's advisory lock (961996, 1) is taken at SESSION level BEFORE the
+ * READ ONLY transaction begins, so the REPEATABLE READ snapshot (fixed by the transaction's first query)
+ * is taken after any rebind/close holding that lock has committed: the reads see either the state before
+ * a rebind or after it, never a snapshot older than the lock. lock_timeout bounds the wait (a timeout is
+ * state_unreadable to the caller). Always rolled back and unlocked; never writes. Returns the
+ * classification; the caller decides how a failing verdict marks the run.
  */
 export async function inspectPostApplyIngest(client: pg.Client, input: { targetGeneration: string }) {
-  await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  await client.query("SELECT pg_advisory_lock(961996, 1)");
   try {
-    await requireReleaseOwner(client);
-    await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
-    return classifyPostApplyIngest(await readPostApplyIngestState(client), input.targetGeneration);
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    try {
+      await requireReleaseOwner(client);
+      return classifyPostApplyIngest(await readPostApplyIngestState(client), input.targetGeneration);
+    } finally {
+      await client.query("ROLLBACK");
+    }
   } finally {
-    await client.query("ROLLBACK");
+    await client.query("SELECT pg_advisory_unlock(961996, 1)");
   }
 }
 export function releaseErrorCode(error: unknown) {

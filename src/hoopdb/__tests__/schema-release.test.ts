@@ -2127,22 +2127,24 @@ test("post-apply ingest check: runs after release_apply_verified, READ ONLY, aft
   const src = readFileSync(new URL("../../../scripts/schema-release-database.ts", import.meta.url), "utf8");
   const apply = src.slice(src.indexOf('refuse("release_ledger_changed");'));
   const verified = apply.indexOf('console.log("release_apply_verified");');
-  const evidence = apply.indexOf("await writeApplyEvidence({ version: 1, apply: applyEvidence });");
-  const check = apply.indexOf("await runPostApplyIngestCheck(");
   expect(verified).toBeGreaterThan(apply.indexOf('refuse("release_marker");'));
-  expect(evidence).toBeGreaterThan(verified);
-  expect(check).toBeGreaterThan(evidence);
-  expect(apply.slice(check)).toContain("inspectPostApplyIngest(client, { targetGeneration: approvedPlan!.targetGeneration })");
+  expect(apply.indexOf("await releaseApplyPostCheck(client, approvedPlan!);")).toBeGreaterThan(verified);
   // Exactly once, and never in plan mode.
+  expect(src.match(/releaseApplyPostCheck\(client/g)).toHaveLength(1);
   expect(src.match(/inspectPostApplyIngest\(/g)).toHaveLength(1);
   expect(src.slice(src.indexOf('if (input.mode === "plan") {'), src.indexOf("release_readonly_plan_complete"))).not.toContain("PostApply");
-  // The inspection is a READ ONLY transaction under the migrator xact lock, always rolled back.
+  // The entry writes the apply evidence before it runs the check.
+  const entry = src.slice(src.indexOf("export async function releaseApplyPostCheck("));
+  expect(entry.indexOf("await writeApplyEvidence({ version: 1, apply: applyEvidence }, dir);")).toBeGreaterThan(0);
+  expect(entry.indexOf("await writeApplyEvidence({ version: 1, apply: applyEvidence }, dir);")).toBeLessThan(entry.indexOf("runPostApplyIngestCheck("));
+  // The session lock is taken before BEGIN (so the REPEATABLE READ snapshot starts after it), READ ONLY,
+  // always rolled back, then unlocked.
   const inspect = readFileSync(new URL("../schema-release-inspect.ts", import.meta.url), "utf8");
   const fn = inspect.slice(inspect.indexOf("export async function inspectPostApplyIngest("), inspect.indexOf("export function releaseErrorCode("));
-  expect(fn).toContain('"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"');
-  expect(fn).toContain("await requireReleaseOwner(client);");
-  expect(fn).toContain('"SELECT pg_advisory_xact_lock(961996, 1)"');
-  expect(fn).toContain('await client.query("ROLLBACK");');
+  const order = ['"SELECT pg_advisory_lock(961996, 1)"', '"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"', "await requireReleaseOwner(client);",
+    "readPostApplyIngestState(client)", 'await client.query("ROLLBACK");', '"SELECT pg_advisory_unlock(961996, 1)"'].map((t) => fn.indexOf(t));
+  expect(order.every((i) => i > 0)).toBe(true);
+  expect([...order].sort((x, y) => x - y)).toEqual(order);
   // The check module issues reads only.
   const mod = readFileSync(new URL("../schema-release-post-apply-ingest.ts", import.meta.url), "utf8");
   expect(mod).not.toMatch(/\b(INSERT|UPDATE|DELETE|COMMIT|BEGIN|TRUNCATE|ALTER|CREATE|DROP|GRANT|ingest_generation_overlap_close|ingest_lazy_policy_set)\b/);

@@ -1,5 +1,6 @@
 /** Only the protected workflow's single secret-scoped step invokes this entry point. */
 import { execFileSync } from "node:child_process";
+import type pg from "pg";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   generation,
@@ -242,9 +243,36 @@ async function writeBootstrapEvidence(evidence: unknown) {
  * reads back and COMMITs only on an exact match (else ROLLBACK).
  */
 /** The apply's non-secret evidence (verdicts, counts, generations and flags only), uploaded with if: always(). */
-async function writeApplyEvidence(evidence: unknown) {
-  await mkdir("release-apply", { recursive: true });
-  await writeFile("release-apply/evidence.json", JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
+async function writeApplyEvidence(evidence: unknown, dir = "release-apply") {
+  await mkdir(dir, { recursive: true });
+  await writeFile(dir + "/evidence.json", JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
+}
+/**
+ * After release_apply_verified: the apply has committed. Its evidence is written first, so the post-apply
+ * check can only add to it: that check is READ ONLY, never rolls back, and a failing verdict
+ * (ingest_fenced_post_apply, ingest_post_apply_unexpected) only marks the run red (it throws with the
+ * verdict as the code) with an ::error annotation, the summary and the record appended to the evidence.
+ */
+export async function releaseApplyPostCheck(
+  client: pg.Client,
+  approved: { held: string[]; expectedPending: string[]; targetGeneration: string },
+  dir = "release-apply",
+) {
+  const applyEvidence = {
+    verified: true,
+    held: approved.held.length,
+    applied: approved.expectedPending.length,
+    targetGeneration: approved.targetGeneration,
+  };
+  await writeApplyEvidence({ version: 1, apply: applyEvidence }, dir);
+  return runPostApplyIngestCheck(
+    () => inspectPostApplyIngest(client, { targetGeneration: approved.targetGeneration }),
+    {
+      log: (line) => console.log(line),
+      summary: appendStepSummary,
+      evidence: (postApplyIngest) => writeApplyEvidence({ version: 1, apply: applyEvidence, postApplyIngest }, dir),
+    },
+  );
 }
 async function appendStepSummary(lines: string[]) {
   const path = process.env.GITHUB_STEP_SUMMARY;
@@ -514,24 +542,7 @@ export async function releaseDatabase() {
     if (approvedPlan!.held.length)
       console.log("release_target_held " + approvedPlan!.held.length);
     console.log("release_apply_verified");
-    // The apply has committed. Its evidence is written first, so the post-apply check below can only add
-    // to it: that check is READ ONLY, never rolls back, and a failing verdict (ingest_fenced_post_apply,
-    // ingest_post_apply_unexpected) only marks the run red with an ::error annotation and the summary.
-    const applyEvidence = {
-      verified: true,
-      held: approvedPlan!.held.length,
-      applied: approvedPlan!.expectedPending.length,
-      targetGeneration: approvedPlan!.targetGeneration,
-    };
-    await writeApplyEvidence({ version: 1, apply: applyEvidence });
-    await runPostApplyIngestCheck(
-      () => inspectPostApplyIngest(client, { targetGeneration: approvedPlan!.targetGeneration }),
-      {
-        log: (line) => console.log(line),
-        summary: appendStepSummary,
-        evidence: (postApplyIngest) => writeApplyEvidence({ version: 1, apply: applyEvidence, postApplyIngest }),
-      },
-    );
+    await releaseApplyPostCheck(client, approvedPlan!);
   } finally {
     await client.end().catch(() => {});
   }

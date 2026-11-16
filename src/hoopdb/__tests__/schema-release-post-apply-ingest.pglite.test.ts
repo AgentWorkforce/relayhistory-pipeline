@@ -8,11 +8,15 @@ import {test,expect,afterEach,setDefaultTimeout} from "bun:test";
 import {PGlite} from "@electric-sql/pglite";
 import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
 import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
-import {readFileSync,readdirSync} from "node:fs";
+import {mkdtempSync,readFileSync,readdirSync,rmSync,writeFileSync} from "node:fs";
+import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {SESSION_BOOTSTRAP_FILES} from "../session-bootstrap-chain.ts";
 import {openGenerationOverlap} from "../ingest-generation-overlap.ts";
 import {rebindIngestGeneration} from "../ingest-generation-rebind.ts";
+import {inspectPostApplyIngest,releaseErrorCode} from "../schema-release-inspect.ts";
+import {SCHEMA_RELEASE as P} from "../schema-release-contract.ts";
+import {releaseApplyPostCheck} from "../../../scripts/schema-release-database.ts";
 import {
  classifyPostApplyIngest,
  INGEST_FENCED_POST_APPLY,
@@ -62,7 +66,7 @@ test("classifier: anything unexpected fails closed with ingest_post_apply_unexpe
  expect(bad({},"not-a-generation")).toEqual(["target_generation_invalid"]);
  expect(bad({admission:{rows:3,offPolicy:1}})).toEqual(["admission_off_policy"]);
  expect(bad({policyGeneration:H,admission:{rows:3,offPolicy:3}})).toEqual(["admission_off_policy"]);
- expect(bad({admission:null})).toEqual(["admission_off_policy"]);
+ expect(bad({admission:null})).toEqual(["admission_table_missing"]);
 });
 
 test("report: fixed-token annotations; the fenced error names the design doc's Post-apply recovery; no generations",()=>{
@@ -175,4 +179,72 @@ test("pglite: the read is read-only (runs inside a READ ONLY transaction)",async
  const e=await f.check();
  await f.db.query("ROLLBACK");
  expect(e.verdict).toBe(INGEST_FENCED_POST_APPLY);
+});
+
+test("pglite: no admission table fails closed with its own reason",async()=>{
+ const f=await fixture();
+ await f.marker(H,"pass");
+ await f.db.exec("DROP TABLE sessions.ingest_buffer_admission CASCADE");
+ expect(await f.check()).toMatchObject({verdict:INGEST_POST_APPLY_UNEXPECTED,reasons:["admission_table_missing"],admission:null});
+});
+
+// ---- The real transaction wrapper (inspectPostApplyIngest) and the apply's post-apply entry
+// (releaseApplyPostCheck). PGlite's user is a superuser, so the owner-identity row alone is shimmed
+// (requireReleaseOwner is pinned in schema-release.test.ts); every other statement is real.
+const ownerRow={me:P.owner,session:P.owner,db:P.database,rolcanlogin:true,rolsuper:false,rolcreaterole:true,rolcreatedb:true,rolbypassrls:true,rolreplication:true,schema_owner:P.owner};
+const releaseLike=(db:PGlite,hook:(text:string)=>Promise<void>|void=()=>{})=>({query:async(text:string,params?:unknown[])=>{
+ await hook(text);
+ if(text.startsWith("SELECT current_user AS me"))return{rows:[ownerRow]};
+ return params?.length?db.query(text,params as never):db.query(text);
+}}) as never;
+const advisoryLocks=async(db:PGlite)=>Number((await db.query<{n:number}>("SELECT count(*)::int AS n FROM pg_locks WHERE locktype='advisory'")).rows[0]!.n);
+// A write succeeds only outside any (read-only or aborted) transaction.
+const idle=async(db:PGlite)=>{await db.exec("CREATE TEMP TABLE idle_probe(x int);DROP TABLE idle_probe");return true};
+
+test("wrapper: holds the advisory lock in a READ ONLY transaction while reading, then rolls back and unlocks",async()=>{
+ const f=await fixture();
+ await f.marker(H,"pass");
+ const seen:{locks:number;ro:string}[]=[];
+ const client=releaseLike(f.db,async(t)=>{if(t.includes("ingest_buffer_admission"))seen.push({locks:await advisoryLocks(f.db),ro:(await f.db.query<{r:string}>("SELECT current_setting('transaction_read_only') AS r")).rows[0]!.r})});
+ expect((await inspectPostApplyIngest(client,{targetGeneration:H})).verdict).toBe(INGEST_FENCED_POST_APPLY);
+ expect(seen).toEqual([{locks:1,ro:"on"},{locks:1,ro:"on"}]);
+ expect(await advisoryLocks(f.db)).toBe(0);
+ expect(await idle(f.db)).toBe(true);
+});
+
+test("wrapper: an exception mid-read leaves the connection idle, no transaction open, the advisory lock released",async()=>{
+ const f=await fixture();
+ await f.marker(H,"pass");
+ const client=releaseLike(f.db,(t)=>{if(t.includes("FROM sessions.ingest_buffer_admission"))throw Object.assign(new Error("injected"),{code:"XX000"})});
+ expect(await code(inspectPostApplyIngest(client,{targetGeneration:H}))).toBe("XX000");
+ expect(await advisoryLocks(f.db)).toBe(0);
+ expect(await idle(f.db)).toBe(true);
+ // A SQL error inside the transaction (aborted state) is rolled back the same way.
+ const sqlFail=releaseLike(f.db,async(t)=>{if(t.includes("FROM sessions.ingest_buffer_admission"))await f.db.query("SELECT 1/0")});
+ expect(await code(inspectPostApplyIngest(sqlFail,{targetGeneration:H}))).toBe("22012");
+ expect(await advisoryLocks(f.db)).toBe(0);
+ expect(await idle(f.db)).toBe(true);
+});
+
+test("apply entry: a fenced state throws ingest_fenced_post_apply (exit 1) with the apply evidence present and the post-apply record appended",async()=>{
+ const f=await fixture();
+ await f.marker(H,"pass");
+ const dir=mkdtempSync(join(process.env.TMPDIR??tmpdir(),"post-apply-"));open.push(()=>rmSync(dir,{recursive:true,force:true}));
+ const summary=join(dir,"summary.md");writeFileSync(summary,"");
+ const prev=process.env.GITHUB_STEP_SUMMARY;process.env.GITHUB_STEP_SUMMARY=summary;open.push(()=>{if(prev===undefined)delete process.env.GITHUB_STEP_SUMMARY;else process.env.GITHUB_STEP_SUMMARY=prev});
+ const logs:string[]=[];const log=console.log;console.log=(l:string)=>{logs.push(String(l))};
+ let err:unknown;
+ try{await releaseApplyPostCheck(releaseLike(f.db) as never,{held:[],expectedPending:["upstream:x.sql","upstream:y.sql"],targetGeneration:H},join(dir,"release-apply"))}catch(e){err=e}finally{console.log=log}
+ expect(releaseErrorCode(err)).toBe(INGEST_FENCED_POST_APPLY);
+ const ev=JSON.parse(readFileSync(join(dir,"release-apply/evidence.json"),"utf8"));
+ expect(ev).toMatchObject({version:1,apply:{verified:true,held:0,applied:2,targetGeneration:H},postApplyIngest:{verdict:INGEST_FENCED_POST_APPLY,ok:false,reasons:["no_window"],policyGeneration:G}});
+ expect(logs.some(l=>l.startsWith("::error title=ingest_fenced_post_apply::"))).toBe(true);
+ expect(readFileSync(summary,"utf8")).toContain("ingest_fenced_post_apply");
+ expect(await advisoryLocks(f.db)).toBe(0);
+ // An unreadable state: the apply evidence stays, the record says state_unreadable, exit 1.
+ const broken=releaseLike(f.db,(t)=>{if(t.includes("ingest_lazy_policy"))throw new Error("boom")});
+ console.log=()=>{};
+ try{err=undefined;await releaseApplyPostCheck(broken,{held:[],expectedPending:[],targetGeneration:H},join(dir,"release-apply"))}catch(e){err=e}finally{console.log=log}
+ expect(releaseErrorCode(err)).toBe(INGEST_POST_APPLY_UNEXPECTED);
+ expect(JSON.parse(readFileSync(join(dir,"release-apply/evidence.json"),"utf8"))).toMatchObject({apply:{verified:true},postApplyIngest:{verdict:INGEST_POST_APPLY_UNEXPECTED,reasons:["state_unreadable"]}});
 });

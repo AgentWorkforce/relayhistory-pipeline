@@ -14,7 +14,11 @@
  *                                    claim refuses 55000 (docs/design/zero-503-schema-windows.md
  *                                    "Post-apply recovery");
  *   - ingest_post_apply_unexpected   FAIL, fail-closed: any other state (marker not PASS at H, admission
- *                                    rows off the policy generation, an invalid target, an unreadable state).
+ *                                    rows off the policy generation or no admission table, an invalid
+ *                                    target, an unreadable state).
+ *
+ * Green means generation-consistent only: the policy's valid_until, control epoch, privacy baseline and
+ * the receipt seat clock are not checked here.
  *
  * The apply has already committed. This check never writes and never rolls back; a failure only marks the
  * run red. Its evidence carries generations, counts and flags only (no org ids, no window id, no secrets).
@@ -45,6 +49,7 @@ export type PostApplyIngestReason =
   | "target_generation_invalid"
   | "marker_not_pass_at_target"
   | "admission_off_policy"
+  | "admission_table_missing"
   | "overlap_not_installed"
   | "no_window"
   | "window_from_mismatch"
@@ -106,7 +111,8 @@ export function classifyPostApplyIngest(state: PostApplyIngestState, targetGener
     return fail(INGEST_POST_APPLY_UNEXPECTED, ["marker_not_pass_at_target"]);
   // A buffered claim needs its org's admission row at the policy generation (044030 lazy guard); the
   // rebind moves the policy and every admission row together, so a split is never a state to accept.
-  if (!state.admission || state.admission.offPolicy !== 0) return fail(INGEST_POST_APPLY_UNEXPECTED, ["admission_off_policy"]);
+  if (!state.admission) return fail(INGEST_POST_APPLY_UNEXPECTED, ["admission_table_missing"]);
+  if (state.admission.offPolicy !== 0) return fail(INGEST_POST_APPLY_UNEXPECTED, ["admission_off_policy"]);
   if (G === H) return ok("ingest_at_target");
   const reasons: PostApplyIngestReason[] = [];
   if (!state.overlapInstalled) reasons.push("overlap_not_installed");
