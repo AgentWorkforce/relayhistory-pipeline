@@ -622,6 +622,32 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   const legacyKeys = async (store: ObjectStore, session: string) =>
     (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", legacyGroup(OWNER))) && k.includes(`/s=${session}/`));
 
+  test("owner rule: the hosted eraser targets the owner registered at export, even after Neon later re-derives a different one", async () => {
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    const w = await hostedWorld();
+    try {
+      const store = createFsStore({ root: await tmp("drift") });
+      const counters = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, store, "drift");
+        r.checkpoint.close();
+        return r.counters;
+      });
+      expect(counters.exported).toBe(1);
+      expect(await w.authorityRow(SR)).toEqual([{ legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(SR.workspaceId, OWNER) }]);
+      expect((await legacyKeys(store, "sess_r")).length).toBeGreaterThan(0);
+      // Neon now carries a delivery event by another user: re-deriving would pick 'u_drift' (events outrank outcomes).
+      await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,$4,'u_drift')", [SR.orgId, SR.workspaceId, SR.source, SR.sessionId]);
+      await w.f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [SR.orgId, SR.workspaceId, OTHER, SR.source, SR.sessionId]);
+      await w.sweep(store);
+      expect(await legacyKeys(store, "sess_r")).toEqual([]); // the registered owner's machine, not a re-derived one
+      expect(await w.authorityRow(SR)).toEqual([{ legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(SR.workspaceId, OWNER) }]);
+    } finally {
+      await w.f.close();
+    }
+  });
+
   test("F1-fix (1): a registered scope whose PUT never landed does not wedge the hosted sweep; a fenced neighbour in the same sweep is still erased", async () => {
     const n = await twoScopes();
     const w = await hostedWorld();
