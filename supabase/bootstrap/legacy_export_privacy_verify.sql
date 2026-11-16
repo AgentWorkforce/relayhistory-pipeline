@@ -1,5 +1,5 @@
 -- Read-only phase-2 verifier for the dedicated legacy-export privacy login.
--- Run after 062010 and 062030, before and after legacy_export_privacy_role.sql.
+-- Run after 062020 and 062030, before and after legacy_export_privacy_role.sql.
 -- It accepts the bare NOLOGIN role or the one approved LOGIN timeout profile.
 DO $verify$
 DECLARE
