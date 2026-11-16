@@ -21,6 +21,9 @@
  *                equals the landing --generation; then installs the previous release's
  *                event-trigger body (a stale reviewed wrapper). R1 onward use the release
  *                checkout
+ *   R1-prebuild  the operator's out-of-band CREATE INDEX CONCURRENTLY of every declared
+ *                adoptable index (ADOPTABLE_INDEXES) of a pending window step that is absent
+ *                on a populated table, as production does before its plan (SKIP when none)
  *   R1 plan      inspectRelease (READ ONLY; refuses function_acl_drift, ledger_gap, ...),
  *                migrationTargetSplit checked against an independent window, the target
  *                commit (below) bound by production's targetAnchor at the dispatched
@@ -826,6 +829,49 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     const approved = D.validateReleasePlan(plan, input);
     return { plan, input, approved, inspection };
   };
+
+  // ---- R1-prebuild: the operator's out-of-band index prebuild before the plan.
+  // Production builds a window step's ADOPTABLE_INDEXES (src/hoopdb/migration-sentinels.ts)
+  // with CREATE INDEX CONCURRENTLY before its plan (docs/out-of-band-index-prebuild.md; for
+  // 058000 the guarded index-prebuild-058000.yml), because the plan's preflight refuses
+  // index_prebuild_required for a declared index absent on a populated table (here R7-pre's
+  // rows). The same rule: only a declared index of a pending, not-held window step that is
+  // absent while its table exists and is populated is built, as the owner, one autocommit
+  // statement each, from the release checkout's own declaration; every other state is left
+  // for R1 to judge. Each built index must then read back adoptable (the exact declared
+  // definition, valid, ready and live), or the stage fails index_prebuild_unproven.
+  {
+    const SN = await mod("src/hoopdb/migration-sentinels.ts");
+    const declared = SN.ADOPTABLE_INDEXES as Record<string, readonly { name: string; table: string; def: string }[]>;
+    const window = expectedWindow(tree, new Set((await schemaLedger()).keys()), target);
+    const steps = window.expectedPending.filter((n) => declared[n]?.length);
+    if (!steps.length) await emit("R1-prebuild", "SKIP", { reason: "no_adoptable_index_step_pending" });
+    else
+      await stage("R1-prebuild", async () => {
+        const state = async (x: { name: string; table: string; def: string }) =>
+          (await admin.query<{ state: string; table_exists: boolean }>(String(SN.ADOPTABLE_INDEX_STATE_SQL), [x.name, x.table, x.def])).rows[0]!;
+        const built: string[] = [];
+        const builder = ownerClient();
+        await builder.connect();
+        try {
+          for (const step of steps)
+            for (const x of declared[step]!) {
+              const s = await state(x);
+              if (s.state !== "absent" || !s.table_exists) continue;
+              if (!/^sessions\.[a-z_][a-z0-9_]*$/.test(x.table)) rehearsalRefuse("index_prebuild_spec", { index: x.name });
+              if (!(await admin.query(`SELECT EXISTS (SELECT 1 FROM ${x.table} LIMIT 1) AS p`)).rows[0].p) continue;
+              const prefix = "CREATE INDEX ";
+              if (!x.def.startsWith(prefix) || /;|--|\/\*|\bCONCURRENTLY\b/iu.test(x.def)) rehearsalRefuse("index_prebuild_spec", { index: x.name });
+              await builder.query("CREATE INDEX CONCURRENTLY " + x.def.slice(prefix.length));
+              if ((await state(x)).state !== "adoptable") rehearsalRefuse("index_prebuild_unproven", { index: x.name });
+              built.push(x.name);
+            }
+        } finally {
+          await builder.end().catch(() => {});
+        }
+        return { steps, built };
+      });
+  }
 
   if (inject === "ledger-gap") {
     const up = seed.seed.filter((n) => n.startsWith("upstream:"));
