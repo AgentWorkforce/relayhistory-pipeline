@@ -46,7 +46,9 @@
  *   R3 boundary  the boundary refreshed under the migrator lock is the pinned body (runs
  *                after R4: it reads the refresh R4's beforeWrite performed)
  *   R5 read-back ledger = seed + approved window, nothing held or later applied, marker
- *                PASS at the dispatched generation
+ *                PASS at the dispatched generation; production's post-apply ingest check
+ *                (inspectPostApplyIngest): ingest_overlap_rebind_pending with R7-pre's window,
+ *                else no_lazy_policy (R7 re-runs it after the rebind: ingest_at_target)
  *   R6 ingest    the session-ingest Worker vars during (A,B overlap) and after (B only)
  *   R7 fence     old/next/both Workers around the owner rebind (needs the overlap, 044030)
  *   R8 read      the 047010 mixed-claim shape 17/170/6939/177 on real PostgreSQL
@@ -1223,6 +1225,12 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     if (applied.verified?.prosrc_exact !== true) rehearsalRefuse("rehearsal_boundary_not_pinned");
     return { prosrcExact: true, prosrcMatchesPin: true };
   });
+  const postApplyCheck = typeof I.inspectPostApplyIngest === "function";
+  const postApplyVerdict = async (expected: string) => {
+    const e = await I.inspectPostApplyIngest(owner, { targetGeneration: planned.approved.targetGeneration });
+    if (e.verdict !== expected || e.ok !== true) rehearsalRefuse("rehearsal_post_apply_ingest", { expected, got: e.verdict, reasons: e.reasons });
+    return e.verdict as string;
+  };
   let ledgerAfter!: Map<string, string>;
   await stage("R5", async () => {
     ledgerAfter = await schemaLedger();
@@ -1237,7 +1245,11 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     if (heldLedgered.length) rehearsalRefuse("rehearsal_held_ledgered", { heldLedgered });
     const m = await marker();
     if (m?.status !== "pass" || m.generation !== B) rehearsalRefuse("rehearsal_marker_readback");
-    return { ledgered: got.length, applied: firstPending.length, held: planned.approved.held.length, marker: "pass", generation: B };
+    // Production's READ ONLY post-apply ingest check, as the apply runs it after release_apply_verified.
+    // R7-pre's policy at A with the window A -> B still open: the rebind is pending; without R7-pre
+    // (overlap not installed at the baseline, or an injection row) there is no lazy policy.
+    const postApplyIngest = postApplyCheck ? await postApplyVerdict(overlapOpen ? "ingest_overlap_rebind_pending" : "no_lazy_policy") : "absent";
+    return { ledgered: got.length, applied: firstPending.length, held: planned.approved.held.length, marker: "pass", generation: B, postApplyIngest };
   });
 
   await stage("R6", async () => {
@@ -1289,7 +1301,9 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     if (oldCode !== "ledger_sqlstate_55000") rehearsalRefuse("rehearsal_old_worker_not_fenced", { got: oldCode });
     await f.ok("next", next);
     await f.ok("both", both);
-    return { beforeRebind: "old+both admitted", rebind: "rebound", overlapClosed: true, old: oldCode, after: "next+both admitted" };
+    // After the rebind the same post-apply check sees the policy at the target.
+    const postApplyIngest = postApplyCheck ? await postApplyVerdict("ingest_at_target") : "absent";
+    return { beforeRebind: "old+both admitted", rebind: "rebound", overlapClosed: true, old: oldCode, after: "next+both admitted", postApplyIngest };
   });
 
   if (![...ledgerAfter.keys()].some((n) => READ_047010.test(n))) {

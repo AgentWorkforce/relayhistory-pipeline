@@ -888,6 +888,17 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     expect(pbw.indexOf("checkIngestOverlap(")).toBeLessThan(pbw.indexOf("refreshReleaseBoundary("));
     expect(pbw.indexOf("githubReleaseGate(")).toBeLessThan(pbw.indexOf("checkIngestOverlap("));
   });
+
+  test("R5 runs production's post-apply ingest check and records its verdict; R7 re-runs it after the rebind", () => {
+    const drv = read("scripts/pg-proof/schema-rehearsal.ts");
+    expect(drv.match(/I\.inspectPostApplyIngest\(owner, /g)).toHaveLength(1);
+    const r5 = drv.slice(drv.indexOf('await stage("R5"'), drv.indexOf('await stage("R6"'));
+    expect(r5).toContain('postApplyVerdict(overlapOpen ? "ingest_overlap_rebind_pending" : "no_lazy_policy")');
+    expect(r5.indexOf("postApplyVerdict(")).toBeGreaterThan(r5.indexOf('rehearsalRefuse("rehearsal_marker_readback")'));
+    const r7 = drv.slice(drv.indexOf('await stage("R7"'), drv.indexOf('await stage("R8"'));
+    expect(r7.indexOf('postApplyVerdict("ingest_at_target")')).toBeGreaterThan(r7.indexOf("rebindIngestGeneration("));
+    expect(drv).toContain('rehearsalRefuse("rehearsal_post_apply_ingest"');
+  });
 });
 
 test("a stage failing index_prebuild_required keeps the refusing indexes and packets as evidence (never the raw message); other refusals stay {}", async () => {

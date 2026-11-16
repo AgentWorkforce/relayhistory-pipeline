@@ -15,6 +15,7 @@ import {
   releaseBootstrapFiles,
 } from "./schema-release-bootstrap.ts";
 import { checkIngestOverlap, type ReleaseOverlapContract } from "./schema-release-overlap.ts";
+import { classifyPostApplyIngest, readPostApplyIngestState } from "./schema-release-post-apply-ingest.ts";
 export function releaseClient(url: string | undefined, opts: { keepAlive?: boolean } = {}) {
   // Individual fields prevent URL sslmode/options from replacing TLS configuration.
   const client = new pg.Client({
@@ -139,6 +140,21 @@ export async function inspectIngestOverlap(
     await requireReleaseOwner(client);
     await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
     return await checkIngestOverlap(client, input);
+  } finally {
+    await client.query("ROLLBACK");
+  }
+}
+/**
+ * The apply's POST-apply buffered-ingest check (schema-release-post-apply-ingest.ts): READ ONLY under the
+ * migrator's xact lock (so it never interleaves with a rebind), after release_apply_verified. Returns the
+ * classification; it never writes, and the caller decides how a failing verdict marks the run.
+ */
+export async function inspectPostApplyIngest(client: pg.Client, input: { targetGeneration: string }) {
+  await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await requireReleaseOwner(client);
+    await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
+    return classifyPostApplyIngest(await readPostApplyIngestState(client), input.targetGeneration);
   } finally {
     await client.query("ROLLBACK");
   }

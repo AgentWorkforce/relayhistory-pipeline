@@ -119,7 +119,7 @@ jobs:
           run-id: ${{ inputs.plan_run }}
           github-token: ${{ github.token }}
       # One secret-scoped step for every mode; the entry point dispatches on RELEASE_MODE.
-      - name: Read-only plan, approved bootstrap-role stage, or approved boundary-refresh and apply (only step with database secret)
+      - name: Read-only plan, approved bootstrap-role stage, or approved boundary-refresh, apply and read-only post-apply ingest check (only step with database secret)
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
@@ -138,6 +138,16 @@ jobs:
         with:
           name: schema-release-bootstrap
           path: release-bootstrap/evidence.json
+          if-no-files-found: ignore
+          retention-days: 30
+      # Apply evidence (written before the post-apply ingest check), uploaded even when that check
+      # fails the job red (ingest_fenced_post_apply / ingest_post_apply_unexpected): the apply committed.
+      - name: Publish non-secret apply and post-apply ingest evidence
+        if: inputs.mode == 'apply' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-release-apply
+          path: release-apply/evidence.json
           if-no-files-found: ignore
           retention-days: 30
       - name: Summary

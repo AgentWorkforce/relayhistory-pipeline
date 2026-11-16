@@ -2120,3 +2120,47 @@ test("overlap gate: plan records it before writing the artifact, apply fails fas
   const op = readFileSync(new URL("../../../scripts/schema-release-operator-plan.ts", import.meta.url), "utf8");
   expect(op).toContain("const ingestOverlap = await inspectIngestOverlap(client, {");
 });
+
+// ---- Post-apply buffered-ingest check (src/hoopdb/schema-release-post-apply-ingest.ts). The classifier and the
+// database cases run in schema-release-post-apply-ingest.pglite.test.ts; these pin the wiring.
+test("post-apply ingest check: runs after release_apply_verified, READ ONLY, after the apply evidence is written", () => {
+  const src = readFileSync(new URL("../../../scripts/schema-release-database.ts", import.meta.url), "utf8");
+  const apply = src.slice(src.indexOf('refuse("release_ledger_changed");'));
+  const verified = apply.indexOf('console.log("release_apply_verified");');
+  const evidence = apply.indexOf("await writeApplyEvidence({ version: 1, apply: applyEvidence });");
+  const check = apply.indexOf("await runPostApplyIngestCheck(");
+  expect(verified).toBeGreaterThan(apply.indexOf('refuse("release_marker");'));
+  expect(evidence).toBeGreaterThan(verified);
+  expect(check).toBeGreaterThan(evidence);
+  expect(apply.slice(check)).toContain("inspectPostApplyIngest(client, { targetGeneration: approvedPlan!.targetGeneration })");
+  // Exactly once, and never in plan mode.
+  expect(src.match(/inspectPostApplyIngest\(/g)).toHaveLength(1);
+  expect(src.slice(src.indexOf('if (input.mode === "plan") {'), src.indexOf("release_readonly_plan_complete"))).not.toContain("PostApply");
+  // The inspection is a READ ONLY transaction under the migrator xact lock, always rolled back.
+  const inspect = readFileSync(new URL("../schema-release-inspect.ts", import.meta.url), "utf8");
+  const fn = inspect.slice(inspect.indexOf("export async function inspectPostApplyIngest("), inspect.indexOf("export function releaseErrorCode("));
+  expect(fn).toContain('"BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"');
+  expect(fn).toContain("await requireReleaseOwner(client);");
+  expect(fn).toContain('"SELECT pg_advisory_xact_lock(961996, 1)"');
+  expect(fn).toContain('await client.query("ROLLBACK");');
+  // The check module issues reads only.
+  const mod = readFileSync(new URL("../schema-release-post-apply-ingest.ts", import.meta.url), "utf8");
+  expect(mod).not.toMatch(/\b(INSERT|UPDATE|DELETE|COMMIT|BEGIN|TRUNCATE|ALTER|CREATE|DROP|GRANT|ingest_generation_overlap_close|ingest_lazy_policy_set)\b/);
+});
+
+test("post-apply ingest check: workflow uploads the apply evidence even when the check fails the job; the secret stays in the single DB step", () => {
+  const w = readFileSync(new URL("../../../.github/workflows/apply-session-schema.yml", import.meta.url), "utf8");
+  expect(w.match(/SUPABASE_MIGRATION_OWNER_URL:/g)?.length).toBe(1);
+  const steps = (Bun.YAML.parse(w) as any).jobs.database.steps as any[];
+  const secretSteps = steps.filter((s) => JSON.stringify(s).includes("secrets."));
+  expect(secretSteps).toHaveLength(1);
+  expect(secretSteps[0].run).toBe("bun scripts/schema-release-database.ts");
+  const upload = steps.find((s) => s.with?.name === "schema-release-apply");
+  expect(upload).toMatchObject({
+    if: "inputs.mode == 'apply' && always()",
+    uses: "actions/upload-artifact@v4",
+    with: { path: "release-apply/evidence.json", "if-no-files-found": "ignore" },
+  });
+  expect(upload.env).toBeUndefined();
+  expect(steps.indexOf(upload)).toBeGreaterThan(steps.indexOf(secretSteps[0]));
+});
