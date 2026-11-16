@@ -20,16 +20,63 @@ import {
   type RelayhistoryStreamRecord,
 } from "@rhc/lib/pipeline/relayhistory-transform.ts";
 
+
 export interface SessionDigest {
   harness: string;
   records: number;
+  /**
+   * The user turns kept for the summary, in session order: all of them for a session
+   * with at most RETAINED_USER_TURNS turns, else the first ones, the last ones and an
+   * evenly spaced sample between (`userTurnsSampled`). Each is clipped to TURN_TEXT_CHARS.
+   */
   userTurns: string[];
+  /** Every user turn the digest read, including any not kept in `userTurns`. */
+  userTurnCount: number;
+  /** True when `userTurns` holds a sample of the `userTurnCount` turns. */
+  userTurnsSampled?: boolean;
   assistantTurns: number;
   toolCalls: Record<string, number>;
   models: string[];
   firstTs?: string;
   lastTs?: string;
+  /** Present only when the digest was built from part of the session (the handler's input caps). */
+  input?: DigestInputTruncation;
 }
+
+/**
+ * How much of the session a capped digest read. Counts only, never content. The
+ * digest's counts (records, turns, tools) are then lower bounds for the whole session.
+ */
+export interface DigestInputTruncation {
+  chunksTotal: number;
+  chunksRead: number;
+  /** Decompressed bytes read. */
+  bytesRead: number;
+  /** Lines over the line cap: counted as records, never parsed. */
+  linesSkipped: number;
+  /** Delivery envelopes past the envelope cap: neither settled nor counted. */
+  envelopesDropped: number;
+}
+
+/** User turns kept for the summary: the first, the last, and an evenly spaced sample between. */
+export const RETAINED_HEAD_TURNS = 32;
+export const RETAINED_MIDDLE_TURNS = 32;
+export const RETAINED_TAIL_TURNS = 16;
+export const RETAINED_USER_TURNS = RETAINED_HEAD_TURNS + RETAINED_MIDDLE_TURNS + RETAINED_TAIL_TURNS;
+/**
+ * A kept turn's text is clipped to this many characters. The summarisers read at most
+ * 800 (model, after a re-scrub) and 200 (extractive) of it; the margin keeps the clip
+ * from cutting a secret the re-scrub would match inside the part they read. Chunks are
+ * scrubbed at ingest before they are stored.
+ */
+export const TURN_TEXT_CHARS = 8_192;
+/** Distinct tool names and models a digest tracks; further names are not counted. */
+const MAX_TOOL_NAMES = 1_000;
+const MAX_MODELS = 64;
+/** Delivery envelopes held for the settle by default. */
+export const DEFAULT_MAX_ENVELOPES = 200_000;
+/** User text (characters) the held envelopes may carry in total; later turns count without text. */
+export const ENVELOPE_TEXT_BUDGET_CHARS = 16 * 1024 * 1024;
 
 export interface Summary {
   text: string;
@@ -51,62 +98,196 @@ export interface Summarizer {
   summarize(kind: "short" | "long", digest: SessionDigest, ctx?: SummaryContext): Promise<Summary>;
 }
 
+const clipTurn = (t: string) => (t.length > TURN_TEXT_CHARS ? t.slice(0, TURN_TEXT_CHARS) : t);
+
 /**
- * Parses scrubbed JSONL transcript records into a digest. Harness-agnostic best effort.
- * Lines are raw transcript records (Claude Code, Codex rollout) or delivery envelopes
- * (`writer.ts` liveLine); envelopes are settled as a set before they are counted.
+ * Keeps a bounded, order-preserving sample of a stream of user turns: the first
+ * RETAINED_HEAD_TURNS, the last RETAINED_TAIL_TURNS, and between them a systematic
+ * sample (every `stride`-th turn, the stride doubling whenever the sample outgrows
+ * RETAINED_MIDDLE_TURNS), so the kept middle stays evenly spaced whatever the total.
+ * Memory is O(RETAINED_USER_TURNS × TURN_TEXT_CHARS) for any number of turns.
  */
-export function digestRecords(harness: string, lines: string[]): SessionDigest {
-  const d: SessionDigest = { harness, records: 0, userTurns: [], assistantTurns: 0,
-    // No prototype: a tool named "constructor" or "__proto__" is counted like any other.
-    toolCalls: Object.create(null) as Record<string, number>, models: [] };
-  const envelopes: RelayhistoryStreamRecord[] = [];
-  for (const line of lines) {
-    if (!line.trim()) continue;
+export class TurnSampler {
+  count = 0;
+  private head: string[] = [];
+  private middle: { i: number; text: string }[] = [];
+  private tail: { i: number; text: string }[] = [];
+  private stride = 1;
+
+  add(text: string): void {
+    const i = this.count++;
+    const t = clipTurn(text);
+    if (i < RETAINED_HEAD_TURNS) {
+      this.head.push(t);
+      return;
+    }
+    this.tail.push({ i, text: t });
+    if (this.tail.length <= RETAINED_TAIL_TURNS) return;
+    const out = this.tail.shift()!;
+    if ((out.i - RETAINED_HEAD_TURNS) % this.stride !== 0) return;
+    this.middle.push(out);
+    if (this.middle.length > RETAINED_MIDDLE_TURNS) {
+      this.stride *= 2;
+      this.middle = this.middle.filter((e) => (e.i - RETAINED_HEAD_TURNS) % this.stride === 0);
+    }
+  }
+
+  /** Counts a turn whose text was not kept (an envelope past the text budget). */
+  skip(): void {
+    this.count += 1;
+  }
+
+  turns(): string[] {
+    return [...this.head, ...this.middle.map((e) => e.text), ...this.tail.map((e) => e.text)];
+  }
+}
+
+export interface DigestBuilderOptions {
+  /** Delivery envelopes held for the settle; further ones are dropped and counted. */
+  maxEnvelopes?: number;
+}
+
+/**
+ * Builds a digest from scrubbed JSONL transcript lines fed one at a time, so a caller
+ * can stream a session chunk by chunk and let each chunk go once fed. Harness-agnostic
+ * best effort. Lines are raw transcript records (Claude Code, Codex rollout) or delivery
+ * envelopes (`writer.ts` liveLine); envelopes are settled as a set in `finish()` and are
+ * held until then as compact records (the fields the digest reads, user text clipped and
+ * budgeted), never as their full payloads.
+ */
+export class DigestBuilder {
+  private readonly d: SessionDigest;
+  private readonly turns = new TurnSampler();
+  private envelopes: RelayhistoryStreamRecord[] = [];
+  private envelopeTextChars = 0;
+  private readonly maxEnvelopes: number;
+  envelopesDropped = 0;
+
+  constructor(harness: string, options: DigestBuilderOptions = {}) {
+    this.d = { harness, records: 0, userTurns: [], userTurnCount: 0, assistantTurns: 0,
+      // No prototype: a tool named "constructor" or "__proto__" is counted like any other.
+      toolCalls: Object.create(null) as Record<string, number>, models: [] };
+    this.maxEnvelopes = options.maxEnvelopes ?? DEFAULT_MAX_ENVELOPES;
+  }
+
+  /** Counts a line the caller did not parse (over its line cap) as one record, like bad JSON. */
+  countUnparsed(): void {
+    this.d.records += 1;
+  }
+
+  addLine(line: string): void {
+    const d = this.d;
+    if (!line.trim()) return;
     let rec: Record<string, unknown>;
     try {
       rec = JSON.parse(line) as Record<string, unknown>;
     } catch {
       d.records += 1;
-      continue;
+      return;
     }
     if (isDeliveryEnvelope(rec)) {
       // Counted in `records` once settled; a malformed envelope counts as a line, like bad JSON.
+      let parsed: RelayhistoryStreamRecord;
       try {
-        envelopes.push(parseRelayhistoryRecord(line));
+        parsed = parseRelayhistoryRecord(line);
       } catch {
         d.records += 1;
+        return;
       }
-      continue;
+      if (this.envelopes.length >= this.maxEnvelopes) {
+        this.envelopesDropped += 1;
+        return;
+      }
+      this.envelopes.push(this.compactEnvelope(parsed));
+      return;
     }
     d.records += 1;
-    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) continue;
+    if (rec === null || typeof rec !== "object" || Array.isArray(rec)) return;
     const ts = typeof rec.timestamp === "string" ? rec.timestamp : undefined;
     if (ts) {
       d.firstTs ??= ts;
       d.lastTs = ts;
     }
     if (rec.type === "response_item" || rec.type === "turn_context") {
-      digestCodexRecord(d, rec);
-      continue;
+      digestCodexRecord(d, this.turns, rec);
+      return;
     }
     const msg = rec.message as Record<string, unknown> | undefined;
     const role = (msg?.role ?? rec.role ?? rec.type) as string | undefined;
     const content = msg?.content ?? rec.content;
     if (role === "user") {
       const text = textOf(content);
-      if (text) d.userTurns.push(text);
+      if (text) this.turns.add(text);
     } else if (role === "assistant") {
       d.assistantTurns += 1;
-      if (typeof msg?.model === "string" && !d.models.includes(msg.model)) d.models.push(msg.model);
+      if (typeof msg?.model === "string") addModel(d, msg.model);
       if (Array.isArray(content))
         for (const part of content as Record<string, unknown>[])
-          if (part?.type === "tool_use" && typeof part.name === "string") d.toolCalls[part.name] = (d.toolCalls[part.name] ?? 0) + 1;
+          if (part?.type === "tool_use" && typeof part.name === "string") countTool(d, part.name);
     }
   }
-  if (envelopes.length) digestEnvelopes(d, envelopes);
-  return d;
+
+  /**
+   * The envelope with its payload cut to what `digestEnvelopes` and the settle read: the
+   * event-time fields, the turn/tool/model fields, and a user turn's text clipped to
+   * TURN_TEXT_CHARS while the text budget lasts (after it, `text_dropped`). Every copy of a
+   * record is cut the same way, so the settle's equal-revision comparison still holds.
+   */
+  private compactEnvelope(r: RelayhistoryStreamRecord): RelayhistoryStreamRecord {
+    if (r.payload === null) return r;
+    const p = r.payload;
+    const out: Record<string, unknown> = {};
+    for (const f of ENVELOPE_PAYLOAD_FIELDS) if (p[f] !== undefined) out[f] = p[f];
+    if (typeof p.text === "string" && r.kind === "session_event" && p.kind === "text" && p.role === "user") {
+      const text = clipTurn(p.text);
+      if (this.envelopeTextChars + text.length <= ENVELOPE_TEXT_BUDGET_CHARS) {
+        this.envelopeTextChars += text.length;
+        out.text = text;
+      } else if (text.trim()) {
+        out.text_dropped = true;
+      }
+    }
+    return { ...r, payload: out };
+  }
+
+  finish(): SessionDigest {
+    const d = this.d;
+    let textDropped = false;
+    if (this.envelopes.length) {
+      const envelopes = this.envelopes;
+      this.envelopes = [];
+      textDropped = digestEnvelopes(d, this.turns, envelopes);
+    }
+    d.userTurns = this.turns.turns();
+    d.userTurnCount = this.turns.count;
+    if (d.userTurns.length < d.userTurnCount || textDropped) d.userTurnsSampled = true;
+    return d;
+  }
 }
+
+/** The payload fields the envelope digest reads, besides a user turn's `text`. */
+const ENVELOPE_PAYLOAD_FIELDS = [
+  "kind", "role", "name", "model", "control_kind", "is_meta", "is_sidechain",
+  // relayhistoryEventTime's fields: the settle orders by them.
+  "ts_ms", "timestamp_ms", "created_ms", "spawned_at_ms", "updated_ms", "first_activity_ms", "last_activity_ms",
+] as const;
+
+function addModel(d: SessionDigest, model: string): void {
+  if (d.models.length < MAX_MODELS && !d.models.includes(model)) d.models.push(model);
+}
+
+function countTool(d: SessionDigest, name: string): void {
+  if (d.toolCalls[name] !== undefined) d.toolCalls[name] += 1;
+  else if (Object.keys(d.toolCalls).length < MAX_TOOL_NAMES) d.toolCalls[name] = 1;
+}
+
+/** Parses scrubbed JSONL transcript records into a digest: `DigestBuilder` over a list. */
+export function digestRecords(harness: string, lines: Iterable<string>, options?: DigestBuilderOptions): SessionDigest {
+  const builder = new DigestBuilder(harness, options);
+  for (const line of lines) builder.addLine(line);
+  return builder.finish();
+}
+
 
 /**
  * A delivery envelope as the ingest writer stores it in a raw chunk (`session-ingest/writer.ts`
@@ -154,11 +335,12 @@ function settleEnvelopes(records: RelayhistoryStreamRecord[]): RelayhistoryStrea
  * turn by `role`, except control rows (`control_kind`, `is_meta`) and sidechain user rows
  * (subagent prompts), which the projection skips too; `model` from any record.
  */
-function digestEnvelopes(d: SessionDigest, envelopes: RelayhistoryStreamRecord[]): void {
+function digestEnvelopes(d: SessionDigest, turns: TurnSampler, envelopes: RelayhistoryStreamRecord[]): boolean {
   const settled = settleEnvelopes(envelopes);
   d.records += settled.length;
   let first: number | undefined;
   let last: number | undefined;
+  let textDropped = false;
   for (const record of settled) {
     const p = record.payload!;
     const ms = relayhistoryEventTime(record);
@@ -166,21 +348,27 @@ function digestEnvelopes(d: SessionDigest, envelopes: RelayhistoryStreamRecord[]
       if (first === undefined || ms < first) first = ms;
       if (last === undefined || ms > last) last = ms;
     }
-    if (typeof p.model === "string" && p.model && !d.models.includes(p.model)) d.models.push(p.model);
+    if (typeof p.model === "string" && p.model) addModel(d, p.model);
     if (record.kind === "tool_call") {
-      if (typeof p.name === "string" && p.name.trim()) d.toolCalls[p.name] = (d.toolCalls[p.name] ?? 0) + 1;
+      if (typeof p.name === "string" && p.name.trim()) countTool(d, p.name);
       continue;
     }
     if (record.kind !== "session_event" || p.kind !== "text" || flagged(p.control_kind) || truthy(p.is_meta)) continue;
     if (p.role === "user") {
       if (truthy(p.is_sidechain)) continue;
-      if (typeof p.text === "string" && p.text.trim()) d.userTurns.push(p.text);
+      if (typeof p.text === "string" && p.text.trim()) turns.add(p.text);
+      else if (p.text_dropped === true) {
+        // Past the builder's text budget: counted, not kept.
+        turns.skip();
+        textDropped = true;
+      }
     } else if (p.role === "assistant") {
       d.assistantTurns += 1;
     }
   }
   if (first !== undefined && (d.firstTs === undefined || first < Date.parse(d.firstTs))) d.firstTs = new Date(first).toISOString();
   if (last !== undefined && (d.lastTs === undefined || last > Date.parse(d.lastTs))) d.lastTs = new Date(last).toISOString();
+  return textDropped;
 }
 
 /** The projection's `control_kind` test: any non-empty value. */
@@ -193,21 +381,21 @@ const truthy = (v: unknown) => ["1", "true"].includes(String(v ?? ""));
  * `function_call` and `custom_tool_call` tool names, and the model from `turn_context`.
  * Developer messages and the context Codex injects as user messages are not turns.
  */
-function digestCodexRecord(d: SessionDigest, rec: Record<string, unknown>): void {
+function digestCodexRecord(d: SessionDigest, turns: TurnSampler, rec: Record<string, unknown>): void {
   const model = codexTurnModel(rec);
   if (model) {
-    if (!d.models.includes(model)) d.models.push(model);
+    addModel(d, model);
     return;
   }
   const tool = codexToolCall(rec);
   if (tool) {
-    d.toolCalls[tool] = (d.toolCalls[tool] ?? 0) + 1;
+    countTool(d, tool);
     return;
   }
   const message = codexMessage(rec);
   if (message?.role === "user") {
     const text = textOf(message.content, TRANSCRIPT_TEXT_PART_TYPES);
-    if (text?.trim() && !isCodexInjectedContext(text)) d.userTurns.push(text);
+    if (text?.trim() && !isCodexInjectedContext(text)) turns.add(text);
   } else if (message?.role === "assistant") {
     d.assistantTurns += 1;
   }
@@ -233,7 +421,7 @@ export const extractiveSummarizer: Summarizer = {
     const tools = Object.entries(d.toolCalls).sort((a, b) => b[1] - a[1]);
     const toolLine = tools.length ? tools.map(([n, c]) => `${n}×${c}`).join(", ") : "none";
     if (kind === "short") {
-      const text = `${d.harness}: "${first}" — ${d.userTurns.length} user turns, ${d.assistantTurns} assistant turns, tools: ${toolLine}.`;
+      const text = `${d.harness}: "${first}" — ${d.userTurnCount} user turns, ${d.assistantTurns} assistant turns, tools: ${toolLine}.`;
       return { text: scrubText(clip(text, 280)), modelId: this.id, tokensIn: 0, tokensOut: 0 };
     }
     const prompts = d.userTurns.slice(0, 10).map((t, i) => `${i + 1}. ${clip(t.replace(/\s+/g, " ").trim(), 200)}`).join("\n");
@@ -241,10 +429,11 @@ export const extractiveSummarizer: Summarizer = {
       `# Session summary (${d.harness})`,
       "",
       `- Records: ${d.records}`,
-      `- User turns: ${d.userTurns.length}; assistant turns: ${d.assistantTurns}`,
+      `- User turns: ${d.userTurnCount}; assistant turns: ${d.assistantTurns}`,
       `- Models: ${d.models.length ? d.models.join(", ") : "unknown"}`,
       `- Tools: ${toolLine}`,
       `- Span: ${d.firstTs ?? "?"} → ${d.lastTs ?? "?"}`,
+      ...(d.input ? [`- Input: sampled ${d.input.chunksRead} of ${d.input.chunksTotal} chunks; counts are lower bounds`] : []),
       "",
       "## Prompts",
       prompts || "(none)",

@@ -12,12 +12,9 @@
  * Idempotent by revision and raw content hash.
  */
 import { createHash } from "node:crypto";
-import { zstdDecompressSync } from "node:zlib";
 import {
   PipelineError,
   parseSessionKey,
-  rawChunkKey,
-  readAll,
   type ManifestReader,
   type ManifestV1,
   type ObjectStore,
@@ -27,9 +24,10 @@ import {
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
-import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { assertReaderScrubMarker } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
-import { digestRecords, type Summarizer } from "./summarizer.ts";
+import type { DigestInputTruncation, Summarizer } from "./summarizer.ts";
+import { readSessionDigest, type SummaryInputCaps } from "./session-input.ts";
 import {
   ShortSummaryRejected,
   clearShortSummary,
@@ -59,6 +57,8 @@ export interface BobCostasDeps {
   directory?: ShortSummaryDirectory;
   /** READER_MAX_RULESET; undefined (default) keeps the legacy presence-only scrub check. */
   readerMaxRuleset?: number;
+  /** The summary input caps (BOB_COSTAS_MAX_*); defaults to DEFAULT_SUMMARY_INPUT_CAPS. */
+  inputCaps?: SummaryInputCaps;
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -127,6 +127,8 @@ interface Outcome {
   tokensIn: number;
   tokensOut: number;
   records: number;
+  /** Set when the digest read part of the session only (the input caps). */
+  input?: DigestInputTruncation;
 }
 
 /**
@@ -161,37 +163,16 @@ async function buildOutcome(
   assertReaderScrubMarker(m.raw.scrub, deps.readerMaxRuleset);
   if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
   const s = m.session;
-  const loc = sessionLocation(m, manifestKey);
-  const lines: string[] = [];
-  for (const chunk of m.raw.chunks) {
-    const key = rawChunkKey(
-      loc,
-      chunk.seq,
-      chunk.start_offset,
-      chunk.sha256_8,
-      m.raw.format,
-    );
-    let stored: Uint8Array;
-    try {
-      // Unset maximum: the unchanged body-only GET. Set: one GET binds the chunk's scrub metadata to its body.
-      stored = await readAll(deps.readerMaxRuleset === undefined
-        ? await deps.store.get(key)
-        : await readerChunkBody(await deps.store.getObject(key), m.raw.scrub, deps.readerMaxRuleset));
-    } catch (err) {
-      if ((err as { code?: string }).code === "not_found")
-        throw new PipelineError(
-          "chunk_missing",
-          "a listed chunk is not in object storage",
-          true,
-        );
-      throw err;
-    }
-    lines.push(
-      ...zstdDecompressSync(Buffer.from(stored)).toString("utf8").split("\n"),
-    );
-  }
-  const digest = digestRecords(s.harness, lines);
-  if (digest.records === 0) return { status: "empty", ...none };
+  // Streamed chunk by chunk within the input caps (session-input.ts): never the whole
+  // session in memory, whatever its chunk count or size.
+  const digest = await readSessionDigest({
+    manifest: m,
+    location: sessionLocation(m, manifestKey),
+    store: deps.store,
+    ...(deps.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: deps.readerMaxRuleset }),
+    ...(deps.inputCaps ? { caps: deps.inputCaps } : {}),
+  });
+  if (digest.records === 0) return { status: "empty", ...none, ...(digest.input ? { input: digest.input } : {}) };
   // Ids only: the model summariser's per-org budget and per-session cap key on these.
   // The summariser never throws for a model failure; it falls back to extractive.
   const summary = await deps.summarizer.summarize(kind, digest, {
@@ -206,6 +187,7 @@ async function buildOutcome(
     tokensIn: summary.tokensIn,
     tokensOut: summary.tokensOut,
     records: digest.records,
+    ...(digest.input ? { input: digest.input } : {}),
   };
 }
 
@@ -384,6 +366,7 @@ export function bobCostasHandler(
             summary: outcome.summary!,
             model: outcome.model!,
             source_content_sha256: m.raw.content_sha256,
+            ...(outcome.input ? { input_truncated: true as const } : {}),
           }
         : {}),
       built_at: (deps.now?.() ?? new Date()).toISOString(),
@@ -509,6 +492,17 @@ export function bobCostasHandler(
       revision: m.revision,
       session_uuid: ctx.session_uuid,
       count: outcome.records,
+      // Counts only: how much of a capped session the digest read.
+      ...(outcome.input
+        ? {
+            reason: "input_truncated",
+            chunks_read: outcome.input.chunksRead,
+            chunks_total: outcome.input.chunksTotal,
+            bytes_read: outcome.input.bytesRead,
+            lines_skipped: outcome.input.linesSkipped,
+            envelopes_dropped: outcome.input.envelopesDropped,
+          }
+        : {}),
     });
   };
 }

@@ -137,6 +137,45 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     });
     expect(rec?.model).toBe("extractive/v1");
     expect(rec?.summary).toContain("PLANTED-PROMPT");
+    expect(rec && "input_truncated" in rec).toBe(false);
+  });
+
+  it("a session past the input caps summarises from a sample and the record says input_truncated", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const chunks = [];
+    for (let i = 0; i < 12; i++) {
+      const sha = i.toString(16).padStart(8, "0");
+      const line = JSON.stringify({ type: "user", message: { role: "user", content: `prompt ${i}` } });
+      await store.put(rawChunkKey(loc, i, i * 100, sha, "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
+      chunks.push({ seq: i, start_offset: i * 100, sha256_8: sha, bytes: 100 });
+    }
+    const m = manifest(true, chunks);
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    await bobCostasHandler("long", {
+      db,
+      reader: { provider: "fs", read: async () => ({ manifest: m }) } as never,
+      store,
+      summarizer: extractiveSummarizer,
+      directory: noDirectory,
+      keyring,
+      inputCaps: { maxChunks: 4, maxInputBytes: 1 << 20, maxChunkBytes: 1 << 20, maxLineBytes: 1 << 16, maxEnvelopes: 1_000 },
+    })(message, recorder);
+    const row = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(row.status).toBe("ready");
+    const rec = await readSummaryObject({
+      store,
+      keyring,
+      ids: { orgId: "o", workspaceId: "w" },
+      key: String(row.object_key),
+      sha256: String(row.object_sha256),
+      kind: "long",
+      revision: 2,
+    });
+    expect(rec?.input_truncated).toBe(true);
+    expect(rec?.summary).toContain("- Input: sampled 4 of 12 chunks");
+    expect(rec?.summary).toContain("1. prompt 0");
+    expect(rec?.summary).toContain("prompt 11");
   });
 
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {

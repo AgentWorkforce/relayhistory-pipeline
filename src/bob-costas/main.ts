@@ -5,6 +5,7 @@ import { summarizerFromEnv } from "./model-summarizer.ts";
 import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
+import { summaryInputCapsFromEnv } from "./session-input.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const raw = lockerStore();
@@ -15,6 +16,16 @@ log.info("bob costas summariser", { stage: "summary", model_id: summarizer.id })
 const keyring = await keyringFromEnv();
 // Unset keeps legacy reads; a malformed value fails at startup.
 const maximum = readerMaxRuleset(process.env);
+// BOB_COSTAS_MAX_*: the summary input caps (session-input.ts); an out-of-range value keeps its default.
+const inputCaps = summaryInputCapsFromEnv();
+log.info("bob costas input caps", {
+  stage: "summary",
+  max_chunks: inputCaps.maxChunks,
+  max_input_bytes: inputCaps.maxInputBytes,
+  max_chunk_bytes: inputCaps.maxChunkBytes,
+  max_line_bytes: inputCaps.maxLineBytes,
+  max_envelopes: inputCaps.maxEnvelopes,
+});
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
@@ -32,6 +43,7 @@ await runWorker({
       summarizer,
       keyring,
       readerMaxRuleset: maximum,
+      inputCaps,
     };
     return {
       "summary-short": bobCostasHandler("short", deps),

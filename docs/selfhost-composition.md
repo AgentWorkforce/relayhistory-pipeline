@@ -882,11 +882,35 @@ budget or a cap exhausted, or when the call still fails after its retries, it
 writes the extractive summary and logs a reason code (`no_api_key`, `budget`,
 `session_cap`, `global_cap`, `model_failed` plus the provider error code). The
 prompt is built from the session digest only (harness, counts, the first user
-turns, the tool-call histogram, models, time span), every string scrubbed
+turns (for a long session, a spread to the last), the tool-call histogram,
+models, time span), every string scrubbed
 first; the model's output is scrubbed before it is stored. Logs carry the model
 id, token counts from the Responses usage block, attempt count and codes only:
 never prompts, outputs, request or response bodies, provider error text or the
 key.
+
+### Bob Costas input caps
+
+Bob Costas streams a session's chunks into the digest one at a time
+(`src/bob-costas/session-input.ts`, whose header is the reference), so its
+memory does not grow with the session's chunk count or size. A session past
+these caps is summarised from a sample of its chunks (the first, the last and
+an evenly spaced selection between); its summary object carries
+`input_truncated: true`, the long summary says so, and the `bob costas summary`
+log line adds `reason: input_truncated`, `chunks_read`, `chunks_total`,
+`bytes_read`, `lines_skipped` and `envelopes_dropped`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BOB_COSTAS_MAX_CHUNKS` | 512 | chunks read per summary |
+| `BOB_COSTAS_MAX_INPUT_BYTES` | 268435456 (256 MiB) | decompressed chunk bytes read per summary |
+| `BOB_COSTAS_MAX_CHUNK_BYTES` | 33554432 (32 MiB) | per chunk, decompressed; a bigger chunk is skipped, never inflated |
+| `BOB_COSTAS_MAX_LINE_BYTES` | 2097152 (2 MiB) | per transcript line; a longer line counts as a record and is not parsed |
+| `BOB_COSTAS_MAX_ENVELOPES` | 200000 | delivery envelopes held for the settle; later ones are dropped and counted |
+
+The defaults fit a 4 GiB container: the worker handles one message at a time,
+and a summary's peak is about one inflated chunk plus the digest's bounded
+state. A value that is not a whole number in the cap's range keeps the default.
 
 ### One transport for both services
 

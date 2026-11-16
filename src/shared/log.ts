@@ -20,6 +20,15 @@ export const ADMISSION_PHASE_FIELDS: ReadonlyMap<string, string> = new Map([
 ]);
 const ADMISSION_PHASE_FIELDS_LIST = [...ADMISSION_PHASE_FIELDS.values()];
 
+/**
+ * Bob Costas's summary input (src/bob-costas/session-input.ts): how much of a capped session a
+ * digest read, and the caps it logs at startup. Bounded counts only.
+ */
+const SUMMARY_INPUT_FIELDS = [
+  "chunks_read", "chunks_total", "bytes_read", "lines_skipped", "envelopes_dropped",
+  "max_chunks", "max_input_bytes", "max_chunk_bytes", "max_line_bytes", "max_envelopes",
+];
+
 /** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
@@ -76,6 +85,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
+  ...SUMMARY_INPUT_FIELDS,
 ]);
 
 /**
@@ -99,6 +109,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {

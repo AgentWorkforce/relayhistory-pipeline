@@ -80,6 +80,11 @@ export interface SummaryRecord {
   built_at: string;
   /** `raw.content_sha256` of the raw it was built from (ready only). */
   source_content_sha256?: string;
+  /**
+   * Ready only: true when the summary was built from part of the session (Bob Costas's
+   * input caps: a sample of its chunks, lines or envelopes). Absent otherwise.
+   */
+  input_truncated?: true;
   trace_id: string;
 }
 
