@@ -96,57 +96,50 @@ export async function legacyScopeOwner(
     user_id: string | null;
     reason: LegacyScopeOwnerResolution["reason"];
   }>(
-    `WITH evidence AS (
-       SELECT count(DISTINCT e.user_id)::int AS n,min(e.user_id) AS user_id
+    `WITH event_users AS (
+       SELECT DISTINCT e.user_id
          FROM sessions.convergence_events e
         WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>''),
-     outcomes AS (
-       SELECT count(DISTINCT o.user_id)::int AS n,min(o.user_id) AS user_id
+     outcome_users AS (
+       SELECT DISTINCT o.user_id
          FROM sessions.session_outcomes o
         WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''),
-     turns AS (
-       SELECT count(DISTINCT t.session_owner)::int AS n,min(t.session_owner) AS user_id
+     turn_users AS (
+       SELECT DISTINCT t.session_owner AS user_id
          FROM sessions.conversation_turns t
         WHERE ${turnScopeSql} AND t.session_owner<>''),
-     owner AS (
-       SELECT CASE
-         WHEN e.n=1 THEN e.user_id
-         WHEN e.n>1 THEN NULL
-         WHEN o.n=1 THEN o.user_id
-         WHEN o.n>1 THEN NULL
-         WHEN t.n=1 AND EXISTS(
-           SELECT 1 FROM sessions.convergence_events a
-            WHERE a.org_id=$1
-              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
-              AND a.user_id=t.user_id AND a.user_id<>''
-           UNION ALL
-           SELECT 1 FROM sessions.session_outcomes a
-            WHERE a.org_id=$1
-              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
-              AND a.user_id=t.user_id AND a.user_id<>''
-         ) THEN t.user_id
-         ELSE NULL
-       END AS user_id,
+     authenticated_users AS (
+       SELECT e.user_id FROM sessions.convergence_events e
+        WHERE e.org_id=$1
+          AND CASE WHEN e.workspace_id='' THEN 'default' ELSE e.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+          AND e.user_id<>''
+       UNION
+       SELECT o.user_id FROM sessions.session_outcomes o
+        WHERE o.org_id=$1
+          AND CASE WHEN o.workspace_id='' THEN 'default' ELSE o.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+          AND o.user_id<>''),
+     verified_turn_users AS (
+       SELECT t.user_id FROM turn_users t JOIN authenticated_users a USING(user_id)),
+     candidates AS (
+       SELECT user_id FROM event_users
+       UNION SELECT user_id FROM outcome_users
+       UNION SELECT user_id FROM verified_turn_users),
+     counts AS (
+       SELECT count(DISTINCT c.user_id)::int AS n,min(c.user_id) AS user_id FROM candidates c),
+     evidence AS (
+       SELECT EXISTS(SELECT 1 FROM event_users) AS has_events,
+              EXISTS(SELECT 1 FROM outcome_users) AS has_outcomes,
+              EXISTS(SELECT 1 FROM turn_users) AS has_turns)
+     SELECT CASE WHEN c.n=1 THEN c.user_id ELSE NULL END AS user_id,
        CASE
-         WHEN e.n>1 OR (e.n=0 AND o.n>1) OR (e.n=0 AND o.n=0 AND t.n>1) THEN 'unbound_multi_owner'
-         WHEN e.n=1 THEN 'events'
-         WHEN o.n=1 THEN 'outcomes'
-         WHEN t.n=1 AND EXISTS(
-           SELECT 1 FROM sessions.convergence_events a
-            WHERE a.org_id=$1
-              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
-              AND a.user_id=t.user_id AND a.user_id<>''
-           UNION ALL
-           SELECT 1 FROM sessions.session_outcomes a
-            WHERE a.org_id=$1
-              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
-              AND a.user_id=t.user_id AND a.user_id<>''
-         ) THEN 'turns'
-         WHEN t.n>0 THEN 'unbound_turns_only'
+         WHEN c.n>1 THEN 'unbound_multi_owner'
+         WHEN c.n=1 AND e.has_events THEN 'events'
+         WHEN c.n=1 AND e.has_outcomes THEN 'outcomes'
+         WHEN c.n=1 THEN 'turns'
+         WHEN e.has_turns THEN 'unbound_turns_only'
          ELSE 'unbound'
        END AS reason
-       FROM evidence e CROSS JOIN outcomes o CROSS JOIN turns t)
-     SELECT user_id,reason FROM owner`,
+       FROM counts c CROSS JOIN evidence e`,
     scopeParams(s),
   );
   const row = rows[0];
