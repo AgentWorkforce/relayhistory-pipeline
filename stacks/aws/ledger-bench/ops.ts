@@ -14,9 +14,9 @@
  *   Cluster side (the EKS cluster and its account):
  *     ops.ts up-identity  --inputs <file> --confirm-account <cluster account> [--plan]
  *     ops.ts up-namespace --inputs <file>
- *     ops.ts run          --inputs <file> --run-id <id> [--profile smoke] [--lanes r2,r3] [--steps 1,2]
+ *     ops.ts run          --inputs <file> --run-id <id> --ledger <file> [--fresh-ledger] [--profile smoke] [--lanes r2,r3] [--steps 1,2]
  *     ops.ts collect      --inputs <file> --run-id <id> --out <dir outside the repo>
- *     ops.ts down-cluster --inputs <file> --confirm-account <cluster account> (--collected <dir> | --discard-results)
+ *     ops.ts down-cluster --inputs <file> --confirm-account <cluster account> (--collected <dir> --ledger <file> | --discard-results)
  *     ops.ts verify-cluster --inputs <file> --confirm-account <cluster account>
  *   Either:
  *     ops.ts render       --inputs <file> --run-id <id>   # prints the manifests; contacts nothing
@@ -30,7 +30,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -308,6 +308,7 @@ export function buildBundle(): { path: string; sha256: string; dir: string } {
 }
 
 function upNamespace(i: Inputs): void {
+  confirmCluster(i, "up-namespace");
   must("kubectl", kubectl(i, ["apply", "-f", join(HERE, "namespace.yaml")]));
   console.log("up-namespace: namespace, ServiceAccount, NetworkPolicy and quota applied");
 }
@@ -332,15 +333,41 @@ export function ledgerAdd(entries: LedgerEntry[], run: string, profile: string, 
   return next;
 }
 
-const LEDGER = "ledger-bench-ledger";
-
-function readLedger(i: Inputs): LedgerEntry[] {
-  const r = exec("kubectl", kubectl(i, ["-n", NAMESPACE, "get", "configmap", LEDGER, "-o", "json"]));
-  if (r.status !== 0) {
-    if (/NotFound/.test(r.stderr)) return [];
-    throw new Error("ledger-bench: cannot read the spend ledger; nothing was started");
+/**
+ * The ledger is a file the operator keeps next to the results, outside the repository and outside the
+ * cluster, so it outlives a teardown: deleting the namespace must not reset the cap. A missing file is
+ * accepted only with --fresh-ledger, once, for the benchmark's very first run.
+ */
+export function readLedger(path: string | undefined, fresh: boolean): LedgerEntry[] {
+  if (!path || insideRepo(path)) throw new Error("ledger-bench: --ledger <file outside the repository> is required");
+  if (!existsSync(path)) {
+    if (fresh) return [];
+    throw new Error("ledger-bench: the spend ledger file does not exist; pass --fresh-ledger only for the benchmark's first run. Nothing was started.");
   }
-  return JSON.parse((JSON.parse(r.stdout) as { data?: { entries?: string } }).data?.entries ?? "[]") as LedgerEntry[];
+  if (fresh) throw new Error("ledger-bench: --fresh-ledger given but the ledger exists; refusing to reset the spend. Nothing was started.");
+  const entries = JSON.parse(readFileSync(path, "utf8")) as LedgerEntry[];
+  if (!Array.isArray(entries) || entries.some((e) => typeof e?.run !== "string" || typeof e?.usd !== "number" || !(e.usd >= 0))) throw new Error("ledger-bench: the spend ledger file is malformed. Nothing was started.");
+  return entries;
+}
+
+/** Written whole to a new file and renamed, so an interrupted write cannot leave a shorter ledger. */
+function writeLedger(path: string, entries: LedgerEntry[]): void {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(entries, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+/**
+ * The kube context must be the cluster the inputs name, in the account they name: an EKS context's cluster
+ * entry is the cluster's ARN. Checked before every command that writes to the cluster.
+ */
+export function contextMatches(clusterEntry: string, i: Pick<Inputs, "clusterName" | "clusterAccountId" | "region">): boolean {
+  return clusterEntry === `arn:aws:eks:${i.region}:${i.clusterAccountId}:cluster/${i.clusterName}`;
+}
+
+function confirmCluster(i: Inputs, what: string): void {
+  const view = JSON.parse(must("kubectl", ["config", "view", "--minify", "-o", "json", ...kubectl(i, [])])) as { contexts?: { context?: { cluster?: string } }[] };
+  if (!contextMatches(view.contexts?.[0]?.context?.cluster ?? "", i)) throw new Error(`ledger-bench: ${what}: the kube context is not the cluster the inputs name (expected its EKS ARN as the context's cluster). Nothing was changed.`);
 }
 
 /** Server-side apply of a ConfigMap built by kubectl itself (so no value is ever interpolated into YAML). */
@@ -349,20 +376,23 @@ function applyConfigMap(i: Inputs, name: string, from: string): void {
   must("kubectl", kubectl(i, ["apply", "--server-side", "--force-conflicts", "--field-manager=ledger-bench", "-f", "-"]), manifest);
 }
 
-function run(i: Inputs, runId: string, profile: string, lanes: Lane[], steps: string): void {
+function run(i: Inputs, runId: string, profile: string, lanes: Lane[], steps: string, ledgerPath: string | undefined, fresh: boolean): void {
   if (!i.keys) throw new Error("ledger-bench: run needs inputs.keys (from outputs-data)");
-  const entries = readLedger(i);
+  confirmCluster(i, "run");
+  const entries = readLedger(ledgerPath, fresh);
   if (entries.some((e) => e.run === runId && lanes.includes(e.lane))) throw new Error("ledger-bench: that run id already ran one of these lanes; choose a new run id. Nothing was started.");
   const ledger = ledgerAdd(entries, runId, profile, lanes);
   const bundle = buildBundle();
   try {
     // The ledger is written before any Job exists: a crash here over-counts, never under-counts.
-    applyConfigMap(i, LEDGER, `--from-literal=entries=${JSON.stringify(ledger)}`);
+    writeLedger(ledgerPath!, ledger);
     applyConfigMap(i, "ledger-bench-bundle", `--from-file=main.js=${bundle.path}`);
     applyConfigMap(i, "ledger-bench-config", `--from-literal=config.json=${JSON.stringify(clientConfig(i, i.keys))}`);
     const template = readFileSync(join(HERE, "job.template.yaml"), "utf8");
     for (const lane of lanes) must("kubectl", kubectl(i, ["apply", "-f", "-"]), renderJob(template, i, { runId, lane, profile, steps, bundleSha256: bundle.sha256 }));
     console.log(JSON.stringify({ run: runId, profile, lanes, bundle_sha256: bundle.sha256, cost_bound_so_far_usd: Math.ceil(ledger.reduce((a, e) => a + e.usd, 0) + FIXED_USD) }));
+    // A required anti-affinity or a full node leaves the pod Pending until the 4-hour deadline: look now.
+    console.log(`check scheduling: kubectl -n ${NAMESPACE} get pods -l ledger-bench/run=${runId}; delete a Job whose pod stays Pending`);
   } finally {
     rmSync(bundle.dir, { recursive: true, force: true });
   }
@@ -415,12 +445,13 @@ function deleteStack(profile: string, region: string, stack: string): void {
 }
 
 /** The client first: with the namespace and the pod role gone, nothing can write while the data is removed. */
-function downCluster(i: Inputs, confirmed: string | undefined, collected: string | undefined, discard: boolean): void {
+function downCluster(i: Inputs, confirmed: string | undefined, collected: string | undefined, discard: boolean, ledgerPath: string | undefined): void {
   const profile = clusterProfile(i);
   confirmAccount(profile, i.region, i.clusterAccountId, confirmed, "down-cluster");
+  confirmCluster(i, "down-cluster");
   if (!discard) {
     // The Jobs' logs are the results; deleting the namespace deletes them.
-    const missing = collected ? uncollected(readLedger(i), collected) : ["(no --collected directory given)"];
+    const missing = collected ? uncollected(readLedger(ledgerPath, false), collected) : ["(no --collected directory given)"];
     if (missing.length > 0) throw new Error(`ledger-bench: down-cluster would lose results not yet collected: ${missing.join(", ")}. Collect them, or pass --discard-results. Nothing was changed.`);
   }
   must("kubectl", kubectl(i, ["delete", "namespace", NAMESPACE, "--ignore-not-found", "--wait=true", "--timeout=300s"]));
@@ -534,7 +565,7 @@ if (import.meta.main) {
     allowPositionals: true,
     options: {
       inputs: { type: "string" }, "run-id": { type: "string" }, profile: { type: "string", default: "standard" }, lanes: { type: "string" }, steps: { type: "string", default: "" },
-      out: { type: "string" }, collected: { type: "string" }, plan: { type: "boolean", default: false }, "no-role": { type: "boolean", default: false }, "discard-results": { type: "boolean", default: false }, "confirm-account": { type: "string" },
+      out: { type: "string" }, collected: { type: "string" }, plan: { type: "boolean", default: false }, ledger: { type: "string" }, "fresh-ledger": { type: "boolean", default: false }, "no-role": { type: "boolean", default: false }, "discard-results": { type: "boolean", default: false }, "confirm-account": { type: "string" },
     },
   });
   const command = positionals[0];
@@ -559,9 +590,9 @@ if (import.meta.main) {
     case "outputs-data": console.log(JSON.stringify({ keys: outputsData(inputs) })); break;
     case "up-identity": upIdentity(inputs, values["confirm-account"], values.plan!); break;
     case "up-namespace": upNamespace(inputs); break;
-    case "run": run(inputs, runId, values.profile!, lanes, values.steps!); break;
+    case "run": run(inputs, runId, values.profile!, lanes, values.steps!, values.ledger, values["fresh-ledger"]!); break;
     case "collect": collect(inputs, runId, values.out ?? ""); break;
-    case "down-cluster": downCluster(inputs, values["confirm-account"], values.collected, values["discard-results"]!); break;
+    case "down-cluster": downCluster(inputs, values["confirm-account"], values.collected, values["discard-results"]!, values.ledger); break;
     case "down-data": downData(inputs, values["confirm-account"], !values["no-role"]); break;
     case "verify-data": report(verifyData(inputs, values["confirm-account"])); break;
     case "verify-cluster": report(verifyCluster(inputs, values["confirm-account"])); break;

@@ -39,20 +39,33 @@ export class BudgetExhausted extends BenchError {
  */
 export class RequestMeter {
   #used = 0;
+  #bytes = 0;
   readonly statuses = new Tally();
-  constructor(readonly limit: number) {
+  /** `byteLimit` bounds what is priced per byte: NAT processing, cross-region transfer, S3 Express per-GiB charges. */
+  constructor(
+    readonly limit: number,
+    readonly byteLimit: number = Number.MAX_SAFE_INTEGER,
+  ) {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("ledger-bench: the request budget must be a positive integer");
+    if (!Number.isSafeInteger(byteLimit) || byteLimit < 1) throw new Error("ledger-bench: the byte budget must be a positive integer");
   }
   get used(): number {
     return this.#used;
   }
+  get bytes(): number {
+    return this.#bytes;
+  }
   get exhausted(): boolean {
-    return this.#used >= this.limit;
+    return this.#used >= this.limit || this.#bytes >= this.byteLimit;
+  }
+  /** Bytes sent or received by a request that was allowed to start. */
+  addBytes(n: number): void {
+    if (Number.isFinite(n) && n > 0) this.#bytes += n;
   }
   /** Spend `n` requests; `n` above 1 reserves a child process's whole allowance up front. */
   take(n = 1): void {
-    if (this.#used + n > this.limit) {
-      this.#used = this.limit;
+    if (this.#used + n > this.limit || this.#bytes >= this.byteLimit) {
+      if (this.#used + n > this.limit) this.#used = this.limit;
       throw new BudgetExhausted(this.limit);
     }
     this.#used += n;
@@ -64,8 +77,12 @@ export function meteredFetch(meter: RequestMeter, label: string, inner: typeof f
   const wrapped = async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
     meter.take();
     const method = (init?.method ?? "GET").toUpperCase();
+    const body = init?.body;
+    if (body instanceof Uint8Array) meter.addBytes(body.byteLength);
+    else if (typeof body === "string") meter.addBytes(body.length);
     try {
       const res = await inner(input, init);
+      if (method !== "HEAD") meter.addBytes(Number(res.headers.get("content-length") ?? 0));
       meter.statuses.add(`${label} ${method} ${res.status}`);
       return res;
     } catch (error) {

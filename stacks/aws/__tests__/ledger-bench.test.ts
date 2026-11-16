@@ -5,7 +5,7 @@ import { parseConfig } from "../../../benchmarks/ledger-bench/config.ts";
 import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { STANDARD } from "../../../benchmarks/ledger-bench/config.ts";
-import { BUNDLE_MAX_BYTES, clientConfig, insideRepo, isClean, ledgerAdd, parseInputs, renderJob, resourceNames, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
+import { BUNDLE_MAX_BYTES, clientConfig, contextMatches, insideRepo, isClean, ledgerAdd, parseInputs, readLedger, renderJob, resourceNames, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
 
 const DIR = join(import.meta.dir, "..", "ledger-bench");
 const read = (name: string) => readFileSync(join(DIR, name), "utf8");
@@ -176,7 +176,31 @@ describe("ledger-bench ops guards", () => {
     expect(() => ledgerAdd(ledger, "d", "standard", ["r2"])).toThrow(/Nothing was started/);
     expect(ledgerAdd(ledger, "smoke-2", "smoke", ["r2"]).length).toBe(21);
     expect(() => ledgerAdd([], "a", "constructor", ["r2"])).toThrow(/profile/);
-    expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008, 1);
+    // A lane is its request budget at the dearest request price plus its byte budget per GiB.
+    expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008 + (STANDARD.byteBudgetPerLane / 1024 ** 3) * 0.07, 1);
+  });
+  test("the ledger is a file outside the cluster: a teardown cannot reset the spend", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));
+    const path = join(dir, "ledger.json");
+    // Missing: only the very first run may start from nothing, and says so.
+    expect(() => readLedger(path, false)).toThrow(/does not exist/);
+    expect(readLedger(path, true)).toEqual([]);
+    writeFileSync(path, JSON.stringify([entry("a", "r2", 20)]));
+    expect(readLedger(path, false)).toEqual([entry("a", "r2", 20)]);
+    // An existing ledger is never reset, and a damaged or in-repo one is refused.
+    expect(() => readLedger(path, true)).toThrow(/refusing to reset/);
+    writeFileSync(path, JSON.stringify([{ run: "a", usd: -5 }]));
+    expect(() => readLedger(path, false)).toThrow(/malformed/);
+    expect(() => readLedger(undefined, false)).toThrow(/--ledger/);
+    expect(() => readLedger(join(import.meta.dir, "ledger.json"), true)).toThrow(/outside the repository/);
+  });
+  test("cluster-side writes need the kube context to be the named cluster in the named account", () => {
+    const i = { clusterName: "example-cluster", clusterAccountId: "222222222222", region: "us-west-2" };
+    expect(contextMatches("arn:aws:eks:us-west-2:222222222222:cluster/example-cluster", i)).toBe(true);
+    expect(contextMatches("arn:aws:eks:us-west-2:333333333333:cluster/example-cluster", i)).toBe(false);
+    expect(contextMatches("arn:aws:eks:us-west-2:222222222222:cluster/example-cluster-dev", i)).toBe(false);
+    expect(contextMatches("example-cluster", i)).toBe(false);
+    expect(contextMatches("", i)).toBe(false);
   });
   test("teardown refuses while a lane's results are not collected", () => {
     const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));

@@ -9,8 +9,11 @@ export const TRANSACT_ITEMS = [2, 25, 100];
 export const TRANSACT_WRITERS = [1, 8];
 export const HOT_HEAD_LEVELS = [64, 128, 256, 512];
 
-/** A group of 30 is a 1.9 MiB PUT; the cap keeps a fast backend from writing tens of GiB. */
-export const logOpCap = (profile: Profile, group: number) => Math.min(profile.maxOpsPerCell, Math.ceil(24_000 / group));
+/** A group of 30 is a 1.9 MiB PUT; the cap keeps a cell under about 0.75 GiB written. */
+export const logOpCap = (profile: Profile, group: number) => Math.min(profile.maxOpsPerCell, Math.ceil(12_000 / group));
+
+/** The 256 KiB cells: about 2 GiB each at most. */
+export const bigObjectOpCap = (profile: Profile) => Math.min(profile.maxOpsPerCell, 8_000);
 
 /** A 100-item transaction is 200 write units; the cap keeps a cell near a million units. */
 export const transactOpCap = (profile: Profile, items: number) => Math.min(profile.maxOpsPerCell, Math.ceil(600_000 / items));
