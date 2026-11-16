@@ -27,6 +27,9 @@ spec:
       enableServiceLinks: false
       nodeSelector: ${NODE_SELECTOR_JSON}
       tolerations: ${TOLERATIONS_JSON}
+      # Never on a node that runs the pods named in the inputs (the production ingest pods), so the client
+      # cannot take CPU or network from them, nor they from it.
+      affinity: ${AFFINITY_JSON}
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

@@ -13,7 +13,7 @@ Parameters:
   DataAccountId:
     Type: String
     AllowedPattern: "^[0-9]{12}$"
-    Description: The throwaway (sessions-dev) account that holds the ledger-bench-client role.
+    Description: The throwaway data account that holds the ledger-bench-client role.
   PodRoleName:
     Type: String
     Default: ledger-bench-pod
