@@ -30,6 +30,8 @@ export interface Summary {
   modelId: string;
   tokensIn: number;
   tokensOut: number;
+  /** Set by the model summariser when it fell back to extractive text (a closed reason code). */
+  fallbackReason?: string;
 }
 
 /** Who the summary is for: the model summariser's budget and caps key on it. Ids only. */

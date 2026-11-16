@@ -59,6 +59,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "reason_codes",
   // Analytics export counters (src/shared/analytics-config.ts analyticsCounterFields): bounded counts only.
   ...ANALYTICS_COUNTER_FIELDS,
+  // Summary regeneration (src/summary-regen/audit.ts): the session id is logged only as session_hash (sha256);
+  // system and regeneration_reason are closed sets (ENUM_FIELDS); prior_* and failure_code are controlled codes.
+  "session_hash", "system", "request_id", "prior_status", "prior_failure_code", "regeneration_reason", "failure_code",
 ]);
 
 /**
@@ -100,7 +103,16 @@ function boundedCount(v: unknown, max: number): number | undefined {
 export const STORE_CAUSE_VALUES: ReadonlySet<string> = new Set([
   "econnreset", "etimedout", "econnrefused", "epipe", "abort", "timeout", "dns", "tls", "socket", "other",
 ]);
-const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["store_cause", STORE_CAUSE_VALUES]]);
+/** Summary regeneration reasons and systems (src/summary-regen/settings.ts REGEN_REASONS pins the same set). */
+export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
+  "turns_gained", "idle_uncovered", "ended_uncovered", "retry_backoff", "config_changed", "operator_requeue", "version_backfill",
+]);
+export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
+const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["store_cause", STORE_CAUSE_VALUES],
+  ["regeneration_reason", REGEN_REASON_VALUES],
+  ["system", REGEN_SYSTEM_VALUES],
+]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;

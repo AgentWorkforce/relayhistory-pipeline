@@ -29,7 +29,12 @@ import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
 import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
-import { digestRecords, type Summarizer } from "./summarizer.ts";
+import { digestRecords, type SessionDigest, type Summarizer } from "./summarizer.ts";
+import { hasColumns, SUMMARY_COVERAGE_COLUMNS } from "../summary-regen/detect.ts";
+import { regenActive, type RegenReason } from "../summary-regen/settings.ts";
+import { clampAttempts, maxDueAttempts, nextRetryAt } from "../summary-regen/backoff.ts";
+import { BOB_COSTAS_PIPELINE_VERSION } from "./versions.ts";
+import { RETRYABLE_FALLBACKS, bobCostasRegenFromEnv, reasonFromWorkKey, type BobCostasRegen } from "./regen.ts";
 import {
   ShortSummaryRejected,
   clearShortSummary,
@@ -59,6 +64,11 @@ export interface BobCostasDeps {
   directory?: ShortSummaryDirectory;
   /** READER_MAX_RULESET; undefined (default) keeps the legacy presence-only scrub check. */
   readerMaxRuleset?: number;
+  /**
+   * Summaries regeneration flags (push A). undefined reads them from the environment when the
+   * handler is built; null forces them off. With every flag off the handler runs today's queries only.
+   */
+  regen?: BobCostasRegen | null;
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -127,7 +137,13 @@ interface Outcome {
   tokensIn: number;
   tokensOut: number;
   records: number;
+  /** User turns in the digest the summary was built from (undefined: no digest). */
+  turns?: number;
+  /** The model summariser's fallback reason, when it published extractive text instead. */
+  fallbackReason?: string;
 }
+
+type Digested = { status: "quarantined" | "unsupported" | "empty" } | { status: "digest"; digest: SessionDigest };
 
 /**
  * The session's location, including the deployment prefix the manifest lives
@@ -147,19 +163,13 @@ function sessionLocation(m: ManifestV1, manifestKey: string) {
   };
 }
 
-async function buildOutcome(
-  kind: SummaryKind,
-  m: ManifestV1,
-  deps: BobCostasDeps,
-  manifestKey: string,
-  orgId: string,
-): Promise<Outcome> {
-  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
+/** Reads the scrubbed chunks and digests them; no model call. */
+async function loadDigest(m: ManifestV1, deps: BobCostasDeps, manifestKey: string): Promise<Digested> {
   // Scrub quarantine: an unscrubbed session is never read.
-  if (!m.raw.scrub) return { status: "quarantined", ...none };
+  if (!m.raw.scrub) return { status: "quarantined" };
   // A set maximum refuses a ruleset newer than this reader supports before any chunk GET.
   assertReaderScrubMarker(m.raw.scrub, deps.readerMaxRuleset);
-  if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
+  if (m.raw.format === "sqlite-rows") return { status: "unsupported" };
   const s = m.session;
   const loc = sessionLocation(m, manifestKey);
   const lines: string[] = [];
@@ -191,7 +201,23 @@ async function buildOutcome(
     );
   }
   const digest = digestRecords(s.harness, lines);
-  if (digest.records === 0) return { status: "empty", ...none };
+  if (digest.records === 0) return { status: "empty" };
+  return { status: "digest", digest };
+}
+
+async function buildOutcome(
+  kind: SummaryKind,
+  m: ManifestV1,
+  deps: BobCostasDeps,
+  manifestKey: string,
+  orgId: string,
+  preloaded?: Digested,
+): Promise<Outcome> {
+  const none = { tokensIn: 0, tokensOut: 0, records: 0 };
+  const read = preloaded ?? (await loadDigest(m, deps, manifestKey));
+  if (read.status !== "digest") return { status: read.status, ...none, ...(read.status === "empty" ? { turns: 0 } : {}) };
+  const digest = read.digest;
+  const s = m.session;
   // Ids only: the model summariser's per-org budget and per-session cap key on these.
   // The summariser never throws for a model failure; it falls back to extractive.
   const summary = await deps.summarizer.summarize(kind, digest, {
@@ -206,13 +232,91 @@ async function buildOutcome(
     tokensIn: summary.tokensIn,
     tokensOut: summary.tokensOut,
     records: digest.records,
+    turns: digest.userTurns.length,
+    ...(summary.fallbackReason ? { fallbackReason: summary.fallbackReason } : {}),
   };
+}
+
+/** The pointer row as the regeneration-aware handler reads it (hoopdb 0006 columns). */
+interface CoverageRow {
+  covered_turns: number | null;
+  failure_code: string | null;
+  degraded: boolean;
+  attempts: number;
+  next_retry_at: Date | string | null;
+  config_hash: string | null;
+  pipeline_version: string | null;
+}
+
+const SESSION_ACTIVITY_SQL = `SELECT state, last_activity_at < $6 AS idle FROM sessions.session_index
+        WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5`;
+
+/** ended (done/abandoned) or idle past SUMMARY_REGEN_IDLE_SECONDS, from session_index; null when neither. */
+async function sessionQuiet(deps: BobCostasDeps, pk: unknown[], idleSeconds: number, now: Date): Promise<"ended_uncovered" | "idle_uncovered" | null> {
+  const r = await deps.db.query<{ state: string; idle: boolean }>(SESSION_ACTIVITY_SQL, [
+    ...pk,
+    new Date(now.getTime() - idleSeconds * 1000).toISOString(),
+  ]);
+  const row = r.rows[0];
+  if (!row) return null;
+  if (row.state === "done" || row.state === "abandoned") return "ended_uncovered";
+  return row.idle === true ? "idle_uncovered" : null;
+}
+
+/**
+ * Whether a current, ready summary is due for regeneration anyway (flags (1), (2), (2b)). Returns the
+ * reason, plus the digest when it had to be read for the turn check so the rebuild does not read it again.
+ * A legacy row (covered_turns NULL) that is not due is stamped with the turns it covers, so the sweep's
+ * "uncovered" branch does not queue it again.
+ */
+async function regenDue(
+  regen: BobCostasRegen,
+  row: CoverageRow & { status: string },
+  m: ManifestV1,
+  deps: BobCostasDeps,
+  manifestKey: string,
+  pk: unknown[],
+  kind: SummaryKind,
+  now: Date,
+): Promise<{ reason: RegenReason; digest?: Digested } | null> {
+  if (row.status !== "ready") return null;
+  const { turns, retry } = regen.settings;
+  if (retry.configReset && row.degraded && row.config_hash !== regen.configHash) return { reason: "config_changed" };
+  const attempts = Number(row.attempts);
+  if (
+    retry.enabled &&
+    row.degraded &&
+    attempts >= 1 &&
+    attempts <= maxDueAttempts(retry.backoffSeconds) &&
+    row.next_retry_at !== null &&
+    new Date(row.next_retry_at).getTime() <= now.getTime()
+  )
+    return { reason: "retry_backoff" };
+  // Same revision and content: a stamped row covers exactly the turns it was built from. Only a row
+  // written before the migration (covered_turns NULL, "uncovered") needs the digest.
+  if (!turns.enabled || row.covered_turns !== null) return null;
+  const digest = await loadDigest(m, deps, manifestKey);
+  // No digest (empty, or a manifest no longer readable): nothing to regenerate from; the stamp of 0
+  // below keeps the sweep's "uncovered" branch from queueing the row again every tick.
+  const turnsNow = digest.status === "digest" ? digest.digest.userTurns.length : 0;
+  if (digest.status === "digest" && turnsNow >= turns.threshold) return { reason: "turns_gained", digest };
+  const quiet = turnsNow > 0 ? await sessionQuiet(deps, pk, turns.idleSeconds, now) : null;
+  if (quiet) return { reason: quiet, digest };
+  await deps.db.query(
+    `UPDATE sessions.session_summaries SET covered_turns = $8
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6
+        AND revision=$7 AND covered_turns IS NULL`,
+    [...pk, kind, m.revision, turnsNow],
+  );
+  return null;
 }
 
 export function bobCostasHandler(
   kind: SummaryKind,
   deps: BobCostasDeps,
 ): StageHandler {
+  const regenConfig = deps.regen === undefined ? bobCostasRegenFromEnv() : deps.regen;
+  const coverage = regenConfig && regenActive(regenConfig.settings) ? regenConfig : null;
   return async (message, recorder) => {
     const pointer = message.payload as RawPointer;
     if (!pointer || typeof pointer.manifestKey !== "string")
@@ -232,18 +336,31 @@ export function bobCostasHandler(
       s.session_id,
       s.machine_id,
     ];
-    const existing = await deps.db.query<{
+    // With a coverage flag on and hoopdb 0006 applied, the row also carries the coverage columns;
+    // otherwise (flags off, or the migration not yet applied) the query is today's, unchanged.
+    const regen =
+      coverage && (await hasColumns(deps.db, "sessions.session_summaries", SUMMARY_COVERAGE_COLUMNS)) ? coverage : null;
+    type PointerRow = {
       content_sha256: string;
       revision: string;
       status: string;
       key_id: string | null;
       object_key: string | null;
       object_sha256: string | null;
-    }>(
-      `SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries
+    };
+    const existing = regen
+      ? await deps.db.query<PointerRow & CoverageRow>(
+          `SELECT content_sha256, revision, status, key_id, object_key, object_sha256,
+                  covered_turns, failure_code, degraded, attempts, next_retry_at, config_hash, pipeline_version
+             FROM sessions.session_summaries
+            WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
+          [...pk, kind],
+        )
+      : await deps.db.query<PointerRow>(
+          `SELECT content_sha256, revision, status, key_id, object_key, object_sha256 FROM sessions.session_summaries
         WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
-      [...pk, kind],
-    );
+          [...pk, kind],
+        );
     const row = existing.rows[0];
     if (row && Number(row.revision) > m.revision)
       return { status: "skipped", reason: "stale_revision" };
@@ -256,13 +373,18 @@ export function bobCostasHandler(
       sessionLocation(m, pointer.manifestKey),
       kind,
     );
-    if (
+    const isCurrent =
       row &&
       Number(row.revision) === m.revision &&
       row.content_sha256 === m.raw.content_sha256 &&
       (row.status !== "ready" ||
-        (row.key_id === currentKeyId && row.object_key === expectedKey))
-    ) {
+        (row.key_id === currentKeyId && row.object_key === expectedKey));
+    // Flags (1), (2), (2b): a current row may still be due (uncovered turns, a retry, a config change).
+    const due =
+      isCurrent && regen
+        ? await regenDue(regen, row as PointerRow & CoverageRow, m, deps, pointer.manifestKey, pk, kind, deps.now?.() ?? new Date())
+        : null;
+    if (isCurrent && !due) {
       // The encrypted object and pointer are current, but a previous run may have
       // failed after COMMIT and before the directory write. Reconcile the directory
       // from the published object on every retry.
@@ -370,7 +492,7 @@ export function bobCostasHandler(
       return { status: "skipped", reason: "summary_current" };
     }
 
-    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey, message.ctx.orgId);
+    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey, message.ctx.orgId, due?.digest);
     const loc = sessionLocation(m, pointer.manifestKey);
     const key = summaryObjectKey(loc, kind);
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };
@@ -400,11 +522,17 @@ export function bobCostasHandler(
         [`96bulls:summary:${key}`],
       );
       // Under the lock, a newer revision may have published meanwhile: it owns the object.
-      const locked = await client.query<{ revision: string }>(
-        `SELECT revision FROM sessions.session_summaries
+      const locked = regen
+        ? await client.query<{ revision: string; degraded: boolean; attempts: number; config_hash: string | null }>(
+            `SELECT revision, degraded, attempts, config_hash FROM sessions.session_summaries
+              WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
+            [...pk, kind],
+          )
+        : await client.query<{ revision: string }>(
+            `SELECT revision FROM sessions.session_summaries
           WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
-        [...pk, kind],
-      );
+            [...pk, kind],
+          );
       if (locked.rows[0] && Number(locked.rows[0].revision) > m.revision) {
         await client.query("ROLLBACK");
         return { status: "skipped", reason: "stale_revision" };
@@ -434,7 +562,62 @@ export function bobCostasHandler(
           current,
         });
       }
-      await client.query(
+      const upsertParams = [
+        ...pk,
+        kind,
+        ctx.session_uuid ?? null,
+        m.trace_id,
+        m.revision,
+        m.raw.content_sha256,
+        outcome.status,
+        published ? String(key) : null,
+        published?.sha256 ?? null,
+        published?.keyId ?? null,
+        outcome.tokensIn,
+        outcome.tokensOut,
+      ];
+      if (regen) {
+        // Coverage: the turns this summary covers, and the retry state of a model fallback. Attempts
+        // count consecutive retryable fallbacks under one config (a config change starts again at 0);
+        // failure n of L waits backoff[n-1], failure L+1 is terminal (next_retry_at NULL).
+        const prior = (locked.rows[0] ?? null) as unknown as { degraded: boolean; attempts: number; config_hash: string | null } | null;
+        const { retry } = regen.settings;
+        // degraded marks published extractive text a later run may improve (retry or config change);
+        // the attempt counter and next_retry_at move only with the retry flag on.
+        const degraded =
+          outcome.status === "ready" && outcome.fallbackReason !== undefined && RETRYABLE_FALLBACKS.has(outcome.fallbackReason);
+        const retryable = retry.enabled && degraded;
+        const priorAttempts =
+          prior && prior.degraded && (!retry.configReset || prior.config_hash === regen.configHash) ? Number(prior.attempts) : 0;
+        const attempts = retryable ? clampAttempts(priorAttempts + 1) : 0;
+        const nextRetry = retryable ? nextRetryAt(attempts, retry.backoffSeconds, deps.now?.() ?? new Date()) : null;
+        await client.query(
+          `INSERT INTO sessions.session_summaries
+             (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,
+              content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at,
+              covered_turns, failure_code, degraded, attempts, next_retry_at, config_hash, pipeline_version)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::uuid,$8::uuid,$9,$10,$11,$12,$13,$14,$15,$16, now(),
+                   $17::integer, $18, $19::boolean, $20::smallint, $21::timestamptz, $22, $23)
+           ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id, kind) DO UPDATE SET
+             session_uuid = coalesce(excluded.session_uuid, sessions.session_summaries.session_uuid),
+             trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,
+             status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,
+             key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now(),
+             covered_turns = excluded.covered_turns, failure_code = excluded.failure_code, degraded = excluded.degraded,
+             attempts = excluded.attempts, next_retry_at = excluded.next_retry_at, config_hash = excluded.config_hash,
+             pipeline_version = excluded.pipeline_version`,
+          [
+            ...upsertParams,
+            outcome.turns ?? null,
+            outcome.fallbackReason ?? null,
+            degraded,
+            attempts,
+            nextRetry ? nextRetry.toISOString() : null,
+            regen.configHash,
+            BOB_COSTAS_PIPELINE_VERSION,
+          ],
+        );
+      } else await client.query(
         `INSERT INTO sessions.session_summaries
            (org_id, workspace_id, harness, session_id, machine_id, kind, session_uuid, trace_id, revision,
             content_sha256, status, object_key, object_sha256, key_id, tokens_in, tokens_out, generated_at)
@@ -444,20 +627,7 @@ export function bobCostasHandler(
            trace_id = excluded.trace_id, revision = excluded.revision, content_sha256 = excluded.content_sha256,
            status = excluded.status, object_key = excluded.object_key, object_sha256 = excluded.object_sha256,
            key_id = excluded.key_id, tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out, generated_at = now()`,
-        [
-          ...pk,
-          kind,
-          ctx.session_uuid ?? null,
-          m.trace_id,
-          m.revision,
-          m.raw.content_sha256,
-          outcome.status,
-          published ? String(key) : null,
-          published?.sha256 ?? null,
-          published?.keyId ?? null,
-          outcome.tokensIn,
-          outcome.tokensOut,
-        ],
+        upsertParams,
       );
       await client.query("COMMIT");
     } catch (err) {
@@ -498,6 +668,23 @@ export function bobCostasHandler(
       tokens_in: outcome.tokensIn,
       tokens_out: outcome.tokensOut,
     });
+    // Why this run regenerated, when a regeneration flag caused it (closed set; absent otherwise).
+    let regenerationReason: RegenReason | undefined = due?.reason;
+    if (!regenerationReason && regen) {
+      const queued = reasonFromWorkKey((message as { workKey?: unknown }).workKey);
+      const prior = row as (PointerRow & CoverageRow) | undefined;
+      if (queued === "retry_backoff" || queued === "config_changed") regenerationReason = queued;
+      else if (
+        regen.settings.turns.enabled &&
+        prior?.covered_turns != null &&
+        outcome.turns !== undefined &&
+        outcome.turns - Number(prior.covered_turns) >= regen.settings.turns.threshold
+      )
+        regenerationReason = "turns_gained";
+      else if (queued === "turns")
+        regenerationReason =
+          (await sessionQuiet(deps, pk, regen.settings.turns.idleSeconds, deps.now?.() ?? new Date())) ?? undefined;
+    }
     log.info("bob costas summary", {
       stage: `summary-${kind}`,
       kind,
@@ -509,6 +696,7 @@ export function bobCostasHandler(
       revision: m.revision,
       session_uuid: ctx.session_uuid,
       count: outcome.records,
+      ...(regenerationReason ? { regeneration_reason: regenerationReason } : {}),
     });
   };
 }
