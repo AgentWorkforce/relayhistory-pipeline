@@ -58,6 +58,7 @@ interface Harness {
   /** READ_API_OWNER_BUFFERED_WORKSPACES; default "*" (the directory allowlist decides). */
   obWorkspaces?: ReadonlySet<string> | "*";
   pointers?: Array<{ harness: string; pointers: number; live: number }>;
+  turnSource?: TurnsDeps["source"];
   liveSessions?: Record<string, number>;
   noOwnerBuffered?: boolean;
   livePointers?: (sessionIds: string[]) => Promise<Set<string>>;
@@ -103,9 +104,9 @@ function api(h: Harness = {}) {
   };
   const turns: TurnsDeps = {
     harnesses: async () => h.pointers ?? [],
-    source: async () => {
+    source: h.turnSource ?? (async () => {
       throw new Error("canonical source not used by these tests");
-    },
+    }),
   };
   const ownerBuffered: OwnerBufferedDeps | undefined = h.noOwnerBuffered ? undefined : {
     enabled: h.enabled ?? true,
@@ -528,6 +529,46 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     expect(await json(m)).toEqual({ nativeCli: "claude", nativeResumeId: null, sessionOwner: "u-1", originNode: "node-b" });
   });
 
+  test("source-free SessionClient read discovers the exact buffered turn harness without a directory row", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0), turn(1)]);
+    const scripted = scriptedReads({ sources: ["claude"], stages: [[st.row], [st.row]] });
+    const { get } = api({ store: s, reads: scripted.reads });
+    const r = await get(`/v1/sessions/${SESSION}/turns?workspace=ws-a`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
+    expect((await json(r)).turns.map((t: any) => t.content)).toEqual(["buffered 0", "buffered 1"]);
+    expect(scripted.calls.map((c) => c.fn)).toEqual(["sources", "stages", "stages"]);
+  });
+
+  test("an existing canonical pointer merges a later buffered turn for immediate read-your-writes", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [turn(0, { content: "buffered replacement" })]);
+    const scripted = scriptedReads({ sources: ["claude"], stages: [[st.row]] });
+    const { get } = api({
+      store: s,
+      reads: scripted.reads,
+      pointers: [{ harness: "claude", pointers: 1, live: 1 }],
+      turnSource: async () => ({
+        legacyCoverage: { version: 1, tables: [] },
+        rows: [{
+          table: "conversation_turns",
+          row: {
+            id: "00000000-0000-4000-8000-000000000000", org_id: "org-a", workspace_id: "ws-a",
+            source: "claude", session_id: SESSION, turn_index: 0, session_owner: "u-1", role: "assistant",
+            content: "published old value", actor_name: "Ada", actor_role: "owner",
+            metadata: { nativeCli: "claude" }, ts: "2026-11-05T12:00:00.123Z", live_revision: "1792000000000000",
+          },
+        }],
+      }),
+    });
+    const r = await get(`/v1/sessions/${SESSION}/turns?workspace=ws-a`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
+    expect((await json(r)).turns.map((t: any) => t.content)).toEqual(["buffered replacement"]);
+    expect(scripted.calls.map((c) => c.fn)).toEqual(["sources", "stages", "stages"]);
+  });
+
   test("gate down before the DB read: 501 turns_no_pointers exactly as main (flag off), logged buffered_unverified, no RPC", async () => {
     const s = store();
     const st = await putStage(s, 1, [turn(0, { content: "UNVERIFIED-CONTENT" })]);
@@ -637,12 +678,12 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     }
   });
 
-  test("source is required for the buffered path; canonical pointers win; flag off never calls the gate", async () => {
+  test("source-free needs exact discovery; canonical pointers win; flag off never calls the gate", async () => {
     const gate = scriptedGate(authority("7"));
     expect((await api({ gate }).get(`/v1/sessions/${SESSION}/turns?workspace=ws-a`)).status).toBe(501);
     expect((await api({ gate, enabled: false }).get(T)).status).toBe(501);
     expect((await api({ gate, pointers: [{ harness: "claude", pointers: 1, live: 0 }] }).get(T)).status).toBe(200);
-    expect(gate.calls).toHaveLength(0);
+    expect(gate.calls).toHaveLength(2);
   });
 
   test("a stage of another user is a 500", async () => {

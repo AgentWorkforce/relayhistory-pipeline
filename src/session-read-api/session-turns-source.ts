@@ -114,7 +114,7 @@ function liveAttribution(row: Record<string, unknown>): string | null {
  * relayhistory's `source` selection when given. Throws TurnsInputError.
  */
 export function turnRows(identity: Omit<CanonicalIdentity, "source">, snapshots: Array<{ harness: string; snapshot: CanonicalRows }>, source: string | undefined, options: { assumeNoLegacy?: boolean } = {}): Record<string, unknown>[] {
-  const byId = new Map<string, Record<string, unknown>>();
+  const candidates: Record<string, unknown>[] = [];
   for (const { harness, snapshot } of snapshots) {
     if (!snapshot.legacyCoverage && !options.assumeNoLegacy) throw new TurnsInputError("turns_unknown");
     for (const { table, row } of snapshot.rows) {
@@ -125,11 +125,20 @@ export function turnRows(identity: Omit<CanonicalIdentity, "source">, snapshots:
         if (harness !== source) continue;
         if (isLive(row) && liveAttribution(row) !== source) throw new TurnsInputError("turns_attribution");
       }
-      const id = String(row.id);
-      const prior = byId.get(id);
-      // The same Neon row exported under two sources is one row; a live record shares its Neon id.
-      if (!prior || (isLive(row) && !isLive(prior))) byId.set(id, row);
+      candidates.push(row);
     }
+  }
+  return mergeTurnRows(candidates);
+}
+
+/** Merge already validated public turn rows. Live (including owner-buffered) wins by revision. */
+export function mergeTurnRows(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const row of rows) {
+    const id = String(row.id);
+    const prior = byId.get(id);
+    // The same Neon row exported under two sources is one row; a live record shares its Neon id.
+    if (!prior || (isLive(row) && (!isLive(prior) || BigInt(String(row.live_revision)) > BigInt(String(prior.live_revision))))) byId.set(id, row);
   }
   // Neon holds one row per (workspace, stored source, turn_index); a live record of a key wins.
   const byKey = new Map<string, Record<string, unknown>>();

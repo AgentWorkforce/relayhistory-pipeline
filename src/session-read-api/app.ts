@@ -88,7 +88,7 @@ import type { StoredAnalysisResult } from "../session-analysis/processor.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
-import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
+import { MAX_TURN_HARNESSES, TurnsInputError, mergeTurnRows, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
@@ -136,6 +136,7 @@ import {
   readOwnerBufferedList,
   readOwnerBufferedEvents,
   readOwnerBufferedTurns,
+  readOwnerBufferedTurnSources,
   BufferedProjectionFailed,
   type BufferedScope,
   type BufferedSessionRow,
@@ -1612,13 +1613,31 @@ export function createReadApi(deps: ReadApiDeps) {
     const states = await turns.harnesses(scope);
     if (states.length > MAX_TURN_HARNESSES) throw unsupported("turns_harness_bound");
     const selected = source === undefined ? states : states.filter((h) => h.harness === source);
+    const ob = ownerBufferedFor(identity);
+    const bufferedSources = ob
+      ? source === undefined
+        ? (await bufferedDetail(c, () => readOwnerBufferedTurnSources(ob, bufferedScope(identity), sessionId)))?.sources ?? []
+        : [source]
+      : [];
+    if (bufferedSources.length > MAX_TURN_HARNESSES) throw unsupported("turns_harness_bound");
     if (!selected.some((h) => h.pointers > 0)) {
-      // Owner-only buffered (flag on): the caller's own kept buffered stages, `source` required.
-      const ob = ownerBufferedFor(identity);
-      if (ob && source !== undefined) {
-        const served = await bufferedTurns(c, identity, ob, sessionId, source);
-        // Stages that project to no turn: the existing answer (Cloud falls back).
-        if (served && (served.erased || served.rows.length > 0)) return { ...served, buffered: true };
+      // Owner-only buffered (flag on): exact-session discovery is independent of the directory,
+      // so a source-free SessionClient read can see its just-accepted turn without listing the
+      // turn-only session.
+      if (ob) {
+        const rows: Record<string, unknown>[] = [];
+        let erased = false;
+        for (const bufferedSource of bufferedSources) {
+          const served = await bufferedTurns(c, identity, ob, sessionId, bufferedSource);
+          if (!served) continue;
+          erased ||= served.erased;
+          rows.push(...served.rows);
+        }
+        if (erased || rows.length > 0) {
+          rows.sort((a, b) => Number(a.turn_index) - Number(b.turn_index)
+            || String(a.source).localeCompare(String(b.source)) || String(a.id).localeCompare(String(b.id)));
+          return { erased, rows: erased ? [] : rows, buffered: true };
+        }
       }
       throw unsupported("turns_no_pointers");
     }
@@ -1636,7 +1655,20 @@ export function createReadApi(deps: ReadApiDeps) {
           }, turns.deadlineMs ?? 3000);
         }),
       ]);
-      return { rows: turnRows(scope, snapshots, source, { assumeNoLegacy: turns.assumeNoLegacy === true }), erased: false, buffered: false };
+      let rows = turnRows(scope, snapshots, source, { assumeNoLegacy: turns.assumeNoLegacy === true });
+      let buffered = false;
+      if (ob) {
+        for (const bufferedSource of bufferedSources) {
+          const served = await bufferedTurns(c, identity, ob, sessionId, bufferedSource);
+          if (!served) continue;
+          if (served.erased) return { rows: [] as Record<string, unknown>[], erased: true, buffered: true };
+          if (served.rows.length > 0) {
+            rows = mergeTurnRows([...rows, ...served.rows]);
+            buffered = true;
+          }
+        }
+      }
+      return { rows, erased: false, buffered };
     } finally {
       clearTimeout(timer);
     }

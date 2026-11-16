@@ -654,6 +654,8 @@ export interface BufferedListPosition {
 
 export interface OwnerBufferedReads {
   list(scope: BufferedScope, authority: AuthorityHead, args: { cursor?: BufferedListPosition; limit: number }): Promise<BufferedSessionRow[]>;
+  /** Visible buffered harnesses for one exact session. Optional for non-SQL test/read adapters. */
+  sources?(scope: BufferedScope, authority: AuthorityHead, sessionId: string): Promise<string[]>;
   /** `signal`: the request's abort signal; the paged reader checks it before every page. */
   stages(scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string, signal?: AbortSignal): Promise<BufferedStageRow[]>;
 }
@@ -869,6 +871,9 @@ export const BUFFERED_STAGES_SQL =
 
 /** Same scope/head/source/session arguments; only the closed RPC name changes. */
 export const BUFFERED_TARGET_STAGES_SQL = BUFFERED_STAGES_SQL.replace("sessions.buffered_session_stages_for(", "sessions.buffered_session_stages_for_target(");
+/** Exact-session source discovery for source-free turns/metadata reads. */
+export const BUFFERED_TURN_SOURCES_SQL =
+  `SELECT source FROM sessions.buffered_turn_sources_for(p_workspace => $1, ${HEAD_ARGS}, p_session_id => $9)`;
 
 /**
  * 047020 paged exact-session stages: the same scope/head/source/session arguments plus the
@@ -1008,6 +1013,13 @@ export function sqlOwnerBufferedReads(
       const rows = await call(scope, BUFFERED_SESSIONS_SQL, [scope.workspaceId, ...head(authority), c?.ts ?? null, c ? c.sessionId : null, c ? c.source : null, limit]);
       if (rows.length > limit) invalid();
       return rows.map((r) => sessionRow(r, scope));
+    },
+    async sources(scope, authority, sessionId) {
+      const rows = await call(scope, BUFFERED_TURN_SOURCES_SQL, [scope.workspaceId, ...head(authority), sessionId]);
+      if (rows.length > 5) invalid();
+      const out = rows.map((r) => text(r.source, 255));
+      if (new Set(out).size !== out.length || out.some((s, i) => i > 0 && out[i - 1]!.localeCompare(s) >= 0)) invalid();
+      return out;
     },
     async stages(scope, authority, source, sessionId, signal) {
       const sql = STAGES_SQL[mode];
@@ -1539,6 +1551,37 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
   if (read === null || "unverifiedBeforeCandidate" in read) return read;
   if (read.erased) return { erased: true, rows: [] };
   return { erased: false, rows: bufferedTurnRows(scope, source, sessionId, read.records) };
+}
+
+/**
+ * GATED exact-session source discovery for a source-free turns read. This is deliberately
+ * separate from the directory list: a relay turn-only session must never become a directory
+ * row. A refusal before a candidate is observed preserves the route's existing 501; once a
+ * candidate exists, a moving authority fails closed with BufferedFenced.
+ */
+export async function readOwnerBufferedTurnSources(
+  deps: OwnerBufferedDeps,
+  scope: BufferedScope,
+  sessionId: string,
+): Promise<UnverifiedBeforeCandidate | { sources: string[] }> {
+  if (!deps.reads.sources) return { sources: [] };
+  let first: AuthorityHead;
+  let sources: string[];
+  try {
+    if (deps.indexCheck) await deps.indexCheck.ensure(scope);
+    first = await deps.gate.observe(scope);
+    sources = await deps.reads.sources(scope, first, sessionId);
+  } catch (error) {
+    if (error instanceof BufferedFenced) return unverified(error);
+    throw error;
+  }
+  try {
+    await finalGate(deps, scope, first);
+  } catch (error) {
+    if (error instanceof BufferedFenced && sources.length === 0) return unverified(error);
+    throw error;
+  }
+  return { sources };
 }
 
 type GatedSession =

@@ -32,13 +32,43 @@ session's S3 stream, through the normal buffered path.
 Under relayhistory custody (`DELIVERY_CUSTODY_SOURCE_MODE` unset), the forward still READS Neon (custody witness, cutover state), like a delivery batch. Only `frozen-supabase` takes Neon off it entirely.
 
 ## Activation gates
-`dual` can be turned on now (it changes no answer). `forward` must not be turned on until all of these are true:
-1. **Read-your-writes.** The SessionClient reads its write back from `GET /v1/sessions/:id/turns` immediately and retries into the next index when it is missing. That GET reads Neon today, so in `forward` mode every `writeTurn` fails (test: "forward: documents the activation gate"). Needs the read side (turns from S3 in the read Worker) AND a read path that sees buffered, not-yet-published stages, or a SessionClient change that tolerates eventual consistency.
-2. **Erasure fence off Neon.** Neon drops turns for sessions in `conversation_turn_fences` (any member's erasure). relayhistory's `forward` reads that fence from Neon today, and refuses under frozen-supabase custody. The ingest's own deletion fences are per origin, so the synthetic origin is not covered. Removing the Neon read needs the fences copied to Supabase plus a cross-origin session fence check on this route (a Supabase function; migration slot 20261105030000 is reserved for it).
-3. **Custody.** `forward` with relayhistory custody still reads Neon; flip `frozen-supabase` first (docs/p1-frozen-source-custody.md).
-4. **Erasure during a forward.** A `turns forward` line with `erased_during_forward: true` names a session whose copy reached the buffered stage after its erasure committed. Purge those copies before publication is enabled.
-5. **Publication.** Records reach canonical images and directory pointers only when the publication drain runs. A turn-only relay session (the SessionClient's random UUID) then gets a `session_index` row and would appear in the directory list (Neon never listed them). The list must exclude turn-only images before publication is enabled for orgs using turns.
-6. **Backfill.** Historical rows come from the legacy export (`legacy_conversation_turn`, PR 2). Read-side merge rule: per (workspace, source, session, turn_index) a live `conversation_turn` wins over a legacy row. Once `dual` is on, never go back to `neon` without re-running the export for the affected sessions.
+The code paths for all six gates are present, but this document does not authorize a production
+migration, export, publication run, or flag change. Those remain separate operator actions with
+Khaliq's explicit approval. In order:
+
+1. **Read-your-writes.** The canonical Cloud GET calls the read Worker before any Neon client is
+   created. With owner-buffered exact-session reads enabled, a source-free SessionClient GET uses
+   `buffered_turn_sources_for` and the existing twice-gated stage reader. It does not depend on a
+   directory row, so a just-acknowledged turn is visible before publication; when a canonical
+   pointer already exists, the newer buffered revision is merged over that image by the same
+   live-revision rule.
+2. **Erasure fence off Neon.** Migration `20261105062010_turns_forward_gates.sql` adds the permanent
+   logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
+   before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
+   turns origin; registration after an older fence materializes the same deletion. Before activation,
+   import every frozen Neon `conversation_turn_fences` key through `ingest_turn_fences_import` and
+   compare the source and target ordered key counts/digests.
+3. **Custody.** Cloud forward is Neon-free only in `frozen-supabase`. `supabase-authority` continues
+   to refuse all non-empty turn writes and must not be used for this migration. Flip custody first,
+   under its own runbook and approval.
+4. **Erasure during a forward.** Fence materialization bumps the normal turn-origin fence version,
+   writes `upload_deletions`, deletes stored revisions/ownership, and therefore drives the existing
+   buffered GC and publication-retire paths. A forward racing an erasure is either dropped at claim/
+   commit or retired and purged; there is no log-driven manual privacy gap.
+5. **Publication.** `aa_session_directory_hide_turn_only` tombstones a directory projection whose
+   live pointers are exclusively registered turns-origin pointers. The canonical pointer stays live
+   for GET turns. A normal pointer makes the predicate false and the ordinary projector restores the
+   directory row.
+6. **Backfill.** `migration:legacy-export` is the bounded, resumable one-shot exporter/verifier for
+   `conversation_turns`, links and outcomes. Its manifest is accepted only on the dedicated legacy
+   machine. The read merge remains live-over-legacy per
+   `(workspace, source, session, turn_index)`. Run `--verify` successfully after the final export;
+   once forward begins, never return to `neon` without re-exporting the affected scopes.
+
+Activation is allowed only after the migration is applied, the legacy fence import and legacy export
+both verify equal, `frozen-supabase` is already healthy, owner-buffered exact-session reads and
+canonical reads are healthy for the canary, and publication/GC have no backlog. `TURNS_WRITE_PATH`
+stays unset/`neon` while these code changes are reviewed.
 
 ## Rollback
 Unset `TURNS_WRITE_PATH` (live in seconds). Records already forwarded stay in the buffered stage and are inert until publication; Neon stays complete in `dual`.

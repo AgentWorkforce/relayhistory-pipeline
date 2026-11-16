@@ -185,6 +185,8 @@ export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenan
 /** C3 Supabase-first privacy authority head: the mirror head plus Neon's reset count (null for a selection). */
 export interface PrivacyAuthorityHead extends SourceControlHead { deleted: string | null }
 export interface Ledger {
+  /** Register relay-turn session writers and materialize any cross-origin erasure fence. */
+  registerTurnSessions?(input: { tenant: LedgerTenant; sessions: [string, string][] }): Promise<[string, string][]>;
   /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */
   frozenWitness?(input: FrozenWitnessInput): Promise<CurrentCustodyPacket>;
   /** Frozen Neon legacy receipt for a retried pre-cutover batch (refuses while a control is pending). */

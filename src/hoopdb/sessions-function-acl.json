@@ -1,6 +1,9 @@
 {
   "comment": "Expected ACL of every sessions function after a clean migrate (src/hoopdb/migrate-guards.ts sessionsFunctionAcl). Regenerate only in a reviewed change; tests compare it exactly on PGlite and real PostgreSQL 15/17.",
   "functions": {
+    "sessions.aa_session_directory_hide_turn_only()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ack_session_brief_documents(uuid,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -88,6 +91,10 @@
       "bulls96_read_api:EXECUTE"
     ],
     "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
@@ -1064,6 +1071,20 @@
     ],
     "sessions.ingest_stage_intent_retired_attempt_guard()": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_turn_capture_erasure()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_turn_fences_import(jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.ingest_turn_materialize_fence(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_turn_register(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.initialize_search_feature_baseline(text,text,uuid,bigint,text,bigint)": [
       "<owner>:EXECUTE",

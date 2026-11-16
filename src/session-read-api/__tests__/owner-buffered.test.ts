@@ -941,7 +941,7 @@ describe("no ungated path", () => {
     const names = Object.keys(ownerBuffered);
     for (const hidden of ["readStagesUngated", "finalGate", "bufferedTurnRows", "redactQuotedTail", "scrubTurnRow", "scrubDeep", "sameAuthority", "specOf", "readGatedSession", "bufferedEventRows", "scrubEventRow"])
       expect(names).not.toContain(hidden);
-    expect(names.filter((n) => /^read/u.test(n)).sort()).toEqual(["readOwnerBufferedEvents", "readOwnerBufferedList", "readOwnerBufferedTurns"]);
+    expect(names.filter((n) => /^read/u.test(n)).sort()).toEqual(["readOwnerBufferedEvents", "readOwnerBufferedList", "readOwnerBufferedTurnSources", "readOwnerBufferedTurns"]);
   });
   test("app.ts reaches buffered content only through the gated readers", () => {
     const app = readFileSync(join(import.meta.dir, "..", "app.ts"), "utf8");

@@ -80,7 +80,8 @@ type LedgerFunction =
   | "ingest_source_control_complete"
   | "ingest_privacy_authority_begin"
   | "ingest_privacy_authority_complete"
-  | "ingest_frozen_source_receipt";
+  | "ingest_frozen_source_receipt"
+  | "ingest_turn_register";
 
 async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, input: unknown): Promise<unknown> {
   let rows: Record<string, unknown>[];
@@ -328,6 +329,11 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
   }
   const hex64 = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   return {
+    async registerTurnSessions(input) {
+      if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
+      const r = (await call(run, "ingest_turn_register", input)) as Record<string, unknown>;
+      return pairs(r.fenced);
+    },
     async frozenWitness(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
       const r = (await call(run, "ingest_frozen_source_witness", input)) as Record<string, unknown>;

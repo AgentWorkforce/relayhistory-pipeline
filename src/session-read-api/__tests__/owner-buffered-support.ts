@@ -112,14 +112,19 @@ export const unzip = (b: Uint8Array, maxBytes?: number) => {
 };
 
 /** Scripted readers: `stages` answers per call (the last repeats); every call is recorded. */
-export function scriptedReads(init: { list?: BufferedSessionRow[] | Error; stages?: Array<BufferedStageRow[] | Error> } = {}) {
-  const calls: Array<{ fn: "list" | "stages"; scope: BufferedScope; authority: AuthorityHead; args: unknown }> = [];
+export function scriptedReads(init: { list?: BufferedSessionRow[] | Error; sources?: string[] | Error; stages?: Array<BufferedStageRow[] | Error> } = {}) {
+  const calls: Array<{ fn: "list" | "sources" | "stages"; scope: BufferedScope; authority: AuthorityHead; args: unknown }> = [];
   let stageCalls = 0;
   const reads: OwnerBufferedReads = {
     async list(scope, authority, args) {
       calls.push({ fn: "list", scope, authority, args });
       if (init.list instanceof Error) throw init.list;
       return init.list ?? [];
+    },
+    async sources(scope, authority, sessionId) {
+      calls.push({ fn: "sources", scope, authority, args: { sessionId } });
+      if (init.sources instanceof Error) throw init.sources;
+      return init.sources ?? [];
     },
     async stages(scope, authority, source, sessionId) {
       calls.push({ fn: "stages", scope, authority, args: { source, sessionId } });

@@ -765,6 +765,15 @@ export function createIngestApp(deps: IngestAppDeps) {
         if (capturePolicyUploads === "enforce") throw uploadPolicyError(violation, identity.capturePolicy!.revision);
       }
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      // The turns origin participates in every logical-session erasure. Registration is a
+      // mandatory privacy write before async enqueue or synchronous claim: it either materializes
+      // a pre-existing cross-origin fence or makes a later erasure fan out to this writer.
+      if (route === "turns.batches") {
+        if (!deps.deliver.ledger.registerTurnSessions) throw new IngestUnavailable("fence", "turn_fence_unavailable");
+        const sessions = [...new Map(batch.records.filter((r) => r.session_id !== null)
+          .map((r) => [`${r.source}\u001f${r.session_id}`, [r.source, r.session_id!] as [string, string]])).values()];
+        await deps.deliver.ledger.registerTurnSessions({ tenant, sessions });
+      }
       // Upload consent (upload-consent.ts): before any enqueue, claim or write. Explicit denies wait for the
       // post-claim check, which knows which sessions the deletion fence will drop anyway.
       // The operator's enforced sharing mode caps the person's choice (capture-policy.ts operatorSharingCap).
