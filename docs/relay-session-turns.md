@@ -48,9 +48,10 @@ Khaliq's explicit approval. In order:
    logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
    under a per-logical-session transaction advisory lock shared with erasure capture, then attests
    the completed registration with `X-Relay-Turn-Fence: registered-v1`; relayhistory-cloud refuses
-   before posting any batch unless the authenticated `GET /v1/turns/capabilities` probe reads the
-   migration-owned capability RPC and returns that header. Each batch response repeats the attestation.
-   before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
+   before posting any batch unless the independently default-off `INGEST_TURN_FENCE_REGISTER=on`
+   gate installs the authenticated `GET /v1/turns/capabilities` probe, reads the
+   migration-owned capability RPC, and returns that header. Each batch response repeats the attestation
+   after registration and before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
    turns origin; registration after an older fence materializes the same deletion. Before activation,
    import every frozen Neon `conversation_turn_fences` key through `ingest_turn_fences_import` and
    compare the source and target ordered key counts/digests.

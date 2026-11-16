@@ -182,6 +182,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
   INGEST_ORIGIN_CLAIM_FENCE?: string;
+  /** "on" (any case): register turn writers and serve the turn-fence capability receipt. Buffered only; default off. */
+  INGEST_TURN_FENCE_REGISTER?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
   SESSION_ERASE_API_ENABLED?: string;
   /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
@@ -268,6 +270,8 @@ export interface IngestSettings {
   claimLockWaitMs?: number;
   /** INGEST_ORIGIN_CLAIM_FENCE=on (buffered only): per-origin claim serialization (ledger-sql.ts). Absent (the default): per-user. */
   originClaimFence?: true;
+  /** INGEST_TURN_FENCE_REGISTER=on (buffered only): turn writer registration + receipt. Absent (the default): old route behavior. */
+  turnFenceRegister?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
@@ -325,6 +329,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (asyncMode !== "off" && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ASYNC_ADMISSION needs buffered acceptance");
   const originClaimFence = routingFlag(env.INGEST_ORIGIN_CLAIM_FENCE);
   if (originClaimFence && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ORIGIN_CLAIM_FENCE needs buffered acceptance");
+  const turnFenceRegister = routingFlag(env.INGEST_TURN_FENCE_REGISTER);
+  if (turnFenceRegister && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_TURN_FENCE_REGISTER needs buffered acceptance");
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
@@ -383,6 +389,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
+    ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
@@ -522,6 +529,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
     ...(settings.httpAdmissionStoppedOrgs ? { httpAdmissionStoppedOrgs: settings.httpAdmissionStoppedOrgs } : {}),
     ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
+    ...(settings.turnFenceRegister ? { turnFenceRegister: true as const } : {}),
     // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
     // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;
     // the next S3-ledger claim for the user (or the reset's own retry elsewhere) finishes it (ledger-s3.ts finishResets).

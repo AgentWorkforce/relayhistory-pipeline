@@ -98,7 +98,7 @@ test("HTTP: turns land in the buffered stage through the normal custody + claim 
  const {createIngestApp}=await import("../app.ts");
  const {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER}=await import("../custody-protocol.ts");
  const f=await fixture();const logs:Record<string,unknown>[]=[];
- const mk=(custodySource:"relayhistory"|"frozen-supabase")=>createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:(x)=>logs.push(x),custodySource});
+ const mk=(custodySource:"relayhistory"|"frozen-supabase")=>createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:(x)=>logs.push(x),custodySource,turnFenceRegister:true});
  const capability=await mk("frozen-supabase").request("/v1/turns/capabilities");
  expect(capability.status).toBe(204);
  expect(capability.headers.get("x-relay-turn-fence")).toBe("registered-v1");
@@ -150,12 +150,26 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
  expect(await f.stages()).toHaveLength(0);
 });
 
+test("HTTP: turn-fence registration and capability are independently default-off",async()=>{
+ const {createIngestApp}=await import("../app.ts");
+ const f=await fixture();let registrations=0;
+ const app=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:{...f.deps,ledger:{...f.deps.ledger,registerTurnSessions:async()=>{registrations++;return[]},turnFenceCapability:async()=>true}},log:()=>{},custodySource:"frozen-supabase"});
+ expect((await app.request("/v1/turns/capabilities")).status).toBe(501);
+ const response=await app.request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await turnBatch([turn(0)]))});
+ expect(response.status).toBe(200);
+ expect(response.headers.get("x-relay-turn-fence")).toBeNull();
+ expect(registrations).toBe(0);
+});
+
 test("cross-origin erasure fences registered turns whether erasure or registration commits first",async()=>{
  const f=await fixture();
  await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
  await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'another-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  const materialized=await f.db.query("SELECT origin_id,source,session_id FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID]);
  expect(materialized.rows).toEqual([{origin_id:TURN_ORIGIN_ID,source:"claude",session_id:SESSION}]);
+ expect((await f.db.query("SELECT epoch::int AS epoch FROM sessions.ingest_fence_versions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID])).rows).toEqual([{epoch:1}]);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:0}]);
+ await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
  expect((await f.db.query("SELECT epoch::int AS epoch FROM sessions.ingest_fence_versions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID])).rows).toEqual([{epoch:1}]);
 
  const later="7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a6b";
@@ -164,14 +178,31 @@ test("cross-origin erasure fences registered turns whether erasure or registrati
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4 AND session_id=$5",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,later])).rows).toEqual([{n:1}]);
 });
 
+test("migration backfills exact-session deletions that predate the turn trigger",async()=>{
+ const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
+ await db.exec(read("supabase/tests/supabase_shim.sql"));
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
+ for(const f of migrationFiles(root).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"))await db.exec(read("supabase/migrations/"+f));
+ await db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'older-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
+ await db.exec(read("supabase/migrations/20261105062020_turns_forward_gates.sql"));
+ expect((await db.query("SELECT fence_basis FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{fence_basis:"live"}]);
+});
+
 test("turn-only canonical pointers stay addressable but their directory projection is tombstoned",async()=>{
  const f=await fixture();
+ // Production's post-migration operator bootstrap grants this exact direct-DML surface.
+ // Keep the fixture narrow: it has no search_index schema, which the full bootstrap also manages.
+ await f.db.exec("GRANT USAGE ON SCHEMA sessions TO search_consumer_runtime;GRANT SELECT,INSERT,UPDATE ON sessions.session_directory TO search_consumer_runtime;CREATE POLICY search_consumer_trusted ON sessions.session_directory FOR ALL TO search_consumer_runtime USING(true) WITH CHECK(true)");
  await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
  const pointer=[TENANT.orgId,TENANT.workspaceId,"claude",SESSION,liveMachineId(TENANT.workspaceId,TURN_ORIGIN_ID,TENANT.userId),TENANT.userId];
  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
   VALUES($1,$2,$3,$4,$5,$6,'2026-11-05','2026-11-05','s3','bucket','turn-manifest','11111111-1111-4111-8111-111111111111')`,pointer);
- await f.db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at)
-  VALUES($1,$2,'claude',$3,'2026-11-05','2026-11-05')`,[TENANT.orgId,TENANT.workspaceId,SESSION]);
+ await f.db.exec("BEGIN;SET LOCAL ROLE search_consumer_runtime");
+ try{
+  await f.db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at)
+   VALUES($1,$2,'claude',$3,'2026-11-05','2026-11-05')`,[TENANT.orgId,TENANT.workspaceId,SESSION]);
+  await f.db.exec("COMMIT");
+ }catch(error){await f.db.exec("ROLLBACK");throw error}
  expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3 AND deleted_at IS NULL",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{n:1}]);
  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)

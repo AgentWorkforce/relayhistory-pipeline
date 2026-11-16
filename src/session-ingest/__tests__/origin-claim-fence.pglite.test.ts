@@ -228,6 +228,16 @@ describe("ledger-sql routing (INGEST_ORIGIN_CLAIM_FENCE)", () => {
     const canonical = { ...full, INGEST_ACCEPTANCE_MODE: "canonical", INGEST_EXPECT_GENERATION: undefined, INGEST_INLINE_MAX_SESSIONS: undefined, INGEST_ORIGIN_CLAIM_FENCE: "on" };
     await expect(ingestSettings(canonical as never)).rejects.toThrow("INGEST_ORIGIN_CLAIM_FENCE needs buffered acceptance");
   });
+  test("worker: INGEST_TURN_FENCE_REGISTER is independently default-off, buffered-only, and strict-on", async () => {
+    const { ingestSettings } = await import("../worker.ts");
+    const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign",
+      INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn", INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: generation, INGEST_INLINE_MAX_SESSIONS: "0" };
+    expect((await ingestSettings(full))!.turnFenceRegister).toBeUndefined();
+    for (const value of ["on", "ON", " On "]) expect((await ingestSettings({ ...full, INGEST_TURN_FENCE_REGISTER: value }))!.turnFenceRegister).toBe(true);
+    for (const value of ["", "off", "1", "true", "garbage"]) expect((await ingestSettings({ ...full, INGEST_TURN_FENCE_REGISTER: value }))!.turnFenceRegister).toBeUndefined();
+    await expect(ingestSettings({ ...full, INGEST_ACCEPTANCE_MODE: "canonical", INGEST_EXPECT_GENERATION: undefined, INGEST_INLINE_MAX_SESSIONS: undefined, INGEST_TURN_FENCE_REGISTER: "on" } as never))
+      .rejects.toThrow("INGEST_TURN_FENCE_REGISTER needs buffered acceptance");
+  });
   test("on: every other error passes through unchanged and never retries the per-user function", async () => {
     for (const code of ["55P03", "57014", "40001", "55000"]) {
       resetOriginFenceHint();

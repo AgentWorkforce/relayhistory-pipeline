@@ -321,9 +321,13 @@ describe("async request path: no SQL, one create-only inbox PUT, the hosted queu
     const sync = await start({ SELFHOST_INGEST_ADMISSION: undefined });
     const syncRes = await post(sync.url("/v1/turns/batches"), body);
     expect(syncRes.status).toBe(200);
+    expect(syncRes.headers.get("x-relay-turn-fence")).toBeNull();
+    // Self-host's unknown-capability wrapper is the pre-gate 501 contract.
+    expect((await fetch(sync.url("/v1/turns/capabilities"))).status).toBe(501);
     const s = await start();
     const res = await post(s.url("/v1/turns/batches"), body);
     expect(res.status).toBe(200);
+    expect(res.headers.get("x-relay-turn-fence")).toBeNull();
     expect(res.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_QUEUED);
     expect(await res.text()).toBe(await syncRes.text());
     expect(s.sql.calls).toBe(0);

@@ -2,6 +2,7 @@
 -- ledger row. Guard, object removal and ledger removal are one transaction
 -- under the migrator lock. On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
+SET LOCAL lock_timeout='5s';
 SELECT pg_advisory_xact_lock(961996,1); -- same namespace as the real migrator
 DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
@@ -10,7 +11,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062020_turns_forward_gates.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_turns_forward_gates.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'08ba3e772d0752494b041206f8c1bd273032e551064e04e7ed15fc962ca3d958'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '7fc75e9218420d86567c5784f86e560d87e06b536168c68017573e6c7737471b'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.turn_session_fences) OR EXISTS(SELECT 1 FROM sessions.turn_writers)
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: privacy state must be preserved';END IF;

@@ -41,7 +41,7 @@ export const turnsForwardGates: LaneManifest = {
       grants: ["bulls96_read_api"],
     },
     "sessions.aa_session_directory_hide_turn_only()": {
-      secdef: false,
+      secdef: true,
       grants: [],
     },
   },

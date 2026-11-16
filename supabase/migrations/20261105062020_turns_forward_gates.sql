@@ -55,25 +55,34 @@ CREATE FUNCTION sessions.ingest_turn_materialize_fence(
  p_org text,p_ws text,p_source text,p_session text
 ) RETURNS integer LANGUAGE plpgsql VOLATILE
 SET search_path=pg_catalog,pg_temp AS $materialize$
-DECLARE w record;v_n integer:=0;
+DECLARE w record;v_n integer:=0;v_inserted integer;
 BEGIN
  FOR w IN SELECT user_id FROM sessions.turn_writers
    WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=p_session
    ORDER BY user_id COLLATE "C"
  LOOP
-  INSERT INTO sessions.ingest_fence_versions AS f(org_id,workspace_id,user_id,origin_id,source,session_id,epoch)
-   VALUES(p_org,p_ws,w.user_id,'relayhistory:conversation_turns:v1',p_source,p_session,1)
-  ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id)
-   DO UPDATE SET epoch=f.epoch+1;
   INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id)
    VALUES(p_org,p_ws,w.user_id,'relayhistory:conversation_turns:v1',p_source,p_session)
   ON CONFLICT DO NOTHING;
-  DELETE FROM sessions.ingest_record_revisions r
-   WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.user_id=w.user_id
-    AND r.origin_id='relayhistory:conversation_turns:v1' AND r.source=p_source AND r.session_id=p_session;
-  DELETE FROM sessions.ingest_session_ownership o
-   WHERE o.org_id=p_org AND o.workspace_id=p_ws AND o.user_id=w.user_id
-    AND o.origin_id='relayhistory:conversation_turns:v1' AND o.source=p_source AND o.session_id=p_session;
+  GET DIAGNOSTICS v_inserted=ROW_COUNT;
+  -- A retry of the same permanently fenced writer must not manufacture a new epoch. The first
+  -- materialization does the existing invalidation/cleanup; later retries only prove the fence.
+  IF v_inserted=1 THEN
+   INSERT INTO sessions.ingest_fence_versions AS f(org_id,workspace_id,user_id,origin_id,source,session_id,epoch)
+    VALUES(p_org,p_ws,w.user_id,'relayhistory:conversation_turns:v1',p_source,p_session,1)
+   ON CONFLICT(org_id,workspace_id,user_id,origin_id,source,session_id)
+    DO UPDATE SET epoch=f.epoch+1;
+   DELETE FROM sessions.ingest_record_revisions r
+    WHERE r.org_id=p_org AND r.workspace_id=p_ws AND r.user_id=w.user_id
+     AND r.origin_id='relayhistory:conversation_turns:v1' AND r.source=p_source AND r.session_id=p_session;
+   DELETE FROM sessions.ingest_session_ownership o
+    WHERE o.org_id=p_org AND o.workspace_id=p_ws AND o.user_id=w.user_id
+     AND o.origin_id='relayhistory:conversation_turns:v1' AND o.source=p_source AND o.session_id=p_session;
+  END IF;
+  -- The permanent logical fence plus the ordinary upload_deletions row is the durable state.
+  -- Do not retain the erased user's id in the auxiliary writer registry.
+  DELETE FROM sessions.turn_writers
+   WHERE org_id=p_org AND workspace_id=p_ws AND user_id=w.user_id AND source=p_source AND session_id=p_session;
   v_n:=v_n+1;
  END LOOP;
  RETURN v_n;
@@ -111,6 +120,14 @@ CREATE TRIGGER ingest_turn_capture_erasure
  AFTER INSERT ON sessions.upload_deletions
  REFERENCING NEW TABLE AS inserted_turn_erasures
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_turn_capture_erasure();
+
+-- The trigger cannot observe rows that predate this migration. Seed the permanent logical census
+-- from every existing exact-session deletion before a turn writer can be registered.
+INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
+ SELECT DISTINCT org_id,workspace_id,source,session_id,'live'
+ FROM sessions.upload_deletions
+ WHERE session_id IS NOT NULL AND origin_id<>'relayhistory:conversation_turns:v1'
+ ON CONFLICT DO NOTHING;
 
 -- Called by POST /v1/turns/batches after strict parsing and before any enqueue/claim. It registers
 -- the exact user/source/session writers and returns the pairs already fenced. A fenced pair is not
@@ -190,13 +207,14 @@ BEGIN
     AND EXISTS(SELECT 1 FROM sessions.buffered_session_stages_for_target(
       p_workspace,c.source,p_session_id,p_cutover_epoch,p_head_epoch,p_head_version,p_head_digest,
       p_head_kind,p_head_pending,p_privacy_baseline_sha256))
-   ORDER BY c.source COLLATE "C" LIMIT 5;
+   -- Six is an overflow sentinel: the caller refuses >5 instead of silently truncating.
+   ORDER BY c.source COLLATE "C" LIMIT 6;
 END $sources$;
 
 -- Turn-only canonical pointers remain addressable by GET turns but never become a live directory
 -- row. A later non-turn pointer makes the predicate false and the normal projector can restore it.
 CREATE FUNCTION sessions.aa_session_directory_hide_turn_only() RETURNS trigger
-LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
 BEGIN
  IF NEW.deleted_at IS NULL
   AND EXISTS(SELECT 1 FROM sessions.session_index s WHERE s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id

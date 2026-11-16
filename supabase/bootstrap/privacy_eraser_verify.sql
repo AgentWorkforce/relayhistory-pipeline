@@ -13,7 +13,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||
   CASE WHEN current_setting('server_version_num')::int>=170000 THEN ',MAINTAIN' ELSE '' END;
 BEGIN
- -- Allowed only after 062010. The same verifier must pass before that migration
+ -- Allowed only after 062020. The same verifier must pass before that migration
  -- and again after its guarded rollback.
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn
   WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT IN(

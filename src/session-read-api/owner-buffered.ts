@@ -1018,7 +1018,9 @@ export function sqlOwnerBufferedReads(
       const rows = await call(scope, BUFFERED_TURN_SOURCES_SQL, [scope.workspaceId, ...head(authority), sessionId]);
       if (rows.length > 5) invalid();
       const out = rows.map((r) => text(r.source, 255));
-      if (new Set(out).size !== out.length || out.some((s, i) => i > 0 && out[i - 1]!.localeCompare(s) >= 0)) invalid();
+      // The RPC orders with COLLATE "C". Source ids are ASCII; compare code units here rather
+      // than localeCompare, whose underscore/hyphen and case ordering varies by runtime locale.
+      if (new Set(out).size !== out.length || out.some((s, i) => i > 0 && out[i - 1]! >= s)) invalid();
       return out;
     },
     async stages(scope, authority, source, sessionId, signal) {

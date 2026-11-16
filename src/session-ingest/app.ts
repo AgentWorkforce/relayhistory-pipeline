@@ -155,6 +155,12 @@ export interface IngestAppDeps {
    */
   analytics?: AnalyticsPort;
   /**
+   * INGEST_TURN_FENCE_REGISTER=on (buffered hosted ingest only). Absent (the default): the turns
+   * route is byte-for-byte the pre-gate path, the capability route is not installed, no writer is
+   * registered, and no turn-fence receipt header is returned.
+   */
+  turnFenceRegister?: true;
+  /**
    * RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): report (default) logs an upload that breaks the
    * caller's capture policy and accepts it; enforce refuses it. Only identities carrying a policy (self-host) are checked.
    */
@@ -748,16 +754,18 @@ export function createIngestApp(deps: IngestAppDeps) {
   // Cloud's deployment-order interlock. This reads an RPC created atomically with the
   // turn-fence tables/functions, so new Worker code against old ingest code OR an old
   // database refuses before the first turn batch is posted.
-  app.get(TURN_FENCE_CAPABILITY_PATH, async (c) => {
-    try {
-      if (!deps.deliver.ledger.turnFenceCapability || !(await deps.deliver.ledger.turnFenceCapability()))
-        throw new IngestUnavailable("fence", "turn_fence_unavailable");
-      c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
-      return c.body(null, 204);
-    } catch (error) {
-      return failure(c, error);
-    }
-  });
+  if (deps.turnFenceRegister) {
+    app.get(TURN_FENCE_CAPABILITY_PATH, async (c) => {
+      try {
+        if (!deps.deliver.ledger.turnFenceCapability || !(await deps.deliver.ledger.turnFenceCapability()))
+          throw new IngestUnavailable("fence", "turn_fence_unavailable");
+        c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
+        return c.body(null, 204);
+      } catch (error) {
+        return failure(c, error);
+      }
+    });
+  }
 
   // One acceptance path for the public delivery shape and the private turns shape: the
   // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.
@@ -784,24 +792,25 @@ export function createIngestApp(deps: IngestAppDeps) {
         if (capturePolicyUploads === "enforce") throw uploadPolicyError(violation, identity.capturePolicy!.revision);
       }
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
-      // The turns origin participates in every logical-session erasure. Registration is a
-      // mandatory privacy write before async enqueue or synchronous claim: it either materializes
-      // a pre-existing cross-origin fence or makes a later erasure fan out to this writer.
-      if (route === "turns.batches") {
-        if (!deps.deliver.ledger.registerTurnSessions) throw new IngestUnavailable("fence", "turn_fence_unavailable");
-        const sessions = [...new Map(batch.records.filter((r) => r.session_id !== null)
-          .map((r) => [`${r.source}\u001f${r.session_id}`, [r.source, r.session_id!] as [string, string]])).values()];
-        await deps.deliver.ledger.registerTurnSessions({ tenant, sessions });
-        // This response-local attestation is the cloud Worker's deployment interlock:
-        // an older ingest can still return a valid durable receipt, but can never set it.
-        c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
-      }
       // Upload consent (upload-consent.ts): before any enqueue, claim or write. Explicit denies wait for the
       // post-claim check, which knows which sessions the deletion fence will drop anyway.
       // The operator's enforced sharing mode caps the person's choice (capture-policy.ts operatorSharingCap).
       // Only with INGEST_UPLOAD_CONSENT on: with it off (the default) capture enforce behaves exactly as on main.
       const operator = deps.uploadConsent && deps.uploadConsent.enforcement !== "off" ? operatorSharingCap(identity, capturePolicyUploads) : undefined;
       await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { deferDenied: true, phase: "precheck", route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f }));
+      // The turns origin participates in every logical-session erasure. The independently
+      // default-off registration gate is checked only after the pre-write consent check, and
+      // before either async enqueue or synchronous claim. It either materializes a pre-existing
+      // cross-origin fence or makes a later erasure fan out to this writer.
+      if (route === "turns.batches" && deps.turnFenceRegister) {
+        if (!deps.deliver.ledger.registerTurnSessions) throw new IngestUnavailable("fence", "turn_fence_unavailable");
+        const sessions = [...new Map(batch.records.filter((r) => r.session_id !== null)
+          .map((r) => [`${r.source}\u001f${r.session_id}`, [r.source, r.session_id!] as [string, string]])).values()];
+        await deps.deliver.ledger.registerTurnSessions({ tenant, sessions });
+        // This response-local attestation is the cloud Worker's deployment interlock:
+        // an older or flag-off ingest can still return a durable receipt, but can never set it.
+        c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
+      }
       // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
       // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
       // header must come from the claim).
