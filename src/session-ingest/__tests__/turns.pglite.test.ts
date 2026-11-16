@@ -102,6 +102,7 @@ test("HTTP: turns land in the buffered stage through the normal custody + claim 
  const b1=await turnBatch([turn(0),turn(1,{role:"assistant",content:"card 4111 1111 1111 1111 here"})]);
  const r1=await mk("frozen-supabase").request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(b1)});
  expect(r1.status).toBe(200);
+ expect(r1.headers.get("x-relay-turn-fence")).toBe("registered-v1");
  const receipt=await r1.json() as any;
  expect(receipt).toMatchObject({protocolVersion:1,batchId:"turns-1",acceptanceLevel:"durable",acceptedRevisionIds:b1.records.map((r)=>r.revision_id)});
  expect(JSON.parse(r1.headers.get(CURRENT_CUSTODY_ACK_HEADER)!)).toMatchObject({version:1});
@@ -124,10 +125,12 @@ test("HTTP: turns land in the buffered stage through the normal custody + claim 
  const envelope=JSON.stringify({protocol:"relay-ingest-custody-v1",original:{bodyBase64:Buffer.from(body(b2)).toString("base64"),contentEncoding:"identity"},...packet});
  const r2=await mk("relayhistory").request("/v1/turns/batches",{method:"POST",headers:{"content-type":CURRENT_CUSTODY_CONTENT_TYPE},body:envelope});
  expect(r2.status).toBe(200);
+ expect(r2.headers.get("x-relay-turn-fence")).toBe("registered-v1");
  expect(await f.stages()).toHaveLength(2);
  // Default custody mode with no witness fails closed (503), exactly like a batch.
  const r3=await mk("relayhistory").request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await turnBatch([turn(5)],"turns-3"))});
  expect(r3.status).toBe(503);
+ expect(r3.headers.get("x-relay-turn-fence")).toBe("registered-v1");
 });
 
 test("HTTP: the private kind is never accepted on the public delivery route, and turns route refuses delivery records",async()=>{
@@ -136,6 +139,7 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
  const app=createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:()=>{},custodySource:"frozen-supabase"});
  const pub=await app.request("/v1/delivery/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await turnBatch([turn(0)]))});
  expect(pub.status).toBe(422);expect((await pub.json() as any).error.code).toBe("unsupported_evidence");
+ expect(pub.headers.get("x-relay-turn-fence")).toBeNull();
  const priv=await app.request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await batch([record({record_id:"r1"})]))});
  expect(priv.status).toBe(400);
  const noScope=createIngestApp({identify:()=>({...TENANT,scopes:["rth:read"]}),deliver:f.deps,log:()=>{},custodySource:"frozen-supabase"});

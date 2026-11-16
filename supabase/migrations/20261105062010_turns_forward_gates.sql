@@ -74,6 +74,11 @@ CREATE FUNCTION sessions.ingest_turn_capture_erasure() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $capture$
 BEGIN
  IF NEW.session_id IS NULL OR NEW.origin_id='relayhistory:conversation_turns:v1' THEN RETURN NEW;END IF;
+ -- Serialize registration and every erasure for one logical session. Without this lock,
+ -- registration can insert an uncommitted writer while an erasure inserts an uncommitted
+ -- fence; each transaction then misses the other's row and neither materializes the fence.
+ PERFORM pg_advisory_xact_lock(hashtextextended(
+  NEW.org_id||chr(31)||NEW.workspace_id||chr(31)||NEW.source||chr(31)||NEW.session_id,0));
  INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
  VALUES(NEW.org_id,NEW.workspace_id,NEW.source,NEW.session_id,'live') ON CONFLICT DO NOTHING;
  PERFORM sessions.ingest_turn_materialize_fence(NEW.org_id,NEW.workspace_id,NEW.source,NEW.session_id);
@@ -102,6 +107,8 @@ BEGIN
  FOR x IN SELECT f.source,f.session_id FROM sessions.ingest_fence_pairs(p->'sessions') f
           ORDER BY f.source COLLATE "C",f.session_id COLLATE "C"
  LOOP
+  PERFORM pg_advisory_xact_lock(hashtextextended(
+   v_org||chr(31)||v_ws||chr(31)||x.source||chr(31)||x.session_id,0));
   INSERT INTO sessions.turn_writers(org_id,workspace_id,user_id,source,session_id)
    VALUES(v_org,v_ws,v_user,x.source,x.session_id) ON CONFLICT DO NOTHING;
   IF EXISTS(SELECT 1 FROM sessions.turn_session_fences q
@@ -128,6 +135,8 @@ BEGIN
  LOOP
   IF x.org_id IS NULL OR x.workspace_id IS NULL OR x.source IS NULL OR x.session_id IS NULL
   THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn fence import: incomplete row';END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(
+   x.org_id||chr(31)||x.workspace_id||chr(31)||x.source||chr(31)||x.session_id,0));
   INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
    VALUES(x.org_id,x.workspace_id,x.source,x.session_id,'legacy_import') ON CONFLICT DO NOTHING;
   PERFORM sessions.ingest_turn_materialize_fence(x.org_id,x.workspace_id,x.source,x.session_id);

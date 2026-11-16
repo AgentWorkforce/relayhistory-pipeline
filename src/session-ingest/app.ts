@@ -75,6 +75,9 @@ export const UPLOAD_CONSENT_PATH = "/v1/upload-consent";
 const READ_PATHS = new Set(["/v1/onboarding/connection", "/v1/onboarding/receipt"]);
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
 export const SIGNATURE_HEADER = "x-relay-ingest-signature";
+/** Set only after the mandatory cross-origin turn writer registration commits to this request. */
+export const TURN_FENCE_HEADER = "x-relay-turn-fence";
+export const TURN_FENCE_REGISTERED = "registered-v1";
 /** How old (or how far ahead) a signature may be. */
 export const SIGNATURE_WINDOW_SECONDS = 60;
 
@@ -773,6 +776,9 @@ export function createIngestApp(deps: IngestAppDeps) {
         const sessions = [...new Map(batch.records.filter((r) => r.session_id !== null)
           .map((r) => [`${r.source}\u001f${r.session_id}`, [r.source, r.session_id!] as [string, string]])).values()];
         await deps.deliver.ledger.registerTurnSessions({ tenant, sessions });
+        // This response-local attestation is the cloud Worker's deployment interlock:
+        // an older ingest can still return a valid durable receipt, but can never set it.
+        c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
       }
       // Upload consent (upload-consent.ts): before any enqueue, claim or write. Explicit denies wait for the
       // post-claim check, which knows which sessions the deletion fence will drop anyway.

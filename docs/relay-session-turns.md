@@ -46,6 +46,9 @@ Khaliq's explicit approval. In order:
    turn.
 2. **Erasure fence off Neon.** Migration `20261105062010_turns_forward_gates.sql` adds the permanent
    logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
+   under a per-logical-session transaction advisory lock shared with erasure capture, then attests
+   the completed registration with `X-Relay-Turn-Fence: registered-v1`; relayhistory-cloud refuses
+   every otherwise-valid receipt from an older ingest that omits this header.
    before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
    turns origin; registration after an older fence materializes the same deletion. Before activation,
    import every frozen Neon `conversation_turn_fences` key through `ingest_turn_fences_import` and
