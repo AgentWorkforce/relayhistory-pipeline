@@ -38,12 +38,13 @@ heartbeat gate; landing or applying 062030 alone cannot enable exports.
     approval; run `supabase/bootstrap/legacy_export_privacy_verify.sql` before
     and after that step, and set its password from 1Password in memory.
   - Migration
-    `20261105062010_turns_forward_gates.sql`, which creates
+    `20261105062020_turns_forward_gates.sql`, which creates
     `turn_session_fences`, must already be landed and applied; a missing
     relation is a hard refusal, never an empty fence set.
-    Preserve the registry order `062010` turns gates -> `062020` read-API
-    reader kind -> `062030` legacy authority: do not land or apply `062030`
-    while either predecessor is absent.
+    Preserve the registry order `062010` ingest origin claim -> `062020`
+    turns gates -> `062030` legacy authority: do not land or apply `062030`
+    while either predecessor is absent. The read-API reader kind follows at
+    `062050`.
   - Poolers, including port 6543, any other identity, and roles with ledger
     write privileges are refused. With RLS active, migration 062030's reviewed,
     permissive full-read policy must be present and no applicable restrictive
