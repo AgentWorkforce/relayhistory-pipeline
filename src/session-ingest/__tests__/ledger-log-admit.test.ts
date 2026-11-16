@@ -154,7 +154,9 @@ describe("a stream in log mode", () => {
     expect([(await status(e.base, k1)).state, (await status(e.base, k2)).state]).toEqual(["admitted", "admitted"]);
     const es = await entries(e.base);
     expect(es.map((x) => x.kind)).toEqual(["open", "epoch", "batches", "batches"]);
-    expect(batchesIn(es).map((b) => b.batchId)).toEqual(["b1", "b2"]);
+    // Both uploads are promoted in one round; when their object mtimes tie at millisecond resolution, the fair
+    // selection falls back to key order (the hashed batch segment), so the two batches' relative order is not pinned.
+    expect(batchesIn(es).map((b) => b.batchId).sort()).toEqual(["b1", "b2"]);
     expect(await payloadRecords(e.base, es)).toEqual(["r1", "r2", "r3"]);
     // Admission was the log entry; the legacy batch doc is written afterwards, by slice 3's materializer applying it
     // (the only legacy writer allowed on a log-mode stream; the guard test below pins that every other is refused).
