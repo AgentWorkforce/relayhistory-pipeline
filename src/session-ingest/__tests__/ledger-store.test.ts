@@ -276,8 +276,35 @@ describe("configuration", () => {
     expect(await code(s)).toBe("ledger_home_invalid");
     const failing = (err: unknown) => ({ ...s, backend: s.backend, getObject: async () => { throw err; } }) as ObjectStore;
     expect(await code(failing(new ObjectStoreError("unauthorized", "s3", "GET", { status: 403 })))).toBe("access_denied");
+    // Retryable: the store's transient class (5xx, 429, 408, network) and failures below it (connection, timeout).
     expect(await code(failing(new ObjectStoreError("transient", "s3", "GET", { status: 503 })))).toBe("ledger_home_unavailable");
+    expect(await code(failing(new ObjectStoreError("transient", "s3", "GET", { status: 429 })))).toBe("ledger_home_unavailable");
     expect(await code(failing(new TypeError("fetch failed")))).toBe("ledger_home_unavailable");
+    expect(await code(failing(Object.assign(new Error("t"), { name: "TimeoutError" })))).toBe("ledger_home_unavailable");
+    // Not retryable as-is: configuration faults.
+    expect(await code(failing(new ObjectStoreError("backend", "s3", "GET", { status: 400 })))).toBe("ledger_home_store_error"); // wrong region
+    expect(await code(failing(new ObjectStoreError("backend", "s3", "GET", { status: 301 })))).toBe("ledger_home_store_error");
+    expect(await code(failing(new ObjectStoreError("invalid_key", "s3", "GET")))).toBe("ledger_home_store_error");
+    expect(await code(failing(new ObjectStoreError("unsupported", "s3", "GET")))).toBe("ledger_home_store_error");
+    expect(await code(failing(new Error("something else")))).toBe("ledger_home_store_error");
+    // A bad flag value: a closed code, before any request.
+    reads = 0;
+    await expect(assertLedgerHomeHere(counted, ROOT, "locker-b", { INGEST_LEDGER_HOME_GUARD: "yes" })).rejects.toMatchObject({ code: "ledger_home_guard_invalid" });
+    expect(reads).toBe(0);
+  });
+
+  describe("each operator tool prints ledger_home_guard_invalid for a bad flag value (before any request)", () => {
+    const repo = join(import.meta.dir, "../../..");
+    const env = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", TMPDIR: process.env.TMPDIR ?? "", INGEST_LEDGER_HOME_GUARD: "yes",
+      AWS_ACCESS_KEY_ID: "test-access-key-id", AWS_SECRET_ACCESS_KEY: "test-only-secret" };
+    const run = (args: string[], stdin = "") => {
+      const p = Bun.spawnSync([process.execPath, ...args], { cwd: repo, env, stdin: new TextEncoder().encode(stdin), timeout: 60_000 });
+      return new TextDecoder().decode(p.stdout) + new TextDecoder().decode(p.stderr);
+    };
+    test("buffered-drain", () => expect(run(["scripts/buffered-drain.ts", "--dry-run", "--bucket", "test-bucket"])).toContain("ledger_home_guard_invalid"));
+    test("upload-fence-backfill", () => expect(run(["scripts/upload-fence-backfill.ts", "--dry-run", "--bucket", "test-bucket"], "{}\n")).toContain("ledger_home_guard_invalid"));
+    test("ledger-reshard-revisions", () => expect(run(["scripts/ledger-reshard-revisions.ts", "--bucket", "test-bucket"])).toContain("ledger_home_guard_invalid"));
+    test("ledger-log-stream", () => expect(run(["scripts/ledger-log-stream.ts", "status", "--bucket", "test-bucket", "--org", "o", "--workspace", "w", "--user", "u", "--origin", "x"])).toContain("ledger_home_guard_invalid"));
   });
 });
 

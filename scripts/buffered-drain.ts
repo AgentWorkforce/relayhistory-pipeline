@@ -32,7 +32,8 @@
  * Exactly one of --dry-run / --execute is required. --dry-run needs only s3:ListBucket and s3:GetObject
  * (and kms:Decrypt); every put/delete is refused in code as well. With INGEST_LEDGER_HOME_GUARD=on (default off) both
  * modes first GET `96bulls/.ledger/fence-authority/.ledger-home.json` and refuse a relocated ledger (ledger-store.ts
- * assertLedgerHomeHere: ledger_home_moved | ledger_home_invalid | access_denied | ledger_home_unavailable). --execute writes the canonical layout,
+ * assertLedgerHomeHere: ledger_home_moved | ledger_home_invalid | access_denied | ledger_home_unavailable |
+ * ledger_home_store_error | ledger_home_guard_invalid). --execute writes the canonical layout,
  * the 0005 revision index, re-arm markers and the drained markers, and needs the owner's explicit OK.
  *
  * Without --org, orgs are discovered with one delimiter listing of `96bulls/` (S3 ListObjectsV2,

@@ -180,8 +180,25 @@ export async function readLedgerHome(store: ObjectStore, keyRoot: string): Promi
   return v;
 }
 
+/**
+ * Worth retrying as-is: the store's own transient class (network, 408, 429, 5xx), or a failure below the store
+ * (fetch's TypeError on a refused or reset connection, an abort or timeout). Every other store code (backend: a
+ * wrong-region 400 or a 301; invalid_key, unsupported, invalid_argument, ...) is a configuration fault.
+ */
+/** A tool's preflight, before any I/O: INGEST_LEDGER_HOME_GUARD is on, off or unset, else `ledger_home_guard_invalid`. */
+export function assertLedgerHomeGuardValid(env: Record<string, string | undefined> = process.env): void {
+  try { ledgerHomeGuard(env); } catch { throw new LedgerHomeRefused("ledger_home_guard_invalid"); }
+}
+
+function transientFailure(error: unknown): boolean {
+  if (isObjectStoreError(error)) return (error as { code?: string }).code === "transient";
+  const name = (error as { name?: unknown } | null)?.name;
+  return error instanceof TypeError || name === "AbortError" || name === "TimeoutError";
+}
+
 /** The closed codes of `assertLedgerHomeHere`; the Error's message is exactly the code (safe to print). */
-export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable";
+export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable"
+  | "ledger_home_store_error" | "ledger_home_guard_invalid";
 export class LedgerHomeRefused extends Error {
   constructor(readonly code: LedgerHomeRefusal) { super(code); this.name = "LedgerHomeRefused"; }
 }
@@ -194,15 +211,24 @@ export class LedgerHomeRefused extends Error {
  *   a valid marker naming another bucket `ledger_home_moved` (its ledger/** objects are stale copies)
  *   an unparseable or invalid body       `ledger_home_invalid`
  *   403                                  `access_denied`
- *   any other store or network failure   `ledger_home_unavailable` (retryable: run the tool again)
+ *   a transient failure: 408, 429, 5xx,  `ledger_home_unavailable` (retryable: run the tool again)
+ *     a network, connection or timeout
+ *     error
+ *   any other store error (a wrong-      `ledger_home_store_error` (not retryable: fix the bucket, region or endpoint)
+ *     region 400, a 301, invalid_key,
+ *     unsupported, ...)
+ *   INGEST_LEDGER_HOME_GUARD neither     `ledger_home_guard_invalid` (before any request)
+ *     on nor off
  */
 export async function assertLedgerHomeHere(store: ObjectStore, keyRoot: string, bucket: string, env: Record<string, string | undefined> = process.env): Promise<void> {
-  if (!ledgerHomeGuard(env)) return;
+  let on: boolean;
+  try { on = ledgerHomeGuard(env); } catch { throw new LedgerHomeRefused("ledger_home_guard_invalid"); }
+  if (!on) return;
   let home: LedgerHomeDoc | null;
   try { home = await readLedgerHome(store, keyRoot); } catch (error) {
     if (error instanceof Error && error.message === "ledger_home_invalid") throw new LedgerHomeRefused("ledger_home_invalid");
     if (isObjectStoreError(error, "unauthorized")) throw new LedgerHomeRefused("access_denied");
-    throw new LedgerHomeRefused("ledger_home_unavailable");
+    throw new LedgerHomeRefused(transientFailure(error) ? "ledger_home_unavailable" : "ledger_home_store_error");
   }
   if (ledgerHomeVerdict(home, bucket, false) !== "ok") throw new LedgerHomeRefused("ledger_home_moved");
 }
