@@ -23,13 +23,18 @@
  *   --tables=a,b       verify only these source tables (data and schema rows), so
  *                      disjoint groups can run in parallel with their own
  *                      --checkpoint. Catalog and sequence checks always cover all.
- *   --method=ctid --streams=N   full mode only: compare each table's whole-table
- *                      fingerprint (count and both hash sums, which are
- *                      order-independent) computed as the sum over N physical
- *                      ctid ranges per side, read in parallel. Needs no key and
- *                      no index, so it can run before post-data. Only valid when
- *                      neither side takes writes (a frozen branch and a sealed
- *                      copy). Not checkpointed: rerun a table group with --tables.
+ *   --method=ctid --streams=N   full mode with --frozen-copy only: compare each
+ *                      table's whole-table fingerprint (count and both hash
+ *                      sums, which are order-independent) as the sum over N
+ *                      physical ctid ranges per side, read in parallel. Every
+ *                      stream of one side joins one exported REPEATABLE READ
+ *                      snapshot, so the ranges see one consistent state. Needs
+ *                      no key or index. N is at most MAX_CTID_STREAMS; each side
+ *                      opens N connections per process (times parallel --tables
+ *                      groups). Not checkpointed: rerun a group with --tables.
+ * Endpoints must be direct or session-mode: transaction-mode poolers (port
+ * 6543, Neon `-pooler` hosts, pgbouncer=true) are refused, because the pinned
+ * session settings would not follow the queries across backends.
  * Every session pins the settings row_to_json output depends on
  * (FINGERPRINT_SESSION_SETTINGS), so both sides format values identically.
  */
@@ -104,6 +109,33 @@ export function parseTableFilter(argv: readonly string[]): Set<string> | null {
   return new Set(names);
 }
 
+export const MAX_CTID_STREAMS = 32;
+
+/** Refuses a transaction-mode pooler URL; returns the reason, or null when acceptable. */
+export function transactionPoolerReason(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "endpoint URL does not parse";
+  }
+  if (parsed.port === "6543") return "port 6543 is a transaction-mode pooler";
+  if (parsed.hostname.includes("-pooler.")) return "Neon -pooler hosts are transaction-mode poolers";
+  if (parsed.searchParams.get("pgbouncer") === "true") return "pgbouncer=true marks a transaction-mode pooler";
+  return null;
+}
+
+/** --streams: a positive integer up to MAX_CTID_STREAMS, only meaningful with --method=ctid. */
+export function parseStreams(raw: string | undefined, method: string): number {
+  if (raw === undefined) return method === "ctid" ? 8 : 1;
+  if (method !== "ctid") throw new Error("--streams applies to --method=ctid only");
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_CTID_STREAMS) {
+    throw new Error(`--streams must be an integer from 1 to ${MAX_CTID_STREAMS}`);
+  }
+  return value;
+}
+
 /** Split [0, pages) into at most `streams` contiguous ranges; the last is open-ended. */
 export function ctidRanges(pages: number, streams: number): Array<[number, number | null]> {
   if (!Number.isInteger(streams) || streams < 1) throw new Error("--streams must be a positive integer");
@@ -128,23 +160,54 @@ export function ctidRangeFingerprintSql(schema: string, table: string, columns: 
 }
 
 async function ctidFingerprint(pool: pg.Pool, table: string, columns: string[], streams: number): Promise<Fingerprint> {
-  const size = await pool.query<{ pages: string }>(
-    `SELECT (pg_relation_size(c.oid) / current_setting('block_size')::bigint)::text AS pages
-       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sessions' AND c.relname = $1`,
-    [table],
-  );
-  const ranges = ctidRanges(Number(size.rows[0]?.pages ?? 0), streams);
-  const prints = await Promise.all(ranges.map(([start, end]) =>
-    pool.query<Fingerprint>(
-      ctidRangeFingerprintSql("sessions", table, columns, end !== null),
-      end === null ? [start] : [start, end],
-    ).then((result) => result.rows[0]!)));
-  return prints.reduce(addFingerprint, { ...EMPTY_FINGERPRINT });
+  // One exported snapshot per side and table: every range reads the same state,
+  // so a row that moves pages cannot be counted twice or missed.
+  const coordinator = await pool.connect();
+  const workers: pg.PoolClient[] = [];
+  let broken = false;
+  try {
+    await coordinator.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    const snapshot = (await coordinator.query<{ id: string }>("SELECT pg_export_snapshot() AS id")).rows[0]!.id;
+    const size = await coordinator.query<{ pages: string }>(
+      `SELECT (pg_relation_size(c.oid) / current_setting('block_size')::bigint)::text AS pages
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sessions' AND c.relname = $1`,
+      [table],
+    );
+    const ranges = ctidRanges(Number(size.rows[0]?.pages ?? 0), streams);
+    for (let index = 0; index < ranges.length; index += 1) workers.push(await pool.connect());
+    const prints = await Promise.all(ranges.map(async ([start, end], index) => {
+      const client = workers[index]!;
+      await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+      await client.query(`SET TRANSACTION SNAPSHOT '${snapshot.replaceAll("'", "''")}'`);
+      const result = await client.query<Fingerprint>(
+        ctidRangeFingerprintSql("sessions", table, columns, end !== null),
+        end === null ? [start] : [start, end],
+      );
+      await client.query("ROLLBACK");
+      return result.rows[0]!;
+    }));
+    await coordinator.query("ROLLBACK");
+    return prints.reduce(addFingerprint, { ...EMPTY_FINGERPRINT });
+  } catch (error) {
+    broken = true;
+    throw error;
+  } finally {
+    for (const client of workers) client.release(broken);
+    coordinator.release(broken);
+  }
 }
 
-/** Sequence readiness: the T0 fence needs target >= source; a frozen copy needs equality. */
-export function sequenceReady(source: string | null, target: string | null, frozenCopy: boolean): boolean {
-  if (frozenCopy) return source === target;
+/**
+ * Sequence readiness: the T0 fence needs target >= source; a frozen copy needs
+ * the target sequence to exist and equal the source.
+ */
+export function sequenceReady(
+  source: string | null,
+  target: string | null,
+  frozenCopy: boolean,
+  targetPresent = true,
+): boolean {
+  if (frozenCopy) return targetPresent && source === target;
   return source === null || (target !== null && BigInt(target) >= BigInt(source));
 }
 
@@ -861,13 +924,27 @@ export async function main() {
   const method = argument("method") ?? "keyset";
   if (method !== "keyset" && method !== "ctid") throw new Error("--method must be keyset or ctid");
   if (method === "ctid" && mode !== "full") throw new Error("--method=ctid applies to --mode=full only");
-  const streams = Number(argument("streams") ?? 1);
-  if (!Number.isInteger(streams) || streams < 1) throw new Error("--streams must be a positive integer");
-  const poolSize = method === "ctid" ? Math.max(2, streams) : 2;
+  if (method === "ctid" && !frozenCopy) throw new Error("--method=ctid requires --frozen-copy");
+  const streams = parseStreams(argument("streams"), method);
+  for (const [side, url] of [["source", sourceUrl], ["target", targetUrl]] as const) {
+    const reason = transactionPoolerReason(url);
+    if (reason) throw new Error(`${side} endpoint refused: ${reason}; use a direct or session-mode endpoint`);
+  }
+  // ctid mode: one coordinator plus up to `streams` workers per side.
+  const poolSize = method === "ctid" ? streams + 1 : 2;
   const source = new pg.Pool({ connectionString: sourceUrl, max: poolSize, application_name: "96bulls-migration-verify-source", statement_timeout: 0 });
   const target = new pg.Pool({ connectionString: targetUrl, max: poolSize, application_name: "96bulls-migration-verify-target", statement_timeout: 0 });
   // node-postgres runs queries on a client in order, so this SET precedes every query on it.
-  for (const pool of [source, target]) pool.on("connect", (client) => { void client.query(fingerprintSettingsSql()); });
+  // If it fails, the client is ended: every later query on it errors and main fails closed.
+  let settingsFailure: unknown = null;
+  for (const pool of [source, target]) {
+    pool.on("connect", (client) => {
+      client.query(fingerprintSettingsSql()).catch((error: unknown) => {
+        settingsFailure ??= error;
+        void client.end().catch(() => undefined);
+      });
+    });
+  }
   let passed = true;
   try {
     const allSourceTables = await tables(source);
@@ -964,6 +1041,7 @@ export async function main() {
           });
         }
       }
+      if (settingsFailure) throw new Error("pinning fingerprint session settings failed");
       results.push(result);
     }
     const sourceRoleName = argument("source-role");
@@ -1002,7 +1080,7 @@ export async function main() {
     const targetByName = new Map(targetSequences.map((item) => [item.name, item.lastValue]));
     const sequenceResults = sourceSequences.map((item) => {
       const targetValue = targetByName.get(item.name) ?? null;
-      const ready = sequenceReady(item.lastValue, targetValue, frozenCopy);
+      const ready = sequenceReady(item.lastValue, targetValue, frozenCopy, targetByName.has(item.name));
       if (mode === "full" && !ready) passed = false;
       return { name: item.name, source: item.lastValue, target: targetValue, ready };
     });
@@ -1012,6 +1090,7 @@ export async function main() {
       frozenCopy,
       method,
       tableFilter: tableFilter ? [...tableFilter].sort() : null,
+      coverage: tableFilter ? "partial" : "all",
       passed,
       checkpoint: {
         enabled: mode === "full" && Boolean(checkpointPath),

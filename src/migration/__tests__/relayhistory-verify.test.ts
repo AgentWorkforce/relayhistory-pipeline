@@ -17,6 +17,9 @@ import {
   parseTableFilter,
   sequenceReady,
   ctidRanges,
+  MAX_CTID_STREAMS,
+  parseStreams,
+  transactionPoolerReason,
   ctidRangeFingerprintSql,
   type CatalogObjects,
   type ColumnDefinition,
@@ -366,6 +369,27 @@ describe("frozen full-copy verification", () => {
     expect(sequenceReady(null, "1", true)).toBe(false);
     expect(sequenceReady("10", null, false)).toBe(false);
     expect(sequenceReady(null, null, false)).toBe(true);
+    expect(sequenceReady(null, null, true, false)).toBe(false);
+    expect(sequenceReady("5", null, true, false)).toBe(false);
+  });
+
+  test("refuses transaction-mode poolers and accepts direct or session-mode endpoints", () => {
+    expect(transactionPoolerReason("postgresql://u:p@aws-1-us-east-1.pooler.supabase.com:6543/postgres")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@ep-x-pooler.c-7.us-east-1.aws.neon.tech/neondb")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@h:5432/db?pgbouncer=true")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@aws-1-us-east-1.pooler.supabase.com:5432/db")).toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@ep-x.c-7.us-east-1.aws.neon.tech/neondb")).toBeNull();
+    expect(transactionPoolerReason("not a url")).not.toBeNull();
+  });
+
+  test("bounds --streams and ties it to --method=ctid", () => {
+    expect(parseStreams(undefined, "keyset")).toBe(1);
+    expect(parseStreams(undefined, "ctid")).toBe(8);
+    expect(parseStreams("16", "ctid")).toBe(16);
+    expect(() => parseStreams("4", "keyset")).toThrow();
+    expect(() => parseStreams("0", "ctid")).toThrow();
+    expect(() => parseStreams("2.5", "ctid")).toThrow();
+    expect(() => parseStreams(String(MAX_CTID_STREAMS + 1), "ctid")).toThrow();
   });
 });
 
