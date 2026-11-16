@@ -853,6 +853,55 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     }
   });
 
+  // ---- user-level erasure ledgers in the hosted feed (lead + reviewer request, 3baa8750 delta) ----
+  /** Two layout-safe legacy-only scopes owned by two DIFFERENT users, both exported through runOrg on the real stack. */
+  async function twoUsers() {
+    const n = await neon();
+    await n.pg.query("DELETE FROM sessions.conversation_turns");
+    await n.pg.query("DELETE FROM sessions.session_outcomes");
+    const scopes = [
+      { sid: "sess_a", user: OWNER, turn: "66666666-6666-4666-8666-666666666666", sha: "a1" },
+      { sid: "sess_b", user: "u_other", turn: "77777777-7777-4777-8777-777777777777", sha: "b2" },
+    ];
+    for (const sc of scopes) {
+      await n.pg.query(
+        `INSERT INTO sessions.conversation_turns VALUES($1,$2,$3,'owner',$4,$5,0,'assistant','user-level','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
+        [sc.turn, S.orgId, S.workspaceId, sc.sid, sc.user],
+      );
+      await n.pg.query("INSERT INTO sessions.session_outcomes VALUES($1,$2,'claude',$3,$4,$5,false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z')", [S.orgId, S.workspaceId, sc.sid, sc.sha, sc.user]);
+    }
+    return n;
+  }
+  const userKeys = async (store: ObjectStore, user: string, sid: string) =>
+    (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", { org_id: S.orgId, workspace_id: S.workspaceId, user_id: user, origin_id: LEGACY_EXPORT_ORIGIN_ID })) && k.includes(`/s=${sid}/`));
+
+  for (const ledger of ["upload_resets", "operator_user_erasures"] as const)
+    test(`user-level ${ledger} recorded AFTER export: the hosted eraser removes that user's legacy copies and leaves another user's intact`, async () => {
+      const n = await twoUsers();
+      const w = await hostedWorld();
+      try {
+        const store = createFsStore({ root: await tmp(`user-${ledger}`) });
+        const counters = await w.asExporter(async (privacyDb) => {
+          const r = await run(n.db, privacyDb, store, `user-${ledger}`);
+          r.checkpoint.close();
+          return r.counters;
+        });
+        expect(counters).toMatchObject({ exported: 2, failed: 0 });
+        expect((await userKeys(store, OWNER, "sess_a")).length).toBeGreaterThan(0);
+        expect((await userKeys(store, "u_other", "sess_b")).length).toBeGreaterThan(0);
+        // The user-wide event for OWNER only, after the export.
+        if (ledger === "upload_resets")
+          await w.f.db.query("INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id) VALUES($1,$2,$3,'reset-after-export')", [S.orgId, S.workspaceId, OWNER]);
+        else
+          await w.f.db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('erase-after-export',$1,$2,$3,'purging',ARRAY[]::text[])", [S.orgId, S.workspaceId, OWNER]);
+        await w.sweep(store);
+        expect(await userKeys(store, OWNER, "sess_a")).toEqual([]); // that user's legacy copy is gone
+        expect((await userKeys(store, "u_other", "sess_b")).length).toBeGreaterThan(0); // another user's copy is untouched
+      } finally {
+        await w.f.close();
+      }
+    });
+
   // ---- (h) pre-landing review findings (layered-sessions-pipeline review of 1d573e75; lead-requested gate cases) ----
   test("(h1) the privacy eraser verifier passes on a database WITHOUT 062030's legacy eraser RPCs (every prefix release, production today)", async () => {
     const w = await hostedWorld();
