@@ -126,6 +126,17 @@ const ERASE_CFG = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true } as ty
 /** The same job with the legacy feed OFF (the default). */
 const ERASE_CFG_LEGACY_OFF = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: false } as typeof DEFAULT_ERASURE_CONFIG;
 
+/**
+ * GATE TARGET (explicit runner selector, never auto-detected from the branch, so nothing is skipped silently):
+ *   LEGACY_GATE_TARGET=landing     runs everything except '(g)' (the ship branch has no heartbeat) and includes '(s)'.
+ *   LEGACY_GATE_TARGET=activation  runs everything except '(s)' (the activation branch must NOT refuse unconditionally).
+ * Unset or any other value fails the "gate target" test, so a run without a declared target can never pass.
+ */
+const GATE_TARGET = process.env.LEGACY_GATE_TARGET;
+test("gate target: LEGACY_GATE_TARGET is declared as landing or activation", () => {
+  expect(["landing", "activation"]).toContain(GATE_TARGET);
+});
+
 /** Supabase privacy authority: the real column sets of the ledgers the exporter may read. */
 async function supabase() {
   const pg = new PGlite();
@@ -1065,7 +1076,7 @@ const heartbeatAge = (f: { db: PGlite }, minutes: number) =>
 const heartbeatRows = async (f: { db: PGlite }) =>
   ((await f.db.query(`SELECT count(*)::int AS n FROM ${HEARTBEAT.table}`)).rows[0] as { n: number }).n;
 
-describe("(g) activation gate: the exporter runs only on a fresh, eraser-written Supabase heartbeat", () => {
+describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter runs only on a fresh, eraser-written Supabase heartbeat", () => {
   const later = () => Date.now() + 10 * 60 * 1000;
   /** Real stack, ACTIVATED Supabase authority, provisioned exporter role (same seam as (c)'s hostedWorld). */
   async function world() {
@@ -1361,7 +1372,7 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
  * production entry point refuses unconditionally, even with every legacy flag on, before reading secrets or connecting.
  * Run on the LANDING branch; excluded on the ACTIVATION branch (which instead requires a fresh eraser heartbeat, see (g)).
  */
-describe("(s) ship branch: the exporter CLI refuses unconditionally before activation", () => {
+describe.skipIf(GATE_TARGET !== "landing")("(s) ship branch: the exporter CLI refuses unconditionally before activation", () => {
   test("main() is the ONLY production caller of runOrg: no other non-test module in src/, scripts/ or packages/ imports it", () => {
     const root = new URL("../../../", import.meta.url).pathname;
     const offenders: string[] = [];
