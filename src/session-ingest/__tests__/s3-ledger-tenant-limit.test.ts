@@ -11,7 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { SYNC_SCOPE, type IngestIdentity } from "../app.ts";
 import { outcomeKey, receiptDir } from "../async-admission.ts";
 import { fenceAuthorityKey, s3LedgerKeys } from "../ledger-s3.ts";
@@ -207,6 +207,87 @@ describe("INGEST_LEDGER=s3, the async consumer at the tenant cap (direct uploads
   });
 });
 
+describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches", () => {
+  const statusOf = (e: ReturnType<typeof edge>) => async (k: string) =>
+    ((await uploadAdmissionStatus({ store: e.base, keyRoot: ROOT }, uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on" }), TENANT, k)) as { body: { state: string } }).body.state;
+
+  test("org cap above the user cap: the same machine's second upload is held back by the per-directory count alone (no deferral)", async () => {
+    // Per-org 4, per-user 1: the org check cannot hold the second upload back; only the per-directory check can.
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 1 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 1 });
+    await writeAuthority(e.base);
+    const k1 = await upload(e.base, "batch-u1", "u1");
+    const k2 = await upload(e.base, "batch-u2", "u2");
+    await e.consumer().scan();
+    e.hold();
+    const settling = e.consumer().settle();
+    await until(() => e.blocked() > 0, "one admission to reach its writes");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(e.consumer().status().inFlight).toBe(1);
+    expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+    e.open();
+    await settling;
+    const state = statusOf(e);
+    expect([await state(k1), await state(k2)]).toEqual(["admitted", "admitted"]);
+    expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+    expect(e.sql).toEqual([]);
+  });
+
+  test("after a deferral, the deferred directory's sibling is not started before Retry-After, and starts as soon as an admission in that directory ends", async () => {
+    // Per-user 2, per-org 4. origin-1 and origin-2 each hold one of the user's two slots. Then two more origin-2
+    // uploads arrive: one starts (its directory count is 1 < 2) and is deferred by the user cap. The memo keeps the
+    // other from starting until the in-flight origin-2 admission ends, which frees the slot.
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 2 });
+    await writeAuthority(e.base);
+    await upload(e.base, "batch-a", "a", TENANT, "origin-1");
+    await upload(e.base, "batch-b", "b", TENANT, "origin-2");
+    await e.consumer().scan();
+    e.hold();
+    const settling = e.consumer().settle();
+    const sessions = () => new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1])).size;
+    await until(() => sessions() === 2, "both slots to be held in their writes");
+    const k3 = await upload(e.base, "batch-c", "c", TENANT, "origin-2");
+    const k4 = await upload(e.base, "batch-d", "d", TENANT, "origin-2");
+    await e.consumer().scan(); // promotes c and d; the pump starts one of them
+    const deferrals = () => e.logged.filter((f) => f.route === "ingest.admission" && f.outcome === "deferred").length;
+    await until(() => deferrals() === 1, "one of the late uploads to be deferred");
+    await new Promise((r) => setTimeout(r, 50));
+    // The memo: the sibling was never started (no second deferral, no ledger doc for it).
+    expect(deferrals()).toBe(1);
+    const docs = await Promise.all(["batch-c", "batch-d"].map((b) => exists(e.base, s3LedgerKeys(ROOT, TENANT).batch("origin-2", b))));
+    expect(docs.filter(Boolean).length).toBe(1);
+    e.open();
+    await settling; // b ends (not deferred) and clears the memo: the sibling starts at once, with no clock advance
+    const state = statusOf(e);
+    expect([await state(k3), await state(k4)].sort()).toEqual(["admitted", "pending"]);
+    expect(deferrals()).toBe(1);
+    // The deferred one is admitted after its Retry-After.
+    e.advance(11_000);
+    await e.consumer().settle();
+    expect([await state(k3), await state(k4)]).toEqual(["admitted", "admitted"]);
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
+  });
+
+  test("a store failure in the claim logs store_status and stage on the consumer's retry line", async () => {
+    const e = edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true });
+    await writeAuthority(e.base);
+    await upload(e.base, "batch-s", "s");
+    await e.consumer().scan();
+    const batchDoc = s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-s");
+    let fail = true;
+    const original = e.base.put.bind(e.base);
+    (e.base as { put: ObjectStore["put"] }).put = (async (key: Parameters<ObjectStore["put"]>[0], ...rest: unknown[]) => {
+      if (fail && String(key) === batchDoc) { fail = false; throw new ObjectStoreError("transient", "fs", "secret key path", { status: 503 }); }
+      return (original as (...a: unknown[]) => unknown)(key, ...rest);
+    }) as ObjectStore["put"];
+    await e.consumer().settle();
+    const retry = e.logged.find((f) => f.route === "ingest.admission" && f.outcome === "retry");
+    expect(retry).toMatchObject({ error_code: expect.any(String), stage: expect.any(String), store_status: 503 });
+    expect(JSON.stringify(e.logged)).not.toContain("secret key path");
+    expect(e.sql).toEqual([]);
+  });
+});
+
 describe("INGEST_S3_TENANT_LIMIT off (the default): byte-identical to before", () => {
   test("sync: a second concurrent batch of the same user is admitted (no 429 from a limiter)", async () => {
     const e = edge({ limit: null });
@@ -253,6 +334,8 @@ describe("INGEST_S3_TENANT_LIMIT=on, INGEST_ASYNC_MAX_PER_ORG: one org's backlog
     await until(async () => (await stateOf(b, TENANT_B)) === "admitted", "tenant B to be admitted");
     await until(() => new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1])).size === 2, "two of A's admissions to reach their writes");
     // The pre-claim hint: the rest of A's backlog is left due, not started (so not deferred), at the org cap.
+    // B's status is written before its admitOne settles, so wait for B to leave the in-flight set too.
+    await until(() => e.consumer().status().inFlight === 2, "tenant B's admission to settle");
     expect(e.consumer().status().inFlight).toBe(2);
     expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
     const inWrites = new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1]));

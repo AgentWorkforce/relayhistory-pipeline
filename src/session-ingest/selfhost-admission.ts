@@ -314,6 +314,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (stopped) return;
     if (wake) { clearTimeout(wake); wake = undefined; }
     const at = now();
+    // Sweep expired deferral memos (a directory whose deferred entry left another way would otherwise linger).
+    for (const [dir, until] of dirBusyUntil) if (until <= at) dirBusyUntil.delete(dir);
     const waiting = [...entries].filter(([key]) => !inflight.has(key)).sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
     let next = Infinity;
     for (const [key, entry] of waiting) {

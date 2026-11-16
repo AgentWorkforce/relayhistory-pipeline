@@ -202,8 +202,14 @@ export interface DeliverResult {
 /** Code only: storage and ledger messages can quote keys. */
 export class IngestUnavailable extends DeliveryError {
   /** `db`: set only for a ledger (database) cause; the closed diagnosis (class, safe code, basis). */
-  constructor(readonly stage: string, readonly cause_code: string, readonly db?: DbErrorDiagnosis) {
+  /**
+   * `storeStatus`: set only for an object-store ledger cause (ledger-s3.ts `ledger_store_*`), the store's HTTP status
+   * (an integer 100..599), so the admission consumer's retry line can say what the store answered. Never a key or body.
+   */
+  readonly storeStatus?: number;
+  constructor(readonly stage: string, readonly cause_code: string, readonly db?: DbErrorDiagnosis, storeStatus?: number) {
     super("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
+    if (typeof storeStatus === "number" && Number.isSafeInteger(storeStatus) && storeStatus >= 100 && storeStatus <= 599) this.storeStatus = storeStatus;
   }
 }
 
@@ -299,7 +305,8 @@ async function runStage<T>(name: string, work: () => Promise<T>, observe?: Stage
     const outcome = passthrough && !(error instanceof IngestUnavailable) ? "refused" : "unavailable";
     observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome, duration_ms: Date.now() - t0, ...(sqlstate ? { sqlstate } : {}) });
     if (passthrough) throw error;
-    throw new IngestUnavailable(name, causeCode(error), db);
+    const storeStatus = error instanceof LedgerUnavailableError ? error.storeStatus : undefined;
+    throw new IngestUnavailable(name, causeCode(error), db, storeStatus);
   }
 }
 
