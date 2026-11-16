@@ -8,6 +8,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_privacy_eraser_page(jsonb)',
  'sessions.ingest_privacy_eraser_state()',
  'sessions.ingest_privacy_eraser_still_fenced(jsonb)',
+ 'sessions.legacy_export_privacy_eraser_heartbeat()',
  'sessions.legacy_export_privacy_eraser_page(jsonb)',
  'sessions.legacy_export_privacy_eraser_still_fenced(jsonb)'
  ]::text[];

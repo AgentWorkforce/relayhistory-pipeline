@@ -2620,6 +2620,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105062030_legacy_export_scope_authority.down.sql");
     expect(await names()).not.toContain(LA);
     expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();
+    expect(await relation("sessions.legacy_export_privacy_eraser_readiness")).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'legacy_export_privacy_%' OR proname='ingest_legacy_export_scope_authority_register')")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live

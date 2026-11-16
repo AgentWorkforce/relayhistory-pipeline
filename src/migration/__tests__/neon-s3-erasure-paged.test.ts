@@ -68,6 +68,31 @@ const job = (s: FakeS3Versions, st: SyncState, a: ErasureAuthority, now = () => 
   new ErasureJob(a, st, s.eraser(), () => {}, SETTLED_CFG, now, async () => {});
 
 describe("E3 job on the shared paged eraser", () => {
+  test("only a healthy non-dry-run Supabase sweep records exporter readiness", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    let heartbeats = 0;
+    const base = {
+      fencedLivePage: async () => [],
+      recordSuccessfulSweep: async () => void (heartbeats += 1),
+      legacyFencedPage: async () => [] as LegacyFencedGroup[],
+      stillLegacyFenced: async () => true,
+    };
+    await job(s, st, authority(base)).sweep({ dryRun: true });
+    expect(heartbeats).toBe(0);
+    await job(s, st, authority(base)).sweep();
+    expect(heartbeats).toBe(1);
+    const broken = authority({
+      ...base,
+      legacyFencedPage: async () => { throw Object.assign(new Error("broken"), { code: "legacy_rpc_broken" }); },
+    });
+    const j = job(s, st, broken);
+    await j.sweep();
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(heartbeats).toBe(1);
+    st.close();
+  });
+
   test("a machine over 10k versions resumes across sweeps (and a fresh process) instead of failing closed; pointer last", async () => {
     const s = new FakeS3Versions();
     fill(s, 12_500);

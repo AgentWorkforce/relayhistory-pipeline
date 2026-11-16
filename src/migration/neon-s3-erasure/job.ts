@@ -14,7 +14,7 @@
  *  - what the exporter queued: objects a rewritten manifest no longer
  *    references, and session prefixes it no longer produces.
  *
- * It reads the privacy authority (read-only) and the shared watermark, never object content. The
+ * It reads the privacy authority (read-only except for the narrow durable readiness heartbeat) and the shared watermark, never object content. The
  * authority is Neon today, or Supabase once C3 activated it (`./authority.ts`, S3X_PRIVACY_AUTHORITY).
  * A session prefix is leased while it is erased, so the exporter never reuses
  * a chunk the eraser is deleting.
@@ -106,7 +106,7 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
 export type PagedOutcome = "incomplete" | "erased" | "unverified" | "unresolved" | "refused";
 
 export class ErasureJob {
-  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, legacyVersionsDeleted: 0, legacyFenceFailed: 0, resumable: 0, unverified: 0 };
+  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, legacyVersionsDeleted: 0, legacyFenceFailed: 0, readinessHeartbeatFailed: 0, resumable: 0, unverified: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
   readonly authority: ErasureAuthority;
@@ -340,6 +340,7 @@ export class ErasureJob {
   /** With `dryRun`, reports what it would erase; deletes nothing and marks nothing done. */
   async sweep(opts: { dryRun?: boolean } = {}) {
     const startedAt = this.now();
+    const dryRun = opts.dryRun ?? false;
     const authority = this.authority;
     try {
       await authority.ready();
@@ -354,10 +355,12 @@ export class ErasureJob {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
       return;
     }
+    let healthy = true;
     // Live (srv_) erasure first and on its own: it reads only tombstones, so
     // a failure or an early return in the rollup and catalog walks below
     // must not hold it back.
-    const live = await this.#eraseLiveFenced(opts.dryRun ?? false).catch((error) => {
+    const live = await this.#eraseLiveFenced(dryRun).catch((error) => {
+      healthy = false;
       this.counters.liveFenceFailed += 1;
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
       return { groups: 0, versions: 0 };
@@ -365,20 +368,27 @@ export class ErasureJob {
     // The one-shot legacy exporter writes to a separate user-scoped srv_
     // machine and never enters the ordinary export queue.  Consume its own
     // scope-level fence feed independently of the live-origin feed.
-    const legacy = this.cfg.legacyExportErasure
-      ? await this.#eraseLegacyFenced(opts.dryRun ?? false).catch((error) => {
-          this.counters.legacyFenceFailed += 1;
-          this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
-          return { groups: 0, versions: 0 };
-        })
-      : { groups: 0, versions: 0 };
+    let legacy: { groups: number; versions: number };
+    if (!this.cfg.legacyExportErasure) {
+      // A sweep with the legacy feed disabled cannot attest that the exporter
+      // is safe to activate, even when every ordinary live erasure succeeded.
+      healthy = false;
+      legacy = { groups: 0, versions: 0 };
+    } else {
+      legacy = await this.#eraseLegacyFenced(dryRun).catch((error) => {
+        healthy = false;
+        this.counters.legacyFenceFailed += 1;
+        this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
+        return { groups: 0, versions: 0 };
+      });
+    }
     // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
     // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
     let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
     let seen = 0;
     let gone = 0;
     if (authority.presence) {
-      const r = await this.#presenceSweep(authority.presence, startedAt, opts.dryRun ?? false);
+      const r = await this.#presenceSweep(authority.presence, startedAt, dryRun);
       if (!r) return;
       ({ id, seen, gone } = r);
     }
@@ -392,12 +402,31 @@ export class ErasureJob {
         }
       }
     } catch (error) {
+      healthy = false;
       this.counters.fenceSweepFailed += 1;
       this.log({ message: "fence sweep failed", error_code: errorCode(error) });
     }
+    // The exporter's readiness signal is written only after a healthy real
+    // Supabase sweep. The eraser-only RPC rechecks active authority and reads
+    // the immutable legacy mapping before recording its durable timestamp.
+    if (!dryRun && !this.stopped() && authority.kind === "supabase") {
+      if (!healthy || !authority.recordSuccessfulSweep) {
+        if (!authority.recordSuccessfulSweep) {
+          this.counters.readinessHeartbeatFailed += 1;
+          this.log({ message: "eraser readiness heartbeat failed", error_code: "eraser_readiness_heartbeat_unavailable" });
+        }
+      } else {
+        try {
+          await authority.recordSuccessfulSweep();
+        } catch (error) {
+          this.counters.readinessHeartbeatFailed += 1;
+          this.log({ message: "eraser readiness heartbeat failed", error_code: errorCode(error) });
+        }
+      }
+    }
     this.counters.swept += 1;
-    if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions, legacy_fenced: legacy.groups, legacy_versions: legacy.versions });
+    if (!dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
+    this.log({ message: dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions, legacy_fenced: legacy.groups, legacy_versions: legacy.versions });
   }
 
   /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */

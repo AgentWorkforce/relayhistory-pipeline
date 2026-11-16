@@ -403,6 +403,40 @@ describe("supabase privacy authority as the eraser's source", () => {
     ).toEqual([]);
   });
 
+  test("legacy export readiness requires a fresh heartbeat from a healthy real Supabase sweep", async () => {
+    const w = await world();
+    // 062010 is separately owned and absent from this standalone fixture; a
+    // release stack always has it before 062020.
+    await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+      first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
+      PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+    await w.activate();
+    const ready = () => w.f.db.query("SELECT sessions.legacy_export_privacy_authority_ready() AS ready");
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
+    // A dry run proves nothing about the deployed deleter and must not arm export.
+    await w.job().sweep({ dryRun: true });
+    expect((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ n: 0 });
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
+    // The real healthy sweep reaches the eraser-only mapping probe and records
+    // a durable Supabase heartbeat which the exporter checks afresh. Production
+    // keeps this connection read-only by default; only the fixed RPC's explicit
+    // transaction is read-write.
+    await w.f.db.query("SET default_transaction_read_only=on");
+    try {
+      await w.job().sweep();
+    } finally {
+      await w.f.db.query("SET default_transaction_read_only=off");
+    }
+    expect((await w.f.db.query("SELECT authority FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ authority: "supabase" });
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+
+    await w.f.db.query("UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()-interval '31 minutes'");
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+  });
+
   test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {
     const w = await world();
     await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(

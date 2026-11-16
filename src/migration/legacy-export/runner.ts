@@ -218,8 +218,9 @@ export interface RunDeps {
 
 /**
  * A mapped legacy copy may exist only after Supabase is the active erasure
- * authority. A missing probe is not compatibility: it means the durable
- * authority contract is absent, so exporting must fail closed.
+ * authority and its production eraser has completed a recent healthy sweep
+ * through the mapping RPC. A missing probe is not compatibility: it means the
+ * durable authority contract is absent, so exporting must fail closed.
  */
 export async function assertLegacyErasureAuthorityReady(
   db: Queryable,

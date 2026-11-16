@@ -52,6 +52,8 @@ export interface ErasureAuthority {
   readonly kind: ErasureAuthorityKind;
   /** Refuses (throws) when this source is not the privacy authority right now. */
   ready(): Promise<void>;
+  /** Supabase only: durably attest a healthy non-dry-run sweep and mapping-RPC probe. */
+  recordSuccessfulSweep?(): Promise<void>;
   lockWaiters(): Promise<{ total: number; nonAdvisory: number }>;
   /** Neon only: the rollup/catalog presence sweep ("gone from Neon"). */
   readonly presence?: ErasurePresence;
@@ -146,6 +148,19 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
   return {
     kind: "supabase",
     ready,
+    recordSuccessfulSweep: async () => {
+      // The dedicated authority connection is read-only by default. Open one
+      // explicit write transaction for this fixed eraser-only RPC; the role
+      // still has no direct table writes or any other write-capable function.
+      await db.query("BEGIN READ WRITE");
+      try {
+        await rpc("SELECT sessions.legacy_export_privacy_eraser_heartbeat() AS r");
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    },
     lockWaiters: () => lockWaiters(db),
     fencedGroups: async () => rpc<{ org_id: string; session_id: string }[]>("SELECT sessions.ingest_privacy_eraser_groups() AS r"),
     fencedLivePage: async (after, limit = LIVE_FENCE_PAGE) =>

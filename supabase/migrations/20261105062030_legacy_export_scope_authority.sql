@@ -18,6 +18,19 @@ REVOKE ALL ON sessions.legacy_export_scope_authority
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,
  bulls96_privacy_eraser,bulls96_legacy_export_privacy,bulls96_babysitter_retention;
 
+-- Durable proof that the production eraser has completed a healthy Supabase
+-- authority sweep recently. Only its narrow heartbeat RPC can write this row;
+-- an environment setting in the exporter is never accepted as readiness.
+CREATE TABLE sessions.legacy_export_privacy_eraser_readiness(
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ authority text NOT NULL CHECK(authority='supabase'),
+ last_success_at timestamptz NOT NULL
+);
+ALTER TABLE sessions.legacy_export_privacy_eraser_readiness ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON sessions.legacy_export_privacy_eraser_readiness
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,
+ bulls96_privacy_eraser,bulls96_legacy_export_privacy,bulls96_babysitter_retention;
+
 -- The exporter's privacy credential is a dedicated table-SELECT role plus
 -- this migration's one register RPC. It is never an owner or BYPASSRLS role.
 DO $legacy_export_role$
@@ -56,13 +69,35 @@ BEGIN
   'legacy_user_id',r.legacy_user_id,'legacy_machine_id',r.legacy_machine_id);
 END $register$;
 
--- The exporter must never create a legacy copy while Neon is still the
--- erasure authority: Neon has no access to the immutable owner row and is
--- forbidden to re-derive one. This narrow probe exposes only readiness.
-CREATE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean
-LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $ready$
+-- Called only by the Supabase eraser after a healthy, non-dry-run sweep. The
+-- mapping-table probe is intentionally inside the eraser RPC: a heartbeat is
+-- durable evidence that the deployed reader's exact production surface was
+-- live, not merely that the authority handoff row or an environment flag said
+-- "supabase".
+CREATE FUNCTION sessions.legacy_export_privacy_eraser_heartbeat() RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $heartbeat$
+DECLARE v_has_mappings boolean;v_at timestamptz;
 BEGIN
  PERFORM sessions.ingest_privacy_eraser_require_active();
+ SELECT EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority LIMIT 1) INTO v_has_mappings;
+ v_at:=clock_timestamp();
+ INSERT INTO sessions.legacy_export_privacy_eraser_readiness(singleton,authority,last_success_at)
+  VALUES(true,'supabase',v_at)
+  ON CONFLICT(singleton) DO UPDATE SET authority=EXCLUDED.authority,last_success_at=EXCLUDED.last_success_at;
+ RETURN jsonb_build_object('authority','supabase','last_success_at',v_at,'has_mappings',v_has_mappings);
+END $heartbeat$;
+
+-- The exporter must never create a legacy copy while Neon is still the
+-- erasure authority or before the active eraser has proven its mapping RPC.
+-- Thirty minutes permits two missed ten-minute sweeps without accepting a
+-- stale deployment. This is evaluated afresh for every export run.
+CREATE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $ready$
+BEGIN
+ PERFORM sessions.ingest_privacy_eraser_require_active();
+ IF NOT EXISTS(SELECT 1 FROM sessions.legacy_export_privacy_eraser_readiness
+   WHERE singleton AND authority='supabase' AND last_success_at>=clock_timestamp()-interval '30 minutes') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: supabase eraser readiness missing or stale';END IF;
  RETURN true;
 END $ready$;
 
@@ -135,6 +170,7 @@ BEGIN
 END $legacy_still$;
 
 REVOKE ALL ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb),
+ sessions.legacy_export_privacy_eraser_heartbeat(),
  sessions.legacy_export_privacy_authority_ready(),
  sessions.legacy_export_privacy_eraser_page(jsonb),sessions.legacy_export_privacy_eraser_still_fenced(jsonb)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,
@@ -165,4 +201,5 @@ END $turn_fence_grant$;
 GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb),
  sessions.legacy_export_privacy_authority_ready() TO bulls96_legacy_export_privacy;
 GRANT EXECUTE ON FUNCTION sessions.legacy_export_privacy_eraser_page(jsonb),
- sessions.legacy_export_privacy_eraser_still_fenced(jsonb) TO bulls96_privacy_eraser;
+ sessions.legacy_export_privacy_eraser_still_fenced(jsonb),
+ sessions.legacy_export_privacy_eraser_heartbeat() TO bulls96_privacy_eraser;

@@ -33,8 +33,10 @@ REVOKE SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,
  FROM bulls96_legacy_export_privacy;
 DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb),
  sessions.legacy_export_privacy_eraser_page(jsonb),
+ sessions.legacy_export_privacy_eraser_heartbeat(),
  sessions.legacy_export_privacy_authority_ready(),
  sessions.ingest_legacy_export_scope_authority_register(jsonb);
+DROP TABLE sessions.legacy_export_privacy_eraser_readiness;
 DROP TABLE sessions.legacy_export_scope_authority;
 REVOKE USAGE ON SCHEMA sessions FROM bulls96_legacy_export_privacy;
 DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql';
