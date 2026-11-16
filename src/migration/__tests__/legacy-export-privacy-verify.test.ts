@@ -22,7 +22,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { objectKey, parseManifest, readAll, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { LEGACY_EXPORT_ORIGIN_ID, legacyMachineId, legacyUnit, legacyUnitSource, type LegacyScope } from "../neon-s3-sync/legacy-source.ts";
-import { exportUnit } from "../neon-s3-sync/export-session.ts";
+import { exportUnit, writeOnly } from "../neon-s3-sync/export-session.ts";
 import { Checkpoint, newCounters, runOrg, withLegacyPrivacyFence } from "../legacy-export/runner.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
@@ -1243,6 +1243,40 @@ describe.skipIf(GATE_TARGET !== "activation")("(g) activation gate: the exporter
       await w.f.close();
     }
   });
+
+  test("PUT TIMEOUT: a hung S3 PUT is aborted by the exporter's put bound and surfaces as the coded legacy_export_put_timeout, writing nothing", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const real = createFsStore({ root: await tmp("hb-put-timeout") });
+      await w.sweepSupabase(real); // arm, so only the PUT can fail
+      let attempted = 0;
+      // A store whose PUT never completes on its own: it settles only when the caller's AbortSignal fires.
+      const hung = new Proxy(real, {
+        get(target, prop, recv) {
+          if (prop === "put") return (_k: unknown, _b: unknown, o: { signal?: AbortSignal } = {}) => {
+            attempted += 1;
+            return new Promise((_resolve, reject) => {
+              if (!o.signal) return; // no bound at all: hangs forever (the test's own timeout would catch it)
+              o.signal.addEventListener("abort", () => reject(o.signal!.reason), { once: true });
+            });
+          };
+          const v = Reflect.get(target, prop, recv);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) as ObjectStore;
+      // The production write-only wrapper with a short bound (production: LEGACY_EXPORT_PUT_TIMEOUT_MS).
+      const bounded = writeOnly(hung, { putTimeoutMs: 500 } as never);
+      const r = await w.exportAs(n, bounded, "hb-put-timeout");
+      expect(attempted).toBeGreaterThan(0);
+      expect(await allKeys(real)).toEqual([]);
+      const codes = r.thrown !== undefined ? [r.thrown] : (r.codes ?? []);
+      expect(codes).toContain("legacy_export_put_timeout");
+      if (r.counters) expect(r.counters.exported).toBe(0);
+    } finally {
+      await w.f.close();
+    }
+  }, 60_000);
 
   test("STALE heartbeat (older than the bound): refused before any PUT", async () => {
     const n = await neon();
