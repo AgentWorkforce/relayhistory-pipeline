@@ -2617,6 +2617,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // the durable legacy-export authority and its grants/policies are removed.
     expect(await names()).toContain(LA);
     expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    const legacyDown = readFileSync(join(root, "supabase/rollbacks/20261105062030_legacy_export_scope_authority.down.sql"), "utf8");
+    expect(legacyDown.indexOf("LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE")).toBeGreaterThan(-1);
+    expect(legacyDown.indexOf("LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE")).toBeLessThan(
+      legacyDown.indexOf("IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)"),
+    );
     await rollback("20261105062030_legacy_export_scope_authority.down.sql");
     expect(await names()).not.toContain(LA);
     expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();

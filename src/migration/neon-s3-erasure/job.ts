@@ -126,6 +126,23 @@ export class ErasureJob {
   }
 
   /**
+   * Every legacy-fence failure is a privacy page, not merely an informational
+   * log. The metric discriminator is the stable log-ingestion contract; the
+   * exact error code remains available for the stricter Neon-authority alarm.
+   */
+  #legacyFenceFailure(message: string, error: unknown) {
+    this.counters.legacyFenceFailed += 1;
+    this.log({
+      message,
+      error_code: errorCode(error),
+      "@metric": "legacy_fence_sweep_failed_total",
+      value: 1,
+      legacyFenceFailed: this.counters.legacyFenceFailed,
+      alarm_route: "on-call",
+    });
+  }
+
+  /**
    * One bounded, resumable, obligation-gated erasure of `prefix` through the shared strict paged eraser
    * (eraser.ts) and the shared unresolved-write model (write-obligation.ts v3), over SyncState:
    *  - resumes from the durable checkpoint bound to `scope` (a foreign scope restarts from the start);
@@ -385,8 +402,7 @@ export class ErasureJob {
     } else {
       legacy = await this.#eraseLegacyFenced(dryRun).catch((error) => {
         healthy = false;
-        this.counters.legacyFenceFailed += 1;
-        this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
+        this.#legacyFenceFailure("legacy fence sweep failed", error);
         return { groups: 0, versions: 0 };
       });
     }
@@ -761,8 +777,7 @@ export class ErasureJob {
           this.counters.legacyVersionsDeleted += pointer.deleted;
         } catch (error) {
           if (errorCode(error) === "erasure_reenabled") continue;
-          this.counters.legacyFenceFailed += 1;
-          this.log({ message: "legacy erasure failed", error_code: errorCode(error) });
+          this.#legacyFenceFailure("legacy erasure failed", error);
         }
       }
     }
