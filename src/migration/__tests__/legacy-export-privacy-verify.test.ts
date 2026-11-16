@@ -177,6 +177,27 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect(await allKeys(store)).toEqual([]);
   });
 
+  test("Supabase ledgers written under the delivery spelling '' fence turns stored under 'default'", async () => {
+    const ledgers: [string, string][] = [
+      ["turn_session_fences", "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,'',$2,$3,'live')"],
+      ["session_erasure_receipts", "INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id) VALUES($1,'',$2,$3)"],
+      ["upload_deletions", `INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,'','${OTHER}','o',$2,$3)`],
+    ];
+    for (const [ledger, insert] of ledgers) {
+      const n = await neon(), p = await supabase();
+      await n.pg.query("DELETE FROM sessions.conversation_turns");
+      await n.pg.query(
+        `INSERT INTO sessions.conversation_turns VALUES($1,$2,'default','owner',$3,$4,0,'assistant','erase me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
+        [TURN, SD.orgId, SD.sessionId, OWNER],
+      );
+      await p.pg.query(insert, [SD.orgId, SD.source, SD.sessionId]);
+      const store = createFsStore({ root: await tmp("a3s") });
+      const { counters } = await run(n.db, p.db, store, "a3s");
+      expect({ ledger, ...counters }).toMatchObject({ ledger, exported: 0, fenced: 1 });
+      expect(await allKeys(store)).toEqual([]);
+    }
+  });
+
   test("an already-exported, unchanged scope fenced later is reported fenced on the rerun (checkpoint skip path)", async () => {
     const n = await neon(), p = await supabase();
     const store = createFsStore({ root: await tmp("a4") });
