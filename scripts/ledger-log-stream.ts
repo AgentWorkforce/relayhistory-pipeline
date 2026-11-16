@@ -18,7 +18,7 @@
  */
 import { parseArgs } from "node:util";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
-import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
+import { assertLedgerHomeHere, LedgerHomeRefused } from "../src/session-ingest/ledger-store.ts";
 import { closeLogStream, streamStatus, switchToLogMode } from "../src/session-ingest/ledger-log-stream-ops.ts";
 import { migrateLogStreamRegistry } from "../src/session-ingest/ledger-log-materialize.ts";
 import { reshardCredentials, type ReshardCredentialMode } from "./ledger-reshard-revisions.ts";
@@ -75,10 +75,10 @@ if (import.meta.main) {
   const store = createS3Store({ bucket: values.bucket, region: values.region!, credentials,
     ...(values.apply ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: values["kms-key-arn"]! } : {}) }) as unknown as ObjectStore;
   const keyRoot = values["key-root"]!;
-  // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
-  // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
+  // INGEST_LEDGER_HOME_GUARD=on (docs/ledger-relocation.md step 0; default off, no request): a relocated ledger's
+  // marker names another bucket, so this bucket's ledger/** objects are stale copies: refuse (a closed code).
   try { await assertLedgerHomeHere(store, keyRoot, values.bucket!); } catch (error) {
-    console.error(JSON.stringify({ failed: (error as Error).message === "ledger_home_invalid" ? "ledger_home_invalid" : "ledger_home_moved" }));
+    console.error(JSON.stringify({ failed: error instanceof LedgerHomeRefused ? error.code : "ledger_home_unavailable" }));
     process.exit(1);
   }
   const tenant = { orgId: values.org!, workspaceId: values.workspace!, userId: values.user! };

@@ -180,14 +180,31 @@ export async function readLedgerHome(store: ObjectStore, keyRoot: string): Promi
   return v;
 }
 
+/** The closed codes of `assertLedgerHomeHere`; the Error's message is exactly the code (safe to print). */
+export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable";
+export class LedgerHomeRefused extends Error {
+  constructor(readonly code: LedgerHomeRefusal) { super(code); this.name = "LedgerHomeRefused"; }
+}
+
 /**
- * For the single-bucket operator tools (the buffered drain, the fence backfill, the revision reshard, the log-stream
- * tool): refuse when this bucket's ledger-home marker names another bucket (the ledger moved away), or is unreadable.
- * Absent, or naming `bucket`: the ledger is here. Throws Error("ledger_home_moved" | "ledger_home_invalid").
+ * For the single-bucket operator tools (the buffered drain, the fence backfill's ownership / revision sections, the
+ * revision reshard, the log-stream tool). Only with INGEST_LEDGER_HOME_GUARD=on in the tool's environment (default
+ * off: no request, byte-identical); the relocation runbook sets it in the tool shells at step 0. Then:
+ *   absent, or naming `bucket`          the ledger is here: returns
+ *   a valid marker naming another bucket `ledger_home_moved` (its ledger/** objects are stale copies)
+ *   an unparseable or invalid body       `ledger_home_invalid`
+ *   403                                  `access_denied`
+ *   any other store or network failure   `ledger_home_unavailable` (retryable: run the tool again)
  */
-export async function assertLedgerHomeHere(store: ObjectStore, keyRoot: string, bucket: string): Promise<void> {
-  const home = await readLedgerHome(store, keyRoot);
-  if (ledgerHomeVerdict(home, bucket, false) !== "ok") throw new Error("ledger_home_moved");
+export async function assertLedgerHomeHere(store: ObjectStore, keyRoot: string, bucket: string, env: Record<string, string | undefined> = process.env): Promise<void> {
+  if (!ledgerHomeGuard(env)) return;
+  let home: LedgerHomeDoc | null;
+  try { home = await readLedgerHome(store, keyRoot); } catch (error) {
+    if (error instanceof Error && error.message === "ledger_home_invalid") throw new LedgerHomeRefused("ledger_home_invalid");
+    if (isObjectStoreError(error, "unauthorized")) throw new LedgerHomeRefused("access_denied");
+    throw new LedgerHomeRefused("ledger_home_unavailable");
+  }
+  if (ledgerHomeVerdict(home, bucket, false) !== "ok") throw new LedgerHomeRefused("ledger_home_moved");
 }
 
 /**

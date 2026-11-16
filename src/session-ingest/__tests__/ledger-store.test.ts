@@ -7,11 +7,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { journalKey } from "../async-admission.ts";
 import { LedgerUnavailableError } from "../ledger.ts";
 import { fenceAuthorityKey, fenceAuthorityStopKey, s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
-import { assertLedgerHomeHere, isLedgerKey, isRoutedCursor, ledgerHomeGuard, ledgerHomeKey, ledgerHomeVerdict, ledgerListScope, ledgerRoutedStore, readLedgerHome } from "../ledger-store.ts";
+import { assertLedgerHomeHere, LedgerHomeRefused, isLedgerKey, isRoutedCursor, ledgerHomeGuard, ledgerHomeKey, ledgerHomeVerdict, ledgerListScope, ledgerRoutedStore, readLedgerHome } from "../ledger-store.ts";
 import { parseRelocateArgs, relocateLedger, RelocateRefused, type RelocateArgs, type RelocateDeps } from "../ledger-relocate.ts";
 import { selfhostLedgerHomeGuard, selfhostLedgerStore } from "../selfhost-config.ts";
 import { hostedUploadAdmissionConfig } from "../upload-admission-hosted.ts";
@@ -236,6 +236,9 @@ describe("configuration", () => {
     expect(selfhostLedgerStore({ ...ep, INGEST_LEDGER_REGION: "us-west-2", INGEST_LEDGER_ENDPOINT: "https://s3.us-west-2.amazonaws.com" }, "s3"))
       .toEqual({ bucket: "ledger-b", region: "us-west-2", endpoint: "https://s3.us-west-2.amazonaws.com" });
     expect(() => selfhostLedgerStore({ ...ep, INGEST_LEDGER_ENDPOINT: "https://x/path" }, "s3")).toThrow("bare origin");
+    expect(() => selfhostLedgerStore({ ...base, INGEST_LEDGER_ENDPOINT: "https://e" }, "s3")).toThrow("INGEST_LEDGER_ENDPOINT needs INGEST_LEDGER_BUCKET");
+    // Cross-region with no LOCKER_ENDPOINT: AWS S3 in the ledger region, no refusal.
+    expect(selfhostLedgerStore({ ...base, INGEST_LEDGER_BUCKET: "ledger-b", INGEST_LEDGER_REGION: "us-west-2" }, "s3")).toEqual({ bucket: "ledger-b", region: "us-west-2" });
     const built: Record<string, string | undefined>[] = [];
     const build = ((env: NodeJS.ProcessEnv) => { built.push({ bucket: env.LOCKER_BUCKET, endpoint: env.LOCKER_ENDPOINT }); return { provider: "s3", bucket: env.LOCKER_BUCKET, store: fsStore() }; }) as never;
     selfhostStores({ keyRoot: ROOT, ledger: "s3", ledgerStore: { bucket: "ledger-b", region: "us-west-2" } }, { ...base, LOCKER_ENDPOINT: "https://e" }, build);
@@ -243,22 +246,38 @@ describe("configuration", () => {
   });
 
   test("the hosted upload-admission Lambda: the guard is opt-in, and a separate ledger bucket refuses", () => {
-    const env = { INGEST_LEDGER: "s3", AWS_REGION: "us-east-1", UPLOAD_ADMISSION_BUCKET: "locker-b", UPLOAD_ADMISSION_SECRET_ID: "96bulls/prod/upload-admission" };
+    const env = { INGEST_LEDGER: "s3", AWS_REGION: "us-east-1", UPLOAD_ADMISSION_BUCKET: "locker-b", UPLOAD_ADMISSION_SECRET_ID: "96bulls/ci-fixture/upload-admission" };
     expect(hostedUploadAdmissionConfig(env).ledgerHomeGuard).toBeUndefined();
     expect(hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_HOME_GUARD: "on" }).ledgerHomeGuard).toBe(true);
-    expect(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_HOME_GUARD: "yes" })).toThrow();
-    expect(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_BUCKET: "ledger-b" })).toThrow();
+    const codeOf = (e: Record<string, string>) => { try { hostedUploadAdmissionConfig(e); return "ok"; } catch (x) { return (x as { code?: string }).code ?? (x as Error).message; } };
+    expect(codeOf({ ...env, INGEST_LEDGER_HOME_GUARD: "yes" })).toContain("ledger_home_guard_invalid");
+    expect(codeOf({ ...env, INGEST_LEDGER_BUCKET: "ledger-b" })).toContain("ledger_bucket_unsupported");
   });
 
-  test("assertLedgerHomeHere (the single-bucket operator tools)", async () => {
+  test("assertLedgerHomeHere (the single-bucket operator tools): off by default, exact codes when on", async () => {
+    const ON = { INGEST_LEDGER_HOME_GUARD: "on" };
     const s = fsStore();
-    await assertLedgerHomeHere(s, ROOT, "locker-b");
-    await put(s, ledgerHomeKey(ROOT), { v: 1, home: "locker-b", writtenAtMs: 1 });
-    await assertLedgerHomeHere(s, ROOT, "locker-b");
+    let reads = 0;
+    const counted = { ...s, backend: s.backend, getObject: (k: never, r?: never) => { reads++; return s.getObject(k, r); } } as ObjectStore;
     await put(s, ledgerHomeKey(ROOT), { v: 1, home: "ledger-b", writtenAtMs: 2 });
-    await expect(assertLedgerHomeHere(s, ROOT, "locker-b")).rejects.toThrow("ledger_home_moved");
+    // Off (the default): no request at all, even with a "moved" marker present.
+    await assertLedgerHomeHere(counted, ROOT, "locker-b", {});
+    expect(reads).toBe(0);
+    const code = async (store: ObjectStore) => { try { await assertLedgerHomeHere(store, ROOT, "locker-b", ON); return "ok"; } catch (e) { return (e as LedgerHomeRefused).code; } };
+    expect(await code(counted)).toBe("ledger_home_moved");
+    expect(reads).toBe(1);
+    await put(s, ledgerHomeKey(ROOT), { v: 1, home: "locker-b", writtenAtMs: 3 });
+    expect(await code(s)).toBe("ok");
+    await s.delete(objectKey(ledgerHomeKey(ROOT)));
+    expect(await code(s)).toBe("ok");
     await put(s, ledgerHomeKey(ROOT), { v: 1 });
-    await expect(assertLedgerHomeHere(s, ROOT, "locker-b")).rejects.toThrow("ledger_home_invalid");
+    expect(await code(s)).toBe("ledger_home_invalid");
+    await s.put(objectKey(ledgerHomeKey(ROOT)), enc.encode("not json"));
+    expect(await code(s)).toBe("ledger_home_invalid");
+    const failing = (err: unknown) => ({ ...s, backend: s.backend, getObject: async () => { throw err; } }) as ObjectStore;
+    expect(await code(failing(new ObjectStoreError("unauthorized", "s3", "GET", { status: 403 })))).toBe("access_denied");
+    expect(await code(failing(new ObjectStoreError("transient", "s3", "GET", { status: 503 })))).toBe("ledger_home_unavailable");
+    expect(await code(failing(new TypeError("fetch failed")))).toBe("ledger_home_unavailable");
   });
 });
 

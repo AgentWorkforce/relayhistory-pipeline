@@ -30,7 +30,9 @@
  * backlog.
  *
  * Exactly one of --dry-run / --execute is required. --dry-run needs only s3:ListBucket and s3:GetObject
- * (and kms:Decrypt); every put/delete is refused in code as well. --execute writes the canonical layout,
+ * (and kms:Decrypt); every put/delete is refused in code as well. With INGEST_LEDGER_HOME_GUARD=on (default off) both
+ * modes first GET `96bulls/.ledger/fence-authority/.ledger-home.json` and refuse a relocated ledger (ledger-store.ts
+ * assertLedgerHomeHere: ledger_home_moved | ledger_home_invalid | access_denied | ledger_home_unavailable). --execute writes the canonical layout,
  * the 0005 revision index, re-arm markers and the drained markers, and needs the owner's explicit OK.
  *
  * Without --org, orgs are discovered with one delimiter listing of `96bulls/` (S3 ListObjectsV2,
@@ -220,8 +222,8 @@ if (import.meta.main) {
       bucket: args.bucket, region: args.region, credentials,
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
     }) as unknown as ObjectStore;
-    // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
-    // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
+    // INGEST_LEDGER_HOME_GUARD=on (docs/ledger-relocation.md step 0; default off, no request): a relocated ledger's
+    // marker names another bucket, so this bucket's ledger/** objects are stale copies: refuse (a closed code).
     await assertLedgerHomeHere(store, KEY_ROOT, args.bucket);
     const summary = await runDrain(args, { store, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
     process.stdout.write(JSON.stringify(summary) + "\n");

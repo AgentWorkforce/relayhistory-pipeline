@@ -157,9 +157,10 @@ if (import.meta.main) {
       credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
     }) as unknown as ObjectStore;
-    // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
-    // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
-    await assertLedgerHomeHere(store, "96bulls", args.bucket);
+    // INGEST_LEDGER_HOME_GUARD=on (docs/ledger-relocation.md step 0; default off, no request): a relocated ledger's
+    // marker names another bucket, so this bucket's ledger/** objects are stale copies: refuse (a closed code).
+    // Only the ownership and revision sections write ledger/** (the fences never move: ledger-store.ts).
+    if (args.sections.some((s) => s !== "fences")) await assertLedgerHomeHere(store, "96bulls", args.bucket);
     const db = client;
     const summary = await backfillUploadFences({
       sql: { query: async (text, params) => ({ rows: (await db.query(text, params)).rows }) },
