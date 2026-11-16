@@ -88,6 +88,7 @@ import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.
 import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
 import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import { briefRegenFromEnv } from "../session-brief/regen.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
@@ -521,11 +522,14 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
   const key = modelKey({ OPENAI_API_KEY: secret.openai_api_key });
+  const briefSettings = briefConfig();
   const brief = briefTick({
     reader,
     store,
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
-    config: briefConfig(),
+    config: briefSettings,
+    // Summaries regeneration flags (default off: null, today's behaviour).
+    regen: briefRegenFromEnv(briefSettings.model, key),
   });
   // Session analysis (lane F1): the same secret-only model key; no key = no claim.
   const sessionAnalysis = analysisTick({

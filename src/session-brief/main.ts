@@ -12,6 +12,7 @@ import { createAnalysisTransport } from "./engine/transport.ts";
 import { briefTick } from "./worker.ts";
 import { canonicalBriefInputFromEnv } from "./canonical-input.ts";
 import { briefCollectorFetch } from "./analytics-transport.ts";
+import { briefRegenFromEnv } from "./regen.ts";
 
 const config = briefConfig();
 const analyticsSettings = analyticsConfig(process.env, "selfhost");
@@ -38,6 +39,8 @@ const tick = briefTick({
   transport,
   config,
   ...(canonicalInput ? { canonicalInput } : {}),
+  // Summaries regeneration flags (default off: null, today's behaviour).
+  regen: briefRegenFromEnv(config.model, key),
 }, analytics);
 await runWorker({
   service: "session-brief",
