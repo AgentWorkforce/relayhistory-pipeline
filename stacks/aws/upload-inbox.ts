@@ -35,6 +35,7 @@
  * (`unsupported_encoding`). S3 itself verifies a sent checksum against the body.
  */
 import { INBOX_UPLOAD_NAMESPACE, UPLOAD_OBJECT_SUFFIX } from "../../src/session-ingest/upload-inbox-contract.ts";
+import { ledgerLogCommitConsumerStatements } from "./ledger-log-commit-policy.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 
 /** Key prefix of every desktop upload: `96bulls/.upload-inbox/<org>/v1/ws=<ws>/u=<uh>/...`. */
@@ -211,7 +212,12 @@ export const FENCE_AUTHORITY_MARKER_KEY = `${TENANT_KEY_BASE}/.ledger/fence-auth
 /** The per-org markers (ledger-s3.ts orgFenceAuthorityKey): `96bulls/.ledger/fence-authority/<org>.json`, read only. */
 export const FENCE_AUTHORITY_ORG_MARKERS = `${TENANT_KEY_BASE}/.ledger/fence-authority/*`;
 
-export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[] }) {
+/**
+ * `ledgerLogCommit` (transcriptStore.uploadAdmission.ledgerLogCommit === "on"): appends the numbered-log ledger's
+ * consumer statements (ledger-log-commit-policy.ts). Refused today (assertUploadAdmissionInputs), so the rendered
+ * policy is unchanged; absent or false, byte-for-byte as before.
+ */
+export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[]; ledgerLogCommit?: boolean }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   const principal = { AWS: i.consumerRoleArn };
   return [
@@ -235,6 +241,7 @@ export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumer
       Resource: [i.bucketArn, `${i.bucketArn}/*`],
       Condition: { ArnEquals: { "aws:PrincipalArn": i.consumerRoleArn } },
     },
+    ...(i.ledgerLogCommit ? ledgerLogCommitConsumerStatements({ bucketArn: i.bucketArn, consumerRoleArn: i.consumerRoleArn }) : []),
   ];
 }
 
@@ -396,6 +403,9 @@ export function uploadInboxQueueConfiguration(queueArn: string) {
  *   allowlist           allowlist only (and required then): `org:<id>` / `ws:<id>` entries
  *                       (HISTORY_UPLOAD_DIRECT_ALLOWLIST). It must match the issuer's allowlist: a tenant the
  *                       consumer excludes waits (retry, then the DLQ), never refuses.
+ *   ledgerLogCommit     INGEST_LEDGER_LOG_COMMIT's IAM (ledger-log-commit-policy.ts): "off" (or absent) only. "on" is
+ *                       refused, as the hosted runtime refuses the flag (docs/design/s3-ledger-log-commit.md: log mode
+ *                       is not cleared for production); the grants it would add are written down there.
  *
  * Not inputs: UPLOAD_WITNESS_KEY lives in the `upload-admission-secret` container, set out of band (never in
  * env, state or source). Decision 0005 removed the Cloudflare queue hand-off: the consumer admits itself.
@@ -403,6 +413,7 @@ export function uploadInboxQueueConfiguration(queueArn: string) {
 export interface UploadAdmissionInputs {
   direct: "off" | "allowlist" | "on";
   allowlist?: string[];
+  ledgerLogCommit?: "off" | "on";
 }
 
 const ALLOWLIST_ENTRY = /^(org|ws):(?!\.)[A-Za-z0-9._-]{1,128}$/;
@@ -415,7 +426,10 @@ export function assertUploadAdmissionInputs(value: unknown, required: boolean, r
   if (value === null || typeof value !== "object" || Array.isArray(value)) return refuse("transcriptStore.uploadAdmission must be an object");
   const v = value as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "direct" && k !== "allowlist") refuse(`transcriptStore.uploadAdmission.${k} is not a known setting`);
+    if (k !== "direct" && k !== "allowlist" && k !== "ledgerLogCommit") refuse(`transcriptStore.uploadAdmission.${k} is not a known setting`);
+  // Not cleared for production: the hosted runtime refuses INGEST_LEDGER_LOG_COMMIT=on, so the stack refuses its grants.
+  if (v.ledgerLogCommit !== undefined && v.ledgerLogCommit !== "off")
+    refuse('transcriptStore.uploadAdmission.ledgerLogCommit must be "off" (log mode is not cleared for production: docs/design/s3-ledger-log-commit.md)');
   if (v.direct !== "off" && v.direct !== "allowlist" && v.direct !== "on") refuse('transcriptStore.uploadAdmission.direct must be "off", "allowlist" or "on"');
   if (v.direct === "allowlist") {
     if (!Array.isArray(v.allowlist) || v.allowlist.length === 0 || v.allowlist.length > 100 || !v.allowlist.every((e) => typeof e === "string" && ALLOWLIST_ENTRY.test(e)) || new Set(v.allowlist).size !== v.allowlist.length)

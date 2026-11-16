@@ -386,6 +386,19 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
   - Tests: the ambiguous-take test now ends with one epoch entry (`ledger-log.test.ts`); a registry PUT failing before
     or after landing writes no epoch entry and the retry takes once; the same writer id with its cache dropped appends
     without a take, and another writer still takes (`ledger-log-admit.test.ts`).
+- **IAM in the stack (Remaining 10).** `stacks/aws/ledger-log-commit-policy.ts` writes the grants down as statements:
+  the consumer (admission and the materializer, one process) GET/PUT on every stream object and the receipt outcomes,
+  GET/PUT on the registry, DELETE on payloads and the admitted outcome; the operator tool (a role outside the stack)
+  GET on the legacy batch docs, the log and the markers, PUT on entry 0, `closed.json`, the identity doc and the
+  registry, DELETE on registry docs (the migration), KMS via S3 for those keys. `uploadAdmissionBucketStatements`
+  appends the consumer's statements only with `ledgerLogCommit` on, and `assertUploadAdmissionInputs` refuses `on`
+  (the stack mirrors `ledger_log_commit_unsupported`): default off, the rendered policy is byte-for-byte unchanged.
+  The bucket's `OnlyTheEraserDeletes` deny would still refuse the consumer's deletes; the carve-out it needs is named
+  (`LEDGER_LOG_DELETE_CARVE_OUT`) and left for the change that clears log mode for production.
+  - Tests (`upload-inbox-infra.test.ts`): off is byte-for-byte unchanged and `on` is refused; every glob matches the
+    keys the code writes (from the real key functions); with the statements rendered, the consumer reads and writes
+    every log object, gets nothing else and no other principal does, and the eraser-only deny still refuses its
+    deletes; the operator's grants are exactly the drain reads, the four writes and registry deletes.
 - **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
   written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
   malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
@@ -424,7 +437,9 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
    key them by hash only).
 9. Closed in slice 6: admission registers the stream before it takes it, and `takeStream` is idempotent for the
    writer that already holds the epoch, so a retry adds no epoch entry.
-10. IAM: the materializer needs GET/PUT/DELETE/LIST on `ledger/log/` (including the skip records under `s/`) and
-    `.ledger/log-streams/`, PUT/DELETE on the receipt outcomes; the admission consumer GET on the skip records and
-    DELETE on its own admitted outcome; the operator tool GET/LIST on `ledger/batches/` and PUT on `ledger/log/e/`, `closed.json` and the
-    registry. Document them in the stack before any deployment.
+10. Documented in the stack in slice 6 (`stacks/aws/ledger-log-commit-policy.ts`), behind
+    `transcriptStore.uploadAdmission.ledgerLogCommit`, which refuses `on` as the hosted runtime refuses the flag, so
+    nothing renders and nothing is applied. Before production, the change that lifts both refusals must also carve the
+    payload, admitted-outcome and registry deletes out of `OnlyTheEraserDeletes` (`LEDGER_LOG_DELETE_CARVE_OUT`) and
+    grant the operator role (`ledgerLogOperatorStatements`, `ledgerLogOperatorKeyStatement`), which lives outside the
+    stack today.
