@@ -26,6 +26,7 @@ import {
   legacyGroupScopes,
   legacyScopeFenced,
   legacyScopeUser,
+  legacyMachineId,
   legacyUnit,
   legacyUnitSource,
   type LegacyGroup,
@@ -202,7 +203,7 @@ const cursorName = (table: LegacyTable, window: Window | undefined) =>
 
 export interface RunDeps {
   db: Queryable;
-  /** Live HoopDb/Supabase privacy authority, read-only. */
+  /** Live Supabase privacy authority: ledger SELECT plus the narrow register RPC. */
   privacyDb: Queryable;
   target: ExportTarget;
   checkpoint: Checkpoint;
@@ -219,14 +220,19 @@ export async function withLegacyPrivacyFence<T>(
   scope: LegacyScope,
   userId: string,
   action: () => Promise<T>,
+  registration?: { machineId: string; existing: boolean },
 ): Promise<{ fenced: true } | { fenced: false; value: T }> {
   let phase: "privacy" | "action" = "privacy";
   let actionValue: { set: false } | { set: true; value: T } = { set: false };
   try {
-    await db.query("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY");
+    // The login has no table-write grants, but this transaction must be able
+    // to invoke the narrow SECURITY DEFINER authority-row register before a
+    // PUT. The privilege preflight, not transaction_read_only, is the write
+    // boundary on this connection.
+    await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
     await db.query("SET LOCAL lock_timeout='30s'");
     await db.query("SET LOCAL statement_timeout='15min'");
-    // sessionReadOnly's session default is 30 s. A large scope intentionally
+    // The connection's session default is 30 s. A large scope intentionally
     // idles this connection while Neon is streamed and S3 is written; keep the
     // privacy transaction and its locks alive for this operator-controlled scope.
     await db.query("SET LOCAL idle_in_transaction_session_timeout='0'");
@@ -234,15 +240,17 @@ export async function withLegacyPrivacyFence<T>(
     await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
     const privacyQuery = `SELECT (
         EXISTS(SELECT 1 FROM sessions.session_erasure_receipts
-          WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.upload_deletions
-          WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND source=$3 AND session_id=$4)
+        OR EXISTS(SELECT 1 FROM sessions.ingest_frozen_source_deletions
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.upload_resets
-          WHERE org_id=$1 AND workspace_id=$2 AND user_id=$5)
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND user_id=$5)
         OR EXISTS(SELECT 1 FROM sessions.turn_session_fences
-          WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.operator_user_erasures
-          WHERE org_id=$1 AND workspace_id=$2 AND user_id=$5)
+          WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND user_id=$5)
       ) AS fenced`;
     const privacyParams = [
       scope.orgId,
@@ -251,6 +259,28 @@ export async function withLegacyPrivacyFence<T>(
       scope.sessionId,
       userId,
     ];
+    const register = async () => {
+      if (!registration) return;
+      const expected = {
+        org_id: scope.orgId,
+        workspace_id: scope.workspaceId === "" ? "default" : scope.workspaceId,
+        source: scope.source,
+        session_id: scope.sessionId,
+        legacy_user_id: userId,
+        legacy_machine_id: registration.machineId,
+      };
+      const { rows } = await db.query<{ r: typeof expected }>(
+        "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb) AS r",
+        [JSON.stringify(expected)],
+      );
+      const got = rows[0]?.r;
+      if (!got || (Object.keys(expected) as Array<keyof typeof expected>).some((k) => got[k] !== expected[k]))
+        throw Object.assign(new Error("legacy export authority registration mismatch"), { code: "legacy_authority_register_mismatch" });
+    };
+    // Repair an already-exported checkpoint even when a fence now exists, so
+    // the eraser can find the pre-registration object. A brand-new scope is
+    // registered only after its initial no-fence check below.
+    if (registration?.existing) await register();
     const { rows } = await db.query<{ fenced: boolean }>(
       privacyQuery,
       privacyParams,
@@ -259,6 +289,7 @@ export async function withLegacyPrivacyFence<T>(
       await db.query("COMMIT");
       return { fenced: true };
     }
+    if (registration && !registration.existing) await register();
     phase = "action";
     const value = await action();
     actionValue = { set: true, value };
@@ -372,8 +403,9 @@ async function exportScope(
       });
     const userId = prior?.user_id ?? resolvedUserId;
     boundUserId = userId;
+    const registration = { machineId: legacyMachineId(scope.workspaceId === "" ? "default" : scope.workspaceId, userId), existing: !!prior?.manifest_key };
     if (!opts.force && prior?.fingerprint === fingerprint && prior.status === "exported") {
-      const privacy = await withLegacyPrivacyFence(deps.privacyDb, scope, userId, async () => undefined);
+      const privacy = await withLegacyPrivacyFence(deps.privacyDb, scope, userId, async () => undefined, opts.export ? registration : undefined);
       if (privacy.fenced) {
         counters.fenced += 1;
         if (opts.export) deps.checkpoint.setScope(key, scope.orgId, "fenced", fingerprint, prior.manifest_key, userId);
@@ -402,6 +434,7 @@ async function exportScope(
         unit,
         legacyUnitSource(deps.db, deps.hook, 500, undefined, userId),
       ),
+      registration,
     );
     if (privacy.fenced) {
       counters.fenced += 1;

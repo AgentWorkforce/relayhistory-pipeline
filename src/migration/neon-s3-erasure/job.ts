@@ -9,6 +9,8 @@
  *    rollup has nothing left to keep), every 10 min;
  *  - whole session prefixes of groups a deletion fence covers
  *    (`deleted_upload_sessions`, `session_resets`), every 10 min;
+ *  - the exact owner-bound `legacy:tables:v1` machine copy of each fenced
+ *    legacy scope, including its live pointer, every 10 min;
  *  - what the exporter queued: objects a rewritten manifest no longer
  *    references, and session prefixes it no longer produces.
  *
@@ -20,7 +22,8 @@
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
-import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence } from "./authority.ts";
+import { LEGACY_EXPORT_ORIGIN_ID, legacyMachineId } from "../../shared/legacy-export-machine.ts";
+import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence, type LegacyFencedGroup } from "./authority.ts";
 import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagedPrefix, liveTargets } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
@@ -59,8 +62,9 @@ export interface ErasureConfig {
   /**
    * Whether the existence guard also counts legacy-only evidence (conversation
    * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`. Legacy manifests
-   * from `migration:legacy-export` are never in this job's queue, so this only
-   * changes when a delivery group's own prefixes may be erased.
+   * from `migration:legacy-export` are not in the ordinary exporter queue
+   * (the dedicated legacy fence sweep below owns them), so this only changes
+   * when a delivery group's ordinary prefixes may be erased.
    */
   recognizeLegacy: boolean;
   /**
@@ -95,7 +99,7 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
 export type PagedOutcome = "incomplete" | "erased" | "unverified" | "unresolved" | "refused";
 
 export class ErasureJob {
-  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, resumable: 0, unverified: 0 };
+  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, legacyVersionsDeleted: 0, legacyFenceFailed: 0, resumable: 0, unverified: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
   readonly authority: ErasureAuthority;
@@ -351,6 +355,14 @@ export class ErasureJob {
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
       return { groups: 0, versions: 0 };
     });
+    // The one-shot legacy exporter writes to a separate user-scoped srv_
+    // machine and never enters the ordinary export queue.  Consume its own
+    // scope-level fence feed independently of the live-origin feed.
+    const legacy = await this.#eraseLegacyFenced(opts.dryRun ?? false).catch((error) => {
+      this.counters.legacyFenceFailed += 1;
+      this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
+      return { groups: 0, versions: 0 };
+    });
     // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
     // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
     let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
@@ -376,7 +388,7 @@ export class ErasureJob {
     }
     this.counters.swept += 1;
     if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions, legacy_fenced: legacy.groups, legacy_versions: legacy.versions });
   }
 
   /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */
@@ -584,6 +596,96 @@ export class ErasureJob {
           if (errorCode(error) === "erasure_reenabled") continue;
           this.counters.liveFenceFailed += 1;
           this.log({ message: "live erasure failed", error_code: errorCode(error) });
+        }
+      }
+    }
+    return { groups, versions };
+  }
+
+  /**
+   * Erase the legacy export's one owner-bound machine copy for every fenced
+   * scope.  A member other than the owner may have created the fence; the
+   * authority supplies the exporter's bound owner, so this never hashes the
+   * deleting member into the target machine.
+   *
+   * The transcript selection is the exact encoded `s=` segment under every
+   * date.  In particular, a canonical id containing `:` is mapped with the
+   * writer's component codec instead of being treated as a successful
+   * refusal.  The pointer is exact-key erased only after the transcript has a
+   * fresh zero-inventory proof.  Every page rechecks the exact scope fence.
+   */
+  async #eraseLegacyFenced(dryRun: boolean): Promise<{ groups: number; versions: number }> {
+    const page = this.authority.legacyFencedPage;
+    const stillFenced = this.authority.stillLegacyFenced;
+    // In-process test authorities predating this lane have no legacy feed.
+    // Production factories install both methods as a pair.
+    if (!page && !stillFenced) return { groups: 0, versions: 0 };
+    if (!page || !stillFenced) throw refusal("legacy_erasure_authority_incomplete");
+    let groups = 0;
+    let versions = 0;
+    let after: LegacyFencedGroup | null = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows: LegacyFencedGroup[] = await page.call(this.authority, after);
+      if (rows.length === 0) break;
+      after = rows.at(-1)!;
+      for (const g of rows) {
+        if (this.stopped()) break;
+        // The stored machine is evidence, not destructive authority by
+        // itself: derive it again from the canonical owner tuple and refuse
+        // corruption instead of following an arbitrary machine id.
+        if (legacyMachineId(g.workspace_id, g.legacy_user_id) !== g.legacy_machine_id)
+          throw refusal("legacy_erasure_machine_mismatch");
+        let t;
+        try {
+          t = liveTargets(this.cfg.keyRoot, {
+            org_id: g.org_id,
+            workspace_id: g.workspace_id,
+            user_id: g.legacy_user_id,
+            origin_id: LEGACY_EXPORT_ORIGIN_ID,
+            source: g.source,
+            session_id: g.session_id,
+          });
+        } catch {
+          this.counters.refused += 1;
+          throw refusal("legacy_erasure_scope_invalid");
+        }
+        groups += 1;
+        if (dryRun) continue;
+        const checkedAt = this.now();
+        if (!(await stillFenced.call(this.authority, g))) continue;
+        const before = checkedAt - LIVE_SKEW_MS;
+        const matchesSession = (key: string) => inSessionAnyDate(t.base, t.sessionSegment, key);
+        const authorize = async () => {
+          if (!(await stillFenced.call(this.authority, g))) throw refusal("erasure_reenabled");
+          await this.authority.ready();
+        };
+        try {
+          const transcript = await this.#erasePaged(
+            t.base,
+            eraseScope(["legacy-session", this.authority.kind, g.org_id, g.workspace_id, g.legacy_user_id, g.source, g.session_id]),
+            (v) => matchesSession(v.key) && v.lastModified !== undefined && v.lastModified < before,
+            authorize,
+            matchesSession,
+          );
+          versions += transcript.deleted;
+          this.counters.legacyVersionsDeleted += transcript.deleted;
+          // A successor written after the fence re-read is deliberately kept;
+          // keep the pointer too so that successor remains discoverable and a
+          // later sweep can erase it after the skew window.
+          if (transcript.status !== "erased" || transcript.remaining > 0) continue;
+          const pointer = await this.#eraseKey(
+            t.pointerKey,
+            eraseScope(["legacy-pointer", this.authority.kind, g.org_id, g.workspace_id, g.legacy_user_id, g.source, g.session_id]),
+            (v) => v.lastModified !== undefined && v.lastModified < before,
+            authorize,
+          );
+          versions += pointer.deleted;
+          this.counters.legacyVersionsDeleted += pointer.deleted;
+        } catch (error) {
+          if (errorCode(error) === "erasure_reenabled") continue;
+          this.counters.legacyFenceFailed += 1;
+          this.log({ message: "legacy erasure failed", error_code: errorCode(error) });
         }
       }
     }

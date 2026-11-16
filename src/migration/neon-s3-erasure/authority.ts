@@ -14,6 +14,8 @@
  * erasing from it could destroy a session the user re-enabled.
  */
 import type { Queryable } from "../relayhistory-export.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
+import { selectedPublicTurnPredicateColumnSql } from "../../shared/legacy-turn-source.ts";
 import {
   activityPage,
   catalogPage,
@@ -33,6 +35,21 @@ export interface ErasurePresence {
   groupExists(orgId: string, sessionId: string, includeLegacy: boolean): Promise<boolean>;
 }
 
+/**
+ * One legacy-exported scope whose privacy fence is still authoritative.  The
+ * user is the owner bound by the legacy exporter, not necessarily the member
+ * whose deletion created the fence; it derives the one `legacy:tables:v1`
+ * machine which may be erased without reaching another user's copy.
+ */
+export interface LegacyFencedGroup {
+  org_id: string;
+  workspace_id: string;
+  source: string;
+  session_id: string;
+  legacy_user_id: string;
+  legacy_machine_id: string;
+}
+
 export interface ErasureAuthority {
   readonly kind: ErasureAuthorityKind;
   /** Refuses (throws) when this source is not the privacy authority right now. */
@@ -44,6 +61,89 @@ export interface ErasureAuthority {
   fencedLivePage(after: LiveFencedGroup | null, limit?: number): Promise<LiveFencedGroup[]>;
   /** Re-read right before an erasure: false once the user re-enabled the session. */
   stillFenced(g: LiveFencedGroup): Promise<boolean>;
+  /**
+   * Legacy-export scope fences, already joined to their exporter-bound owner.
+   * Optional only for small in-process test authorities; both production
+   * authority factories install it before legacy erasure is activated.
+   */
+  legacyFencedPage?(after: LegacyFencedGroup | null, limit?: number): Promise<LegacyFencedGroup[]>;
+  /** Re-read the exact scope-level fence immediately before every delete page. */
+  stillLegacyFenced?(g: LegacyFencedGroup): Promise<boolean>;
+}
+
+const LEGACY_FENCE_PAGE = 5_000;
+
+/**
+ * Neon-era legacy scopes.  The owner expression is deliberately identical to
+ * the legacy exporter's binding order: one delivery-event user, otherwise one
+ * outcome user, otherwise one owner across the selected public turns. A
+ * deleting member's user id is never substituted for it.
+ */
+async function neonLegacyFencedPage(
+  db: Queryable,
+  after: LegacyFencedGroup | null,
+  limit = LEGACY_FENCE_PAGE,
+): Promise<LegacyFencedGroup[]> {
+  const { rows } = await db.query<Omit<LegacyFencedGroup, "legacy_machine_id">>(
+    `WITH fences AS (
+       SELECT org_id,CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END AS workspace_id,source,session_id
+         FROM sessions.deleted_upload_sessions
+       UNION
+       SELECT org_id,CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END AS workspace_id,source,session_id
+         FROM sessions.conversation_turn_fences),
+     bound AS (
+       SELECT f.*,
+         CASE
+           WHEN EXISTS(SELECT 1 FROM sessions.convergence_events e
+             WHERE e.org_id=f.org_id AND (e.workspace_id=f.workspace_id OR (f.workspace_id='default' AND e.workspace_id=''))
+               AND e.source=f.source AND e.session_id=f.session_id AND e.user_id<>'')
+           THEN (SELECT min(e.user_id) FROM sessions.convergence_events e
+             WHERE e.org_id=f.org_id AND (e.workspace_id=f.workspace_id OR (f.workspace_id='default' AND e.workspace_id=''))
+               AND e.source=f.source AND e.session_id=f.session_id AND e.user_id<>''
+             HAVING count(DISTINCT e.user_id)=1)
+           WHEN EXISTS(SELECT 1 FROM sessions.session_outcomes o
+             WHERE o.org_id=f.org_id AND (o.workspace_id=f.workspace_id OR (f.workspace_id='default' AND o.workspace_id=''))
+               AND o.source=f.source AND o.session_id=f.session_id AND o.user_id<>'')
+           THEN (SELECT min(o.user_id) FROM sessions.session_outcomes o
+             WHERE o.org_id=f.org_id AND (o.workspace_id=f.workspace_id OR (f.workspace_id='default' AND o.workspace_id=''))
+               AND o.source=f.source AND o.session_id=f.session_id AND o.user_id<>''
+             HAVING count(DISTINCT o.user_id)=1)
+           WHEN EXISTS(SELECT 1 FROM sessions.conversation_turns t
+             WHERE t.org_id=f.org_id AND (t.workspace_id=f.workspace_id OR (f.workspace_id='default' AND t.workspace_id='')) AND t.session_id=f.session_id
+               AND ${selectedPublicTurnPredicateColumnSql("t", "f")} AND t.session_owner<>'')
+           THEN (SELECT min(t.session_owner) FROM sessions.conversation_turns t
+             WHERE t.org_id=f.org_id AND (t.workspace_id=f.workspace_id OR (f.workspace_id='default' AND t.workspace_id='')) AND t.session_id=f.session_id
+               AND ${selectedPublicTurnPredicateColumnSql("t", "f")} AND t.session_owner<>''
+             HAVING count(DISTINCT t.session_owner)=1)
+           ELSE NULL
+         END AS legacy_user_id
+       FROM fences f)
+     SELECT org_id,workspace_id,source,session_id,legacy_user_id
+       FROM bound
+      WHERE legacy_user_id IS NOT NULL
+        AND ($1::text IS NULL OR (org_id,workspace_id,source,session_id,legacy_user_id) > ($1,$2,$3,$4,$5))
+      ORDER BY org_id,workspace_id,source,session_id,legacy_user_id
+      LIMIT $6`,
+    after
+      ? [after.org_id, after.workspace_id, after.source, after.session_id, after.legacy_user_id, Math.min(limit, LEGACY_FENCE_PAGE)]
+      : [null, null, null, null, null, Math.min(limit, LEGACY_FENCE_PAGE)],
+  );
+  return rows.map((r) => ({ ...r, legacy_machine_id: legacyMachineId(r.workspace_id, r.legacy_user_id) }));
+}
+
+async function neonStillLegacyFenced(db: Queryable, g: LegacyFencedGroup): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 WHERE
+       EXISTS(SELECT 1 FROM sessions.deleted_upload_sessions
+         WHERE org_id=$1 AND source=$3 AND session_id=$4
+           AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
+       OR EXISTS(SELECT 1 FROM sessions.conversation_turn_fences
+         WHERE org_id=$1 AND source=$3 AND session_id=$4
+           AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
+       LIMIT 1`,
+    [g.org_id, g.workspace_id, g.source, g.session_id],
+  );
+  return rows.length > 0;
 }
 
 export function neonAuthority(db: Queryable): ErasureAuthority {
@@ -66,6 +166,8 @@ export function neonAuthority(db: Queryable): ErasureAuthority {
           [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
         )
       ).rows.length > 0,
+    legacyFencedPage: (after, limit) => neonLegacyFencedPage(db, after, limit),
+    stillLegacyFenced: (g) => neonStillLegacyFenced(db, g),
   };
 }
 
@@ -81,7 +183,8 @@ export class AuthorityNotActive extends Error {
  * The Supabase authority's fenced set, through the least-privilege eraser RPCs (20261105041000): the deduplicated
  * UNION of the frozen-source deletions (Neon-era sessions) and the target's upload_deletions (every session the
  * ordered fence deleted, post-cutover uploads included). Each RPC refuses unless the authority is active. The
- * connection is expected to be bulls96_privacy_eraser (assertEraserIdentity), which can call nothing else.
+ * connection is expected to be bulls96_privacy_eraser (assertEraserIdentity), which can call nothing else beyond
+ * the eraser RPC surface (ordinary and legacy-scope pages plus their rechecks).
  */
 export function supabaseAuthority(db: Queryable): ErasureAuthority {
   const rpc = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
@@ -107,6 +210,16 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
     stillFenced: async (g) =>
       (await rpc<boolean>("SELECT sessions.ingest_privacy_eraser_still_fenced($1::jsonb) AS r", [JSON.stringify({
         org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id,
+      })])) === true,
+    legacyFencedPage: async (after, limit = LIVE_FENCE_PAGE) =>
+      rpc<LegacyFencedGroup[]>("SELECT sessions.legacy_export_privacy_eraser_page($1::jsonb) AS r", [JSON.stringify({
+        after: after ? [after.org_id, after.workspace_id, after.source, after.session_id, after.legacy_user_id, after.legacy_machine_id] : null,
+        limit: Math.min(limit, 5000),
+      })]),
+    stillLegacyFenced: async (g) =>
+      (await rpc<boolean>("SELECT sessions.legacy_export_privacy_eraser_still_fenced($1::jsonb) AS r", [JSON.stringify({
+        org_id: g.org_id, workspace_id: g.workspace_id, source: g.source, session_id: g.session_id,
+        legacy_user_id: g.legacy_user_id, legacy_machine_id: g.legacy_machine_id,
       })])) === true,
   };
 }

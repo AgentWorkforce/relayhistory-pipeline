@@ -41,11 +41,11 @@ test("the static manifest equals the first consumer recomputed from the migratio
 });
 
 test("every chain role is mapped exactly once and no unknown role is mapped", () => {
-  expect(chainNames.length).toBe(14);
+  expect(chainNames.length).toBe(15);
   const roles = SESSION_BOOTSTRAP_CONSUMERS.map(([r]) => r);
   expect(new Set(roles).size).toBe(roles.length);
   expect([...roles].sort()).toEqual([...chainNames].sort());
-  expect(bootstrapConsumers().size).toBe(14);
+  expect(bootstrapConsumers().size).toBe(15);
 });
 
 test("a malformed, duplicate, conflicting, unknown or missing manifest entry refuses", () => {
@@ -71,7 +71,9 @@ test("required set: first consumer at or before the target, upstream before hist
   expect(compareSteps("96bulls:0001_a.sql", "upstream:20261105047000_x.sql")).toBeGreaterThan(0);
   expect(compareSteps("upstream:20261105046000_analysis_jobs.sql", "upstream:20261105046000_analysis_jobs.sql")).toBe(0);
   expect(code(() => compareSteps("other:1.sql", "96bulls:0001_a.sql"))).toBe("release_bootstrap_manifest");
-  expect(targetRequiredRoles("upstream:20261105047000_coordination_fact_readers.sql")).toEqual([...chainNames].sort());
+  expect(targetRequiredRoles("upstream:20261105047000_coordination_fact_readers.sql")).toEqual(
+    chainNames.filter((r) => r !== "bulls96_legacy_export_privacy").sort(),
+  );
   expect(targetRequiredRoles("96bulls:0001_anything.sql")).toEqual([...chainNames].sort());
   // At a first consumer: that role is required (<=).
   expect(targetRequiredRoles("upstream:20261105046000_analysis_jobs.sql")).toContain("bulls96_analysis_admit");
@@ -92,7 +94,9 @@ test("bootstrapRequiredRoles binds the manifest to the anchor's steps up to the 
     return migrations.filter((f) => f <= t).map(consumerStep);
   };
   const target = "upstream:20261105047000_coordination_fact_readers.sql";
-  expect(bootstrapRequiredRoles({ target, steps: upTo(target) })).toEqual([...chainNames].sort());
+  expect(bootstrapRequiredRoles({ target, steps: upTo(target) })).toEqual(
+    chainNames.filter((r) => r !== "bulls96_legacy_export_privacy").sort(),
+  );
   // Target not an anchor step.
   expect(code(() => bootstrapRequiredRoles({ target, steps: upTo(target).slice(0, -1) }))).toBe("release_bootstrap_manifest");
   // A required role's first consumer missing from the anchor up to the target.
