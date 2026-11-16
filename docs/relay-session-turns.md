@@ -71,4 +71,6 @@ canonical reads are healthy for the canary, and publication/GC have no backlog. 
 stays unset/`neon` while these code changes are reviewed.
 
 ## Rollback
-Unset `TURNS_WRITE_PATH` (live in seconds). Records already forwarded stay in the buffered stage and are inert until publication; Neon stays complete in `dual`.
+Unset `TURNS_WRITE_PATH` (live in seconds). Records already forwarded stay canonical. Neon is
+complete only for a preceding `dual` interval; after any direct `forward` interval, returning to
+Neon would split authority and is forbidden until the affected scopes are re-exported and verified.
