@@ -546,6 +546,158 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       await f.close();
     }
   });
+
+  /**
+   * The production-shaped hosted world shared by the F1-fix checks: the repo's real Supabase migration stack, activated,
+   * with 062010's turn_session_fences (062010 then 062020's own grant block when the stack lacks it), the provisioned
+   * bulls96_legacy_export_privacy role, and the exporter's own privacy-session initializer and preflight.
+   */
+  async function hostedWorld() {
+    const main = (await import("../legacy-export/main.ts")) as Record<string, unknown>;
+    const initPrivacy = main.legacyPrivacySession as ((q: Queryable) => Promise<Queryable>) | undefined;
+    const preflight = main.assertPrivacySelectOnly as (q: Queryable) => Promise<void>;
+    expect(typeof initPrivacy).toBe("function");
+    expect(existsSync(AUTHORITY_MIGRATION)).toBe(true);
+    const f = await authorityFixture();
+    await f.seal();
+    await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+    const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+    await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+    const had = ((await f.db.query("SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
+    if (!had) {
+      await f.db.exec(`CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+        first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id));
+        ALTER TABLE sessions.turn_session_fences ENABLE ROW LEVEL SECURITY`);
+      const block = /DO \$turn_fence_grant\$[\s\S]*?END \$turn_fence_grant\$;/u.exec(readFileSync(AUTHORITY_MIGRATION, "utf8"))?.[0];
+      if (!block) throw new Error("062020 no longer carries its conditional turn_session_fences grant block");
+      await f.db.exec(block);
+    }
+    const raw: Queryable = {
+      query: async <T,>(t: string, p?: unknown[]) => {
+        if (p?.length) return (await f.db.query<T>(t, p as never)) as { rows: T[] };
+        const all = await f.db.exec(t);
+        return { rows: (all.at(-1)?.rows ?? []) as T[] };
+      },
+    };
+    const asExporter = async <T,>(body: (privacyDb: Queryable) => Promise<T>): Promise<T> => {
+      await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+      try {
+        const privacyDb = await initPrivacy!(raw);
+        await preflight(privacyDb);
+        return await body(privacyDb);
+      } finally {
+        await f.db.exec("RESET ROLE");
+      }
+    };
+    const authorityRow = async (sc: LegacyScope) =>
+      (await f.db.query("SELECT legacy_user_id,legacy_machine_id FROM sessions.legacy_export_scope_authority WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4", [sc.orgId, sc.workspaceId, sc.source, sc.sessionId])).rows;
+    const sweep = async (store: ObjectStore) => {
+      const state = new SyncState(join(await tmp("hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+      const logs: Record<string, unknown>[] = [];
+      const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+      try {
+        await job.sweep();
+        await job.sweep();
+      } finally {
+        state.close();
+      }
+      expect(logs.some((l) => l.message === "erasure sweep" && l.authority === "supabase")).toBe(true);
+      return logs;
+    };
+    return { f, asExporter, authorityRow, sweep };
+  }
+  /** A Neon fixture holding two layout-safe legacy-only scopes owned by OWNER. */
+  async function twoScopes() {
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    await n.pg.query(
+      `INSERT INTO sessions.conversation_turns VALUES('44444444-4444-4444-8444-444444444444',$1,$2,'owner','sess_q',$3,0,'assistant','erase me too','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
+      [S.orgId, S.workspaceId, OWNER],
+    );
+    await outcome(n.pg, { ...S, sessionId: "sess_q" }, "dead");
+    return n;
+  }
+  const legacyKeys = async (store: ObjectStore, session: string) =>
+    (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", legacyGroup(OWNER))) && k.includes(`/s=${session}/`));
+
+  test("F1-fix (1): a registered scope whose PUT never landed does not wedge the hosted sweep; a fenced neighbour in the same sweep is still erased", async () => {
+    const n = await twoScopes();
+    const w = await hostedWorld();
+    try {
+      const store = createFsStore({ root: await tmp("absent") });
+      let failed = 0;
+      // sess_r: registration may commit, then the PUT itself fails before writing anything. sess_q: exported normally.
+      const flaky = new Proxy(store, {
+        get(target, prop, recv) {
+          if (prop === "put") return async (...a: unknown[]) => {
+            if (String(a[0]).includes("/s=sess_r/")) { failed += 1; throw Object.assign(new Error("PUT failed"), { code: "ECONNRESET_SIM" }); }
+            return (target.put as (...x: unknown[]) => unknown).apply(target, a);
+          };
+          const v = Reflect.get(target, prop, recv);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) as ObjectStore;
+      await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, flaky, "absent");
+        r.checkpoint.close();
+      });
+      expect(failed).toBeGreaterThan(0);
+      expect(await legacyKeys(store, "sess_r")).toEqual([]);
+      expect((await legacyKeys(store, "sess_q")).length).toBeGreaterThan(0);
+      for (const sid of ["sess_r", "sess_q"])
+        await w.f.db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'live') ON CONFLICT DO NOTHING", [S.orgId, S.workspaceId, S.source, sid]);
+      const logs = await w.sweep(store);
+      // A missing object counts as erased: no failure logged, and the sweep reaches the fenced neighbour.
+      expect(logs.filter((l) => /failed|refused/u.test(String(l.message)) && /legacy/u.test(String(l.message)))).toEqual([]);
+      expect(await legacyKeys(store, "sess_q")).toEqual([]);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("F1-fix (2): an erasure committed between owner registration and the PUT leaves no legacy object", async () => {
+    const n = await twoScopes();
+    await n.pg.query("DELETE FROM sessions.conversation_turns WHERE session_id='sess_q'");
+    await n.pg.query("DELETE FROM sessions.session_outcomes WHERE session_id='sess_q'");
+    const w = await hostedWorld();
+    const erase = () =>
+      w.f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5) ON CONFLICT DO NOTHING", [SR.orgId, SR.workspaceId, OTHER, SR.source, SR.sessionId]);
+    try {
+      const store = createFsStore({ root: await tmp("window") });
+      let fired = 0;
+      // The erasure commits after registration and before the object lands. On a one-connection database the insert at
+      // the PUT is what READ COMMITTED shows the exporter's recheck; it is durable, so it is re-asserted after any rollback.
+      const racing = new Proxy(store, {
+        get(target, prop, recv) {
+          if (prop === "put") return async (...a: unknown[]) => {
+            if (!fired) {
+              fired += 1;
+              await w.f.db.exec("RESET ROLE");
+              await erase();
+              await w.f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+            }
+            return (target.put as (...x: unknown[]) => unknown).apply(target, a);
+          };
+          const v = Reflect.get(target, prop, recv);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) as ObjectStore;
+      const counters = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, racing, "window");
+        r.checkpoint.close();
+        return r.counters;
+      });
+      await erase(); // the concurrent erasure committed: it survives whatever the exporter rolled back
+      expect(fired).toBe(1);
+      expect(counters.exported).toBe(0); // never checkpointed as exported over an erasure
+      await w.sweep(store);
+      expect(await legacyKeys(store, "sess_r")).toEqual([]);
+    } finally {
+      await w.f.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
