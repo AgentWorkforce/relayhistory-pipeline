@@ -16,6 +16,7 @@
  *     ops.ts up-namespace --inputs <file>
  *     ops.ts run          --inputs <file> --run-id <id> --ledger <file> [--fresh-ledger] [--profile smoke] [--lanes r2,r3] [--steps 1,2]
  *     ops.ts collect      --inputs <file> --run-id <id> --out <dir outside the repo>
+ *     ops.ts settle       --inputs <file> --collected <dir> --ledger <file>   # finished lanes at what they used
  *     ops.ts down-cluster --inputs <file> --confirm-account <cluster account> (--collected <dir> --ledger <file> | --discard-results)
  *     ops.ts verify-cluster --inputs <file> --confirm-account <cluster account>
  *   Either:
@@ -36,7 +37,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { LANES, PROFILES, type Lane } from "../../../benchmarks/ledger-bench/config.ts";
-import { APPROVED_CAP_USD, FIXED_USD, laneCostBound } from "../../../benchmarks/ledger-bench/cost.ts";
+import { APPROVED_CAP_USD, FIXED_USD, laneCostBound, laneCostSettled } from "../../../benchmarks/ledger-bench/cost.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../..");
@@ -318,6 +319,8 @@ export interface LedgerEntry {
   lane: Lane;
   profile: string;
   usd: number;
+  /** Set once the lane's collected `end` record replaced its bound with what its meter counted. */
+  settled?: boolean;
 }
 
 /**
@@ -435,6 +438,20 @@ function collect(i: Inputs, runId: string, out: string): void {
     writeFileSync(join(dir, `${runId}-${lane}.jsonl`), `${lines.join("\n")}\n`);
     console.log(`collect: lane ${lane}: ${lines.length} records, ${lines.some((l) => l.includes('"event":"end"')) ? "ended" : "NOT ended"}`);
   }
+}
+
+/**
+ * Replaces the bound of every lane whose collected results hold its `end` record with what that lane's meter
+ * counted. A lane with no `end` record (still running, aborted, not collected) keeps its full bound.
+ */
+export function settleLedger(entries: LedgerEntry[], dir: string): LedgerEntry[] {
+  return entries.map((e) => {
+    const file = join(dir, `${e.run}-${e.lane}.jsonl`);
+    if (e.settled || !existsSync(file) || !Object.hasOwn(PROFILES, e.profile)) return e;
+    const end = readFileSync(file, "utf8").split("\n").filter((l) => l.includes('"event":"end"')).map((l) => JSON.parse(l) as { run?: string; lane?: string; requests?: number; bytes?: number }).find((r) => r.run === e.run && r.lane === e.lane);
+    if (!end || typeof end.requests !== "number" || typeof end.bytes !== "number") return e;
+    return { ...e, usd: laneCostSettled(PROFILES[e.profile]!, e.lane, { requests: end.requests, bytes: end.bytes }), settled: true };
+  });
 }
 
 /** Lane runs in the ledger with no collected `end` record in `dir`: what a teardown would lose. */
@@ -605,12 +622,19 @@ if (import.meta.main) {
     case "up-namespace": upNamespace(inputs); break;
     case "run": run(inputs, runId, values.profile!, lanes, values.steps!, values.ledger, values["fresh-ledger"]!); break;
     case "collect": collect(inputs, runId, values.out ?? ""); break;
+    case "settle": {
+      if (!values.collected || insideRepo(values.collected)) throw new Error("ledger-bench: settle needs --collected <private results dir>");
+      const settled = settleLedger(readLedger(values.ledger, false), values.collected);
+      writeLedger(values.ledger!, settled);
+      console.log(JSON.stringify({ lanes: settled.length, settled: settled.filter((e) => e.settled).length, cost_bound_so_far_usd: Math.ceil(settled.reduce((a, e) => a + e.usd, 0) + FIXED_USD) }));
+      break;
+    }
     case "down-cluster": downCluster(inputs, values["confirm-account"], values.collected, values["discard-results"]!, values.ledger); break;
     case "down-data": downData(inputs, values["confirm-account"], !values["no-role"]); break;
     case "verify-data": report(verifyData(inputs, values["confirm-account"])); break;
     case "verify-cluster": report(verifyCluster(inputs, values["confirm-account"])); break;
     default:
-      console.error("usage: ops.ts render|up-data|up-role|outputs-data|down-data|verify-data|up-identity|up-namespace|run|collect|down-cluster|verify-cluster --inputs <file> ...");
+      console.error("usage: ops.ts render|up-data|up-role|outputs-data|down-data|verify-data|up-identity|up-namespace|run|collect|settle|down-cluster|verify-cluster --inputs <file> ...");
       process.exit(2);
   }
 }

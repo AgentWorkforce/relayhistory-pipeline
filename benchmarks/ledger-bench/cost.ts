@@ -69,16 +69,34 @@ export function dynamoWriteUnitsMax(profile: Profile): number {
   return units;
 }
 
-/** The most one run of one lane can cost: what `ops.ts run` adds to the spend ledger before it starts the lane. */
-export function laneCostBound(profile: Profile, lane: Lane): number {
-  const s3 = lane === "dynamo" ? 0 : profile.requestBudgetPerLane * (PRICE.s3Write + PRICE.kmsCall) + (profile.byteBudgetPerLane / 1024 ** 3) * PRICE_PER_GIB;
+/** The most DynamoDB write units one run of a lane can consume: bounded by its cells' operation caps. */
+export function laneWriteUnitsMax(profile: Profile, lane: Lane): number {
   let units = 0;
   if (lane === "dynamo") {
     for (const items of TRANSACT_ITEMS) units += TRANSACT_WRITERS.length * transactOpCap(profile, items) * items * 2;
     units += HOT_HEAD_LEVELS.length * profile.maxOpsPerCell;
   }
   if (lane === "r2") for (const group of GROUP_SIZES) units += STREAM_COUNTS.length * logOpCap(profile, group) * (group + 2) * 2;
-  return Math.ceil((s3 + units * PRICE.dynamoWriteUnit) * 100) / 100;
+  return units;
+}
+
+const cents = (usd: number) => Math.ceil(usd * 100) / 100;
+
+/** The most one run of one lane can cost: what `ops.ts run` adds to the spend ledger before it starts the lane. */
+export function laneCostBound(profile: Profile, lane: Lane): number {
+  const s3 = lane === "dynamo" ? 0 : profile.requestBudgetPerLane * (PRICE.s3Write + PRICE.kmsCall) + (profile.byteBudgetPerLane / 1024 ** 3) * PRICE_PER_GIB;
+  return cents(s3 + laneWriteUnitsMax(profile, lane) * PRICE.dynamoWriteUnit);
+}
+
+/**
+ * What a finished lane can have cost at most, from the requests and bytes its own meter counted (its `end`
+ * record): every request still priced as the dearest type. DynamoDB units are not metered, so they stay at
+ * the lane's bound. Never more than the bound the lane started with.
+ */
+export function laneCostSettled(profile: Profile, lane: Lane, used: { requests: number; bytes: number }): number {
+  if (!(used.requests >= 0) || !(used.bytes >= 0)) throw new Error("ledger-bench: a lane's usage must be non-negative numbers");
+  const s3 = lane === "dynamo" ? 0 : used.requests * (PRICE.s3Write + PRICE.kmsCall) + (used.bytes / 1024 ** 3) * PRICE_PER_GIB;
+  return Math.min(laneCostBound(profile, lane), cents(s3 + laneWriteUnitsMax(profile, lane) * PRICE.dynamoWriteUnit));
 }
 
 export function costBound(profile: Profile, repeats: number, lanes: number = S3_LANES): CostBound {
