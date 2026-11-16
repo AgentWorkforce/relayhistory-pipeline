@@ -55,6 +55,16 @@ BEGIN
   'legacy_user_id',r.legacy_user_id,'legacy_machine_id',r.legacy_machine_id);
 END $register$;
 
+-- The exporter must never create a legacy copy while Neon is still the
+-- erasure authority: Neon has no access to the immutable owner row and is
+-- forbidden to re-derive one. This narrow probe exposes only readiness.
+CREATE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $ready$
+BEGIN
+ PERFORM sessions.ingest_privacy_eraser_require_active();
+ RETURN true;
+END $ready$;
+
 CREATE FUNCTION sessions.legacy_export_privacy_eraser_page(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $legacy_page$
 DECLARE v_limit int;a jsonb;v jsonb;
@@ -116,6 +126,7 @@ BEGIN
 END $legacy_still$;
 
 REVOKE ALL ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb),
+ sessions.legacy_export_privacy_authority_ready(),
  sessions.legacy_export_privacy_eraser_page(jsonb),sessions.legacy_export_privacy_eraser_still_fenced(jsonb)
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder,
  bulls96_privacy_eraser,bulls96_legacy_export_privacy,bulls96_babysitter_retention;
@@ -142,6 +153,7 @@ DO $turn_fence_grant$ BEGIN
    FOR SELECT TO bulls96_legacy_export_privacy USING(true);
  END IF;
 END $turn_fence_grant$;
-GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb) TO bulls96_legacy_export_privacy;
+GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb),
+ sessions.legacy_export_privacy_authority_ready() TO bulls96_legacy_export_privacy;
 GRANT EXECUTE ON FUNCTION sessions.legacy_export_privacy_eraser_page(jsonb),
  sessions.legacy_export_privacy_eraser_still_fenced(jsonb) TO bulls96_privacy_eraser;

@@ -216,6 +216,31 @@ export interface RunDeps {
   stopped?: () => boolean;
 }
 
+/**
+ * A mapped legacy copy may exist only after Supabase is the active erasure
+ * authority. Older synthetic fixtures do not install the probe; every real
+ * release containing the authority-row migration does.
+ */
+export async function assertLegacyErasureAuthorityReady(
+  db: Queryable,
+): Promise<void> {
+  const installed = await db.query<{ installed: boolean }>(
+    "SELECT to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AS installed",
+  );
+  if (installed.rows[0]?.installed !== true) return;
+  try {
+    const { rows } = await db.query<{ ready: boolean }>(
+      "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
+    );
+    if (rows[0]?.ready !== true) throw new Error("authority readiness probe returned false");
+  } catch (cause) {
+    throw Object.assign(
+      new Error("Supabase legacy erasure authority is not active"),
+      { code: "legacy_export_authority_not_active", cause },
+    );
+  }
+}
+
 /** A legacy export is forbidden once either live session erasure or user
  * erasure has started. The operator-erasure global lock is held shared across
  * the S3 write so begin/complete cannot cross this check. */
@@ -369,6 +394,7 @@ export async function runOrg(
   opts: { export: boolean; window?: Window; refresh?: boolean; force?: boolean; maxScopes?: number; pageGroups?: number },
   counters: Counters,
 ): Promise<void> {
+  if (opts.export) await assertLegacyErasureAuthorityReady(deps.privacyDb);
   const seen = new Set<string>();
   for (const spec of LEGACY_TABLES) {
     const cursor = cursorName(spec.table, opts.window);
