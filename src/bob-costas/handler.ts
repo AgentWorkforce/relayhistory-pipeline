@@ -229,10 +229,9 @@ async function buildOutcome(
   deps: BobCostasDeps,
   manifestKey: string,
   orgId: string,
-  preloaded?: Digested,
 ): Promise<Outcome> {
   const none = { tokensIn: 0, tokensOut: 0, records: 0 };
-  const read = preloaded ?? (await loadDigest(m, deps, manifestKey));
+  const read = await loadDigest(m, deps, manifestKey);
   if (read.status === "quarantined" && read.failAfterPublish) return { status: "quarantined", ...none, failAfterPublish: read.failAfterPublish };
   if (read.status !== "digest") return { status: read.status, ...none, ...(read.status === "empty" ? { turns: 0 } : {}) };
   const digest = read.digest;
@@ -287,7 +286,7 @@ async function sessionQuiet(deps: BobCostasDeps, pk: unknown[], idleSeconds: num
 
 /**
  * Whether a current, ready summary is due for regeneration anyway (flags (1), (2), (2b)). Returns the
- * reason, plus the digest when it had to be read for the turn check so the rebuild does not read it again.
+ * reason; a turn check never makes the row due (it only stamps), so the rebuild always reads afresh.
  * A legacy row (covered_turns NULL) that is current is never due for turns: it is stamped with the
  * turns it covers (guarded UPDATE, no model call), so the sweep's "uncovered" branch does not queue it again.
  */
@@ -300,7 +299,7 @@ async function regenDue(
   pk: unknown[],
   kind: SummaryKind,
   now: Date,
-): Promise<{ reason: RegenReason; digest?: Digested } | null> {
+): Promise<{ reason: RegenReason } | null> {
   if (row.status !== "ready") return null;
   const { turns, retry } = regen.settings;
   if (retry.configReset && row.degraded && row.config_hash !== regen.configHash) return { reason: "config_changed" };
@@ -321,6 +320,18 @@ async function regenDue(
   // No digest (empty, or a manifest no longer readable): nothing to regenerate from; the stamp of 0
   // below keeps the sweep's "uncovered" branch from queueing the row again every tick.
   const turnsNow = digest.status === "digest" ? digest.digest.userTurnCount : 0;
+  // A quarantined read of a current, ready row (an envelope session not readable whole, or a capped read
+  // that found no record; only possible with BOB_COSTAS_INPUT_SAMPLING on) is a privacy signal the stamp
+  // would otherwise swallow: the row is left as is (the next revision rebuilds it), but say so.
+  if (digest.status === "quarantined")
+    log.warn("summary coverage stamp read found no digest; stamping 0, summary left in place", {
+      stage: `summary-${kind}`,
+      kind,
+      reason: digest.failAfterPublish ?? "quarantined",
+      error_code: digest.failAfterPublish,
+      revision: m.revision,
+      trace_id: m.trace_id,
+    });
   // A legacy row that is current by revision and content already summarizes every turn the manifest
   // holds: it is stamped with that count, never regenerated (no model call). Only a later revision, or
   // the retry/config reasons above, regenerates it. This keeps the first turns-flag-on rollout from
@@ -515,7 +526,7 @@ export function bobCostasHandler(
       return { status: "skipped", reason: "summary_current" };
     }
 
-    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey, message.ctx.orgId, due?.digest);
+    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey, message.ctx.orgId);
     const loc = sessionLocation(m, pointer.manifestKey);
     const key = summaryObjectKey(loc, kind);
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };

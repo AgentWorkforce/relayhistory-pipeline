@@ -6,10 +6,12 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { zstdCompressSync } from "node:zlib";
 import type { PGlite } from "@electric-sql/pglite";
-import { rawChunkKey } from "../../shared/vendor.ts";
+import { PipelineError, rawChunkKey } from "../../shared/vendor.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
-import { bobCostasHandler } from "../handler.ts";
-import { extractiveSummarizer, type Summarizer } from "../summarizer.ts";
+import { bobCostasHandler, notCurrentContent } from "../handler.ts";
+import type { SummaryInputCaps } from "../session-input.ts";
+import { readSummaryObject } from "../summary-objects.ts";
+import { RETAINED_USER_TURNS, extractiveSummarizer, type Summarizer } from "../summarizer.ts";
 import { createModelSummarizer, modelSummarizerConfig } from "../model-summarizer.ts";
 import { summarySweep } from "../sweep.ts";
 import { BOB_COSTAS_PIPELINE_VERSION } from "../versions.ts";
@@ -52,7 +54,11 @@ async function world() {
   const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
   const manifests = new Map<string, unknown>();
   const reader = { provider: "fs", read: async (k: string) => (manifests.has(k) ? { manifest: manifests.get(k) } : null) } as never;
-  const directory = { write: async () => ({ written: true }), clear: async () => true };
+  const directoryCalls: string[] = [];
+  const directory = {
+    write: async () => { directoryCalls.push("write"); return { written: true }; },
+    clear: async () => { directoryCalls.push("clear"); return true; },
+  };
 
   /** A session with `turns` user turns at `revision`, its manifest and its session_index pointer. */
   async function session(id: string, turns: number, revision = 2, state = "active", lastActivity = T0) {
@@ -66,16 +72,50 @@ async function world() {
     await pointer(pg, { key: { orgId: "o", workspaceId: "w", harness: "claude", sessionId: id }, machine: "m", revision, manifestKey: keyOf(id) });
     await pg.query("UPDATE sessions.session_index SET state=$2, last_activity_at=$3 WHERE session_id=$1", [id, state, lastActivity.toISOString()]);
   }
-  async function handle(id: string, opts: { regen: BobCostasRegen | null; now?: Date; summarizer?: Summarizer; kind?: "short" | "long"; workKey?: string }) {
+  /**
+   * A session of delivery envelopes at `revision`: a small chunk, then one of ~200 KiB that a
+   * 64 KiB per-chunk cap (sampling on) refuses, so the capped read ends summary_input_incomplete.
+   */
+  async function envelopeSession(id: string, revision = 2, state = "active") {
+    const env = (uid: string, text: string) => JSON.stringify({
+      kind: "session_event", origin_id: "o1", record_id: uid, revision: "1", operation: "upsert",
+      received_at: "2026-11-16T00:00:00Z", payload: { kind: "text", role: "user", text, ts_ms: 1_763_251_200_000 },
+    });
+    await store.put(rawChunkKey(loc(id), 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(env("r1", `hello ${id}`) + "\n")));
+    await store.put(rawChunkKey(loc(id), 1, 100, "abcdef13", "jsonl"), zstdCompressSync(Buffer.from(env("r2", "z".repeat(200 * 1024)) + "\n")));
+    manifests.set(keyOf(id), {
+      revision, trace_id: TRACE,
+      session: { workspace_id: "w", machine_id: "m", harness: "claude", session_id: id, started_at: "2026-10-29T10:00:00Z" },
+      raw: {
+        format: "jsonl", content_sha256: String(revision).repeat(64), scrub: { ruleset: "r", version: 1 },
+        chunks: [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }, { seq: 1, start_offset: 100, sha256_8: "abcdef13" }],
+      },
+    });
+    await pointer(pg, { key: { orgId: "o", workspaceId: "w", harness: "claude", sessionId: id }, machine: "m", revision, manifestKey: keyOf(id) });
+    await pg.query("UPDATE sessions.session_index SET state=$2 WHERE session_id=$1", [id, state]);
+  }
+  type HandleOpts = {
+    regen: BobCostasRegen | null; now?: Date; summarizer?: Summarizer; kind?: "short" | "long"; workKey?: string; inputCaps?: SummaryInputCaps;
+  };
+  const run = (id: string, opts: HandleOpts) => {
     const handler = bobCostasHandler(opts.kind ?? "long", {
       db, reader, store, directory, keyring, summarizer: opts.summarizer ?? extractiveSummarizer,
-      regen: opts.regen, now: () => opts.now ?? T0,
+      regen: opts.regen, now: () => opts.now ?? T0, ...(opts.inputCaps ? { inputCaps: opts.inputCaps } : {}),
     });
-    return captureLogs(() => handler({
+    return handler({
       payload: { manifestKey: keyOf(id) }, workKey: opts.workKey,
       ctx: { orgId: "o", session_uuid: "01a188e1-ef86-7892-9389-39149894eeec" },
-    } as never, { log: { info: () => {} } } as never));
+    } as never, { log: { info: () => {} } } as never);
+  };
+  async function handle(id: string, opts: HandleOpts) {
+    return captureLogs(() => run(id, opts));
   }
+  /** Like handle, for a delivery expected to fail: the error and the log lines written before it. */
+  async function attempt(id: string, opts: HandleOpts) {
+    const { result, lines } = await captureLogs(() => run(id, opts).then(() => null, (err: unknown) => err));
+    return { error: result as { code?: string; retryable?: boolean } | null, lines };
+  }
+  const manifestOf = (id: string) => manifests.get(keyOf(id)) as { revision: number; raw: { content_sha256: string } };
   const row = async (id: string, kind = "long") => (await pg.query<Record<string, unknown>>(
     `SELECT status, revision, covered_turns, failure_code, degraded, attempts, next_retry_at, config_hash, pipeline_version
        FROM sessions.session_summaries WHERE session_id=$1 AND kind=$2`, [id, kind])).rows[0];
@@ -88,7 +128,7 @@ async function world() {
   }
   const audit = async () => (await pg.query<Record<string, unknown>>(
     "SELECT session_id, system, kind, reason, prior_status, prior_failure_code, prior_pipeline_version FROM sessions.summary_regeneration_audit ORDER BY session_id, created_at")).rows;
-  return { pg, db, session, handle, row, sweep, audit };
+  return { pg, db, store, keyring, directoryCalls, session, envelopeSession, handle, attempt, manifestOf, row, sweep, audit };
 }
 
 const summaryLine = (lines: Record<string, unknown>[]) => lines.find((l) => l.message === "bob costas summary");
@@ -386,5 +426,119 @@ describe("fences and feature detection", () => {
     expect(second.lines.filter((l) => l.message === warns[0]!.message)).toEqual([]);
     const swept = await w.sweep(ALL, T0);
     expect(swept.jobs).toEqual([]);
+  });
+});
+
+describe("flags on, input caps on (BOB_COSTAS_INPUT_SAMPLING): quarantined and sampled reads", () => {
+  /** A 64 KiB per-chunk cap: the envelope session's 200 KiB chunk is refused, so its read is incomplete. */
+  const CAPPED: SummaryInputCaps = { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 };
+  /** A 16-byte per-chunk cap: a transcript's only chunk is refused, so the capped read finds no record. */
+  const TINY: SummaryInputCaps = { ...CAPPED, maxChunkBytes: 16 };
+  const STAMP_WARN = "summary coverage stamp read found no digest; stamping 0, summary left in place";
+  const ids = { orgId: "o", workspaceId: "w" };
+  const fullRow = async (pg: PGlite, id: string, kind: string) =>
+    (await pg.query<Record<string, unknown>>("SELECT * FROM sessions.session_summaries WHERE session_id=$1 AND kind=$2", [id, kind])).rows[0]!;
+
+  test("a retry_backoff or config_changed rebuild whose capped read ends incomplete or unreadable publishes a text-free quarantined row, clears the directory and fails non-retryably", async () => {
+    const w = await world();
+    const flags = { SUMMARY_RETRY_BACKOFF_ENABLED: "true", SUMMARY_RETRY_CONFIG_RESET_ENABLED: "true", SUMMARY_REGEN_TURNS_ENABLED: "true" };
+    const cases = [
+      { id: "rb-incomplete", envelopes: true, due: "retry_backoff", code: "summary_input_incomplete" },
+      { id: "rb-unreadable", envelopes: false, due: "retry_backoff", code: "summary_input_unreadable" },
+      { id: "cc-incomplete", envelopes: true, due: "config_changed", code: "summary_input_incomplete" },
+      { id: "cc-unreadable", envelopes: false, due: "config_changed", code: "summary_input_unreadable" },
+    ] as const;
+    for (const c of cases) {
+      if (c.envelopes) await w.envelopeSession(c.id);
+      else await w.session(c.id, 3);
+      // A degraded short summary (model fallback), read whole under the default caps.
+      await w.handle(c.id, { kind: "short", regen: regenOf(flags, HASH_A), summarizer: failing(), now: T0 });
+      const before = await fullRow(w.pg, c.id, "short");
+      expect(before).toMatchObject({ status: "ready", degraded: true, attempts: 1 });
+      expect(Number(before.covered_turns)).toBeGreaterThan(0);
+      w.directoryCalls.length = 0;
+      // retry_backoff: same config, at next_retry_at. config_changed: another config hash, before next_retry_at.
+      const regen = regenOf(flags, c.due === "config_changed" ? HASH_B : HASH_A);
+      const { calls, summarizer } = counting();
+      const { error, lines } = await w.attempt(c.id, {
+        kind: "short", regen, summarizer, now: c.due === "retry_backoff" ? at(300) : T0, inputCaps: c.envelopes ? CAPPED : TINY,
+      });
+      expect(error).toBeInstanceOf(PipelineError);
+      expect(error).toMatchObject({ code: c.code, retryable: false });
+      expect(calls.n).toBe(0);
+      const after = await fullRow(w.pg, c.id, "short");
+      expect(after).toMatchObject({
+        status: "quarantined",
+        revision: 2,
+        // Recorded as not current, so a replay of the same revision reads again.
+        content_sha256: notCurrentContent(w.manifestOf(c.id).raw.content_sha256),
+        object_key: null, object_sha256: null, key_id: null,
+        covered_turns: null, failure_code: null, degraded: false, attempts: 0, next_retry_at: null,
+        config_hash: regen.configHash, pipeline_version: BOB_COSTAS_PIPELINE_VERSION,
+      });
+      expect(w.directoryCalls).toEqual(["clear"]);
+      // The earlier text no longer opens at its key.
+      expect(await readSummaryObject({
+        store: w.store, keyring: w.keyring, ids, key: String(before.object_key), sha256: String(before.object_sha256), kind: "short", revision: 2,
+      })).toBeNull();
+      expect(summaryLine(lines)).toMatchObject({
+        level: "info", status: "quarantined", reason: c.code, error_code: c.code, retryable: false, regeneration_reason: c.due,
+      });
+      expect(JSON.stringify(lines)).not.toContain(`hello ${c.id}`);
+    }
+  });
+
+  test("a coverage stamp read that comes back quarantined stamps 0, skips as summary_current and leaves the summary untouched", async () => {
+    const w = await world();
+    const TURNS = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "1" });
+    const cases = [
+      { id: "st-incomplete", envelopes: true, code: "summary_input_incomplete" },
+      { id: "st-unreadable", envelopes: false, code: "summary_input_unreadable" },
+    ] as const;
+    for (const c of cases) {
+      if (c.envelopes) await w.envelopeSession(c.id, 2, "done");
+      else await w.session(c.id, 3, 2, "done");
+      await w.handle(c.id, { regen: null }); // written before the flag: covered_turns NULL
+      const before = await fullRow(w.pg, c.id, "long");
+      expect(before).toMatchObject({ status: "ready", covered_turns: null });
+      const { jobs } = await w.sweep(TURNS, T0);
+      expect(jobs).toEqual([{ session_id: c.id, work_key: expect.stringMatching(/:regen-stamp$/) }]);
+      const { calls, summarizer } = counting();
+      const { result, lines } = await w.handle(c.id, {
+        regen: TURNS, summarizer, workKey: jobs[0]!.work_key, inputCaps: c.envelopes ? CAPPED : TINY,
+      });
+      expect(result).toEqual({ status: "skipped", reason: "summary_current" });
+      expect(calls.n).toBe(0);
+      expect(summaryLine(lines)).toBeUndefined();
+      expect(lines.filter((l) => l.message === STAMP_WARN)).toEqual([
+        expect.objectContaining({ level: "warn", stage: "summary-long", kind: "long", reason: c.code, error_code: c.code, revision: 2 }),
+      ]);
+      // Only covered_turns moved; status, content hash, object and key are the ones published before.
+      expect(await fullRow(w.pg, c.id, "long")).toEqual({ ...before, covered_turns: 0 });
+      expect(await readSummaryObject({
+        store: w.store, keyring: w.keyring, ids, key: String(before.object_key), sha256: String(before.object_sha256), kind: "long", revision: 2,
+      })).toMatchObject({ status: "ready" });
+      // Stamped: the sweep does not queue it again.
+      expect((await w.sweep(TURNS, T0)).jobs).toEqual([]);
+    }
+  });
+
+  test("with sampling on, covered_turns is every user turn read (userTurnCount), not the sampled userTurns", async () => {
+    const w = await world();
+    const TURNS = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true" });
+    const SAMPLED: SummaryInputCaps = { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 1 << 20 };
+    const n = RETAINED_USER_TURNS * 3;
+    // A write.
+    await w.session("sampled-write", n);
+    const { lines } = await w.handle("sampled-write", { regen: TURNS, inputCaps: SAMPLED });
+    // The sample kept at most RETAINED_USER_TURNS of the n turns read.
+    expect(summaryLine(lines)?.turns_dropped).toBeGreaterThanOrEqual(n - RETAINED_USER_TURNS);
+    expect((await w.row("sampled-write"))!.covered_turns).toBe(n);
+    // A legacy row's coverage stamp.
+    await w.session("sampled-stamp", n);
+    await w.handle("sampled-stamp", { regen: null });
+    const stamp = await w.handle("sampled-stamp", { regen: TURNS, inputCaps: SAMPLED });
+    expect(stamp.result).toEqual({ status: "skipped", reason: "summary_current" });
+    expect((await w.row("sampled-stamp"))!.covered_turns).toBe(n);
   });
 });
