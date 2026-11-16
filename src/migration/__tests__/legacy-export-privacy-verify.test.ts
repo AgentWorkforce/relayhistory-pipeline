@@ -13,7 +13,7 @@ import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { mkdtemp, readFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -82,7 +82,13 @@ async function neon() {
   return { pg, db: pg as unknown as Queryable };
 }
 
-const AUTHORITY_MIGRATION = new URL("../../../supabase/migrations/20261105062020_legacy_export_scope_authority.sql", import.meta.url);
+/** The owner-registration migration, found by name so a renumbered slot (e.g. 062020 -> 062030) needs no suite change. */
+const AUTHORITY_MIGRATION = (() => {
+  const dir = new URL("../../../supabase/migrations/", import.meta.url);
+  const hits = readdirSync(dir).filter((f) => /^\d+_legacy_export_scope_authority\.sql$/u.test(f));
+  if (hits.length > 1) throw new Error(`more than one legacy_export_scope_authority migration: ${hits.join(",")}`);
+  return new URL(hits[0] ?? "__absent_legacy_export_scope_authority.sql", dir);
+})();
 /** The statements a plain ledger fixture needs to run the real register RPC; empty on heads without the migration. */
 function legacyAuthoritySql(): string[] {
   if (!existsSync(AUTHORITY_MIGRATION)) return [];
