@@ -58,32 +58,29 @@ export function logRegenQueued(e: RegenAuditEntry, stage: string): void {
   });
 }
 
-export const AUDIT_INSERT_SQL = `INSERT INTO sessions.summary_regeneration_audit
-     (org_id, workspace_id, harness, session_id, system, kind, reason, prior_status, prior_failure_code,
-      prior_pipeline_version, request_id, scope_hash, requested_by)
-   SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
-                        $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[])`;
+/** Rows go through the SECURITY DEFINER append function (062040); the runtime has no table write grant. */
+export const AUDIT_APPEND_SQL = "SELECT sessions.summary_regeneration_audit_append_v1($1::jsonb) AS n";
 
-/** One batch INSERT for a sweep's enqueues. Returns the number of rows written. */
+/** One batch per sweep (the SQL function caps a call at 1000 rows). Returns the number of rows written. */
 export async function writeRegenAudit(db: Queryable, entries: readonly RegenAuditEntry[]): Promise<number> {
   if (!entries.length) return 0;
-  const col = <T>(f: (e: RegenAuditEntry) => T) => entries.map(f);
-  await db.query(AUDIT_INSERT_SQL, [
-    col((e) => e.orgId),
-    col((e) => e.workspaceId),
-    col((e) => e.harness),
-    col((e) => e.sessionId),
-    col((e) => e.system),
-    col((e) => e.kind),
-    col((e) => e.reason),
-    col((e) => status(e.priorStatus)),
-    col((e) => code(e.priorFailureCode)),
-    col((e) => version(e.priorPipelineVersion)),
-    col((e) => e.requestId ?? null),
-    col((e) => e.scopeHash ?? null),
-    col((e) => e.requestedBy ?? null),
-  ]);
-  return entries.length;
+  const rows = entries.map((e) => ({
+    org_id: e.orgId,
+    workspace_id: e.workspaceId,
+    harness: e.harness,
+    session_id: e.sessionId,
+    system: e.system,
+    kind: e.kind,
+    reason: e.reason,
+    prior_status: status(e.priorStatus),
+    prior_failure_code: code(e.priorFailureCode),
+    prior_pipeline_version: version(e.priorPipelineVersion),
+    request_id: e.requestId ?? null,
+    scope_hash: e.scopeHash ?? null,
+    requested_by: e.requestedBy ?? null,
+  }));
+  const r = await db.query<{ n: string | number }>(AUDIT_APPEND_SQL, [JSON.stringify(rows)]);
+  return Number(r.rows[0]?.n ?? 0);
 }
 
 /** Retention purge (bounded per call by the SQL function). Returns rows deleted. */

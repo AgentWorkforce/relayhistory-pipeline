@@ -431,7 +431,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105058010_operator_user_erase.sql` | table sessions.operator_user_erasures and the erase check in sessions.ingest_lock_fences |
 | `upstream:20261105059000_ingest_publication_gcs_provider.sql` | replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs |
 | `upstream:20261105062000_coordination_advisories.sql` | function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories (coordination live advisories; EXECUTE to service_role and bulls96_read_api only) |
-| `upstream:20261105062040_summary_regeneration.sql` | function sessions.summary_regeneration_audit_purge_v1 and table sessions.summary_regeneration_audit (summaries regeneration audit, append-only; purge EXECUTE to service_role only) plus the session_briefs coverage/retry columns |
+| `upstream:20261105062040_summary_regeneration.sql` | function sessions.summary_regeneration_audit_purge_v1 and table sessions.summary_regeneration_audit (summaries regeneration audit, append-only; rows written only via summary_regeneration_audit_append_v1; append and purge EXECUTE to service_role only) plus the session_briefs coverage/retry columns |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |

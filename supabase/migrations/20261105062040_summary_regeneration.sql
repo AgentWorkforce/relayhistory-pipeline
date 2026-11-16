@@ -11,7 +11,8 @@
 -- key and are NULL for sweep rows. The self-host Bob Costas lane (96bulls 0006) uses this same table and
 -- does not require it: the lanes may apply in either order, so the writers feature-detect it at runtime.
 --
--- Append-only: UPDATE and TRUNCATE are refused; DELETE is refused unless it comes from one of the two
+-- Writers insert through sessions.summary_regeneration_audit_append_v1 (SECURITY DEFINER, EXECUTE to
+-- service_role); the runtime has no table write grant. Append-only: UPDATE and TRUNCATE are refused; DELETE is refused unless it comes from one of the two
 -- SECURITY DEFINER functions below (the table owner, with their transaction-local marker set): the forget
 -- trigger (pointer or directory row tombstoned or deleted, which includes operator erase) and the retention
 -- purge. The operator erase metadata guard refuses (skips) a row for a fenced session.
@@ -50,7 +51,9 @@ CREATE INDEX summary_regeneration_audit_created ON sessions.summary_regeneration
 ALTER TABLE sessions.summary_regeneration_audit ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.summary_regeneration_audit
   FROM PUBLIC, anon, authenticated, service_role, search_consumer_runtime, bulls96_read_api;
-GRANT SELECT, INSERT ON sessions.summary_regeneration_audit TO service_role;
+-- Rows are written only through summary_regeneration_audit_append_v1 (below): no runtime table grant, so a
+-- release-target run that holds this step never has to grant on a relation it has not created yet.
+GRANT SELECT ON sessions.summary_regeneration_audit TO service_role;
 
 CREATE FUNCTION sessions.summary_regeneration_audit_append_only() RETURNS trigger
 LANGUAGE plpgsql SET search_path=pg_catalog,pg_temp AS $append_only$
@@ -117,11 +120,36 @@ BEGIN
 END
 $purge$;
 
+-- The writer entry point (Bob Costas sweep, brief sweep): one batch per sweep, at most 1000 rows, each
+-- checked by the table's CHECK constraints and the operator erase guard. Returns the rows written.
+CREATE FUNCTION sessions.summary_regeneration_audit_append_v1(p_rows jsonb) RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $append$
+DECLARE v_count integer;
+BEGIN
+  IF p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array' OR jsonb_array_length(p_rows) > 1000 THEN
+    RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='summary regeneration audit: rows must be a JSON array of at most 1000';
+  END IF;
+  INSERT INTO sessions.summary_regeneration_audit
+    (org_id, workspace_id, harness, session_id, system, kind, reason, prior_status, prior_failure_code,
+     prior_pipeline_version, request_id, scope_hash, requested_by)
+  SELECT r.org_id, r.workspace_id, r.harness, r.session_id, r.system, r.kind, r.reason, r.prior_status,
+         r.prior_failure_code, r.prior_pipeline_version, r.request_id, r.scope_hash, r.requested_by
+    FROM jsonb_to_recordset(p_rows) AS r(org_id text, workspace_id text, harness text, session_id text, system text,
+         kind text, reason text, prior_status text, prior_failure_code text, prior_pipeline_version text,
+         request_id text, scope_hash text, requested_by text);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count;
+END
+$append$;
+
 REVOKE ALL ON FUNCTION sessions.summary_regeneration_audit_append_only(),
   sessions.summary_regeneration_audit_forget(),
-  sessions.summary_regeneration_audit_purge_v1(integer)
+  sessions.summary_regeneration_audit_purge_v1(integer),
+  sessions.summary_regeneration_audit_append_v1(jsonb)
   FROM PUBLIC, anon, authenticated, service_role, search_consumer_runtime, bulls96_read_api;
-GRANT EXECUTE ON FUNCTION sessions.summary_regeneration_audit_purge_v1(integer) TO service_role;
+GRANT EXECUTE ON FUNCTION sessions.summary_regeneration_audit_purge_v1(integer),
+  sessions.summary_regeneration_audit_append_v1(jsonb) TO service_role;
 
 -- An erased (fenced) session never gains an audit row, as for the other optional per-session tables.
 DO $guard$ BEGIN
