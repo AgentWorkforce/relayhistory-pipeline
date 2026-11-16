@@ -124,9 +124,18 @@ test("the legacy exporter aborts a stalled object PUT well before its privacy-lo
   const bounded = writeOnly(stalled, { putTimeoutMs: 20 });
   const error = await bounded
     .put(objectKey("timeout/probe.json"), new Uint8Array([1]))
-    .then(() => null, (cause) => cause as { name?: string });
-  expect(error?.name).toBe("TimeoutError");
+    .then(() => null, (cause) => cause as { code?: string });
+  expect(error?.code).toBe("legacy_export_put_timeout");
   expect(observed?.aborted).toBe(true);
+
+  const caller = new AbortController();
+  const callerError = Object.assign(new Error("caller stopped"), { code: "caller_abort" });
+  const callerPut = bounded
+    .put(objectKey("timeout/caller.json"), new Uint8Array([1]), { signal: caller.signal })
+    .then(() => null, (cause) => cause);
+  caller.abort(callerError);
+  expect(await callerPut).toBe(callerError);
+
   expect(LEGACY_EXPORT_PUT_TIMEOUT_MS).toBe(120_000);
   expect(LEGACY_EXPORT_PUT_TIMEOUT_MS).toBeLessThan(15 * 60_000);
 });

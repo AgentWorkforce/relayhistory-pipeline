@@ -580,7 +580,14 @@ export function writeOnly(
       const signal = o.signal
         ? AbortSignal.any([o.signal, deadline])
         : deadline;
-      return store.put(k, b, { ...o, signal });
+      return store.put(k, b, { ...o, signal }).catch((error: unknown) => {
+        // AbortSignal.timeout() rejects with a runtime-specific DOMException
+        // (Bun currently exposes numeric code 23). Translate only our deadline,
+        // while preserving an independent caller abort unchanged.
+        if (deadline.aborted && signal.reason === deadline.reason)
+          throw coded("legacy_export_put_timeout", "the legacy exporter object PUT timed out");
+        throw error;
+      });
     },
     delete: async () => {
       throw coded("exporter_write_only", "the exporter does not delete");
