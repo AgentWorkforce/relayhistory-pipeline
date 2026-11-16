@@ -112,9 +112,19 @@ async function entries(store: ObjectStore): Promise<LogEntry[]> {
   return out;
 }
 const batchesIn = (es: LogEntry[]) => es.flatMap((e) => (e.kind === "batches" ? e.batches : []));
+/**
+ * The records the logged batches carry. Slice 3's materializer applies each entry after the append and then deletes
+ * its payload, so a payload still present is read directly and an applied one is read back from the canonical
+ * session it landed in (this file's uploads put each record in `sess-<record id>`, or the session the test names).
+ */
 async function payloadRecords(store: ObjectStore, es: LogEntry[]): Promise<string[]> {
   const ids: string[] = [];
-  for (const b of batchesIn(es)) for (const p of b.payloads) ids.push(...((await json(store, p.key)) as { records: { record_id: string }[] }).records.map((r) => r.record_id));
+  const applied: string[] = [];
+  for (const b of batchesIn(es)) for (const p of b.payloads) {
+    if (await exists(store, p.key)) ids.push(...((await json(store, p.key)) as { records: { record_id: string }[] }).records.map((r) => r.record_id));
+    else applied.push(...b.sessions.map(([, s]) => s));
+  }
+  for (const s of applied) ids.push(s.replace(/^sess-/, ""));
   return ids.sort();
 }
 const enable = (store: ObjectStore) => enableLogMode(store, logKeys(ROOT, TENANT, ORIGIN), null, { writer: "operator", now: () => T0 });
@@ -146,8 +156,9 @@ describe("a stream in log mode", () => {
     expect(es.map((x) => x.kind)).toEqual(["open", "epoch", "batches", "batches"]);
     expect(batchesIn(es).map((b) => b.batchId)).toEqual(["b1", "b2"]);
     expect(await payloadRecords(e.base, es)).toEqual(["r1", "r2", "r3"]);
-    // The legacy chain wrote nothing for these batches.
-    expect(await exists(e.base, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b1"))).toBe(false);
+    // Admission was the log entry; the legacy batch doc is written afterwards, by slice 3's materializer applying it
+    // (the only legacy writer allowed on a log-mode stream; the guard test below pins that every other is refused).
+    expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b1"))).toMatchObject({ state: "committed" });
     // Same batch id, other content: refused as the legacy batch_conflict; no new entry.
     const k3 = await upload(e.base, "b1", ["r9"]);
     await drain(e);

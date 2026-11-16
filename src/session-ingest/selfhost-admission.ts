@@ -43,6 +43,7 @@ import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-
 import { INBOX_NAMESPACE, pendingAdmissions, type AdmissionTenantHint } from "./async-admission.ts";
 import { lockAlertFields } from "./app.ts";
 import type { LogStreams } from "./ledger-log-admit.ts";
+import type { LogMaterializer } from "./ledger-log-materialize.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
 import { DeliveryBusyError } from "./vendor/delivery/delivery-contracts.ts";
@@ -100,6 +101,8 @@ export interface SelfhostAdmissionOptions {
   userHintMax?: number;
   /** INGEST_LEDGER_LOG_COMMIT=on (ledger-log-admit.ts): streams in log mode are admitted through their log. */
   logStreams?: LogStreams;
+  /** With logStreams: the log materializer (kicked after each append; every registered stream kicked each scan). */
+  logMaterializer?: LogMaterializer;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -318,6 +321,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     } finally {
       lastProgressAt = undefined;
     }
+    // Log mode: kick every registered stream (not awaited past the listing; a failure retries next scan).
+    if (opts.logMaterializer) await opts.logMaterializer.sweep().catch(() => {});
   }
 
   function scan(): Promise<void> {
@@ -339,7 +344,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     entry.attempts += 1;
     const t0 = Date.now();
     const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}),
-      ...(opts.logStreams ? { logStreams: opts.logStreams } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
+      ...(opts.logStreams ? { logStreams: opts.logStreams } : {}), ...(opts.logMaterializer ? { logMaterializer: opts.logMaterializer } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
       .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
     if (r.action === "ack") {
       const timing: Record<string, number> = {};
@@ -486,6 +491,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     async settle() {
       pump();
       while (running.size > 0) await Promise.allSettled([...running]);
+      await opts.logMaterializer?.settle();
     },
     status,
     userHints: () => userOf.size,

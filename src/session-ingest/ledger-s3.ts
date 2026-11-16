@@ -863,7 +863,9 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   /** logModeGuard: the stream's log mode marker, read beside the first reads; absent when the guard is off. */
   const logModeRead = (tenant: LedgerTenant, originId: string): Promise<boolean> =>
     opts.logModeGuard
-      ? store.head(objectKey(logKeys(keyRoot, tenant, originId).entry(0))).then((m) => m !== undefined, () => { throw new LedgerUnavailableError("ledger_log_mode_unreadable"); })
+      // Log mode: entry 0 exists and no close marker (an operator rollback hands the stream back to legacy).
+      ? Promise.all([store.head(objectKey(logKeys(keyRoot, tenant, originId).entry(0))), store.head(objectKey(logKeys(keyRoot, tenant, originId).closed))])
+        .then(([zero, closed]) => zero !== undefined && closed === undefined, () => { throw new LedgerUnavailableError("ledger_log_mode_unreadable"); })
       : Promise.resolve(false);
   const refuseLogMode = (r: PromiseSettledResult<boolean>) => {
     if (r.status === "rejected") throw r.reason;
