@@ -42,6 +42,7 @@ import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { uploadInboxQueueConfiguration } from "./upload-inbox.ts";
 import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
+import { REGEN_BOUNDS } from "../../src/summary-regen/settings.ts";
 
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
@@ -133,6 +134,11 @@ export interface SessionPipelineInputs {
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
   briefs?: SessionBriefInputs;
   /**
+   * Summaries regeneration flags for the brief on this function (src/summary-regen, push A). Absent:
+   * nothing is rendered and every flag stays off in code. Each group renders its env only when set.
+   */
+  summaryRegen?: SummaryRegenInputs;
+  /**
    * SESSIONS_NEON_EXIT: the Neon-exit release profile (src/shared/neon-exit.ts, docs/neon-exit-edge-map.md).
    * `true` renders SESSIONS_NEON_EXIT="true". Analysis-cache and semantic-copy readers additionally
    * require `legacyReadSource: "frozen-supabase"`; runtime validates the Supabase relayhistory_legacy URL.
@@ -192,6 +198,21 @@ export interface SessionBriefInputs {
    * briefed only by this sweep; new evidence arms its own wakeup through indexing.
    */
   sweepSeconds?: number;
+}
+
+/**
+ * sessionPipeline.summaryRegen. Each `enabled` renders its flag as "true" or "false"; a tuning value
+ * renders only when set (the code defaults apply otherwise). Bounds are src/summary-regen/settings.ts
+ * REGEN_BOUNDS, so a value accepted here is never replaced by a default at run time. Needs the
+ * 20261105062040 migration for any effect: before it, the worker logs once and keeps the flags off.
+ */
+export interface SummaryRegenInputs {
+  /** (1) SUMMARY_REGEN_TURNS_ENABLED, SUMMARY_REGEN_TURN_THRESHOLD, SUMMARY_REGEN_IDLE_SECONDS. */
+  turns?: { enabled: boolean; threshold?: number; idleSeconds?: number };
+  /** (2) SUMMARY_RETRY_BACKOFF_ENABLED, SUMMARY_RETRY_BACKOFF_SECONDS; (2b) SUMMARY_RETRY_CONFIG_RESET_ENABLED. */
+  retry?: { enabled: boolean; backoffSeconds?: number[]; configReset?: boolean };
+  /** (4) SUMMARY_REGEN_AUDIT_ENABLED, SUMMARY_REGEN_AUDIT_RETENTION_DAYS. */
+  audit?: { enabled: boolean; retentionDays?: number };
 }
 
 export const SESSION_PIPELINE_RESOURCES = [
@@ -273,7 +294,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -379,6 +400,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (b.sweepSeconds !== undefined && !(Number.isInteger(b.sweepSeconds) && (b.sweepSeconds as number) >= 0 && (b.sweepSeconds as number) <= 86_400))
       refuse("transcriptStore.sessionPipeline.briefs.sweepSeconds must be an integer from 0 to 86400");
   }
+  if (v.summaryRegen !== undefined) assertSummaryRegenInputs(v.summaryRegen, refuse);
   if (v.schedules !== undefined) {
     const sc = v.schedules as Record<string, unknown> | null;
     if (sc === null || typeof sc !== "object" || Array.isArray(sc) || Object.getPrototypeOf(sc) !== Object.prototype)
@@ -396,6 +418,55 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (enabled(v.analysisJobs) && !declared("analysisJob")) refuse("transcriptStore.sessionPipeline.analysisJobs.enabled requires schedules.analysisJob");
   if (enabled(v.bufferedSearchFeed) && !declared("bufferedSearchFeed")) refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires schedules.bufferedSearchFeed");
   if (enabled(v.bufferedErasureDelete) && !declared("bufferedErasureDelete")) refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.enabled requires schedules.bufferedErasureDelete");
+}
+
+function assertSummaryRegenInputs(value: unknown, refuse: (why: string) => never): void {
+  const at = "transcriptStore.sessionPipeline.summaryRegen";
+  const plain = (o: unknown): o is Record<string, unknown> =>
+    o !== null && typeof o === "object" && !Array.isArray(o) && Object.getPrototypeOf(o) === Object.prototype;
+  const int = (o: unknown, b: { min: number; max: number }) => Number.isInteger(o) && (o as number) >= b.min && (o as number) <= b.max;
+  const group = (name: string, keys: readonly string[]): Record<string, unknown> | undefined => {
+    const g = (value as Record<string, unknown>)[name];
+    if (g === undefined) return undefined;
+    if (!plain(g)) refuse(`${at}.${name} must be a plain object`);
+    for (const k of Object.keys(g)) if (!keys.includes(k)) refuse(`${at}.${name}.${k} is not a known setting`);
+    if (typeof g.enabled !== "boolean") refuse(`${at}.${name}.enabled must be a boolean`);
+    return g;
+  };
+  if (!plain(value)) refuse(`${at} must be a plain object`);
+  for (const k of Object.keys(value)) if (k !== "turns" && k !== "retry" && k !== "audit") refuse(`${at}.${k} is not a known setting`);
+  const B = REGEN_BOUNDS;
+  const turns = group("turns", ["enabled", "threshold", "idleSeconds"]);
+  if (turns?.threshold !== undefined && !int(turns.threshold, B.threshold))
+    refuse(`${at}.turns.threshold must be an integer from ${B.threshold.min} to ${B.threshold.max}`);
+  if (turns?.idleSeconds !== undefined && !int(turns.idleSeconds, B.idleSeconds))
+    refuse(`${at}.turns.idleSeconds must be an integer from ${B.idleSeconds.min} to ${B.idleSeconds.max}`);
+  const retry = group("retry", ["enabled", "backoffSeconds", "configReset"]);
+  if (retry?.backoffSeconds !== undefined) {
+    const list = retry.backoffSeconds;
+    if (!Array.isArray(list) || list.length < 1 || list.length > B.backoffSeconds.maxEntries || !list.every((n) => int(n, B.backoffSeconds)))
+      refuse(`${at}.retry.backoffSeconds must be 1 to ${B.backoffSeconds.maxEntries} integers, each from ${B.backoffSeconds.min} to ${B.backoffSeconds.max}`);
+  }
+  if (retry?.configReset !== undefined && typeof retry.configReset !== "boolean") refuse(`${at}.retry.configReset must be a boolean`);
+  const audit = group("audit", ["enabled", "retentionDays"]);
+  if (audit?.retentionDays !== undefined && !int(audit.retentionDays, B.retentionDays))
+    refuse(`${at}.audit.retentionDays must be an integer from ${B.retentionDays.min} to ${B.retentionDays.max}`);
+}
+
+/** The env for sessionPipeline.summaryRegen: only what is set (absent renders nothing). */
+export function summaryRegenEnv(r: SummaryRegenInputs | undefined): Record<string, string> {
+  if (!r) return {};
+  const flag = (b: boolean) => (b ? "true" : "false");
+  return {
+    ...(r.turns ? { SUMMARY_REGEN_TURNS_ENABLED: flag(r.turns.enabled) } : {}),
+    ...(r.turns?.threshold !== undefined ? { SUMMARY_REGEN_TURN_THRESHOLD: String(r.turns.threshold) } : {}),
+    ...(r.turns?.idleSeconds !== undefined ? { SUMMARY_REGEN_IDLE_SECONDS: String(r.turns.idleSeconds) } : {}),
+    ...(r.retry ? { SUMMARY_RETRY_BACKOFF_ENABLED: flag(r.retry.enabled) } : {}),
+    ...(r.retry?.backoffSeconds !== undefined ? { SUMMARY_RETRY_BACKOFF_SECONDS: r.retry.backoffSeconds.join(",") } : {}),
+    ...(r.retry?.configReset !== undefined ? { SUMMARY_RETRY_CONFIG_RESET_ENABLED: flag(r.retry.configReset) } : {}),
+    ...(r.audit ? { SUMMARY_REGEN_AUDIT_ENABLED: flag(r.audit.enabled) } : {}),
+    ...(r.audit?.retentionDays !== undefined ? { SUMMARY_REGEN_AUDIT_RETENTION_DAYS: String(r.audit.retentionDays) } : {}),
+  };
 }
 
 /** The pipeline role reads session objects through S3 only, for objects under `96bulls/` (as the reader user). */
@@ -607,6 +678,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.neonExit === true ? { SESSIONS_NEON_EXIT: "true" } : {}),
     // Only when armed, so a default deploy leaves the relayfacts extractor at its source default of off.
     ...(i.p.relayfacts === true ? { SUMMARY_DECISION_RECORDS_ENABLED: "true" } : {}),
+    ...summaryRegenEnv(i.p.summaryRegen),
   };
 }
 
