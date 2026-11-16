@@ -144,39 +144,15 @@ CREATE TRIGGER ingest_turn_capture_user_erasure
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_turn_capture_user_erasure();
 
 -- The trigger cannot observe rows that predate this migration. Seed the permanent logical census
--- from every existing exact-session deletion before a turn writer can be registered. Page the
--- frozen history in C order, under the file-level 120-second statement ceiling, so one old tenant
--- cannot create an unbounded lock-time or work-memory spike while this migration owns the trigger.
-DO $backfill$
-DECLARE
- x record;
- v_after_org text;
- v_after_ws text;
- v_after_source text;
- v_after_session text;
- v_n integer;
-BEGIN
- LOOP
-  v_n:=0;
-  FOR x IN
-   SELECT org_id,workspace_id,source,session_id FROM(
-    SELECT DISTINCT org_id,workspace_id,source,session_id
-     FROM sessions.upload_deletions
-     WHERE session_id IS NOT NULL AND origin_id<>'relayhistory:conversation_turns:v1') q
-    WHERE (v_after_org IS NULL OR
-       (org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C")>
-       (v_after_org COLLATE "C",v_after_ws COLLATE "C",v_after_source COLLATE "C",v_after_session COLLATE "C"))
-    ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"
-    LIMIT 1000
-  LOOP
-   INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
-    VALUES(x.org_id,x.workspace_id,x.source,x.session_id,'live') ON CONFLICT DO NOTHING;
-   v_after_org:=x.org_id;v_after_ws:=x.workspace_id;v_after_source:=x.source;v_after_session:=x.session_id;
-   v_n:=v_n+1;
-  END LOOP;
-  EXIT WHEN v_n=0;
- END LOOP;
-END $backfill$;
+-- from every existing exact-session deletion before a turn writer can be registered. This is one
+-- set-based scan under the file-level 120-second statement ceiling; on an oversized census the
+-- migration fails closed and releases its transaction locks instead of multiplying full-table
+-- DISTINCT scans across cursor pages.
+INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
+ SELECT DISTINCT org_id,workspace_id,source,session_id,'live'
+ FROM sessions.upload_deletions
+ WHERE session_id IS NOT NULL AND origin_id<>'relayhistory:conversation_turns:v1'
+ ON CONFLICT DO NOTHING;
 
 -- Called by POST /v1/turns/batches after strict parsing and before any enqueue/claim. It registers
 -- the exact user/source/session writers and returns the pairs already fenced. A fenced pair is not
@@ -262,9 +238,10 @@ BEGIN
 END $sources$;
 
 -- Turn-only canonical pointers remain addressable by GET turns but never become a live directory
--- row. The synthetic machine id is the durable, non-personal origin marker: unlike turn_writers it
--- survives user/session erasure. A later non-turn pointer makes the predicate false and the normal
--- projector can restore the row.
+-- row. Registration is the activation gate; after erasure removes its personal writer row, the
+-- permanent logical fence is the durable witness. The synthetic machine id is server-derived from
+-- (workspace, fixed turns origin, authenticated user), never accepted from a client. A later
+-- non-turn pointer makes the predicate false and the normal projector can restore the row.
 CREATE FUNCTION sessions.aa_session_directory_hide_turn_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
 BEGIN
@@ -273,8 +250,14 @@ BEGIN
     AND s.harness=NEW.harness AND coalesce(s.canonical_session_id,s.session_id)=NEW.session_id AND s.deleted_at IS NULL)
   AND NOT EXISTS(SELECT 1 FROM sessions.session_index s WHERE s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id
     AND s.harness=NEW.harness AND coalesce(s.canonical_session_id,s.session_id)=NEW.session_id AND s.deleted_at IS NULL
-    AND s.machine_id IS DISTINCT FROM 'srv_'||left(encode(sha256(convert_to(
+    AND NOT (s.machine_id='srv_'||left(encode(sha256(convert_to(
       s.workspace_id||chr(31)||'relayhistory:conversation_turns:v1'||chr(31)||s.user_id,'UTF8')),'hex'),32)
+      AND (EXISTS(SELECT 1 FROM sessions.turn_writers w
+        WHERE w.org_id=s.org_id AND w.workspace_id=s.workspace_id AND w.user_id=s.user_id
+         AND w.source=s.harness AND w.session_id=s.session_id)
+       OR EXISTS(SELECT 1 FROM sessions.turn_session_fences f
+        WHERE f.org_id=s.org_id AND f.workspace_id=s.workspace_id
+         AND f.source=s.harness AND f.session_id=s.session_id)))
   )
  THEN NEW.deleted_at:=clock_timestamp();END IF;
  RETURN NEW;

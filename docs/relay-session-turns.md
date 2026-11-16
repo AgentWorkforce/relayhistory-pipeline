@@ -69,9 +69,12 @@ Khaliq's explicit approval. In order:
    buffered GC and publication-retire paths. A forward racing an erasure is either dropped at claim/
    commit or retired and purged; there is no log-driven manual privacy gap.
 5. **Publication.** `aa_session_directory_hide_turn_only` tombstones a directory projection whose
-   live pointers are exclusively registered turns-origin pointers. The canonical pointer stays live
-   for GET turns. A normal pointer makes the predicate false and the ordinary projector restores the
-   directory row.
+   live pointers are exclusively synthetic turns-origin pointers with a registration or permanent
+   fence witness. The machine id is server-derived from workspace, the fixed turns origin and the
+   authenticated user; client machine ids are not trusted or copied into this namespace. The
+   canonical pointer stays live for GET turns. A normal pointer makes the predicate false and the
+   ordinary projector restores the directory row. With registration off, a marker-shaped pointer
+   without a writer/fence witness remains byte-for-byte on the ordinary directory path.
 6. **Backfill.** `migration:legacy-export` is the bounded, resumable one-shot exporter/verifier for
    `conversation_turns`, links and outcomes. Its manifest is accepted only on the dedicated legacy
    machine. The read merge remains live-over-legacy per

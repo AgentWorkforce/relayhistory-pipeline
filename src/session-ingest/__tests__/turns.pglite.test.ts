@@ -181,9 +181,13 @@ test("cross-origin erasure fences registered turns whether erasure or registrati
 test("operator user erase removes writer ids and refuses re-registration",async()=>{
  const f=await fixture();
  await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
- await f.db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('turn-user-erase',$1,$2,$3,'purging','{}')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+ const begun=await f.db.query<{result:{state:string}}>("SELECT sessions.operator_user_erase_begin('turn-user-erase',$1,$2,$3) AS result",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+ expect(begun.rows[0]!.result.state).toBe("purging");
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:0}]);
  await expect(f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})).rejects.toThrow();
+ await f.db.query("UPDATE sessions.operator_user_erasures SET state='bytes_verified',origins='{}',metadata_purged_at=clock_timestamp(),bytes_verified_at=clock_timestamp() WHERE request_id='turn-user-erase'");
+ expect(await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})).toEqual([]);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:1}]);
 });
 
 test("migration backfills exact-session deletions that predate the turn trigger",async()=>{
@@ -219,10 +223,33 @@ test("turn-only canonical pointers stay addressable but their directory projecti
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{n:0}]);
  await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
+ // The same durable witness also covers a fresh projector INSERT after the row was removed.
+ await f.db.query("DELETE FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
+ await f.db.exec("BEGIN;SET LOCAL ROLE search_consumer_runtime");
+ try{
+  await f.db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at)
+   VALUES($1,$2,'claude',$3,'2026-11-05','2026-11-05')`,[TENANT.orgId,TENANT.workspaceId,SESSION]);
+  await f.db.exec("COMMIT");
+ }catch(error){await f.db.exec("ROLLBACK");throw error}
+ expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
   VALUES($1,$2,'claude',$3,'desktop-1',$4,'2026-11-05','2026-11-05','s3','bucket','normal-manifest','22222222-2222-4222-8222-222222222222')`,[TENANT.orgId,TENANT.workspaceId,SESSION,TENANT.userId]);
  await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  expect((await f.db.query("SELECT deleted_at IS NULL AS visible FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{visible:true}]);
+
+ // Marker shape alone is not authority: with the independently default-off registration absent,
+ // even the exact server-derived value stays on the ordinary visible directory path.
+ const markerOnly="7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a9b";
+ await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
+  VALUES($1,$2,'claude',$3,$4,$5,'2026-11-05','2026-11-05','s3','bucket','marker-only','33333333-3333-4333-8333-333333333333')`,
+  [TENANT.orgId,TENANT.workspaceId,markerOnly,liveMachineId(TENANT.workspaceId,TURN_ORIGIN_ID,TENANT.userId),TENANT.userId]);
+ await f.db.exec("BEGIN;SET LOCAL ROLE search_consumer_runtime");
+ try{
+  await f.db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at)
+   VALUES($1,$2,'claude',$3,'2026-11-05','2026-11-05')`,[TENANT.orgId,TENANT.workspaceId,markerOnly]);
+  await f.db.exec("COMMIT");
+ }catch(error){await f.db.exec("ROLLBACK");throw error}
+ expect((await f.db.query("SELECT deleted_at IS NULL AS visible FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,markerOnly])).rows).toEqual([{visible:true}]);
 });
 
 test("the service-role legacy fence import is bounded, idempotent, and fences a later writer",async()=>{

@@ -1486,6 +1486,14 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
+    // Whole-user erase can remove the source ledger while the permanent logical fence must survive.
+    // Such an orphan is no longer derivable, so rollback refuses until its witness exists again.
+    await db.exec("DELETE FROM sessions.upload_deletions WHERE org_id='historical-org'");
+    expect((await failure(db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8"))))?.code).toBe("55000");
+    await db.exec("ROLLBACK");
+    await db.query(
+      "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
+    );
     await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8"));
     expect((await db.query<{ n: number }>(
       "SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id='historical-org'",
@@ -2549,12 +2557,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       return src.slice(open, src.indexOf(tag, open));
     };
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
-    // row is derived from the retained upload_deletions ledger and is safe to drop.
+    // row with its retained upload_deletions witness is derived and safe to drop.
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
     expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.turn_session_fences")).toBe("sessions.turn_session_fences");
     await db.query("DELETE FROM sessions.turn_session_fences WHERE org_id='rollback-org'");
-    await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','historical-session','live')");
+    await db.query(
+      "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('rollback-org','rollback-ws','rollback-user','desktop-origin','claude','historical-session')",
+    );
     await rollback("20261105062020_turns_forward_gates.down.sql");
     expect(await names()).not.toContain(TG);
     expect(await relation("sessions.turn_session_fences")).toBeNull();
