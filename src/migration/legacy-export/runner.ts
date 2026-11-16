@@ -218,8 +218,8 @@ export interface RunDeps {
 
 /**
  * A mapped legacy copy may exist only after Supabase is the active erasure
- * authority. Older synthetic fixtures do not install the probe; every real
- * release containing the authority-row migration does.
+ * authority. A missing probe is not compatibility: it means the durable
+ * authority contract is absent, so exporting must fail closed.
  */
 export async function assertLegacyErasureAuthorityReady(
   db: Queryable,
@@ -227,7 +227,11 @@ export async function assertLegacyErasureAuthorityReady(
   const installed = await db.query<{ installed: boolean }>(
     "SELECT to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AS installed",
   );
-  if (installed.rows[0]?.installed !== true) return;
+  if (installed.rows[0]?.installed !== true)
+    throw Object.assign(
+      new Error("Supabase legacy erasure authority readiness probe is missing"),
+      { code: "legacy_export_authority_not_active" },
+    );
   try {
     const { rows } = await db.query<{ ready: boolean }>(
       "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
@@ -264,10 +268,10 @@ export async function withLegacyPrivacyFence<T>(
       transactionOpen = true;
       await db.query("SET LOCAL lock_timeout='30s'");
       await db.query("SET LOCAL statement_timeout='15min'");
-      // The connection's session default is 30 s. A large scope intentionally
-      // idles this connection while Neon is streamed and S3 is written; keep the
-      // privacy transaction and its locks alive for this operator-controlled scope.
-      await db.query("SET LOCAL idle_in_transaction_session_timeout='0'");
+      // The connection idles while Neon is streamed and S3 is written. Bound
+      // that lock hold: a wedged object-store request must eventually release
+      // the shared privacy locks so an exclusive erase can proceed.
+      await db.query("SET LOCAL idle_in_transaction_session_timeout='15min'");
       await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
       await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
     };
@@ -315,6 +319,18 @@ export async function withLegacyPrivacyFence<T>(
         throw Object.assign(new Error("legacy export authority registration mismatch"), { code: "legacy_authority_register_mismatch" });
     };
     const fenced = async () => {
+      // Registration is the durable proof that this scope can later be erased.
+      // Recheck the authority in every transaction, including after the PUT,
+      // so a mid-run fallback to Neon refuses the export.
+      if (registration) {
+        const { rows: readiness } = await db.query<{ ready: boolean }>(
+          "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
+        );
+        if (readiness[0]?.ready !== true)
+          throw Object.assign(new Error("Supabase legacy erasure authority is not active"), {
+            code: "legacy_export_authority_not_active",
+          });
+      }
       const { rows } = await db.query<{ fenced: boolean }>(
         privacyQuery,
         privacyParams,

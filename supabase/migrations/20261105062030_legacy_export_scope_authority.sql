@@ -35,6 +35,7 @@ CREATE FUNCTION sessions.ingest_legacy_export_scope_authority_register(p jsonb) 
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $register$
 DECLARE v_org text;v_ws text;v_source text;v_session text;v_user text;v_machine text;r sessions.legacy_export_scope_authority%ROWTYPE;
 BEGIN
+ PERFORM sessions.ingest_privacy_eraser_require_active();
  PERFORM sessions.ingest_exact_keys(p,ARRAY['org_id','workspace_id','source','session_id','legacy_user_id','legacy_machine_id']);
  IF EXISTS(SELECT 1 FROM jsonb_each(p) e WHERE jsonb_typeof(e.value)<>'string') THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='legacy export authority: string fields required';END IF;
@@ -96,6 +97,10 @@ BEGIN
     OR EXISTS(SELECT 1 FROM sessions.session_erasure_receipts d WHERE d.org_id=q.org_id AND d.source=q.source AND d.session_id=q.session_id
       AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=q.workspace_id)
     OR EXISTS(SELECT 1 FROM sessions.turn_session_fences d WHERE d.org_id=q.org_id AND d.source=q.source AND d.session_id=q.session_id
+      AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=q.workspace_id)
+    OR EXISTS(SELECT 1 FROM sessions.upload_resets d WHERE d.org_id=q.org_id AND d.user_id=q.legacy_user_id
+      AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=q.workspace_id)
+    OR EXISTS(SELECT 1 FROM sessions.operator_user_erasures d WHERE d.org_id=q.org_id AND d.user_id=q.legacy_user_id
       AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=q.workspace_id))
   ORDER BY q.org_id COLLATE "C",q.workspace_id COLLATE "C",q.source COLLATE "C",q.session_id COLLATE "C",
    q.legacy_user_id COLLATE "C",q.legacy_machine_id COLLATE "C" LIMIT v_limit)q;
@@ -122,6 +127,10 @@ BEGIN
   OR EXISTS(SELECT 1 FROM sessions.session_erasure_receipts d WHERE d.org_id=r.org_id AND d.source=r.source AND d.session_id=r.session_id
     AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=r.workspace_id)
   OR EXISTS(SELECT 1 FROM sessions.turn_session_fences d WHERE d.org_id=r.org_id AND d.source=r.source AND d.session_id=r.session_id
+    AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=r.workspace_id)
+  OR EXISTS(SELECT 1 FROM sessions.upload_resets d WHERE d.org_id=r.org_id AND d.user_id=r.legacy_user_id
+    AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=r.workspace_id)
+  OR EXISTS(SELECT 1 FROM sessions.operator_user_erasures d WHERE d.org_id=r.org_id AND d.user_id=r.legacy_user_id
     AND CASE WHEN d.workspace_id='' THEN 'default' ELSE d.workspace_id END=r.workspace_id);
 END $legacy_still$;
 

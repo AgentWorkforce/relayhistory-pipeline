@@ -1,7 +1,7 @@
 -- Operator-only phase after 20261105062030. The password is set separately
 -- from 1Password in memory; never put it in this file or a connection file.
 -- This role has SELECT on exactly the six export fence ledgers and EXECUTE on
--- the one authority-row registration RPC. It has no authority-table write.
+-- the authority-row registration and readiness RPCs. It has no authority-table write.
 BEGIN;
 DO $role$ BEGIN
  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_legacy_export_privacy')

@@ -197,6 +197,7 @@ export const RELEASE_ANCHOR_FIXED_PATHS: readonly string[] = [
     "supabase/bootstrap/babysitter_retention_verify.sql",
     "supabase/bootstrap/buffered_search_feed_runtime_verify.sql",
     "supabase/bootstrap/canonical_project_events_verify.sql",
+    "supabase/bootstrap/legacy_export_privacy_verify.sql",
     "supabase/bootstrap/privacy_eraser_verify.sql",
     "supabase/bootstrap/session_directory_search_worker_verify.sql",
     "supabase/bootstrap/session_ingest_verify.sql",

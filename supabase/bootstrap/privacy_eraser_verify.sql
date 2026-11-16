@@ -33,6 +33,11 @@ BEGIN
  IF to_regclass('sessions.session_erasure_writes') IS NULL THEN
   v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.ingest\_operator\_runtime\_%');
  END IF;
+ -- Allowed, not required before 20261105062030 installs the durable legacy-owner mapping.
+ -- Once the table exists both RPCs remain mandatory, so a partial or edited migration fails closed.
+ IF to_regclass('sessions.legacy_export_scope_authority') IS NULL THEN
+  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.legacy\_export\_privacy\_eraser\_%');
+ END IF;
  SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;
  IF cardinality(v_oids)<>cardinality(v_allowed) OR array_position(v_oids,NULL) IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='privacy eraser RPC missing';END IF;

@@ -16,7 +16,7 @@ import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
 import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/authority.ts";
-import { authorityKind, authorityUrl, eraserFor } from "../neon-s3-erasure/main.ts";
+import { authorityKind, authorityUrl, eraserFor, legacyExportErasureEnabled } from "../neon-s3-erasure/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
@@ -320,6 +320,10 @@ describe("credentials only through stdin (RAM)", () => {
     expect(authorityKind(undefined)).toBe("neon");
     expect(authorityKind("supabase")).toBe("supabase");
     expect(code(() => authorityKind("both"))).toContain("must be neon or supabase");
+    expect(legacyExportErasureEnabled(undefined)).toBe(false);
+    expect(legacyExportErasureEnabled("")).toBe(false);
+    expect(legacyExportErasureEnabled("true")).toBe(true);
+    expect(code(() => legacyExportErasureEnabled("1"))).toContain("must be exactly true or unset");
     expect(code(() => authorityUrl("neon", "postgres://u@ep-x-pooler.us-east-2.aws.neon.tech/db"))).toBe("database_url_pooler");
     expect(code(() => authorityUrl("supabase", "postgres://u@aws-0.pooler.supabase.com:6543/postgres"))).toBe("database_url_transaction_pooler");
     expect(code(() => authorityUrl("supabase", "postgres://u@db.ref.supabase.co:5432/postgres?pgbouncer=true"))).toBe("database_url_transaction_pooler");
@@ -377,6 +381,28 @@ async function world() {
 }
 
 describe("supabase privacy authority as the eraser's source", () => {
+  test("the owner register RPC refuses while Supabase is not the active authority", async () => {
+    const w = await world();
+    const registration = {
+      org_id: "org-1", workspace_id: "ws/1", source: "claude", session_id: "inactive:legacy",
+      legacy_user_id: "legacy-owner", legacy_machine_id: legacyMachineId("ws/1", "legacy-owner"),
+    };
+    await w.f.db.exec("BEGIN;SET LOCAL ROLE bulls96_legacy_export_privacy");
+    try {
+      await expect(
+        w.f.db.query(
+          "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)",
+          [JSON.stringify(registration)],
+        ),
+      ).rejects.toMatchObject({ code: "55000" });
+    } finally {
+      await w.f.db.exec("ROLLBACK");
+    }
+    expect(
+      (await w.f.db.query("SELECT 1 FROM sessions.legacy_export_scope_authority WHERE session_id=$1", [registration.session_id])).rows,
+    ).toEqual([]);
+  });
+
   test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {
     const w = await world();
     await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
@@ -388,6 +414,7 @@ describe("supabase privacy authority as the eraser's source", () => {
       org_id: "org-1", workspace_id: "ws/1", source: "claude", session_id: "legacy:sess",
       legacy_user_id: "legacy-owner", legacy_machine_id: machine,
     };
+    await w.activate();
     await w.f.db.exec("BEGIN;SET LOCAL ROLE bulls96_legacy_export_privacy");
     try {
       const r = (await w.f.db.query(
@@ -400,7 +427,6 @@ describe("supabase privacy authority as the eraser's source", () => {
       await w.f.db.exec("ROLLBACK");
       throw error;
     }
-    await w.activate();
     await w.f.db.query(
       "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'legacy_import')",
       [registration.org_id, registration.workspace_id, registration.source, registration.session_id],
@@ -408,6 +434,50 @@ describe("supabase privacy authority as the eraser's source", () => {
     const authority = supabaseAuthority(w.f.queryable);
     expect(await authority.legacyFencedPage!(null)).toEqual([registration]);
     expect(await authority.stillLegacyFenced!(registration)).toBe(true);
+  });
+
+  test("user-wide reset and operator-erasure ledgers keep late legacy copies sweepable", async () => {
+    const w = await world();
+    await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+      first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
+      PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+    await w.activate();
+    const registrations = [
+      { session_id: "reset-late", legacy_user_id: "reset-owner" },
+      { session_id: "operator-late", legacy_user_id: "operator-owner" },
+    ].map(({ session_id, legacy_user_id }) => ({
+      org_id: "org-1",
+      workspace_id: "ws/1",
+      source: "claude",
+      session_id,
+      legacy_user_id,
+      legacy_machine_id: legacyMachineId("ws/1", legacy_user_id),
+    })).sort((a, b) => a.session_id.localeCompare(b.session_id));
+    await w.f.db.exec("BEGIN;SET LOCAL ROLE bulls96_legacy_export_privacy");
+    try {
+      for (const registration of registrations)
+        await w.f.db.query(
+          "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)",
+          [JSON.stringify(registration)],
+        );
+      await w.f.db.exec("COMMIT");
+    } catch (error) {
+      await w.f.db.exec("ROLLBACK");
+      throw error;
+    }
+    await w.f.db.query(
+      "INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id) VALUES($1,$2,$3,'legacy-reset')",
+      ["org-1", "ws/1", "reset-owner"],
+    );
+    await w.f.db.query(
+      `INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins)
+       VALUES('legacy-operator','org-1','ws/1','operator-owner','purging','{}')`,
+    );
+    const authority = supabaseAuthority(w.f.queryable);
+    expect(await authority.legacyFencedPage!(null)).toEqual(registrations);
+    for (const registration of registrations)
+      expect(await authority.stillLegacyFenced!(registration)).toBe(true);
   });
 
   test("before activation the frozen table is NOT the authority: nothing is erased even with a fence row present", async () => {
