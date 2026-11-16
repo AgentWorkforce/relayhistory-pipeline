@@ -22,7 +22,7 @@ without Khaliq's explicit words for that exact run. Design and gate status:
   - It refuses anything else, including `neondb_owner`.
 - **Privacy role.**
   - Use only the dedicated `bulls96_legacy_export_privacy` direct connection.
-    Bootstrap/migration `20261105062020_legacy_export_scope_authority.sql`
+    Bootstrap/migration `20261105062030_legacy_export_scope_authority.sql`
     grants it SELECT on `session_erasure_receipts`, `upload_deletions`,
     `ingest_frozen_source_deletions`, `upload_resets`,
     `turn_session_fences`, and `operator_user_erasures`, plus EXECUTE on the
@@ -36,7 +36,7 @@ without Khaliq's explicit words for that exact run. Design and gate status:
     `turn_session_fences`, must already be landed and applied; a missing
     relation is a hard refusal, never an empty fence set.
   - Poolers, including port 6543, any other identity, and roles with ledger
-    write privileges are refused. With RLS active, migration 062020's reviewed,
+    write privileges are refused. With RLS active, migration 062030's reviewed,
     permissive full-read policy must be present and no applicable restrictive
     policy may hide rows; a policy-less SELECT is refused. Creating this
     dedicated role, changing grants, or granting `BYPASSRLS` is an IAM change
