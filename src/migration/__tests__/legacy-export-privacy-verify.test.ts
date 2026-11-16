@@ -649,11 +649,11 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
         return { rows: (all.at(-1)?.rows ?? []) as T[] };
       },
     };
-    const asExporter = async <T,>(body: (privacyDb: Queryable) => Promise<T>): Promise<T> => {
+    const asExporter = async <T,>(body: (privacyDb: Queryable) => Promise<T>, opts: { preflight?: boolean } = {}): Promise<T> => {
       await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
       try {
         const privacyDb = await initPrivacy!(raw);
-        await preflight(privacyDb);
+        if (opts.preflight !== false) await preflight(privacyDb);
         return await body(privacyDb);
       } finally {
         await f.db.exec("RESET ROLE");
@@ -813,6 +813,72 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       // A missing object counts as erased: no failure logged, and the sweep reaches the fenced neighbour.
       expect(logs.filter((l) => /failed|refused/u.test(String(l.message)) && /legacy/u.test(String(l.message)))).toEqual([]);
       expect(await legacyKeys(store, "sess_q")).toEqual([]);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  // ---- (h) pre-landing review findings (layered-sessions-pipeline review of 1d573e75; lead-requested gate cases) ----
+  test("(h1) the privacy eraser verifier passes on a database WITHOUT 062030's legacy eraser RPCs (every prefix release, production today)", async () => {
+    const w = await hostedWorld();
+    try {
+      const verify = readFileSync(new URL("../../../supabase/bootstrap/privacy_eraser_verify.sql", import.meta.url), "utf8");
+      // Control: with 062030 applied the verifier accepts the provisioned role.
+      expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
+      // A prefix database: 062030's two eraser RPCs absent. The verifier must allow, not require, them.
+      await w.f.db.exec("DROP FUNCTION sessions.legacy_export_privacy_eraser_page(jsonb); DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb);");
+      expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("(h2) one poison authority row (well-formed machine id NOT derived from its workspace/user) is refused loudly but never wedges erasure of other fenced scopes", async () => {
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    const w = await hostedWorld();
+    try {
+      const store = createFsStore({ root: await tmp("poison") });
+      const counters = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, store, "poison");
+        r.checkpoint.close();
+        return r.counters;
+      });
+      expect(counters.exported).toBe(1);
+      // The poison row sorts BEFORE the genuine scope in the eraser page order, and is fenced too.
+      const poison = { org_id: SR.orgId, workspace_id: SR.workspaceId, source: SR.source, session_id: "aaa_poison" };
+      await w.f.db.query("INSERT INTO sessions.legacy_export_scope_authority VALUES($1,$2,$3,$4,$5,$6)", [poison.org_id, poison.workspace_id, poison.source, poison.session_id, OWNER, "srv_" + "0".repeat(32)]);
+      for (const sid of [poison.session_id, SR.sessionId])
+        await w.f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [SR.orgId, SR.workspaceId, OTHER, SR.source, sid]);
+      const logs = await w.sweep(store).catch(() => [] as Record<string, unknown>[]);
+      // The genuine fenced scope is still erased in the same sweeps ...
+      expect(await legacyKeys(store, "sess_r")).toEqual([]);
+      // ... and the poison row is surfaced (not silently skipped).
+      expect(logs.some((l) => /mismatch|poison|invalid|refus/iu.test(`${String(l.message)} ${String(l.error_code ?? "")}`))).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("(h3) runOrg refuses when the readiness probe is missing (library path, without the CLI preflight)", async () => {
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    const w = await hostedWorld();
+    try {
+      await w.f.db.exec("DROP FUNCTION sessions.legacy_export_privacy_authority_ready()");
+      const store = createFsStore({ root: await tmp("noprobe") });
+      let puts = 0;
+      const outcome = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, withPutHook(store, async () => void (puts += 1)), "noprobe");
+        r.checkpoint.close();
+        return { exported: r.counters.exported, codes: r.logs.map((l) => String(l.error_code ?? "")) };
+      }, { preflight: false }).then((v) => ({ ok: v }), (e: unknown) => ({ code: String((e as { code?: string }).code ?? "error") }));
+      expect(puts).toBe(0);
+      expect(await allKeys(store)).toEqual([]);
+      const codes = "code" in outcome ? [outcome.code] : outcome.ok.codes;
+      expect(codes.some((c) => /authority|ready|readiness|probe/iu.test(c))).toBe(true);
     } finally {
       await w.f.close();
     }
