@@ -2,22 +2,11 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   ledger-bench (throwaway): the in-region targets of the hosted-ledger benchmark
   (docs/design/hosted-ledger-benchmark-plan.md, decision 0008). R2, R3 general-purpose buckets,
-  R4, R5 S3 Express directory buckets, R6 DynamoDB table, key K2 and the client role.
-  Deployed in the cluster's Region, in the throwaway (sessions-dev) account. Delete the stack to remove it.
+  R4, R5 S3 Express directory buckets, R6 DynamoDB table, key K2 and a probe key. No IAM: the role that
+  may use them is client-role.yaml. Deployed in the compute's Region, in the throwaway data account.
+  Delete the stack to remove it.
 
 Parameters:
-  ClusterAccountId:
-    Type: String
-    AllowedPattern: "^[0-9]{12}$"
-    Description: Account of the EKS cluster whose ledger-bench pod role may assume the client role.
-  PodRoleName:
-    Type: String
-    Default: ledger-bench-pod
-    AllowedPattern: "^ledger-bench-[a-z0-9-]{1,40}$"
-  EastRegion:
-    Type: String
-    Default: us-east-1
-    Description: Region of the R1 bucket (data-east.yaml), named here only to scope the client role.
   ExpressZoneA:
     Type: String
     AllowedPattern: "^[a-z0-9]+-az[0-9]+$"
@@ -51,7 +40,7 @@ Conditions:
   WithBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
 
 Resources:
-  # K2. The account-root statement delegates to IAM, where only the client role is granted use.
+  # K2. The account-root statement delegates to IAM, where only the client role (client-role.yaml) is granted use.
   Key:
     Type: AWS::KMS::Key
     DeletionPolicy: Delete
@@ -231,70 +220,6 @@ Resources:
         - { Key: ttl, Value: !Ref Ttl }
         - { Key: owner, Value: !Ref Owner }
 
-  # The only identity with data access. Assumable only by the cluster's ledger-bench pod role; the
-  # account-root principal plus the PrincipalArn condition lets this stack exist before that role does.
-  ClientRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: ledger-bench-client
-      MaxSessionDuration: 3600
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              AWS: !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:root"
-            # EKS Pod Identity session tags are transitive, so the hop carries them: TagSession is required.
-            Action: ["sts:AssumeRole", "sts:TagSession"]
-            Condition:
-              ArnEquals:
-                "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"
-      Policies:
-        - PolicyName: ledger-bench-targets
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: ListBenchBuckets
-                Effect: Allow
-                Action: "s3:ListBucket"
-                Resource:
-                  - !GetAtt BucketR2.Arn
-                  - !GetAtt BucketR3.Arn
-                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}"
-              - Sid: BenchObjects
-                Effect: Allow
-                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-                Resource:
-                  - !Sub "${BucketR2.Arn}/bench/*"
-                  - !Sub "${BucketR3.Arn}/bench/*"
-                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}/bench/*"
-              - Sid: ExpressSessions
-                Effect: Allow
-                Action: "s3express:CreateSession"
-                Resource:
-                  - !GetAtt BucketR4.Arn
-                  - !GetAtt BucketR5.Arn
-              # S3 calls KMS as the caller, so the role needs the keys themselves. K2 by ARN; K1 lives in the
-              # other Region's stack, so it is matched by its tag.
-              - Sid: BenchKeyInRegion
-                Effect: Allow
-                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
-                Resource: !GetAtt Key.Arn
-              - Sid: BenchKeysByTag
-                Effect: Allow
-                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
-                Resource: !Sub "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
-                Condition:
-                  StringEquals: { "aws:ResourceTag/purpose": ledger-bench }
-              - Sid: BenchTable
-                Effect: Allow
-                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
-                Resource: !GetAtt Table.Arn
-      Tags:
-        - { Key: purpose, Value: ledger-bench }
-        - { Key: ttl, Value: !Ref Ttl }
-        - { Key: owner, Value: !Ref Owner }
-
   # A backstop, not the cap: AWS Budgets lags by hours. The cap is the client's request budget
   # (benchmarks/ledger-bench/cost.ts). Scoped to the services the benchmark uses, account-wide.
   Budget:
@@ -325,4 +250,3 @@ Outputs:
   BucketR4: { Value: !Ref BucketR4 }
   BucketR5: { Value: !Ref BucketR5 }
   Table: { Value: !Ref Table }
-  ClientRoleArn: { Value: !GetAtt ClientRole.Arn }

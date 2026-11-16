@@ -6,12 +6,13 @@
  * operator typed.
  *
  *   Data side (the throwaway account):
- *     ops.ts up-data      --inputs <file> --confirm-account <data account>
+ *     ops.ts up-data      --inputs <file> --confirm-account <data account> [--plan] [--no-role]
+ *     ops.ts up-role      --inputs <file> --confirm-account <data account> [--plan]
  *     ops.ts outputs-data --inputs <file>                 # the key ARNs the cluster side's inputs need
- *     ops.ts down-data    --inputs <file> --confirm-account <data account>
+ *     ops.ts down-data    --inputs <file> --confirm-account <data account> [--no-role]
  *     ops.ts verify-data  --inputs <file> --confirm-account <data account>
  *   Cluster side (the EKS cluster and its account):
- *     ops.ts up-identity  --inputs <file> --confirm-account <cluster account>
+ *     ops.ts up-identity  --inputs <file> --confirm-account <cluster account> [--plan]
  *     ops.ts up-namespace --inputs <file>
  *     ops.ts run          --inputs <file> --run-id <id> [--profile smoke] [--lanes r2,r3] [--steps 1,2]
  *     ops.ts collect      --inputs <file> --run-id <id> --out <dir outside the repo>
@@ -19,6 +20,9 @@
  *     ops.ts verify-cluster --inputs <file> --confirm-account <cluster account>
  *   Either:
  *     ops.ts render       --inputs <file> --run-id <id>   # prints the manifests; contacts nothing
+ *
+ * `--plan` creates each stack's change set without executing it, so it can be shown before anything exists.
+ * `--no-role` leaves the client role's stack to an operator who may create IAM roles (`up-role`).
  *
  * The inputs file holds names and ids (accounts, cluster, image digest). It is not a credential, but it is
  * not public either: keep it outside the repository. Credentials come from the AWS CLI profiles and the
@@ -37,7 +41,7 @@ import { APPROVED_CAP_USD, FIXED_USD, laneCostBound } from "../../../benchmarks/
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../..");
 export const NAMESPACE = "ledger-bench";
-export const STACKS = { west: "ledger-bench-data-west", east: "ledger-bench-data-east", identity: "ledger-bench-cluster-identity" } as const;
+export const STACKS = { west: "ledger-bench-data-west", east: "ledger-bench-data-east", role: "ledger-bench-client-role", identity: "ledger-bench-cluster-identity" } as const;
 
 export interface KeyArns {
   /** K1 (R1's key), K2 (the key of R2..R5) and the probe key no bucket uses. */
@@ -47,7 +51,7 @@ export interface KeyArns {
 }
 
 export interface Inputs {
-  /** AWS CLI profile for the throwaway (sessions-dev) account. Needed by the data-side commands only. */
+  /** AWS CLI profile for the throwaway data account. Needed by the data-side commands only. */
   dataProfile?: string;
   dataAccountId: string;
   /** AWS CLI profile for the EKS cluster's account. Needed by the cluster-side commands only. */
@@ -68,6 +72,8 @@ export interface Inputs {
   image: string;
   nodeSelector: Record<string, string>;
   tolerations: Record<string, unknown>[];
+  /** Pods the benchmark must never share a node with (the production ingest pods): a required anti-affinity. */
+  avoidPods?: { namespaces: string[]; matchLabels: Record<string, string> };
   /** CPU request and limit; the limit caps what the client can take from a node it shares with production pods. */
   cpu: string;
   cpuLimit: string;
@@ -114,6 +120,12 @@ export function parseInputs(text: string): Inputs {
   if (o.dataAccountId === o.clusterAccountId) throw new Error("ledger-bench: the data account must not be the cluster's account");
   if (o.expressZoneA === o.expressZoneB) throw new Error("ledger-bench: R4 and R5 must be in different zones");
   if (o.region === o.eastRegion) throw new Error("ledger-bench: R1 must be in another Region than the compute");
+  if (o.avoidPods !== undefined) {
+    const name = /^[a-z0-9]([a-z0-9.\/_-]{0,61}[a-z0-9])?$/i;
+    const { namespaces, matchLabels } = o.avoidPods;
+    if (!Array.isArray(namespaces) || namespaces.length === 0 || namespaces.some((n) => typeof n !== "string" || !name.test(n))) throw new Error("ledger-bench: inputs.avoidPods.namespaces is malformed");
+    if (!matchLabels || Object.keys(matchLabels).length === 0 || Object.entries(matchLabels).some(([k, v]) => !name.test(k) || typeof v !== "string" || !name.test(v))) throw new Error("ledger-bench: inputs.avoidPods.matchLabels is malformed");
+  }
   if (o.budgetEmail !== undefined && !/^[^@\s]+@[^@\s]+$/.test(o.budgetEmail)) throw new Error("ledger-bench: inputs.budgetEmail is malformed");
   return { ...(o as Inputs), nodeSelector: o.nodeSelector ?? {}, tolerations: o.tolerations ?? [] };
 }
@@ -178,6 +190,9 @@ export function renderJob(template: string, i: Inputs, p: JobParams): string {
     MEMORY: i.memory,
     NODE_SELECTOR_JSON: JSON.stringify(i.nodeSelector),
     TOLERATIONS_JSON: JSON.stringify(i.tolerations),
+    AFFINITY_JSON: JSON.stringify(
+      i.avoidPods ? { podAntiAffinity: { requiredDuringSchedulingIgnoredDuringExecution: [{ topologyKey: "kubernetes.io/hostname", namespaces: i.avoidPods.namespaces, labelSelector: { matchLabels: i.avoidPods.matchLabels } }] } } : {},
+    ),
   };
   // An empty step list means every step: the client reads an empty LEDGER_BENCH_STEPS as unset.
   return template.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name: string) => {
@@ -228,13 +243,15 @@ function confirmAccount(profile: string, region: string, expected: string, confi
   if (live !== expected) throw new Error(`ledger-bench: ${what}: profile ${profile} is for another account than the inputs name. Nothing was changed.`);
 }
 
-function deploy(profile: string, region: string, stack: string, template: string, parameters: Record<string, string>, iam: boolean, i: Inputs): void {
-  must("aws", aws(profile, region, [
-    "cloudformation", "deploy", "--stack-name", stack, "--template-file", join(HERE, template), "--no-fail-on-empty-changeset",
+function deploy(profile: string, region: string, stack: string, template: string, parameters: Record<string, string>, iam: boolean, i: Inputs, plan: boolean): void {
+  // With --plan the change set is created and left for review (`aws cloudformation describe-change-set`).
+  const out = must("aws", aws(profile, region, [
+    "cloudformation", "deploy", "--stack-name", stack, "--template-file", join(HERE, template), plan ? "--no-execute-changeset" : "--no-fail-on-empty-changeset",
     ...(iam ? ["--capabilities", "CAPABILITY_NAMED_IAM"] : []),
     "--tags", "purpose=ledger-bench", `ttl=${i.ttl}`, `owner=${i.owner}`,
     ...(Object.keys(parameters).length > 0 ? ["--parameter-overrides", ...Object.entries(parameters).map(([k, v]) => `${k}=${v}`)] : []),
   ]));
+  if (plan) console.log(`${stack}: change set created, not executed\n${out.trim()}`);
 }
 
 function output(profile: string, region: string, stack: string, name: string): string {
@@ -244,15 +261,22 @@ function output(profile: string, region: string, stack: string, name: string): s
   return value;
 }
 
-function upData(i: Inputs, confirmed: string | undefined): void {
+const roleParameters = (i: Inputs) => ({ ClusterAccountId: i.clusterAccountId, EastRegion: i.eastRegion, ExpressZoneA: i.expressZoneA, ExpressZoneB: i.expressZoneB, Owner: i.owner, Ttl: i.ttl });
+
+function upRole(i: Inputs, confirmed: string | undefined, plan: boolean): void {
+  const profile = dataProfile(i);
+  confirmAccount(profile, i.region, i.dataAccountId, confirmed, "up-role");
+  deploy(profile, i.region, STACKS.role, "client-role.yaml", roleParameters(i), true, i, plan);
+  if (!plan) console.log("up-role: the client role is deployed");
+}
+
+function upData(i: Inputs, confirmed: string | undefined, plan: boolean, withRole: boolean): void {
   const profile = dataProfile(i);
   confirmAccount(profile, i.region, i.dataAccountId, confirmed, "up-data");
-  deploy(profile, i.eastRegion, STACKS.east, "data-east.yaml", { Owner: i.owner, Ttl: i.ttl }, false, i);
-  deploy(profile, i.region, STACKS.west, "data-west.yaml", {
-    ClusterAccountId: i.clusterAccountId, EastRegion: i.eastRegion, ExpressZoneA: i.expressZoneA, ExpressZoneB: i.expressZoneB, Owner: i.owner, Ttl: i.ttl,
-    ...(i.budgetEmail ? { BudgetEmail: i.budgetEmail } : {}),
-  }, true, i);
-  console.log("up-data: both data stacks are deployed; run outputs-data for the key ARNs");
+  deploy(profile, i.eastRegion, STACKS.east, "data-east.yaml", { Owner: i.owner, Ttl: i.ttl }, false, i, plan);
+  deploy(profile, i.region, STACKS.west, "data-west.yaml", { ExpressZoneA: i.expressZoneA, ExpressZoneB: i.expressZoneB, Owner: i.owner, Ttl: i.ttl, ...(i.budgetEmail ? { BudgetEmail: i.budgetEmail } : {}) }, false, i, plan);
+  if (withRole) deploy(profile, i.region, STACKS.role, "client-role.yaml", roleParameters(i), true, i, plan);
+  if (!plan) console.log(`up-data: the data stacks are deployed${withRole ? ", with the client role" : "; the client role is left to up-role"}; run outputs-data for the key ARNs`);
 }
 
 function outputsData(i: Inputs): KeyArns {
@@ -260,11 +284,11 @@ function outputsData(i: Inputs): KeyArns {
   return { east: output(profile, i.eastRegion, STACKS.east, "KeyArn"), west: output(profile, i.region, STACKS.west, "KeyArn"), probe: output(profile, i.region, STACKS.west, "ProbeKeyArn") };
 }
 
-function upIdentity(i: Inputs, confirmed: string | undefined): void {
+function upIdentity(i: Inputs, confirmed: string | undefined, plan: boolean): void {
   const profile = clusterProfile(i);
   confirmAccount(profile, i.region, i.clusterAccountId, confirmed, "up-identity");
-  deploy(profile, i.region, STACKS.identity, "cluster-identity.yaml", { ClusterName: i.clusterName, DataAccountId: i.dataAccountId, Owner: i.owner, Ttl: i.ttl }, true, i);
-  console.log("up-identity: the pod role and its Pod Identity association are deployed");
+  deploy(profile, i.region, STACKS.identity, "cluster-identity.yaml", { ClusterName: i.clusterName, DataAccountId: i.dataAccountId, Owner: i.owner, Ttl: i.ttl }, true, i, plan);
+  if (!plan) console.log("up-identity: the pod role and its Pod Identity association are deployed");
 }
 
 /**
@@ -404,16 +428,18 @@ function downCluster(i: Inputs, confirmed: string | undefined, collected: string
   console.log("down-cluster: namespace and identity stack deleted; run verify-cluster");
 }
 
-function downData(i: Inputs, confirmed: string | undefined): void {
+function downData(i: Inputs, confirmed: string | undefined, withRole: boolean): void {
   const profile = dataProfile(i);
   confirmAccount(profile, i.region, i.dataAccountId, confirmed, "down-data");
   const n = resourceNames(i);
+  // The role first: once it is gone nothing can write, even if a pod were still running.
+  if (withRole) deleteStack(profile, i.region, STACKS.role);
   // Every object, directory buckets included (a stack cannot delete a non-empty bucket).
   emptyBucket(profile, i.eastRegion, n.R1);
   for (const bucket of [n.R2, n.R3, n.R4, n.R5]) emptyBucket(profile, i.region, bucket);
   deleteStack(profile, i.region, STACKS.west);
   deleteStack(profile, i.eastRegion, STACKS.east);
-  console.log("down-data: buckets emptied, both data stacks deleted; run verify-data");
+  console.log(`down-data: buckets emptied, data stacks deleted${withRole ? "" : " (the client role's stack is left to its own operator)"}; run verify-data`);
 }
 
 export interface Check {
@@ -472,6 +498,7 @@ function verifyData(i: Inputs, confirmed: string | undefined): Verification {
   const data = (region: string, args: string[]) => exec("aws", aws(profile, region, args));
   const checks: Check[] = [
     checkOf("stack data-west", data(i.region, ["cloudformation", "describe-stacks", "--stack-name", STACKS.west]), /does not exist/),
+    checkOf("stack client-role", data(i.region, ["cloudformation", "describe-stacks", "--stack-name", STACKS.role]), /does not exist/),
     checkOf("stack data-east", data(i.eastRegion, ["cloudformation", "describe-stacks", "--stack-name", STACKS.east]), /does not exist/),
     checkOf("R1 bucket", data(i.eastRegion, ["s3api", "head-bucket", "--bucket", n.R1]), /\b404\b|Not Found|NoSuchBucket/),
     ...(["R2", "R3", "R4", "R5"] as const).map((id) => checkOf(`${id} bucket`, data(i.region, ["s3api", "head-bucket", "--bucket", n[id]]), /\b404\b|Not Found|NoSuchBucket/)),
@@ -507,7 +534,7 @@ if (import.meta.main) {
     allowPositionals: true,
     options: {
       inputs: { type: "string" }, "run-id": { type: "string" }, profile: { type: "string", default: "standard" }, lanes: { type: "string" }, steps: { type: "string", default: "" },
-      out: { type: "string" }, collected: { type: "string" }, "discard-results": { type: "boolean", default: false }, "confirm-account": { type: "string" },
+      out: { type: "string" }, collected: { type: "string" }, plan: { type: "boolean", default: false }, "no-role": { type: "boolean", default: false }, "discard-results": { type: "boolean", default: false }, "confirm-account": { type: "string" },
     },
   });
   const command = positionals[0];
@@ -527,18 +554,19 @@ if (import.meta.main) {
       for (const lane of lanes) console.log(`---\n${renderJob(template, inputs, { runId, lane, profile: values.profile!, steps: values.steps!, bundleSha256: "" })}`);
       break;
     }
-    case "up-data": upData(inputs, values["confirm-account"]); break;
+    case "up-data": upData(inputs, values["confirm-account"], values.plan!, !values["no-role"]); break;
+    case "up-role": upRole(inputs, values["confirm-account"], values.plan!); break;
     case "outputs-data": console.log(JSON.stringify({ keys: outputsData(inputs) })); break;
-    case "up-identity": upIdentity(inputs, values["confirm-account"]); break;
+    case "up-identity": upIdentity(inputs, values["confirm-account"], values.plan!); break;
     case "up-namespace": upNamespace(inputs); break;
     case "run": run(inputs, runId, values.profile!, lanes, values.steps!); break;
     case "collect": collect(inputs, runId, values.out ?? ""); break;
     case "down-cluster": downCluster(inputs, values["confirm-account"], values.collected, values["discard-results"]!); break;
-    case "down-data": downData(inputs, values["confirm-account"]); break;
+    case "down-data": downData(inputs, values["confirm-account"], !values["no-role"]); break;
     case "verify-data": report(verifyData(inputs, values["confirm-account"])); break;
     case "verify-cluster": report(verifyCluster(inputs, values["confirm-account"])); break;
     default:
-      console.error("usage: ops.ts render|up-data|outputs-data|down-data|verify-data|up-identity|up-namespace|run|collect|down-cluster|verify-cluster --inputs <file> ...");
+      console.error("usage: ops.ts render|up-data|up-role|outputs-data|down-data|verify-data|up-identity|up-namespace|run|collect|down-cluster|verify-cluster --inputs <file> ...");
       process.exit(2);
   }
 }

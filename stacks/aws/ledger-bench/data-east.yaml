@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   ledger-bench (throwaway): R1 and K1, the cross-region baseline of the hosted-ledger benchmark
   (docs/design/hosted-ledger-benchmark-plan.md). Production's shape: a general-purpose bucket with SSE-KMS
-  and Bucket Keys off, in a Region other than the compute's. Deployed in the throwaway (sessions-dev)
-  account. The client role that may use it is in data-west.yaml. Delete the stack to remove it.
+  and Bucket Keys off, in a Region other than the compute's. Deployed in the throwaway data account.
+  The client role that may use it is client-role.yaml. Delete the stack to remove it.
 
 Parameters:
   Owner:

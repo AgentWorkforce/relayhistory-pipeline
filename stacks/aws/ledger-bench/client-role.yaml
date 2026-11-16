@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ledger-bench (throwaway): the one identity that can reach the benchmark's data
+  (docs/design/hosted-ledger-benchmark-plan.md). Its own stack, so the storage (data-west.yaml,
+  data-east.yaml) can be created by an identity that may not create IAM roles. It names the buckets and the
+  table by the names those templates derive, so it can be deployed before or after them. Deployed in the
+  compute's Region, in the throwaway data account. Delete the stack to remove it.
+
+Parameters:
+  ClusterAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: Account of the EKS cluster whose ledger-bench pod role may assume this role.
+  PodRoleName:
+    Type: String
+    Default: ledger-bench-pod
+    AllowedPattern: "^ledger-bench-[a-z0-9-]{1,40}$"
+  EastRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region of the R1 bucket (data-east.yaml).
+  ExpressZoneA:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+-az[0-9]+$"
+  ExpressZoneB:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+-az[0-9]+$"
+  Owner:
+    Type: String
+    AllowedPattern: "^[a-z0-9-]{3,40}$"
+  Ttl:
+    Type: String
+    AllowedPattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+
+Resources:
+  # Assumable only by the cluster's ledger-bench pod role; the account-root principal plus the PrincipalArn
+  # condition lets this stack exist before that role does.
+  ClientRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ledger-bench-client
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:root"
+            # EKS Pod Identity session tags are transitive, so the hop carries them: TagSession is required.
+            Action: ["sts:AssumeRole", "sts:TagSession"]
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"
+      Policies:
+        - PolicyName: ledger-bench-targets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBenchBuckets
+                Effect: Allow
+                Action: "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}"
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r2-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r3-${AWS::AccountId}-${AWS::Region}"
+              - Sid: BenchObjects
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}/bench/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r2-${AWS::AccountId}-${AWS::Region}/bench/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r3-${AWS::AccountId}-${AWS::Region}/bench/*"
+              - Sid: ExpressSessions
+                Effect: Allow
+                Action: "s3express:CreateSession"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3express:${AWS::Region}:${AWS::AccountId}:bucket/ledger-bench-r4-${AWS::AccountId}--${ExpressZoneA}--x-s3"
+                  - !Sub "arn:${AWS::Partition}:s3express:${AWS::Region}:${AWS::AccountId}:bucket/ledger-bench-r5-${AWS::AccountId}--${ExpressZoneB}--x-s3"
+              # S3 calls KMS as the caller, so the role needs the keys themselves. They live in the data
+              # stacks, so they are matched by their tag: only this account's keys tagged for the benchmark.
+              - Sid: BenchKeysByTag
+                Effect: Allow
+                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+                Resource: !Sub "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals: { "aws:ResourceTag/purpose": ledger-bench }
+              - Sid: BenchTable
+                Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ledger_bench"
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+Outputs:
+  ClientRoleArn: { Value: !GetAtt ClientRole.Arn }

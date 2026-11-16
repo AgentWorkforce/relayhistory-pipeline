@@ -11,7 +11,8 @@ temporary: it is created for one benchmark and deleted when the benchmark has ru
 
 | Where | Template | Resources |
 | --- | --- | --- |
-| Throwaway data account, the compute's Region | `data-west.yaml` | R2, R3 (general-purpose buckets, Bucket Keys off and on), R4, R5 (S3 Express directory buckets in two zones), R6 (DynamoDB on-demand table, capped at 10,000 write and read units), key K2, a probe key that no bucket uses, the role `ledger-bench-client`, optionally a budget |
+| Throwaway data account, the compute's Region | `data-west.yaml` | R2, R3 (general-purpose buckets, Bucket Keys off and on), R4, R5 (S3 Express directory buckets in two zones), R6 (DynamoDB on-demand table, capped at 10,000 write and read units), key K2, a probe key that no bucket uses, optionally a budget |
+| Throwaway data account, the compute's Region | `client-role.yaml` | The role `ledger-bench-client`, in its own stack so that the storage can be created by an identity that may not create IAM roles |
 | Throwaway data account, another Region | `data-east.yaml` | R1 (general-purpose bucket, Bucket Keys off) and key K1 |
 | The EKS cluster's account | `cluster-identity.yaml` | The role `ledger-bench-pod` and its EKS Pod Identity association |
 | The EKS cluster | `namespace.yaml`, `job.template.yaml` | Namespace `ledger-bench` with a ServiceAccount, a NetworkPolicy and a quota; three ConfigMaps (the client bundle, its config, the spend ledger); one Job per lane |
@@ -24,7 +25,7 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
   It has no access to any bucket, key or table in the cluster's account.
 - `ledger-bench-client` is trusted only by that pod role (`sts:AssumeRole` with `sts:TagSession`, which the
   Pod Identity session tags need). It can read and write `bench/*` in R1, R2 and R3,
-  open sessions on R4 and R5, use the bench keys (K2 by ARN, the others by their tag), and read and write
+  open sessions on R4 and R5, use the bench keys (matched by their tag), and read and write
   the one table.
 - The client refuses any target whose name lacks `ledger-bench` before its first request
   (`benchmarks/ledger-bench/config.ts`).
@@ -40,8 +41,9 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
   total bound past 300 USD. The optional AWS budget is a backstop only: its data lags by hours.
 - **Time.** Each Job has `activeDeadlineSeconds: 14400` (4 hours). A finished Job is kept for 2 days,
   because its log is the results.
-- **Shared nodes.** The pod has a CPU limit, so it cannot take more than that from a node it shares with
-  other workloads. Run one lane at a time (`--lanes`) on a cluster that serves production.
+- **Shared nodes.** The pod has a CPU limit, and with `avoidPods` in the inputs a required anti-affinity
+  keeps it off any node that runs the named pods (the production ingest pods). Run one lane at a time
+  (`--lanes`) on a cluster that serves production.
 - **Throughput.** The table has a maximum on-demand throughput, and a cell stops at its operation cap.
 
 ## Differences from the plan
@@ -70,6 +72,7 @@ The data side and the cluster side need different access and can be run by two o
 operator runs:
 
 ```sh
+bun stacks/aws/ledger-bench/ops.ts up-data      --inputs <file> --confirm-account <data account id> --plan   # change sets only
 bun stacks/aws/ledger-bench/ops.ts up-data      --inputs <file> --confirm-account <data account id>
 bun stacks/aws/ledger-bench/ops.ts outputs-data --inputs <file>   # key ARNs for the cluster side's inputs
 ```
@@ -98,7 +101,7 @@ bun stacks/aws/ledger-bench/ops.ts verify-data    --inputs <file> --confirm-acco
 
 `down-cluster` goes first, so nothing is writing while the data is removed. It refuses while a lane in the
 spend ledger has no collected results (`--discard-results` overrides), then deletes the namespace and the
-identity stack. `down-data` empties all five buckets and deletes the two data stacks. Each `verify` then
+identity stack. `down-data` deletes the client role's stack, empties all five buckets and deletes the two data stacks. Each `verify` then
 looks every resource of its side up by name and lists everything tagged `purpose=ledger-bench`. It exits
 non-zero unless every lookup said "gone"; the only resources allowed to remain are the three KMS keys in
 their 7-day pending-deletion window. Its output names no account, ARN or bucket, and goes into the results

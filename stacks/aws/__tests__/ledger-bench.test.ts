@@ -55,16 +55,23 @@ describe("ledger-bench client config", () => {
     const names = resourceNames(INPUTS);
     const west = read("data-west.yaml");
     const east = read("data-east.yaml");
-    const sub = (pattern: string) => pattern.replace("${AWS::AccountId}", INPUTS.dataAccountId).replace("${AWS::Region}", INPUTS.region).replace("${ExpressZoneA}", INPUTS.expressZoneA).replace("${ExpressZoneB}", INPUTS.expressZoneB).replace("${EastRegion}", INPUTS.eastRegion);
+    const sub = (pattern: string) => pattern.replaceAll("${AWS::AccountId}", INPUTS.dataAccountId).replaceAll("${AWS::Region}", INPUTS.region).replace("${ExpressZoneA}", INPUTS.expressZoneA).replace("${ExpressZoneB}", INPUTS.expressZoneB).replace("${EastRegion}", INPUTS.eastRegion);
     for (const id of ["R2", "R3", "R4", "R5"] as const) {
       const pattern = new RegExp(`BucketName: !Sub "(ledger-bench-${id.toLowerCase()}-[^"]+)"`).exec(west)![1]!;
       expect(sub(pattern)).toBe(names[id]);
     }
     expect(/BucketName: !Sub "(ledger-bench-r1-[^"]+)"/.exec(east)![1]!.replace("${AWS::AccountId}", INPUTS.dataAccountId).replace("${AWS::Region}", INPUTS.eastRegion)).toBe(names.R1);
     // The client role's grant on R1 uses the same derivation.
-    expect(west).toContain("s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}/bench/*");
+    // The client role is its own stack, so it names every target by the same derivation rather than by reference.
+    const role = read("client-role.yaml");
+    const roleSub = (pattern: string) => sub(pattern).replace("${AWS::Partition}", "aws");
+    for (const id of ["R1", "R2", "R3"] as const) expect(role.split("\n").map(roleSub)).toContain(`                  - !Sub "arn:aws:s3:::${names[id]}/bench/*"`);
+    for (const id of ["R4", "R5"] as const) expect(role.split("\n").map(roleSub)).toContain(`                  - !Sub "arn:aws:s3express:${INPUTS.region}:${INPUTS.dataAccountId}:bucket/${names[id]}"`);
+    expect(role).toContain(`table/${names.R6}`);
     expect(west).toContain(`TableName: ${names.R6}`);
-    expect(west).toContain(`RoleName: ${names.clientRole}`);
+    expect(role).toContain(`RoleName: ${names.clientRole}`);
+    // The storage stacks hold no IAM, so an identity that may not create roles can deploy them.
+    for (const name of ["data-west.yaml", "data-east.yaml"]) expect(read(name)).not.toContain("AWS::IAM::");
     expect(read("cluster-identity.yaml")).toContain(`role/${names.clientRole}`);
   });
 });
@@ -84,6 +91,10 @@ describe("ledger-bench Job", () => {
     expect(job).toContain('nodeSelector: {"example/role":"general"}');
     expect(job).toContain('limits: { cpu: "1", memory: "1536Mi" }');
     expect(job).toContain("readOnlyRootFilesystem: true");
+    expect(job).toContain("affinity: {}");
+    // With pods to avoid, the Job may never be scheduled onto their node.
+    const apart = renderJob(template, { ...INPUTS, avoidPods: { namespaces: ["example-prod"], matchLabels: { "app.kubernetes.io/component": "ingest-edge" } } }, { runId: "run-1", lane: "r2", profile: "standard", steps: "", bundleSha256: SHA });
+    expect(apart).toContain('affinity: {"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{"topologyKey":"kubernetes.io/hostname","namespaces":["example-prod"],"labelSelector":{"matchLabels":{"app.kubernetes.io/component":"ingest-edge"}}}]}}');
     expect(job).toContain("automountServiceAccountToken: false");
     expect(job).toContain("namespace: ledger-bench");
   });
@@ -103,7 +114,7 @@ describe("ledger-bench templates", () => {
   const west = read("data-west.yaml");
   const identity = read("cluster-identity.yaml");
   test("carry no account id, ARN of a real account, or bucket name", () => {
-    for (const name of ["data-west.yaml", "data-east.yaml", "cluster-identity.yaml", "job.template.yaml", "namespace.yaml"]) expect(read(name)).not.toMatch(/\d{12}/);
+    for (const name of ["data-west.yaml", "data-east.yaml", "client-role.yaml", "cluster-identity.yaml", "job.template.yaml", "namespace.yaml"]) expect(read(name)).not.toMatch(/\d{12}/);
   });
   test("the pod role can only assume the client role, and only the bench ServiceAccount gets it", () => {
     const policies = identity.slice(identity.indexOf("      Policies:"), identity.indexOf("      Tags:"));
@@ -117,13 +128,14 @@ describe("ledger-bench templates", () => {
     expect(identity).toContain('"aws:RequestTag/kubernetes-service-account": !Ref ServiceAccount');
   });
   test("the client role is trusted only by that pod role and reaches only bench resources", () => {
-    const trust = west.slice(west.indexOf("      AssumeRolePolicyDocument:", west.indexOf("  ClientRole:")), west.indexOf("        - PolicyName: ledger-bench-targets"));
+    const role = read("client-role.yaml");
+    const trust = role.slice(role.indexOf("      AssumeRolePolicyDocument:"), role.indexOf("        - PolicyName: ledger-bench-targets"));
     expect(trust).toContain('Action: ["sts:AssumeRole", "sts:TagSession"]');
     expect(trust.match(/Effect: Allow/g)!.length).toBe(1);
-    expect(west).toContain('"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"');
-    const policy = west.slice(west.indexOf("        - PolicyName: ledger-bench-targets"), west.indexOf("  # A backstop"));
-    // Every S3 object grant is under bench/, every bucket is a ledger-bench bucket, KMS is the bench keys only (by ARN and by tag).
-    for (const line of policy.split("\n").filter((l) => l.includes("s3:::"))) expect(line).toContain("ledger-bench-r1-");
+    expect(role).toContain('"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"');
+    const policy = role.slice(role.indexOf("        - PolicyName: ledger-bench-targets"), role.indexOf("Outputs:"));
+    // Every S3 object grant is under bench/, every bucket is a ledger-bench bucket, KMS is the tagged bench keys only.
+    for (const line of policy.split("\n").filter((l) => l.includes("s3:::") || l.includes(":bucket/"))) expect(line).toMatch(/ledger-bench-r[1-5]-/);
     expect(policy.match(/\/bench\/\*/g)!.length).toBe(3);
     expect(policy).toContain('"aws:ResourceTag/purpose": ledger-bench');
     expect(policy).not.toMatch(/Action: "?(s3|dynamodb|kms|iam|sts):\*/);
