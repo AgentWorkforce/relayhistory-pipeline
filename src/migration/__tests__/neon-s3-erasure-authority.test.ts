@@ -686,9 +686,12 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     await a.ready();
     expect(Array.isArray(await a.fencedGroups())).toBe(true);
     expect(Array.isArray(await a.fencedLivePage(null))).toBe(true);
+    await a.recordSuccessfulSweep!();
+    expect((await w.f.db.query("SELECT authority FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ authority: "supabase" });
     // A superuser session that SET ROLE to the eraser role is refused: the login keeps its credential.
     expect(await assertEraserIdentity(w.asEraser).then(() => "ok", (e) => e.code)).toMatch(/^eraser_identity_(not_authenticated_as_privacy_eraser|superuser)$/);
-    for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records"])
+    for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records",
+      "sessions.legacy_export_scope_authority", "sessions.legacy_export_privacy_eraser_readiness"])
       expect(await w.asEraser.query(`SELECT 1 FROM ${t} LIMIT 1`).then(() => "read", (e) => String(e.message))).toContain("permission denied");
     for (const fn of ["sessions.ingest_privacy_authority_state()", "sessions.ingest_privacy_authority_owned_digest()"])
       expect(await w.asEraser.query(`SELECT ${fn}`).then(() => "ran", (e) => String(e.message))).toContain("permission denied");
