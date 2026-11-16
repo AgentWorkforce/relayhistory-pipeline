@@ -73,39 +73,105 @@ const scopeParams = (s: LegacyScope) => [
   s.sessionId,
 ];
 
+export type LegacyScopeOwnerResolution =
+  | { userId: string; reason: "events" | "outcomes" | "turns" }
+  | {
+      userId: null;
+      reason: "unbound_multi_owner" | "unbound_turns_only" | "unbound";
+    };
+
 /**
  * The scope's user, for the manifest (activation gate 8), in a fixed order:
- * the delivery user of its own events, else an outcome's user_id, else the
- * unambiguous `session_owner` of its attributed public turns. `null` when no
- * owner source is unambiguous;
- * the caller records that explicitly (never silently "unknown").
+ * the one delivery user of its own events, else the one outcome user, else the
+ * one `session_owner` of its attributed public turns *provided that owner is
+ * also authenticated by event/outcome evidence in the same tenant*. Free-form
+ * turn labels are not erasure identities. Ambiguity is returned explicitly so
+ * the caller can retain the scope on Neon without recording an export failure.
  */
+export async function legacyScopeOwner(
+  db: Queryable,
+  s: LegacyScope,
+): Promise<LegacyScopeOwnerResolution> {
+  const { rows } = await db.query<{
+    user_id: string | null;
+    reason: LegacyScopeOwnerResolution["reason"];
+  }>(
+    `WITH evidence AS (
+       SELECT count(DISTINCT e.user_id)::int AS n,min(e.user_id) AS user_id
+         FROM sessions.convergence_events e
+        WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>''),
+     outcomes AS (
+       SELECT count(DISTINCT o.user_id)::int AS n,min(o.user_id) AS user_id
+         FROM sessions.session_outcomes o
+        WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''),
+     turns AS (
+       SELECT count(DISTINCT t.session_owner)::int AS n,min(t.session_owner) AS user_id
+         FROM sessions.conversation_turns t
+        WHERE ${turnScopeSql} AND t.session_owner<>''),
+     owner AS (
+       SELECT CASE
+         WHEN e.n=1 THEN e.user_id
+         WHEN e.n>1 THEN NULL
+         WHEN o.n=1 THEN o.user_id
+         WHEN o.n>1 THEN NULL
+         WHEN t.n=1 AND EXISTS(
+           SELECT 1 FROM sessions.convergence_events a
+            WHERE a.org_id=$1
+              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+              AND a.user_id=t.user_id AND a.user_id<>''
+           UNION ALL
+           SELECT 1 FROM sessions.session_outcomes a
+            WHERE a.org_id=$1
+              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+              AND a.user_id=t.user_id AND a.user_id<>''
+         ) THEN t.user_id
+         ELSE NULL
+       END AS user_id,
+       CASE
+         WHEN e.n>1 OR (e.n=0 AND o.n>1) OR (e.n=0 AND o.n=0 AND t.n>1) THEN 'unbound_multi_owner'
+         WHEN e.n=1 THEN 'events'
+         WHEN o.n=1 THEN 'outcomes'
+         WHEN t.n=1 AND EXISTS(
+           SELECT 1 FROM sessions.convergence_events a
+            WHERE a.org_id=$1
+              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+              AND a.user_id=t.user_id AND a.user_id<>''
+           UNION ALL
+           SELECT 1 FROM sessions.session_outcomes a
+            WHERE a.org_id=$1
+              AND CASE WHEN a.workspace_id='' THEN 'default' ELSE a.workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END
+              AND a.user_id=t.user_id AND a.user_id<>''
+         ) THEN 'turns'
+         WHEN t.n>0 THEN 'unbound_turns_only'
+         ELSE 'unbound'
+       END AS reason
+       FROM evidence e CROSS JOIN outcomes o CROSS JOIN turns t)
+     SELECT user_id,reason FROM owner`,
+    scopeParams(s),
+  );
+  const row = rows[0];
+  if (!row || row.user_id === null) {
+    const reason = row?.reason;
+    return {
+      userId: null,
+      reason:
+        reason === "unbound_multi_owner" || reason === "unbound_turns_only"
+          ? reason
+          : "unbound",
+    };
+  }
+  return {
+    userId: row.user_id,
+    reason: row.reason as "events" | "outcomes" | "turns",
+  };
+}
+
+/** Compatibility helper for readers that only need the bound id. */
 export async function legacyScopeUser(
   db: Queryable,
   s: LegacyScope,
 ): Promise<string | null> {
-  const { rows } = await db.query<{ user_id: string | null }>(
-    `SELECT CASE
-  WHEN EXISTS(SELECT 1 FROM sessions.convergence_events e
-    WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>'')
-  THEN (SELECT min(e.user_id) FROM sessions.convergence_events e
-    WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>''
-    HAVING count(DISTINCT e.user_id)=1)
-  WHEN EXISTS(SELECT 1 FROM sessions.session_outcomes o
-    WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>'')
-  THEN (SELECT min(o.user_id) FROM sessions.session_outcomes o
-    WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''
-    HAVING count(DISTINCT o.user_id)=1)
-  WHEN EXISTS(SELECT 1 FROM sessions.conversation_turns t
-    WHERE ${turnScopeSql} AND t.session_owner<>'')
-  THEN (SELECT min(t.session_owner) FROM sessions.conversation_turns t
-    WHERE ${turnScopeSql} AND t.session_owner<>''
-    HAVING count(DISTINCT t.session_owner)=1)
-  ELSE NULL
- END AS user_id`,
-    scopeParams(s),
-  );
-  return rows[0]?.user_id ?? null;
+  return (await legacyScopeOwner(db, s)).userId;
 }
 
 /**
