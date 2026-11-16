@@ -95,6 +95,22 @@ export interface SessionPipelineInputs {
     /** Per-run time budget in ms (INGEST_BUFFERED_ERASURE_BUDGET_MS, 5000-240000). Absent: the lane's default (40000) applies. */
     budgetMs?: number;
   };
+  /**
+   * The streamed ClickHouse reconcile (issue 610 L3 D1; src/session-pipeline/search-index.ts streamedReconcile).
+   * Absent or `enabled: false`: no variable is rendered and the Lambda never streams. `enabled: true` needs
+   * `searchIndex: true` and renders SEARCH_INDEX_STREAMING_CH=1; the Lambda also refuses to start unless the
+   * pipeline secret selects the clickhouse search backend. Each knob renders only when armed and set; absent, the
+   * Lambda's default applies. Streamed output facts (D2) and the large worker (D3) are not in this cut.
+   */
+  streamReconcile?: {
+    enabled: boolean;
+    /** Raw bytes the streamed passes may read per scope (SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES, 256 MiB-2 GiB). Default 1 GiB. */
+    maxReadBytes?: number;
+    /** Events the streamed passes may read per scope (SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS, 400000-2000000). Default 1000000. */
+    maxReadEvents?: number;
+    /** Time kept back from the invocation's remaining time (SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, 10000-240000). Default 60000. */
+    deadlineMarginMs?: number;
+  };
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -245,7 +261,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -315,6 +331,23 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
       refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.stagesPerSecond must be an integer from 1 to 20");
     if (e.budgetMs !== undefined && !(Number.isInteger(e.budgetMs) && (e.budgetMs as number) >= 5_000 && (e.budgetMs as number) <= 240_000))
       refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.budgetMs must be an integer from 5000 to 240000");
+  }
+  if (v.streamReconcile !== undefined) {
+    const r = v.streamReconcile as Record<string, unknown> | null;
+    if (r === null || typeof r !== "object" || Array.isArray(r) || Object.getPrototypeOf(r) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.streamReconcile must be a plain object");
+    for (const k of Object.keys(r))
+      if (k !== "enabled" && k !== "maxReadBytes" && k !== "maxReadEvents" && k !== "deadlineMarginMs") refuse(`transcriptStore.sessionPipeline.streamReconcile.${k} is not a known setting`);
+    if (typeof r.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.streamReconcile.enabled must be a boolean");
+    if (r.enabled === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.streamReconcile.enabled requires searchIndex: true");
+    // The same bounds as searchIndexStreamChFromEnv under the hosted limits (replayPages: true is refused above,
+    // so the floor is four passes of the default scope bound), so a value here is never refused at Lambda start.
+    if (r.maxReadBytes !== undefined && !(Number.isInteger(r.maxReadBytes) && (r.maxReadBytes as number) >= 268_435_456 && (r.maxReadBytes as number) <= 2_147_483_648))
+      refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadBytes must be an integer from 268435456 (256 MiB) to 2147483648 (2 GiB)");
+    if (r.maxReadEvents !== undefined && !(Number.isInteger(r.maxReadEvents) && (r.maxReadEvents as number) >= 400_000 && (r.maxReadEvents as number) <= 2_000_000))
+      refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadEvents must be an integer from 400000 to 2000000");
+    if (r.deadlineMarginMs !== undefined && !(Number.isInteger(r.deadlineMarginMs) && (r.deadlineMarginMs as number) >= 10_000 && (r.deadlineMarginMs as number) <= 240_000))
+      refuse("transcriptStore.sessionPipeline.streamReconcile.deadlineMarginMs must be an integer from 10000 to 240000");
   }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
@@ -543,6 +576,11 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedErasureDelete?.pageSize !== undefined ? { INGEST_BUFFERED_ERASURE_PAGE: String(i.p.bufferedErasureDelete.pageSize) } : {}),
     ...(i.p.bufferedErasureDelete?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_ERASURE_RATE: String(i.p.bufferedErasureDelete.stagesPerSecond) } : {}),
     ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
+    // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.
+    ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
+    ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),
+    ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadEvents !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: String(i.p.streamReconcile.maxReadEvents) } : {}),
+    ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.deadlineMarginMs !== undefined ? { SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: String(i.p.streamReconcile.deadlineMarginMs) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
