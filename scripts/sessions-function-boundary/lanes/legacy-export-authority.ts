@@ -1,13 +1,13 @@
-/** Lane (slot 062020): durable legacy-export owner authority and its two eraser readers. */
+/** Lane (slot 062030): durable legacy-export owner authority and its two eraser readers. */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105062020_legacy_export_scope_authority.sql";
+const MIGRATION = "supabase/migrations/20261105062030_legacy_export_scope_authority.sql";
 const EXPORTER = "bulls96_legacy_export_privacy";
 const ERASER = "bulls96_privacy_eraser";
 
 export const legacyExportAuthority: LaneManifest = {
   lane: "legacy-export-authority",
-  owner: "Neon exit legacy export/hosted erasure (slot 062020)",
+  owner: "Neon exit legacy export/hosted erasure (slot 062030)",
   migration: MIGRATION,
   prefixes: ["sessions.legacy_export_", "sessions.ingest_legacy_export_"],
   grantSources: [{ path: MIGRATION, roles: [EXPORTER, ERASER] }],
