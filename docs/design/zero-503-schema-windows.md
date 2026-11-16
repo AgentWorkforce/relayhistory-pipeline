@@ -282,6 +282,13 @@ Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.
 
+**Release gate.** The guarded schema release (`scripts/schema-release-database.ts`) enforces this order: with a
+lazy policy present, a plan or apply that would move readiness off the policy generation G refuses
+`release_ingest_overlap_required` unless the window G -> targetGeneration is open with at least 15 minutes
+left and the release sha's `PRIVATE_INGEST_OVERLAP` is exactly `{from: G, to: H}`; the apply rechecks it under
+the migrator lock before its first write (`src/hoopdb/schema-release-overlap.ts`,
+runbooks/guarded-session-schema-release.md "Buffered ingest: required order").
+
 #### Post-apply recovery (marker already at H, no window)
 
 When an owner-apply has moved readiness to `(H, pass)` before the Worker offered H and before a window was
