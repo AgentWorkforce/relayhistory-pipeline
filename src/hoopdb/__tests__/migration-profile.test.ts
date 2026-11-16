@@ -1903,7 +1903,7 @@ describe("per-step catalog sentinels", () => {
     expect((await failure(verify()))?.code).toBe("55000");
   });
 
-  test("the legacy-export phase-2 verifier enforces the 062010 predecessor", async () => {
+  test("the legacy-export phase-2 verifier enforces the 062020 predecessor", async () => {
     const steps = (await plan(LOCAL)).filter(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
@@ -1917,7 +1917,7 @@ describe("per-step catalog sentinels", () => {
       ),
     );
     const hasTurnsGate = steps.some((st) =>
-      st.name.endsWith("20261105062010_turns_forward_gates.sql"),
+      st.name.endsWith("20261105062020_turns_forward_gates.sql"),
     );
     if (hasTurnsGate) expect(error).toBeNull();
     else expect(error?.code).toBe("42P01");
