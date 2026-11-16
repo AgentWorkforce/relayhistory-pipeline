@@ -409,36 +409,46 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   const later = () => Date.now() + 10 * 60 * 1000;
   const legacyGroup = (user: string, s: LegacyScope = S) => ({ org_id: s.orgId, workspace_id: s.workspaceId, user_id: user, origin_id: LEGACY_EXPORT_ORIGIN_ID, source: s.source, session_id: s.sessionId });
 
+  /**
+   * Erasure after export on the only permitted production path (lead rule: the eraser reads the durable owner row and
+   * never re-derives; the neon authority fails loud instead, see its own test): export through runOrg as the provisioned
+   * privacy role (which registers the owner row), plant a pointer, erase via an ordinary-origin upload_deletions row by
+   * `tombstoneUser`, then sweep the hosted job on the real supabaseAuthority. Uses the lossy id `sess:1` on purpose.
+   */
   async function exportThenErase(tombstoneUser: string, opts: { neighbour?: boolean } = {}) {
-    const n = await neon(), p = await supabase();
-    const store = createFsStore({ root: await tmp("c") });
-    if (opts.neighbour)
+    const n = await neon();
+    if (opts.neighbour) {
       await n.pg.query(
         `INSERT INTO sessions.conversation_turns VALUES('33333333-3333-4333-8333-333333333333',$1,$2,'owner','sess:keep',$3,0,'assistant','keep me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
         [S.orgId, S.workspaceId, OWNER],
       );
-    if (opts.neighbour) await outcome(n.pg, { ...S, sessionId: "sess:keep" }, "beef");
-    const { counters } = await run(n.db, p.db, store, "c-export");
-    expect(counters.exported).toBe(opts.neighbour ? 2 : 1);
-    const exported = await allKeys(store);
-    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
-    const manifestKey = exported.find((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/") && k.endsWith("manifest.json"));
-    expect(manifestKey).toBeDefined();
-    expect(objectRoot).toContain(`/m=${legacyMachineId(S.workspaceId, OWNER)}/`);
-    const pointer = await pointerFor(store, manifestKey!);
-    expect((await servedLegacy(store, [pointer])).length).toBeGreaterThan(0); // readable before erasure
-    // A location pointer under the legacy machine, as an indexer/live writer layout would hold it.
-    const ptrKey = liveTargets("96bulls", legacyGroup(OWNER)).pointerKey;
-    await store.put(objectKey(ptrKey), new TextEncoder().encode("{}"));
-    // The session is erased afterwards, through an ORDINARY origin (never legacy:tables:v1).
-    await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, tombstoneUser, S.source, S.sessionId]);
-    const state = new SyncState(join(await tmp("c-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
-    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
-    await job.sweep();
-    await job.sweep();
-    const left = await allKeys(store);
-    state.close();
-    return { left, objectRoot, ptrKey, pointer, store, pointerRoot: livePointerPrefix("96bulls", legacyGroup(OWNER)) };
+      await outcome(n.pg, { ...S, sessionId: "sess:keep" }, "beef");
+    }
+    const w = await hostedWorld();
+    try {
+      const store = createFsStore({ root: await tmp("c") });
+      const counters = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, store, "c-export");
+        r.checkpoint.close();
+        return r.counters;
+      });
+      expect(counters.exported).toBe(opts.neighbour ? 2 : 1);
+      expect(await w.authorityRow(S)).toEqual([{ legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(S.workspaceId, OWNER) }]);
+      const exported = await allKeys(store);
+      const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+      const manifestKey = exported.find((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/") && k.endsWith("manifest.json"));
+      expect(manifestKey).toBeDefined();
+      const pointer = await pointerFor(store, manifestKey!);
+      expect((await servedLegacy(store, [pointer])).length).toBeGreaterThan(0); // readable before erasure
+      const ptrKey = liveTargets("96bulls", legacyGroup(OWNER)).pointerKey;
+      await store.put(objectKey(ptrKey), new TextEncoder().encode("{}"));
+      await w.f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, tombstoneUser, S.source, S.sessionId]);
+      await w.sweep(store);
+      const left = await allKeys(store);
+      return { left, objectRoot, ptrKey, pointer, store, pointerRoot: livePointerPrefix("96bulls", legacyGroup(OWNER)) };
+    } finally {
+      await w.f.close();
+    }
   }
 
   test("the owner's own erasure removes every legacy object of the session, its pointer, and the reader serves nothing", async () => {
