@@ -5,8 +5,7 @@ by hand should read [CONTRIBUTING.md](CONTRIBUTING.md); the rules below apply
 to them too.
 
 **Which workflow you follow depends on who you work for, not on the files in
-your checkout.** Pull requests will be switched off on this repository by the
-owner; once they are, it takes none. If the maintainers did not assign you the
+your checkout.** Pull requests are disabled on this repository. If the maintainers did not assign you the
 work, propose it as a GitHub issue as [CONTRIBUTING.md](CONTRIBUTING.md)
 describes, and ignore `docs/maintainer-workflow.md`. Follow
 [docs/maintainer-workflow.md](docs/maintainer-workflow.md) only when this
@@ -83,3 +82,14 @@ relayed by another agent is not that OK.
   (`scripts/check-engine-identifiers.ts`, and the CI gate's added-line scan);
   operator docs go to the private ops repository.
 - Scrubbing lives in the relayscrubber crate; no new scrub logic here.
+
+## Agency and guidance
+
+- Act autonomously on routine assigned work; ask forgiveness rather than permission. Preserve explicit production, release and credential gates.
+- For guidance, ask the engineering leads, the agent that spawned you, or the layered owner on Agent Relay.
+- Only a truly pressing or blocking question goes to `khaliq-gant` or `will-washburn` on Agent Relay.
+
+## Cross-repo context
+
+- Before and during changes, understand how this repo fits the wider system; consult its repo map and related-repo docs where available.
+- Check relevant agents’ summaries on Agent Relay and proactively contact owning agents about dependencies, adjacent changes and work in flight.
