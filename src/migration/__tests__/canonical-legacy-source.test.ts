@@ -17,6 +17,7 @@ import {
   legacyMachineId,
   legacyDiscoveryPage,
   legacyGroupScopes,
+  legacyScopeOwner,
   legacyScopeUser,
   legacyUnit,
   legacyUnitSource,
@@ -300,12 +301,13 @@ test("gate 8: a legacy-only manifest carries the scope's real user, never the pl
     const p = await pointerFor(store, result.manifests[0]!.manifestKey);
     expect(p.user_id).toBe("user_1");
     expect(p.machine_id).toBe(legacyMachineId("ws_1", "user_1"));
-    // The delivery user of the scope's own events wins over an outcome user.
+    // A delivery user that disagrees with the outcome is ambiguous; neither
+    // authenticated member may be left unable to erase the resulting copy.
     await pg.exec(`INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','sess:1','u_delivery')`);
-    const again = await exportScope(scope, createFsStore({ root: join(root, "g8b") }));
-    expect((await pointerFor(createFsStore({ root: join(root, "g8b") }), again.result.manifests[0]!.manifestKey)).user_id).toBe(
-      "u_delivery",
-    );
+    expect(await legacyScopeOwner(db, scope)).toEqual({
+      userId: null,
+      reason: "unbound_multi_owner",
+    });
   } finally {
     await pg.exec("DELETE FROM sessions.convergence_events;DELETE FROM sessions.session_outcomes");
     await restoreBaseOwner();
@@ -316,7 +318,7 @@ test("nonempty links and outcomes preserve exact source IDs, timestamps and meta
   try {
     await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
     await pg.exec(`INSERT INTO sessions.session_links VALUES(9007199254740993,'org_1','ws_1','claude','sess:1','commit','','url','{"kept":true}',5000,'2026-11-01T10:00:00.123456Z','2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');
- INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
+ INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','person',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     const store = createFsStore({ root: join(root, "links") });
     const { result } = await exportScope(scope, store);
     const snap = await snapshot(store, [await pointerFor(store, result.manifests[0]!.manifestKey)]);
@@ -324,7 +326,7 @@ test("nonempty links and outcomes preserve exact source IDs, timestamps and meta
       row: { id: "9007199254740993", link_ref: "", metadata: { kept: true }, link_ts: "2026-11-01T10:00:00.123456+00:00" },
     });
     expect(snap.rows.find((r) => r.table === "session_outcomes")).toMatchObject({
-      row: { commit_sha: "abcdef", user_id: "user_1", reverted: false, shipped_at: null },
+      row: { commit_sha: "abcdef", user_id: "person", reverted: false, shipped_at: null },
     });
     expect(snap.legacyCoverage).not.toBeNull();
   } finally {
@@ -479,7 +481,7 @@ test("a post-PUT privacy race records the written manifest and aborts the run", 
 test("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {
   try {
     await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
-    await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
+    await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','person',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     await pg.query(`UPDATE sessions.conversation_turns SET content='key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end' WHERE id=$1`, [turnId]);
     const checkpoint = new Checkpoint(join(root, "verify.sqlite"));
     const store = createFsStore({ root: join(root, "verify") });
@@ -494,7 +496,7 @@ test("verifier: equal on a fresh export, mismatched after Neon changes, includin
     );
     expect(ok).toMatchObject({ ok: true, scopes: 1 });
     await pg.query(`UPDATE sessions.conversation_turns SET content='drifted' WHERE id=$1`, [turnId]);
-    await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','fedcba','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
+    await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','fedcba','person',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     const bad = await verifyExported(
       db,
       store,
@@ -586,6 +588,52 @@ test("turns-only free text without authenticated tenant evidence is not an erasu
     expect(await legacyScopeUser(db, scope)).toBeNull();
   } finally {
     await restoreBaseOwner();
+  }
+});
+
+test("disagreement across authenticated owner evidence is unbound_multi_owner and is not exported", async () => {
+  const checkpoint = new Checkpoint(join(root, "multi-owner.sqlite"));
+  const store = createFsStore({ root: join(root, "multi-owner") });
+  await pg.exec(`INSERT INTO sessions.session_outcomes VALUES(
+    'org_1','ws_1','claude','sess:1','other-owner','person2',false,NULL,
+    '2026-11-01T10:00:00Z','2026-11-01T10:00:00Z')`);
+  try {
+    expect(await legacyScopeOwner(db, scope)).toEqual({
+      userId: null,
+      reason: "unbound_multi_owner",
+    });
+    const counters = newCounters();
+    await runOrg(
+      {
+        db,
+        privacyDb,
+        target: { store, keyRoot: "96bulls", grantId: "g" },
+        checkpoint,
+        hook: async () => {},
+        log: () => {},
+      },
+      "org_1",
+      { export: true },
+      counters,
+    );
+    expect(counters).toMatchObject({
+      exported: 0,
+      failed: 0,
+      unboundMultiOwner: 1,
+    });
+    expect((await store.list(objectKey("96bulls"))).items).toEqual([]);
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE commit_sha='other-owner';
+      INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','verified-other','person2');
+      UPDATE sessions.conversation_turns SET session_owner='person2' WHERE id='${turnId}'`);
+    expect(await legacyScopeOwner(db, scope)).toEqual({
+      userId: null,
+      reason: "unbound_multi_owner",
+    });
+  } finally {
+    checkpoint.close();
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE commit_sha='other-owner';
+      DELETE FROM sessions.convergence_events WHERE session_id='verified-other';
+      UPDATE sessions.conversation_turns SET session_owner='person' WHERE id='${turnId}'`);
   }
 });
 
