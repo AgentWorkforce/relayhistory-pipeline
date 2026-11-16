@@ -337,24 +337,34 @@ export async function openStream(store: ObjectStore, keys: LogKeys): Promise<Log
   let state = opened(keys, zero);
   // Start from the newest checkpoint the hint names, if it verifies against its entry; else from entry 0. The hint
   // and the checkpoint are optional: a missing, malformed or unreadable one (a transient store error) falls back.
+  let hint: { seq?: unknown } | undefined;
+  try { hint = parse((await readBytes(store, keys.head)) ?? new Uint8Array()) as { seq?: unknown } | undefined; }
+  catch (error) { if (!isObjectStoreError(error)) throw error; }
+  if (hint && isNat(hint.seq) && hint.seq > 0) state = (await verifiedCheckpoint(store, keys, hint.seq, state)) ?? state;
+  for await (const _ of replay(store, state)) { /* applied in order */ }
+  return state;
+}
+
+/**
+ * The state at checkpoint `seq`, or undefined to fall back to `base` (entry 0's state). Bounded on read: a checkpoint is
+ * trusted only as far as its hash plus its fields cross-checked against entry `seq` (epoch, epoch writer; for a
+ * batches entry also the inbox cursor and every batch in the remembered window), with entry 0's legacyCutover, an
+ * epoch of at least 1 and a window no larger than LOG_REMEMBERED_BATCHES. Any mismatch, a missing or malformed
+ * checkpoint, or a store error reading it (transient or not) is ignored: the caller replays from entry 0.
+ */
+async function verifiedCheckpoint(store: ObjectStore, keys: LogKeys, seq: number, base: LogState): Promise<LogState | undefined> {
   try {
-    const hint = parse((await readBytes(store, keys.head)) ?? new Uint8Array()) as { seq?: unknown } | undefined;
-    if (hint && isNat(hint.seq) && hint.seq > 0) {
-      const cp = parse((await readBytes(store, keys.checkpoint(hint.seq))) ?? new Uint8Array());
-      const at = await readBytes(store, keys.entry(hint.seq));
-      // Bounded on read: a checkpoint is trusted only as far as its hash plus its fields cross-checked against entry
-      // `seq` (epoch, epoch writer; for a batches entry also the inbox cursor and every batch in the remembered
-      // window). An oversized window, or any mismatch, is ignored and the open replays from entry 0.
-      if (validCheckpoint(cp) && cp.seq === hint.seq && cp.remembered.length <= LOG_REMEMBERED_BATCHES && cp.epoch >= 1 &&
-        at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover && checkpointMatchesEntry(cp, at))
-        state = { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, epochWriter: cp.epochWriter, legacyCutover: cp.legacyCutover,
-          inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
-    }
+    const cp = parse((await readBytes(store, keys.checkpoint(seq))) ?? new Uint8Array());
+    if (!validCheckpoint(cp)) return undefined;
+    const at = await readBytes(store, keys.entry(seq));
+    if (cp.seq === seq && cp.remembered.length <= LOG_REMEMBERED_BATCHES && cp.epoch >= 1 &&
+      at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === base.legacyCutover && checkpointMatchesEntry(cp, at))
+      return { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, epochWriter: cp.epochWriter, legacyCutover: cp.legacyCutover,
+        inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
   } catch (error) {
     if (!isObjectStoreError(error)) throw error;
   }
-  for await (const _ of replay(store, state)) { /* applied in order */ }
-  return state;
+  return undefined;
 }
 
 /** A checkpoint's state fields agree with the entry it names (its hash already matched). */
@@ -397,15 +407,32 @@ function remember(m: Map<string, string>, batchId: string, digest: string) {
 }
 
 /**
- * Every entry after `fromSeq`, in order, validated as a chain (for consumers that materialize from the log). It
- * replays from entry 0 (checkpoints are not a starting point here yet), so compaction must not delete any entry a
- * reader may still replay through; entry 0 is never deleted.
+ * Checkpoint seqs `readEntries` tries, newest first, at or below `fromSeq`: the checkpoint boundary at or below it and
+ * the one before (a checkpoint PUT is best effort, so one boundary may have none). Deterministic keys: no listing of
+ * `c/`, which grows with the stream.
+ */
+const checkpointCandidates = (fromSeq: number) => {
+  const top = Math.floor(fromSeq / LOG_CHECKPOINT_EVERY) * LOG_CHECKPOINT_EVERY;
+  return [top, top - LOG_CHECKPOINT_EVERY].filter((c) => c > 0);
+};
+
+/**
+ * Every entry after `fromSeq` (entry 0 too when `fromSeq` is 0), in order, validated as a chain (for consumers that
+ * materialize from the log). Entry 0 is always read (the mode marker, and its legacyCutover the checkpoint must
+ * match); the replay then starts from the newest VERIFIED checkpoint at or below `fromSeq` (verifiedCheckpoint, the
+ * same trust rules as openStream), or from entry 0 when none verifies. So a materializer run reads O(entries since its
+ * cursor) entries, not O(stream length), and entries strictly between entry 0 and that checkpoint are not read: they
+ * are what compaction (Remaining 5) may later delete. Entry 0 is never deleted.
  */
 export async function* readEntries(store: ObjectStore, keys: LogKeys, fromSeq = 0): AsyncGenerator<LogEntry> {
   const zero = await readZero(store, keys);
   if (zero === undefined) return;
-  const state = opened(keys, zero);
+  let state = opened(keys, zero);
   if (fromSeq === 0) yield parse(zero) as LogEntry;
+  else for (const c of checkpointCandidates(fromSeq)) {
+    const at = await verifiedCheckpoint(store, keys, c, state);
+    if (at) { state = at; break; }
+  }
   for await (const e of replay(store, state)) if (e.seq > fromSeq) yield e;
 }
 
