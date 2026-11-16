@@ -5,7 +5,7 @@ import { parseConfig } from "../../../benchmarks/ledger-bench/config.ts";
 import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { STANDARD } from "../../../benchmarks/ledger-bench/config.ts";
-import { BUNDLE_MAX_BYTES, clientConfig, contextMatches, insideRepo, isClean, ledgerAdd, parseInputs, readLedger, renderJob, resourceNames, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
+import { BUNDLE_MAX_BYTES, clientConfig, contextMatches, insideRepo, isClean, ledgerAdd, parseInputs, readLedger, renderJob, resourceNames, settleLedger, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
 
 const DIR = join(import.meta.dir, "..", "ledger-bench");
 const read = (name: string) => readFileSync(join(DIR, name), "utf8");
@@ -203,6 +203,30 @@ describe("ledger-bench ops guards", () => {
     expect(contextMatches("arn:aws:eks:us-west-2:222222222222:cluster/example-cluster-dev", i)).toBe(false);
     expect(contextMatches("example-cluster", i)).toBe(false);
     expect(contextMatches("", i)).toBe(false);
+  });
+  test("a finished lane is settled at what its meter counted; an aborted or uncollected lane keeps its bound", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));
+    const ledger = ledgerAdd([], "a", "standard", ["r1", "r2", "r3", "dynamo"]);
+    const end = (lane: string, requests: number, bytes: number) => `${JSON.stringify({ ledger_bench: 1, run: "a", lane, event: "end", requests, bytes })}\n`;
+    writeFileSync(join(dir, "a-r1.jsonl"), end("r1", 400_000, 11 * 1024 ** 3));
+    writeFileSync(join(dir, "a-r2.jsonl"), '{"ledger_bench":1,"run":"a","lane":"r2","event":"start"}\n'); // aborted: no end record
+    writeFileSync(join(dir, "a-dynamo.jsonl"), end("dynamo", 50_000, 1024));
+    const settled = settleLedger(ledger, dir);
+    const of = (l: LedgerEntry[], lane: string) => l.find((e) => e.lane === lane)!;
+    // 400k requests at the dearest price plus 11 GiB.
+    expect(of(settled, "r1").settled).toBe(true);
+    expect(of(settled, "r1").usd).toBeCloseTo(3.97, 1);
+    expect(of(settled, "r2")).toEqual(of(ledger, "r2"));
+    expect(of(settled, "r3")).toEqual(of(ledger, "r3"));
+    // DynamoDB units are not metered: the lane keeps its unit bound.
+    expect(of(settled, "dynamo").usd).toBe(of(ledger, "dynamo").usd);
+    // Never above the bound, whatever a record claims; and settling twice changes nothing.
+    writeFileSync(join(dir, "a-r3.jsonl"), end("r3", 9e9, 9e15));
+    expect(of(settleLedger(settled, dir), "r3").usd).toBe(of(ledger, "r3").usd);
+    expect(settleLedger(settled, dir).filter((e) => e.lane !== "r3")).toEqual(settled.filter((e) => e.lane !== "r3"));
+    // A record for another run or lane in the file does not settle this one.
+    writeFileSync(join(dir, "a-r2.jsonl"), end("r1", 1, 1));
+    expect(of(settleLedger(ledger, dir), "r2").settled).toBeUndefined();
   });
   test("teardown refuses while a lane's results are not collected", () => {
     const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));

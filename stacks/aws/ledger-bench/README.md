@@ -39,7 +39,10 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
   repeats of all lanes cost at most the figure printed by `bun benchmarks/ledger-bench/main.ts plan`, which
   a test keeps under 300 USD. `ops.ts run` keeps a spend ledger in a file the operator holds next to the
   results (so it survives a teardown) and refuses any run, smoke runs and re-runs included, that would
-  take the total bound past 300 USD. The optional AWS budget is a backstop only: its data lags by hours.
+  take the total bound past 300 USD. `ops.ts settle` replaces a finished lane's bound with what its own
+  meter counted (still priced as the dearest request type); a lane without a collected `end` record keeps
+  its full bound. `--fresh-ledger` is only for a benchmark that has never run, or after a confirmed
+  teardown that also removed the ledger file: the check for existing Jobs is best-effort. The optional AWS budget is a backstop only: its data lags by hours.
 - **Time.** Each Job has `activeDeadlineSeconds: 14400` (4 hours). A finished Job is kept for 2 days,
   because its log is the results.
 - **Shared nodes.** The pod has a CPU limit, and with `avoidPods` in the inputs a required anti-affinity
