@@ -1163,6 +1163,10 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
     await job.sweep().catch(() => {});
     state.close();
     expect((job.counters as Record<string, number>).legacyFenceFailed ?? 0).toBeGreaterThan(0);
+    // Lead: the edge-triggered metric line routed to on-call, keeping the exact neon error code ...
+    expect(logs.some((l) => l["@metric"] === "legacy_fence_sweep_failed_total" && l.value === 1 && l.error_code === "legacy_erasure_requires_supabase_authority")).toBe(true);
+    // ... AND a non-zero legacy failure count in the per-sweep summary. (Real pager delivery is infra-pending and an
+    // unchecked activation item; these fields alone do not make activation green.)
     const summary = logs.find((l) => l.message === "erasure sweep");
     expect(summary).toBeDefined();
     const failures = Object.entries(summary!).filter(([k, v]) => /legacy/iu.test(k) && /fail|refus|error/iu.test(k) && typeof v === "number" && v > 0);
