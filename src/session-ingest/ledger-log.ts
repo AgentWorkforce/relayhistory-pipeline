@@ -1,8 +1,7 @@
 /**
  * The numbered-log-entry commit for the S3 ledger (docs/design/s3-ledger-log-commit.md), behind
- * INGEST_LEDGER_LOG_COMMIT (default off). FIRST SLICE: the per-stream log writer and reader only. Nothing in the
- * admission path calls this module yet, and `on` is refused at startup until that wiring lands, so with the flag
- * at its default every byte the ingest writes is unchanged.
+ * INGEST_LEDGER_LOG_COMMIT (default off): the per-stream log writer and reader. The admission wiring is
+ * ledger-log-admit.ts; with the flag at its default every byte the ingest writes is unchanged.
  *
  * One STREAM per (org, workspace, user, origin): ordering across a user's machines is not required
  * (Khaliq, 2026-11-16), so each machine's stream commits on its own. A stream is a dense sequence of immutable

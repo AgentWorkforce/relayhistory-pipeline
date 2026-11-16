@@ -42,6 +42,7 @@ import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-consumer.ts";
 import { INBOX_NAMESPACE, pendingAdmissions, type AdmissionTenantHint } from "./async-admission.ts";
 import { lockAlertFields } from "./app.ts";
+import type { LogStreams } from "./ledger-log-admit.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
 import { DeliveryBusyError } from "./vendor/delivery/delivery-contracts.ts";
@@ -97,6 +98,8 @@ export interface SelfhostAdmissionOptions {
    * entry falls back to the per-directory hint, as for a key found only by a scan.
    */
   userHintMax?: number;
+  /** INGEST_LEDGER_LOG_COMMIT=on (ledger-log-admit.ts): streams in log mode are admitted through their log. */
+  logStreams?: LogStreams;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -335,7 +338,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   async function admitOne(key: string, entry: Entry): Promise<"deferred" | void> {
     entry.attempts += 1;
     const t0 = Date.now();
-    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
+    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}),
+      ...(opts.logStreams ? { logStreams: opts.logStreams } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
       .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
     if (r.action === "ack") {
       const timing: Record<string, number> = {};

@@ -14,6 +14,7 @@ import { checkUploadConsent, UploadConsentRequired, type UploadConsentConfig } f
 import type { DeliverDeps } from "./deliver.ts";
 import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
+import type { LogStreams } from "./ledger-log-admit.ts";
 import { DeliveryBusyError, DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import {
@@ -43,6 +44,11 @@ export interface AdmissionConsumerDeps {
    */
   uploadConsent?: UploadConsentConfig;
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * INGEST_LEDGER_LOG_COMMIT=on (ledger-log-admit.ts): a batch whose stream is in log mode (entry 0 exists) is
+   * admitted through the stream's log; every other stream keeps the legacy path, unchanged. Absent: legacy only.
+   */
+  logStreams?: LogStreams;
 }
 
 export type AdmissionAction =
@@ -135,13 +141,19 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
       custody = await ledger.frozenWitness(witnessInput(tenant, prepared));
       if (custody.witness.originalRecordCount !== prepared.receipt.acceptedRevisionIds.length) throw new IngestUnavailable("fence", "custody_record_count");
     }
+    const consentGate = (deps.uploadConsent && deps.uploadConsent.enforcement !== "off") || consentCap
+      ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer", ...(consentCap ? { operator: consentCap } : {}) }, deps.log); }
+      : undefined;
+    // Log mode is decided per stream by its durable marker, never by this message: a legacy stream stays legacy.
+    if (deps.logStreams && await deps.logStreams.isLogMode(tenant, prepared.originId)) {
+      const outcome = await deps.logStreams.admit(tenant, prepared, { journalSeq, ...(consentGate ? { consent: consentGate } : {}) });
+      return finish("admitted", outcome);
+    }
     const result = await deliverPrepared({
       ...deps.deliver,
       ...(custody ? { custody } : {}),
       admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, (deps.nowMs ?? Date.now)()),
-      ...((deps.uploadConsent && deps.uploadConsent.enforcement !== "off") || consentCap
-        ? { consentGate: async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer", ...(consentCap ? { operator: consentCap } : {}) }, deps.log); } }
-        : {}),
+      ...(consentGate ? { consentGate } : {}),
     }, tenant, prepared);
     return finish("admitted", result.outcome, result.stats.timing_ms);
   } catch (error) {
