@@ -272,6 +272,61 @@ describe("readiness during a long admission scan", () => {
     await consumer.stop();
   });
 
+  test("startup: a 90 s first scan with steady pages is ready throughout, with a numeric lastScanAgeMs", async () => {
+    const clock = { t: 14_000_000 };
+    let consumer!: ReturnType<typeof consumerOn>;
+    const seen: Array<{ state: string; age: number | null }> = [];
+    const { store } = pagedStore(10, (n) => {
+      if (n > 0) { clock.t += 10_000; const s = consumer.status(); seen.push({ state: s.state, age: s.lastScanAgeMs }); }
+    });
+    consumer = consumerOn(store, clock);
+    expect(consumer.status().state).toBe("starting");
+    await consumer.scan(); // first scan: 10 pages, 90 s of listing, longer than the startup budget
+    await consumer.settle();
+    expect(seen).toHaveLength(9);
+    expect(seen.every((s) => s.state === "ok" && typeof s.age === "number" && s.age >= 0)).toBe(true);
+    expect(consumer.status().state).toBe("ok");
+    await consumer.stop();
+  });
+
+  test("startup: a first scan with no page for 61 s is not ready", async () => {
+    const clock = { t: 15_000_000 };
+    let release!: () => void;
+    const stuck = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const inList = new Promise<void>((r) => { entered = r; });
+    const { store } = pagedStore(3, async (n) => { if (n === 1) { entered(); await stuck; } });
+    const consumer = consumerOn(store, clock);
+    const pass = consumer.scan();
+    await inList; // page 0 listed, page 1 hangs
+    clock.t += 30_000;
+    expect(consumer.status().state).toBe("ok");
+    clock.t += 31_000;
+    expect(consumer.status()).toMatchObject({ state: "starting", lastScanAgeMs: null });
+    release();
+    await pass;
+    await consumer.settle();
+    await consumer.stop();
+  });
+
+  test("startup: a failed first scan withdraws its pages, and a progressing retry is ready", async () => {
+    const clock = { t: 16_000_000 };
+    const { store, ctl } = pagedStore(5, (n) => { clock.t += 10_000; if (n === 4) ctl.fail = true; });
+    const consumer = consumerOn(store, clock);
+    await consumer.scan(); // fails on its last page
+    await consumer.settle();
+    expect(consumer.status()).toMatchObject({ state: "starting", lastScanAgeMs: null, lastProgressAgeMs: null });
+    ctl.fail = false;
+    const states: string[] = [];
+    ctl.hook = (n) => { clock.t += 10_000; if (n > 0) states.push(consumer.status().state); };
+    await consumer.scan();
+    await consumer.settle();
+    expect(states.length).toBeGreaterThan(0);
+    expect(states.every((s) => s === "ok")).toBe(true);
+    expect(consumer.status().state).toBe("ok");
+    await consumer.stop();
+  });
+
   test("idle behaviour is unchanged when listings are short", async () => {
     const clock = { t: 13_000_000 };
     const { store } = pagedStore(2, () => {});

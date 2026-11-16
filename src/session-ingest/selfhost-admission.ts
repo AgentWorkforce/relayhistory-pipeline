@@ -191,7 +191,14 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
    */
   let scanPageAt: number | undefined;
   let lastScanFailed = false;
-  const scanPage = () => { if (!lastScanFailed) scanPageAt = now(); };
+  /**
+   * Startup: before the FIRST successful admission scan, a large inbox makes that first scan outlast the startup
+   * probe (16k+ objects, 60-90 s), so a pod that is listing pages would be killed before it is ever ready. Until
+   * the first success, the running scan's pages count (a failed first scan withdraws them and the retry starts
+   * fresh), and lastScanAgeMs reports the age of that running first scan. After the first success, unchanged.
+   */
+  let firstScanStartedAt: number | undefined;
+  const scanPage = () => { if (!lastScanFailed || lastScanOkAt === undefined) scanPageAt = now(); };
   let scanning: Promise<void> | undefined;
   let started = false, stopped = false;
   let interval: ReturnType<typeof setInterval> | undefined;
@@ -273,6 +280,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   async function scanOnce(): Promise<void> {
     const scanAt = now();
     const t0 = Date.now();
+    if (lastScanOkAt === undefined) firstScanStartedAt = scanAt;
     try {
       const dead = await listDeadLetters(scanAt);
       // No age threshold (and so no dependence on this pod's clock agreeing with the store's): every pending object.
@@ -420,7 +428,10 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     let oldest = Infinity;
     for (const e of entries.values()) if (Number.isFinite(e.receivedAtMs)) oldest = Math.min(oldest, e.receivedAtMs);
     const freshest = Math.max(lastScanOkAt ?? -Infinity, lastProgressAt ?? -Infinity, scanPageAt ?? -Infinity);
-    const state = stopped ? "stopped" : lastScanOkAt === undefined ? "starting" : at - freshest > staleAfterMs ? "stale" : "ok";
+    // Before the first success: ok only while the running first scan lists pages (startup grace); else starting.
+    const state = stopped ? "stopped"
+      : lastScanOkAt === undefined ? (scanPageAt !== undefined && at - scanPageAt <= staleAfterMs ? "ok" : "starting")
+      : at - freshest > staleAfterMs ? "stale" : "ok";
     return {
       state,
       healthy: state === "ok",
@@ -428,7 +439,8 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       oldestAgeMs: oldest === Infinity ? null : Math.max(0, at - oldest),
       deadLetters,
       inFlight: inflight.size,
-      lastScanAgeMs: lastScanOkAt === undefined ? null : Math.max(0, at - lastScanOkAt),
+      lastScanAgeMs: lastScanOkAt !== undefined ? Math.max(0, at - lastScanOkAt)
+        : state === "ok" && firstScanStartedAt !== undefined ? Math.max(0, at - firstScanStartedAt) : null,
       lastProgressAgeMs: lastProgressAt === undefined && scanPageAt === undefined ? null
         : Math.max(0, at - Math.max(lastProgressAt ?? -Infinity, scanPageAt ?? -Infinity)),
     };
