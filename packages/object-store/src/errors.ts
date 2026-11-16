@@ -23,18 +23,24 @@ export class ObjectStoreError extends Error {
   readonly code: ObjectStoreErrorCode;
   readonly backend: string;
   readonly status: number | undefined;
+  /**
+   * A request that failed below HTTP (no status): the closed class of its transport failure
+   * (storeTransportCause), diagnostic only. Never the message, a key or a URL.
+   */
+  readonly transportCause: StoreTransportCause | undefined;
 
   constructor(
     code: ObjectStoreErrorCode,
     backend: string,
     message: string,
-    options: { status?: number; cause?: unknown } = {},
+    options: { status?: number; cause?: unknown; transportCause?: StoreTransportCause } = {},
   ) {
     super(`${backend}: ${message}`, { cause: options.cause });
     this.name = "ObjectStoreError";
     this.code = code;
     this.backend = backend;
     this.status = options.status;
+    this.transportCause = options.transportCause;
   }
 
   get retryable(): boolean {
@@ -70,4 +76,38 @@ export function errorForStatus(
   if (status === 408 || status === 429 || status >= 500)
     return new ObjectStoreError("transient", backend, detail, { status });
   return new ObjectStoreError("backend", backend, detail, { status });
+}
+
+/** The closed set of transport-failure classes a status-less store error can carry. */
+export const STORE_TRANSPORT_CAUSES = [
+  "econnreset", "etimedout", "econnrefused", "epipe", "abort", "timeout", "dns", "tls", "socket", "other",
+] as const;
+export type StoreTransportCause = (typeof STORE_TRANSPORT_CAUSES)[number];
+
+function causeTag(e: unknown): string {
+  if (typeof e !== "object" || e === null) return "";
+  const o = e as { code?: unknown; name?: unknown; errno?: unknown };
+  const parts = [o.code, o.name, o.errno].filter((v) => typeof v === "string" || typeof v === "number");
+  return parts.join(" ").toLowerCase();
+}
+
+/**
+ * Classify a fetch failure into a closed class from its `code` / `name` / `errno` only (Node and Bun
+ * spellings), looking one `cause` level down. Never reads the message, so a key or URL cannot leak.
+ */
+export function storeTransportCause(error: unknown): StoreTransportCause {
+  const nested = typeof error === "object" && error !== null ? (error as { cause?: unknown }).cause : undefined;
+  const tag = `${causeTag(error)} ${causeTag(nested)}`;
+  if (/econnreset|connectionreset/.test(tag)) return "econnreset";
+  if (/etimedout/.test(tag)) return "etimedout";
+  if (/econnrefused|connectionrefused/.test(tag)) return "econnrefused";
+  if (/epipe|brokenpipe/.test(tag)) return "epipe";
+  // A socket the peer aborted (ECONNABORTED) is a socket failure, not a caller's abort signal.
+  if (/econnaborted/.test(tag)) return "socket";
+  if (/aborterror|abort/.test(tag)) return "abort";
+  if (/timeout/.test(tag)) return "timeout";
+  if (/enotfound|eai_again|dns/.test(tag)) return "dns";
+  if (/cert|tls|ssl/.test(tag)) return "tls";
+  if (/socket|connectionclosed|econnaborted|und_err|closed/.test(tag)) return "socket";
+  return "other";
 }

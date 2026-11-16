@@ -77,7 +77,17 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
   has its own per-replica, in-memory pool (`tenant-limiter.ts`): `INGEST_MAX_PER_USER` per user and
   `INGEST_ASYNC_MAX_PER_ORG` per org (default half of `SELFHOST_ADMISSION_CONCURRENCY`, at least 1).
   A refusal at the cap is a deferral that does not count toward the dead-letter attempts
-  (`docs/selfhost-composition.md` section 5).
+  (`docs/selfhost-composition.md` section 5). So that a deferred attempt does not spend a slot and its
+  S3 claim first, the consumer leaves an object due, without starting it, while its org or its user is
+  already at the cap. It knows the user for every key this process wrote (the request path and upload
+  promotion pass it in-process, never in the object or the key), so one user's uploads from many
+  machines are counted together. A key it only found by a scan (written before a restart, or by
+  another replica) is counted by its machine directory instead, which can only start more than the
+  cap allows (the limiter then defers it), never fewer.
+  - **Store failure diagnostics.** A `ledger_store_*` retry line carries `store_status` (the store's
+    HTTP status) or, for a request that failed below HTTP, `store_cause`: one of `econnreset`,
+    `etimedout`, `econnrefused`, `epipe`, `abort`, `timeout`, `dns`, `tls`, `socket` or `other`,
+    classified from the error's code and name, never its message.
 - **Dead letters.** After `SELFHOST_ADMISSION_MAX_ATTEMPTS` failures (default 20, the hosted queue's
   max retries) in one process, the consumer writes a marker at
   `<keyRoot>/.admission-dlq/<the inbox path>.json` holding `{v, kind, code, attempts, atMs}`. It holds

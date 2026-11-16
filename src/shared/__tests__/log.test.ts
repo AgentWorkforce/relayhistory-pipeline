@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, errorFields, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, STORE_CAUSE_VALUES, errorFields, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { STORE_TRANSPORT_CAUSES } from "../vendor.ts";
+import { send } from "../../../packages/object-store/src/core.ts";
+import { ObjectStoreError, storeTransportCause } from "../../../packages/object-store/src/errors.ts";
 import { SearchIndexError } from "@rhc/search-index/contracts.ts";
 import { spanAttrs } from "../telemetry.ts";
 
@@ -57,6 +60,40 @@ describe("telemetry allowlist", () => {
     }
     expect(sanitizeLogField("prompt", "x")).toBeUndefined();
   });
+  test("store_cause is one closed class or nothing, and the log's set equals object-store's", () => {
+    expect([...STORE_CAUSE_VALUES].sort()).toEqual([...STORE_TRANSPORT_CAUSES].sort());
+    expect(sanitizeLogField("store_cause", "econnreset")).toBe("econnreset");
+    for (const bad of ["ECONNRESET", "socket hang up at https://bucket/96bulls/key", "", 104, null]) expect(sanitizeLogField("store_cause", bad)).toBeUndefined();
+  });
+
+  test("storeTransportCause classifies by code / name / errno only (one cause level), never the message", () => {
+    const e = (code?: string, name?: string, message = "https://bucket/96bulls/secret") => Object.assign(new Error(message), code ? { code } : {}, name ? { name } : {});
+    expect(storeTransportCause(e("ECONNRESET"))).toBe("econnreset");
+    expect(storeTransportCause(e("ConnectionReset"))).toBe("econnreset");
+    expect(storeTransportCause(e("ETIMEDOUT"))).toBe("etimedout");
+    expect(storeTransportCause(e("ConnectionRefused"))).toBe("econnrefused");
+    expect(storeTransportCause(e("EPIPE"))).toBe("epipe");
+    expect(storeTransportCause(e(undefined, "AbortError"))).toBe("abort");
+    expect(storeTransportCause(e(undefined, "TimeoutError"))).toBe("timeout");
+    expect(storeTransportCause(e("ENOTFOUND"))).toBe("dns");
+    expect(storeTransportCause(e("UNABLE_TO_VERIFY_LEAF_SIGNATURE_CERT"))).toBe("tls");
+    expect(storeTransportCause(e("UND_ERR_SOCKET"))).toBe("socket");
+    expect(storeTransportCause(e("ECONNABORTED"))).toBe("socket");
+    expect(storeTransportCause(new TypeError("fetch failed", { cause: e("ECONNRESET") }))).toBe("econnreset");
+    // The message is never read: an ECONNRESET in the text alone is "other".
+    expect(storeTransportCause(new Error("ECONNRESET at https://bucket/96bulls/key"))).toBe("other");
+    expect(storeTransportCause("nope")).toBe("other");
+  });
+
+  test("send() wraps a fetch failure as a status-less transient carrying its closed class", async () => {
+    const failing = (async () => { throw Object.assign(new Error("reset"), { code: "ECONNRESET" }); }) as unknown as typeof fetch;
+    const err = await send("s3", "96bulls/key", "https://example.invalid/x", {}, failing).catch((x: unknown) => x);
+    expect(err).toBeInstanceOf(ObjectStoreError);
+    expect((err as ObjectStoreError).code).toBe("transient");
+    expect((err as ObjectStoreError).status).toBeUndefined();
+    expect((err as ObjectStoreError).transportCause).toBe("econnreset");
+  });
+
   test("store_status (a ledger_store_* retry's HTTP status) is a bounded integer only", () => {
     expect(sanitizeLogField("store_status", 503)).toBe(503);
     expect(sanitizeLogField("store_status", 9999)).toBe(599);

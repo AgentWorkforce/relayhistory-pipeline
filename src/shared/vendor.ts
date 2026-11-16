@@ -149,7 +149,7 @@ export {
   type ObjectVersion,
   type RawFormat,
 } from "@rhc-object-store";
-export { ObjectStoreError, isObjectStoreError } from "@rhc-object-store";
+export { ObjectStoreError, isObjectStoreError, STORE_TRANSPORT_CAUSES, type StoreTransportCause } from "@rhc-object-store";
 export {
   deleteParkedSession,
   expireParkedSession,

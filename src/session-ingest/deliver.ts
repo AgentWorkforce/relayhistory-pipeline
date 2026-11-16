@@ -45,6 +45,9 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
+import { STORE_TRANSPORT_CAUSES } from "../shared/vendor.ts";
+
+const STORE_CAUSE_SET: ReadonlySet<string> = new Set(STORE_TRANSPORT_CAUSES);
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import {
   DELIVERY_BUSY_RETRY_AFTER,
@@ -207,9 +210,12 @@ export class IngestUnavailable extends DeliveryError {
    * (an integer 100..599), so the admission consumer's retry line can say what the store answered. Never a key or body.
    */
   readonly storeStatus?: number;
-  constructor(readonly stage: string, readonly cause_code: string, readonly db?: DbErrorDiagnosis, storeStatus?: number) {
+  /** `storeCause`: a status-less store failure's closed transport class (STORE_TRANSPORT_CAUSES), never text. */
+  readonly storeCause?: string;
+  constructor(readonly stage: string, readonly cause_code: string, readonly db?: DbErrorDiagnosis, storeStatus?: number, storeCause?: string) {
     super("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
     if (typeof storeStatus === "number" && Number.isSafeInteger(storeStatus) && storeStatus >= 100 && storeStatus <= 599) this.storeStatus = storeStatus;
+    if (typeof storeCause === "string" && STORE_CAUSE_SET.has(storeCause)) this.storeCause = storeCause;
   }
 }
 
@@ -306,7 +312,8 @@ async function runStage<T>(name: string, work: () => Promise<T>, observe?: Stage
     observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome, duration_ms: Date.now() - t0, ...(sqlstate ? { sqlstate } : {}) });
     if (passthrough) throw error;
     const storeStatus = error instanceof LedgerUnavailableError ? error.storeStatus : undefined;
-    throw new IngestUnavailable(name, causeCode(error), db, storeStatus);
+    const storeCause = error instanceof LedgerUnavailableError ? error.storeCause : undefined;
+    throw new IngestUnavailable(name, causeCode(error), db, storeStatus, storeCause);
   }
 }
 

@@ -28,7 +28,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { prepareForAdmission, TenantNotASegment } from "./admission-core.ts";
-import { enqueueAdmission, inboxKey, INBOX_MIN_BYTES, INBOX_NAMESPACE, outcomeKey, receiptDir, witnessPrivacyJournal, type AdmissionMessage } from "./async-admission.ts";
+import { enqueueAdmission, inboxKey, INBOX_MIN_BYTES, INBOX_NAMESPACE, outcomeKey, receiptDir, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionTarget } from "./async-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -174,7 +174,7 @@ export interface PromoteUploadDeps {
   /** UPLOAD_WITNESS_KEY as configured (raw). Missing or malformed: every object is a `retry`, never a refusal. */
   witnessKey: string | undefined;
   /** The admission queue send (hosted) or the self-host consumer's notify. */
-  enqueue: (message: AdmissionMessage) => Promise<void>;
+  enqueue: AsyncAdmissionTarget["enqueue"];
   nowMs?: () => number;
   nonce?: () => string;
 }

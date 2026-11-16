@@ -5,7 +5,7 @@
  * key filtering. Mirrors `core.rs` in the Rust crate.
  */
 import { sha256Hex } from "./crypto.js";
-import { ObjectStoreError, isObjectStoreError } from "./errors.js";
+import { ObjectStoreError, isObjectStoreError, storeTransportCause } from "./errors.js";
 import { isObjectKey, objectKey, type ObjectKey } from "./key.js";
 import {
   DEFAULT_PAGE_SIZE,
@@ -378,6 +378,7 @@ export async function send(
   } catch (cause) {
     throw new ObjectStoreError("transient", backend, `${key}: request failed`, {
       cause,
+      transportCause: storeTransportCause(cause),
     });
   }
 }

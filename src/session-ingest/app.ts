@@ -180,7 +180,7 @@ export interface IngestAppDeps {
    * every reset / re-enable raises the privacy journal first. "drain": no new async ACK, the
    * journal is still raised (the consumer is still admitting). Buffered acceptance only.
    */
-  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number; selfhost?: SelfhostAdmissionHooks };
+  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage, hint?: { orgId: string; userId: string }) => Promise<void>; nowMs?: () => number; selfhost?: SelfhostAdmissionHooks };
   /**
    * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (async-admission.ts). Absent or "off": nothing changes. "on":
    * under frozen-supabase custody, a batch whose SIGNED identity carries `admission: queued-v1` but did

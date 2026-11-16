@@ -47,6 +47,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "promoted", "waiting", "upload_due", "upload_origins", "upload_results",
   // ...a `ledger_store_*` retry's object-store HTTP status (LedgerUnavailableError.storeStatus): a bounded integer.
   "store_status",
+  // ...and, with no HTTP status, its closed transport-failure class (STORE_CAUSE_VALUES; anything else dropped).
+  "store_cause",
   // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
   ...ADMISSION_PHASE_FIELDS_LIST,
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
@@ -91,8 +93,19 @@ function boundedCount(v: unknown, max: number): number | undefined {
  * dropped; a BOUNDED_COUNT_FIELDS key survives only as a clamped non-negative integer; a string
  * is scrubbed and truncated. Other values pass through (callers narrow further by type).
  */
+/**
+ * Enumerated fields: emitted only when the value is one of a closed set (else dropped), so they can never
+ * carry free text. `store_cause` mirrors object-store STORE_TRANSPORT_CAUSES (log.test.ts pins the two equal).
+ */
+export const STORE_CAUSE_VALUES: ReadonlySet<string> = new Set([
+  "econnreset", "etimedout", "econnrefused", "epipe", "abort", "timeout", "dns", "tls", "socket", "other",
+]);
+const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["store_cause", STORE_CAUSE_VALUES]]);
+
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;
+  const allowed = ENUM_FIELDS.get(key);
+  if (allowed !== undefined) return typeof value === "string" && allowed.has(value) ? value : undefined;
   const max = BOUNDED_COUNT_FIELDS.get(key);
   if (max !== undefined) return boundedCount(value, max);
   // Strings are scrubbed again before emit as a backstop; ids never match a rule.

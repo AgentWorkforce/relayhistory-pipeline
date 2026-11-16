@@ -40,7 +40,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { ADMISSION_PHASE_FIELDS, log as sharedLog } from "../shared/log.ts";
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-consumer.ts";
-import { INBOX_NAMESPACE, pendingAdmissions } from "./async-admission.ts";
+import { INBOX_NAMESPACE, pendingAdmissions, type AdmissionTenantHint } from "./async-admission.ts";
 import { lockAlertFields } from "./app.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
@@ -50,6 +50,8 @@ export const DEAD_LETTER_NAMESPACE = ".admission-dlq";
 export const DEAD_LETTER_RETENTION_MS = 14 * 24 * 3600 * 1000;
 const INBOX_SUFFIX = ".ndjson.zst";
 const ATTEMPT = /\/a=(\d{15})-[0-9a-f]{16}\.ndjson\.zst$/;
+/** Most inbox keys whose writer's user this process remembers for the tenant-cap hint (oldest dropped first). */
+export const USER_HINT_MAX = 100_000;
 
 /** The dead-letter marker for one inbox object: the same path under the DLQ namespace. */
 export function deadLetterKey(keyRoot: string, inboxKey: string): string {
@@ -90,6 +92,11 @@ export interface SelfhostAdmissionOptions {
    * a slot refusal is an ordinary retry, unchanged.
    */
   deferTenantLimit?: boolean;
+  /**
+   * How many inbox keys' writer users the tenant-cap hint remembers (default USER_HINT_MAX). 0 keeps none: every
+   * entry falls back to the per-directory hint, as for a key found only by a scan.
+   */
+  userHintMax?: number;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -109,12 +116,14 @@ export interface SelfhostAdmissionConsumer {
   start(): void;
   stop(): Promise<void>;
   /** The request path's latency hint for a fresh inbox key. Never throws. */
-  notify(key: string): void;
+  notify(key: string, hint?: AdmissionTenantHint): void;
   /** One ListBucket pass (tests and the interval). */
   scan(): Promise<void>;
   /** Start every due object (bounded), then wait until nothing is in flight. Tests. */
   settle(): Promise<void>;
   status(): SelfhostAdmissionStatus;
+  /** How many inbox keys currently carry a writer-user hint (bounded by userHintMax). Tests. */
+  userHints(): number;
 }
 
 interface Entry { attempts: number; notBefore: number; addedAt: number; receivedAtMs: number }
@@ -127,24 +136,35 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const entries = new Map<string, Entry>();
   const inflight = new Set<string>();
   const running = new Set<Promise<void>>();
-  // Tenant-cap HINT (deferTenantLimit only): skip, without starting, an entry whose org or machine directory is
-  // already at the consumer's tenant cap, or whose directory was just deferred by it. The authoritative guard is
-  // still deliver.ts's post-claim acquire (a race still defers safely); this only stops a deferred attempt from
-  // spending a consumer slot and its full S3 claim first. A machine directory (`…/m=<hash of ws, origin, user>`)
-  // belongs to exactly one user, so its in-flight count never exceeds that user's: skipping at
-  // `dir >= maxPerUser` never skips a start the limiter would have allowed. The org count is exact: the consumer's
-  // limiter pool is its own (selfhost-server.ts asyncLimiter).
+  // Tenant-cap HINT (deferTenantLimit only): skip, without starting, an entry whose org or user is already at the
+  // consumer's tenant cap, or whose user was just deferred by it. The authoritative guard is still deliver.ts's
+  // post-claim acquire (a race still defers safely); this only stops a deferred attempt from spending a consumer
+  // slot and its full S3 claim first. The per-user GROUP is the user the key was written for when this process
+  // wrote it (notify's hint: the request path and upload promotion both pass it), so one user's uploads from many
+  // machines count together, as the limiter counts them. A key found only by a scan (written before a restart, or
+  // by another replica) falls back to its machine directory (`…/m=<hash of ws, origin, user>`), which belongs to
+  // exactly one user: its count never exceeds that user's, so the fallback can only start more than the cap
+  // allows (which the limiter then defers, as before), never skip a start the limiter would have allowed. The org
+  // count is exact: the consumer's limiter pool is its own (selfhost-server.ts asyncLimiter).
   const caps = opts.deferTenantLimit ? opts.deliver.slots : undefined;
   const inboxPrefix = `${keyRoot}/${INBOX_NAMESPACE}/`;
-  const tenantOf = (key: string): { org: string; dir: string } | undefined => {
+  /** Inbox key -> `<org>\n<userId>` from notify's hint (bounded; forgotten with the entry). In-process only. */
+  const userOf = new Map<string, string>();
+  // 0: no hints are kept, so every entry uses the per-directory fallback (exactly a scan-only process).
+  const userHintMax = Math.max(0, Math.floor(opts.userHintMax ?? USER_HINT_MAX));
+  const tenantOf = (key: string): { org: string; group: string } | undefined => {
     if (!key.startsWith(inboxPrefix)) return undefined;
     const r = key.indexOf("/r=", inboxPrefix.length), slash = key.indexOf("/", inboxPrefix.length);
     if (r < 0 || slash < 0 || slash > r) return undefined;
-    return { org: key.slice(inboxPrefix.length, slash), dir: key.slice(0, r) };
+    const org = key.slice(inboxPrefix.length, slash);
+    const user = userOf.get(key);
+    return { org, group: user !== undefined ? `u:${user}` : `d:${key.slice(0, r)}` };
   };
-  const inflightOrg = new Map<string, number>(), inflightDir = new Map<string, number>();
-  /** Directory -> no start before (ms): set by a tenant-limit deferral, cleared when one of its admissions ends. */
-  const dirBusyUntil = new Map<string, number>();
+  /** Drop an entry and its user hint (a terminal outcome, a dead letter, or gone from the inbox). */
+  const forget = (key: string) => { entries.delete(key); userOf.delete(key); };
+  const inflightOrg = new Map<string, number>(), inflightGroup = new Map<string, number>();
+  /** User group -> no start before (ms): set by a tenant-limit deferral, cleared when one of its admissions ends. */
+  const busyUntil = new Map<string, number>();
   const bump = (m: Map<string, number>, k: string, d: number) => { const n = (m.get(k) ?? 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
   /** Inbox keys with a dead-letter marker seen by this process (to clear it after a later terminal outcome). */
   const marked = new Set<string>();
@@ -234,12 +254,12 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const seen = new Set<string>();
       let live = 0;
       for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: Number.NEGATIVE_INFINITY })) {
-        if (dead.has(m.key)) { live++; marked.add(m.key); if (!inflight.has(m.key)) entries.delete(m.key); continue; }
+        if (dead.has(m.key)) { live++; marked.add(m.key); if (!inflight.has(m.key)) forget(m.key); continue; }
         seen.add(m.key);
         if (!entries.has(m.key)) entries.set(m.key, { attempts: 0, notBefore: 0, addedAt: scanAt, receivedAtMs: receivedAtOf(m.key) });
       }
       // Terminal (tombstoned) or gone: forget it, unless it is in flight or was notified during this scan.
-      for (const [key, e] of entries) if (!seen.has(key) && !inflight.has(key) && e.addedAt < scanAt) entries.delete(key);
+      for (const [key, e] of entries) if (!seen.has(key) && !inflight.has(key) && e.addedAt < scanAt) forget(key);
       deadLetters = live;
       lastScanOkAt = now();
       const s = status();
@@ -276,7 +296,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const timing: Record<string, number> = {};
       for (const [phase, ms] of Object.entries(r.timingMs ?? {})) { const field = ADMISSION_PHASE_FIELDS.get(phase); if (field) timing[field] = ms; }
       logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts, ...timing });
-      entries.delete(key);
+      forget(key);
       if (marked.delete(key)) await store.delete(objectKey(deadLetterKey(keyRoot, key))).catch(() => {});
       return;
     }
@@ -286,12 +306,13 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       entry.notBefore = now() + r.delaySeconds * 1000;
       // Its siblings in the same machine directory (the same user) wait as long, unless one of them ends first.
       const tenant = caps ? tenantOf(key) : undefined;
-      if (tenant) dirBusyUntil.set(tenant.dir, Math.max(dirBusyUntil.get(tenant.dir) ?? 0, entry.notBefore));
+      if (tenant) busyUntil.set(tenant.group, Math.max(busyUntil.get(tenant.group) ?? 0, entry.notBefore));
       logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
       return "deferred";
     }
     const storeStatus = (r.error as { storeStatus?: unknown } | undefined)?.storeStatus;
-    const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
+    const storeCause = (r.error as { storeCause?: unknown } | undefined)?.storeCause;
+    const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), ...(typeof storeCause === "string" ? { store_cause: storeCause } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
     const db = (r.error as { db?: { db_error_class: string; db_error_code: string; db_error_basis: string } } | undefined)?.db;
     if (db) Object.assign(fields, { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis });
     logger.warn("session ingest admission", fields);
@@ -300,7 +321,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (entry.attempts >= opts.maxAttempts) {
       if (await deadLetter(key, r.code, entry.attempts)) {
         logger.error("session ingest admission", { route: "ingest.admission", outcome: "dead_lettered", error_code: r.code, attempt: entry.attempts });
-        entries.delete(key);
+        forget(key);
         return;
       }
       // The marker could not be written: keep the object, try again later (never drop it).
@@ -315,7 +336,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (wake) { clearTimeout(wake); wake = undefined; }
     const at = now();
     // Sweep expired deferral memos (a directory whose deferred entry left another way would otherwise linger).
-    for (const [dir, until] of dirBusyUntil) if (until <= at) dirBusyUntil.delete(dir);
+    for (const [dir, until] of busyUntil) if (until <= at) busyUntil.delete(dir);
     const waiting = [...entries].filter(([key]) => !inflight.has(key)).sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
     let next = Infinity;
     for (const [key, entry] of waiting) {
@@ -325,15 +346,15 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       if (tenant && caps) {
         // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
         // re-pumps (finally), and a deferral's window is woken below.
-        const busy = dirBusyUntil.get(tenant.dir);
+        const busy = busyUntil.get(tenant.group);
         if (busy !== undefined && busy > at) { next = Math.min(next, busy); continue; }
-        if (busy !== undefined) dirBusyUntil.delete(tenant.dir);
+        if (busy !== undefined) busyUntil.delete(tenant.group);
         // Only a positive cap is a hint (a 0 cap is left to the limiter, as before, so this never parks an entry
         // with nothing in flight to re-pump it). The counts can only be stricter than the limiter's (a lease past its
         // TTL frees the limiter slot before the admission ends here), so the hint never over-admits.
         if ((caps.maxPerOrg >= 1 && (inflightOrg.get(tenant.org) ?? 0) >= caps.maxPerOrg)
-          || (caps.maxPerUser >= 1 && (inflightDir.get(tenant.dir) ?? 0) >= caps.maxPerUser)) continue;
-        bump(inflightOrg, tenant.org, 1); bump(inflightDir, tenant.dir, 1);
+          || (caps.maxPerUser >= 1 && (inflightGroup.get(tenant.group) ?? 0) >= caps.maxPerUser)) continue;
+        bump(inflightOrg, tenant.org, 1); bump(inflightGroup, tenant.group, 1);
       }
       inflight.add(key);
       let deferred = false;
@@ -343,9 +364,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         .finally(() => {
           inflight.delete(key);
           if (tenant) {
-            bump(inflightOrg, tenant.org, -1); bump(inflightDir, tenant.dir, -1);
+            bump(inflightOrg, tenant.org, -1); bump(inflightGroup, tenant.group, -1);
             // A finished (non-deferred) admission freed this user's slot: its siblings may try again now.
-            if (!deferred) dirBusyUntil.delete(tenant.dir);
+            if (!deferred) busyUntil.delete(tenant.group);
           }
           running.delete(p); pump();
         });
@@ -388,9 +409,17 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       await scanning?.catch(() => {});
       await Promise.allSettled([...running]);
     },
-    notify(key) {
+    notify(key, hint) {
       try {
-        if (stopped || entries.has(key) || !ATTEMPT.test(key) || !key.startsWith(`${keyRoot}/${INBOX_NAMESPACE}/`)) return;
+        if (stopped || !ATTEMPT.test(key) || !key.startsWith(`${keyRoot}/${INBOX_NAMESPACE}/`)) return;
+        // The writer's tenant, for the per-user cap hint: only for the key's own org, and only while the
+        // entry is not in flight (a running admission keeps the group it started with). Bounded: oldest first out.
+        if (caps && userHintMax > 0 && hint && typeof hint.orgId === "string" && typeof hint.userId === "string" && hint.userId !== ""
+          && key.startsWith(`${inboxPrefix}${hint.orgId}/`) && !inflight.has(key) && !userOf.has(key)) {
+          if (userOf.size >= userHintMax) { const oldest = userOf.keys().next().value; if (oldest !== undefined) userOf.delete(oldest); }
+          userOf.set(key, `${hint.orgId}\n${hint.userId}`);
+        }
+        if (entries.has(key)) return;
         entries.set(key, { attempts: 0, notBefore: 0, addedAt: now(), receivedAtMs: receivedAtOf(key) });
         if (started) pump();
       } catch {
@@ -403,6 +432,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       while (running.size > 0) await Promise.allSettled([...running]);
     },
     status,
+    userHints: () => userOf.size,
   };
 }
 

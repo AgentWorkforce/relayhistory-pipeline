@@ -248,9 +248,16 @@ export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array)
 export interface AsyncAdmissionTarget {
   store: ObjectStore;
   keyRoot: string;
-  enqueue: (message: AdmissionMessage) => Promise<void>;
+  /**
+   * The queue send (hosted) or the self-host consumer's notify. `hint` is in-process only (the self-host
+   * consumer's per-user tenant-cap hint); it is never part of the message, so the wire format is unchanged.
+   */
+  enqueue: (message: AdmissionMessage, hint?: AdmissionTenantHint) => Promise<void>;
   nonce?: () => string;
 }
+
+/** The tenant an inbox key was written for, as known at the write (in-process hint only, never serialized). */
+export interface AdmissionTenantHint { orgId: string; userId: string }
 
 /**
  * The request path: durable inbox PUT, then the queue send. Either failing is a retryable 503
@@ -262,7 +269,7 @@ export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: Led
   const key = inboxKey(target.keyRoot, tenant, prepared.originId, prepared.receipt.receiptId, receivedAtMs, nonce);
   await target.store.put(objectKey(key), encodeInbox(tenant, prepared, receivedAtMs, journalSeq, consentCap), { ifNoneMatch: true, contentType: "application/zstd" });
   try {
-    await target.enqueue({ v: 1, kind: "ingest-admission", key });
+    await target.enqueue({ v: 1, kind: "ingest-admission", key }, { orgId: tenant.orgId, userId: tenant.userId });
   } catch (error) {
     // Unacknowledged: retire the content now (best effort; a 503 means the client retries with a new attempt).
     await target.store.put(objectKey(key), TOMBSTONE, { contentType: "application/zstd" }).catch(() => {});

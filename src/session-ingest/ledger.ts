@@ -267,6 +267,8 @@ export interface BabysitterWriteOutcome {
 export class LedgerUnavailableError extends Error {
   /** `ledger_store_*` only: the object store's HTTP status (100..599), diagnostic only, never a key or message. */
   storeStatus?: number;
+  /** `ledger_store_*` with no HTTP status: its closed transport-failure class (object-store STORE_TRANSPORT_CAUSES). */
+  storeCause?: string;
   /** `db`: the closed diagnosis (class, safe code, basis) of the underlying failure (diagnostic only). */
   constructor(readonly code: string, readonly db?: DbErrorDiagnosis) {
     super(`session ingest ledger unavailable: ${code}`);

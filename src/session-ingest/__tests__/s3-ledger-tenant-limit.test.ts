@@ -69,8 +69,10 @@ async function until(cond: () => boolean | Promise<boolean>, what: string): Prom
 
 function edge(opts: { admission?: { mode: "async"; concurrency: number; scanIntervalMs: number; maxAttempts: number }; direct?: boolean; ledger?: "s3";
   /** INGEST_S3_TENANT_LIMIT: on ({}, or with asyncMaxPerOrg) by default here; null = off. */
-  limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number }) {
-  const s = scratchStore();
+  limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number;
+  /** Share another edge's store (a second process: its consumer has none of the first one's notify hints). */
+  base?: ObjectStore; userHintMax?: number }) {
+  const s = opts.base ? { store: opts.base, done: () => {} } : scratchStore();
   cleanups.push(s.done);
   const g = gatedStore(s.store);
   const sql: string[] = [];
@@ -84,7 +86,7 @@ function edge(opts: { admission?: { mode: "async"; concurrency: number; scanInte
     ...(opts.direct ? { uploadDirect: { config: uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on" }), witnessKey: WITNESS_KEY, scanBatch: 16 } } : {}),
   }, { run: (async (text: string) => { sql.push(text); throw new Error("SQL runner called on the S3 ledger path"); }) as never, store: g.store,
     verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} },
-  { startConsumer: false, nowMs: () => clock, onConsumer: (c) => { consumer = c; },
+  { startConsumer: false, nowMs: () => clock, onConsumer: (c) => { consumer = c; }, ...(opts.userHintMax !== undefined ? { userHintMax: opts.userHintMax } : {}),
     log: { info: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), warn: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), error: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}) } as never });
   cleanups.push(() => runtime.close());
   const identity = { ...TENANT, scopes: [SYNC_SCOPE] } as unknown as IngestIdentity;
@@ -170,9 +172,10 @@ describe("INGEST_LEDGER=s3, the async consumer at the tenant cap (direct uploads
     expect(e.sql).toEqual([]);
   });
 
-  test("over the cap across two machines of one user (the hint cannot see it): the race still defers (not refused, not dead-lettered even at maxAttempts 1) and admits later", async () => {
+  test("scan-only (no writer hint): over the cap across two machines of one user, the race still defers (not refused, not dead-lettered even at maxAttempts 1) and admits later", async () => {
     // Per-org 2 so only the per-user cap (1) binds, and the two uploads sit in different machine directories.
-    const e = edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 1 }, direct: true, limit: { asyncMaxPerOrg: 2 } });
+    // userHintMax 0: no writer hint is kept, so the per-directory fallback applies (a key found only by a scan).
+    const e = edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 1 }, direct: true, limit: { asyncMaxPerOrg: 2 }, userHintMax: 0 });
     await writeAuthority(e.base);
     const k1 = await upload(e.base, "batch-u1", "u1");
     const k2 = await upload(e.base, "batch-u2", "u2", TENANT, "origin-2");
@@ -232,11 +235,11 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     expect(e.sql).toEqual([]);
   });
 
-  test("after a deferral, the deferred directory's sibling is not started before Retry-After, and starts as soon as an admission in that directory ends", async () => {
+  test("scan-only: after a deferral, the deferred directory's sibling is not started before Retry-After, and starts as soon as an admission in that directory ends", async () => {
     // Per-user 2, per-org 4. origin-1 and origin-2 each hold one of the user's two slots. Then two more origin-2
     // uploads arrive: one starts (its directory count is 1 < 2) and is deferred by the user cap. The memo keeps the
     // other from starting until the in-flight origin-2 admission ends, which frees the slot.
-    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 2 });
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 2, userHintMax: 0 });
     await writeAuthority(e.base);
     await upload(e.base, "batch-a", "a", TENANT, "origin-1");
     await upload(e.base, "batch-b", "b", TENANT, "origin-2");
@@ -265,6 +268,98 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     await e.consumer().settle();
     expect([await state(k3), await state(k4)]).toEqual(["admitted", "admitted"]);
     expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
+  });
+
+  test("the writer hint: one user's uploads from many machines never run more than the per-user cap at once, with no deferral", async () => {
+    // Per-user 2, per-org 8, concurrency 8, five machines of one user. The per-directory count alone would start
+    // all five (each directory holds one) and the limiter would defer three; the writer hint counts them together.
+    const e = edge({ admission: { mode: "async", concurrency: 8, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 8 }, maxPerUser: 2 });
+    await writeAuthority(e.base);
+    const keys: string[] = [];
+    for (let i = 1; i <= 5; i++) keys.push(await upload(e.base, `batch-m${i}`, `m${i}`, TENANT, `origin-${i}`));
+    let peak = 0;
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    const sessions = () => new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1])).size;
+    await until(() => sessions() === 2, "the user's two slots to be held in their writes");
+    await new Promise((r) => setTimeout(r, 50));
+    peak = Math.max(peak, e.consumer().status().inFlight);
+    expect(peak).toBe(2);
+    expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+    e.open();
+    await settling;
+    // No starvation: every machine's upload is admitted, without one deferral or a clock advance.
+    const state = statusOf(e);
+    expect(await Promise.all(keys.map(state))).toEqual(["admitted", "admitted", "admitted", "admitted", "admitted"]);
+    // Each terminal outcome dropped its hint: nothing lingers.
+    expect(e.consumer().userHints()).toBe(0);
+    expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
+  });
+
+  test("the writer hint never holds back another user of the same org", async () => {
+    const other = { ...TENANT, userId: "user-2" };
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 1 });
+    await writeAuthority(e.base);
+    const k1 = await upload(e.base, "batch-x1", "x1", TENANT, "origin-1");
+    const k2 = await upload(e.base, "batch-x2", "x2", TENANT, "origin-2");
+    const k3 = await upload(e.base, "batch-y1", "y1", other, "origin-9");
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    const sessions = () => new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1])).size;
+    // One of user-1's and user-2's single upload run together; user-1's second waits for its own slot.
+    await until(() => sessions() === 2, "one admission per user in its writes");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(e.consumer().status().inFlight).toBe(2);
+    e.open();
+    await settling;
+    expect([await statusOf(e)(k1), await statusOf(e)(k2)]).toEqual(["admitted", "admitted"]);
+    const st = (await uploadAdmissionStatus({ store: e.base, keyRoot: ROOT }, uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on" }), other, k3)) as { body: { state: string } };
+    expect(st.body.state).toBe("admitted");
+    expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+  });
+
+  test("the hint map is bounded: past userHintMax the oldest key loses its hint and falls back to its directory (the limiter still defers, never over-admits)", async () => {
+    // userHintMax 1, per-user 1, two machines: the second hint evicts the first, so the first key is counted by its
+    // directory; both start, and the limiter defers one (safe), then it is admitted after its Retry-After.
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true, limit: { asyncMaxPerOrg: 4 }, maxPerUser: 1, userHintMax: 1 });
+    await writeAuthority(e.base);
+    const k1 = await upload(e.base, "batch-b1", "b1", TENANT, "origin-1");
+    const k2 = await upload(e.base, "batch-b2", "b2", TENANT, "origin-2");
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    await until(() => e.logged.some((f) => f.outcome === "deferred"), "the evicted key's start to be deferred");
+    e.open();
+    await settling;
+    e.advance(11_000);
+    await e.consumer().settle();
+    expect([await statusOf(e)(k1), await statusOf(e)(k2)]).toEqual(["admitted", "admitted"]);
+    expect(e.logged.filter((f) => f.outcome === "deferred").length).toBe(1);
+    expect(e.logged.some((f) => f.outcome === "dead_lettered" || f.outcome === "refused")).toBe(false);
+  });
+
+  test("a status-less store failure logs a closed store_cause class, never the error text", async () => {
+    const e = edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 20 }, direct: true });
+    await writeAuthority(e.base);
+    await upload(e.base, "batch-c", "c");
+    await e.consumer().scan();
+    const batchDoc = s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-c");
+    let fail = true;
+    const original = e.base.put.bind(e.base);
+    (e.base as { put: ObjectStore["put"] }).put = (async (key: Parameters<ObjectStore["put"]>[0], ...rest: unknown[]) => {
+      if (fail && String(key) === batchDoc) {
+        fail = false;
+        throw new ObjectStoreError("transient", "s3", "secret key path: request failed", { cause: Object.assign(new Error("socket hang up at https://bucket/secret"), { code: "ECONNRESET" }), transportCause: "econnreset" });
+      }
+      return (original as (...a: unknown[]) => unknown)(key, ...rest);
+    }) as ObjectStore["put"];
+    await e.consumer().settle();
+    const retry = e.logged.find((f) => f.route === "ingest.admission" && f.outcome === "retry");
+    expect(retry).toMatchObject({ error_code: "ledger_store_transient", stage: expect.any(String), store_cause: "econnreset" });
+    expect(retry).not.toHaveProperty("store_status");
+    expect(JSON.stringify(e.logged)).not.toContain("secret");
     expect(e.sql).toEqual([]);
   });
 

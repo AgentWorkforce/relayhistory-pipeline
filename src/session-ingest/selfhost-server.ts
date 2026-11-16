@@ -84,7 +84,7 @@ import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
-import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage, type AdmissionTenantHint } from "./async-admission.ts";
 import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
@@ -198,6 +198,8 @@ export interface SelfhostRuntimeOptions {
   startConsumer?: boolean;
   onConsumer?: (consumer: SelfhostAdmissionConsumer) => void;
   log?: SelfhostAdmissionOptions["log"];
+  /** Tests: the consumer's per-user hint bound (SelfhostAdmissionOptions.userHintMax). */
+  userHintMax?: number;
 }
 
 /**
@@ -279,7 +281,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
   // No queue: the inbox PUT is the record, and the consumer's scan is the authority. This only lets the
   // consumer start on a fresh upload without waiting for the next scan; it never throws.
-  const notify = async (message: AdmissionMessage) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key); };
+  // `hint`: the tenant the key was written for, so the consumer's tenant-cap hint counts per USER (a user's
+  // uploads from many machines land in many `m=` directories). In-process only.
+  const notify = async (message: AdmissionMessage, hint?: AdmissionTenantHint) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key, hint); };
   // HISTORY_UPLOAD_DIRECT allowlist|on (selfhost-config.ts): the consumer's scan also promotes the upload inbox.
   const upload = settings.uploadDirect;
   const uploadInbox = upload
@@ -300,6 +304,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...uploadConsent,
     // INGEST_S3_TENANT_LIMIT=on: the per-replica tenant limit defers an object (never dead-letters it). Off: unchanged.
     ...(asyncLimiter ? { deferTenantLimit: true } : {}),
+    ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
   });
   options.onConsumer?.(consumer);
   const app = withSelfhostCapabilities(createIngestApp({

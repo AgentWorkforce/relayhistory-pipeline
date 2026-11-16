@@ -524,6 +524,7 @@ function storeFailure(error: unknown): LedgerUnavailableError {
     const failure = new LedgerUnavailableError(`ledger_store_${error.code}`);
     const status = error.status;
     if (typeof status === "number" && Number.isSafeInteger(status) && status >= 100 && status <= 599) failure.storeStatus = status;
+    else if (error.transportCause) failure.storeCause = error.transportCause;
     return failure;
   }
   return new LedgerUnavailableError("ledger_store_error");

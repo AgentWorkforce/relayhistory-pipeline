@@ -1,7 +1,10 @@
 export {
   ObjectStoreError,
   isObjectStoreError,
+  storeTransportCause,
+  STORE_TRANSPORT_CAUSES,
   type ObjectStoreErrorCode,
+  type StoreTransportCause,
 } from "./errors.js";
 export {
   objectKey,
