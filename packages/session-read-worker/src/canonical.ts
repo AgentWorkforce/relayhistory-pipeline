@@ -50,6 +50,21 @@ const tables = new Set([
   "session_timing",
   "session_directory_event_values",
 ]);
+
+/** Legacy ordering is opt-in per snapshot; live-only rows retain the exact
+ * projector order for both asc and desc, including existing offset cursors. */
+export function orderLegacySnapshotRows<
+  T extends { row: Record<string, unknown> },
+>(
+  table: string,
+  rows: T[],
+  order: "asc" | "desc",
+  legacyRowsMerged: boolean,
+): T[] {
+  return legacyRowsMerged && isLegacySourceTable(table)
+    ? sortLegacyRows(table, rows, order)
+    : rows;
+}
 async function boundedJson(
   response: Response,
   signal: AbortSignal,
@@ -476,8 +491,9 @@ export async function canonicalHandle(
         (a, b) =>
           (order === "asc" ? 1 : -1) * compareArtifactEventRows(a.row, b.row),
       );
-    // Legacy tables in Neon's key order, reversed for desc (activation gate 9).
-    if (isLegacySourceTable(table)) sortLegacyRows(table, all, order);
+    // Preserve the established live-only order and cursor contract byte-for-byte.
+    // Only a snapshot that actually merged legacy rows needs Neon's legacy key order.
+    orderLegacySnapshotRows(table, all, order, snapshot.legacyRowsMerged);
     if (offset > all.length) throw new CanonicalReadError("cursor", 400);
     const rows = [];
     let bytes = 0;
