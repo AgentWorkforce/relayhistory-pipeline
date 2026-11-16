@@ -38,6 +38,7 @@ import { routingFlag } from "./babysitter-retention.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode, s3Ledger, serverLedgerParallel } from "./ledger-s3.ts";
+import { ledgerHomeGuard } from "./ledger-store.ts";
 import { uploadConsentEnforcement, UPLOAD_CONSENT_VAR } from "./upload-consent.ts";
 import type { PromoteUploadDeps, UploadDirectConfig } from "./upload-admission.ts";
 
@@ -62,6 +63,12 @@ export interface HostedUploadAdmissionConfig {
   secretId: string;
   /** INGEST_LEDGER_PARALLEL (1..64), else SERVER_LEDGER_PARALLEL. */
   ledgerParallel: number;
+  /**
+   * INGEST_LEDGER_HOME_GUARD=on (ledger-store.ts, default off): every claim also reads the bucket's ledger-home marker
+   * and refuses when it names another bucket, so after a relocation (docs/ledger-relocation.md) this Lambda can never
+   * claim against the stale `ledger/**` copies. It has no routed store: it only ever runs on the Locker bucket.
+   */
+  ledgerHomeGuard?: true;
 }
 
 /** The hosted settings, or a coded error naming no value. */
@@ -95,7 +102,11 @@ export function hostedUploadAdmissionConfig(env: Record<string, string | undefin
   if (logCommit !== "off") no("ledger_log_commit_unsupported");
   let ledgerParallel;
   try { ledgerParallel = serverLedgerParallel(env); } catch { return no("ledger_parallel_invalid"); }
-  return { region, bucket, keyRoot, secretId, ledgerParallel };
+  let homeGuard;
+  try { homeGuard = ledgerHomeGuard(env); } catch { return no("ledger_home_guard_invalid"); }
+  // A separate ledger bucket is the EKS edge's setting; this Lambda has none, so it must never run with one.
+  if (env.INGEST_LEDGER_BUCKET) no("ledger_bucket_unsupported");
+  return { region, bucket, keyRoot, secretId, ledgerParallel, ...(homeGuard ? { ledgerHomeGuard: true as const } : {}) };
 }
 
 /** The secret's exact shape. The witness key is passed through raw: promoteUpload validates it (malformed = retry). */
@@ -153,7 +164,8 @@ export function hostedUploadAdmissionRuntime(overrides: HostedRuntimeOverrides =
     const deliver: DeliverDeps = {
       // Fail closed: no admission until an operator has written the fence-authority marker (ledger-s3.ts
       // FenceAuthorityDoc: fence backfill complete, control mirror on, re-arm sweeper live). Every record retries.
-      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: config.ledgerParallel }),
+      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: config.ledgerParallel,
+        ...(config.ledgerHomeGuard ? { ledgerHome: { expect: config.bucket, required: false } } : {}) }),
       acceptanceMode: "canonical",
       // SCRUB_ENGINE is refused above unless ts, so this is {} today; it stays wired if that ever widens.
       target: { store, keyRoot: config.keyRoot, ...routedRawChunkSealerDeps() },

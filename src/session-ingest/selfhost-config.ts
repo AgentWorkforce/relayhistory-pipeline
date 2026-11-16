@@ -115,6 +115,15 @@
  *                                    store. Needs INGEST_LEDGER=s3. Claims then also need the ledger-home marker in that
  *                                    bucket naming it (docs/ledger-relocation.md). Proven for conditional writes at startup.
  *   INGEST_LEDGER_REGION             the ledger bucket's signing region; default LOCKER_REGION. Only with INGEST_LEDGER_BUCKET.
+ *   INGEST_LEDGER_ENDPOINT           the ledger bucket's endpoint origin; default LOCKER_ENDPOINT, but only when the regions
+ *                                    match: a LOCKER_ENDPOINT with a different INGEST_LEDGER_REGION refuses startup (it would
+ *                                    send the ledger bucket's requests to the Locker region's endpoint). Only with the bucket.
+ *   INGEST_LEDGER_HOME_GUARD         unset | "" | "off" (default: no marker read, byte-identical) | exactly "on": every
+ *                                    claim's fence-authority read also reads the ledger-home marker
+ *                                    (<keyRoot>/.ledger/fence-authority/.ledger-home.json) in LOCKER_BUCKET and refuses
+ *                                    when it names another bucket (`ledger_home_moved`). Needs INGEST_LEDGER=s3. Implied
+ *                                    by INGEST_LEDGER_BUCKET (then the marker must name that bucket). docs/ledger-relocation.md
+ *                                    requires it on before a relocation starts.
  *   INGEST_ASYNC_MAX_PER_ORG         the async consumer's per-org cap with INGEST_S3_TENANT_LIMIT=on and
  *                                    SELFHOST_INGEST_ADMISSION=async|drain: 1..SELFHOST_ADMISSION_CONCURRENCY,
  *                                    default max(1, floor(concurrency / 2)), so one org never holds more than half
@@ -122,6 +131,7 @@
  */
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
+import { LEDGER_HOME_GUARD_VAR, ledgerHomeGuard } from "./ledger-store.ts";
 import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
@@ -201,10 +211,12 @@ export interface SelfhostIngestSettings {
   s3TenantLimit?: SelfhostS3TenantLimitSettings;
   /** INGEST_LEDGER_BUCKET (+ INGEST_LEDGER_REGION), INGEST_LEDGER=s3 only. Absent (the default): the ledger is in LOCKER_BUCKET. */
   ledgerStore?: SelfhostLedgerStoreSettings;
+  /** INGEST_LEDGER_HOME_GUARD=on (INGEST_LEDGER=s3 only). Absent (the default): no ledger-home read without ledgerStore. */
+  ledgerHomeGuard?: true;
 }
 
 /** The S3 ledger's own bucket (ledger-store.ts). `region`: INGEST_LEDGER_REGION, else LOCKER_REGION, else us-east-1. */
-export interface SelfhostLedgerStoreSettings { bucket: string; region: string }
+export interface SelfhostLedgerStoreSettings { bucket: string; region: string; endpoint?: string }
 export const INGEST_LEDGER_BUCKET_VAR = "INGEST_LEDGER_BUCKET";
 export const INGEST_LEDGER_REGION_VAR = "INGEST_LEDGER_REGION";
 
@@ -219,9 +231,24 @@ export function selfhostLedgerStore(env: NodeJS.ProcessEnv, ledger: "s3" | undef
   if (ledger !== "s3") throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} needs ${INGEST_LEDGER_VAR}=s3`);
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must be a bucket name`);
   if (bucket === env.LOCKER_BUCKET?.trim()) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must differ from LOCKER_BUCKET (unset it to keep the ledger there)`);
-  const region = regionRaw || env.LOCKER_REGION?.trim() || "us-east-1";
+  const lockerRegion = env.LOCKER_REGION?.trim() || "us-east-1";
+  const region = regionRaw || lockerRegion;
   if (!/^[a-z0-9-]{1,63}$/.test(region)) throw new Error(`96bulls: ${INGEST_LEDGER_REGION_VAR} must be a region name`);
-  return { bucket, region };
+  const own = env.INGEST_LEDGER_ENDPOINT?.trim();
+  const locker = env.LOCKER_ENDPOINT?.trim();
+  if (!own && locker && region !== lockerRegion)
+    throw new Error(`96bulls: LOCKER_ENDPOINT is set and ${INGEST_LEDGER_REGION_VAR} differs from LOCKER_REGION: set INGEST_LEDGER_ENDPOINT`);
+  const endpoint = own || locker;
+  if (endpoint && !/^https?:\/\/[^/?#\s]+$/.test(endpoint)) throw new Error("96bulls: INGEST_LEDGER_ENDPOINT must be a bare origin");
+  return { bucket, region, ...(endpoint ? { endpoint } : {}) };
+}
+
+/** INGEST_LEDGER_HOME_GUARD (ledger-store.ts): on only with INGEST_LEDGER=s3. */
+export function selfhostLedgerHomeGuard(env: NodeJS.ProcessEnv, ledger: "s3" | undefined): boolean {
+  let on: boolean;
+  try { on = ledgerHomeGuard(env); } catch { throw new Error(`96bulls: ${LEDGER_HOME_GUARD_VAR} must be on or off`); }
+  if (on && ledger !== "s3") throw new Error(`96bulls: ${LEDGER_HOME_GUARD_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
+  return on;
 }
 
 /** INGEST_S3_TENANT_LIMIT=on. `asyncMaxPerOrg` (INGEST_ASYNC_MAX_PER_ORG): present only with async/drain admission. */
@@ -460,6 +487,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
   const ledgerStore = selfhostLedgerStore(env, ledger);
+  const homeGuard = selfhostLedgerHomeGuard(env, ledger);
   return {
     enabled: true,
     port: port(env),
@@ -484,5 +512,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(ledger ? { ledger, ledgerLogCommit } : {}),
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
     ...(ledgerStore ? { ledgerStore } : {}),
+    ...(homeGuard ? { ledgerHomeGuard: true as const } : {}),
   };
 }

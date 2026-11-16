@@ -90,6 +90,12 @@ export interface RelocateDeps {
   nowMs?: () => number;
 }
 
+/**
+ * The Content-Type every ledger writer sets: `application/json` on the `.json` documents (ledger-s3, ledger-log,
+ * rearm-sweeper all pass it); anything else (log payloads, `.json.zst`) was written without one, so the store infers it
+ * from the key exactly as it did then. ObjectMeta carries no Content-Type to copy, so this reproduces the writers' rule.
+ */
+const contentTypeOf = (key: string): { contentType?: string } => (key.endsWith(".json") ? { contentType: "application/json" } : {});
 const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
 const enc = new TextEncoder();
 
@@ -198,7 +204,7 @@ export async function relocateLedger(d: RelocateDeps, args: RelocateArgs): Promi
       if (!a) return;
       bytes += a.bytes.byteLength;
       try {
-        const ack = await dst.store.put(objectKey(k), a.bytes, { ifNoneMatch: true });
+        const ack = await dst.store.put(objectKey(k), a.bytes, { ifNoneMatch: true, ...contentTypeOf(k) });
         if (ack.created) copied++; else skipped++;
         return;
       } catch (error) {
@@ -207,7 +213,7 @@ export async function relocateLedger(d: RelocateDeps, args: RelocateArgs): Promi
       const b = await read(dst.store, k);
       if (b && sha(b.bytes) === sha(a.bytes)) { skipped++; return; }
       if (!b || !args.replaceStale) { diverged++; return; }
-      await dst.store.put(objectKey(k), a.bytes, { ifMatch: b.version });
+      await dst.store.put(objectKey(k), a.bytes, { ifMatch: b.version, ...contentTypeOf(k) });
       replaced++;
     });
     return { ...base, ok: diverged === 0, source: { objects: keys.length, bytes }, destination: { objects: copied + skipped + replaced }, copied, skipped, replaced, diverged };
@@ -232,7 +238,9 @@ export function relocateDepsFromEnv(env: NodeJS.ProcessEnv): RelocateDeps {
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(keyRoot)) refuse("config_invalid");
   const main = buildLockerStore(env).store as unknown as ObjectStore;
-  const ledger = buildLockerStore({ ...env, LOCKER_BUCKET: sep.bucket, LOCKER_REGION: sep.region }).store as unknown as ObjectStore;
+  const ledgerEnv: NodeJS.ProcessEnv = { ...env, LOCKER_BUCKET: sep.bucket, LOCKER_REGION: sep.region };
+  if (sep.endpoint) ledgerEnv.LOCKER_ENDPOINT = sep.endpoint; else delete ledgerEnv.LOCKER_ENDPOINT;
+  const ledger = buildLockerStore(ledgerEnv).store as unknown as ObjectStore;
   return { main: { store: main, bucket: env.LOCKER_BUCKET! }, ledger: { store: ledger, bucket: sep.bucket }, keyRoot };
 }
 

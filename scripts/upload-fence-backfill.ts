@@ -28,6 +28,7 @@
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
+import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
 
@@ -156,6 +157,9 @@ if (import.meta.main) {
       credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
     }) as unknown as ObjectStore;
+    // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
+    // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
+    await assertLedgerHomeHere(store, "96bulls", args.bucket);
     const db = client;
     const summary = await backfillUploadFences({
       sql: { query: async (text, params) => ({ rows: (await db.query(text, params)).rows }) },

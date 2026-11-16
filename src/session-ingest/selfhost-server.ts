@@ -194,8 +194,8 @@ export interface RuntimeParts {
   /** The Locker store; with INGEST_LEDGER_BUCKET, the routed store over it and the ledger bucket (ledger-store.ts). */
   store: ObjectStore;
   /**
-   * INGEST_LEDGER=s3: the ledger-home fork guard (ledger-s3.ts `ledgerHome`). Production always sets it: `expect` is
-   * the ledger's bucket, `required` true only with a separate ledger bucket. Absent (tests): no check.
+   * INGEST_LEDGER=s3: the ledger-home fork guard (ledger-s3.ts `ledgerHome`): with INGEST_LEDGER_BUCKET, `expect` that
+   * bucket and `required`; with INGEST_LEDGER_HOME_GUARD=on alone, `expect` LOCKER_BUCKET, not required. Absent: no read.
    */
   ledgerHome?: { expect: string; required: boolean };
   verify: (authorization: string | undefined) => Promise<IngestIdentity>;
@@ -539,13 +539,15 @@ export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings
  * The Locker store, and with INGEST_LEDGER_BUCKET the routed store over it and the ledger bucket (same provider,
  * endpoint and credential source). `ledgerHome`: the fork guard's expectation (INGEST_LEDGER=s3).
  */
-export function selfhostStores(settings: Pick<SelfhostIngestSettings, "keyRoot"> & Partial<Pick<SelfhostIngestSettings, "ledger" | "ledgerStore">>, env: NodeJS.ProcessEnv,
+export function selfhostStores(settings: Pick<SelfhostIngestSettings, "keyRoot"> & Partial<Pick<SelfhostIngestSettings, "ledger" | "ledgerStore" | "ledgerHomeGuard">>, env: NodeJS.ProcessEnv,
   build: typeof buildLockerStore = buildLockerStore): { store: ObjectStore; main: ObjectStore; ledgerStore?: ObjectStore; ledgerHome?: { expect: string; required: boolean } } {
   const sep = settings.ledgerStore;
   const main = build(env).store as unknown as ObjectStore;
   if (settings.ledger !== "s3") return { store: main, main };
-  if (!sep) return { store: main, main, ledgerHome: { expect: env.LOCKER_BUCKET!, required: false } };
-  const ledgerStore = build({ ...env, LOCKER_BUCKET: sep.bucket, LOCKER_REGION: sep.region }).store as unknown as ObjectStore;
+  if (!sep) return settings.ledgerHomeGuard ? { store: main, main, ledgerHome: { expect: env.LOCKER_BUCKET!, required: false } } : { store: main, main };
+  const ledgerEnv: NodeJS.ProcessEnv = { ...env, LOCKER_BUCKET: sep.bucket, LOCKER_REGION: sep.region };
+  if (sep.endpoint) ledgerEnv.LOCKER_ENDPOINT = sep.endpoint; else delete ledgerEnv.LOCKER_ENDPOINT;
+  const ledgerStore = build(ledgerEnv).store as unknown as ObjectStore;
   return { store: ledgerRoutedStore(main, ledgerStore, settings.keyRoot), main, ledgerStore, ledgerHome: { expect: sep.bucket, required: true } };
 }
 
