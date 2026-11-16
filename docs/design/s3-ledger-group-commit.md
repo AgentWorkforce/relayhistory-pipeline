@@ -43,7 +43,7 @@ Counts below are S3 requests. A batch has R records, K distinct revision shards 
 | 6 | fence again | ledger-s3.ts:1167 | 1 GET | yes |
 | 7 | batch doc create/CAS (pending, or committed for `replay_fast`) | ledger-s3.ts:1181 | 1 PUT | yes |
 | 8 | privacy-journal gate | async-admission.ts:440 | 1 GET (+1 CAS only to expire stale pending) | yes |
-| 9 | consent gate (admit) | deliver.ts:404 | 0 S3 (policy); refused config under `INGEST_LEDGER=s3`, see §4 | — |
+| 9 | consent gate (admit) | deliver.ts:404 | 0 S3 when no consent store is needed; runs under `INGEST_LEDGER=s3` whenever the inbox header carries `consentCap`, see §4 | — |
 | 10 | per session: pointer GET (+ first PUT), manifest GET, chunk PUT, manifest CAS | writer.ts:204/220 `resolveLocation`, 335 `writeGroup`, 443 `writeGroups` | about 4S (≤ 6 sessions at once) | yes, within a session |
 | 11 | commit: batch doc + fence | ledger-s3.ts:1201 | 2 GET | yes |
 | 12 | claim-token check | ledger-s3.ts:1204-1206 | 0 (on step 11's read) | — |
@@ -130,8 +130,10 @@ The skip-at-cap hint (selfhost-admission.ts:318-348) counts per started entry. A
   cannot start a member separately (which would steal its claim token, `ledger_attempt_superseded`, and waste
   the work the hint exists to save).
 - A member is eligible only if its own `notBefore` has passed and its directory's `dirBusyUntil` has passed,
-  exactly as for a single start. A member deferred inside a group sets its own `notBefore` and the directory's
-  `dirBusyUntil`, as `admitOne` does today (selfhost-admission.ts:283-291).
+  exactly as for a single start. A group member never hits a tenant deferral: its limiter units are taken
+  before the claim, clamped to what is free. A tenant deferral (with its own `notBefore` and the directory's
+  `dirBusyUntil`, selfhost-admission.ts:283-291) happens only on the single-member fallback, where the slot is
+  still taken after the claim (deliver.ts:420-422).
 
 ### Sequence
 
@@ -277,10 +279,13 @@ receipt id (content-addressed), outcome marker per receipt dir. There is no grou
 
 Each invariant holds per member, with reads that are the same as, or later than, a single batch's.
 
-**Scope under `INGEST_LEDGER=s3`.** The self-host server refuses session-selection erase, operator erase,
-upload consent and `withSessionWrites` with the S3 ledger (selfhost-server.ts:228-229). So the consent gates
-below never run on the path this design changes today; they are kept per member so that the design stays
-correct if consent is ever admitted with the S3 ledger. The gates a group can meet today are the privacy
+**Scope under `INGEST_LEDGER=s3`.** The self-host server refuses session selection, upload consent,
+`withSessionWrites` and the session erase service with the S3 ledger (selfhost-server.ts:228-229). Capture
+policy is still applied in every admission mode (selfhost-server.ts:257-258/275/320): the inbox header carries
+`consentCap` (async-admission.ts:147/162-164/241-242), and admission-consumer.ts:142-143 installs the consent
+gate whenever `consentCap` is present (with no consent store it refuses `consent_store_required`,
+upload-consent.ts:329-334). So the per-inbox consent gate DOES run on the path this design changes, and the
+group path keeps it per member, at admit and again at commit. The other gates a group meets are the privacy
 journal (reset, seq) and the fence (selections and deletions written by the control path).
 
 1. **No write before the gates.** No canonical or index write for a member happens before its own claim (E),
