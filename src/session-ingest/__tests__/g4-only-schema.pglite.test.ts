@@ -194,6 +194,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Summary regeneration: one append-only audit table (owner-only trigger and purge functions) and five nullable/defaulted
       // session_briefs columns plus a partial index; no G4 function names them.
       "20261105062040_summary_regeneration.sql",
+      // Read API token reader kind: one nullable column on the 044000 token table and one new SECURITY DEFINER issue function; no G4 function names them.
+      "20261105062050_read_api_token_reader_kind.sql",
       // Relay-turn origin guard: adds an owner-only helper and replaces the public selection
       // boundary so it cannot impersonate the reserved private-turn origin.
       "20261105062060_turns_selection_origin_guard.sql",

@@ -604,6 +604,14 @@ components:
         audience: {type: string, description: Must normalize to this service's origin, else 403 audience_mismatch.}
         scopes: {type: array, const: ["rth:read"]}
         label: {type: string, maxLength: 128}
+        reader_kind:
+          type: string
+          enum: [browser, device, mcp]
+          description: >-
+            Accepted only when READ_API_MINT_READER_KIND is on (default off); with it off, a body
+            carrying this field is 400 bad_request "body has an unknown field". Any other value or
+            type is 400 bad_request. Recorded on issue. On refresh it is validated but not stored:
+            the session keeps the reader_kind recorded at issue.
     SessionSummary:
       type: object
       required: [sessionId, source, userIds, machineIds, firstTs, lastTs, eventCount, models]

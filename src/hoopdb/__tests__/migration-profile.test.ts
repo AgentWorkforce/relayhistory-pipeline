@@ -2639,6 +2639,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
     const LA = "upstream:20261105062030_legacy_export_scope_authority.sql";
     const RG = "upstream:20261105062040_summary_regeneration.sql";
+    const RK = "upstream:20261105062050_read_api_token_reader_kind.sql";
     const TSOG = "upstream:20261105062060_turns_selection_origin_guard.sql";
     const AR = "upstream:20261105062070_coordination_advisor_readers.sql";
     const MD = "upstream:20261105062080_memory_documents.sql";
@@ -2654,7 +2655,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, TSOG, AR, MD, MDE, MUE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2764,6 +2765,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       bodyOf("20261105057030_selfhost_erase_directory_membership.sql", "ingest_selfhost_set_session_uploads", "$selfhost_selection$"),
     );
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_set_session_uploads_internal(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    // 20261105062050 (read API token reader kind) is the newest: 062010's down refuses (55000) while it is applied;
+    // its checksum-pinned down drops read_api_token_issue_v2, the reader_kind column and its ledger row, and
+    // refuses on a rerun. The 044000 table and functions stay.
+    const readerKindColumn = async () =>
+      (await db.query<{ e: boolean }>("SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sessions.read_api_tokens'::regclass AND attname = 'reader_kind' AND NOT attisdropped) e")).rows[0]!.e;
+    const issueV2 = "sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)";
+    const regproc = async (sig: string) =>
+      (await db.query<{ r: string | null }>("SELECT to_regprocedure($1)::text r", [sig])).rows[0]?.r ?? null;
+    expect(await names()).toContain(RK);
+    expect(await readerKindColumn()).toBe(true);
+    expect(await regproc(issueV2)).not.toBeNull();
+    expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(OCF);
+    await rollback("20261105062050_read_api_token_reader_kind.down.sql");
+    expect(await names()).not.toContain(RK);
+    expect(await readerKindColumn()).toBe(false);
+    expect(await regproc(issueV2)).toBeNull();
+    expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
+    expect(await regproc("sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz)")).not.toBeNull();
+    expect((await failure(rollback("20261105062050_read_api_token_reader_kind.down.sql")))?.code).toBe("55000");
     // 20261105062040 (summary regeneration) is the newest: 062030's down refuses (55000) while it is applied; its
     // checksum-pinned down drops the audit table, its four functions, the session_briefs columns and partial index
     // and its ledger row (96bulls 0006's session_summaries columns stay), and refuses on a rerun.

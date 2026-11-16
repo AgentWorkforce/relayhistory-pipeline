@@ -480,6 +480,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
                WHERE attrelid = to_regclass('sessions.session_briefs') AND NOT attisdropped
                  AND attname IN ('covered_turns', 'retry_attempts', 'next_retry_at', 'config_hash', 'pipeline_version')) = 5 AS applied`,
   },
+  "upstream:20261105062050_read_api_token_reader_kind.sql": {
+    evidence: "column sessions.read_api_tokens.reader_kind and function sessions.read_api_token_issue_v2",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.read_api_tokens') AND attname = 'reader_kind' AND NOT attisdropped) AND to_regprocedure('sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)') IS NOT NULL AS applied",
+  },
   "upstream:20261105062060_turns_selection_origin_guard.sql": {
     evidence: "public selection rejects the reserved turns origin; owner-only helper preserves internal erasure",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%turns origin is reserved%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_set_session_uploads_internal(jsonb)') AND prosecdef) AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_set_session_uploads_internal%') AS applied",

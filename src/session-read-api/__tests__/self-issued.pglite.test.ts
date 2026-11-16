@@ -1,7 +1,7 @@
 /**
- * Migration 20261105044000 on PGlite, as the genuine bulls96_read_api login: the store over the
- * real functions, atomic refresh, identity binding, delete, the sweep, the role guard and the
- * table's refusal of direct access.
+ * Migrations 20261105044000 and 20261105062050 on PGlite, as the genuine bulls96_read_api login: the
+ * store over the real functions, atomic refresh, identity binding, delete, the sweep, the role guard,
+ * the table's refusal of direct access, and the reader_kind column (recorded at issue, kept on refresh).
  */
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -34,6 +34,7 @@ beforeAll(async () => {
     CREATE SCHEMA sessions; GRANT USAGE ON SCHEMA sessions TO bulls96_read_api;
   `);
   await db.exec(readFileSync(join(root, "supabase/migrations/20261105044000_read_api_tokens.sql"), "utf8"));
+  await db.exec(readFileSync(join(root, "supabase/migrations/20261105062050_read_api_token_reader_kind.sql"), "utf8"));
   const client: TokenQuery & { release(): void } = {
     async query(text, params) {
       return (await db.query(text, params as never)) as { rows: unknown[] };
@@ -50,7 +51,7 @@ async function seed(over: Partial<NewTokenRow> = {}) {
   const row: NewTokenRow = {
     id: `id-${serial}`, family: `f-${serial}`, subjectType: "cli", audience: AUD, userId: "u-a", orgId: "org-a", workspaceId: "ws-a",
     accessHash: await hashToken(`a${serial}`), accessExpires: inMs(60_000), refreshHash: await hashToken(`r${serial}`), refreshExpires: inMs(3_600_000),
-    label: null, now, ...over,
+    label: null, readerKind: null, now, ...over,
   };
   await asReader(() => store.issue(row));
   return row;
@@ -129,5 +130,41 @@ describe("read_api_tokens", () => {
     await db.exec("BEGIN; SET LOCAL ROLE bulls96_read_api");
     await expect(store.verify("0".repeat(64), now)).rejects.toThrow(/not the read api login/);
     await db.exec("ROLLBACK");
+  });
+});
+
+describe("read_api_tokens.reader_kind (062050)", () => {
+  const readerKindOf = async (id: string) =>
+    (await db.query<{ k: string | null }>("SELECT reader_kind k FROM sessions.read_api_tokens WHERE id = $1", [id])).rows[0]?.k;
+  const V2 = "sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)";
+
+  test("each kind is recorded through issue_v2; none stays NULL through the 044000 issue", async () => {
+    for (const kind of ["browser", "device", "mcp"] as const) {
+      const row = await seed({ readerKind: kind });
+      expect(await readerKindOf(row.id)).toBe(kind);
+      expect((await asReader(() => store.verify(row.accessHash, now)))?.id).toBe(row.id);
+    }
+    expect(await readerKindOf((await seed()).id)).toBeNull();
+  });
+
+  test("refresh keeps the reader_kind recorded at issue", async () => {
+    const row = await seed({ readerKind: "device" });
+    const next = await refreshOf(row);
+    expect((await asReader(() => store.refresh(next)))?.id).toBe(row.id);
+    expect(await readerKindOf(row.id)).toBe("device");
+  });
+
+  test("the CHECK refuses any other kind, even through issue_v2", async () => {
+    for (const bad of ["Browser", "", "cli"])
+      await expect(seed({ readerKind: bad as never })).rejects.toThrow(/read_api_tokens_reader_kind_check/);
+  });
+
+  test("issue_v2 is SECURITY DEFINER, pinned, EXECUTE to bulls96_read_api only, and refuses another login", async () => {
+    const fn = (await db.query<{ d: boolean; c: string[] }>("SELECT prosecdef d, proconfig c FROM pg_proc WHERE oid = $1::regprocedure", [V2])).rows[0]!;
+    expect(fn).toEqual({ d: true, c: ["search_path=pg_catalog, pg_temp"] });
+    for (const role of ["PUBLIC", "anon", "authenticated", "service_role"])
+      expect((await db.query<{ e: boolean }>(`SELECT has_function_privilege(${role === "PUBLIC" ? "'public'" : `'${role}'`}, $1, 'EXECUTE') e`, [V2])).rows[0]!.e).toBe(false);
+    expect((await db.query<{ e: boolean }>("SELECT has_function_privilege('bulls96_read_api', $1, 'EXECUTE') e", [V2])).rows[0]!.e).toBe(true);
+    await expect(store.issue({ id: "not-reader", family: "f", subjectType: "cli", audience: AUD, userId: "u", orgId: "o", workspaceId: "w", accessHash: "a".repeat(64), accessExpires: inMs(60_000), refreshHash: "b".repeat(64), refreshExpires: inMs(60_000), label: null, readerKind: "mcp", now })).rejects.toThrow(/not the read api login/);
   });
 });

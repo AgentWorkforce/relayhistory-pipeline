@@ -163,6 +163,18 @@ export const READ_API_INTERNAL_SECRET_PREVIOUS_VAR = "READ_API_INTERNAL_SECRET_P
 export const READ_API_ACCESS_TOKEN_TTL_VAR = "READ_API_ACCESS_TOKEN_TTL_SECONDS";
 export const READ_API_CORS_ORIGINS_VAR = "READ_API_CORS_ALLOWED_ORIGINS";
 export const READ_API_EVENT_MESSAGE_IDS_VAR = "READ_API_EVENT_MESSAGE_IDS";
+export const READ_API_MINT_READER_KIND_VAR = "READ_API_MINT_READER_KIND";
+
+/**
+ * READ_API_MINT_READER_KIND (default off, self_issued mode only): the self-issued mint routes accept an
+ * optional reader_kind. Parsed like src/shared/env.ts flag(): "1" or "true" (any case) is on; unset, ""
+ * or any other value is off.
+ */
+export function mintReaderKindEnabled(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[READ_API_MINT_READER_KIND_VAR];
+  if (raw === undefined || raw === "") return false;
+  return raw === "1" || raw.toLowerCase() === "true";
+}
 
 /**
  * READ_API_EVENT_MESSAGE_IDS (default off): exactly "true" serves includeMessageId on session events
@@ -260,7 +272,11 @@ function selfIssuedAuthConfig(env: NodeJS.ProcessEnv): AuthConfig {
   return {
     origin: raw,
     mode: "self_issued",
-    selfIssued: { audience, internalSecrets: previous ? [current, previous] : [current], accessTtlSeconds: accessTtlSeconds(env) },
+    selfIssued: {
+      audience, internalSecrets: previous ? [current, previous] : [current], accessTtlSeconds: accessTtlSeconds(env),
+      // Present only when on, so the default config is exactly as before.
+      ...(mintReaderKindEnabled(env) ? { mintReaderKind: true } : {}),
+    },
   };
 }
 

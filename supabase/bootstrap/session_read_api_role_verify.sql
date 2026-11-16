@@ -139,6 +139,7 @@ BEGIN
          'sessions.read_api_token_delete_by_hash(text,text)',
          'sessions.read_api_token_delete_for(text,text,text,text)',
          'sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone)',
+         'sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone,text)',
          'sessions.read_api_token_refresh(text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone)',
          'sessions.read_api_token_verify(text,timestamp with time zone)',
          'sessions.relayfacts_list_v1(text,text,text,timestamp with time zone,uuid,integer)',
