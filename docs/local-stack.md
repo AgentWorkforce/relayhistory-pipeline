@@ -386,6 +386,24 @@ malformed value that the old image ignored now fails startup, naming the variabl
 remove or correct those values, or set `SEARCH_INDEX_STREAMING_ENABLED="false"` (chart `enabled: false`), under
 which neither budget is read.
 
+### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
+
+The hosted session pipeline Lambda has its own flags, separate from the self-host ones above (it keeps ignoring
+`SEARCH_INDEX_STREAMING_ENABLED`). All are default off: with them unset the Lambda behaves as before and never
+streams. `SEARCH_INDEX_STREAMING_CH` must be exactly `1` (unset, `""` or `0` is off; any other value fails
+startup) and needs `SEARCH_INDEX_ENABLED=1` and the `clickhouse` search backend from the pipeline secret; it is
+refused together with `SEARCH_INDEX_OUTPUT_FACTS=1`. Only with it on, `SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES`
+(default 1 GiB, accepted 256 MiB to 2 GiB, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS`
+(default 1000000, accepted 400000 to 2000000) bound the read as above, and `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS`
+(default 60000, accepted 10000 to 240000) sets a deadline of the invocation's remaining time minus the margin. The
+index scan reads the ClickHouse scope in keyset pages under the events budget; going past it leaves the scope
+partial with `stream_read_events_budget`. The deadline is checked between chunk reads, between scan pages, before
+the regenerating pass and before deletes; once passed, the scope stays partial with `scope_too_large` and
+`stream_deadline`, keeps owing a pass, and nothing is deleted (rows already written stay). The stack renders these
+only from `transcriptStore.sessionPipeline.streamReconcile` with `enabled: true` (and `searchIndex: true`); its
+`maxReadBytes`, `maxReadEvents` and `deadlineMarginMs` take the same ranges in plain numbers. Streamed output facts
+(D2) and the large-scope worker (D3) are not in this cut.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

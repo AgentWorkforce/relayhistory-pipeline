@@ -38,6 +38,7 @@ import {
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
+import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, STREAM_READ_CEILING } from "../../../src/session-pipeline/search-index.ts";
 import { lambdaEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
@@ -912,5 +913,78 @@ describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
     for (const value of ["supabase", "legacy", true, false, null, "", {}])
       expect(() => validate(withPipeline({ legacyReadSource: value }))).toThrow('legacyReadSource must be "frozen-supabase"');
     expect(() => validate(withPipeline({ SESSIONS_NEON_EXIT: "true" }))).toThrow(/sessionPipeline.SESSIONS_NEON_EXIT is not a known setting/);
+  });
+});
+
+describe("session pipeline: streamed ClickHouse reconcile (issue 610 L3 D1)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  const NEW = ["SEARCH_INDEX_STREAMING_CH", "SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", "SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", "SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS"];
+  const base = Object.keys(envOf({ searchIndex: true })).sort();
+
+  it("unset or disabled renders nothing new, whatever knobs are given", () => {
+    for (const key of NEW) expect(base).not.toContain(key);
+    for (const cfg of [{ searchIndex: true }, { searchIndex: true, streamReconcile: { enabled: false } }, { streamReconcile: { enabled: false, maxReadBytes: 268_435_456, maxReadEvents: 400_000, deadlineMarginMs: 10_000 } }] as SessionPipelineInputs[]) {
+      expect(refusedBy(cfg)).toBe("");
+      expect(Object.keys(envOf(cfg)).sort()).toEqual(base);
+      expect(searchIndexStreamChFromEnv(envOf(cfg), searchIndexLimits(false))).toBeUndefined();
+    }
+  });
+
+  it("armed renders exactly the flag plus the knobs that are set, and the Lambda parses them unchanged", () => {
+    const armed = { searchIndex: true, streamReconcile: { enabled: true } };
+    expect(refusedBy(armed)).toBe("");
+    const env = envOf(armed);
+    expect(Object.keys(env).sort()).toEqual([...base, "SEARCH_INDEX_STREAMING_CH"].sort());
+    expect(env.SEARCH_INDEX_STREAMING_CH).toBe("1");
+    expect(searchIndexStreamChFromEnv(env, searchIndexLimits(false))).toEqual({ maxReadBytes: 1024 * 1024 * 1024, maxReadEvents: 1_000_000, deadlineMarginMs: 60_000 });
+    const full = { searchIndex: true, streamReconcile: { enabled: true, maxReadBytes: 536_870_912, maxReadEvents: 700_000, deadlineMarginMs: 90_000 } };
+    expect(refusedBy(full)).toBe("");
+    const fenv = envOf(full);
+    expect(Object.keys(fenv).sort()).toEqual([...base, ...NEW].sort());
+    expect(Object.fromEntries(NEW.map((k) => [k, fenv[k as keyof typeof fenv]]))).toEqual({
+      SEARCH_INDEX_STREAMING_CH: "1",
+      SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: "536870912",
+      SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS: "700000",
+      SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS: "90000",
+    });
+    expect(searchIndexStreamChFromEnv(fenv, searchIndexLimits(false))).toEqual({ maxReadBytes: 536_870_912, maxReadEvents: 700_000, deadlineMarginMs: 90_000 });
+    // No output facts input in this cut.
+    for (const key of Object.keys(fenv)) expect(key).not.toMatch(/OUTPUT_FACTS/);
+  });
+
+  it("the stack bounds are the Lambda's: every accepted edge parses and every refused edge would fail at start", () => {
+    const floor = searchIndexStreamFloor(searchIndexLimits(false));
+    expect(floor).toEqual({ maxReadBytes: 268_435_456, maxReadEvents: 400_000 });
+    expect(STREAM_READ_CEILING).toMatchObject({ maxReadBytes: 2_147_483_648, maxReadEvents: 2_000_000 });
+    const edges = [
+      { maxReadBytes: floor.maxReadBytes, maxReadEvents: floor.maxReadEvents, deadlineMarginMs: 10_000 },
+      { maxReadBytes: STREAM_READ_CEILING.maxReadBytes, maxReadEvents: STREAM_READ_CEILING.maxReadEvents, deadlineMarginMs: 240_000 },
+    ];
+    for (const knobs of edges) {
+      const cfg = { searchIndex: true, streamReconcile: { enabled: true, ...knobs } };
+      expect(refusedBy(cfg)).toBe("");
+      expect(searchIndexStreamChFromEnv(envOf(cfg), searchIndexLimits(false))).toEqual(knobs);
+    }
+    const outside: [string, number][] = [["maxReadBytes", floor.maxReadBytes - 1], ["maxReadBytes", STREAM_READ_CEILING.maxReadBytes + 1], ["maxReadEvents", floor.maxReadEvents - 1], ["maxReadEvents", STREAM_READ_CEILING.maxReadEvents + 1], ["deadlineMarginMs", 9_999], ["deadlineMarginMs", 240_001]];
+    const lambdaName: Record<string, string> = { maxReadBytes: "SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", maxReadEvents: "SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", deadlineMarginMs: "SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS" };
+    for (const [k, n] of outside) {
+      expect(refusedBy({ searchIndex: true, streamReconcile: { enabled: true, [k]: n } })).toMatch(new RegExp(`streamReconcile\\.${k} must be an integer`));
+      expect(() => searchIndexStreamChFromEnv({ SEARCH_INDEX_STREAMING_CH: "1", [lambdaName[k]!]: String(n) }, searchIndexLimits(false))).toThrow(lambdaName[k]!);
+    }
+  });
+
+  it("invalid shapes are refused", () => {
+    expect(refusedBy({ streamReconcile: { enabled: true } })).toMatch(/streamReconcile.enabled requires searchIndex: true/);
+    expect(refusedBy({ searchIndex: false, streamReconcile: { enabled: true } })).toMatch(/requires searchIndex: true/);
+    expect(refusedBy({ searchIndex: true, streamReconcile: { enabled: true, outputFacts: true } })).toMatch(/streamReconcile.outputFacts is not a known setting/);
+    expect(refusedBy({ searchIndex: true, streamReconcile: { enabled: true, maxreadbytes: 1 } })).toMatch(/streamReconcile.maxreadbytes is not a known setting/);
+    expect(refusedBy({ searchIndex: true, streamReconcile: {} })).toMatch(/streamReconcile.enabled must be a boolean/);
+    expect(refusedBy({ searchIndex: true, streamReconcile: { enabled: "1" } })).toMatch(/enabled must be a boolean/);
+    for (const bad of [null, true, [], "on"]) expect(refusedBy({ searchIndex: true, streamReconcile: bad })).toMatch(/streamReconcile must be a plain object/);
+    for (const n of [1.5, "300000000", Number.NaN, Number.POSITIVE_INFINITY])
+      expect(refusedBy({ searchIndex: true, streamReconcile: { enabled: true, maxReadBytes: n } })).toMatch(/maxReadBytes must be an integer/);
+    // Disabled knobs are still validated, so arming later cannot surface a bad value.
+    expect(refusedBy({ streamReconcile: { enabled: false, deadlineMarginMs: 5 } })).toMatch(/deadlineMarginMs must be an integer/);
   });
 });
