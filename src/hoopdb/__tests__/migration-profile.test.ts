@@ -583,7 +583,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(35); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations)
+    ).toBe(36); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations) + summary_regeneration_audit (20261105062040)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2467,13 +2467,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const UE = "upstream:20261105058010_operator_user_erase.sql";
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
     const CA = "upstream:20261105062000_coordination_advisories.sql";
+    const RG = "upstream:20261105062040_summary_regeneration.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, RG]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2524,7 +2525,21 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062000 (coordination advisories) is the newest: 059000's down refuses (55000) while it is applied;
+    // 20261105062040 (summary regeneration) is the newest: 062000's down refuses (55000) while it is applied; its
+    // checksum-pinned down drops the audit table, its three functions, the session_briefs columns and partial index
+    // and its ledger row (96bulls 0006's session_summaries columns stay), and refuses on a rerun.
+    expect(await names()).toContain(RG);
+    expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(CA);
+    await rollback("20261105062040_summary_regeneration.down.sql");
+    expect(await names()).not.toContain(RG);
+    expect(await relation("sessions.summary_regeneration_audit")).toBeNull();
+    expect(await relation("sessions.session_briefs_next_retry")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'summary\\_regeneration\\_audit\\_%'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_briefs' AND column_name IN ('covered_turns','retry_attempts','next_retry_at','config_hash','pipeline_version')")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_summaries' AND column_name='degraded'")).rows[0]!.n).toBe(1);
+    expect((await failure(rollback("20261105062040_summary_regeneration.down.sql")))?.code).toBe("55000");
+    // 20261105062000 (coordination advisories) is then the newest: 059000's down refuses (55000) while it is applied;
     // its checksum-pinned down drops the five functions, the table and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CA);
     expect((await failure(rollback("20261105059000_ingest_publication_gcs_provider.down.sql")))?.code).toBe("55000");

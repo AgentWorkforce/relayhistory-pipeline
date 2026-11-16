@@ -264,6 +264,7 @@ const adoptableIndexesSentinel = (step: string) =>
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "96bulls:0005_operator_session_erase_guards.sql": { evidence: "table sessions.session_erasure_optional_guards", sql: relation("sessions.session_erasure_optional_guards") },
+  "96bulls:0006_summary_regeneration.sql": { evidence: "ALTER-only: column sessions.session_summaries.degraded", sql: column("sessions.session_summaries", "degraded") },
   "upstream:20261105050020_operator_session_erase_runtime.sql": { evidence: "table sessions.session_erasure_writes", sql: relation("sessions.session_erasure_writes") },
   "upstream:20261105041000_ingest_privacy_authority.sql": {
     evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
@@ -460,6 +461,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105062000_coordination_advisories.sql": {
     evidence: "function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories",
     sql: "SELECT to_regprocedure('sessions.coordination_advisories_upsert_v1(text,text,jsonb)') IS NOT NULL AND to_regclass('sessions.coordination_advisories') IS NOT NULL AS applied",
+  },
+  "upstream:20261105062040_summary_regeneration.sql": {
+    evidence: "function sessions.summary_regeneration_audit_purge_v1 and table sessions.summary_regeneration_audit",
+    sql: "SELECT to_regprocedure('sessions.summary_regeneration_audit_purge_v1(integer)') IS NOT NULL AND to_regclass('sessions.summary_regeneration_audit') IS NOT NULL AS applied",
   },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
