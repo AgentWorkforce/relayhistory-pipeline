@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore, type PutOpts } from "../../shared/vendor.ts";
 import {
   appendBatches, enableLogMode, ledgerLogCommitMode, LOG_CHECKPOINT_EVERY, LOG_ENTRIES_PER_DIR, LOG_REMEMBERED_BATCHES, LogFenced, logKeys, LogUnavailable,
-  openStream, putPayload, readEntries, takeStream, type LogBatch,
+  LOG_PENDING_MAX_AGE_MS, openStream, putPayload, readEntries, settlePending, takeStream, type LogBatch,
 } from "../ledger-log.ts";
 import { selfhostLedgerLogCommit } from "../selfhost-config.ts";
 import { TENANT, scratchStore } from "./support.ts";
@@ -476,5 +476,33 @@ describe("readers fail closed", () => {
     const b = await putPayload(store, keys, new TextEncoder().encode("same"));
     expect(a).toEqual(b);
     expect(new TextDecoder().decode(await readAll(await store.get(objectKey(a.key))))).toBe("same");
+  });
+});
+
+describe("an unresolved entry past its age bound is only read back, never resent (its payload may be collected)", () => {
+  test("absent: dropped, so the next append builds a fresh entry at that seq; landed: applied", async () => {
+    for (const landed of [false, true]) {
+      const inner = fresh();
+      let failing = true;
+      const store = faulty(inner, (_k, n) => (n === 1 ? "ok" : failing ? "before" : "ok"));
+      let clock = 1_800_000_000_000;
+      const w = { writer: "w", now: () => clock, ...noSleep };
+      const s = await enableLogMode(store, keys, null, w);
+      await expect(appendBatches(store, s, [await batch(inner, "old")], null, w)).rejects.toBeInstanceOf(LogUnavailable);
+      expect(s.pending?.seq).toBe(1);
+      failing = false;
+      // landed: the unanswered PUT did land after all (written here, outside the writer).
+      if (landed) await inner.put(objectKey(keys.entry(1)), s.pending!.bytes, { ifNoneMatch: true });
+      clock += LOG_PENDING_MAX_AGE_MS + 1;
+      await settlePending(store, s, w);
+      expect(s.pending).toBeUndefined();
+      expect(s.head).toBe(landed ? 1 : 0);
+      expect(s.remembered.has("old")).toBe(landed);
+      // The next append lands at the next seq either way, and the chain stays valid.
+      expect((await appendBatches(store, s, [await batch(inner, "new")], null, w)).seq).toBe(landed ? 2 : 1);
+      const ids: string[] = [];
+      for await (const e of readEntries(inner, keys)) if (e.kind === "batches") ids.push(...e.batches.map((b) => b.batchId));
+      expect(ids).toEqual(landed ? ["old", "new"] : ["new"]);
+    }
   });
 });

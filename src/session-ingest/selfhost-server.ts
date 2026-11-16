@@ -86,7 +86,7 @@ import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
 import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage, type AdmissionTenantHint } from "./async-admission.ts";
 import { promoteUpload } from "./upload-admission.ts";
-import type { DeliverDeps } from "./deliver.ts";
+import { assertWithinBudget, type DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import { s3Ledger, serverLedgerParallel, withSqlControlMirror } from "./ledger-s3.ts";
@@ -220,6 +220,7 @@ export interface SelfhostRuntimeOptions {
  */
 export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean } = {}): Ledger {
   // The log materializer's ledger passes logModeGuard false: it is the one legacy writer allowed on a log-mode stream.
+  // Callers pass the parsed mode (selfhostIngestRuntime); the env read is only for a direct caller that does not.
   const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
@@ -233,7 +234,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "s3TenantLimit">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "s3TenantLimit">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
@@ -245,7 +246,10 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   // INGEST_S3_TENANT_LIMIT=on (selfhost-config.ts): needs the S3 ledger; refused again here for direct callers.
   const tenantLimit = settings.s3TenantLimit;
   if (tenantLimit && !s3) throw new Error("96bulls: INGEST_S3_TENANT_LIMIT=on needs INGEST_LEDGER=s3");
-  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  // INGEST_LEDGER_LOG_COMMIT: the mode parsed at config (settings.ledgerLogCommit); a direct caller that omits it
+  // falls back to the process env, validated the same way.
+  const logCommit = s3 && (settings.ledgerLogCommit ?? selfhostLedgerLogCommit(process.env)) === "on";
+  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
@@ -323,8 +327,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:
     // it is off the request path and serial per stream).
-    ...(s3 && selfhostLedgerLogCommit(process.env) === "on"
-      ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }),
+    ...(logCommit
+      ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+            budget: (records, receivedAt) => assertWithinBudget(deliver, records, receivedAt) }),
           logMaterializer: new LogMaterializer({ store: parts.store, keyRoot: settings.keyRoot, ...(options.nowMs ? { nowMs: options.nowMs } : {}),
             deliver: { ...withoutSlots(deliver), ledger: selfhostS3Ledger(settings.keyRoot, parts, undefined, { logModeGuard: false }) },
             log: (fields) => log.info("session ingest", fields) }) }

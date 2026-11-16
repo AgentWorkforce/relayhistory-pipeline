@@ -1,6 +1,6 @@
 # S3 ledger: numbered-log-entry commit
 
-Status: proposed. Slices 1 (writer and reader), 2 (admission wiring) and 3 (materializer, operator tool) are
+Status: proposed. Slices 1 (writer and reader), 2 (admission wiring), 3 (materializer, operator tool) and 4 (review fixes) are
 implemented behind `INGEST_LEDGER_LOG_COMMIT` (default off). With `on`, only a stream whose entry 0 exists is
 admitted through its log; entry 0 is written only by the operator tool (`scripts/ledger-log-stream.ts switch`). No
 stream should be switched in production before the items in Remaining marked "before production" are done.
@@ -283,18 +283,74 @@ today.
     their endpoints are set. fake-gcs-server ignores generation preconditions, so GCS runs only the sequential
     cases.
 
+## Slice 4: admission order, the admission snapshot, and the slice-3 review fixes
+
+Slice 2's review (lander, P2 1-4) and slice 3's (P2 1-4) found ordering and lifecycle gaps. Every one of them gates log
+mode: no stream leaves tests before slice 4 lands. What slice 4 changes:
+
+- **Replay before the gates** (`ledger-log-admit.ts`). Admission settles any unresolved entry, then answers a replay or
+  the batch-id 409 from the stream's window and then from the legacy batch doc, before it reads the fence or runs a
+  privacy or consent gate, as the legacy core does (`deliver.ts` answers its claim's replay first). A retry of a
+  committed batch is never refused or held by a control that landed after it committed.
+- **The legacy batch doc is read at admit.** A batch committed by the legacy path before the switch, or one the window
+  evicted and the materializer committed, is a replay; the same id with another digest is the 409; a legacy claim still
+  pending is a retry.
+- **The revision rules at admit.** The claim's own `judge` (moved to module scope in `ledger-s3.ts`, unchanged) runs over
+  the shards of the live records, so two records at one revision with another revision id and digest are refused as
+  the legacy revision 409 and never logged.
+- **The admission snapshot** (`LogBatch.admitted`: the journal seq, the fence's `resets`, each written session's epoch)
+  is written on every batch. The materializer re-judges against it before it applies: a reset pending or running is a
+  retry; one that completed since the append refuses the batch (`delivery_privacy_superseded`); a session whose epoch
+  moved (deleted, maybe re-enabled) has its records dropped. Owner stubs are registered by the materializer, through
+  the legacy claim, at apply time; a reset between the append and the apply needs no stub, because nothing of the batch
+  is written and the snapshot refuses it.
+- **One admission per stream at a time** in a process (a promise chain per stream), so concurrent admits of one stream
+  never race for head+1; a LogFenced drops the cached state only if it is still the state that failed.
+- **The payload is written only after every refusal point**, and carries no admission time, so a retried admission
+  writes the same content-addressed payload (received_at is the entry's own `atMs`).
+- **Unresolved entries have an age bound** (`LOG_PENDING_MAX_AGE_MS`, 15 min). Past it an entry is never resent, only
+  read back: landed applies, absent is dropped. The orphan collection (`ORPHAN_GRACE_MS`, 1 h) is longer, and it also
+  skips any payload an entry names, so no entry can land naming a payload that was collected.
+- **A final skip at apply writes a refused outcome** into the batch's receipt directory and retires its admitted one,
+  so the upload's status never reads admitted for data that was not written. The consumer writes its admitted outcome
+  before it kicks the materializer. Log lines name the stream, seq and batch by hash prefix.
+- **The sweep is bounded**: `LOG_SWEEP_CONCURRENCY` streams at a time in the background, one sweep at a time, and a
+  stream this process already applied is skipped unless its next entry exists (one HEAD). It also runs when upload
+  promotion fails. A corrupt registry doc is skipped, a malformed payload is refused (skipped as `payload_invalid`, with
+  its refused outcome), never a blocked stream.
+- **The switch** requires the deployment-wide proof `<keyRoot>/.ledger/log-commit-on.json` (written by the operator
+  once every replica runs with the flag on), waits past the longest legacy claim (`SWITCH_SETTLE_MS`) after entry 0 and
+  re-checks: a legacy batch that committed or is pending in that window (the commit guard's HEAD race with entry 0)
+  reports `legacy_raced_switch`. The CLI refuses to switch a bucket named prod, production or hosted, catches failures
+  and prints a code only, and uses a per-run operator writer id.
+- **Precheck parity**: the tenant segment and the delivery budget run first, as the legacy core's precheck. The log
+  path takes no tenant slot: its per-stream concurrency is one. The mode is carried in `SelfhostIngestSettings`
+  (`ledgerLogCommit`), parsed at config; the env is read only for a direct caller that omits it. An unreadable mode
+  HEAD on the admission side is a `ledger_log_mode_unreadable` retry, logged by the consumer's retry line.
+
 ## Remaining
 
 1. Before production: the materializer does not re-check upload consent at apply time (the inbox `consentCap` is not
    in the payload). Carry it in the payload and re-run the consent gate in the replay.
-2. Before production: `readEntries` replays from entry 0 on every materializer run, and the sweeper lists the whole
-   registry every scan. Both need a start-from-checkpoint read and a dirty-stream set before streams are many or long.
-3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (journal
-   re-check) and then deletes them, so they live until the stream's next apply. Operator and session erase are refused
-   under `INGEST_LEDGER=s3` today; when they are admitted, they must call `eraseLogPayloads`.
+2. Before production: `readEntries` still replays from entry 0 on every materializer run of a stream with new entries
+   (slice 4 only skips idle streams). It needs a start-from-checkpoint read before streams are long.
+3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (the journal
+   re-check and the snapshot) and then deletes them, so they live until the stream's next apply. Operator and session
+   erase are refused under `INGEST_LEDGER=s3` today; when they are admitted, they must call `eraseLogPayloads`.
 4. The GCS protocol run on a backend that honours generation preconditions (real GCS or a newer emulator). The local
    fake-gcs-server 1.52.2 also answered the adapter's create with `400 invalid uploadType`, so the GCS case did not run
    here.
-5. The hosted Worker must refuse `on` before any hosted wiring. Compaction and retention, and metrics.
-6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel) instead of using the cached
-   state, so a close is seen at once.
+5. Compaction and retention: entries, materializer markers (`m/`) and the stream registry grow forever. Metrics.
+6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel), reads the legacy batch doc,
+   the fence and the shards of its live records; each apply reads the fence once more.
+7. A refused outcome written by the materializer races an admitted outcome written by ANOTHER replica's consumer for
+   the same batch only if that replica's sweep applies the entry before the admitting consumer writes its outcome
+   (milliseconds); status could then read admitted. Close it with a refusal that outranks admitted in
+   `admissionStatus`.
+8. Stream registry docs hold the user id and raw origin id outside the user's directory: erasure must delete them (or
+   key them by hash only).
+9. `registerLogStream` failing after `takeStream` makes the retry take the stream again (one more epoch entry per
+   retry): register before taking, or make the take idempotent for the same writer.
+10. IAM: the materializer needs GET/PUT/DELETE/LIST on `ledger/log/` and `.ledger/log-streams/`, PUT/DELETE on the
+    receipt outcomes; the operator tool GET/LIST on `ledger/batches/` and PUT on `ledger/log/e/`, `closed.json` and the
+    registry. Document them in the stack before any deployment.

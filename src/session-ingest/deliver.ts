@@ -260,7 +260,7 @@ function withLimits(prepared: PreparedDelivery): DeliveryReceipt {
   return { ...prepared.receipt, limits: { ...DELIVERY_LIMITS } };
 }
 
-function revisionConflict(originId: string, conflicts: RevisionConflict[], count: number): DeliveryError {
+export function revisionConflict(originId: string, conflicts: RevisionConflict[], count: number): DeliveryError {
   const items: DeliveryRecordRevisionConflict[] = conflicts.slice(0, MAX_DELIVERY_CONFLICTS).map((c) => ({ type: "record_revision", originId, ...c }));
   return new DeliveryError("delivery_conflict", 409, "Delivery record revision was reused with different content", items[0], items, count);
 }

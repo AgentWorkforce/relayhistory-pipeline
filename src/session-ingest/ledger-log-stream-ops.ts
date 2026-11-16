@@ -3,9 +3,14 @@
  * Every mutating step is a dry run unless `apply` is set; the CLI is scripts/ledger-log-stream.ts.
  *
  *   status   legacy | log | closed, the log head, the materialized cursor, legacy batches still pending.
- *   switch   refuses while any legacy batch of the stream is pending (drain it first) or the stream is already in
- *            log mode; writes entry 0 with legacyCutover = "committed=<n legacy batches committed>", and registers
- *            the stream for the sweeper.
+ *   switch   refuses unless the deployment-wide proof exists (LOG_COMMIT_PROOF_KEY: every replica runs with
+ *            INGEST_LEDGER_LOG_COMMIT=on, so every legacy claim and commit honours the marker); refuses while any
+ *            legacy batch of the stream is pending (drain it first) or the stream is already in log mode; writes
+ *            entry 0 with legacyCutover = "committed=<n legacy batches committed>". Then it waits past the longest
+ *            legacy claim (settleMs) and re-checks: a legacy claim that read "not log mode" just before entry 0
+ *            landed (the commit guard's HEAD race) has either committed by then (counted) or is refused at its commit.
+ *            pending must be 0 and committed must not have moved; otherwise it reports `legacy_raced_switch`
+ *            (entry 0 stays: close the stream after the log drains, then investigate). Registers the stream last.
  *   close    refuses until every entry is applied (cursor = head); writes the close marker, after which the stream
  *            reads as legacy again (the admission consumer and the logModeGuard both read it). One way: a closed
  *            stream is not re-opened. A writer that had the stream cached may still append an entry it had in
@@ -58,12 +63,27 @@ export async function streamStatus(store: ObjectStore, keyRoot: string, tenant: 
 
 export interface StepResult { applied: boolean; action: string; refused?: string; status: StreamStatus }
 
-export async function switchToLogMode(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string, opts: { apply: boolean; writer: string }): Promise<StepResult> {
+/**
+ * The deployment-wide proof the switch requires: written by the operator only once every replica of the deployment
+ * runs with INGEST_LEDGER_LOG_COMMIT=on (nothing in the service writes it). Without it a replica still on `off`
+ * would claim and commit a log-mode stream behind its log.
+ */
+export const logCommitProofKey = (keyRoot: string) => `${keyRoot}/.ledger/log-commit-on.json`;
+/** Longer than a legacy claim lives (claim -> commit, with its retries): the switch's settle wait. */
+export const SWITCH_SETTLE_MS = 5 * 60_000;
+
+export async function switchToLogMode(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string,
+  opts: { apply: boolean; writer: string; settleMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<StepResult> {
   const status = await streamStatus(store, keyRoot, tenant, originId);
   if (status.mode !== "legacy") return { applied: false, action: "switch", refused: `stream_is_${status.mode}`, status };
+  if (!(await exists(store, logCommitProofKey(keyRoot)))) return { applied: false, action: "switch", refused: "log_commit_not_proven_on", status };
   if (status.legacyPending > 0) return { applied: false, action: "switch", refused: "legacy_batches_pending", status };
   if (!opts.apply) return { applied: false, action: "switch (dry run)", status };
   await enableLogMode(store, logKeys(keyRoot, tenant, originId), `committed=${status.legacyCommitted}`, { writer: opts.writer });
+  await (opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(opts.settleMs ?? SWITCH_SETTLE_MS);
+  const after = await streamStatus(store, keyRoot, tenant, originId);
+  if (after.legacyPending > 0 || after.legacyCommitted !== status.legacyCommitted)
+    return { applied: true, action: "switch", refused: "legacy_raced_switch", status: after };
   await registerLogStream(store, keyRoot, tenant, originId);
   return { applied: true, action: "switch", status: await streamStatus(store, keyRoot, tenant, originId) };
 }

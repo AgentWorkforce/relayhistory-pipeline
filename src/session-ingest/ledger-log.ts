@@ -42,6 +42,11 @@ export const LOG_CHECKPOINT_EVERY = 64;
 export const LOG_REMEMBERED_BATCHES = 4096;
 /** Attempts of one entry PUT on a transient failure before an ambiguous result is returned to the caller. */
 export const LOG_PUT_ATTEMPTS = 4;
+/**
+ * An unresolved entry older than this is resolved by reading only, never resent (settlePending). Must stay well
+ * below the materializer's ORPHAN_GRACE_MS, so a payload an unresolved entry names is never collected under it.
+ */
+export const LOG_PENDING_MAX_AGE_MS = 15 * 60_000;
 
 const SEQ_DIGITS = 20;
 /**
@@ -91,7 +96,16 @@ export interface LogBatch {
   /** The sessions the batch writes, as [source, sessionId]: privacy gates and readers key on these. */
   sessions: [string, string][];
   payloads: LogPayloadRef[];
+  /**
+   * The admission-time privacy snapshot (ledger-log-admit.ts writes it on every batch): the upload's privacy-journal
+   * seq, the user's fence resets and each written session's fence epoch, as the legacy claim records them in its
+   * batch doc. The materializer re-judges against it: a reset that completed, or a session whose epoch moved, between
+   * the append and the apply refuses or drops those records, so a pre-control upload is never written as a
+   * post-control one. Optional only so library tests may append bare batches; admission always writes it.
+   */
+  admitted?: LogAdmitSnapshot;
 }
+export interface LogAdmitSnapshot { journalSeq: number; resets: number; epochs: Record<string, number> }
 /** `stream`: the stream's key root, so an entry copied to another stream never validates there. */
 interface EntryBase { v: 1; stream: string; seq: number; prev: string | null; epoch: number; writer: string; atMs: number }
 export type LogEntry =
@@ -140,7 +154,7 @@ export interface LogState {
   inboxCursor: string | null;
   remembered: Map<string, string>;
   /** An entry whose landing is unresolved: the next append must resend exactly these bytes first. */
-  pending?: { seq: number; bytes: Uint8Array; entry: LogEntry };
+  pending?: { seq: number; bytes: Uint8Array; entry: LogEntry; atMs?: number };
 }
 
 // ---- validation ----
@@ -151,7 +165,13 @@ function validBatch(b: unknown): b is LogBatch {
   const x = b as LogBatch;
   return !!x && isStr(x.batchId) && x.batchId !== "" && isStr(x.digest) && isStr(x.receiptId) &&
     Array.isArray(x.sessions) && x.sessions.every((s) => Array.isArray(s) && s.length === 2 && isStr(s[0]) && isStr(s[1])) &&
-    Array.isArray(x.payloads) && x.payloads.every((p) => !!p && isStr(p.key) && isStr(p.sha256) && isNat(p.size));
+    Array.isArray(x.payloads) && x.payloads.every((p) => !!p && isStr(p.key) && isStr(p.sha256) && isNat(p.size)) &&
+    (x.admitted === undefined || validSnapshot(x.admitted));
+}
+function validSnapshot(v: unknown): v is LogAdmitSnapshot {
+  const a = v as LogAdmitSnapshot;
+  return !!a && typeof a === "object" && isNat(a.journalSeq) && isNat(a.resets) && !!a.epochs && typeof a.epochs === "object" && !Array.isArray(a.epochs) &&
+    Object.entries(a.epochs).every(([k, e]) => /^[0-9a-f]{32}$/.test(k) && isNat(e));
 }
 export function validEntry(v: unknown): v is LogEntry {
   const e = v as LogEntry;
@@ -423,9 +443,9 @@ export async function enableLogMode(store: ObjectStore, keys: LogKeys, legacyCut
  */
 export async function takeStream(store: ObjectStore, state: LogState, d: WriteDeps): Promise<LogState> {
   const { now, sleep } = deps(d);
-  if (state.pending) await resolvePending(store, state, sleep);
+  if (state.pending) await settlePending(store, state, d);
   const entry: LogEntry = { v: 1, stream: state.keys.root, seq: state.head + 1, prev: state.headHash, kind: "epoch", epoch: state.epoch + 1, writer: d.writer, atMs: now() };
-  state.pending = { seq: entry.seq, bytes: encode(entry), entry };
+  state.pending = { seq: entry.seq, bytes: encode(entry), entry, atMs: now() };
   try {
     await resolvePending(store, state, sleep);
   } catch (error) {
@@ -454,7 +474,7 @@ export interface AppendResult {
  */
 export async function appendBatches(store: ObjectStore, state: LogState, batches: LogBatch[], inboxCursor: string | null, d: WriteDeps): Promise<AppendResult> {
   const { now, sleep } = deps(d);
-  if (state.pending) await resolvePending(store, state, sleep);
+  if (state.pending) await settlePending(store, state, d);
   if (state.epochWriter !== d.writer) throw new LogFenced("log_not_owner", state.head + 1);
   const admitted: LogBatch[] = [], replays: string[] = [], conflicts: string[] = [];
   // Dedupe against the window plus this call's own batches (only the call's ids are added, not a window copy).
@@ -470,10 +490,33 @@ export async function appendBatches(store: ObjectStore, state: LogState, batches
   if (admitted.length === 0) return { seq: null, admitted, replays, conflicts };
   const entry: LogEntry = { v: 1, stream: state.keys.root, seq: state.head + 1, prev: state.headHash, kind: "batches", epoch: state.epoch, writer: d.writer, atMs: now(), batches: admitted, inboxCursor };
   const bytes = encode(entry);
-  state.pending = { seq: entry.seq, bytes, entry };
+  state.pending = { seq: entry.seq, bytes, entry, atMs: now() };
   await resolvePending(store, state, sleep);
   await maybeCheckpoint(store, state);
   return { seq: entry.seq, admitted, replays, conflicts };
+}
+
+/**
+ * Settle an unresolved entry before anything else reads the state (the replay answer, a new append): resends the
+ * pending bytes, exactly as appendBatches would first. No-op without one. LogFenced / LogUnavailable as appendBatches.
+ */
+export async function settlePending(store: ObjectStore, state: LogState, d: WriteDeps, maxAgeMs = LOG_PENDING_MAX_AGE_MS): Promise<void> {
+  const { now, sleep } = deps(d);
+  const p = state.pending;
+  if (!p) return;
+  // Past its age bound an unresolved entry is never RESENT: its payload may be gone (the materializer collects an
+  // unreferenced payload after ORPHAN_GRACE_MS, which is longer than this bound). It is only READ: landed (the
+  // same bytes) applies, a different entry there fences, absent drops it (a PUT unanswered for this long does not
+  // land later), and the caller builds a fresh entry for the batch.
+  if (p.atMs !== undefined && now() - p.atMs > maxAgeMs) {
+    const got = await readEntryBytes(store, state.keys.entry(p.seq));
+    state.pending = undefined;
+    if (got === undefined) return;
+    if (!equalBytes(got, p.bytes)) throw new LogFenced("log_entry_taken", p.seq);
+    applyEntry(state, p.bytes);
+    return;
+  }
+  await resolvePending(store, state, sleep);
 }
 
 async function resolvePending(store: ObjectStore, state: LogState, sleep: (ms: number) => Promise<void>) {

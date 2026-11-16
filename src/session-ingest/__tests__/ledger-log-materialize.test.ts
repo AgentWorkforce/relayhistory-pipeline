@@ -208,7 +208,7 @@ describe("equivalence: log mode plus materialization against legacy admission", 
       expect(log.outcomes.map(([s]) => s)).toEqual(legacy.outcomes.map(([s]) => s));
       sameState(log.state, legacy.state, when);
     }
-  });
+  }, 60_000); // every write fails once, before and after: a hundred-odd materializer rounds
 });
 
 describe("the materializer", () => {
@@ -260,13 +260,16 @@ describe("the materializer", () => {
     expect(side.some((k) => k.includes("/s=gone/"))).toBe(false);
     // A reset completed after the next upload began (its witness is seq 0): logged, then skipped at apply.
     hold(true);
-    await upload(e.base, "b2", ["late"], () => "sess-late");
+    const k2 = await upload(e.base, "b2", ["late"], () => "sess-late");
     await rounds(e, 2);
+    expect((await status(e.base, k2)).state).toBe("admitted");
     await putJson(e.base, journalKey(ROOT, TENANT), { v: 3, seq: 1, pending: [], ambiguous: [] });
     hold(false);
     await rounds(e, 2);
     side = [...(await readSide(e.base)).keys()];
     expect(side.some((k) => k.includes("/s=sess-late/"))).toBe(false);
+    // The skip is final, so the upload's status reads refused, never admitted for data that was not written.
+    expect(await status(e.base, k2)).toMatchObject({ state: "refused", code: "delivery_privacy_superseded" });
     // Erasure: a payload erased before its entry applies is skipped, never written. (The journal stays at seq 1, so
     // a fresh upload with witness seq 0 would be refused at admit: write the journal back first.)
     await putJson(e.base, journalKey(ROOT, TENANT), { v: 3, seq: 0, pending: [], ambiguous: [] });
@@ -306,7 +309,7 @@ describe("the materializer", () => {
 
 describe("operator steps (ledger-log-stream-ops.ts)", () => {
   test("switch: dry run writes nothing; refused while a legacy batch is pending; apply opens and registers the stream", async () => {
-    const { closeLogStream, streamStatus, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
+    const { closeLogStream, logCommitProofKey, streamStatus, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
     const { logStreamRegistryKey } = await import("../ledger-log-materialize.ts");
     const e = edge("on");
     await writeAuthority(e.base);
@@ -315,13 +318,16 @@ describe("operator steps (ledger-log-stream-ops.ts)", () => {
     await upload(e.base, "b1", ["r1"]);
     await rounds(e, 1);
     expect((await streamStatus(e.base, ROOT, TENANT, ORIGIN)).legacyPending).toBe(1);
-    expect((await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op" })).refused).toBe("legacy_batches_pending");
+    // No deployment-wide proof that every replica runs with the flag on: refused before anything else.
+    expect((await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 0 })).refused).toBe("log_commit_not_proven_on");
+    await putJson(e.base, logCommitProofKey(ROOT), { v: 1, mode: "on" });
+    expect((await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 0 })).refused).toBe("legacy_batches_pending");
     e.setFault(undefined);
     await rounds(e, 2);
-    const dry = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: false, writer: "op" });
+    const dry = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: false, writer: "op", settleMs: 0 });
     expect([dry.applied, dry.refused]).toEqual([false, undefined]);
     expect(await exists(e.base, logKeys(ROOT, TENANT, ORIGIN).entry(0))).toBe(false);
-    const done = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op" });
+    const done = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 0 });
     expect([done.applied, done.status.mode, done.status.legacyCommitted]).toEqual([true, "log", 1]);
     expect(await exists(e.base, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(true);
     // The next upload goes through the log and is applied.
@@ -347,5 +353,60 @@ describe("operator steps (ledger-log-stream-ops.ts)", () => {
     expect((await status(e.base, k4)).state).toBe("admitted");
     expect((await streamStatus(e.base, ROOT, TENANT, ORIGIN)).head).toBe(head);
     expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b4"))).toMatchObject({ state: "committed" });
+  });
+});
+
+describe("slice 4: the admission snapshot, re-judged at apply", () => {
+  test("a reset that completes between the append and the apply refuses the batch (no fence journal entry needed)", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    const io = s3LedgerObjects(e.base, ROOT);
+    const fenceKey = s3LedgerKeys(ROOT, TENANT).fence;
+    e.setFault((key) => (key.includes("/ledger/batches/") ? "before" : "ok"));
+    const k = await upload(e.base, "b1", ["pre"], () => "sess-pre");
+    await rounds(e, 2);
+    expect((await status(e.base, k)).state).toBe("admitted");
+    const logged = (await entries(e.base)).flatMap((x) => (x.kind === "batches" ? x.batches : []));
+    expect(logged[0]!.admitted).toMatchObject({ journalSeq: 0, resets: 0 });
+    expect(Object.keys(logged[0]!.admitted!.epochs)).toHaveLength(1);
+    // A reset recorded and completed in the fence only (the journal does not move): the snapshot is what refuses it.
+    await io.editFence(fenceKey, (f) => ({ next: { ...f, resets: f.resets + 1, resetsCompleted: f.resetsCompleted + 1 }, result: null }));
+    e.setFault(undefined);
+    await rounds(e, 2);
+    expect([...(await readSide(e.base)).keys()].some((x) => x.includes("/s=sess-pre/"))).toBe(false);
+    expect(await status(e.base, k)).toMatchObject({ state: "refused", code: "delivery_privacy_superseded" });
+  });
+
+  test("a session whose epoch moved between the append and the apply (deleted, then re-enabled) has its records dropped", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    const io = s3LedgerObjects(e.base, ROOT);
+    const fenceKey = s3LedgerKeys(ROOT, TENANT).fence;
+    e.setFault((key) => (key.includes("/ledger/batches/") ? "before" : "ok"));
+    await upload(e.base, "b1", ["a", "b"], (id) => (id === "a" ? "sess-moved" : "sess-kept"));
+    await rounds(e, 2);
+    // Delete then re-enable sess-moved: no tombstone left, but its epoch moved past the snapshot.
+    const { sessionKeyHash } = await import("../ledger-s3.ts");
+    await io.editFence(fenceKey, (f) => ({ next: { ...f, epochs: { [ORIGIN]: { [sessionKeyHash("claude", "sess-moved")]: 7 } } }, result: null }));
+    e.setFault(undefined);
+    await rounds(e, 2);
+    const side = [...(await readSide(e.base)).keys()];
+    expect(side.some((x) => x.includes("/s=sess-moved/"))).toBe(false);
+    expect(side.some((x) => x.includes("/s=sess-kept/manifest.json"))).toBe(true);
+  });
+
+  test("switch: a legacy batch that commits during the settle wait is reported as legacy_raced_switch", async () => {
+    const { logCommitProofKey, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await putJson(e.base, logCommitProofKey(ROOT), { v: 1, mode: "on" });
+    const r = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 1, sleep: async () => {
+      // A legacy writer that read "not log mode" just before entry 0 landed commits during the wait.
+      const keys = s3LedgerKeys(ROOT, TENANT);
+      await putJson(e.base, keys.batch(ORIGIN, "late"), { v: 1, originId: ORIGIN, batchId: "late", state: "committed" });
+    } });
+    expect([r.applied, r.refused]).toEqual([true, "legacy_raced_switch"]);
   });
 });

@@ -62,7 +62,7 @@ function faulty(base: ObjectStore) {
   return { store, setFault: (f: typeof fault) => { fault = f; } };
 }
 
-function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async") {
+function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async", concurrency = 1) {
   const s = scratchStore();
   cleanups.push(s.done);
   const f = faulty(s.store);
@@ -73,7 +73,7 @@ function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async") {
   try {
     const runtime = selfhostIngestRuntime({
       keyRoot: ROOT, maxPerUser: 4, maxPerOrg: 32, ledger: "s3",
-      ...(admission === "async" ? { admission: { mode: "async" as const, concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 20 },
+      ...(admission === "async" ? { admission: { mode: "async" as const, concurrency, scanIntervalMs: 15_000, maxAttempts: 20 },
         uploadDirect: { config: DIRECT, witnessKey: WITNESS_KEY, scanBatch: 16 } } : {}),
     }, { run: (async () => { throw new Error("SQL runner called on the S3 ledger path"); }) as never, store: f.store,
       verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} },
@@ -239,5 +239,75 @@ describe("equivalence: legacy edge against log-mode edge", () => {
     const log = await run("log");
     expect(log.map(([s]) => s)).toEqual(legacy.map(([s]) => s));
     expect(log[2]).toEqual(legacy[2]);
+  });
+});
+
+describe("slice 4: replay before the gates, legacy batch docs, revision rules, one admission per stream at a time", () => {
+  test("a retry of a logged batch is answered replay even while a reset is pending (no gate runs first)", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    const streams = new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0 });
+    const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "r1", session_id: "sess-r1", origin_id: ORIGIN })],
+      { batch_id: "b1", origin_id: ORIGIN, account_id: await deliveryAccount(TENANT) }));
+    expect(await streams.admit(TENANT, prepared, { journalSeq: 0 })).toBe("accepted");
+    // A pending ordered reset and a journal moved past the upload: a NEW batch would be held or refused...
+    const io = s3LedgerObjects(sc.store, ROOT);
+    await io.editFence(s3LedgerKeys(ROOT, TENANT).fence, (f) => ({ next: { ...f, pending: { p1: { kind: "reset", requestId: "rq1" } } }, result: null }));
+    await putJson(sc.store, journalKey(ROOT, TENANT), { v: 3, seq: 1, pending: [], ambiguous: [] });
+    // ...but the retry of the committed one is a replay (no legacy batch doc exists: only the window answers).
+    expect(await exists(sc.store, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b1"))).toBe(false);
+    expect(await streams.admit(TENANT, prepared, { journalSeq: 0 })).toBe("replay");
+    expect(batchesIn(await entries(sc.store)).map((b) => b.batchId)).toEqual(["b1"]);
+  });
+
+  test("a batch committed by the legacy path before the switch is a replay; the same id with other content is the 409", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    const k1 = await upload(e.base, "b1", ["r1"]);
+    await drain(e);
+    expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b1"))).toMatchObject({ state: "committed" });
+    await enable(e.base);
+    const same = await upload(e.base, "b1", ["r1"]);
+    const other = await upload(e.base, "b1", ["rZ"]);
+    await drain(e);
+    expect(await status(e.base, k1)).toMatchObject({ state: "admitted" });
+    expect(await status(e.base, same)).toMatchObject({ state: "admitted" });
+    expect(await status(e.base, other)).toMatchObject({ state: "refused" });
+    // Neither went into the log.
+    expect(batchesIn(await entries(e.base))).toEqual([]);
+  });
+
+  test("two records at one revision with another revision id and digest: the legacy revision 409, nothing logged", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    const b = await batch([record({ record_id: "dup", revision: 1, revision_id: "rev-a", session_id: "sess-dup", origin_id: ORIGIN, payload: { text: "one" } }),
+      record({ record_id: "dup", revision: 1, revision_id: "rev-b", session_id: "sess-dup", origin_id: ORIGIN, payload: { text: "two" } })],
+      { batch_id: "btw", origin_id: ORIGIN, account_id: await deliveryAccount(TENANT) });
+    const bytes = new Uint8Array(zstdCompressSync(Buffer.from(JSON.stringify({ protocolVersion: 1, batch: b }))));
+    const key = uploadObjectKey(uploadKeyPrefix({ keyRoot: ROOT, ...TENANT }), { originId: ORIGIN, batchId: "btw", objectSha256Hex: uploadObjectSha256Hex(bytes), witnessSeq: 0 });
+    const witness = encodeUploadWitness(parseUploadWitnessKey(WITNESS_KEY), { v: 1, org: TENANT.orgId, ws: TENANT.workspaceId, user: TENANT.userId, seq: 0, exp: Math.floor(T0 / 1000) + 3600 });
+    await e.base.put(objectKey(key), bytes, { metadata: { "relay-witness": witness } });
+    await drain(e);
+    const st = await status(e.base, key);
+    expect(st.state).toBe("refused");
+    expect(batchesIn(await entries(e.base))).toEqual([]);
+  });
+
+  test("concurrency 4: batches of one stream are admitted one at a time (no lost head+1 race, no extra epoch)", async () => {
+    const e = edge("on", "async", 4);
+    await writeAuthority(e.base);
+    await enable(e.base);
+    const ks = [];
+    for (let i = 0; i < 6; i++) ks.push(await upload(e.base, `c${i}`, [`rc${i}`]));
+    await drain(e);
+    for (const k of ks) expect(await status(e.base, k)).toMatchObject({ state: "admitted" });
+    const es = await entries(e.base);
+    expect(es.filter((x) => x.kind === "epoch").length).toBe(1);
+    expect(batchesIn(es).map((b) => b.batchId).sort()).toEqual(["c0", "c1", "c2", "c3", "c4", "c5"]);
   });
 });
