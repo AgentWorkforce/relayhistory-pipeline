@@ -12,6 +12,7 @@ import { TENANT, batch, record } from "../../session-ingest/__tests__/support.ts
 import { authorityFixture, epoch, generation, identity } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { objectKey } from "../../shared/vendor.ts";
 import { runUserErase, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
 
@@ -261,6 +262,10 @@ describe("operator per-user erase (058010)", () => {
     const f = await fixture();
     await deliver(f, ALICE, "a1", 3);
     await deliver(f, BOB, "b1", 2);
+    const aliceLegacy = `96bulls/${ALICE.orgId}/v1/ws=${ALICE.workspaceId}/m=${legacyMachineId(ALICE.workspaceId, ALICE.userId)}/h=codex/d=2026/11/16/s=legacy-alice/manifest.json`;
+    const bobLegacy = `96bulls/${BOB.orgId}/v1/ws=${BOB.workspaceId}/m=${legacyMachineId(BOB.workspaceId, BOB.userId)}/h=codex/d=2026/11/16/s=legacy-bob/manifest.json`;
+    await f.deps.target.store.put(objectKey(aliceLegacy), new TextEncoder().encode("alice legacy") as never);
+    await f.deps.target.store.put(objectKey(bobLegacy), new TextEncoder().encode("bob legacy") as never);
     const before = await storeKeys(f);
     expect(before.filter((k) => k.includes("/buffered-batches/") && k.includes(`/m=${machine(ALICE)}/`)).length).toBeGreaterThan(0);
     const bobKeys = before.filter((k) => k.includes(`/m=${machine(BOB)}/`));
@@ -278,6 +283,8 @@ describe("operator per-user erase (058010)", () => {
     const after = await storeKeys(f);
     expect(after.filter((k) => k.includes(`/m=${machine(ALICE)}/`))).toEqual([]);
     expect(after.filter((k) => k.includes(`/m=${machine(BOB)}/`))).toEqual(bobKeys);
+    expect(after.filter((k) => k.includes(`/m=${legacyMachineId(ALICE.workspaceId, ALICE.userId)}/`))).toEqual([]);
+    expect(after).toContain(bobLegacy);
     expect(await footprint(f, ALICE)).toEqual({}); // complete deleted the fence row with the bytes_verified transition
 
     // A rerun of the same request is a no-op that reports the completed erase.
