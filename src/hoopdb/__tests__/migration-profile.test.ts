@@ -600,7 +600,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(35); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations)
+    ).toBe(36); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations) + summary_regeneration_audit (20261105062040)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2638,6 +2638,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
     const LA = "upstream:20261105062030_legacy_export_scope_authority.sql";
+    const RG = "upstream:20261105062040_summary_regeneration.sql";
     const TSOG = "upstream:20261105062060_turns_selection_origin_guard.sql";
     const AR = "upstream:20261105062070_coordination_advisor_readers.sql";
     const MD = "upstream:20261105062080_memory_documents.sql";
@@ -2653,7 +2654,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, TSOG, AR, MD, MDE, MUE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, TSOG, AR, MD, MDE, MUE]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2763,6 +2764,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       bodyOf("20261105057030_selfhost_erase_directory_membership.sql", "ingest_selfhost_set_session_uploads", "$selfhost_selection$"),
     );
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_set_session_uploads_internal(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    // 20261105062040 (summary regeneration) is the newest: 062030's down refuses (55000) while it is applied; its
+    // checksum-pinned down drops the audit table, its three functions, the session_briefs columns and partial index
+    // and its ledger row (96bulls 0006's session_summaries columns stay), and refuses on a rerun.
+    expect(await names()).toContain(RG);
+    expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(LA);
+    await rollback("20261105062040_summary_regeneration.down.sql");
+    expect(await names()).not.toContain(RG);
+    expect(await relation("sessions.summary_regeneration_audit")).toBeNull();
+    expect(await relation("sessions.session_briefs_next_retry")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'summary\\_regeneration\\_audit\\_%'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_briefs' AND column_name IN ('covered_turns','retry_attempts','next_retry_at','config_hash','pipeline_version')")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_summaries' AND column_name='degraded'")).rows[0]!.n).toBe(1);
+    expect((await failure(rollback("20261105062040_summary_regeneration.down.sql")))?.code).toBe("55000");
     // 20261105062030 is then newest: the per-origin claim-fence down refuses until
     // the durable legacy-export authority and its grants/policies are removed.
     expect(await names()).toContain(LA);

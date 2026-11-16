@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|relayfacts_|relayfacts_evidence_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|relayfacts_|relayfacts_evidence_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
