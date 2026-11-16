@@ -13,9 +13,10 @@ import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, eraseScope } from "../neon-s3-erasure/job.ts";
 import { liveStagedPrefix, liveTargets, livePointerPrefix } from "../neon-s3-erasure/live.ts";
-import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
+import type { ErasureAuthority, LegacyFencedGroup } from "../neon-s3-erasure/authority.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { LEGACY_EXPORT_ORIGIN_ID, legacyMachineId } from "../../shared/legacy-export-machine.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
 // The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
@@ -166,6 +167,56 @@ describe("E3 job on the shared paged eraser", () => {
     expect(s.count(prefix)).toBe(0);
     expect(st.nextErasures(NOW + 1, 10)).toEqual([]);
     expect(j.counters.prefixesErased).toBe(1);
+    st.close();
+  });
+});
+
+describe("hosted legacy-export scope erasure", () => {
+  const L: LegacyFencedGroup = {
+    org_id: "org-1", workspace_id: "ws/1", source: "claude", session_id: "sess:1",
+    legacy_user_id: "owner-1", legacy_machine_id: legacyMachineId("ws/1", "owner-1"),
+  };
+  const LT = liveTargets("96bulls", {
+    org_id: L.org_id, workspace_id: L.workspace_id, user_id: L.legacy_user_id,
+    origin_id: LEGACY_EXPORT_ORIGIN_ID, source: L.source, session_id: L.session_id,
+  });
+  const legacyAuthority = (row: LegacyFencedGroup = L) => authority({
+    fencedLivePage: async () => [],
+    legacyFencedPage: async (after) => after ? [] : [row],
+    stillLegacyFenced: async () => true,
+  });
+
+  test("an injected authority row erases only its encoded owner-machine session and pointer, idempotently", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/`;
+    const neighbour = `${LT.base}d=2026/10/30/s=sess_keep/`;
+    const otherOwner = liveTargets("96bulls", {
+      org_id: L.org_id, workspace_id: L.workspace_id, user_id: "owner-2",
+      origin_id: LEGACY_EXPORT_ORIGIN_ID, source: L.source, session_id: L.session_id,
+    });
+    for (const key of [`${target}manifest.json`, `${target}raw/c.ndjson.zst`, LT.pointerKey,
+      `${neighbour}manifest.json`, `${otherOwner.base}d=2026/10/30/${otherOwner.sessionSegment}/manifest.json`]) s.put(key, OLD);
+    const st = await state();
+    const j = job(s, st, legacyAuthority());
+    await j.sweep();
+    await j.sweep();
+    expect(s.count(target)).toBe(0);
+    expect(s.count(LT.pointerKey)).toBe(0);
+    expect(s.count(neighbour)).toBe(1);
+    expect(s.count(otherOwner.base)).toBe(1);
+    expect(j.counters.legacyVersionsDeleted).toBe(3);
+    st.close();
+  });
+
+  test("a stored machine that does not match the canonical owner tuple refuses before deletion", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    const st = await state();
+    const j = job(s, st, legacyAuthority({ ...L, legacy_machine_id: legacyMachineId(L.workspace_id, "someone-else") }));
+    await j.sweep();
+    expect(s.count(target)).toBe(1);
+    expect(j.counters.legacyFenceFailed).toBeGreaterThan(0);
     st.close();
   });
 });

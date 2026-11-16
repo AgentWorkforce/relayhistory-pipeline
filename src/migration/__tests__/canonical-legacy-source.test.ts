@@ -37,6 +37,7 @@ import {
   type CanonicalPointer,
 } from "../../session-read-api/canonical.ts";
 import type { Queryable } from "../relayhistory-export.ts";
+import { neonAuthority } from "../neon-s3-erasure/authority.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
 // The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
@@ -72,12 +73,30 @@ beforeAll(async () => {
  CREATE TABLE sessions.conversation_turn_fences(org_id text,workspace_id text,user_id text,source text,session_id text);
  CREATE TABLE sessions.session_erasure_receipts(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.upload_deletions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+ CREATE TABLE sessions.ingest_frozen_source_deletions(org_id text,workspace_id text,user_id text,source text,session_id text);
  CREATE TABLE sessions.upload_resets(org_id text,workspace_id text,user_id text,request_id text);
  CREATE TABLE sessions.turn_session_fences(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.operator_user_erasures(request_id text,org_id text,workspace_id text,user_id text,state text);
  CREATE TABLE sessions.conversation_turns(id uuid PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,session_owner text,turn_index int,role text,content text,actor_name text,actor_role text,metadata jsonb,ts timestamptz,UNIQUE(org_id,workspace_id,source,session_id,turn_index));
  CREATE TABLE sessions.session_links(id bigint PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,link_kind text,link_ref text,link_url text,metadata jsonb,confidence_basis_points int,link_ts timestamptz,updated_at timestamptz,created_at timestamptz);
  CREATE TABLE sessions.session_outcomes(org_id text,workspace_id text,source text,session_id text,commit_sha text,user_id text,reverted boolean,shipped_at timestamptz,ingested_at timestamptz,created_at timestamptz);`);
+  await pg.exec(`CREATE TABLE sessions.legacy_export_scope_authority(
+    org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+    legacy_user_id text NOT NULL,legacy_machine_id text NOT NULL,
+    PRIMARY KEY(org_id,workspace_id,source,session_id));
+  CREATE FUNCTION sessions.ingest_legacy_export_scope_authority_register(p jsonb) RETURNS jsonb
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $$
+  DECLARE v jsonb;
+  BEGIN
+    INSERT INTO sessions.legacy_export_scope_authority VALUES(
+      p->>'org_id',CASE WHEN p->>'workspace_id'='' THEN 'default' ELSE p->>'workspace_id' END,
+      p->>'source',p->>'session_id',p->>'legacy_user_id',p->>'legacy_machine_id') ON CONFLICT DO NOTHING;
+    SELECT to_jsonb(a) INTO v FROM sessions.legacy_export_scope_authority a
+      WHERE a.org_id=p->>'org_id'
+        AND a.workspace_id=CASE WHEN p->>'workspace_id'='' THEN 'default' ELSE p->>'workspace_id' END
+        AND a.source=p->>'source' AND a.session_id=p->>'session_id';
+    RETURN v;
+  END $$;`);
   await pg.query(
     `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','person',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
     [turnId],
@@ -528,7 +547,8 @@ test("secrets come only from stdin lines, and a writable Neon role is refused", 
 test("privacy preflight rejects active RLS even for a SELECT-only role", async () => {
   await pg.exec(`CREATE ROLE legacy_privacy_reader;
     GRANT USAGE ON SCHEMA sessions TO legacy_privacy_reader;
-    GRANT SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures TO legacy_privacy_reader;
+    GRANT SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.ingest_frozen_source_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures TO legacy_privacy_reader;
+    GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb) TO legacy_privacy_reader;
     ALTER TABLE sessions.session_erasure_receipts ENABLE ROW LEVEL SECURITY;
     SET ROLE legacy_privacy_reader`);
   try {
@@ -538,18 +558,34 @@ test("privacy preflight rejects active RLS even for a SELECT-only role", async (
   } finally {
     await pg.exec(`RESET ROLE;
       ALTER TABLE sessions.session_erasure_receipts DISABLE ROW LEVEL SECURITY;
-      REVOKE ALL PRIVILEGES ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures FROM legacy_privacy_reader;
+      REVOKE ALL PRIVILEGES ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.ingest_frozen_source_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures FROM legacy_privacy_reader;
+      REVOKE EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb) FROM legacy_privacy_reader;
       REVOKE USAGE ON SCHEMA sessions FROM legacy_privacy_reader;
       DROP ROLE legacy_privacy_reader`);
   }
 });
 
-test("session_owner is not accepted as an erasure user id", async () => {
+test("turns-only scope uses the unambiguous attributed session_owner", async () => {
   await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
   await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
   try {
-    expect(await legacyScopeUser(db, scope)).toBeNull();
+    expect(await legacyScopeUser(db, scope)).toBe("person");
   } finally {
+    await restoreBaseOwner();
+  }
+});
+
+test("the Neon hosted eraser derives that same turns-only owner for a fenced scope", async () => {
+  await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1';
+    DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1';
+    INSERT INTO sessions.deleted_upload_sessions VALUES('org_1','ws_1','claude','sess:1')`);
+  try {
+    expect(await neonAuthority(db).legacyFencedPage!(null)).toEqual([{
+      org_id: "org_1", workspace_id: "ws_1", source: "claude", session_id: "sess:1",
+      legacy_user_id: "person", legacy_machine_id: legacyMachineId("ws_1", "person"),
+    }]);
+  } finally {
+    await pg.exec("DELETE FROM sessions.deleted_upload_sessions");
     await restoreBaseOwner();
   }
 });

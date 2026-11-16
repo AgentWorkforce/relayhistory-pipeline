@@ -1,8 +1,8 @@
 # Legacy evidence export (conversation_turns, session_links, session_outcomes)
 
 Operator: Khaliq only. This runbook does production reads from Neon and the
-live HoopDb/Supabase privacy authority (both read-only), plus production S3
-writes. Do not run any mode against real data or write the production bucket
+live HoopDb/Supabase privacy authority (table-read-only, with one narrow
+authority-registration RPC), plus production S3 writes. Do not run any mode against real data or write the production bucket
 without Khaliq's explicit words for that exact run. Design and gate status:
 [docs/canonical-legacy-source.md](../docs/canonical-legacy-source.md).
 
@@ -21,15 +21,24 @@ without Khaliq's explicit words for that exact run. Design and gate status:
   - The runner verifies `default_transaction_read_only=on`, UTC, SELECT and no write privilege on all three evidence tables plus `deleted_upload_sessions` and `conversation_turn_fences`.
   - It refuses anything else, including `neondb_owner`.
 - **Privacy role.**
-  - Use a SELECT-only direct connection that can read
-    `session_erasure_receipts`, `upload_deletions`, `upload_resets`,
-    `turn_session_fences`, and `operator_user_erasures`. Migration
+  - Use only the dedicated `bulls96_legacy_export_privacy` direct connection.
+    Bootstrap/migration `20261105062020_legacy_export_scope_authority.sql`
+    grants it SELECT on `session_erasure_receipts`, `upload_deletions`,
+    `ingest_frozen_source_deletions`, `upload_resets`,
+    `turn_session_fences`, and `operator_user_erasures`, plus EXECUTE on the
+    narrow SECURITY DEFINER authority registration RPC. It has no table-write
+    privilege and no privilege on `legacy_export_scope_authority`. Promote the
+    bare role to LOGIN only through
+    `supabase/bootstrap/legacy_export_privacy_role.sql` under a separate apply
+    approval; set its password from 1Password in memory.
+  - Migration
     `20261105062010_turns_forward_gates.sql`, which creates
     `turn_session_fences`, must already be landed and applied; a missing
     relation is a hard refusal, never an empty fence set.
-  - Poolers, including port 6543, and roles with ledger write privileges are
-    refused. The runner also refuses active row-level security on any privacy
-    table: a policy-less SELECT under RLS would hide every fence. Creating this
+  - Poolers, including port 6543, any other identity, and roles with ledger
+    write privileges are refused. With RLS active, migration 062020's reviewed,
+    permissive full-read policy must be present and no applicable restrictive
+    policy may hide rows; a policy-less SELECT is refused. Creating this
     dedicated role, changing grants, or granting `BYPASSRLS` is an IAM change
     and needs Khaliq's explicit approval; do not make it as part of a run.
   - The exporter holds the operator-erasure advisory locks shared across each
@@ -37,6 +46,12 @@ without Khaliq's explicit words for that exact run. Design and gate status:
     turn-session fences and user erasures before checkpointing. It overrides
     the privacy connection's idle-in-transaction timeout for the bounded scope
     and aborts the whole run if that connection or transaction is lost.
+  - Before the first S3 PUT for a scope, the exporter immutably registers
+    `(org, normalized workspace, source, session, legacy user, legacy machine)`.
+    A replay must return the same tuple; an owner or machine change refuses.
+    This is how the hosted eraser finds the exact legacy copy after any member,
+    session, frozen-source or turn-fence deletion without deriving an owner
+    from the deleting member.
   - The shared global privacy lock is held for one scope's Neon read and S3
     write. A queued exclusive erase can in turn delay later ingest/export shared
     lock requests. Run only in the approved window, keep scopes bounded, and
@@ -87,7 +102,8 @@ COMMIT;
 
 ## 1. Plan (reads only; writes nothing)
 
-Preflight must show both read-only connections healthy. A scope present in a
+Preflight must show the Neon read-only connection and the table-read-only
+privacy connection healthy. A scope present in a
 frozen-Neon `deleted_upload_sessions` / `conversation_turn_fences` table or a
 live session/turn/user erasure ledger is reported fenced and is never exported. A
 scope without an unambiguous owner fails; it is never written as `unknown`.
@@ -106,7 +122,7 @@ Compare `rows` with the step 0 per-org counts. They are equal unless `--since`/`
 
 Do not proceed from plan to export until the turns-forward migration above is
 present in the live privacy database and the privacy preflight confirms all
-five tables are fully visible without active RLS.
+six tables are fully visible through their reviewed SELECT policy and the register RPC is callable.
 
 ## 2. Export the canary, then all orgs
 
