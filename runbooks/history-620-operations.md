@@ -217,6 +217,29 @@ yet. It is to be wired by the release owner in the G3 window, using the fields `
 lock holder is expected same-origin serialization (see the lock order above): check the
 uploader for overlapping same-origin uploads before treating it as an incident.
 
+### Route-line refusal class and client (diagnostic only)
+
+A ledger refusal with SQLSTATE 55000 (`error_code` `ledger_sqlstate_55000`, `db_error_code` `55000`;
+`db_error_class` stays `unknown`) also carries `db_refusal`, a closed class taken from the start of the
+database message (`src/session-ingest/db-refusal-class.ts`; the message itself is never logged):
+`generation_not_ready`, `policy_unavailable` (the custody policy is at the other generation),
+`policy_expired`, `org_admission_closed`, `org_prior_authority_unbound`, `user_privacy_authority`,
+`ack_seal`, `native_custody_identity_changed`, `source_row_privacy_fenced`,
+`custody_privacy_inconsistent`, `user_seal_missing`, `receipt_proof_missing`, `publication_transition`,
+or `other` (any other 55000 text). In buffered mode a call refused at both accepted generations logs the
+first refusal that is not a generation refusal (`generation_not_ready`, `policy_unavailable`), so a real
+refusal at one generation is not hidden behind the other's `generation_not_ready`. A sustained
+`generation_not_ready` or `policy_unavailable` points at the schema generation overlap; any other class
+is a per-org or per-user state to investigate.
+
+Every line built from the batch route's fields (`route` `delivery.batches` and `turns.batches`: the
+outcome line, and the capture-policy and upload-consent lines emitted from that route) carries
+`client_kind` from the request User-Agent (`src/session-ingest/client-agent.ts`). The Desktop sends
+`agent-relay-desktop/<version> <os>`: that is `client_kind` `desktop` with `client_os` `macos`,
+`linux`, `windows` or `other`, and `client_version` only when it is a release version such as
+`2026.11.12` or `2026.11.12-beta.1`. Any other User-Agent is `client_kind` `other` and nothing more;
+User-Agent text is never logged. Use it to split refusals and busy answers by Desktop release.
+
 ## Pointer-reference tracking
 
 The `session_index` pointer-reference trigger is dormant until armed, so the legacy indexer pays

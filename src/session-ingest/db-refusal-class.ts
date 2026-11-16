@@ -31,7 +31,9 @@ export const DB_REFUSALS = Object.freeze([
 export type DbRefusal = (typeof DB_REFUSALS)[number];
 
 /** The refusals that depend on which accepted generation the call was offered (retried at the other one). */
-export const GENERATION_REFUSALS: ReadonlySet<DbRefusal> = new Set<DbRefusal>(["generation_not_ready", "policy_expired", "policy_unavailable"]);
+// Not policy_expired: ingest_lazy_begin checks the generation ("current custody policy unavailable") before
+// expiry ("policy expired during operation"), so an expiry is raised only at the right generation: a real refusal.
+export const GENERATION_REFUSALS: ReadonlySet<DbRefusal> = new Set<DbRefusal>(["generation_not_ready", "policy_unavailable"]);
 
 /** Exact message prefixes (lower-cased) from supabase/migrations, each with its class. First match wins. */
 const PREFIXES: readonly (readonly [string, DbRefusal])[] = [

@@ -37,10 +37,12 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "route", "correlation_id",
   // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
   "db_error_class", "db_error_code", "db_error_basis", "error_name",
-  // ...and a 55000's closed refusal class (db-refusal-class.ts; DB_REFUSAL_VALUES, anything else dropped).
+  // ...and a 55000's closed refusal class (db-refusal-class.ts; DB_REFUSAL_VALUES, anything else dropped;
+  // the mirror is pinned in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "db_refusal",
   // The batch route's uploading client (src/session-ingest/client-agent.ts): closed values from the
-  // User-Agent, never its text (CLIENT_KIND_VALUES, CLIENT_OS_VALUES, CLIENT_VERSION_SHAPE).
+  // User-Agent, never its text (CLIENT_KIND_VALUES, CLIENT_OS_VALUES, CLIENT_VERSION_SHAPE; mirrors pinned
+  // in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "client_kind", "client_version", "client_os",
   // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014 only. Read API buffered fence
   // logs (src/session-read-api/app.ts): the two-char SQLSTATE class only (BufferedFenced.sqlstateClass).
@@ -119,21 +121,23 @@ export const STORE_CAUSE_VALUES: ReadonlySet<string> = new Set([
 ]);
 /** `streaming` on the consumer's streaming reconcile startup line. */
 export const STREAMING_VALUES: ReadonlySet<string> = new Set(["on", "off"]);
-/** `db_refusal` mirrors session-ingest DB_REFUSALS (log.test.ts pins the two equal). */
+/** `db_refusal` mirrors session-ingest DB_REFUSALS (ingest-refusal-log.test.ts pins the two equal). */
 export const DB_REFUSAL_VALUES: ReadonlySet<string> = new Set([
   "generation_not_ready", "policy_expired", "policy_unavailable", "org_admission_closed", "org_prior_authority_unbound",
   "user_privacy_authority", "ack_seal", "native_custody_identity_changed", "source_row_privacy_fenced",
   "custody_privacy_inconsistent", "user_seal_missing", "receipt_proof_missing", "publication_transition", "other",
 ]);
-/** `client_kind` / `client_os` mirror session-ingest client-agent.ts CLIENT_KINDS / CLIENT_OSES (pinned in log.test.ts). */
+/** `client_kind` / `client_os` mirror session-ingest client-agent.ts CLIENT_KINDS / CLIENT_OSES (pinned in ingest-refusal-log.test.ts). */
 export const CLIENT_KIND_VALUES: ReadonlySet<string> = new Set(["desktop", "other"]);
 export const CLIENT_OS_VALUES: ReadonlySet<string> = new Set(["macos", "linux", "windows", "other"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
 ]);
-/** Shaped fields: emitted only when the string matches its pattern (else dropped). */
-export const CLIENT_VERSION_SHAPE = /^[0-9A-Za-z.+-]{1,32}$/;
+/** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
+ * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
+ * ingest-refusal-log.test.ts): never a token, hostname or hex id. */
+export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Za-z.]{1,16})?$/;
 const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE]]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
@@ -141,7 +145,7 @@ export function sanitizeLogField(key: string, value: unknown): unknown {
   const allowed = ENUM_FIELDS.get(key);
   if (allowed !== undefined) return typeof value === "string" && allowed.has(value) ? value : undefined;
   const shape = SHAPED_FIELDS.get(key);
-  if (shape !== undefined) return typeof value === "string" && shape.test(value) ? value : undefined;
+  if (shape !== undefined) return typeof value === "string" && shape.test(value) && scrubText(value) === value ? value : undefined;
   const max = BOUNDED_COUNT_FIELDS.get(key);
   if (max !== undefined) return boundedCount(value, max);
   // Strings are scrubbed again before emit as a backstop; ids never match a rule.

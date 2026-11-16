@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
-import { CLIENT_KINDS, CLIENT_OSES, CLIENT_VERSION, clientFields } from "../client-agent.ts";
+import { CLIENT_KINDS, CLIENT_OSES, CLIENT_VERSION, clientFields, MAX_USER_AGENT } from "../client-agent.ts";
 import { dbErrorDiagnosis } from "../db-error-class.ts";
 import { DB_REFUSALS, dbRefusalFromMessage, GENERATION_REFUSALS } from "../db-refusal-class.ts";
 import { sqlLedger } from "../ledger-sql.ts";
@@ -20,6 +20,7 @@ const pg = (code: string, message: string) => Object.assign(new Error(message), 
 /** Representative messages, verbatim from supabase/migrations (pinned below), with their class. */
 const CASES: readonly (readonly [string, string])[] = [
   ["session ingest: generation not ready", "generation_not_ready"],
+  ["ingest seed: generation not ready", "generation_not_ready"],
   ["session ingest: policy expired during operation", "policy_expired"],
   ["session ingest: current custody policy unavailable", "policy_unavailable"],
   ["session ingest: retained org admission closed or conflicting", "org_admission_closed"],
@@ -40,10 +41,15 @@ const CASES: readonly (readonly [string, string])[] = [
 ];
 
 describe("db_refusal: closed class of a 55000 from its message prefix", () => {
-  test("every representative message is raised with ERRCODE 55000 by a migration (drift guard)", () => {
+  test("the NEWEST migration defining each message still raises it with ERRCODE 55000 (drift guard)", () => {
     const dir = join(import.meta.dir, "../../../supabase/migrations");
-    const sql = readdirSync(dir).filter((f) => f.endsWith(".sql")).map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
-    for (const [message] of CASES) expect(sql).toContain(`ERRCODE='55000',MESSAGE='${message}'`);
+    const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort().map((f) => ({ f, sql: readFileSync(join(dir, f), "utf8") }));
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    for (const [message] of CASES) {
+      const newest = files.filter(({ sql }) => sql.includes(`'${message}'`)).at(-1);
+      expect(newest?.f ?? `missing: ${message}`).toMatch(/\.sql$/);
+      expect(new RegExp(`ERRCODE\\s*=\\s*'55000'\\s*,\\s*MESSAGE\\s*=\\s*'${esc(message)}'`).test(newest!.sql)).toBe(true);
+    }
   });
 
   test.each(CASES)("%s -> %s", (message, refusal) => {
@@ -91,7 +97,12 @@ describe("the buffered generation retry reports the first non-generation refusal
     expect(await claimRefusals((_, first) => first ? "session ingest: retained org admission closed or conflicting" : "session ingest: generation not ready")).toBe("org_admission_closed");
   });
   test("generation refusal first, real refusal last: the real one", async () => {
-    expect(await claimRefusals((_, first) => first ? "session ingest: policy expired during operation" : "session ingest: source current row is already privacy fenced")).toBe("source_row_privacy_fenced");
+    expect(await claimRefusals((_, first) => first ? "session ingest: generation not ready" : "session ingest: source current row is already privacy fenced")).toBe("source_row_privacy_fenced");
+  });
+  test("policy_expired is a real refusal (raised only at the right generation): it survives the retry in either order", async () => {
+    expect(GENERATION_REFUSALS.has("policy_expired")).toBe(false);
+    expect(await claimRefusals((_, first) => first ? "session ingest: policy expired during operation" : "session ingest: generation not ready")).toBe("policy_expired");
+    expect(await claimRefusals((_, first) => first ? "session ingest: current custody policy unavailable" : "session ingest: policy expired during operation")).toBe("policy_expired");
   });
   test("two real refusals: the first", async () => {
     expect(await claimRefusals((_, first) => first ? "session ingest: user privacy seal missing" : "session ingest: native custody identity changed")).toBe("user_seal_missing");
@@ -107,24 +118,37 @@ describe("the buffered generation retry reports the first non-generation refusal
 
 describe("client_*: closed values from the User-Agent", () => {
   test.each([
-    ["agent-relay-desktop/1.4.2 macos", { client_kind: "desktop", client_version: "1.4.2", client_os: "macos" }],
-    ["agent-relay-desktop/0.9.0-beta.3+build.7 linux", { client_kind: "desktop", client_version: "0.9.0-beta.3+build.7", client_os: "linux" }],
-    ["agent-relay-desktop/2.0.0 Windows", { client_kind: "desktop", client_version: "2.0.0", client_os: "windows" }],
-    ["agent-relay-desktop/2.0.0 darwin", { client_kind: "desktop", client_version: "2.0.0", client_os: "macos" }],
-    ["agent-relay-desktop/2.0.0 freebsd", { client_kind: "desktop", client_version: "2.0.0", client_os: "other" }],
-    ["agent-relay-desktop/2.0.0 macos (arm64; alice@example.com)", { client_kind: "desktop", client_version: "2.0.0", client_os: "macos" }],
-    // A version off the shape (too long, or with other characters) is omitted, never truncated.
-    [`agent-relay-desktop/${"1".repeat(33)} macos`, { client_kind: "desktop", client_os: "macos" }],
+    // The real Desktop UA (relay-app desktop-core history_origin/transport.rs, stable 2026.11.12), verbatim.
+    ["agent-relay-desktop/2026.11.12 macos", { client_kind: "desktop", client_version: "2026.11.12", client_os: "macos" }],
+    ["agent-relay-desktop/2026.11.12-beta.1 windows", { client_kind: "desktop", client_version: "2026.11.12-beta.1", client_os: "windows" }],
+    ["agent-relay-desktop/2026.11.12 linux", { client_kind: "desktop", client_version: "2026.11.12", client_os: "linux" }],
+    ["agent-relay-desktop/1.4.2 Windows", { client_kind: "desktop", client_version: "1.4.2", client_os: "windows" }],
+    ["agent-relay-desktop/2026.11.12 darwin", { client_kind: "desktop", client_version: "2026.11.12", client_os: "other" }],
+    ["agent-relay-desktop/2026.11.12 macos (arm64; alice@example.com)", { client_kind: "desktop", client_version: "2026.11.12", client_os: "macos" }],
+    // A version off the release shape is omitted, never truncated: tokens, hostnames, hex ids, free text.
+    ["agent-relay-desktop/AKIAIOSFODNN7EXAMPLE macos", { client_kind: "desktop", client_os: "macos" }],
+    ["agent-relay-desktop/alice.example.com macos", { client_kind: "desktop", client_os: "macos" }],
+    [`agent-relay-desktop/${"0123456789abcdef".repeat(2)} macos`, { client_kind: "desktop", client_os: "macos" }],
+    ["agent-relay-desktop/2026 macos", { client_kind: "desktop", client_os: "macos" }],
     ["agent-relay-desktop/1.0;rm_-rf macos", { client_kind: "desktop", client_os: "macos" }],
+    ["agent-relay-desktop/2026.11.12-AKIAIOSFODNN7EXAMPLE macos", { client_kind: "desktop", client_os: "macos" }],
   ] as const)("%s", (ua, expected) => {
     expect(clientFields(ua)).toEqual(expected);
   });
 
   test.each([
-    [undefined], [null], [""], ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"], ["curl/8.4.0"], ["agent-relay-desktop/1.0.0"],
-    ["agent-relay-desktop"], [" agent-relay-desktop/1.0.0 macos"], ["AGENT-RELAY-DESKTOP/1.0.0 macos"], [`agent-relay-desktop/1.0.0 macos ${"x".repeat(300)}`],
+    [undefined], [null], [""], ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"], ["curl/8.4.0"], ["agent-relay-desktop/2026.11.12"],
+    ["agent-relay-desktop"], [" agent-relay-desktop/2026.11.12 macos"], ["AGENT-RELAY-DESKTOP/2026.11.12 macos"], [`agent-relay-desktop/2026.11.12 macos ${"x".repeat(300)}`],
   ] as const)("%p -> other only", (ua) => {
     expect(clientFields(ua)).toEqual({ client_kind: "other" });
+  });
+
+  test("the User-Agent bound: 256 characters is read, 257 is other", () => {
+    const base = "agent-relay-desktop/2026.11.12 macos ";
+    const at = (n: number) => base + "x".repeat(n - base.length);
+    expect(at(MAX_USER_AGENT).length).toBe(256);
+    expect(clientFields(at(256))).toEqual({ client_kind: "desktop", client_version: "2026.11.12", client_os: "macos" });
+    expect(clientFields(at(257))).toEqual({ client_kind: "other" });
   });
 });
 
@@ -136,8 +160,9 @@ describe("the log allowlist mirrors the closed sets", () => {
     expect(CLIENT_VERSION_SHAPE.source).toBe(CLIENT_VERSION.source);
     expect(sanitizeLogField("db_refusal", "ack_seal")).toBe("ack_seal");
     for (const bad of ["session ingest: generation not ready", "ACK_SEAL", "", 1, null]) expect(sanitizeLogField("db_refusal", bad)).toBeUndefined();
-    expect(sanitizeLogField("client_version", "1.4.2")).toBe("1.4.2");
-    for (const bad of ["1.0 macos", "x".repeat(33), "alice@example.com", "", 1]) expect(sanitizeLogField("client_version", bad)).toBeUndefined();
+    for (const good of ["1.4.2", "2026.11.12", "2026.11.12-beta.1"]) expect(sanitizeLogField("client_version", good)).toBe(good);
+    for (const bad of ["1.0 macos", "x".repeat(33), "alice@example.com", "alice.example.com", "AKIAIOSFODNN7EXAMPLE", "0123456789abcdef".repeat(2), "", 1])
+      expect(sanitizeLogField("client_version", bad)).toBeUndefined();
     expect(sanitizeLogField("client_kind", "Mozilla/5.0")).toBeUndefined();
     expect(sanitizeLogField("client_os", "darwin")).toBeUndefined();
   });
@@ -164,12 +189,12 @@ describe("the /v1/delivery/batches route line", () => {
   }
 
   test("a 55000 claim: unchanged 503; db_refusal and the desktop client survive the allowlist; no message or UA text", async () => {
-    const r = await post("agent-relay-desktop/1.4.2 macos", "session ingest: retained org admission closed or conflicting");
+    const r = await post("agent-relay-desktop/2026.11.12 macos", "session ingest: retained org admission closed or conflicting");
     expect(r.status).toBe(503);
     expect(r.line).toMatchObject({
       route: "delivery.batches", outcome: "delivery_unavailable", error_code: "ledger_sqlstate_55000", db_error_code: "55000",
       db_error_class: "unknown", db_error_basis: "none", db_refusal: "org_admission_closed",
-      client_kind: "desktop", client_version: "1.4.2", client_os: "macos",
+      client_kind: "desktop", client_version: "2026.11.12", client_os: "macos",
     });
     const text = JSON.stringify(r.line);
     for (const needle of ["retained org admission", "hunter2", "agent-relay-desktop"]) expect(text).not.toContain(needle);
