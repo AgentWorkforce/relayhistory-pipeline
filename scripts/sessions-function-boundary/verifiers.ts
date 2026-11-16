@@ -2,6 +2,16 @@ import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../../src/session-pipeline/bu
 import type { VerifierTarget } from "./types.ts";
 
 const quoted = (sigs: readonly string[]) => sigs.map((k) => " '" + k + "'").join(",\n");
+const legacyEraserPrefixOptional = (text: string) =>
+  text.replace(
+    " SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;",
+    ` -- Allowed, not required before 20261105062030 installs the durable legacy-owner mapping.
+ -- Once the table exists both RPCs remain mandatory, so a partial or edited migration fails closed.
+ IF to_regclass('sessions.legacy_export_scope_authority') IS NULL THEN
+  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.legacy\\_export\\_privacy\\_eraser\\_%');
+ END IF;
+ SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;`,
+  );
 
 /**
  * Role verifiers whose approved-function arrays are derived from the composed ACL. A lane that
@@ -43,7 +53,9 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     template: "supabase/bootstrap/session_ingest_verify.sql",
     pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
     render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
-    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_privacy_eraser").replaceAll("session ingest", "privacy eraser"),
+    transform: (text) => legacyEraserPrefixOptional(
+      text.replaceAll("bulls96_session_ingest", "bulls96_privacy_eraser").replaceAll("session ingest", "privacy eraser"),
+    ),
   },
   {
     // The E3 erasure phase's registry login (20261105042000): only the retention claim/fence/complete RPCs.

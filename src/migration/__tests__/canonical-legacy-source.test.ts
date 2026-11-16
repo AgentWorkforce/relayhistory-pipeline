@@ -25,7 +25,7 @@ import {
 } from "../neon-s3-sync/legacy-source.ts";
 import { exportUnit } from "../neon-s3-sync/export-session.ts";
 import { groupExistsInNeon } from "../neon-s3-sync/neon-reader.ts";
-import { Checkpoint, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
+import { Checkpoint, assertLegacyErasureAuthorityReady, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
 import {
   assertDirectUrl,
   assertPrivacySelectOnly,
@@ -97,7 +97,9 @@ beforeAll(async () => {
         AND a.workspace_id=CASE WHEN p->>'workspace_id'='' THEN 'default' ELSE p->>'workspace_id' END
         AND a.source=p->>'source' AND a.session_id=p->>'session_id';
     RETURN v;
-  END $$;`);
+  END $$;
+  CREATE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean
+  LANGUAGE sql AS $$ SELECT true $$;`);
   await pg.query(
     `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','person',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
     [turnId],
@@ -427,6 +429,78 @@ test("session, upload deletion and reset races are caught after the object write
       privacyValue: { manifests: [{ manifestKey: `written/${erase}/manifest.json` }] },
     });
     await pg.exec("DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.upload_deletions;DELETE FROM sessions.upload_resets");
+  }
+});
+
+test("legacy authority readiness fails closed when its RPC is absent", async () => {
+  await expect(
+    assertLegacyErasureAuthorityReady({
+      async query<T>() {
+        return { rows: [{ installed: false }] as T[] };
+      },
+    }),
+  ).rejects.toMatchObject({ code: "legacy_export_authority_not_active" });
+  let n = 0;
+  await expect(
+    assertLegacyErasureAuthorityReady({
+      async query<T>() {
+        n += 1;
+        if (n === 1) return { rows: [{ installed: true }] as T[] };
+        throw Object.assign(new Error("relation missing"), { code: "42P01" });
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "legacy_export_authority_not_active",
+    cause: { code: "42P01" },
+  });
+});
+
+test("the privacy transaction has a finite idle bound", async () => {
+  const sql: string[] = [];
+  const bounded: Queryable = {
+    async query<T>(text: string, params?: unknown[]) {
+      sql.push(text);
+      return privacyDb.query<T>(text, params);
+    },
+  };
+  expect(await withLegacyPrivacyFence(bounded, scope, "person", async () => undefined)).toEqual({
+    fenced: false,
+    value: undefined,
+  });
+  expect(sql).toContain("SET LOCAL idle_in_transaction_session_timeout='15min'");
+  expect(sql).not.toContain("SET LOCAL idle_in_transaction_session_timeout='0'");
+});
+
+test("authority deactivation after a PUT fails the scope and preserves its write evidence", async () => {
+  const s = { ...scope, sessionId: "authority-deactivated" };
+  let ready = 0;
+  const flips: Queryable = {
+    async query<T>(sql: string, params?: unknown[]) {
+      if (sql.includes("legacy_export_privacy_authority_ready")) {
+        ready += 1;
+        if (ready === 4)
+          throw Object.assign(new Error("authority deactivated"), {
+            code: "privacy_authority_not_active",
+          });
+      }
+      return privacyDb.query<T>(sql, params);
+    },
+  };
+  try {
+    await expect(
+      withLegacyPrivacyFence(
+        flips,
+        s,
+        "person",
+        async () => ({ manifests: [{ manifestKey: "written/authority-deactivated/manifest.json" }] }),
+        { machineId: legacyMachineId(s.workspaceId, "person"), existing: false },
+      ),
+    ).rejects.toMatchObject({
+      code: "privacy_fence_unavailable",
+      privacyValue: { manifests: [{ manifestKey: "written/authority-deactivated/manifest.json" }] },
+    });
+  } finally {
+    await pg.exec("DELETE FROM sessions.legacy_export_scope_authority WHERE session_id='authority-deactivated'");
   }
 });
 

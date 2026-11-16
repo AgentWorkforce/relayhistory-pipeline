@@ -1,10 +1,15 @@
 # Legacy evidence export (conversation_turns, session_links, session_outcomes)
 
 Operator: Khaliq only. This runbook does production reads from Neon and the
-live HoopDb/Supabase privacy authority (table-read-only, with one narrow
-authority-registration RPC), plus production S3 writes. Do not run any mode against real data or write the production bucket
+live HoopDb/Supabase privacy authority (table-read-only, with narrow
+authority-registration and readiness RPCs), plus production S3 writes. Do not run any mode against real data or write the production bucket
 without Khaliq's explicit words for that exact run. Design and gate status:
 [docs/canonical-legacy-source.md](../docs/canonical-legacy-source.md).
+
+The landing branch's `--export` entry point refuses unconditionally with
+`legacy_export_requires_activation_heartbeat`. Only the separately reviewed
+activation follow-up may replace that refusal with its fresh, eraser-written
+heartbeat gate; landing or applying 062030 alone cannot enable exports.
 
 ## Rules
 
@@ -26,15 +31,19 @@ without Khaliq's explicit words for that exact run. Design and gate status:
     grants it SELECT on `session_erasure_receipts`, `upload_deletions`,
     `ingest_frozen_source_deletions`, `upload_resets`,
     `turn_session_fences`, and `operator_user_erasures`, plus EXECUTE on the
-    narrow SECURITY DEFINER authority registration RPC. It has no table-write
+    narrow SECURITY DEFINER authority registration and readiness RPCs. It has no table-write
     privilege and no privilege on `legacy_export_scope_authority`. Promote the
     bare role to LOGIN only through
     `supabase/bootstrap/legacy_export_privacy_role.sql` under a separate apply
-    approval; set its password from 1Password in memory.
+    approval; run `supabase/bootstrap/legacy_export_privacy_verify.sql` before
+    and after that step, and set its password from 1Password in memory.
   - Migration
     `20261105062010_turns_forward_gates.sql`, which creates
     `turn_session_fences`, must already be landed and applied; a missing
     relation is a hard refusal, never an empty fence set.
+    Preserve the registry order `062010` turns gates -> `062020` read-API
+    reader kind -> `062030` legacy authority: do not land or apply `062030`
+    while either predecessor is absent.
   - Poolers, including port 6543, any other identity, and roles with ledger
     write privileges are refused. With RLS active, migration 062030's reviewed,
     permissive full-read policy must be present and no applicable restrictive
@@ -42,10 +51,10 @@ without Khaliq's explicit words for that exact run. Design and gate status:
     dedicated role, changing grants, or granting `BYPASSRLS` is an IAM change
     and needs Khaliq's explicit approval; do not make it as part of a run.
   - The exporter holds the operator-erasure advisory locks shared across each
-    object write and rechecks session receipts, upload deletions/resets,
+    object write and rechecks authority readiness, session receipts, upload deletions/resets,
     turn-session fences and user erasures before checkpointing. It overrides
-    the privacy connection's idle-in-transaction timeout for the bounded scope
-    and aborts the whole run if that connection or transaction is lost.
+    the privacy connection's idle-in-transaction timeout to a 15-minute scope
+    bound and aborts the whole run if that connection or transaction is lost.
   - Before the first S3 PUT for a scope, the exporter immutably registers
     `(org, normalized workspace, source, session, legacy user, legacy machine)`.
     A replay must return the same tuple; an owner or machine change refuses.

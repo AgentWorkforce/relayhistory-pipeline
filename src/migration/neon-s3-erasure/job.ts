@@ -68,6 +68,12 @@ export interface ErasureConfig {
    */
   recognizeLegacy: boolean;
   /**
+   * Dedicated legacy-export fence feed. The process entry keeps this default
+   * off until 062030 and the Supabase authority are activated together.
+   * Every caller must opt in explicitly after the schema/authority gate.
+   */
+  legacyExportErasure: boolean;
+  /**
    * TEST SEAM ONLY (never set by main.ts): whether exporter obligations may be treated as settled. Production has NO
    * value for it, so an exporter prefix or object is never marked erased (every genesis is unattested; there is no
    * unlock until a separately reviewed recovery contract exists). Tests of the completion path opt in explicitly.
@@ -82,6 +88,7 @@ export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
   progressEveryMs: 60 * 1000,
   slaWarnMs: 24 * 60 * 60 * 1000,
   recognizeLegacy: false,
+  legacyExportErasure: false,
 };
 
 const SESSION_PREFIX = /^[^/]+\/[^/]+\/v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/$/;
@@ -358,11 +365,13 @@ export class ErasureJob {
     // The one-shot legacy exporter writes to a separate user-scoped srv_
     // machine and never enters the ordinary export queue.  Consume its own
     // scope-level fence feed independently of the live-origin feed.
-    const legacy = await this.#eraseLegacyFenced(opts.dryRun ?? false).catch((error) => {
-      this.counters.legacyFenceFailed += 1;
-      this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
-      return { groups: 0, versions: 0 };
-    });
+    const legacy = this.cfg.legacyExportErasure
+      ? await this.#eraseLegacyFenced(opts.dryRun ?? false).catch((error) => {
+          this.counters.legacyFenceFailed += 1;
+          this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
+          return { groups: 0, versions: 0 };
+        })
+      : { groups: 0, versions: 0 };
     // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
     // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
     let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
@@ -631,40 +640,41 @@ export class ErasureJob {
       after = rows.at(-1)!;
       for (const g of rows) {
         if (this.stopped()) break;
-        // The stored machine is evidence, not destructive authority by
-        // itself: derive it again from the canonical owner tuple and refuse
-        // corruption instead of following an arbitrary machine id.
-        const storageWorkspaces = g.workspace_id === "default" ? ["", "default"] : [g.workspace_id];
-        const storageWorkspace = storageWorkspaces.find(
-          (workspace) => legacyMachineId(workspace, g.legacy_user_id) === g.legacy_machine_id,
-        );
-        if (storageWorkspace === undefined)
-          throw refusal("legacy_erasure_machine_mismatch");
-        let t;
         try {
-          t = liveTargets(this.cfg.keyRoot, {
-            org_id: g.org_id,
-            workspace_id: storageWorkspace,
-            user_id: g.legacy_user_id,
-            origin_id: LEGACY_EXPORT_ORIGIN_ID,
-            source: g.source,
-            session_id: g.session_id,
-          });
-        } catch {
-          this.counters.refused += 1;
-          throw refusal("legacy_erasure_scope_invalid");
-        }
-        groups += 1;
-        if (dryRun) continue;
-        const checkedAt = this.now();
-        if (!(await stillFenced.call(this.authority, g))) continue;
-        const before = checkedAt - LIVE_SKEW_MS;
-        const matchesSession = (key: string) => inSessionAnyDate(t.base, t.sessionSegment, key);
-        const authorize = async () => {
-          if (!(await stillFenced.call(this.authority, g))) throw refusal("erasure_reenabled");
-          await this.authority.ready();
-        };
-        try {
+          // The stored machine is evidence, not destructive authority by
+          // itself: derive it again from the canonical owner tuple and refuse
+          // corruption instead of following an arbitrary machine id. A bad
+          // row remains loudly retryable but cannot wedge later valid scopes.
+          const storageWorkspaces = g.workspace_id === "default" ? ["", "default"] : [g.workspace_id];
+          const storageWorkspace = storageWorkspaces.find(
+            (workspace) => legacyMachineId(workspace, g.legacy_user_id) === g.legacy_machine_id,
+          );
+          if (storageWorkspace === undefined)
+            throw refusal("legacy_erasure_machine_mismatch");
+          let t;
+          try {
+            t = liveTargets(this.cfg.keyRoot, {
+              org_id: g.org_id,
+              workspace_id: storageWorkspace,
+              user_id: g.legacy_user_id,
+              origin_id: LEGACY_EXPORT_ORIGIN_ID,
+              source: g.source,
+              session_id: g.session_id,
+            });
+          } catch {
+            this.counters.refused += 1;
+            throw refusal("legacy_erasure_scope_invalid");
+          }
+          groups += 1;
+          if (dryRun) continue;
+          const checkedAt = this.now();
+          if (!(await stillFenced.call(this.authority, g))) continue;
+          const before = checkedAt - LIVE_SKEW_MS;
+          const matchesSession = (key: string) => inSessionAnyDate(t.base, t.sessionSegment, key);
+          const authorize = async () => {
+            if (!(await stillFenced.call(this.authority, g))) throw refusal("erasure_reenabled");
+            await this.authority.ready();
+          };
           const transcript = await this.#erasePaged(
             t.base,
             eraseScope(["legacy-session", this.authority.kind, g.org_id, g.workspace_id, g.legacy_user_id, g.source, g.session_id]),

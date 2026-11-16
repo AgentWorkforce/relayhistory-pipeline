@@ -184,6 +184,16 @@ activation (migration 20261105041000_ingest_privacy_authority) and the RHC
 `supabase-authority` flip; restarting in `supabase` before activation only
 logs `sweep refused: privacy authority not ready`.
 
+The legacy-export fence feed is independently default-off. Set
+`S3X_LEGACY_EXPORT_ERASURE_ENABLED=true` only in the same reviewed activation
+that applies 062030, switches the eraser to the Supabase authority, and starts
+the legacy exporter. Any other non-empty value refuses startup. Keep it true
+after activation: if the authority ever falls back to Neon, the enabled feed
+detects legacy copies and fails loudly instead of silently re-deriving an owner.
+On Supabase it reads the immutable registered owner and treats both session
+fences and the durable user-wide `upload_resets` / `operator_user_erasures`
+ledgers as authority, so a late PUT after the export lock times out is retried.
+
 Dry run (reads the authority, builds everything, erases nothing): run `main.ts`
 without `--execute`; it needs only `databaseUrl` on stdin. It does open the state
 file at `S3X_STATE` (creating it if absent, and with `S3X_OBLIGATIONS=on`
