@@ -169,6 +169,13 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
+        if (result.deferred) {
+          // This invocation already streamed a scope (streamSlot): stream this one in a later invocation.
+          if (!deps.requeue) throw new Error("stream deferred and no requeue");
+          await deps.requeue(manifestKey);
+          log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
+          continue;
+        }
         if (result.partial)
           log.warn("search index partial", {
             stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests,

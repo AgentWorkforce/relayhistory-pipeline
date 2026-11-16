@@ -148,6 +148,14 @@ export interface SearchIndexDeps {
    * no deadline.
    */
   streamDeadline?: StreamDeadline;
+  /**
+   * Only with `stream` (the hosted Lambda sets one per invocation, with the deadline): the
+   * invocation's single streamed scope. The first scope that streams takes it; a later scope
+   * of the same invocation that would stream returns `deferred` instead, before any write,
+   * and the consumer requeues it (as `busy`), so one streamed scope's run up to the deadline
+   * never leaves several more to finish inside the margin. Absent: no such limit.
+   */
+  streamSlot?: { used: boolean };
   /** Tests only: how often the streaming reader keeps its transaction busy (default 20 s). */
   streamKeepaliveMs?: number;
 }
@@ -247,6 +255,8 @@ export interface SearchIndexResult {
   reasons: string[];
   /** Another pass holds this session: nothing was done, re-enqueue the event. */
   busy?: boolean;
+  /** Would stream, but this invocation already streamed a scope (`streamSlot`): nothing was written, re-enqueue the event. */
+  deferred?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
   /** Present only with `outputFacts`: fact rows inserted and deleted, and whether they are exact. */
@@ -434,8 +444,12 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (
       deps.stream && !deps.outputFacts && !deps.outputFactsStore && siblingKeys.length &&
       s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
-    )
+    ) {
+      if (deps.streamSlot?.used)
+        return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
+      if (deps.streamSlot) deps.streamSlot.used = true;
       return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
+    }
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
       await io.record(scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
@@ -798,6 +812,18 @@ export const SEARCH_INDEX_STREAM_CH_DEFAULTS: Readonly<StreamReadLimits> = Objec
   maxReadBytes: 1024 * MiB,
   maxReadEvents: 1_000_000,
 });
+/**
+ * The hosted Lambda's cap: the self-host STREAM_READ_CEILING bytes (streamed a chunk at a time,
+ * never held), but 1,000,000 events. On the ClickHouse binding the keyset scan holds up to
+ * maxReadEvents index identities, each with its hashed key and the reader's wanted entry:
+ * about 0.8 KB per identity, measured on Node 24 (V8). That is ~0.75 GiB at 1,000,000 against the
+ * ~1.65 GiB default V8 heap of the 3008 MiB function (stacks/aws/session-pipeline.ts
+ * memorySize), leaving room for chunk buffers and directory events; 2,000,000 (~1.5 GiB) would not.
+ */
+export const SEARCH_INDEX_STREAM_CH_CEILING: Readonly<StreamReadLimits> = Object.freeze({
+  maxReadBytes: STREAM_READ_CEILING.maxReadBytes,
+  maxReadEvents: 1_000_000,
+});
 export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_DEFAULT_MS = 60_000;
 export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MIN_MS = 10_000;
 export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MAX_MS = 240_000;
@@ -818,9 +844,10 @@ export interface SearchIndexStreamCh extends StreamReadLimits {
  *   SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS default 1,000,000
  *   SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS default 60000, in 10000..240000
  *
- * Each budget must lie between four times the effective whole-read bound and the cap
- * STREAM_READ_CEILING (2 GiB / 2,000,000); a default under that floor (the replay profile's
- * events) is raised to it. The self-host SEARCH_INDEX_STREAMING_ENABLED and
+ * Each budget must lie between four times the effective whole-read bound (at most the cap)
+ * and the cap SEARCH_INDEX_STREAM_CH_CEILING (2 GiB / 1,000,000, sized to the function's
+ * memory); a default under that floor is raised to it (the replay profile's events floor is
+ * the cap itself). The self-host SEARCH_INDEX_STREAMING_ENABLED and
  * SEARCH_INDEX_STREAM_MAX_READ_* are not read here. The caller checks the dependencies
  * (SEARCH_INDEX_ENABLED=1, the clickhouse backend, no SEARCH_INDEX_OUTPUT_FACTS=1).
  * Errors name the variable and its range, never the value.
@@ -833,10 +860,11 @@ export function searchIndexStreamChFromEnv(
   if (flag === undefined || flag === "" || flag === "0") return undefined;
   if (flag !== "1") throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH must be 1 or 0");
   const prefix = "session pipeline";
-  const cap = STREAM_READ_CEILING;
-  const floor = searchIndexStreamFloor(limits);
+  const cap = SEARCH_INDEX_STREAM_CH_CEILING;
+  const defaults = searchIndexStreamFloor(limits);
+  const floor = { maxReadBytes: Math.min(defaults.maxReadBytes, cap.maxReadBytes), maxReadEvents: Math.min(defaults.maxReadEvents, cap.maxReadEvents) };
   const budget = (name: string, bytes: boolean, fallback: number, min: number, max: number) =>
-    readStreamBudget(env, prefix, name, bytes, Math.max(fallback, min), min, max);
+    readStreamBudget(env, prefix, name, bytes, Math.min(Math.max(fallback, min), max), min, max);
   const marginRaw = env.SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS;
   let deadlineMarginMs = SEARCH_INDEX_STREAM_DEADLINE_MARGIN_DEFAULT_MS;
   if (marginRaw !== undefined && marginRaw !== "") {
@@ -978,7 +1006,10 @@ interface LegacyProjectionIo extends SearchProjectionIo {
  * (org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id): with org,
  * workspace and source fixed by the scope, (ts, session_id, machine_id, kind, event_id) is
  * the ReplacingMergeTree identity, unique under FINAL, so `WHERE tuple > last ORDER BY tuple`
- * visits every row once. There is no row_id column; no DDL is needed for this order.
+ * visits every row once. A later page also carries `ts >= last.ts`, implied by the tuple
+ * comparison but a plain range on the sort key's third column, so ClickHouse prunes the
+ * granules before it instead of rescanning the scope's prefix on every page. There is no
+ * row_id column; no DDL is needed for this order.
  */
 export async function clickhouseScopePage(
   ch: ClickHouseClient,
@@ -1004,6 +1035,7 @@ export async function clickhouseScopePage(
      WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String})
        AND workspace_id = {workspace:String} AND source = {source:String}
        AND toUnixTimestamp64Milli(ts) >= {from:Int64}${after ? `
+       AND ts >= fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC')
        AND (ts, session_id, machine_id, kind, event_id) >
            (fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC'), {after_session:String}, {after_machine:String}, {after_kind:String}, {after_event:String})` : ""}
      ORDER BY ts, session_id, machine_id, kind, event_id

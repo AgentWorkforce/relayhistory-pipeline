@@ -101,12 +101,16 @@ export interface SessionPipelineInputs {
    * `searchIndex: true` and renders SEARCH_INDEX_STREAMING_CH=1; the Lambda also refuses to start unless the
    * pipeline secret selects the clickhouse search backend. Each knob renders only when armed and set; absent, the
    * Lambda's default applies. Streamed output facts (D2) and the large worker (D3) are not in this cut.
+   * Memory: the keyset scan holds up to maxReadEvents index identities, about 0.8 KB each with their keys
+   * (measured on Node 24), so the 1000000 cap is ~0.75 GiB of the ~1.65 GiB default V8 heap at memorySize 3008;
+   * the cap is SEARCH_INDEX_STREAM_CH_CEILING and must move with memorySize. One streamed scope per invocation;
+   * the margin must cover the batch's other scopes (whole reads) and replay.
    */
   streamReconcile?: {
     enabled: boolean;
     /** Raw bytes the streamed passes may read per scope (SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES, 256 MiB-2 GiB). Default 1 GiB. */
     maxReadBytes?: number;
-    /** Events the streamed passes may read per scope (SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS, 400000-2000000). Default 1000000. */
+    /** Events the streamed passes may read per scope (SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS, 400000-1000000, memory-bound). Default 1000000. */
     maxReadEvents?: number;
     /** Time kept back from the invocation's remaining time (SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, 10000-240000). Default 60000. */
     deadlineMarginMs?: number;
@@ -347,8 +351,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     // so the floor is four passes of the default scope bound), so a value here is never refused at Lambda start.
     if (r.maxReadBytes !== undefined && !(Number.isInteger(r.maxReadBytes) && (r.maxReadBytes as number) >= 268_435_456 && (r.maxReadBytes as number) <= 2_147_483_648))
       refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadBytes must be an integer from 268435456 (256 MiB) to 2147483648 (2 GiB)");
-    if (r.maxReadEvents !== undefined && !(Number.isInteger(r.maxReadEvents) && (r.maxReadEvents as number) >= 400_000 && (r.maxReadEvents as number) <= 2_000_000))
-      refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadEvents must be an integer from 400000 to 2000000");
+    if (r.maxReadEvents !== undefined && !(Number.isInteger(r.maxReadEvents) && (r.maxReadEvents as number) >= 400_000 && (r.maxReadEvents as number) <= 1_000_000))
+      refuse("transcriptStore.sessionPipeline.streamReconcile.maxReadEvents must be an integer from 400000 to 1000000");
     if (r.deadlineMarginMs !== undefined && !(Number.isInteger(r.deadlineMarginMs) && (r.deadlineMarginMs as number) >= 10_000 && (r.deadlineMarginMs as number) <= 240_000))
       refuse("transcriptStore.sessionPipeline.streamReconcile.deadlineMarginMs must be an integer from 10000 to 240000");
   }
