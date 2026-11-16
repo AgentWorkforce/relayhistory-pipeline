@@ -23,7 +23,7 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
 - The pod's role (`ledger-bench-pod`) has one permission: assume `ledger-bench-client` in the data account.
   It has no access to any bucket, key or table in the cluster's account.
 - `ledger-bench-client` is trusted only by that pod role. It can read and write `bench/*` in R1, R2 and R3,
-  open sessions on R4 and R5, use the two bench keys (matched by tag, through S3 only), and read and write
+  open sessions on R4 and R5, use the two bench keys (K2 by ARN, K1 by its tag), and read and write
   the one table.
 - The client refuses any target whose name lacks `ledger-bench` before its first request
   (`benchmarks/ledger-bench/config.ts`).
