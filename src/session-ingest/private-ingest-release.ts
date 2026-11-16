@@ -105,7 +105,7 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
 const COMMON_PROFILE = {
   acceptanceMode: "buffered",
   accountId: PRIVATE_INGEST_RELEASE.accountId,
-  expectedGeneration: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
+  expectedGeneration: "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8",
   hyperdriveId: "0fcc0265e96f43a39976b5aa4263f4a6",
   secretsStoreId: "59e0dcc52f0a4bd7863730548299fb2f",
   maxPerUser: 4,
@@ -145,6 +145,10 @@ const COMMON_PROFILE = {
  * policy and the admission rows are still at G = 52a3f2f0... with no window open. Lifecycle step (1)
  * again: the pair is now {G, H} (the 11-13 pair's step (3) had not yet removed it), the tracked
  * profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then rebind G -> H.
+ * Done: G+H deploy 43905867111 and rebind 43906084961 moved the policy and all 1050 admission rows to
+ * H. This is lifecycle step (2): deploy H-only at the same baseline phase while retaining the pair
+ * solely to authorize the G+H -> H transition; step (3) sets it to null after the live Worker reads
+ * back exactly H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
   from: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
