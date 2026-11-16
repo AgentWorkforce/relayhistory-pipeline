@@ -10,6 +10,11 @@
 -- observes or creates the durable fence; a later fence-version bump retires an already-published
 -- generation through ingest_publication_retire_fence.
 
+-- This file installs triggers on two live privacy ledgers. Refuse rather than wait indefinitely,
+-- and put a hard ceiling on the historical fence census while those DDL locks are retained.
+SET LOCAL lock_timeout='5s';
+SET LOCAL statement_timeout='120s';
+
 CREATE TABLE sessions.turn_session_fences (
   org_id text NOT NULL,
   workspace_id text NOT NULL,
@@ -88,8 +93,9 @@ BEGIN
  RETURN v_n;
 END $materialize$;
 
--- Every existing selection/reset/operator erase eventually inserts upload_deletions. Turn-origin
--- rows are the materialized result and are ignored to prevent recursion.
+-- Existing exact-session deletions are captured here. Operator whole-user erase separately purges
+-- its user's auxiliary writer rows; it does not promise an upload_deletions row for every scope.
+-- Turn-origin rows are the materialized result and are ignored to prevent recursion.
 CREATE FUNCTION sessions.ingest_turn_capture_erasure() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $capture$
 DECLARE x record;
@@ -121,13 +127,56 @@ CREATE TRIGGER ingest_turn_capture_erasure
  REFERENCING NEW TABLE AS inserted_turn_erasures
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_turn_capture_erasure();
 
+-- Whole-user erase takes the global privacy lock before inserting this ledger row. Registration
+-- takes the shared side through operator_user_erase_control_gate, so whichever commits first makes
+-- the other wait and observe it. The ledger insert removes the auxiliary personal writer ids; the
+-- durable logical/session fences and synthetic pointer marker contain no erased user content.
+CREATE FUNCTION sessions.ingest_turn_capture_user_erasure() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $capture_user$
+BEGIN
+ DELETE FROM sessions.turn_writers
+  WHERE org_id=NEW.org_id AND workspace_id=NEW.workspace_id AND user_id=NEW.user_id;
+ RETURN NEW;
+END $capture_user$;
+
+CREATE TRIGGER ingest_turn_capture_user_erasure
+ AFTER INSERT ON sessions.operator_user_erasures
+ FOR EACH ROW EXECUTE FUNCTION sessions.ingest_turn_capture_user_erasure();
+
 -- The trigger cannot observe rows that predate this migration. Seed the permanent logical census
--- from every existing exact-session deletion before a turn writer can be registered.
-INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
- SELECT DISTINCT org_id,workspace_id,source,session_id,'live'
- FROM sessions.upload_deletions
- WHERE session_id IS NOT NULL AND origin_id<>'relayhistory:conversation_turns:v1'
- ON CONFLICT DO NOTHING;
+-- from every existing exact-session deletion before a turn writer can be registered. Page the
+-- frozen history in C order, under the file-level 120-second statement ceiling, so one old tenant
+-- cannot create an unbounded lock-time or work-memory spike while this migration owns the trigger.
+DO $backfill$
+DECLARE
+ x record;
+ v_after_org text;
+ v_after_ws text;
+ v_after_source text;
+ v_after_session text;
+ v_n integer;
+BEGIN
+ LOOP
+  v_n:=0;
+  FOR x IN
+   SELECT org_id,workspace_id,source,session_id FROM(
+    SELECT DISTINCT org_id,workspace_id,source,session_id
+     FROM sessions.upload_deletions
+     WHERE session_id IS NOT NULL AND origin_id<>'relayhistory:conversation_turns:v1') q
+    WHERE (v_after_org IS NULL OR
+       (org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C")>
+       (v_after_org COLLATE "C",v_after_ws COLLATE "C",v_after_source COLLATE "C",v_after_session COLLATE "C"))
+    ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"
+    LIMIT 1000
+  LOOP
+   INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis)
+    VALUES(x.org_id,x.workspace_id,x.source,x.session_id,'live') ON CONFLICT DO NOTHING;
+   v_after_org:=x.org_id;v_after_ws:=x.workspace_id;v_after_source:=x.source;v_after_session:=x.session_id;
+   v_n:=v_n+1;
+  END LOOP;
+  EXIT WHEN v_n=0;
+ END LOOP;
+END $backfill$;
 
 -- Called by POST /v1/turns/batches after strict parsing and before any enqueue/claim. It registers
 -- the exact user/source/session writers and returns the pairs already fenced. A fenced pair is not
@@ -142,6 +191,7 @@ BEGIN
  v_org:=sessions.ingest_identifier(t->'orgId',false);
  v_ws:=sessions.ingest_identifier(t->'workspaceId',true);
  v_user:=sessions.ingest_identifier(t->'userId',false);
+ PERFORM sessions.operator_user_erase_control_gate(v_org,v_ws,v_user);
  IF jsonb_typeof(p->'sessions') IS DISTINCT FROM'array' OR jsonb_array_length(p->'sessions') NOT BETWEEN 1 AND 500
  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn register: sessions must contain 1..500 pairs';END IF;
  FOR x IN SELECT f.source,f.session_id FROM sessions.ingest_fence_pairs(p->'sessions') f
@@ -212,7 +262,9 @@ BEGIN
 END $sources$;
 
 -- Turn-only canonical pointers remain addressable by GET turns but never become a live directory
--- row. A later non-turn pointer makes the predicate false and the normal projector can restore it.
+-- row. The synthetic machine id is the durable, non-personal origin marker: unlike turn_writers it
+-- survives user/session erasure. A later non-turn pointer makes the predicate false and the normal
+-- projector can restore the row.
 CREATE FUNCTION sessions.aa_session_directory_hide_turn_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
 BEGIN
@@ -221,10 +273,9 @@ BEGIN
     AND s.harness=NEW.harness AND coalesce(s.canonical_session_id,s.session_id)=NEW.session_id AND s.deleted_at IS NULL)
   AND NOT EXISTS(SELECT 1 FROM sessions.session_index s WHERE s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id
     AND s.harness=NEW.harness AND coalesce(s.canonical_session_id,s.session_id)=NEW.session_id AND s.deleted_at IS NULL
-    AND NOT EXISTS(SELECT 1 FROM sessions.turn_writers w
-      WHERE w.org_id=s.org_id AND w.workspace_id=s.workspace_id AND w.user_id=s.user_id
-       AND w.source=s.harness AND w.session_id=s.session_id
-       AND s.machine_id='srv_'||left(encode(sha256(convert_to(s.workspace_id||chr(31)||'relayhistory:conversation_turns:v1'||chr(31)||s.user_id,'UTF8')),'hex'),32)))
+    AND s.machine_id IS DISTINCT FROM 'srv_'||left(encode(sha256(convert_to(
+      s.workspace_id||chr(31)||'relayhistory:conversation_turns:v1'||chr(31)||s.user_id,'UTF8')),'hex'),32)
+  )
  THEN NEW.deleted_at:=clock_timestamp();END IF;
  RETURN NEW;
 END $hide_turn_only$;
@@ -234,7 +285,8 @@ CREATE TRIGGER aa_session_directory_hide_turn_only
  FOR EACH ROW EXECUTE FUNCTION sessions.aa_session_directory_hide_turn_only();
 
 REVOKE ALL ON FUNCTION sessions.ingest_turn_materialize_fence(text,text,text,text),
- sessions.ingest_turn_capture_erasure(),sessions.ingest_turn_capability(jsonb),sessions.ingest_turn_register(jsonb),
+ sessions.ingest_turn_capture_erasure(),sessions.ingest_turn_capture_user_erasure(),
+ sessions.ingest_turn_capability(jsonb),sessions.ingest_turn_register(jsonb),
  sessions.ingest_turn_fences_import(jsonb),
  sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text),
  sessions.aa_session_directory_hide_turn_only()

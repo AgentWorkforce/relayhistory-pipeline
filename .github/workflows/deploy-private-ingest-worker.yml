@@ -90,6 +90,8 @@ jobs:
       PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: ${{ vars.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS }}
       # Per-origin claim fence (ledger-sql.ts originClaimFence, migration 20261105062010). Unset or empty = off.
       PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: ${{ vars.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE }}
+      # Relay turns privacy registration/capability (migration 20261105062020). Unset or empty = off.
+      PRIVATE_INGEST_TURN_FENCE_REGISTER: ${{ vars.PRIVATE_INGEST_TURN_FENCE_REGISTER }}
     steps:
       - uses: actions/checkout@v4
         with:

@@ -178,6 +178,14 @@ test("cross-origin erasure fences registered turns whether erasure or registrati
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4 AND session_id=$5",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,later])).rows).toEqual([{n:1}]);
 });
 
+test("operator user erase removes writer ids and refuses re-registration",async()=>{
+ const f=await fixture();
+ await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
+ await f.db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('turn-user-erase',$1,$2,$3,'purging','{}')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:0}]);
+ await expect(f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})).rejects.toThrow();
+});
+
 test("migration backfills exact-session deletions that predate the turn trigger",async()=>{
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
@@ -205,6 +213,12 @@ test("turn-only canonical pointers stay addressable but their directory projecti
  }catch(error){await f.db.exec("ROLLBACK");throw error}
  expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3 AND deleted_at IS NULL",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{n:1}]);
+ // Erasure removes the personal writer registry row. The durable synthetic machine marker must
+ // still keep a retry/unpublished-head projection hidden afterwards.
+ await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'another-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{n:0}]);
+ await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
+ expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
   VALUES($1,$2,'claude',$3,'desktop-1',$4,'2026-11-05','2026-11-05','s3','bucket','normal-manifest','22222222-2222-4222-8222-222222222222')`,[TENANT.orgId,TENANT.workspaceId,SESSION,TENANT.userId]);
  await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);

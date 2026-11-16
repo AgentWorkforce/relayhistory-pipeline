@@ -1079,6 +1079,9 @@
     "sessions.ingest_turn_capture_erasure()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_turn_capture_user_erasure()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_turn_fences_import(jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

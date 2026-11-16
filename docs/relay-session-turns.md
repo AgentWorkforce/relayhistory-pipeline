@@ -51,10 +51,16 @@ Khaliq's explicit approval. In order:
    before posting any batch unless the independently default-off `INGEST_TURN_FENCE_REGISTER=on`
    gate installs the authenticated `GET /v1/turns/capabilities` probe, reads the
    migration-owned capability RPC, and returns that header. Each batch response repeats the attestation
-   after registration and before async enqueue or claim. Any ordinary `upload_deletions` insert fans out to the synthetic
+   after registration and before async enqueue or claim. Registration deliberately precedes the
+   downstream custody/enqueue/claim decision: a later refusal can leave a privacy-only writer row,
+   but can never admit bytes without the erase race fence. Any ordinary `upload_deletions` insert fans out to the synthetic
    turns origin; registration after an older fence materializes the same deletion. Before activation,
    import every frozen Neon `conversation_turn_fences` key through `ingest_turn_fences_import` and
    compare the source and target ordered key counts/digests.
+   Operator whole-user erase does not manufacture one exact-session deletion per registered writer;
+   registration shares its global privacy lock, and the erase-ledger insert removes that user's
+   auxiliary writer rows. The durable session fence and synthetic pointer marker contain no erased
+   content and keep later directory retries hidden.
 3. **Custody.** Cloud forward is Neon-free only in `frozen-supabase`. `supabase-authority` continues
    to refuse all non-empty turn writes and must not be used for this migration. Flip custody first,
    under its own runbook and approval.

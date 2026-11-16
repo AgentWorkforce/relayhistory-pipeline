@@ -76,7 +76,6 @@ export const INGEST_EDGE_RETRY_AFTER_MAX_S = 10;
 export const INGEST_EDGE_ROUTES: Readonly<Record<string, "GET" | "POST">> = Object.freeze({
   "/v1/delivery/batches": "POST",
   "/v1/turns/batches": "POST",
-  [TURN_FENCE_CAPABILITY_PATH]: "GET",
   "/v1/delivery/limits": "GET",
 });
 
@@ -150,6 +149,8 @@ export interface IngestEdgeOptions {
   random?: () => number;
   /** Test seams for the `rth_at_` verifier (used only when settings.rthVerifier is present). */
   rthVerifier?: RthVerifierOptions;
+  /** Independently exposes the turn-fence preflight only with the registration gate on. */
+  turnFenceRegister?: true;
 }
 
 const introspectionLog: RelaycontrolLog = (level, message, fields) =>
@@ -226,7 +227,11 @@ function refusal(status: number, code: string, message: string, correlationId: s
  * The edge over an in-process handler. `makeHandler` receives the only identity source the handler
  * may use; production passes `ingestEdgeHandler(deps)` (app.ts), tests may pass a recorder.
  */
-export function createIngestEdge(verify: EdgeVerify, makeHandler: (identify: EdgeHandlerIdentify) => FetchApp, options: Pick<IngestEdgeOptions, "random"> = {}): IngestEdge {
+export function createIngestEdge(
+  verify: EdgeVerify,
+  makeHandler: (identify: EdgeHandlerIdentify) => FetchApp,
+  options: Pick<IngestEdgeOptions, "random" | "turnFenceRegister"> = {},
+): IngestEdge {
   const bound = new WeakMap<Request, IngestIdentity>();
   const identify: EdgeHandlerIdentify = (request) => {
     const identity = bound.get(request);
@@ -243,7 +248,8 @@ export function createIngestEdge(verify: EdgeVerify, makeHandler: (identify: Edg
     async fetch(request) {
       const correlationId = correlationOf(request);
       const url = new URL(request.url);
-      const method = INGEST_EDGE_ROUTES[url.pathname];
+      const method = INGEST_EDGE_ROUTES[url.pathname] ??
+        (options.turnFenceRegister === true && url.pathname === TURN_FENCE_CAPABILITY_PATH ? "GET" : undefined);
       if (!method) {
         if (url.pathname.startsWith("/v1/"))
           return refusal(501, "unsupported_by_backend", "this route is not served by the ingest edge", correlationId);
@@ -294,5 +300,8 @@ export function ingestEdgeHandler(deps: IngestEdgeAppDeps): (identify: EdgeHandl
 export function mountIngestEdge(env: NodeJS.ProcessEnv, deps: IngestEdgeAppDeps, options: IngestEdgeOptions = {}): IngestEdge | null {
   const config = ingestEdgeConfig(env);
   if (!config.enabled) return null;
-  return createIngestEdge(edgeIdentify(config, env, options), ingestEdgeHandler(deps), options);
+  return createIngestEdge(edgeIdentify(config, env, options), ingestEdgeHandler(deps), {
+    ...options,
+    ...(deps.turnFenceRegister === true ? { turnFenceRegister: true as const } : {}),
+  });
 }

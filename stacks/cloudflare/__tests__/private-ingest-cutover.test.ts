@@ -181,3 +181,27 @@ test("origin claim fence control: env shape, and add / remove at a held phase", 
     expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
   }
 });
+
+test("turn-fence registration control is strict and independently default-off", () => {
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_TURN_FENCE_REGISTER: "on" }))
+    .toEqual({ turnFenceRegister: "on" });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_TURN_FENCE_REGISTER: "" })).toEqual({});
+  for (const value of ["true", "1", "off", "ON"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_TURN_FENCE_REGISTER: value })))
+      .toBe("private_ingest_profile_turn_fence_register");
+  expect(privateIngestReleasePhase(at("baseline-drain", { turnFenceRegister: "on" }))).toBe("baseline-drain");
+  const plain = at("baseline-drain");
+  const registered = at("baseline-drain", { turnFenceRegister: "on" });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromRegistered = live(registered);
+  expect(privateIngestTransitionReadback(registered, fromPlain.active, fromPlain.version)).toMatchObject(pass);
+  expect(privateIngestTransitionReadback(plain, fromRegistered.active, fromRegistered.version)).toMatchObject(pass);
+  expect(privateIngestVersionReadback(registered, fromRegistered.active, fromRegistered.version))
+    .toMatchObject({ phase: "baseline-drain" });
+  for (const bad of [[{ name: "INGEST_TURN_FENCE_REGISTER", type: "plain_text", text: "off" }],
+    [{ name: "INGEST_TURN_FENCE_REGISTER", type: "secret_text" }]]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version)))
+      .toBe("private_ingest_live_cutover");
+  }
+});

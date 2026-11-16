@@ -24,6 +24,7 @@ export const turnsForwardGates: LaneManifest = {
       grants: [],
     },
     "sessions.ingest_turn_capture_erasure()": { secdef: false, grants: [] },
+    "sessions.ingest_turn_capture_user_erasure()": { secdef: false, grants: [] },
     "sessions.ingest_turn_capability(jsonb)": {
       secdef: true,
       grants: ["bulls96_session_ingest"],

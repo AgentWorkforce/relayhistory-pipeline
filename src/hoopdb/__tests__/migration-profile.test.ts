@@ -1473,6 +1473,28 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
 });
 
 describe("the ordered migration lanes: contiguous prefixes, no unledgered footprint", () => {
+  test("turn-gates historical deletion backfill is derived and does not make rollback one-way", async () => {
+    const db = await fresh();
+    const tg = "upstream:20261105062020_turns_forward_gates.sql";
+    const steps = await plan(LOCAL);
+    const prefix = steps.filter((step) => !step.name.startsWith("upstream:") || step.name < tg);
+    await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps: prefix });
+    await db.query(
+      "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
+    );
+    await runMigrations(client(db), { profile: LOCAL, steps });
+    expect((await db.query<{ basis: string }>(
+      "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
+    )).rows).toEqual([{ basis: "live" }]);
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8"));
+    expect((await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id='historical-org'",
+    )).rows).toEqual([{ n: 1 }]);
+    expect((await db.query<{ rel: string | null }>(
+      "SELECT to_regclass('sessions.turn_session_fences')::text AS rel",
+    )).rows).toEqual([{ rel: null }]);
+  });
+
   test("helm repro (a): only session_directory present: refused before any write (no ledger rows, no 42P07)", async () => {
     const db = await fresh();
     await db.exec(
@@ -2526,12 +2548,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // Turns gates is newest. Its rollback refuses while privacy state exists, then
-    // removes only its own objects and exposes the per-origin claim fence as newest.
-    await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','live')");
+    // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
+    // row is derived from the retained upload_deletions ledger and is safe to drop.
+    await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
     expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.turn_session_fences")).toBe("sessions.turn_session_fences");
     await db.query("DELETE FROM sessions.turn_session_fences WHERE org_id='rollback-org'");
+    await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','historical-session','live')");
     await rollback("20261105062020_turns_forward_gates.down.sql");
     expect(await names()).not.toContain(TG);
     expect(await relation("sessions.turn_session_fences")).toBeNull();

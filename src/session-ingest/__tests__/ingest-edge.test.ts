@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { IDENTITY_HEADER, SIGNATURE_HEADER, contentEncodings, encodeIdentity, type IngestIdentity } from "../app.ts";
+import { IDENTITY_HEADER, SIGNATURE_HEADER, TURN_FENCE_CAPABILITY_PATH, contentEncodings, encodeIdentity, type IngestIdentity } from "../app.ts";
 import { DELIVERY_LIMITS } from "../vendor/delivery/delivery-contracts.ts";
 import {
   INGEST_EDGE_FLAG, createIngestEdge, edgeIdentify, ingestEdgeConfig, ingestEdgeEnabled, mountIngestEdge,
@@ -138,6 +138,20 @@ describe("flag", () => {
 });
 
 describe("mounted edge over the real ingest app", () => {
+  test("turn-fence capability is absent by default and exposed only with registration", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const off = mountIngestEdge(env(rc.url), DEPS)!;
+    expect((await off.fetch(req(TURN_FENCE_CAPABILITY_PATH))).status).toBe(501);
+    const on = mountIngestEdge(env(rc.url), {
+      ...DEPS,
+      deliver: { ledger: { turnFenceCapability: async () => true } } as never,
+      turnFenceRegister: true,
+    })!;
+    const response = await on.fetch(req(TURN_FENCE_CAPABILITY_PATH));
+    expect(response.status).toBe(204);
+    expect(response.headers.get("x-relay-turn-fence")).toBe("registered-v1");
+  });
+
   test("happy path: sh_at_ introspected once (no cache), identity mapped, limits answered unchanged", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const edge = mountIngestEdge(env(rc.url), DEPS)!;
