@@ -26,6 +26,7 @@ import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
 import { liveObjectPrefix, livePointerPrefix, liveTargets } from "../neon-s3-erasure/live.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { eraseDiscoveredSessionBytes } from "../../session-erase/selfhost-eraser.ts";
 import { canonicalSnapshot, CanonicalReadError, type CanonicalPointer } from "../../session-read-api/canonical.ts";
 import { canonicalLegacy } from "../../session-read-api/canonical-legacy.ts";
 import type { Queryable } from "../relayhistory-export.ts";
@@ -45,6 +46,8 @@ const OTHER = "member_b";
 /** A legacy-only scope (no rollup, no catalog, no events): only the legacy exporter can put it in S3. */
 const S: LegacyScope = { orgId: "org_1", workspaceId: "ws_1", source: "claude", sessionId: "sess:1" };
 /** The same session under the token-without-workspace spelling: turns say `default`, fences say `""`. */
+/** A layout-safe session id for the discovery eraser. */
+const SR: LegacyScope = { ...S, sessionId: "sess_r" };
 const SD: LegacyScope = { ...S, workspaceId: "default", sessionId: "sess:d" };
 
 /** Neon: legacy tables, the vendored deleted_upload_sessions, and 0074's conversation_turn_fences. */
@@ -88,6 +91,17 @@ async function supabase() {
     },
   };
   return { pg, db };
+}
+
+/** The store with a hook before every put; keeps the class's prototype methods (a spread would drop them). */
+function withPutHook(store: ObjectStore, before: () => Promise<void>): ObjectStore {
+  return new Proxy(store, {
+    get(target, prop, recv) {
+      if (prop === "put") return async (...a: unknown[]) => { await before(); return (target.put as (...x: unknown[]) => unknown).apply(target, a); };
+      const v = Reflect.get(target, prop, recv);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
 }
 
 async function allKeys(store: ObjectStore) {
@@ -258,14 +272,14 @@ describe("(b) the race-loser recheck sees every ledger the pre-check sees", () =
     const n = await neon(), p = await supabase();
     const store = createFsStore({ root: await tmp("b4") });
     // Inject the receipt at the first S3 write (inside the fence).
-    const racing: ObjectStore = {
-      ...store,
-      put: async (k, b, o) => {
-        await p.pg.query("INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id) SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_receipts)", [S.orgId, S.workspaceId, S.source, S.sessionId]);
-        return store.put(k, b, o);
-      },
-    } as ObjectStore;
-    const { counters, checkpoint } = await run(n.db, p.db, racing, "b4");
+    let puts = 0;
+    const racing = withPutHook(store, async () => {
+      puts += 1;
+      await p.pg.query("INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id) SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_receipts)", [S.orgId, S.workspaceId, S.source, S.sessionId]);
+    });
+    const { counters, checkpoint, logs } = await run(n.db, p.db, racing, "b4");
+    expect(puts).toBeGreaterThan(0); // the write really started inside the fence
+    expect(logs.some((l) => l.error_code === "legacy_privacy_race")).toBe(true);
     expect(counters.exported).toBe(0);
     expect(counters.failed + counters.fenced).toBe(1);
     checkpoint.close();
@@ -333,6 +347,47 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     expect(r.left.filter((k) => k.startsWith(r.objectRoot) && k.includes("/s=sess_1/"))).toEqual([]);
     expect(r.left).not.toContain(r.ptrKey);
     expect(await servedLegacy(r.store, [r.pointer])).toEqual([]);
+  });
+
+  /**
+   * Race losers (reviewer request): the export is fenced mid-write by a ledger that writes NO
+   * deleted_upload_sessions/upload_deletions tombstone, so the objects already put stay in S3 (the
+   * exporter key is write-only by design). The eraser that owns that fence type must remove them.
+   */
+  async function raceLoser(ledger: "turn_session_fences" | "session_erasure_receipts") {
+    const n = await neon(), p = await supabase();
+    // A layout-safe id: the discovery eraser refuses lossy ids such as `sess:1` by design.
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    const store = createFsStore({ root: await tmp(`race-${ledger}`) });
+    const insert = ledger === "turn_session_fences"
+      ? "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) SELECT $1,$2,$3,$4,'legacy_import' WHERE NOT EXISTS(SELECT 1 FROM sessions.turn_session_fences)"
+      : "INSERT INTO sessions.session_erasure_receipts(org_id,workspace_id,source,session_id) SELECT $1,$2,$3,$4 WHERE NOT EXISTS(SELECT 1 FROM sessions.session_erasure_receipts)";
+    const racing = withPutHook(store, async () => void (await p.pg.query(insert, [SR.orgId, SR.workspaceId, SR.source, SR.sessionId])));
+    const { counters, checkpoint } = await run(n.db, p.db, racing, `race-${ledger}`);
+    checkpoint.close();
+    expect(counters.exported).toBe(0);
+    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+    const leftover = (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"));
+    expect(leftover.length).toBeGreaterThan(0); // the loser did write before the recheck (fixture is live)
+    return { n, p, store, objectRoot };
+  }
+
+  test("race loser fenced by session_erasure_receipts: the receipt-owned session eraser removes the legacy manifest and raw object", async () => {
+    const { store, objectRoot } = await raceLoser("session_erasure_receipts");
+    // The operator session-erase byte stage (selfhost-runtime.ts) is what consumes a receipt.
+    await eraseDiscoveredSessionBytes(storeEraser(store), { orgId: SR.orgId, workspaceId: SR.workspaceId, source: SR.source, sessionId: SR.sessionId }, { keyRoot: "96bulls", bucket: "bucket" });
+    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
+  });
+
+  test("race loser fenced by turn_session_fences alone (no tombstone): the ordinary deletion job removes the legacy manifest and raw object", async () => {
+    const { n, store, objectRoot } = await raceLoser("turn_session_fences");
+    // A legacy-only session has no registered turn writer, so the fence materializes no upload_deletions row.
+    const state = new SyncState(join(await tmp("race-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.sweep();
+    await job.sweep();
+    state.close();
+    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
   });
 });
 
