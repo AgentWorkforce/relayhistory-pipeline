@@ -23,7 +23,7 @@ import {
 } from "../neon-s3-sync/legacy-source.ts";
 import { exportUnit } from "../neon-s3-sync/export-session.ts";
 import { groupExistsInNeon } from "../neon-s3-sync/neon-reader.ts";
-import { Checkpoint, newCounters, runOrg, verifyExported, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
+import { Checkpoint, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
 import {
   assertDirectUrl,
   assertSelectOnly,
@@ -67,8 +67,10 @@ beforeAll(async () => {
  CREATE TABLE sessions.session_catalog(org_id text,session_id text,workspace_id text,source text,first_activity_at timestamptz,last_activity_at timestamptz,received_at timestamptz);
  CREATE TABLE sessions.convergence_events(org_id text,workspace_id text,source text,session_id text,user_id text NOT NULL DEFAULT 'u_event');
  CREATE TABLE sessions.deleted_upload_sessions(org_id text,workspace_id text,source text,session_id text);
+ CREATE TABLE sessions.conversation_turn_fences(org_id text,workspace_id text,user_id text,source text,session_id text);
  CREATE TABLE sessions.session_erasure_receipts(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.upload_deletions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+ CREATE TABLE sessions.turn_session_fences(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.operator_user_erasures(request_id text,org_id text,workspace_id text,user_id text,state text);
  CREATE TABLE sessions.conversation_turns(id uuid PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,session_owner text,turn_index int,role text,content text,actor_name text,actor_role text,metadata jsonb,ts timestamptz,UNIQUE(org_id,workspace_id,source,session_id,turn_index));
  CREATE TABLE sessions.session_links(id bigint PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,link_kind text,link_ref text,link_url text,metadata jsonb,confidence_basis_points int,link_ts timestamptz,updated_at timestamptz,created_at timestamptz);
@@ -297,31 +299,40 @@ test("nonempty links and outcomes preserve exact source IDs, timestamps and meta
   }
 });
 
-test("a fenced scope is not exported", async () => {
-  try {
-    await pg.exec(`INSERT INTO sessions.deleted_upload_sessions VALUES('org_1','ws_1','claude','sess:1')`);
-    const checkpoint = new Checkpoint(join(root, "fence.sqlite"));
-    const counters = newCounters();
-    await runOrg(
-      { db, privacyDb, target: { store: createFsStore({ root: join(root, "fence") }), keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} },
-      "org_1",
-      { export: true },
-      counters,
-    );
-    expect(counters).toMatchObject({ fenced: 1, exported: 0 });
-    checkpoint.close();
-  } finally {
-    await pg.exec("DELETE FROM sessions.deleted_upload_sessions");
+test("frozen Neon delivery and conversation-turn fences both prevent export", async () => {
+  for (const table of ["deleted_upload_sessions", "conversation_turn_fences"] as const) {
+    const checkpoint = new Checkpoint(join(root, `fence-${table}.sqlite`));
+    try {
+      if (table === "deleted_upload_sessions")
+        await pg.exec(`INSERT INTO sessions.deleted_upload_sessions VALUES('org_1','ws_1','claude','sess:1')`);
+      else
+        await pg.exec(`INSERT INTO sessions.conversation_turn_fences VALUES('org_1','ws_1','person','claude','sess:1')`);
+      const counters = newCounters();
+      await runOrg(
+        { db, privacyDb, target: { store: createFsStore({ root: join(root, `fence-${table}`) }), keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} },
+        "org_1",
+        { export: true },
+        counters,
+      );
+      expect(counters).toMatchObject({ fenced: 1, exported: 0 });
+    } finally {
+      checkpoint.close();
+      await pg.exec("DELETE FROM sessions.deleted_upload_sessions;DELETE FROM sessions.conversation_turn_fences");
+    }
   }
 });
 
-test("live session and completed-user erase ledgers fence legacy export", async () => {
-  for (const erase of ["session", "user"] as const) {
+test("live session, turn-session and completed-user erase ledgers fence legacy export", async () => {
+  for (const erase of ["session", "turn", "user"] as const) {
     const checkpoint = new Checkpoint(join(root, `live-fence-${erase}.sqlite`));
     try {
       if (erase === "session")
         await pg.exec(
           `INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`,
+        );
+      else if (erase === "turn")
+        await pg.exec(
+          `INSERT INTO sessions.turn_session_fences VALUES('org_1','ws_1','claude','sess:1')`,
         );
       else
         await pg.exec(
@@ -349,10 +360,21 @@ test("live session and completed-user erase ledgers fence legacy export", async 
     } finally {
       checkpoint.close();
       await pg.exec(
-        "DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.operator_user_erasures",
+        "DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.turn_session_fences;DELETE FROM sessions.operator_user_erasures",
       );
     }
   }
+});
+
+test("a session erasure receipt won during the object write is caught by the race-loser recheck", async () => {
+  await expect(
+    withLegacyPrivacyFence(privacyDb, scope, "person", async () => {
+      await pg.exec(
+        `INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`,
+      );
+    }),
+  ).rejects.toMatchObject({ code: "legacy_privacy_race" });
+  await pg.exec("DELETE FROM sessions.session_erasure_receipts");
 });
 
 test("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {

@@ -328,6 +328,11 @@ async function snapshotWithLimits(
     generation: version,
     exists: true,
     legacyCoverage: legacy.coverage,
+    /** Stable operator-only warning: invalid legacy evidence was dropped while
+     * valid live canonical rows remained available. */
+    ...(result.reasons.includes("legacy_provenance_invalid")
+      ? { legacyDroppedReason: "legacy_provenance_invalid" as const }
+      : {}),
     legacyRowsMerged: legacy.rows.length > 0,
     rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
     // Always present: the never-in-Neon objects half fails closed on absence (evidence.ts).

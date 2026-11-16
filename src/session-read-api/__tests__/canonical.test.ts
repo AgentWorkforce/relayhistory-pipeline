@@ -649,12 +649,20 @@ test("provider drops legacy records carried by a live delivery manifest", async 
       },
     },
   ]);
-  const response = await canonicalHandle(
-    request("&table=conversation_turns"),
-    { CANONICAL_READ_ENABLED: "true" },
-    fetch,
-    deps,
-  );
+  const logs: string[] = [];
+  const priorError = console.error;
+  console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+  let response!: Response;
+  try {
+    response = await canonicalHandle(
+      request("&table=conversation_turns"),
+      { CANONICAL_READ_ENABLED: "true" },
+      fetch,
+      deps,
+    );
+  } finally {
+    console.error = priorError;
+  }
   expect(response.status).toBe(200);
   const body = (await response.json()) as {
     rows: unknown[];
@@ -662,6 +670,8 @@ test("provider drops legacy records carried by a live delivery manifest", async 
   };
   expect(body.rows).toEqual([]);
   expect(body.legacyCoverage).toBeNull();
+  expect(logs.join("\n")).toContain("legacy_provenance_invalid");
+  expect(logs.join("\n")).not.toContain("legacy body");
 });
 
 test("immutable publication snapshot uses existing canonical fold and generation-qualified raw namespace",async()=>{

@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { STAGED_ERASE_AFTER_MS } from "../../migration/neon-s3-erasure/job.ts";
 import { liveMachineId } from "../../session-ingest/writer.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { stagedKey } from "../../session-ingest/staging.ts";
 import { assertAllowed, eraseDiscoveredSessionBytes, eraseSessionBytes, planDiscoveryTargets, planTargets, STAGED_MIN_AGE_MS, SessionEraseRefused, type SessionEraseBytesRequest } from "../selfhost-eraser.ts";
 import { exitCodeForError, exitCodeForResult, requestPathFrom, runSessionEraseBytes, sessionEraseBytesEnabled } from "../selfhost-eraser-main.ts";
@@ -75,16 +76,21 @@ describe("automatic byte discovery", () => {
 
   test("discovers unindexed machines, old dates and publication generations; exact neighbours survive", async () => {
     const s = new FakeS3Versions(); s.pageSize = 2;
-    const doomed = [dir("unindexed", "2025/01/01") + "raw/one", dir(M, "2026/11/02") + "manifest.json", generation, pointer];
+    const legacy = legacyMachineId(WS, "user-1");
+    const legacyDir = dir(legacy, "2026/10/30");
+    const legacyPointer = pointer.replace("m=unindexed", `m=${legacy}`);
+    const doomed = [dir("unindexed", "2025/01/01") + "raw/one", dir(M, "2026/11/02") + "manifest.json", generation, pointer,
+      legacyDir + "manifest.json", legacyDir + "raw/0000000000-0-legacy.ndjson.zst", legacyPointer];
     const kept = [dir(M, "2026/11/02", "session-10") + "manifest.json", dir(M, "2026/11/02", key.sessionId, "ws-2") + "manifest.json",
       dir(M, "2026/11/02", key.sessionId, "other-source") + "manifest.json", pointer.replace("session-1.json", "session-10.json"),
       generation.replace("ws=ws-1", "ws=ws-2"), `${ROOT}/org-b/v1/ws=${WS}/m=${M}/h=${SRC}/d=2026/11/01/s=session-1/manifest.json`];
     for (const k of [...doomed, ...kept]) { s.put(k, OLD); s.put(k, OLD + 1); marker(s, k, OLD + 2); }
     const r = await eraseDiscoveredSessionBytes(s.eraser(), key, opts());
-    expect(r).toMatchObject({ verified: true, transcriptObjects: 3, pointerObjects: 1, versionsDeleted: 12 });
+    expect(r).toMatchObject({ verified: true, transcriptObjects: 5, pointerObjects: 2, versionsDeleted: 21 });
     for (const k of doomed) expect(s.count(k)).toBe(0);
     for (const k of kept) expect(s.count(k)).toBe(3);
     expect(s.deletes.findIndex((d) => d.startsWith(pointer))).toBeGreaterThan(s.deletes.findIndex((d) => d.startsWith(generation)));
+    expect(s.deletes.findIndex((d) => d.startsWith(legacyPointer))).toBeGreaterThan(s.deletes.findIndex((d) => d.startsWith(legacyDir)));
     expect((await eraseDiscoveredSessionBytes(s.eraser(), key, opts())).versionsDeleted).toBe(0);
   });
 
