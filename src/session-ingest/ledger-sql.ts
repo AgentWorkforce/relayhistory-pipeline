@@ -204,7 +204,44 @@ export function acceptedGenerationSet(expected: string, accept?: readonly string
 const admittedHint = new Map<string, string>();
 const STICKY_MAX = 256;
 
-export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string;acceptGenerations?:readonly string[];selfhostSelectionErase?:boolean } = {}): Ledger {
+/** INGEST_CLAIM_LOCK_WAIT_MS bounds (ms): the claim's own lock wait, below the role's lock_timeout (2 s). */
+export const CLAIM_LOCK_WAIT_MS_MIN = 25;
+export const CLAIM_LOCK_WAIT_MS_MAX = 2000;
+
+/**
+ * One claim attempt in its own short transaction whose lock_timeout is `ms` (set_config(..., true) is SET
+ * LOCAL: it ends with the transaction and never reaches another use of a pooled connection). The claim
+ * function, its input and its lock order are unchanged; only how long it may WAIT for a lock that another
+ * claim holds. A lock still held after `ms` fails the one statement with 55P03 (ledger_lock_timeout): the
+ * transaction rolls back, nothing is written, and with claimLockBusy the HTTP answer is the existing 429
+ * ClaimLockBusy (Retry-After 5-10 s). A free lock: the same claim, committed. A lost COMMIT answer is the
+ * ambiguity a lost autocommit answer already has: the client's retry resumes the claim idempotently.
+ * Errors of `work` (already typed by `call`) pass through unchanged; a failing BEGIN, set_config or COMMIT
+ * is mapped the way `call` maps a database error.
+ * Requires a `run` bound to ONE connection that nothing else uses while the claim runs (the Worker's
+ * per-request / per-queue-batch pg Client, used sequentially). A pooled `run` must not set this option:
+ * BEGIN and the claim could land on different connections.
+ */
+export async function inClaimLockWait<T>(run: SqlRun, ms: number, work: () => Promise<T>): Promise<T> {
+  const mapped = (error: unknown) => {
+    const s = dbErrorSnapshot(error);
+    return new LedgerUnavailableError(ledgerErrorCodeFrom(s), dbErrorDiagnosisFrom(s));
+  };
+  const rollback = () => run("ROLLBACK", []).then(() => undefined, () => undefined);
+  try { await run("BEGIN", []); } catch (error) { await rollback(); throw mapped(error); }
+  try { await run("SELECT set_config('lock_timeout', $1, true)", [`${ms}ms`]); } catch (error) { await rollback(); throw mapped(error); }
+  let value: T;
+  try { value = await work(); } catch (error) { await rollback(); throw error; }
+  try { await run("COMMIT", []); } catch (error) { await rollback(); throw mapped(error); }
+  return value;
+}
+
+export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string;acceptGenerations?:readonly string[];selfhostSelectionErase?:boolean;
+  /** INGEST_CLAIM_LOCK_WAIT_MS: each claim attempt waits at most this long for a lock (25..2000 ms). Absent: the role's lock_timeout, unchanged. */
+  claimLockWaitMs?: number } = {}): Ledger {
+  if(options.claimLockWaitMs!==undefined&&(!Number.isSafeInteger(options.claimLockWaitMs)||options.claimLockWaitMs<CLAIM_LOCK_WAIT_MS_MIN||options.claimLockWaitMs>CLAIM_LOCK_WAIT_MS_MAX))throw new LedgerUnavailableError("ledger_claim_lock_wait_invalid");
+  const claimLockWaitMs=options.claimLockWaitMs;
+  const claimCall=(fn:LedgerFunction,input:unknown):Promise<unknown>=>claimLockWaitMs===undefined?call(run,fn,input):inClaimLockWait(run,claimLockWaitMs,()=>call(run,fn,input));
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
   if(options.acceptGenerations!==undefined&&options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_generation_set_refused");
   // Bounded overlap (docs/design/zero-503-schema-windows.md): a call that STARTS an operation (claim, ordered
@@ -285,9 +322,9 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     async claim(input: ClaimInput): Promise<ClaimResult> {
       let raw:Record<string,unknown>;
       if(options.acceptanceMode==="buffered"){
-        const claimed=await admitted((g)=>call(run,"ingest_claim_buffered_batch",buffered(input,g)));
+        const claimed=await admitted((g)=>claimCall("ingest_claim_buffered_batch",buffered(input,g)));
         raw=claimed.value as Record<string,unknown>;remember(raw.claimToken,claimed.generation);
-      }else raw=(await call(run,"ingest_claim_batch",input)) as Record<string,unknown>;
+      }else raw=(await claimCall("ingest_claim_batch",input)) as Record<string,unknown>;
       const result=parseClaimResult(raw);
       if(raw.custodyAck!==undefined){try{result.custodyAck=validatedCustodyAck(raw.custodyAck,input.custody)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
       if(input.custody&&!result.custodyAck)throw new LedgerUnavailableError("ledger_custody_ack_missing");

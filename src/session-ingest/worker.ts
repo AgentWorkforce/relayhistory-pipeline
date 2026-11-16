@@ -42,6 +42,12 @@
  *                              instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY; every other
  *                              stage and cause stays 503 (HTTP only, as above). The Cloudflare stack
  *                              renders it only from sessionIngest.claimTimeoutBusy: "on"
+ *   INGEST_CLAIM_LOCK_WAIT_MS  unset (default) | 25..2000: each claim runs in its own short transaction with
+ *                              SET LOCAL lock_timeout of this many ms (ledger-sql.ts inClaimLockWait), so a
+ *                              claim behind the same user's in-flight claim gives up quickly (55P03, and
+ *                              with INGEST_CLAIM_LOCK_BUSY the 429) instead of waiting the role's 2 s.
+ *                              Same function, input and lock order; a free lock is unchanged. The
+ *                              Cloudflare stack renders it only from sessionIngest.claimLockWaitMs
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
@@ -86,7 +92,7 @@ import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
 import { httpAdmissionStoppedOrgs } from "./http-admission-stop.ts";
-import { sqlLedger } from "./ledger-sql.ts";
+import { CLAIM_LOCK_WAIT_MS_MAX, CLAIM_LOCK_WAIT_MS_MIN, sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
@@ -165,6 +171,8 @@ export interface IngestWorkerEnv {
   INGEST_STAGE_LATENCY_LOG?: string;
   INGEST_CLAIM_LOCK_BUSY?: string;
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
+  /** 25..2000 ms: a claim's own lock wait (ledger-sql.ts inClaimLockWait). Unset (default): the role's lock_timeout. */
+  INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
   SESSION_ERASE_API_ENABLED?: string;
   /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
@@ -241,6 +249,8 @@ export interface IngestSettings {
   claimLockBusy?: true;
   /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
   claimTimeoutBusy?: true;
+  /** INGEST_CLAIM_LOCK_WAIT_MS (25..2000): each claim waits at most this long for a lock (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
+  claimLockWaitMs?: number;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
@@ -352,6 +362,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
+    ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: bounded(env.INGEST_CLAIM_LOCK_WAIT_MS, CLAIM_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, "INGEST_CLAIM_LOCK_WAIT_MS") } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
@@ -413,7 +424,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{})}),
+    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{})}),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,

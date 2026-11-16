@@ -834,3 +834,23 @@ describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
     expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, uploadConsent: "on" } }, env)).toThrow(/uploadConsent.*Nothing was changed/);
   });
 });
+
+describe("session ingest: INGEST_CLAIM_LOCK_WAIT_MS (claimLockWaitMs, default absent)", () => {
+  it("omitted: no INGEST_CLAIM_LOCK_WAIT_MS var, props byte-identical to a stack without the input", () => {
+    expect(Object.hasOwn(sessionIngestVars(inputs), "INGEST_CLAIM_LOCK_WAIT_MS")).toBe(false);
+    expect(JSON.stringify(props(inputs))).toBe(JSON.stringify(props({ ...inputs, claimLockWaitMs: undefined })));
+  });
+
+  it("set: exactly one more var (the number as text), no new binding", () => {
+    const on: SessionIngestInputs = { ...inputs, claimLockWaitMs: 250 };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(inputs), INGEST_CLAIM_LOCK_WAIT_MS: "250" });
+    expect(Object.keys(props(on).env).sort()).toEqual([...Object.keys(props(inputs).env), "INGEST_CLAIM_LOCK_WAIT_MS"].sort());
+  });
+
+  it("is refused outside 25..2000 or when not an integer", () => {
+    for (const value of [24, 2001, 0, -5, 12.5, "250", null, true])
+      expect(() => assertSessionIngestInputs({ ...inputs, claimLockWaitMs: value } as never, refuse)).toThrow("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
+    for (const value of [25, 250, 2000]) expect(() => assertSessionIngestInputs({ ...inputs, claimLockWaitMs: value }, refuse)).not.toThrow();
+  });
+});

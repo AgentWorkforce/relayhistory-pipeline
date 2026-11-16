@@ -180,6 +180,25 @@ sees the flag only when the stack sets that input; without it the flag is inert 
 same out-of-band Worker version secret note as for `INGEST_CLAIM_LOCK_BUSY` applies. Not read by
 the self-host server (follow-up).
 
+Claim lock wait (default absent): with `INGEST_CLAIM_LOCK_WAIT_MS` (25..2000; stack input
+`sessionIngest.claimLockWaitMs`) each claim attempt runs in its own short transaction, `BEGIN;
+set_config('lock_timeout', '<ms>ms', true); <the same claim statement>; COMMIT` (ROLLBACK on any
+error; `src/session-ingest/ledger-sql.ts` `inClaimLockWait`). The claim function, its input and its
+lock order are unchanged; only the wait is shorter. A claim queued behind the same user's in-flight
+claim on the per-user fence row fails with 55P03 after `<ms>` (`ledger_lock_timeout`, rolled back,
+nothing written), which with `INGEST_CLAIM_LOCK_BUSY=on` is the 429 `delivery_busy` with Retry-After
+5-10 s, instead of waiting up to 2 s per lock and stacking into the 5 s `statement_timeout`. A free
+lock: the same claim, committed. `SET LOCAL` ends with the transaction, so it never reaches another
+use of a pooled connection. It needs a `run` bound to one connection used sequentially (the
+Worker's per-request and per-queue-batch pg Client); a pooled `run` must not set it. Production
+sets 250 ms with `claimTimeoutBusy` and `claimLockBusy` on (2026-11-16, customer upload retries).
+Watch `outcome=delivery_busy` with `error_code=ledger_lock_timeout` per tenant: a rise is expected
+and means fast back-off, not failure. Rollback: remove `claimLockWaitMs` from the tracked profile and
+redeploy (no var rendered; the claim returns to the single autocommit statement). Only `stage=claim`
+is affected: `buffer_intent` and `buffer_receipt` run after the claim has committed its attempt, so
+a short lock wait there would throw away a successful claim and force a resume; they keep the role
+`lock_timeout` and stay 503 on a lock or statement timeout.
+
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
 `sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin

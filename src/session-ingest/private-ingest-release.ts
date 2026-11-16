@@ -113,6 +113,11 @@ const COMMON_PROFILE = {
   inlineMaxSessions: 0,
   replicaMode: "off",
   claimLockBusy: "on",
+  // 2026-11-16 customer incident: a user's own concurrent claims queue on their fence-owner row and add up
+  // to the 5 s statement_timeout. A claim waits at most 250 ms for that lock, then answers the 429
+  // ClaimLockBusy (claimLockBusy); a 57014 claim timeout is the same 429 (claimTimeoutBusy).
+  claimTimeoutBusy: "on",
+  claimLockWaitMs: 250,
 } as const;
 
 /**

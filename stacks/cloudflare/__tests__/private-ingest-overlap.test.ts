@@ -52,14 +52,14 @@ test("dormant profile: the tracked H-only baseline plans, confirms and reads bac
   const file = readFileSync("config/cloudflare/private-ingest-production.json", "utf8");
   const baseFile = file;
   expect(trackedFile.sessionIngest.overlapGeneration).toBeUndefined();
-  expect(sha256(baseFile)).toBe("be91eb21c3938b413c0e72dd5a38763773b8c12e97003f65a0e17e1c509a5f03");
+  expect(sha256(baseFile)).toBe("1dcae88ea3d94fd6fcf31f3e08418dd0abb6223007dfdb76679bdba13dcaa8a9");
   const input = withTarget(tracked.sessionIngest);
   expect(inputsDigest(JSON.stringify(input, null, 2) + "\n"))
-    .toBe("88729b0cc7f91ea0c2c34089fd70e8ced299a174003cddafcde0ed2e70feb5fc");
+    .toBe("fa9d05bb8b5e9b090e12e0366ef070e5c6aa381093c9f42b729eba22cf897358");
   expect(sha256(JSON.stringify(sessionIngestVars(input.sessionIngest))))
-    .toBe("bb54de207e3d0d93e66c61556bd75dd31e44ea3132ab7b4aadce453d548ee559");
+    .toBe("2ce9454a708e4bb690bdc9a40838afa228eecbab38f11f2f53a92f9922332b97");
   expect(sha256(JSON.stringify(input.sessionIngest)))
-    .toBe("a3bd4f60fd51fd1043f11a21555b2ae96de80ab4994058c73d18018cc7d6fd0b");
+    .toBe("d1d298658c9998881bd4f90a12eda433e405a90d4dbc516088c90703638c134a");
   expect(sessionIngestVars(input.sessionIngest).INGEST_ACCEPT_GENERATIONS).toBeUndefined();
   expect(privateIngestReleasePhase(input, DORMANT)).toBe("baseline-drain");
   expect(privateIngestReleaseInputs({

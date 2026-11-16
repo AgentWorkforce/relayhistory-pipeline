@@ -10,6 +10,8 @@
     "inlineMaxSessions": 0,
     "replicaMode": "off",
     "claimLockBusy": "on",
+    "claimTimeoutBusy": "on",
+    "claimLockWaitMs": 250,
     "asyncAdmission": "drain"
   }
 }
