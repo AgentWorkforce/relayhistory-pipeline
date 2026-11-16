@@ -270,7 +270,9 @@ describe("operator per-user erase (058010)", () => {
     const out = await runUserErase(pgDb(f), { requestId: "req-e2e", ...ALICE }, {
       keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), stepLimit: 2, settleMs: 5, sleep: async (ms) => { sleeps.push(ms); },
     });
-    expect(out).toMatchObject({ state: "bytes_verified", verified: true, prefixes: 4, byteRounds: 1 });
+    // One captured ingest origin plus the synthetic legacy-export origin, with four live prefixes each.
+    // User erasure intentionally walks both so it cannot complete while leaving a legacy copy behind.
+    expect(out).toMatchObject({ state: "bytes_verified", verified: true, prefixes: 8, byteRounds: 1 });
     expect(out.versionsDeleted).toBeGreaterThan(0);
     expect(sleeps).toEqual([5]);
     const after = await storeKeys(f);

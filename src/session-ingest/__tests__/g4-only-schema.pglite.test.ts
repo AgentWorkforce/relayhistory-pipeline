@@ -181,6 +181,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Relay turns forward gates: new owner-only fence/writer tables and independently gated ingest/read entry
       // points. The G4 Worker never calls the new names, and the body scan below covers their dependencies.
       "20261105062020_turns_forward_gates.sql",
+      // Legacy-export owner authority tables and narrowly granted exporter/eraser RPCs. They only read the
+      // erasure ledgers and are never called by a G4 ingest path; the absence/body checks below review that impact.
+      "20261105062030_legacy_export_scope_authority.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
