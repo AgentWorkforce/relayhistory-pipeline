@@ -742,7 +742,7 @@ describe("startup and wiring rules", () => {
     expect(((await timing.json()) as { coverage: { eventCount: number } }).coverage.eventCount).toBe(2);
     for (const path of ROUTES.slice(1)) expect([path, (await get(path, token)).status]).toEqual([path, 200]);
     // The same session's pointer at the manifest's revision (as after the next tick) serves all three.
-    await supa.query(`UPDATE sessions.session_index SET revision = 2, content_sha256 = decode($1, 'hex') WHERE org_id = 'org_4'`, [
+    await supa.query(`UPDATE sessions.session_index SET revision = 2, content_sha256 = decode($1, 'hex') WHERE org_id = 'org_4' AND machine_id = 'srv_bb'`, [
       (JSON.parse(new TextDecoder().decode(objects.get(String(objectKey(manifestKey(locationFor("org_4"))))))) as ManifestV1).raw.content_sha256,
     ]);
     const healed = await get(ROUTES[0]!, token);
