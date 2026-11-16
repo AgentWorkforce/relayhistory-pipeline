@@ -107,6 +107,17 @@ function legacyAuthoritySql(): string[] {
   ];
 }
 
+/**
+ * The ONLY stand-ins in this suite (plain-ledger fixture): their signatures must exist on the real migration stack, which
+ * the "(f) stand-in signatures" test checks, so a rename fails loudly instead of being masked here.
+ */
+const READINESS_STANDINS = [
+  { signature: "sessions.ingest_privacy_eraser_require_active()", returns: "void",
+    ddl: "CREATE OR REPLACE FUNCTION sessions.ingest_privacy_eraser_require_active() RETURNS void LANGUAGE sql AS $$ SELECT $$" },
+  { signature: "sessions.legacy_export_privacy_authority_ready()", returns: "boolean",
+    ddl: "CREATE OR REPLACE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean LANGUAGE sql AS $$ SELECT true $$" },
+] as const;
+
 /** Supabase privacy authority: the real column sets of the ledgers the exporter may read. */
 async function supabase() {
   const pg = new PGlite();
@@ -124,8 +135,7 @@ async function supabase() {
   // exporter readiness probe answers ready. The fence tests here exercise fences, not readiness. Readiness, activation,
   // heartbeat freshness and their refusals run against the REAL migration stack in (c) hostedWorld, (g), (h) and the
   // 'exporter REFUSES' / 'registration while inactive' tests, never against these stand-ins.
-  await pg.exec(`CREATE OR REPLACE FUNCTION sessions.ingest_privacy_eraser_require_active() RETURNS void LANGUAGE sql AS $$ SELECT $$;
-    CREATE OR REPLACE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;`);
+  for (const fn of READINESS_STANDINS) await pg.exec(fn.ddl);
   // Transaction control and advisory locks are stood in (PGlite is single-session); the fence SQL runs for real.
   const db: Queryable = {
     async query<T>(sql: string, params?: unknown[]) {
@@ -957,6 +967,18 @@ describe("(f) the owner-registration rollback never destroys a live owner mappin
     };
     return { f, exists, rollback };
   }
+
+  test("stand-in signatures: every readiness stand-in used by the plain-ledger fixture exists, with the same return type, on the real stack", async () => {
+    const w = await stackWithLedger();
+    try {
+      for (const fn of READINESS_STANDINS) {
+        const row = (await w.f.db.query("SELECT to_regprocedure($1) IS NOT NULL AS ok, (SELECT format_type(prorettype,NULL) FROM pg_proc WHERE oid=to_regprocedure($1)) AS ret", [fn.signature])).rows[0] as { ok: boolean; ret: string | null };
+        expect({ fn: fn.signature, ok: row.ok, ret: row.ret }).toEqual({ fn: fn.signature, ok: true, ret: fn.returns });
+      }
+    } finally {
+      await w.f.close();
+    }
+  });
 
   test("registration while the Supabase eraser authority is INACTIVE is refused and writes no owner row", async () => {
     const w = await stackWithLedger(); // real stack, authority never activated
