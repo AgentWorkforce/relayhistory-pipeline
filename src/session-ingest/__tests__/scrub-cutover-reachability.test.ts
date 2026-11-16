@@ -304,6 +304,7 @@ describe('wiring inventory is complete (source scan)', () => {
     ['PublicationJobDeps', 'src/session-ingest/publication-runtime.ts', 1],
     ['PublicationJobDeps', 'src/session-ingest/publication-portable.ts', 1],
     ['write/export target', 'src/migration/neon-s3-sync/main.ts', 1],
+    ['write/export target', 'src/migration/legacy-export/main.ts', 1],
     ['write/export target', 'src/session-ingest/buffered-drain.ts', 1], // buffered backlog drain (0005)
   ] as const;
   const UNWIRED_SITES = [
