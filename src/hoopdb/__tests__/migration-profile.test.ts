@@ -4571,6 +4571,15 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
           readFileSync(
             join(
               root,
+              "supabase/bootstrap/legacy_export_privacy_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
               "supabase/bootstrap/session_read_api_roles.sql",
             ),
             "utf8",
@@ -4626,6 +4635,15 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
               join(
                 root,
                 "supabase/bootstrap/session_ingest_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/legacy_export_privacy_roles.sql",
               ),
               "utf8",
             ),
