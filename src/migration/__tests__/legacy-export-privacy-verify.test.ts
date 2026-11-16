@@ -895,6 +895,246 @@ describe("(f) the owner-registration rollback never destroys a live owner mappin
 });
 
 // ---------------------------------------------------------------------------
+/**
+ * (g) ACTIVATION GATE for the heartbeat follow-up (lead ruling on ca6b6aba): the legacy exporter may run only while the
+ * Supabase eraser is demonstrably alive. The Supabase eraser writes a durable heartbeat (authority=supabase, last
+ * successful sweep, RPC contract version); the exporter checks it fresh at run start AND per scope and refuses, before
+ * any PUT, when it is missing, stale, or not eraser-written. These tests are expected to FAIL until that follow-up lands.
+ *
+ * Everything contract-specific lives in HEARTBEAT below. legacy-erasure-hosted fills in the names when the follow-up's
+ * migration exists; the assertions do not change. The heartbeat is only ever WRITTEN here by running the real hosted
+ * ErasureJob sweep on supabaseAuthority; the adapter only ages or inspects it as the owner.
+ */
+const HEARTBEAT = {
+  /** Contract from legacy-erasure-hosted (062020 hardening): singleton readiness row written only by the eraser RPC. */
+  table: "sessions.legacy_export_privacy_eraser_readiness",
+  at: "last_success_at",
+  /** legacy_export_privacy_authority_ready() requires a heartbeat no older than this. */
+  staleAfterMinutes: 30,
+  /** A complete, valid forged row: a refusal must come from privileges, never from a constraint on a partial row. */
+  forgeInsert: "INSERT INTO sessions.legacy_export_privacy_eraser_readiness(singleton,authority,last_success_at) VALUES(true,'supabase',clock_timestamp()) ON CONFLICT (singleton) DO UPDATE SET last_success_at=EXCLUDED.last_success_at",
+  forgeUpdate: "UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()",
+};
+const heartbeatAge = (f: { db: PGlite }, minutes: number) =>
+  f.db.query(`UPDATE ${HEARTBEAT.table} SET ${HEARTBEAT.at} = ${HEARTBEAT.at} - make_interval(mins => $1)`, [minutes]);
+const heartbeatRows = async (f: { db: PGlite }) =>
+  ((await f.db.query(`SELECT count(*)::int AS n FROM ${HEARTBEAT.table}`)).rows[0] as { n: number }).n;
+
+describe("(g) activation gate: the exporter runs only on a fresh, eraser-written Supabase heartbeat", () => {
+  const later = () => Date.now() + 10 * 60 * 1000;
+  /** Real stack, ACTIVATED Supabase authority, provisioned exporter role (same seam as (c)'s hostedWorld). */
+  async function world() {
+    const main = (await import("../legacy-export/main.ts")) as Record<string, unknown>;
+    const initPrivacy = main.legacyPrivacySession as (q: Queryable) => Promise<Queryable>;
+    const preflight = main.assertPrivacySelectOnly as (q: Queryable) => Promise<void>;
+    const f = await authorityFixture();
+    await f.seal();
+    await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+    const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+    const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+    await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+    const had = ((await f.db.query("SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
+    if (!had) {
+      await f.db.exec(`CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+        first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id));
+        ALTER TABLE sessions.turn_session_fences ENABLE ROW LEVEL SECURITY`);
+      const block = /DO \$turn_fence_grant\$[\s\S]*?END \$turn_fence_grant\$;/u.exec(readFileSync(AUTHORITY_MIGRATION, "utf8"))?.[0];
+      if (block) await f.db.exec(block);
+    }
+    const raw: Queryable = {
+      query: async <T,>(t: string, p?: unknown[]) => {
+        if (p?.length) return (await f.db.query<T>(t, p as never)) as { rows: T[] };
+        const all = await f.db.exec(t);
+        return { rows: (all.at(-1)?.rows ?? []) as T[] };
+      },
+    };
+    /** Exporter run as the provisioned role; refusals (thrown or logged per scope) are returned, never swallowed. */
+    const exportAs = async (n: { db: Queryable }, store: ObjectStore, name: string) => {
+      await f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+      try {
+        const privacyDb = await initPrivacy(raw);
+        await preflight(privacyDb);
+        const r = await run(n.db, privacyDb, store, name);
+        r.checkpoint.close();
+        return { counters: r.counters, codes: r.logs.map((l) => String(l.error_code ?? "")) };
+      } catch (e) {
+        return { thrown: String((e as { code?: string }).code ?? "error") };
+      } finally {
+        await f.db.exec("RESET ROLE");
+      }
+    };
+    /** The ONLY heartbeat writer used here: a real hosted sweep on the Supabase authority. */
+    const sweepSupabase = async (store: ObjectStore, opts: { dryRun?: boolean } = {}) => {
+      const state = new SyncState(join(await tmp("hb-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+      try {
+        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+        await job.sweep(opts.dryRun ? { dryRun: true } : undefined);
+      } finally {
+        state.close();
+      }
+    };
+    return { f, exportAs, sweepSupabase };
+  }
+  const refusedFor = (r: { thrown?: string; codes?: string[] }, re: RegExp) => (r.thrown !== undefined ? re.test(r.thrown) : (r.codes ?? []).some((c) => re.test(c)));
+  const HB = /heartbeat|stale|ready|readiness/iu;
+
+  test("control: after a real Supabase eraser sweep (fresh heartbeat) the exporter exports", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-fresh") });
+      await w.sweepSupabase(store);
+      expect(await heartbeatRows(w.f)).toBeGreaterThan(0);
+      const r = await w.exportAs(n, store, "hb-fresh");
+      expect(r).toMatchObject({ counters: { exported: 1, failed: 0 } });
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("MISSING heartbeat (authority active, but no eraser sweep has ever succeeded): refused before any PUT", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-missing") });
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-missing");
+      expect(puts).toBe(0);
+      expect(await allKeys(store)).toEqual([]);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("DRY-RUN eraser sweep does not arm the exporter: refused before any PUT", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-dry") });
+      await w.sweepSupabase(store, { dryRun: true });
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-dry");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("STALE heartbeat (older than the bound): refused before any PUT", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-stale") });
+      await w.sweepSupabase(store);
+      await heartbeatAge(w.f, HEARTBEAT.staleAfterMinutes + 5);
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-stale");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("NOT eraser-written: neither the exporter role nor the ingest role can write a heartbeat", async () => {
+    const w = await world();
+    try {
+      for (const role of ["bulls96_legacy_export_privacy", "bulls96_session_ingest"]) {
+        await w.f.db.exec(`SET ROLE ${role}`);
+        try {
+          const ins = await w.f.db.query(HEARTBEAT.forgeInsert).then(() => "wrote", (e) => String((e as Error).message));
+          const upd = await w.f.db.query(HEARTBEAT.forgeUpdate).then(() => "wrote", (e) => String((e as Error).message));
+          expect({ role, ins: /permission denied/iu.test(ins), upd: /permission denied/iu.test(upd) }).toEqual({ role, ins: true, upd: true });
+        } finally {
+          await w.f.db.exec("RESET ROLE");
+        }
+      }
+      // And no function writing the heartbeat is executable by the exporter role.
+      const fns = (await w.f.db.query(`SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+         WHERE ns.nspname='sessions' AND p.proname ~ 'heartbeat' AND p.proname !~ '(read|state|check|fresh)'`)).rows as { fn: string }[];
+      for (const { fn } of fns)
+        expect({ fn, exec: ((await w.f.db.query("SELECT has_function_privilege('bulls96_legacy_export_privacy',$1,'EXECUTE') AS x", [fn])).rows[0] as { x: boolean }).x }).toEqual({ fn, exec: false });
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("STALE MID-RUN: the per-scope recheck refuses the next scope before its PUT", async () => {
+    const n = await neon();
+    // A second legacy-only scope, discovered after sess:1 (keyset order).
+    await n.pg.query(
+      `INSERT INTO sessions.conversation_turns VALUES('55555555-5555-4555-8555-555555555555',$1,$2,'owner','sess:2',$3,0,'assistant','second','Agent','owner','{"nativeCli":"claude"}','2026-11-01T11:00:00Z')`,
+      [S.orgId, S.workspaceId, OWNER],
+    );
+    await outcome(n.pg, { ...S, sessionId: "sess:2" }, "cafe");
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-mid") });
+      await w.sweepSupabase(store);
+      const putsBySession: Record<string, number> = {};
+      let aged = false;
+      const hooked = withPutHook(store, async () => {});
+      const ageing = new Proxy(hooked, {
+        get(target, prop, recv) {
+          if (prop === "put") return async (...a: unknown[]) => {
+            const sid = /\/s=([^/]+)\//u.exec(String(a[0]))?.[1] ?? "?";
+            putsBySession[sid] = (putsBySession[sid] ?? 0) + 1;
+            const r = await (target.put as (...x: unknown[]) => unknown).apply(target, a);
+            if (!aged) {
+              aged = true; // the heartbeat goes stale right after the first scope's first object lands
+              await w.f.db.exec("RESET ROLE");
+              await heartbeatAge(w.f, HEARTBEAT.staleAfterMinutes + 5);
+              await w.f.db.exec("SET ROLE bulls96_legacy_export_privacy");
+            }
+            return r;
+          };
+          const v = Reflect.get(target, prop, recv);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) as ObjectStore;
+      const r = await w.exportAs(n, ageing, "hb-mid");
+      expect(aged).toBe(true);
+      const sessions = Object.keys(putsBySession);
+      expect(sessions.length).toBe(1); // the second scope never wrote anything
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("ALARM: under the neon authority a legacy fence makes the sweep's summary line carry a non-zero legacy failure count", async () => {
+    // The neon path already fails loud per scope (legacy_erasure_requires_supabase_authority, counters.legacyFenceFailed).
+    // An operator alert keys on the per-sweep summary, so the failure must be visible there too, not only in a detail line.
+    const n = await neon();
+    const store = createFsStore({ root: await tmp("alarm") });
+    const unit = (await legacyUnit(n.db, S))!;
+    await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+    await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
+    const jobDb = (pg: PGlite): Queryable => ({
+      async query<T>(text: string, params?: unknown[]) {
+        if (text.includes("pg_locks")) return { rows: [{ total: "0", non_advisory: "0" }] as T[] };
+        if (text.includes("sessions.session_catalog")) return { rows: [] as T[] };
+        if (text.includes("FROM sessions.session_rollups"))
+          return { rows: (text.includes("(org_id, session_id) >") || text.startsWith("SELECT 1") ? [] : [{ org_id: "org_1", session_id: "keep", last_ms: "1", events: "1" }]) as T[] };
+        return (await pg.query<T>(text, params)) as { rows: T[] };
+      },
+    });
+    const state = new SyncState(join(await tmp("alarm-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.sweep().catch(() => {});
+    state.close();
+    expect((job.counters as Record<string, number>).legacyFenceFailed ?? 0).toBeGreaterThan(0);
+    const summary = logs.find((l) => l.message === "erasure sweep");
+    expect(summary).toBeDefined();
+    const failures = Object.entries(summary!).filter(([k, v]) => /legacy/iu.test(k) && /fail|refus|error/iu.test(k) && typeof v === "number" && v > 0);
+    expect(failures.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("(d) forged/stale legacy parts are dropped visibly; invalid evidence is a 503", () => {
   test("a forged legacy part keeps the read available and surfaces a provenance reason or counter", async () => {
     const n = await neon();
