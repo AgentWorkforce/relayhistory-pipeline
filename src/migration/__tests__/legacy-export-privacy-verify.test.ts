@@ -468,13 +468,15 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
       // turn_session_fences comes from the turns-forward migration (20261105062010, pipeline-ingest branch); when the
       // stack under test lacks it, create it with that migration's exact shape.
+      const hadTurnFences = ((await f.db.query("SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
       await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
         first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id))`);
       const LEDGERS = ["session_erasure_receipts", "upload_deletions", "ingest_frozen_source_deletions", "upload_resets", "turn_session_fences", "operator_user_erasures"];
-      // The runbook's privacy login: SELECT on the ledgers (BYPASSRLS so RLS cannot hide a fence), EXECUTE on register only.
-      await f.db.exec(`DROP ROLE IF EXISTS lep_privacy; CREATE ROLE lep_privacy NOLOGIN BYPASSRLS; GRANT USAGE ON SCHEMA sessions TO lep_privacy;
-        ${LEDGERS.map((t) => `GRANT SELECT ON sessions.${t} TO lep_privacy;`).join(" ")}
-        GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb) TO lep_privacy;`);
+      // The production privacy role, bootstrapped and granted by the repo's own bootstrap and migrations (never by this test).
+      const ROLE = "bulls96_legacy_export_privacy";
+      expect((await f.db.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [ROLE])).rows.length).toBe(1);
+      // Only when this fixture had to create turn_session_fences itself: reproduce 20261105062020's conditional grant on it.
+      if (!hadTurnFences) await f.db.exec(`GRANT SELECT ON sessions.turn_session_fences TO ${ROLE}`);
       // One session-level SET ROLE for the exporter phase: its BEGIN/COMMIT, advisory locks and RPC run for real.
       // Like node-postgres: a parameterless query uses the simple protocol (multi-statement allowed, last result).
       const raw: Queryable = {
@@ -484,7 +486,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
           return { rows: (all.at(-1)?.rows ?? []) as T[] };
         },
       };
-      await f.db.exec("SET ROLE lep_privacy");
+      await f.db.exec(`SET ROLE ${ROLE}`);
       let privacyDb: Queryable;
       try {
         privacyDb = await initPrivacy!(raw);
