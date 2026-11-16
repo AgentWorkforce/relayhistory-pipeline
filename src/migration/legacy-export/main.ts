@@ -64,12 +64,14 @@ export async function assertPrivacySelectOnly(db: Queryable) {
   for (const table of [
     "session_erasure_receipts",
     "upload_deletions",
+    "turn_session_fences",
     "operator_user_erasures",
   ]) {
-    const { rows } = await db.query<{ w: boolean }>(
-      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w`,
+    const { rows } = await db.query<{ w: boolean; r: boolean }>(
+      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r`,
     );
-    if (rows[0]?.w !== false)
+    if (rows[0]?.w !== false || rows[0]?.r !== true)
       throw Object.assign(
         new Error("the privacy role can write erasure ledgers; use a SELECT-only role"),
         { code: "privacy_role_not_read_only" },
@@ -79,11 +81,12 @@ export async function assertPrivacySelectOnly(db: Queryable) {
 
 /** The Neon role must not be able to write any legacy table. */
 export async function assertSelectOnly(db: Queryable) {
-  for (const s of LEGACY_TABLES) {
-    const { rows } = await db.query<{ w: boolean }>(
-      `SELECT has_table_privilege(current_user,'sessions.${s.table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w`,
+  for (const table of [...LEGACY_TABLES.map((s) => s.table), "deleted_upload_sessions", "conversation_turn_fences"]) {
+    const { rows } = await db.query<{ w: boolean; r: boolean }>(
+      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r`,
     );
-    if (rows[0]?.w !== false) throw Object.assign(new Error("the Neon role can write legacy tables; use the SELECT-only role"), { code: "neon_role_not_read_only" });
+    if (rows[0]?.w !== false || rows[0]?.r !== true) throw Object.assign(new Error("the Neon role must be SELECT-only for legacy evidence and fence tables"), { code: "neon_role_not_read_only" });
   }
 }
 

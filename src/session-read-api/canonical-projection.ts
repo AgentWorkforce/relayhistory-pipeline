@@ -605,6 +605,7 @@ export async function readCanonicalScope(
           ),
       )
     ) {
+      reasons.push("legacy_provenance_invalid");
       for (const p of legacyParts)
         p.records = p.records.filter((r) => !isLegacyRelayhistoryRecord(r));
     }

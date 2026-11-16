@@ -18,16 +18,19 @@ without Khaliq's explicit words for that exact run. Design and gate status:
   Never put them in argv, in env or in files. The runner refuses a terminal stdin. Non-secret settings are flags.
 - **Neon role.**
   - Use a SELECT-only role (e.g. `relayhistory_readonly`) on a **direct**, not pooler, URL.
-  - The runner verifies `default_transaction_read_only=on`, UTC, and `has_table_privilege(...,'INSERT,UPDATE,DELETE,TRUNCATE') = false` on all three tables.
+  - The runner verifies `default_transaction_read_only=on`, UTC, SELECT and no write privilege on all three evidence tables plus `deleted_upload_sessions` and `conversation_turn_fences`.
   - It refuses anything else, including `neondb_owner`.
 - **Privacy role.**
   - Use a SELECT-only direct connection that can read
     `session_erasure_receipts`, `upload_deletions`, and
-    `operator_user_erasures`.
+    `turn_session_fences`, and `operator_user_erasures`. The turns-forward
+    migration that creates `turn_session_fences` must already be applied; a
+    missing relation is a hard refusal, never an empty fence set.
   - Poolers, including port 6543, and roles with ledger write privileges are
     refused.
   - The exporter holds the operator-erasure advisory locks shared across each
-    object write and rechecks ordinary deletion fences before checkpointing.
+    object write and rechecks session receipts, upload deletions, turn-session
+    fences and user erasures before checkpointing.
 - **S3 key.** Use the transcript **writer/exporter** key (the same one as neon-s3-sync), never the eraser key. The store is wrapped write-only.
 - **Checkpoint.** It lives at `~/.agent-tmp/legacy-export/state.sqlite` (override with `--state=`). It holds cursors, scope keys, fingerprints and manifest keys; no secrets, no content. Keep it: it makes runs resumable and is the input to `--verify`.
 
@@ -72,7 +75,8 @@ COMMIT;
 ## 1. Plan (reads only; writes nothing)
 
 Preflight must show both read-only connections healthy. A scope present in a
-live session/user erasure ledger is reported fenced and is never exported. A
+frozen-Neon `deleted_upload_sessions` / `conversation_turn_fences` table or a
+live session/turn/user erasure ledger is reported fenced and is never exported. A
 scope without an unambiguous owner fails; it is never written as `unknown`.
 
 ```sh
