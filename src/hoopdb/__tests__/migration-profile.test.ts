@@ -1492,6 +1492,12 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
+    // A gated registration witness is intentionally not reversible even while its ordinary
+    // upload_deletions witness still exists: dropping it would reveal a later projector retry.
+    await db.exec("UPDATE sessions.turn_session_fences SET registered_writer_seen=true WHERE org_id='historical-org'");
+    expect((await failure(db.exec(down)))?.code).toBe("55000");
+    await db.exec("ROLLBACK");
+    await db.exec("UPDATE sessions.turn_session_fences SET registered_writer_seen=false WHERE org_id='historical-org'");
     // Whole-user erase can remove the source ledger while the permanent logical fence must survive.
     // Such an orphan is no longer derivable, so rollback refuses until its witness exists again.
     await db.exec("DELETE FROM sessions.upload_deletions WHERE org_id='historical-org'");

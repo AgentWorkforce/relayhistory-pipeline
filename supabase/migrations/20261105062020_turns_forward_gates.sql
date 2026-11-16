@@ -67,8 +67,9 @@ SET search_path=pg_catalog,pg_temp AS $materialize$
 DECLARE w record;v_n integer:=0;v_inserted integer;
 BEGIN
  -- Preserve a non-personal activation witness before erasure removes the per-user writer row.
- -- This is the database side of INGEST_TURN_FENCE_REGISTER: flag-off erasure census rows keep
- -- registered_writer_seen=false and therefore cannot affect directory projection.
+ -- This is the database side of INGEST_TURN_FENCE_REGISTER: ordinary/backfill/import census rows
+ -- remain false until an authenticated writer registers that exact scope. Once registration has
+ -- occurred, the durable bit intentionally survives later flag changes and erasure.
  UPDATE sessions.turn_session_fences f SET registered_writer_seen=true
   WHERE f.org_id=p_org AND f.workspace_id=p_ws AND f.source=p_source AND f.session_id=p_session
    AND NOT f.registered_writer_seen
@@ -252,10 +253,10 @@ END $sources$;
 
 -- Turn-only canonical pointers remain addressable by GET turns but never become a live directory
 -- row. Registration is the activation gate; after exact-session erasure removes its personal
--- writer row, registered_writer_seen is the durable non-personal witness. The public delivery route
--- rejects the reserved turns origin, while the private turns route derives the synthetic machine id
--- from (workspace, fixed turns origin, authenticated user). A later non-turn pointer makes the
--- predicate false and the normal projector can restore the row.
+-- writer row, registered_writer_seen is the durable non-personal witness. Both public delivery and
+-- archive recovery reject the reserved turns origin, while the private turns route derives the
+-- synthetic machine id from (workspace, fixed turns origin, authenticated user). A later non-turn
+-- pointer makes the predicate false and the normal projector can restore the row.
 CREATE FUNCTION sessions.aa_session_directory_hide_turn_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
 BEGIN

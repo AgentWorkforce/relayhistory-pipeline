@@ -10,6 +10,7 @@ import {LedgerUnavailableError} from "../ledger.ts";
 import {prepareDelivery,deliveryAccount} from "../vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../vendor/delivery/delivery-contracts.ts";
 import {readBufferedStage} from "../staging.ts";
+import {RECOVERY_CONTENT_TYPE,RECOVERY_PROTOCOL} from "../recovery-protocol.ts";
 import type {CurrentCustodyPacket} from "../custody-protocol.ts";
 import {TURN_KIND,TURN_ORIGIN_ID,parseTurnBatch,turnRecordId} from "../turns.ts";
 import {liveMachineId} from "../writer.ts";
@@ -147,6 +148,9 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
  const reserved=await batch([record({record_id:"reserved-origin",origin_id:TURN_ORIGIN_ID})],{origin_id:TURN_ORIGIN_ID});
  const reservedResponse=await app.request("/v1/delivery/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(reserved)});
  expect(reservedResponse.status).toBe(400);expect((await reservedResponse.json() as any).error.code).toBe("invalid_delivery");
+ const recovered=await prepareDelivery(TENANT,reserved);
+ const recoveryResponse=await app.request("/v1/delivery/recovery",{method:"POST",headers:{"content-type":RECOVERY_CONTENT_TYPE},body:JSON.stringify({protocol:RECOVERY_PROTOCOL,prepared:recovered,custody:await f.witnessFor(reserved)})});
+ expect(recoveryResponse.status).toBe(400);expect((await recoveryResponse.json() as any).error.code).toBe("invalid_delivery");
  const priv=await app.request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await batch([record({record_id:"r1"})]))});
  expect(priv.status).toBe(400);
  const noScope=createIngestApp({identify:()=>({...TENANT,scopes:["rth:read"]}),deliver:f.deps,log:()=>{},custodySource:"frozen-supabase"});

@@ -70,13 +70,14 @@ Khaliq's explicit approval. In order:
    commit or retired and purged; there is no log-driven manual privacy gap.
 5. **Publication.** `aa_session_directory_hide_turn_only` tombstones a directory projection whose
    live pointers are exclusively synthetic turns-origin pointers with a current writer or the
-   non-personal `registered_writer_seen` witness preserved by exact-session erasure. The public
-   delivery route rejects the reserved origin; the private turns route derives the machine id from
-   workspace, that fixed origin and the authenticated user. The canonical pointer stays live for
-   GET turns. A normal pointer makes the predicate false and the ordinary projector restores the
-   directory row. With registration off, ordinary/legacy fence census rows keep
-   `registered_writer_seen=false`, so even a marker-shaped pointer remains byte-for-byte on the
-   ordinary directory path.
+   non-personal `registered_writer_seen` witness preserved by exact-session erasure. Public
+   delivery and archive recovery reject the reserved origin; the private turns route derives the
+   machine id from workspace, that fixed origin and the authenticated user. The canonical pointer
+   stays live for GET turns. A normal pointer makes the predicate false and the ordinary projector
+   restores the directory row. Ordinary/legacy fence census rows begin with
+   `registered_writer_seen=false`; registering that exact scope (including an already-fenced
+   scope) sets it true. Thus flag-off is byte-identical before first registration, while a durable
+   witness intentionally survives a later flag change or erasure.
 6. **Backfill.** `migration:legacy-export` is the bounded, resumable one-shot exporter/verifier for
    `conversation_turns`, links and outcomes. Its manifest is accepted only on the dedicated legacy
    machine. The read merge remains live-over-legacy per

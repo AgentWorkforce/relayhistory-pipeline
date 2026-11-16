@@ -11,7 +11,7 @@ DO $rollback_identity_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062020_turns_forward_gates.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_turns_forward_gates.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '952cf4ffeb7d7d24958d54a15f4125e69474330ae898977c18507e81cf0b4ede'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '63ca3c75bd1b09ec32369e761446da6a592e57fd90aca6640e9fb6a5dbd8ff5a'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: own applied checksum required';END IF;
 END $rollback_identity_guard$;
 
@@ -26,8 +26,10 @@ LOCK TABLE sessions.turn_session_fences,sessions.turn_writers,
 DO $rollback_privacy_guard$ BEGIN
  -- A live row is derivable only while an ordinary-origin upload_deletions witness remains. Whole-user
  -- erase can intentionally remove that witness while retaining the permanent logical fence, so an
- -- orphaned live row, imported Neon evidence, or a registered writer makes rollback refuse.
+ -- orphaned live row, imported Neon evidence, a registered writer, or its durable registration
+ -- witness makes rollback refuse.
  IF EXISTS(SELECT 1 FROM sessions.turn_session_fences WHERE fence_basis='legacy_import')
+    OR EXISTS(SELECT 1 FROM sessions.turn_session_fences WHERE registered_writer_seen)
     OR EXISTS(SELECT 1 FROM sessions.turn_session_fences f WHERE f.fence_basis='live'
       AND NOT EXISTS(SELECT 1 FROM sessions.upload_deletions d
        WHERE d.org_id=f.org_id AND d.workspace_id=f.workspace_id

@@ -903,6 +903,10 @@ export function createIngestApp(deps: IngestAppDeps) {
         throw new IngestUnavailable("recovery", "recovery_wire_unavailable");
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       const { prepared, custody } = await decodeRecoveryEnvelope(c.get("body"), tenant);
+      // Archive recovery is another delivery ingress, not the private turns protocol. Keep the
+      // server-reserved turns origin exclusive to /v1/turns/batches.
+      if (prepared.originId === TURN_ORIGIN_ID)
+        throw new DeliveryError("invalid_delivery", 400, "Delivery origin is reserved for relay turns");
       c.set("custody", custody);
       // Replaying an archive re-publishes it: the same consent check as a live batch.
       await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { deferDenied: true, phase: "precheck", route: "delivery.recovery" }, (f) => emit({ ...fields, ...f }));
