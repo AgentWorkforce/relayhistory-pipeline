@@ -582,6 +582,7 @@ async function streamedReconcile(
     scope, admitted,
     {
       readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
+      originLabels: deps.originLabels === true, // as the whole read (readCanonicalScope) labels rows
       keepalive: { everyMs: 0, ping: () => keepalive() }, // throttled here, shared with the scan and deletes
     },
     budget, version, fromMs,

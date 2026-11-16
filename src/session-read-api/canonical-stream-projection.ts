@@ -92,6 +92,11 @@ export interface StreamDeps {
    * error, unchanged.
    */
   keepalive?: { everyMs: number; ping: () => Promise<void>; now?: () => number };
+  /**
+   * MESSAGE_ORIGIN_LABELS_ENABLED on the index writer (projectedToNeonRow), exactly as the
+   * whole read takes it (readCanonicalScope deps.originLabels): absent or false, rows as before.
+   */
+  originLabels?: boolean;
 }
 
 export const STREAM_READ_BYTES_BUDGET = "stream_read_bytes_budget";
@@ -618,7 +623,7 @@ export async function streamCanonicalScope(
           session_id: row.delivery_record_id ? (found?.sessionId ?? row.session_id) : row.session_id,
           user_id: row.user_id ?? found?.userId ?? ctx.userId,
         };
-        const indexRow = toIndexRow(projectedToNeonRow(canonicalRow, scope, ctx.userId), version);
+        const indexRow = toIndexRow(projectedToNeonRow(canonicalRow, scope, ctx.userId, deps.originLabels === true), version);
         yield {
           rank,
           key: rowKey({ machine_id: indexRow.machine_id, source: indexRow.source, kind: indexRow.kind, event_id: indexRow.event_id }),
