@@ -120,6 +120,12 @@ async function supabase() {
   // The exporter's owner registration (20261105062020), loaded verbatim from the repo when the head has it: the table,
   // the SECURITY DEFINER register RPC, and the helper it calls. Nothing is hand-written.
   for (const sql of legacyAuthoritySql()) await pg.exec(sql);
+  // STAND-INS for an orthogonal concern, in this plain-ledger fixture ONLY: the Supabase eraser authority is active and the
+  // exporter readiness probe answers ready. The fence tests here exercise fences, not readiness. Readiness, activation,
+  // heartbeat freshness and their refusals run against the REAL migration stack in (c) hostedWorld, (g), (h) and the
+  // 'exporter REFUSES' / 'registration while inactive' tests, never against these stand-ins.
+  await pg.exec(`CREATE OR REPLACE FUNCTION sessions.ingest_privacy_eraser_require_active() RETURNS void LANGUAGE sql AS $$ SELECT $$;
+    CREATE OR REPLACE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;`);
   // Transaction control and advisory locks are stood in (PGlite is single-session); the fence SQL runs for real.
   const db: Queryable = {
     async query<T>(sql: string, params?: unknown[]) {
@@ -952,6 +958,19 @@ describe("(f) the owner-registration rollback never destroys a live owner mappin
     return { f, exists, rollback };
   }
 
+  test("registration while the Supabase eraser authority is INACTIVE is refused and writes no owner row", async () => {
+    const w = await stackWithLedger(); // real stack, authority never activated
+    try {
+      const r = await w.f.db.query("SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)", [
+        JSON.stringify({ org_id: S.orgId, workspace_id: S.workspaceId, source: S.source, session_id: "sess:inactive", legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(S.workspaceId, OWNER) }),
+      ]).then(() => "registered", (e) => String((e as { code?: string }).code ?? (e as Error).message));
+      expect(r).not.toBe("registered");
+      expect(((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_scope_authority")).rows[0] as { n: number }).n).toBe(0);
+    } finally {
+      await w.f.close();
+    }
+  });
+
   test("control: with an EMPTY authority table the rollback succeeds (so a refusal below is about the rows, not the fixture)", async () => {
     const w = await stackWithLedger();
     try {
@@ -966,6 +985,12 @@ describe("(f) the owner-registration rollback never destroys a live owner mappin
   test("with registered owner rows the rollback refuses (SQLSTATE 55000) and every row survives", async () => {
     const w = await stackWithLedger();
     try {
+      // Legitimate registrations happen only while the Supabase eraser authority is active.
+      await w.f.seal();
+      await w.f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      const fp = (await w.f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+      const owned = (await w.f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+      await w.f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
       for (const sid of ["sess:1", "sess_r"])
         await w.f.db.query("SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb)", [
           JSON.stringify({ org_id: S.orgId, workspace_id: S.workspaceId, source: S.source, session_id: sid, legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(S.workspaceId, OWNER) }),
