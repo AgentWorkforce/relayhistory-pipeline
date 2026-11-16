@@ -14,6 +14,7 @@ import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
+import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
 import { feedBufferedStageByKey, isBufferedStageKey, type BufferedFeedDeps } from "./buffered-search-feed.ts";
@@ -176,6 +177,11 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           log.info("search index stream deferred, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_deferred" });
           continue;
         }
+        if (result.reasons.includes(LEGACY_PROVENANCE_INVALID))
+          log.warn("canonical legacy evidence dropped", {
+            stage: "search-index",
+            reason: LEGACY_PROVENANCE_INVALID,
+          });
         if (result.partial)
           log.warn("search index partial", {
             stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests,
