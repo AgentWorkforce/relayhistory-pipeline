@@ -6,8 +6,8 @@
 import { describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type ReadApiDeps } from "../app.ts";
 import { selfIssuedVerifier } from "../auth.ts";
-import { eventMessageIdDeps, readApiAuthConfig, readApiAuthMode, readApiCorsOrigins } from "../lambda.ts";
-import { ACCESS_PREFIX, ACCESS_TTL_SECONDS_DEFAULT, REFRESH_PREFIX, SERVICE_PREFIX, generateToken, hashToken, type NewTokenRow, type RefreshInput, type TokenRow, type TokenStore } from "../self-issued.ts";
+import { eventMessageIdDeps, mintReaderKindEnabled, readApiAuthConfig, readApiAuthMode, readApiCorsOrigins } from "../lambda.ts";
+import { ACCESS_PREFIX, ACCESS_TTL_SECONDS_DEFAULT, REFRESH_PREFIX, SERVICE_PREFIX, generateToken, hashToken, sqlTokenStore, type NewTokenRow, type RefreshInput, type TokenRow, type TokenStore } from "../self-issued.ts";
 import { memoryLiveness } from "./support.ts";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 
@@ -55,7 +55,7 @@ function memoryStore() {
 
 const stubCh: ClickHouseClient = { database: "t", async command() {}, async insert() {}, async select() { return [] as never[]; } };
 
-function api(over: Partial<ReadApiDeps> & { secrets?: string[] } = {}) {
+function api(over: Partial<ReadApiDeps> & { secrets?: string[]; mintReaderKind?: boolean } = {}) {
   const mem = memoryStore();
   const logs: Record<string, unknown>[] = [];
   const seen: Array<{ route: string; orgId: string; workspaceId: string }> = [];
@@ -73,7 +73,7 @@ function api(over: Partial<ReadApiDeps> & { secrets?: string[] } = {}) {
     directory,
     directoryWorkspaces: "*",
     turns: { async harnesses(scope) { seen.push({ route: "turns", orgId: scope.orgId, workspaceId: scope.workspaceId }); return []; }, async source() { throw new Error("unused"); } },
-    selfIssued: { store: mem.store, audience: ORIGIN, internalSecrets: over.secrets ?? [SECRET], accessTtlSeconds: ACCESS_TTL_SECONDS_DEFAULT },
+    selfIssued: { store: mem.store, audience: ORIGIN, internalSecrets: over.secrets ?? [SECRET], accessTtlSeconds: ACCESS_TTL_SECONDS_DEFAULT, ...(over.mintReaderKind === undefined ? {} : { mintReaderKind: over.mintReaderKind }) },
     log: (f) => logs.push(f),
     ...over,
   });
@@ -177,6 +177,145 @@ describe("refresh", () => {
   });
 });
 
+describe("READ_API_MINT_READER_KIND", () => {
+  const KINDS = ["browser", "device", "mcp"] as const;
+  const BAD_VALUES: unknown[] = ["", "Browser", "MCP", " browser", "laptop", "cli", 1, 0, true, null, [], ["browser"], {}, { kind: "browser" }];
+
+  test("off (unset or false): reader_kind is an unknown field on issue and refresh, exactly as before", async () => {
+    for (const mintReaderKind of [undefined, false]) {
+      const { post, mem } = api({ mintReaderKind });
+      const pair = await json(await post(ISSUE, issueBody()));
+      for (const [path, body] of [[ISSUE, issueBody()], [REFRESH, { ...issueBody(), refreshToken: pair.refreshToken }]] as const) {
+        const r = await post(path, { ...body, reader_kind: "browser" });
+        expect(r.status).toBe(400);
+        expect((await json(r)).error).toEqual({ code: "bad_request", message: "body has an unknown field" });
+      }
+      // The refused refresh did not spend the token, and nothing new was stored.
+      expect(mem.rows.size).toBe(1);
+      expect([...mem.rows.values()][0]!.readerKind).toBeNull();
+      expect((await post(REFRESH, { ...issueBody(), refreshToken: pair.refreshToken })).status).toBe(200);
+    }
+  });
+
+  test("on: each kind is accepted and recorded; the reply is the frozen shape; the issue log line carries it", async () => {
+    const { post, mem, logs } = api({ mintReaderKind: true });
+    for (const kind of KINDS) {
+      const r = await post(ISSUE, { ...issueBody(), label: "desktop", reader_kind: kind });
+      expect(r.status).toBe(201);
+      const pair = await json(r);
+      expect(Object.keys(pair)).not.toContain("reader_kind");
+      expect(Object.keys(pair).sort()).toEqual(["accessToken", "accessTokenExpiresAt", "audience", "orgId", "refreshToken", "refreshTokenExpiresAt", "scopes", "sessionId", "tokenType", "userId", "workspaceId"]);
+      expect(mem.rows.get(pair.sessionId)?.readerKind).toBe(kind);
+      expect(mem.rows.get(pair.sessionId)?.label).toBe("desktop");
+      expect(logs.filter((l) => l.reason === "session_issued" && l.session_id === pair.sessionId)).toEqual([
+        expect.objectContaining({ route: ISSUE, reason: "session_issued", reader_kind: kind }),
+      ]);
+    }
+  });
+
+  test("on, without the field: stored as null and the issue log line has no reader_kind", async () => {
+    const { post, mem, logs } = api({ mintReaderKind: true });
+    const pair = await json(await post(ISSUE, issueBody()));
+    expect(mem.rows.get(pair.sessionId)?.readerKind).toBeNull();
+    const line = logs.find((l) => l.reason === "session_issued")!;
+    expect(Object.keys(line)).not.toContain("reader_kind");
+  });
+
+  test("off: an issue stores null and the issue log line has no reader_kind", async () => {
+    const { post, mem, logs } = api();
+    const pair = await json(await post(ISSUE, issueBody()));
+    expect(mem.rows.get(pair.sessionId)?.readerKind).toBeNull();
+    expect(Object.keys(logs.find((l) => l.reason === "session_issued")!)).not.toContain("reader_kind");
+  });
+
+  test("on: any other value or type is 400 bad_request on issue and refresh, never echoed, never stored", async () => {
+    const { post, mem, logs } = api({ mintReaderKind: true });
+    const pair = await json(await post(ISSUE, issueBody()));
+    for (const value of BAD_VALUES) {
+      for (const [path, body] of [[ISSUE, issueBody()], [REFRESH, { ...issueBody(), refreshToken: pair.refreshToken }]] as const) {
+        const r = await post(path, { ...body, reader_kind: value });
+        expect(r.status).toBe(400);
+        const error = (await json(r)).error;
+        expect(error).toEqual({ code: "bad_request", message: 'reader_kind must be one of "browser", "device" or "mcp"' });
+      }
+    }
+    // A distinctive value appears in no reply and no log line.
+    const marker = "browser-SECRETMARKER";
+    const r = await post(ISSUE, { ...issueBody(), reader_kind: marker });
+    expect(await r.text()).not.toContain(marker);
+    expect(JSON.stringify(logs)).not.toContain(marker);
+    expect(mem.rows.size).toBe(1);
+    // None of the refused refreshes spent the token.
+    expect((await post(REFRESH, { ...issueBody(), refreshToken: pair.refreshToken })).status).toBe(200);
+  });
+
+  test("on: refresh validates reader_kind but the row keeps the kind recorded at issue", async () => {
+    const { post, mem } = api({ mintReaderKind: true });
+    const first = await json(await post(ISSUE, { ...issueBody(), reader_kind: "device" }));
+    const second = await json(await post(REFRESH, { ...issueBody(), refreshToken: first.refreshToken, reader_kind: "mcp" }));
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(mem.rows.get(first.sessionId)?.readerKind).toBe("device");
+    const third = await post(REFRESH, { ...issueBody(), refreshToken: second.refreshToken });
+    expect(third.status).toBe(200);
+    expect(mem.rows.get(first.sessionId)?.readerKind).toBe("device");
+    // A session issued without one cannot gain one on refresh.
+    const bare = await json(await post(ISSUE, issueBody()));
+    expect((await post(REFRESH, { ...issueBody(), refreshToken: bare.refreshToken, reader_kind: "browser" })).status).toBe(200);
+    expect(mem.rows.get(bare.sessionId)?.readerKind).toBeNull();
+  });
+
+  test("on: the service-token route still refuses reader_kind", async () => {
+    const { post, mem } = api({ mintReaderKind: true });
+    const r = await post(SERVICE, { ...issueBody(), label: "ci", reader_kind: "mcp" });
+    expect(r.status).toBe(400);
+    expect((await json(r)).error.message).toBe("body has an unknown field");
+    expect(mem.rows.size).toBe(0);
+    const ok = await json(await post(SERVICE, { ...issueBody(), label: "ci" }));
+    expect(mem.rows.get(ok.id)?.readerKind).toBeNull();
+  });
+
+  test("the variable follows the shared flag helper: 1 or true (any case) is on, anything else off", () => {
+    for (const on of ["1", "true", "TRUE", "True"]) expect(mintReaderKindEnabled({ READ_API_MINT_READER_KIND: on })).toBe(true);
+    for (const off of [undefined, "", "0", "false", "yes", "on", " true", "2"]) expect(mintReaderKindEnabled({ READ_API_MINT_READER_KIND: off })).toBe(false);
+    const env = { READ_API_AUTH_MODE: "self_issued", READ_API_ORIGIN: ORIGIN, READ_API_INTERNAL_SECRET: SECRET };
+    expect(readApiAuthConfig({ ...env, READ_API_MINT_READER_KIND: "true" }).selfIssued).toEqual({ audience: ORIGIN, internalSecrets: [SECRET], accessTtlSeconds: 300, mintReaderKind: true });
+    for (const off of ["", "0", "false"])
+      expect(readApiAuthConfig({ ...env, READ_API_MINT_READER_KIND: off }).selfIssued).toEqual({ audience: ORIGIN, internalSecrets: [SECRET], accessTtlSeconds: 300 });
+  });
+});
+
+describe("sqlTokenStore issue function", () => {
+  const issueRow = (readerKind?: NewTokenRow["readerKind"]): NewTokenRow => ({
+    id: "id-1", family: "fam-1", subjectType: "cli", audience: ORIGIN, ...A,
+    accessHash: "ah", accessExpires: new Date(2000), refreshHash: "rh", refreshExpires: new Date(3000), label: null,
+    ...(readerKind === undefined ? {} : { readerKind }), now: new Date(1000),
+  } as NewTokenRow);
+  async function issued(row: NewTokenRow) {
+    const calls: Array<{ text: string; params: unknown[] | undefined }> = [];
+    const client = { async query(text: string, params?: unknown[]) { calls.push({ text, params }); return { rows: [] }; }, release() {} };
+    await sqlTokenStore({ query: client.query, connect: async () => client } as never).issue(row);
+    return calls.filter((c) => c.text.includes("read_api_token_issue"));
+  }
+
+  test("no reader kind calls the 044000 read_api_token_issue with 13 args", async () => {
+    for (const readerKind of [undefined, null]) {
+      const calls = await issued(issueRow(readerKind));
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.text).toContain("read_api_token_issue(");
+      expect(calls[0]!.text).not.toContain("read_api_token_issue_v2");
+      expect(calls[0]!.params).toHaveLength(13);
+    }
+  });
+
+  test("reader kind device calls read_api_token_issue_v2 with 14 args, the last being device", async () => {
+    const calls = await issued(issueRow("device"));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.text).toContain("read_api_token_issue_v2(");
+    expect(calls[0]!.params).toHaveLength(14);
+    expect(calls[0]!.params![13]).toBe("device");
+  });
+});
+
 describe("revocation", () => {
   test("offboarding a user is immediate and ends the refresh family; another org is untouched", async () => {
     const { post, get } = api();
@@ -219,7 +358,7 @@ describe("audience isolation", () => {
     const { store } = memoryStore();
     const token = generateToken(ACCESS_PREFIX);
     const now = new Date();
-    await store.issue({ id: "1", family: "f", subjectType: "cli", audience: "https://other.example.test", ...A, accessHash: await hashToken(token), accessExpires: new Date(now.getTime() + 60_000), refreshHash: "r", refreshExpires: new Date(now.getTime() + 60_000), label: null, now });
+    await store.issue({ id: "1", family: "f", subjectType: "cli", audience: "https://other.example.test", ...A, accessHash: await hashToken(token), accessExpires: new Date(now.getTime() + 60_000), refreshHash: "r", refreshExpires: new Date(now.getTime() + 60_000), label: null, readerKind: null, now });
     await expect(selfIssuedVerifier(store, ORIGIN)(token)).rejects.toMatchObject({ status: 401, code: "invalid_token" });
   });
 
@@ -289,7 +428,7 @@ describe("fail closed", () => {
     const { store } = memoryStore();
     const token = generateToken(ACCESS_PREFIX);
     const now = new Date();
-    await store.issue({ id: "1", family: "f", subjectType: "cli", audience: ORIGIN, ...A, accessHash: await hashToken(token), accessExpires: new Date(now.getTime() - 1), refreshHash: "r", refreshExpires: new Date(now.getTime() + 60_000), label: null, now });
+    await store.issue({ id: "1", family: "f", subjectType: "cli", audience: ORIGIN, ...A, accessHash: await hashToken(token), accessExpires: new Date(now.getTime() - 1), refreshHash: "r", refreshExpires: new Date(now.getTime() + 60_000), label: null, readerKind: null, now });
     await expect(selfIssuedVerifier(store, ORIGIN)(token)).rejects.toBeInstanceOf(AuthError);
   });
 

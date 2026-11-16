@@ -461,6 +461,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories",
     sql: "SELECT to_regprocedure('sessions.coordination_advisories_upsert_v1(text,text,jsonb)') IS NOT NULL AND to_regclass('sessions.coordination_advisories') IS NOT NULL AS applied",
   },
+  "upstream:20261105062020_read_api_token_reader_kind.sql": {
+    evidence: "column sessions.read_api_tokens.reader_kind and function sessions.read_api_token_issue_v2",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.read_api_tokens') AND attname = 'reader_kind' AND NOT attisdropped) AND to_regprocedure('sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamptz,text,timestamptz,text,timestamptz,text)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

@@ -175,6 +175,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105059000_ingest_publication_gcs_provider.sql",
       // Coordination live advisories: one new owner-only table and five SECURITY DEFINER entry points; no G4 function names them.
       "20261105062000_coordination_advisories.sql",
+      // Read API token reader kind: one nullable column on the 044000 token table and one new SECURITY DEFINER issue function; no G4 function names them.
+      "20261105062020_read_api_token_reader_kind.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

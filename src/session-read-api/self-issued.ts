@@ -32,6 +32,9 @@ export const TOKEN_MAX_CHARS = 4096;
 export const INTERNAL_MAX_BODY_BYTES = 8 * 1024;
 const LABEL_MAX_CHARS = 128;
 const ID_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
+/** The reader kinds a mint may record (READ_API_MINT_READER_KIND); the table's CHECK holds the same list. */
+export const READER_KINDS = Object.freeze(["browser", "device", "mcp"] as const);
+export type ReaderKind = (typeof READER_KINDS)[number];
 
 export const SESSIONS_PATH = "/internal/v1/session-read/sessions";
 export const REFRESH_PATH = "/internal/v1/session-read/sessions/refresh";
@@ -64,6 +67,8 @@ export interface NewTokenRow {
   refreshHash: string;
   refreshExpires: Date;
   label: string | null;
+  /** Recorded at issue only (slot 062020); null when the mint carried none or the flag is off. */
+  readerKind: ReaderKind | null;
   now: Date;
 }
 
@@ -97,6 +102,11 @@ export interface SelfIssuedDeps {
   /** The current internal secret, then the previous one during an overlap. */
   internalSecrets: readonly string[];
   accessTtlSeconds: number;
+  /**
+   * READ_API_MINT_READER_KIND (default off). When true, the issue and refresh routes accept an optional
+   * reader_kind; when absent or false, a body carrying it is refused as an unknown field, as before.
+   */
+  mintReaderKind?: boolean;
   now?: () => number;
 }
 
@@ -194,6 +204,15 @@ function requireAudience(body: Record<string, unknown>, deps: SelfIssuedDeps): s
   return audience;
 }
 
+/** Optional reader_kind (only reachable with READ_API_MINT_READER_KIND on). The refusal never echoes the value. */
+function readerKindField(body: Record<string, unknown>): ReaderKind | null {
+  const kind = body.reader_kind;
+  if (kind === undefined) return null;
+  if (typeof kind !== "string" || !(READER_KINDS as readonly string[]).includes(kind))
+    throw bad('reader_kind must be one of "browser", "device" or "mcp"');
+  return kind as ReaderKind;
+}
+
 /** Registers the token routes; call before the /v1/* bearer middleware. */
 export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, log: (fields: Record<string, unknown>) => void): void {
   const nowDate = () => new Date((deps.now ?? Date.now)());
@@ -235,17 +254,22 @@ export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, l
     tokenType: "Bearer" as const,
   });
 
+  // reader_kind is appended last, and only with the flag on: with it off the lists, and so the
+  // "unknown field" refusal, are exactly as before.
+  const withReaderKind = (allowed: readonly string[]): readonly string[] => (deps.mintReaderKind ? [...allowed, "reader_kind"] : allowed);
+
   const lifetimes = (now: Date) => ({
     accessExpires: new Date(now.getTime() + deps.accessTtlSeconds * 1000),
     refreshExpires: new Date(now.getTime() + REFRESH_TTL_SECONDS * 1000),
   });
 
   app.post(SESSIONS_PATH, limit, internal(async (c, body) => {
-    onlyFields(body, ["userId", "orgId", "workspaceId", "audience", "scopes", "label"]);
+    onlyFields(body, withReaderKind(["userId", "orgId", "workspaceId", "audience", "scopes", "label"]));
     const identity = { userId: idField(body, "userId"), orgId: idField(body, "orgId"), workspaceId: idField(body, "workspaceId") };
     const audience = requireAudience(body, deps);
     requireReadScope(body);
     const label = labelField(body);
+    const readerKind = readerKindField(body);
     const now = nowDate();
     const id = crypto.randomUUID();
     const accessToken = generateToken(ACCESS_PREFIX);
@@ -253,18 +277,22 @@ export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, l
     const { accessExpires, refreshExpires } = lifetimes(now);
     await deps.store.issue({
       id, family: crypto.randomUUID(), subjectType: "cli", audience, ...identity,
-      accessHash: await hashToken(accessToken), accessExpires, refreshHash: await hashToken(refreshToken), refreshExpires, label, now,
+      accessHash: await hashToken(accessToken), accessExpires, refreshHash: await hashToken(refreshToken), refreshExpires, label, readerKind, now,
     });
-    log({ route: SESSIONS_PATH, reason: "session_issued", session_id: id, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") });
+    log({ route: SESSIONS_PATH, reason: "session_issued", session_id: id, workspace_id: identity.workspaceId, ...(readerKind ? { reader_kind: readerKind } : {}), correlation_id: c.get("correlationId") });
     return c.json(pairReply({ id, audience, ...identity }, { accessToken, accessExpires, refreshToken, refreshExpires }), 201);
   }));
 
   app.post(REFRESH_PATH, limit, internal(async (c, body) => {
-    onlyFields(body, ["refreshToken", "userId", "orgId", "workspaceId", "audience", "scopes", "label"]);
+    onlyFields(body, withReaderKind(["refreshToken", "userId", "orgId", "workspaceId", "audience", "scopes", "label"]));
     const identity = { userId: idField(body, "userId"), orgId: idField(body, "orgId"), workspaceId: idField(body, "workspaceId") };
     const audience = requireAudience(body, deps);
     requireReadScope(body);
     labelField(body);
+    // Validated like issue, but not stored: refresh rotates the hashes in place (044000's
+    // read_api_token_refresh), so the row keeps the reader_kind recorded at issue. A refresh cannot
+    // set, change or clear it; a different reader kind needs a new mint.
+    readerKindField(body);
     const presented = body.refreshToken;
     if (typeof presented !== "string" || presented.length > TOKEN_MAX_CHARS) throw bad("refreshToken must be a string");
     const refused = new RouteError(401, "invalid_token", "refresh token is not valid");
@@ -302,7 +330,7 @@ export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, l
       id, family: crypto.randomUUID(), subjectType: "service", audience, userId, orgId, workspaceId,
       accessHash: await hashToken(token), accessExpires: expires,
       // A value nobody holds: a service token has no refresh path.
-      refreshHash: await hashToken(generateToken(REFRESH_PREFIX)), refreshExpires: expires, label, now,
+      refreshHash: await hashToken(generateToken(REFRESH_PREFIX)), refreshExpires: expires, label, readerKind: null, now,
     });
     log({ route: SERVICE_TOKENS_PATH, reason: "service_token_issued", session_id: id, workspace_id: workspaceId, correlation_id: c.get("correlationId") });
     return c.json({ id, token, label, userId, orgId, workspaceId, audience, scopes: [...READ_SCOPES], expiresAt: expires.toISOString(), tokenType: "Bearer" }, 201);
@@ -397,10 +425,14 @@ export function sqlTokenStore(pool: TokenPool): TokenStore {
     },
     issue: (row) =>
       write(async (q) => {
-        await q.query("SELECT sessions.read_api_token_issue($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)", [
+        const args = [
           row.id, row.family, row.subjectType, row.audience, row.userId, row.orgId, row.workspaceId,
           row.accessHash, row.accessExpires, row.refreshHash, row.refreshExpires, row.label, row.now,
-        ]);
+        ];
+        // Without a reader kind this is the 044000 call, unchanged, so it needs nothing from 062020.
+        // read_api_token_issue_v2 (062020) is called only when a mint carries one.
+        if (row.readerKind == null) await q.query("SELECT sessions.read_api_token_issue($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)", args);
+        else await q.query("SELECT sessions.read_api_token_issue_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)", [...args, row.readerKind]);
       }),
     refresh: (input) =>
       write(async (q) => {

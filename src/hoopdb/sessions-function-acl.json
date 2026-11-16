@@ -1215,6 +1215,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.read_api_token_issue_v2(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.read_api_token_refresh(text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
