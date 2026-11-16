@@ -583,6 +583,8 @@ async function streamedReconcile(
     {
       readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
       keepalive: { everyMs: 0, ping: () => keepalive() }, // throttled here, shared with the scan and deletes
+      // The same labels as the whole read (readCanonicalScope gets them through `deps`).
+      ...(deps.originLabels ? { originLabels: true as const } : {}),
     },
     budget, version, fromMs,
   );

@@ -109,6 +109,34 @@ test("streaming on: a too-large scope gets the whole read's rows, directory even
   expect(again.stream).toMatchObject({ passes: 3 });
 }, 60_000);
 
+test("streaming on: MESSAGE_ORIGIN_LABELS_ENABLED labels a streamed row as the whole read does", async () => {
+  const m = "machine:0";
+  const at = (i: number) => T0 + i * 1000;
+  const x = await scope([
+    ...generate(33),
+    activity(m, `capacity:${m}`, "session_event", "label-human", at(1), { role: "user", text: "typed by a person", message_id: "lh", origin_kind: "human" }),
+    activity(m, `capacity:${m}`, "session_event", "label-agent", at(3), { role: "assistant", text: "an answer", message_id: "la", subagent_session_id: "sub-1" }),
+  ]);
+  const whole = await backend(x, { originLabels: true });
+  const streamed = await backend(x, { limits: TINY, stream: UNLIMITED, originLabels: true });
+  const unlabelled = await backend(x, { limits: TINY, stream: UNLIMITED });
+  expect(await indexSearchScope(SCOPE, whole.deps)).toMatchObject({ complete: true, reasons: [] });
+  expect(await indexSearchScope(SCOPE, streamed.deps)).toMatchObject({ complete: true, reasons: [] });
+  expect(await indexSearchScope(SCOPE, unlabelled.deps)).toMatchObject({ complete: true, reasons: [] });
+  const labels = async (b: Awaited<ReturnType<typeof backend>>) =>
+    Object.fromEntries(
+      (await b.docs()).flatMap((h) => {
+        const id = /:(label-[a-z]+)$/.exec(h.eventId)?.[1];
+        return id ? [[id, [h.actorName, h.subagentId]]] : [];
+      }),
+    );
+  expect(await labels(whole)).toEqual({ "label-human": ["human", ""], "label-agent": ["agent", "sub-1"] });
+  expect(await labels(streamed)).toEqual(await labels(whole));
+  expect(await streamed.scan()).toEqual(await whole.scan());
+  // Labels are part of the fingerprint: without them the streamed rows differ.
+  expect(await unlabelled.scan()).not.toEqual(await whole.scan());
+}, 60_000);
+
 test("streaming on: a retracted row is deleted and a missing row is regenerated", async () => {
   const x = await scope(generate(32));
   const b = await backend(x, { limits: TINY, stream: UNLIMITED });
