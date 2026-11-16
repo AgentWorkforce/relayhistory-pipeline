@@ -1,0 +1,61 @@
+# ledger-bench: the benchmark client on the cluster (docs/design/hosted-ledger-benchmark-plan.md).
+# Rendered by ops.ts: the upper-case placeholders are filled from the operator's inputs, never committed. One Job per lane.
+# The pod runs the ingest-edge image (same Bun, same node type) with the bundled harness from a ConfigMap,
+# so no image is built or pushed for the benchmark.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ledger-bench-${RUN_ID}-${LANE}
+  namespace: ledger-bench
+  labels: { app.kubernetes.io/name: ledger-bench, ledger-bench/run: "${RUN_ID}", ledger-bench/lane: "${LANE}", purpose: ledger-bench }
+spec:
+  # The hard deadline: the Job is killed 4 hours after it starts, and removed an hour after it ends.
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: ledger-bench, ledger-bench/run: "${RUN_ID}", ledger-bench/lane: "${LANE}", purpose: ledger-bench }
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ledger-bench
+      # EKS Pod Identity mounts its own token; the Kubernetes API token is not needed.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector: ${NODE_SELECTOR_JSON}
+      tolerations: ${TOLERATIONS_JSON}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: bench
+          image: ${IMAGE}
+          command: ["bun", "/bench/main.js", "run"]
+          env:
+            - { name: LEDGER_BENCH_LANE, value: "${LANE}" }
+            - { name: LEDGER_BENCH_RUN_ID, value: "${RUN_ID}" }
+            - { name: LEDGER_BENCH_PROFILE, value: "${PROFILE}" }
+            - { name: LEDGER_BENCH_STEPS, value: "${STEPS}" }
+            - name: LEDGER_BENCH_CONFIG
+              valueFrom: { configMapKeyRef: { name: ledger-bench-config, key: config.json } }
+            - { name: TMPDIR, value: /tmp }
+          resources:
+            requests: { cpu: "${CPU}", memory: "${MEMORY}" }
+            limits: { memory: "${MEMORY}" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: bench, mountPath: /bench, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: bench
+          configMap: { name: ledger-bench-bundle }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }

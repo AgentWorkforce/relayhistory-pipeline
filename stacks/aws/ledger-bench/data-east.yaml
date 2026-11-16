@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ledger-bench (throwaway): R1 and K1, the cross-region baseline of the hosted-ledger benchmark
+  (docs/design/hosted-ledger-benchmark-plan.md). Production's shape: a general-purpose bucket with SSE-KMS
+  and Bucket Keys off, in a Region other than the compute's. Deployed in the throwaway (sessions-dev)
+  account. The client role that may use it is in data-west.yaml. Delete the stack to remove it.
+
+Parameters:
+  Owner:
+    Type: String
+    AllowedPattern: "^[a-z0-9-]{3,40}$"
+  Ttl:
+    Type: String
+    AllowedPattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+
+Resources:
+  Key:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: ledger-bench K1 (throwaway benchmark key)
+      EnableKeyRotation: false
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministersThroughIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  BucketR1:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "ledger-bench-r1-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  BucketR1Policy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketR1
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BucketR1.Arn, !Sub "${BucketR1.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+Outputs:
+  KeyArn: { Value: !GetAtt Key.Arn }
+  BucketR1: { Value: !Ref BucketR1 }
