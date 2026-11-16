@@ -60,7 +60,7 @@ export const STANDARD: Profile = {
   poolRamp: [64, 128, 256, 384, 512],
   maxOpsPerCell: 40_000,
   requestBudgetPerLane: 2_200_000,
-  byteBudgetPerLane: 40 * 1024 ** 3,
+  byteBudgetPerLane: 48 * 1024 ** 3,
   ambiguousRecheckSeconds: 45,
 };
 

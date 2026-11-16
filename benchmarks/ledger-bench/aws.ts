@@ -28,8 +28,8 @@ export class BenchError extends Error {
 
 /** Thrown by {@link RequestMeter} once the run's request budget is spent: the hard cost cap. */
 export class BudgetExhausted extends BenchError {
-  constructor(limit: number) {
-    super("budget_exhausted", `the request budget of ${limit} is spent; stopping`);
+  constructor(readonly which: "request" | "byte") {
+    super("budget_exhausted", `the ${which} budget is spent; stopping`);
   }
 }
 
@@ -58,15 +58,20 @@ export class RequestMeter {
   get exhausted(): boolean {
     return this.#used >= this.limit || this.#bytes >= this.byteLimit;
   }
+  /** Which budget ended the run, if one did. */
+  get spent(): "request" | "byte" | undefined {
+    return this.#bytes >= this.byteLimit ? "byte" : this.#used >= this.limit ? "request" : undefined;
+  }
   /** Bytes sent or received by a request that was allowed to start. */
   addBytes(n: number): void {
     if (Number.isFinite(n) && n > 0) this.#bytes += n;
   }
   /** Spend `n` requests; `n` above 1 reserves a child process's whole allowance up front. */
   take(n = 1): void {
-    if (this.#used + n > this.limit || this.#bytes >= this.byteLimit) {
-      if (this.#used + n > this.limit) this.#used = this.limit;
-      throw new BudgetExhausted(this.limit);
+    if (this.#bytes >= this.byteLimit) throw new BudgetExhausted("byte");
+    if (this.#used + n > this.limit) {
+      this.#used = this.limit;
+      throw new BudgetExhausted("request");
     }
     this.#used += n;
   }

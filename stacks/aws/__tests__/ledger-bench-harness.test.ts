@@ -4,7 +4,7 @@ import type { ObjectStore } from "../../../packages/object-store/src/types.ts";
 import { assumeRole, BudgetExhausted, Dynamo, expressStore, expressZone, meteredFetch, RequestMeter } from "../../../benchmarks/ledger-bench/aws.ts";
 import { LANES, parseConfig, SMOKE, STANDARD, type Profile } from "../../../benchmarks/ledger-bench/config.ts";
 import { key, type Cell, type Ctx } from "../../../benchmarks/ledger-bench/context.ts";
-import { costBound, FIXED_USD, laneCostBound } from "../../../benchmarks/ledger-bench/cost.ts";
+import { costBound, FIXED_USD, laneCostBound, PRICE, PRICE_GIB, PRICE_PER_GIB } from "../../../benchmarks/ledger-bench/cost.ts";
 import { errorClass, runLoad } from "../../../benchmarks/ledger-bench/load.ts";
 import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../../../benchmarks/ledger-bench/protocols.ts";
 import { Histogram, median, Tally } from "../../../benchmarks/ledger-bench/stats.ts";
@@ -133,6 +133,9 @@ describe("config and cost", () => {
     const lanes = LANES.reduce((a, lane) => a + laneCostBound(STANDARD, lane), 0);
     expect(Math.abs(lanes * 3 + FIXED_USD - bound.total_usd)).toBeLessThan(0.25);
     expect(laneCostBound(STANDARD, "dynamo")).toBeLessThan(laneCostBound(STANDARD, "r2"));
+    // The per-GiB price is the sum of the named list prices, never less.
+    expect(PRICE_PER_GIB).toBeGreaterThanOrEqual(PRICE_GIB.natProcessing + PRICE_GIB.interRegion + PRICE_GIB.expressData);
+    expect(PRICE.s3Read).toBeLessThan(PRICE.s3Write);
     // The byte budget is priced into the bound: a larger one must show.
     expect(costBound({ ...STANDARD, byteBudgetPerLane: STANDARD.byteBudgetPerLane * 10 }, 3).total_usd).toBeGreaterThan(300);
   });
@@ -155,8 +158,11 @@ describe("request meter", () => {
     expect(bytes.bytes).toBe(700);
     await g("http://localhost/b");
     expect(bytes.exhausted).toBe(true);
-    await expect(g("http://localhost/c")).rejects.toBeInstanceOf(BudgetExhausted);
+    await expect(g("http://localhost/c")).rejects.toMatchObject({ which: "byte" });
     expect(bytes.used).toBe(2);
+    expect(bytes.spent).toBe("byte");
+    expect(meter.spent).toBe("request");
+    expect(new RequestMeter(5).spent).toBeUndefined();
     // A child's allowance is reserved whole, and refused whole when it does not fit.
     const parent = new RequestMeter(10);
     parent.take(6);

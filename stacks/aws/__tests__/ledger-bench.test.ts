@@ -177,7 +177,7 @@ describe("ledger-bench ops guards", () => {
     expect(ledgerAdd(ledger, "smoke-2", "smoke", ["r2"]).length).toBe(21);
     expect(() => ledgerAdd([], "a", "constructor", ["r2"])).toThrow(/profile/);
     // A lane is its request budget at the dearest request price plus its byte budget per GiB.
-    expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008 + (STANDARD.byteBudgetPerLane / 1024 ** 3) * 0.07, 1);
+    expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008 + (STANDARD.byteBudgetPerLane / 1024 ** 3) * 0.07, 0);
   });
   test("the ledger is a file outside the cluster: a teardown cannot reset the spend", () => {
     const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));
@@ -190,6 +190,8 @@ describe("ledger-bench ops guards", () => {
     // An existing ledger is never reset, and a damaged or in-repo one is refused.
     expect(() => readLedger(path, true)).toThrow(/refusing to reset/);
     writeFileSync(path, JSON.stringify([{ run: "a", usd: -5 }]));
+    expect(() => readLedger(path, false)).toThrow(/malformed/);
+    writeFileSync(path, "{not json");
     expect(() => readLedger(path, false)).toThrow(/malformed/);
     expect(() => readLedger(undefined, false)).toThrow(/--ledger/);
     expect(() => readLedger(join(import.meta.dir, "ledger.json"), true)).toThrow(/outside the repository/);

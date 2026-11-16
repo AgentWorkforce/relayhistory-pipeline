@@ -35,7 +35,7 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
 ## Bounds
 
 - **Cost.** Each lane refuses to go past its request budget (2.2 million requests in the standard profile)
-  or its byte budget (40 GiB sent and received). Priced as the dearest request type and per GiB, three
+  or its byte budget (48 GiB sent and received; the killed-client children's allowance is taken from both). Priced as the dearest request type and per GiB, three
   repeats of all lanes cost at most the figure printed by `bun benchmarks/ledger-bench/main.ts plan`, which
   a test keeps under 300 USD. `ops.ts run` keeps a spend ledger in a file the operator holds next to the
   results (so it survives a teardown) and refuses any run, smoke runs and re-runs included, that would
