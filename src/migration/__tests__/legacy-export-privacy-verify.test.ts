@@ -475,8 +475,15 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       // The production privacy role, bootstrapped and granted by the repo's own bootstrap and migrations (never by this test).
       const ROLE = "bulls96_legacy_export_privacy";
       expect((await f.db.query("SELECT 1 FROM pg_roles WHERE rolname=$1", [ROLE])).rows.length).toBe(1);
-      // Only when this fixture had to create turn_session_fences itself: reproduce 20261105062020's conditional grant on it.
-      if (!hadTurnFences) await f.db.exec(`GRANT SELECT ON sessions.turn_session_fences TO ${ROLE}`);
+      // Production order is 062010 (turn_session_fences) THEN 062020. When this stack lacks 062010, the fixture created the
+      // table above in 062010's shape; give it 062010's RLS and re-run 062020's own conditional grant/policy block verbatim
+      // (it skipped that block at migration time because the table did not exist yet). Nothing here is hand-granted.
+      if (!hadTurnFences) {
+        await f.db.exec("ALTER TABLE sessions.turn_session_fences ENABLE ROW LEVEL SECURITY");
+        const block = /DO \$turn_fence_grant\$[\s\S]*?END \$turn_fence_grant\$;/u.exec(readFileSync(AUTHORITY_MIGRATION, "utf8"))?.[0];
+        if (!block) throw new Error("062020 no longer carries its conditional turn_session_fences grant block");
+        await f.db.exec(block);
+      }
       // One session-level SET ROLE for the exporter phase: its BEGIN/COMMIT, advisory locks and RPC run for real.
       // Like node-postgres: a parameterless query uses the simple protocol (multi-statement allowed, last result).
       const raw: Queryable = {
