@@ -41,7 +41,7 @@
  *
  * Visibility: ledger-log-materialize.ts applies the entries to the read-side state after the append (the consumer
  * kicks it; its sweeper catches the rest), so a batch is durable at the append and readable after materialization.
- * The first take registers the stream (registerLogStream) so the sweeper finds it.
+ * The first take registers the stream (registerLogStream, just before it) so the sweeper finds it.
  */
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { assertNoLaterPrivacyControl, PrivacyControlPending } from "./async-admission.ts";
@@ -148,13 +148,18 @@ export class LogStreams {
     return opened;
   }
 
-  /** Owned for writing: the cached state, or `view` taken now (an epoch entry), registered and cached. */
+  /**
+   * Owned for writing: the cached state, or `view` registered and then taken now (an epoch entry), and cached. The
+   * registry doc is written BEFORE the take (idempotent; it names a stream that is already in log mode, so registering
+   * one that is never taken costs the sweeper one idle check), and the take is idempotent for this writer: a retry
+   * after any failure here adds no epoch entry (Remaining 9).
+   */
   async #owned(tenant: LedgerTenant, originId: string, view: LogState): Promise<LogState> {
     const id = this.#id(tenant, originId);
     const cached = this.#states.get(id);
     if (cached) return cached;
-    const state = await takeStream(this.deps.store, view, this.#w());
     await registerLogStream(this.deps.store, this.deps.keyRoot, tenant, originId);
+    const state = await takeStream(this.deps.store, view, this.#w());
     // Bounded: drop the oldest states with nothing pending and no admission in flight (a stream whose chain is running
     // keeps its state, so an in-flight admission is never fenced by its own process's reopen). A dropped stream is
     // reopened and taken again on its next batch: safe (a new epoch entry), only slower.

@@ -105,7 +105,9 @@ configured or host-derived one.
 `takeStream` first resolves any pending entry. It keeps its own epoch entry pending until that resolves, so an
 ambiguous take resends exactly that entry. A take that loses its race does NOT take again: it catches the state up
 and throws `log_take_lost`, so two takers back off (the caller's retry decides) instead of fencing each other in a
-loop. Linearity always held (the head + 1 create); this makes ownership explicit too.
+loop. Linearity always held (the head + 1 create); this makes ownership explicit too. A take by the writer that
+already holds the epoch (after its pending entry is settled) appends nothing (slice 6), so retries never add epoch
+entries.
 
 ## Ambiguous commits
 
@@ -376,6 +378,14 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
   - Tests (`ledger-log.test.ts`): no entry below the checkpoint is read; a missing boundary checkpoint falls back to
     the previous; every forgery (hash, epoch writer, epoch, cursor, cutover, epoch 0, seq) and malformed JSON fall back
     to entry 0 with the same entries; a store fault on the checkpoint falls back; a cursor read stays bounded.
+- **No epoch entry per retry (Remaining 9).** `takeStream` returns the state unchanged when, after settling its
+  pending entry, the epoch is already held by the same writer id (an ambiguous take resolved on the retry, or a
+  process whose cached state was dropped). `LogStreams` writes the registry doc BEFORE the take, so a registry failure
+  fails the attempt before any epoch entry; registering a stream that is then not taken only costs the sweeper an idle
+  check (the stream is already in log mode).
+  - Tests: the ambiguous-take test now ends with one epoch entry (`ledger-log.test.ts`); a registry PUT failing before
+    or after landing writes no epoch entry and the retry takes once; the same writer id with its cache dropped appends
+    without a take, and another writer still takes (`ledger-log-admit.test.ts`).
 - **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
   written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
   malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
@@ -412,8 +422,8 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
    references stay stable.
 8. Stream registry docs hold the user id and raw origin id outside the user's directory: erasure must delete them (or
    key them by hash only).
-9. `registerLogStream` failing after `takeStream` makes the retry take the stream again (one more epoch entry per
-   retry): register before taking, or make the take idempotent for the same writer.
+9. Closed in slice 6: admission registers the stream before it takes it, and `takeStream` is idempotent for the
+   writer that already holds the epoch, so a retry adds no epoch entry.
 10. IAM: the materializer needs GET/PUT/DELETE/LIST on `ledger/log/` (including the skip records under `s/`) and
     `.ledger/log-streams/`, PUT/DELETE on the receipt outcomes; the admission consumer GET on the skip records and
     DELETE on its own admitted outcome; the operator tool GET/LIST on `ledger/batches/` and PUT on `ledger/log/e/`, `closed.json` and the
