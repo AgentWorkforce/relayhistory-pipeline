@@ -60,6 +60,9 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
 - **The per-batch chain** follows the group-commit design's table for a 1-session batch with two revision
   shards: 17 dependent round trips and 22 requests, not "about 13".
 - **KMS share.** Measured as SSE-KMS against SSE-S3 objects in the same bucket, at concurrency 8.
+- **Log commit on R1.** The plan ran only the per-batch chain cross-region. From the third repeat the R1
+  lane also runs the log commit and the racing-writer check there, since switching streams on the existing
+  bucket needs no data move.
 - **No production endpoint is contacted.** The plan's optional HEAD of the production bucket's endpoint is
   left out; R1 reproduces the cross-region baseline.
 - **Budget.** The AWS budget cannot filter by the `purpose` tag in time (cost-allocation tags take a day to

@@ -155,6 +155,10 @@ async function runLane(config: RunConfig): Promise<boolean> {
       await stage(1, "endpoints R1", () => endpointRoundTrips(ctx, "R1", [{ service: "s3", region: targets.R1!.region }, { service: "kms", region: targets.R1!.region }], meteredFetch(meter, "endpoint")));
       await stage(1, "step1 R1", () => step1(ctx, "R1"));
       await stage(3, "p13 R1", () => step3P13(ctx, "R1"));
+      // Beyond the plan (it ran only the chain on R1): the log commit on today's cross-region bucket, because
+      // switching streams to it needs no data move and is therefore the first thing that can ship.
+      await stage(3, "plog R1", () => step3Log(ctx, "R1", "plog"));
+      await stage(3, "racing writers R1", () => step3Race(ctx, "R1"));
       break;
     case "r2":
       await stage(1, "endpoints R2", () => endpointRoundTrips(ctx, "R2", ["s3", "kms", "dynamodb", "sts"].map((service) => ({ service, region: targets.R2!.region })), meteredFetch(meter, "endpoint")));
