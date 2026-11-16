@@ -13,6 +13,8 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_legacy_export_scope_authority.sql' FOR UPDATE;
  IF NOT FOUND OR v_sha<>'a602c8c28e17efb64962a6d84d315a3daef4c95af776c2adcf217e55ac976ca4'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: own applied checksum required';END IF;
+ IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: owner mappings present; erase or export-verify before rollback';END IF;
 END $rollback_guard$;
 DROP POLICY legacy_export_privacy_read_all ON sessions.session_erasure_receipts;
 DROP POLICY legacy_export_privacy_read_all ON sessions.upload_deletions;
