@@ -6,6 +6,7 @@ import {orderedControl,orderedControlResult} from "./control-protocol.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { dbErrorDiagnosisFrom, dbErrorSnapshot, type DbErrorSnapshot } from "./db-error-class.ts";
 import { acquisitionRefusalFrom } from "./acquisition-refusal.ts";
+import { log } from "../shared/log.ts";
 /**
  * The ledger over SQL: one call per claim and per commit, each to its
  * SECURITY DEFINER function (supabase/migrations/20261104022000_session_ingest_ledger.sql),
@@ -88,6 +89,9 @@ async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, inpu
     // One guarded snapshot for every consumer: a throwing getter/proxy cannot escape this path.
     const s = dbErrorSnapshot(error);
     if (s.code === "P0W01") throw new DeliveryError("forbidden", 403, "Delivery record belongs to another user");
+    // 062010 absent: only the missing ENTRY POINT itself (its own name in the 42883 text, never logged or carried).
+    if (s.code === "42883" && fn.startsWith("ingest_origin_") && s.message?.includes(`function sessions.${fn}(`))
+      throw new LedgerUnavailableError(ORIGIN_FENCE_ABSENT_CODE, dbErrorDiagnosisFrom(s));
     // Acquisition owner refusal (claim, stage, commit): the typed 409 of design §5.6, never a 503.
     const refusal = acquisitionRefusalFrom(error);
     if (refusal) throw refusal;
@@ -258,21 +262,29 @@ const ORIGIN_SCOPED = {
 type OriginScopable = keyof typeof ORIGIN_SCOPED;
 /** How long an isolate keeps using the per-user functions after the database answered 42883 (062010 absent). */
 export const ORIGIN_FENCE_ABSENT_MS = 60_000;
+/** `call`'s code for a 42883 that names the origin-scoped entry point itself; any other 42883 stays ledger_sqlstate_42883. */
+const ORIGIN_FENCE_ABSENT_CODE = "ledger_origin_fence_absent";
 /** Isolate-wide: until when the origin-scoped functions are known absent. Only a routing hint, never an authority. */
 let originFenceAbsentUntil = 0;
-/** Tests only. */
-export function resetOriginFenceHint(): void { originFenceAbsentUntil = 0; }
+let originFenceNow = (): number => Date.now();
+/** Tests only: clears the hint; `now` replaces the clock (omit for Date.now). */
+export function resetOriginFenceHint(now?: () => number): void { originFenceAbsentUntil = 0; originFenceNow = now ?? (() => Date.now()); }
 /**
  * One origin-scoped call, falling back to the per-user function when the database does not have 062010 yet (or had
- * it rolled back): 42883 undefined_function is raised before the function runs, so the failed call wrote nothing
- * (each `attempt` is one statement or one whole claim transaction). Every other outcome passes through unchanged.
+ * it rolled back). Only a 42883 that names the entry point itself (ORIGIN_FENCE_ABSENT_CODE) falls back: it is raised
+ * before the function runs, so the failed call wrote nothing (each `attempt` is one statement or one whole claim
+ * transaction). A 42883 from inside a body, and every other outcome, passes through unchanged. Each switch logs one
+ * warning (event, SQLSTATE, entry point, until; never a message).
  */
 async function originScoped<T>(enabled: boolean, fn: OriginScopable, attempt: (fn: LedgerFunction | OriginScopedFunction) => Promise<T>): Promise<T> {
-  if (!enabled || Date.now() < originFenceAbsentUntil) return attempt(fn);
+  if (!enabled || originFenceNow() < originFenceAbsentUntil) return attempt(fn);
   try { return await attempt(ORIGIN_SCOPED[fn]); }
   catch (error) {
-    if (!(error instanceof LedgerUnavailableError) || error.code !== "ledger_sqlstate_42883") throw error;
-    originFenceAbsentUntil = Date.now() + ORIGIN_FENCE_ABSENT_MS;
+    if (!(error instanceof LedgerUnavailableError) || error.code !== ORIGIN_FENCE_ABSENT_CODE) throw error;
+    originFenceAbsentUntil = originFenceNow() + ORIGIN_FENCE_ABSENT_MS;
+    // Allowlisted fields only (src/shared/log.ts): route is the event name, stage the entry point that was absent.
+    log.warn("session ingest origin claim fence absent", { route: "ingest.origin_fence_fallback", sqlstate: "42883",
+      stage: ORIGIN_SCOPED[fn], fallback_until_ms: originFenceAbsentUntil });
     return attempt(fn);
   }
 }

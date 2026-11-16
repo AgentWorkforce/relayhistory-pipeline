@@ -45,6 +45,10 @@
 --                                             otherwise byte-for-byte the 058010 behaviour.
 -- The mark cannot be forged: the table is owner-only and only enter writes it, after taking the origin lock. A
 -- runtime role setting a GUC, taking advisory locks or crafting a call stack gains nothing.
+-- ingest_lock_fences stays SECURITY INVOKER (as in 058010) and the mark table is owner-only with RLS on: the lock
+-- reads the mark with its caller's rights. Every caller today is owner-owned (SECURITY DEFINER wrappers or owner
+-- paths). A FUTURE SECURITY DEFINER function owned by another role that calls it gets 42501 on the mark read (fail
+-- closed), never a silent FOR SHARE.
 --
 -- Lock order (claims): origin advisory (new namespace, only ever taken first, by enter) -> (961996,50000) S ->
 -- fence row S -> seat clock -> (org,ws,origin) native advisory -> slot rows. Controls: 50000 S -> fence row X.
@@ -54,7 +58,13 @@
 -- Interaction with 20261105044030 (generation overlap): with admitDuringApply (off by default) a pending-marker
 -- call is admitted only when the outermost sessions frame is one of the five listed entry points; the three new
 -- entry points are not listed, so during such an apply they fail closed (55000), exactly as any other caller.
--- With the marker at PASS (every normal window) nothing changes.
+-- With the marker at PASS (every normal window) nothing changes. Keep the Worker flag OFF during any schema apply.
+--
+-- Operational notes: every origin-scoped call inserts and deletes one mark row (vacuum churn; the table stays tiny),
+-- and concurrent FOR SHARE holders of one fence row create MultiXacts (autovacuum freezes them; watch
+-- multixact age if a user is extremely hot). A steady stream of FOR SHARE claims can delay a per-user FOR UPDATE
+-- control (selection/reset) of that user; the operator erase is not starved: it takes (961996,50000) EXCLUSIVE
+-- first, and every claim needs that lock SHARED (the fence-row INSERT trigger) before its row lock.
 
 CREATE TABLE sessions.ingest_origin_claim_marks (
  xact xid8 PRIMARY KEY,
@@ -76,6 +86,9 @@ BEGIN
  -- fence row used to give them. Different origins (and different users) never share this key.
  PERFORM pg_advisory_xact_lock(hashtextextended(
   jsonb_build_array('96bulls:ingest-origin-claim-v1',k.org_id,k.workspace_id,k.user_id,k.origin_id)::text,0));
+ -- The mark's key is the TOP-LEVEL xid (also inside a subtransaction). One call at a time per transaction: leave
+ -- deletes the mark before the wrapper returns, so sequential calls are fine; a wrapper nested inside another
+ -- wrapper in one transaction would raise 23505 here (no such caller exists).
  v:=pg_current_xact_id();
  INSERT INTO sessions.ingest_origin_claim_marks(xact,tenant)
   VALUES(v,jsonb_build_array(k.org_id,k.workspace_id,k.user_id)::text);

@@ -15,7 +15,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062010_ingest_origin_claim_fence.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='origin claim fence: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_ingest_origin_claim_fence.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '782e91641db8c815a8d782c9e38a793182c84728527c44ba309c8034e89e1f2d'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM '154039c59599c4096ba62ff12da8a680d9862264763554273fd4f9a79e990b4c'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='origin claim fence: own applied checksum required';END IF;
 END $rollback_guard$;
 SET LOCAL lock_timeout='5s';
@@ -39,5 +39,5 @@ DROP FUNCTION sessions.ingest_origin_commit_buffered_batch(jsonb);
 DROP FUNCTION sessions.ingest_origin_claim_enter(jsonb);
 DROP FUNCTION sessions.ingest_origin_claim_leave(xid8);
 DROP TABLE sessions.ingest_origin_claim_marks;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_ingest_origin_claim_fence.sql' AND sha256='782e91641db8c815a8d782c9e38a793182c84728527c44ba309c8034e89e1f2d';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_ingest_origin_claim_fence.sql' AND sha256='154039c59599c4096ba62ff12da8a680d9862264763554273fd4f9a79e990b4c';
 COMMIT;

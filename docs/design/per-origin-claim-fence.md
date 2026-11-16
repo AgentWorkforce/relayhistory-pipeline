@@ -70,6 +70,15 @@ Each one calls `ingest_origin_claim_enter(p)` (owner-only), then the unchanged f
 holds a mark for exactly this `(org, ws, user)`, and `FOR UPDATE` otherwise. Its INSERT and RH041 check are
 byte-for-byte `058010`.
 
+`ingest_lock_fences` stays SECURITY INVOKER (as in `058010`) while `ingest_origin_claim_marks` is owner-only with
+RLS on, so the lock reads the mark with its caller's rights. Every caller today runs as the owner (the SECURITY
+DEFINER wrappers and the owner paths). A future SECURITY DEFINER function owned by another role that calls
+`ingest_lock_fences` gets 42501 on the mark read: it fails closed and never bypasses the exclusive lock.
+
+The mark's key is the top-level transaction id. `leave` deletes it before the wrapper returns, so sequential calls in
+one transaction are fine. A wrapper nested inside another wrapper in the same transaction would raise 23505 (no such
+caller exists).
+
 Why a mark and not a GUC or the call stack: a runtime role can set any custom GUC, take any advisory lock, and
 (through `DO` + `EXECUTE`) put arbitrary text into `PG_CONTEXT`. None of these can make a control take `FOR SHARE`.
 The mark table has RLS on, every grant revoked, and is written only by `enter` after it has taken the origin lock.
@@ -92,7 +101,8 @@ share-locked by the same transaction and do not wait. Nothing on the origin-scop
 With the marker at PASS (every normal window), the generation fences are unchanged. With `admitDuringApply` (off by
 default and on the production CI path), `044030` admits a pending-marker call only when the outermost `sessions`
 frame is one of its five listed entry points. The three new names are not listed, so during such an apply they fail
-closed (`55000`), like any other caller.
+closed (`55000`), like any other caller. **Keep the flag off during any schema apply** that might use
+`admitDuringApply`. Otherwise every flag-on claim, stage and commit gets a burst of 55000 for the length of the apply.
 
 ## 4. Worker flag (default: current behaviour)
 
@@ -101,9 +111,14 @@ closed (`55000`), like any other caller.
   Everything else (controls, selection, reset, Babysitter evidence, canonical mode) is unchanged.
 - Unset (default): the per-user functions, byte-identical SQL.
 - **42883 fallback**: if the database lacks `062010` (not yet applied, or rolled back), the origin-scoped call fails
-  with `42883` before it runs. The ledger then retries the per-user function once and keeps using it for 60 s in that
-  isolate. Inside the claim lock-wait transaction the failed attempt is rolled back first. So the flag can never turn
-  a missing migration into an outage. Every other error passes through unchanged.
+  with `42883` before it runs. Only a 42883 whose text names that entry point itself (`function
+  sessions.ingest_origin_…(`) falls back. A 42883 from inside a body, for example a missing inner function, is
+  rethrown as `ledger_sqlstate_42883`, as before. On a fallback the ledger retries the per-user function once and
+  keeps using it for 60 s in that isolate, then tries the origin-scoped function again. Inside the claim lock-wait
+  transaction the failed attempt is rolled back first. Each switch logs one structured warning: route
+  `ingest.origin_fence_fallback`, `sqlstate` 42883, `stage` the absent entry point, and `fallback_until_ms`. The
+  database message is never logged. So the flag can never turn a missing migration into an outage, and a real
+  missing-function bug is not masked. Every other error passes through unchanged.
 - Stack: `sessionIngest.originClaimFence: "on"` renders the var (buffered only). Production CI: a cutover control like
   the claim lock controls (`PRIVATE_INGEST_ORIGIN_CLAIM_FENCE` protected-environment variable →
   `privateIngestCutoverFromEnv`), so a deploy may add or remove it at the live phase.
@@ -150,6 +165,16 @@ Rollback:
 - **Canonical mode** and the self-host server are unchanged (per-user `FOR UPDATE`).
 - A per-user control (selection, reset, consent/privacy authority, erase) still waits for every in-flight claim of
   the user and blocks all of them. That is intended, and these operations are rare.
+- **Starvation.** A steady stream of overlapping `FOR SHARE` claims from several machines can delay a per-user
+  `FOR UPDATE` control of that user (selection, reset). PostgreSQL can grant a new `FOR SHARE` alongside existing share
+  holders without queueing behind a waiting `FOR UPDATE`, so in theory overlapping claims could keep the control
+  waiting. In practice it is bounded by the per-user slot cap (4 concurrent deliveries) and seconds-long claims, and
+  the control's own `lock_timeout` surfaces it as a retryable 55P03. The operator
+  erase is not exposed to this: it takes `(961996,50000)` exclusive first, and every claim needs that lock shared
+  (the fence-row INSERT trigger) before its row lock.
+- **Vacuum.** Every origin-scoped call inserts and deletes one row in `ingest_origin_claim_marks`. The table stays
+  tiny but churns, which autovacuum handles. Concurrent `FOR SHARE` holders of one fence row create MultiXacts;
+  watch `mxid_age` and the autovacuum multixact freeze if a single user is extremely hot.
 
 ## 7. Tests
 
@@ -161,10 +186,12 @@ Rollback:
   - O4: a new user's first claims from two machines: one seal adoption; a rolled-back first lets the waiter adopt.
   - X1: per-user control locking (`ingest_lock_fences` without a mark) and origin-scoped claims exclude each other in both directions; other users are unaffected.
   - X2: operator user erase begin waits for an in-flight claim, an open erase blocks a claim from another machine, then RH041 for every origin.
+  - X3: a mark downgrades only its own tenant in its own transaction. Under a mark for U, `ingest_lock_fences(V)` is exclusive, and without a mark of its own a transaction is exclusive.
   - D1: flag-on end-to-end deliveries of two machines concurrently, replay through the per-user path, no mark left.
 - `src/session-ingest/__tests__/origin-claim-fence.pglite.test.ts`: ACLs and SECURITY DEFINER, mark table owner-only
   (no forgery), no tenant columns, malformed input refused before any mark, flag-on routing of claim/stage/commit,
-  RH041 unchanged, `42883` fallback (also inside the lock-wait transaction), other errors not retried, Worker env parsing.
+  RH041 unchanged, `42883` fallback (also inside the lock-wait transaction), one structured warning per switch, hint
+  expiry after 60 s (fake clock), an inner-body 42883 not swallowed, other errors not retried, Worker env parsing.
 - `src/hoopdb/__tests__/sessions-function-boundary.test.ts`: lane ACLs and the generated rollback restoring `058010`'s exact body.
 - `src/hoopdb/__tests__/migration-profile.test.ts`: `062010` rolls back first (062000's down refuses under it), restores the exact body, drops its objects, refuses a rerun; the migrator reapplies it.
 - `stacks/cloudflare/__tests__/session-ingest.test.ts`, `private-ingest-cutover.test.ts`: the stack input and the cutover control.

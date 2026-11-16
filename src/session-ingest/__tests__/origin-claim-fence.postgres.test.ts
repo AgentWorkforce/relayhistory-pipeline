@@ -258,6 +258,44 @@ describe.skipIf(!url)("062010 per-origin claim fence (owned PostgreSQL)", () => 
     expect(await marks()).toBe(0);
   }, 60000);
 
+  test("X3: a mark downgrades only its own tenant: under a mark for user U, ingest_lock_fences(V) still takes V's row FOR UPDATE", async () => {
+    const u = tenant("x3u"), v = tenant("x3v"); await warm(u); await warm(v);
+    const lockTx = async (markFor: Tenant, lockFor: Tenant) => {
+      const c = await connect();
+      await c.query("BEGIN");
+      // The exact form enter() writes (jsonb text, as ingest_lock_fences compares it).
+      await c.query("INSERT INTO sessions.ingest_origin_claim_marks(xact,tenant) VALUES(pg_current_xact_id(),jsonb_build_array($1::text,$2::text,$3::text)::text)",
+        [markFor.orgId, markFor.workspaceId, markFor.userId]);
+      await c.query("SELECT sessions.ingest_lock_fences($1,$2,$3)", [lockFor.orgId, lockFor.workspaceId, lockFor.userId]);
+      return c;
+    };
+    const probe = async (t: Tenant, mode: "SHARE" | "UPDATE") => {
+      const c = await connect();
+      try {
+        await c.query("BEGIN");
+        return await c.query(`SELECT 1 FROM sessions.ingest_fence_owners WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 FOR ${mode} NOWAIT`, [t.orgId, t.workspaceId, t.userId])
+          .then(() => "ok", (e: any) => String(e.code));
+      } finally { await release(c); }
+    };
+    // Mark for U, lock V: exclusive on V (another FOR SHARE cannot coexist).
+    const other = await lockTx(u, v);
+    expect(await probe(v, "SHARE")).toBe("55P03");
+    await release(other);
+    // Mark for V, lock V: shared on V (FOR SHARE coexists, FOR UPDATE does not).
+    const own = await lockTx(v, v);
+    expect(await probe(v, "SHARE")).toBe("ok");
+    expect(await probe(v, "UPDATE")).toBe("55P03");
+    await release(own);
+    // A mark of ANOTHER transaction never counts: same tenant, but this transaction has none -> exclusive.
+    const marked = await lockTx(v, u); // holds a mark for v in its own xid
+    const c = await connect();
+    await c.query("BEGIN");
+    await c.query("SET LOCAL lock_timeout=500");
+    expect(await c.query("SELECT sessions.ingest_lock_fences($1,$2,$3)", [v.orgId, v.workspaceId, v.userId]).then(() => "ok", (e: any) => String(e.code))).toBe("ok");
+    expect(await probe(v, "SHARE")).toBe("55P03");
+    await release(c); await release(marked);
+  }, 60000);
+
   test("D1: flag-on deliveries (claim, stage, commit) of two machines of one user are accepted; no mark is left behind", async () => {
     const u = tenant("d1");
     expect((await deliver(u, `d1a-${serial}`, [`d1-a-${serial}`], "d1-machine-a")).outcome).toBe("accepted_buffered");

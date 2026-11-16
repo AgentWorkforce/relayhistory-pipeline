@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { deliverBatch } from "../deliver.ts";
-import { CLAIM_LOCK_WAIT_SET, resetOriginFenceHint, sqlLedger } from "../ledger-sql.ts";
+import { CLAIM_LOCK_WAIT_SET, ORIGIN_FENCE_ABSENT_MS, resetOriginFenceHint, sqlLedger } from "../ledger-sql.ts";
 import { LedgerUnavailableError } from "../ledger.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { TENANT, batch, record } from "./support.ts";
@@ -118,16 +118,32 @@ describe("flag-on deliveries", () => {
 describe("ledger-sql routing (INGEST_ORIGIN_CLAIM_FENCE)", () => {
   const claimInput = { tenant: TENANT, originId: "o", batchId: "b", batchDigest: "d".repeat(64), receiptId: "rhr_" + "1".repeat(64), sessions: [], records: [] } as never;
   const claimed = { result: { kind: "claimed", claimToken: "00000000-0000-4000-8000-000000000000", deleted: [], stale: [], resets: 0 } };
-  function fake(fail: (fn: string) => string | null) {
+  /** `fail` returns a SQLSTATE, or [SQLSTATE, message]; a bare 42883 names the called function, as PostgreSQL does. */
+  function fake(fail: (fn: string) => string | [string, string] | null) {
     const calls: string[] = [];
     const run = async (sql: string) => {
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql === CLAIM_LOCK_WAIT_SET) { calls.push(sql); return { rows: [] }; }
       const fn = /sessions\.(\w+)\(/.exec(sql)![1]!; calls.push(fn);
-      const code = fail(fn);
-      if (code) throw Object.assign(new Error("x"), { code });
+      const f = fail(fn);
+      if (f) {
+        const [code, message] = Array.isArray(f) ? f : [f, code42883(f, fn)];
+        throw Object.assign(new Error(message), { code });
+      }
       return { rows: [claimed] };
     };
     return { run, calls };
+  }
+  const code42883 = (code: string, fn: string) => (code === "42883" ? `function sessions.${fn}(jsonb) does not exist` : "x");
+  /** Captures the structured warning lines log.warn writes to stderr. */
+  function warnings() {
+    const lines: Record<string, unknown>[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+      try { const j = JSON.parse(String(chunk)); if (j.route === "ingest.origin_fence_fallback") { lines.push(j); return true; } } catch { /* not ours */ }
+      return (original as (...a: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof process.stderr.write;
+    open.push(() => { process.stderr.write = original; });
+    return lines;
   }
   test("off (default): the per-user functions only; on in canonical mode is refused", async () => {
     const { run, calls } = fake(() => null);
@@ -143,6 +159,46 @@ describe("ledger-sql routing (INGEST_ORIGIN_CLAIM_FENCE)", () => {
     calls.length = 0;
     await ledger.claim(claimInput);
     expect(calls).toEqual(["ingest_claim_buffered_batch"]);
+  });
+  test("the fallback logs ONE structured warning per switch (event, SQLSTATE, entry point, until; no message) and the hint expires after 60 s", async () => {
+    let now = 1_000_000;
+    resetOriginFenceHint(() => now);
+    const lines = warnings();
+    const { run, calls } = fake((fn) => (fn.startsWith("ingest_origin_") ? "42883" : null));
+    const ledger = sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation, originClaimFence: true });
+    await ledger.claim(claimInput);
+    await ledger.claim(claimInput);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ level: "warn", route: "ingest.origin_fence_fallback", sqlstate: "42883", stage: "ingest_origin_claim_buffered_batch", fallback_until_ms: 1_060_000 });
+    expect(JSON.stringify(lines[0])).not.toContain("does not exist");
+    expect(calls).toEqual(["ingest_origin_claim_buffered_batch", "ingest_claim_buffered_batch", "ingest_claim_buffered_batch"]);
+    now += ORIGIN_FENCE_ABSENT_MS - 1; calls.length = 0;
+    await ledger.claim(claimInput);
+    expect(calls).toEqual(["ingest_claim_buffered_batch"]);
+    now += 1; calls.length = 0; // expired: the origin-scoped function is tried again (and, still absent, warns again)
+    await ledger.claim(claimInput);
+    expect(calls).toEqual(["ingest_origin_claim_buffered_batch", "ingest_claim_buffered_batch"]);
+    expect(lines).toHaveLength(2);
+  });
+  test("a 42883 from INSIDE an origin-scoped body (another function missing) is not swallowed: no per-user retry, no hint", async () => {
+    const lines = warnings();
+    for (const message of ["function sessions.ingest_lazy_records(jsonb) does not exist", "operator does not exist: text = integer", ""]) {
+      resetOriginFenceHint();
+      const { run, calls } = fake((fn) => (fn.startsWith("ingest_origin_") ? ["42883", message] : null));
+      const ledger = sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation, originClaimFence: true });
+      const e = await ledger.claim(claimInput).then(() => null, (x) => x);
+      expect(e).toBeInstanceOf(LedgerUnavailableError);
+      expect((e as LedgerUnavailableError).code).toBe("ledger_sqlstate_42883");
+      expect(calls).toEqual(["ingest_origin_claim_buffered_batch"]);
+      await ledger.claim(claimInput).catch(() => {});
+      expect(calls).toEqual(["ingest_origin_claim_buffered_batch", "ingest_origin_claim_buffered_batch"]); // no hint was set
+    }
+    // A per-user function's own 42883 is never re-labelled either (flag off).
+    resetOriginFenceHint();
+    const { run } = fake(() => "42883");
+    const off = await sqlLedger(run, { acceptanceMode: "buffered", expectedGeneration: generation }).claim(claimInput).then(() => null, (x) => x);
+    expect((off as LedgerUnavailableError).code).toBe("ledger_sqlstate_42883");
+    expect(lines).toHaveLength(0);
   });
   test("on, inside the claim lock-wait transaction: the failed origin attempt is rolled back before the per-user retry", async () => {
     const { run, calls } = fake((fn) => (fn.startsWith("ingest_origin_") ? "42883" : null));

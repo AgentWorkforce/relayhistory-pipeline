@@ -66,6 +66,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // `streaming` is on / off only (STREAMING_VALUES), the budgets bounded counts (STREAM_BUDGET_FIELDS).
   "streaming",
   ...STREAM_BUDGET_FIELDS,
+  // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
+  // isolate uses the per-user functions; a bounded integer.
+  "fallback_until_ms",
 ]);
 
 /**
@@ -85,6 +88,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["upload_due", 10_000_000],
   ["upload_origins", 1_000_000],
   ["store_status", 599],
+  ["fallback_until_ms", Number.MAX_SAFE_INTEGER],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
