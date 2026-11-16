@@ -226,6 +226,28 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     }
   });
 
+  test("owner rule: a turns-only session_owner that is a verified Cloud user id in the SAME tenant is exported under that owner; evidence from another org does not verify it", async () => {
+    for (const where of ["same-tenant", "other-org"] as const) {
+      const n = await neon(), p = await supabase();
+      await n.pg.query("DELETE FROM sessions.session_outcomes");
+      await n.pg.query("UPDATE sessions.conversation_turns SET session_owner='u_real'");
+      // Authenticated evidence for 'u_real' from a DIFFERENT session (this scope itself stays turns-only).
+      await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,'claude','sess:elsewhere','u_real')", [where === "same-tenant" ? S.orgId : "org_2", S.workspaceId]);
+      const store = createFsStore({ root: await tmp(`verified-${where}`) });
+      const { counters } = await run(n.db, p.db, store, `verified-${where}`);
+      const keys = (await allKeys(store)).filter((k) => k.includes("/s=sess_1/"));
+      if (where === "same-tenant") {
+        expect({ where, ...counters }).toMatchObject({ where, exported: 1, failed: 0 });
+        expect(keys.some((k) => k.includes(`/m=${legacyMachineId(S.workspaceId, "u_real")}/`))).toBe(true);
+      } else {
+        expect({ where, ...counters }).toMatchObject({ where, exported: 0, failed: 0 });
+        expect(keys).toEqual([]);
+        const flat = Object.entries(counters as unknown as Record<string, unknown>);
+        expect(flat.filter(([k, v]) => /unbound_?turns_?only/iu.test(k) && v === 1).length).toBe(1);
+      }
+    }
+  });
+
   test("Supabase turn_session_fences (legacy_import, no user) fences the scope: nothing reaches S3", async () => {
     for (const basis of ["legacy_import", "live"]) {
       const n = await neon(), p = await supabase();
@@ -646,6 +668,24 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   }
   const legacyKeys = async (store: ObjectStore, session: string) =>
     (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", legacyGroup(OWNER))) && k.includes(`/s=${session}/`));
+
+  test("owner rule (Neon authority, today's default): the eraser targets the owner bound at export, even after Neon later re-derives a different one", async () => {
+    const n = await neon(), p = await supabase();
+    const store = createFsStore({ root: await tmp("drift-neon") });
+    const { counters } = await run(n.db, p.db, store, "drift-neon");
+    expect(counters.exported).toBe(1);
+    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+    expect((await allKeys(store)).some((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"))).toBe(true);
+    // A later delivery event by another user: re-deriving from live Neon would now bind 'u_drift' (events outrank outcomes).
+    await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,$4,'u_drift')", [S.orgId, S.workspaceId, S.source, S.sessionId]);
+    await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
+    const state = new SyncState(join(await tmp("drift-neon-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.sweep();
+    await job.sweep();
+    state.close();
+    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"))).toEqual([]);
+  });
 
   test("owner rule: the hosted eraser targets the owner registered at export, even after Neon later re-derives a different one", async () => {
     const n = await neon();
