@@ -124,6 +124,11 @@ export async function inspectBootstrap(
  * ONLY under the migrator's xact lock: refuses release_ingest_overlap_required, else returns the plan
  * artifact's ingestOverlap evidence (gate no_lazy_policy / no_generation_move / policy_at_target /
  * overlap_ready). The apply rechecks it under runMigrations' lock in beforeWrite.
+ *
+ * Like inspectBootstrap, this is a snapshot taken before the migrator's session lock: the xact lock is
+ * released at ROLLBACK, so the window can expire, close or change between this read and the apply's
+ * writes. It is a fail-fast and the plan's evidence only; the binding check is the beforeWrite recheck
+ * (checkIngestOverlap) that runs under runMigrations' lock, immediately before the first write.
  */
 export async function inspectIngestOverlap(
   client: pg.Client,

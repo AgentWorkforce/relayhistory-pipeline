@@ -23,6 +23,10 @@
  * the window G -> H is still the one that protects ingest. The window's open (ingest-generation-overlap-
  * operator.ts) already required readiness PASS at G and the policy at G.
  *
+ * A failed apply that leaves the marker pending at H after the window expired or closed is NOT recoverable
+ * through this route: the gate keeps refusing (reason retry_marker_pending_no_window) and the 044030 SQL
+ * open refuses a window while readiness is not PASS at G. The runbook's break-glass route covers it.
+ *
  * The window cannot be closed while the apply runs: the owner close and the rebind take the migrator's
  * advisory lock (961996, 1), which the migrator holds for the whole apply. It can only expire, hence the
  * minimum remaining TTL, rechecked under that lock immediately before the first write.
@@ -152,7 +156,8 @@ export type IngestOverlapReason =
   | "window_ttl_short"
   | "contract_unreadable"
   | "contract_dormant"
-  | "contract_mismatch";
+  | "contract_mismatch"
+  | "retry_marker_pending_no_window";
 
 /** The plan artifact's ingestOverlap section: generations, window shape and verdict only (no ids, no secrets). */
 export interface IngestOverlapEvidence {
@@ -206,6 +211,16 @@ export function ingestOverlapVerdict(
   if (c === undefined) reasons.push("contract_unreadable");
   else if (c === null) reasons.push("contract_dormant");
   else if (!contract.match) reasons.push("contract_mismatch");
+  // A failed apply of this target left readiness pending at H with the policy still at G and no usable
+  // window. Buffered ingest is already refused (no generation is PASS), and the window can no longer be
+  // opened (the 044030 SQL open requires PASS at `from`), so the stock CI route cannot recover it: named
+  // so the operator takes the break-glass route in runbooks/guarded-session-schema-release.md.
+  if (
+    state.marker?.status === "pending" &&
+    state.marker.generation === H &&
+    reasons.some((r) => r === "overlap_not_installed" || r === "no_window" || r.startsWith("window_"))
+  )
+    reasons.push("retry_marker_pending_no_window");
   return { ...evidence, gate: reasons.length ? "refused" : "overlap_ready", reasons };
 }
 

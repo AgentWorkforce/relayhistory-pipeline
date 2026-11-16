@@ -16,6 +16,8 @@ import {join} from "node:path";
 import {SESSION_BOOTSTRAP_FILES} from "../session-bootstrap-chain.ts";
 import {openGenerationOverlap} from "../ingest-generation-overlap.ts";
 import {rebindIngestGeneration} from "../ingest-generation-rebind.ts";
+import {runMigrations} from "../migrate.ts";
+import {mkdtempSync,writeFileSync} from "node:fs";
 import {
   checkIngestOverlap,
   RELEASE_INGEST_OVERLAP_REQUIRED,
@@ -60,6 +62,32 @@ test("refuses without a window: the policy is at G, the marker PASS at G and the
  // A failed apply's retry (marker pending at H) still moves readiness and still needs the window.
  await f.marker(H,"pending");
  expect(await f.refusal()).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+});
+
+test("retry state: marker pending at H, policy at G, no usable window: refused with retry_marker_pending_no_window, and the window cannot be re-opened",async()=>{
+ const f=await fixture();
+ await f.marker(H,"pending");
+ expect(await f.refusal()).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+ expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" no_window,retry_marker_pending_no_window");
+ // The owner SQL open (044030) itself requires PASS at from: the stock CI route cannot re-open the window.
+ const open=await openGenerationOverlap(f.client as never,{from:G,to:H,ttlSeconds:3600,admitDuringApply:false,approvalSha256:"9".repeat(64)}).then(()=>null,(e:{code?:string})=>e.code);
+ expect(open).toBe("55000");
+ // A window that expired or is too short after the failed apply: the same named state.
+ await f.window(H,"5 minutes");
+ expect(await f.refusal()).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+ expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" window_ttl_short,retry_marker_pending_no_window");
+ await f.db.query("SELECT sessions.ingest_generation_overlap_close($1::jsonb)",[JSON.stringify({from:G,to:H,reason:"owner"})]);
+ // A still-live window G -> H with enough TTL lets the retry through (it was opened before the failed apply).
+ await f.window(H,"2 hours");
+ expect((await f.gate()).gate).toBe("overlap_ready");
+ await f.db.query("SELECT sessions.ingest_generation_overlap_close($1::jsonb)",[JSON.stringify({from:G,to:H,reason:"owner"})]);
+ // Not the retry state: marker pending at another generation, or PASS at G (re-open is the remedy there).
+ await f.marker(C,"pending");
+ expect(await f.refusal()).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+ expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" no_window");
+ await f.marker(G,"pass");
+ expect(await f.refusal()).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+ expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" no_window");
 });
 
 test("refuses a window to another generation, and one from a generation the policy is not at",async()=>{
@@ -134,4 +162,46 @@ test("no readiness move (marker already PASS at H) and an already rebound policy
  await rebindIngestGeneration(f.client as never,{from:G,to:H});
  await f.marker(H,"pending");
  expect(await f.gate({contract:null})).toMatchObject({gate:"policy_at_target",policyGeneration:H,reasons:[]});
+});
+
+test("the early (pre-migrator) check passes but the recheck in beforeWrite under the migrator lock refuses: nothing is written",async()=>{
+ const f=await fixture();
+ // A migrator-shaped client (multi-statement texts without params go through exec).
+ const mig={query:async(text:string,params?:unknown[])=>params?.length?(await f.db.query(text,params as never)) as never:({rows:((await f.db.exec(text)).at(-1)?.rows??[])} as never)};
+ const dir=mkdtempSync(join(process.env.TMPDIR??"/tmp","overlap-gate-"));
+ const path=join(dir,"step.sql");writeFileSync(path,"CREATE TABLE sessions.overlap_gate_probe(x int);");
+ const steps=[{name:"upstream:20990101000001_overlap_gate_probe.sql",path,sentinel:{evidence:"overlap_gate_probe",sql:"SELECT to_regclass('sessions.overlap_gate_probe') IS NOT NULL AS applied"}}];
+ const profile={mode:"local",shim:false,bootstrap:false,verify:false,runtimeRole:"postgres"} as const;
+ const snapshot=async()=>JSON.stringify({
+  ledger:(await f.db.query<{t:string|null}>("SELECT to_regclass('sessions.__96bulls_migrations')::text AS t")).rows[0]!.t,
+  probe:(await f.db.query<{t:string|null}>("SELECT to_regclass('sessions.overlap_gate_probe')::text AS t")).rows[0]!.t,
+  marker:(await f.db.query("SELECT generation,status FROM sessions.__96bulls_role_validation")).rows,
+  // The function boundary stand-in: every sessions function's body and ACL.
+  boundary:(await f.db.query<{d:string}>("SELECT md5(string_agg(p.oid::regprocedure::text||coalesce(p.proacl::text,'')||md5(p.prosrc),',' ORDER BY p.oid::regprocedure::text)) AS d FROM pg_proc p WHERE p.pronamespace='sessions'::regnamespace")).rows[0]!.d,
+ });
+ const run=(beforeWrite:()=>Promise<void>)=>runMigrations(mig as never,{profile:profile as never,steps:steps as never,beforeWrite}).then(()=>null,(e:{code?:string})=>e.code??"no_code");
+ // Plan time / the apply's fail-fast: 16 minutes left, the gate passes.
+ await f.window(H,"16 minutes");
+ expect((await f.gate()).gate).toBe("overlap_ready");
+ const before=await snapshot();
+ // Between the fail-fast check and the lock the window is closed (or replaced by one that is now too short).
+ for(const change of [
+  async()=>{await f.db.query("SELECT sessions.ingest_generation_overlap_close($1::jsonb)",[JSON.stringify({from:G,to:H,reason:"owner"})])},
+  async()=>{await f.window(H,"10 minutes")},
+ ]){
+  await change();
+  expect(await run(async()=>{await f.gate()})).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+  expect(await snapshot()).toBe(before);
+ }
+ expect(f.logs).toEqual([RELEASE_INGEST_OVERLAP_REQUIRED+" no_window",RELEASE_INGEST_OVERLAP_REQUIRED+" window_ttl_short"]);
+ // Control: with an adequate window the same recheck passes and the migrator goes on to its first write
+ // (the ledger table). What it does after that on this bare fixture (no ledger, a minimal marker table) is
+ // outside this test.
+ await f.db.query("SELECT sessions.ingest_generation_overlap_close($1::jsonb)",[JSON.stringify({from:G,to:H,reason:"owner"})]);
+ await f.window(H,"2 hours");
+ let passed=false;
+ const code=await run(async()=>{await f.gate();passed=true});
+ expect(passed).toBe(true);
+ expect(code).not.toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+ expect((await f.db.query<{t:string|null}>("SELECT to_regclass('sessions.__96bulls_migrations')::text AS t")).rows[0]!.t).not.toBeNull();
 });
