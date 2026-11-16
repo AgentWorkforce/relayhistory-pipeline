@@ -1879,6 +1879,50 @@ describe("per-step catalog sentinels", () => {
       expect(await sentinel(db, st.name), `${st.name} at the end`).toBe(true);
   });
 
+  test("the privacy eraser verifier accepts the validated prefix, then requires both legacy RPCs once 062030 is installed", async () => {
+    const name = "upstream:20261105062030_legacy_export_scope_authority.sql";
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const i = steps.findIndex((st) => st.name === name);
+    expect(i).toBeGreaterThan(0);
+    const db = await prefix(i - 1, i);
+    const verify = () =>
+      db.exec(
+        readFileSync(
+          join(root, "supabase/bootstrap/privacy_eraser_verify.sql"),
+          "utf8",
+        ),
+      );
+    expect(await failure(verify())).toBeNull();
+    await db.exec(readFileSync(steps[i]!.path, "utf8"));
+    expect(await failure(verify())).toBeNull();
+    await db.exec(
+      "DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb)",
+    );
+    expect((await failure(verify()))?.code).toBe("55000");
+  });
+
+  test("the legacy-export phase-2 verifier enforces the 062010 predecessor", async () => {
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const db = await prefix(steps.length - 1, steps.length);
+    const error = await failure(
+      db.exec(
+        readFileSync(
+          join(root, "supabase/bootstrap/legacy_export_privacy_verify.sql"),
+          "utf8",
+        ),
+      ),
+    );
+    const hasTurnsGate = steps.some((st) =>
+      st.name.endsWith("20261105062010_turns_forward_gates.sql"),
+    );
+    if (hasTurnsGate) expect(error).toBeNull();
+    else expect(error?.code).toBe("42P01");
+  });
+
   for (const name of NON_CREATE_STEPS)
     test(`${name}: applied and ledgered is accepted; applied but unledgered is refused before any write`, async () => {
       const steps = (await plan(LOCAL)).filter(
