@@ -29,7 +29,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { resetSharedRelaycontrolIntrospectors } from "@rhc/auth/relaycontrol.ts";
 import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import { computeContentSha256, manifestKey, objectKey, rawChunkKey, type ChunkEntry, type ManifestV1 } from "../../../packages/object-store/src/index.ts";
-import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { AuthError } from "../app.ts";
 import { readApiVerifier } from "../auth.ts";
 import { readApiDepsFromSecret, readAppFromSecret } from "../lambda.ts";
@@ -47,6 +47,7 @@ const AT = Date.parse("2026-11-01T10:00:00.000Z");
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const ORG = "org_1", WS = "ws_1", SOURCE = "codex", SESSION = "sess_1";
 const locationFor = (org: string) => ({ prefix: `96bulls/${org}`, workspaceId: WS, machineId: "srv_bb", harness: SOURCE, sessionId: SESSION, startDate: "2026-11-01" });
+const legacyLocationFor = (org: string) => ({ ...locationFor(org), machineId: legacyMachineId(WS, "user_1") });
 
 // ---------------------------------------------------------------------------
 // Loopback stubs: S3 (MinIO stand-in), relaycontrol introspection, a JWKS.
@@ -138,19 +139,20 @@ class PglitePool {
 }
 
 /** A pointer row of `org` naming the objects written under `objectsOrg`'s key prefix (default org_1). */
-async function pointerRow(manifest: ManifestV1, over: { org?: string; ws?: string; deleted?: boolean; provider?: string; objectsOrg?: string } = {}) {
+async function pointerRow(manifest: ManifestV1, over: { org?: string; ws?: string; deleted?: boolean; provider?: string; objectsOrg?: string; legacy?: boolean } = {}) {
+  const location = over.legacy ? legacyLocationFor(over.objectsOrg ?? ORG) : locationFor(over.objectsOrg ?? ORG);
   await supa.query(
     `INSERT INTO sessions.session_index
        (org_id, workspace_id, harness, session_id, canonical_session_id, machine_id, user_id, created_at, last_activity_at,
         storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, deleted_at)
-     VALUES ($1, $2, 'codex', 'sess_1', NULL, 'srv_bb', 'user_1', $3::timestamptz, $3::timestamptz, $8, 'bucket', $4, decode($5, 'hex'), 'ndjson', $6, 1,
+     VALUES ($1, $2, 'codex', 'sess_1', NULL, $9, 'user_1', $3::timestamptz, $3::timestamptz, $8, 'bucket', $4, decode($5, 'hex'), 'ndjson', $6, 1,
              CASE WHEN $7 THEN now() END)`,
-    [over.org ?? ORG, over.ws ?? WS, new Date(AT).toISOString(), manifestKey(locationFor(over.objectsOrg ?? ORG)), manifest.raw.content_sha256, TRACE, over.deleted ?? false, over.provider ?? "s3"],
+    [over.org ?? ORG, over.ws ?? WS, new Date(AT).toISOString(), manifestKey(location), manifest.raw.content_sha256, TRACE, over.deleted ?? false, over.provider ?? "s3", manifest.session.machine_id],
   );
 }
 
-/** A delivery stream with events, markers, a catalog record, the legacy coverage marker and one live turn. */
-function deliveryLines(org = ORG) {
+/** A normal delivery stream with events, markers and a catalog record. */
+function deliveryLines() {
   const line = (record_id: string, kind: string, origin_id: string, payload: Record<string, unknown>, at = AT) => ({
     kind, origin_id, record_id, revision: "1", operation: "upsert", received_at: new Date(at).toISOString(), payload,
   });
@@ -160,17 +162,23 @@ function deliveryLines(org = ORG) {
     line("k1", "session_marker", "origin-1", { marker_uid: "mk1", kind: "task_started", turn_id: "turn-1", ts_ms: AT + 900 }),
     line("k2", "session_marker", "origin-1", { marker_uid: "mk2", kind: "task_complete", turn_id: "turn-1", ts_ms: AT + 9_500 }),
     line("c1", "session", "origin-1", { title: "Fix the flaky test", cwd: "/repo", git_branch: "main", agent_name: "Ada" }),
-    line("legacy:scope:coverage", "legacy_scope", "legacy:scope", { version: 1, org_id: org, workspace_id: WS, source: SOURCE, session_id: SESSION, tables: ["conversation_turns", "session_links", "session_outcomes"] }),
+  ];
+}
+
+/** The dedicated legacy export stream: coverage plus turns and no live delivery rows. */
+function legacyLines(org = ORG) {
+  return [
+    { kind: "legacy_scope", origin_id: "legacy:scope", record_id: "legacy:scope:coverage", revision: "1", operation: "upsert", received_at: new Date(AT).toISOString(),
+      payload: { version: 1, org_id: org, workspace_id: WS, source: SOURCE, session_id: SESSION, tables: ["conversation_turns", "session_links", "session_outcomes"] } },
     {
-      kind: TURN_KIND, origin_id: TURN_ORIGIN_ID, record_id: turnRecordId(WS, SOURCE, SESSION, 0), revision: "1793000000000000", operation: "upsert", received_at: "2026-11-01T10:00:10.000Z",
+      kind: "legacy_conversation_turn", origin_id: "legacy:conversation_turns", record_id: "legacy:conversation_turns:7f1c6a52-6a43-4c2e-9b44-1d3c2a6b9e01", revision: "1793000000000000", operation: "upsert", received_at: "2026-11-01T10:00:10.000Z",
       payload: { id: "7f1c6a52-6a43-4c2e-9b44-1d3c2a6b9e01", org_id: org, workspace_id: WS, source: SOURCE, session_id: SESSION, turn_index: 0, session_owner: "user_1", role: "assistant",
-        content: "live turn 0", actor_name: "Ada", actor_role: "owner", metadata_json: JSON.stringify({ nativeCli: "codex" }), ts: "2026-11-01T10:00:09.000Z", tagged: true },
+        content: "live turn 0", actor_name: "Ada", actor_role: "owner", metadata: { nativeCli: "codex" }, ts: "2026-11-01T10:00:09.000Z", tagged: true },
     },
   ];
 }
 
-async function writeSession(location = locationFor(ORG)): Promise<ManifestV1> {
-  const lines = deliveryLines(location.prefix.split("/")[1]);
+async function writeManifest(location: ReturnType<typeof locationFor>, lines: Array<Record<string, unknown>>, legacy = false): Promise<ManifestV1> {
   const raw = new TextEncoder().encode(lines.map((r) => JSON.stringify(r)).join("\n") + "\n");
   const stored = new Uint8Array(zstdCompressSync(raw));
   const sha = await sha256Hex(raw);
@@ -181,19 +189,37 @@ async function writeSession(location = locationFor(ORG)): Promise<ManifestV1> {
   const iso = new Date(AT).toISOString();
   const manifest = {
     schema_v: 1, layout: "v1", trace_id: TRACE, revision: 1, created_at: iso, updated_at: iso,
-    session: { workspace_id: WS, machine_id: "srv_bb", harness: SOURCE, session_id: SESSION, started_at: iso },
-    writer: { delivery_instance_id: "srv_bb", plugin_version: "test" },
+    session: { workspace_id: WS, machine_id: location.machineId, harness: SOURCE, session_id: SESSION, started_at: iso },
+    writer: { delivery_instance_id: legacy ? "migration:test-grant" : "srv_bb", plugin_version: "test" },
     raw: {
-      owner: "srv_bb", state: "open", updated_at: iso, format: "ndjson", compression: "zstd", chunk_count: 1,
+      owner: legacy ? "migration:test-grant" : "srv_bb", state: "open", updated_at: iso, format: "ndjson", compression: "zstd", chunk_count: 1,
       raw_bytes: raw.byteLength, stored_bytes: stored.byteLength, content_sha256: await computeContentSha256([chunk]), epoch: 0,
-      epochs: [{ epoch: 0, opened_at: iso, reason: "initial", first_seq: 0, opened_by: "srv_bb" }],
+      epochs: [{ epoch: 0, opened_at: iso, reason: "initial", first_seq: 0, opened_by: legacy ? "migration:test-grant" : "srv_bb" }],
       next_offset: raw.byteLength, chunks: [chunk], scrub: { ruleset: "relayhistory-scrub", version: 1 },
     },
-    extensions: { "96bulls": { user_id: "user_1", canonical_session_id: SESSION } },
+    extensions: {
+      "96bulls": { user_id: "user_1", canonical_session_id: SESSION },
+      ...(legacy ? { "client.relayhistory_export": {
+        version: 1, source: "neon.delivery_records", grant_id: "test-grant", plan_digest: "a".repeat(64), source_user_id: "user_1",
+      } } : {}),
+    },
   } as ManifestV1;
   objects.set(String(rawChunkKey(location, 0, 0, sha, "ndjson")), stored);
   objects.set(String(objectKey(manifestKey(location))), new TextEncoder().encode(JSON.stringify(manifest)));
   return manifest;
+}
+
+async function writeSession(location = locationFor(ORG)): Promise<ManifestV1> {
+  return writeManifest(location, deliveryLines());
+}
+
+async function writeLegacySession(org = ORG): Promise<ManifestV1> {
+  return writeManifest(legacyLocationFor(org), legacyLines(org), true);
+}
+
+/** Invalid by design: a delivery writer cannot smuggle legacy evidence beside its live rows. */
+async function writeMixedDeliverySession(org: string): Promise<ManifestV1> {
+  return writeManifest(locationFor(org), [...deliveryLines(), ...legacyLines(org)]);
 }
 
 /**
@@ -241,13 +267,18 @@ beforeAll(async () => {
   await supa.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));
   const manifest = await writeSession();
   await pointerRow(manifest);
+  await pointerRow(await writeLegacySession(), { legacy: true });
   // Another org's and another workspace's pointer to the same objects: RLS must keep them out.
   await pointerRow(manifest, { org: "org_2" });
   // org_3 keeps its session in a GCS Locker (served by the same loopback stub as a GCS emulator).
   const gcsManifest = await writeSession(locationFor("org_3"));
   await pointerRow(gcsManifest, { org: "org_3", objectsOrg: "org_3", provider: "gcs" });
+  await pointerRow(await writeLegacySession("org_3"), { org: "org_3", objectsOrg: "org_3", provider: "gcs", legacy: true });
   // org_4: a pointer at revision 1 whose manifest is already at revision 2.
   await pointerRow(await writeLaggingSession(), { org: "org_4", objectsOrg: "org_4" });
+  await pointerRow(await writeLegacySession("org_4"), { org: "org_4", objectsOrg: "org_4", legacy: true });
+  // org_5 proves a normal delivery manifest cannot make legacy rows authoritative.
+  await pointerRow(await writeMixedDeliverySession("org_5"), { org: "org_5", objectsOrg: "org_5" });
 
   s3 = await listen((req, res) => {
     objectAuth.push(req.headers.authorization ?? "");
@@ -394,6 +425,16 @@ describe("relaycontrol_only, canonical reads wired (server.ts, real assembly)", 
     for (const url of outbound) expect([url, allowed.has(new URL(url).origin)]).toEqual([url, true]);
     expect(jwks.hits).toEqual([]);
   }, 60_000);
+
+  test("a delivery-owned mixed manifest keeps live rows but cannot authorize legacy turns", async () => {
+    const token = "sh_at_synthetic-mixed";
+    answers.set(token, (_b, res) => json(res, 200, active({ org: "org_5", token_id: "tokid_mixed" })));
+    const get = await start(baseEnv());
+    expect((await get(ROUTES[0]!, token)).status).toBe(200);
+    const turns = await get(ROUTES[1]!, token);
+    expect(turns.status).toBe(501);
+    expect(await code(turns)).toMatchObject({ reason: "turns_unknown" });
+  });
 
   test("wrong audience is 401 before any SQL or object read", async () => {
     const token = "sh_at_synthetic-wrong-aud";

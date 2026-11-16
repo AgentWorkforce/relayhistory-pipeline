@@ -1498,6 +1498,10 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
   expect(Object.keys(present.files[0])).toEqual(["file", "sha256_target", "sha256_release", "differs", "scope"]);
   expect(present.files.find((f) => f.file === "supabase/bootstrap/legacy_export_privacy_roles.sql")?.scope).toBe("excluded");
   expect(present.files.filter((f) => f.file !== "supabase/bootstrap/legacy_export_privacy_roles.sql").every((f) => f.scope === "run")).toBe(true);
+  const legacyTarget = bsSection({ target: "upstream:20261105062030_legacy_export_scope_authority.sql" });
+  expect(legacyTarget.required_roles).toContain("bulls96_legacy_export_privacy");
+  expect(legacyTarget.excluded).not.toContain("supabase/bootstrap/legacy_export_privacy_roles.sql");
+  expect(legacyTarget.files.find((f) => f.file === "supabase/bootstrap/legacy_export_privacy_roles.sql")?.scope).toBe("run");
   expect(present.files.every((f) => !f.differs)).toBe(true);
   expect(present.roles.map((r) => r.name)).toEqual(chainNames);
   expect(Object.keys(present.roles[0])).toEqual(["name", "file", "first_consumer", "required", "present", "exact", "will_create"]);
