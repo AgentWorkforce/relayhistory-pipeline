@@ -155,6 +155,14 @@ test("default off: MESSAGE_ORIGIN_LABELS_ENABLED unset writes rows exactly as be
   const { db, index, rows } = await indexed(false);
   // No labels and no derived subagent: the pre-flag rows, fingerprints included.
   expect(rows.every(r => r.actor_name === "" && r.subagent_id === "")).toBe(true);
+  // Pinned: the fingerprints origin/main (94b0d1fc, before this change) gives these records.
+  const machine = "delivery:fa6b7f4a40ca840425a958164593c5f3";
+  expect(Object.fromEntries(rows.map(r => [r.event_id, r.fingerprint]))).toEqual({
+    [`${machine}:rec-1`]: "s3b1a741811bb060", [`${machine}:rec-h1`]: "s3916c8b421c61e4",
+    [`${machine}:rec-2`]: "s3439660f59def63", [`${machine}:rec-4`]: "s320c68e71cdf0a4",
+    [`${machine}:rec-5`]: "s3d49df40bbb343c", [`${machine}:rec-6`]: "s3e71ebfa2d92ad8",
+    [`${machine}:rec-7`]: "s342853431d549fe",
+  });
   const on = await indexed(true);
   const fp = (list: typeof rows) => Object.fromEntries(list.map(r => [r.event_id, r.fingerprint]));
   const offPrints = fp(rows), onPrints = fp(on.rows);

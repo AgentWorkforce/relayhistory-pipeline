@@ -624,7 +624,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}`);
+        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}`);
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {

@@ -19,6 +19,23 @@ Everything below is **default off**. `MESSAGE_ORIGIN_LABELS_ENABLED`, exactly
 When the flag is off, index rows are written exactly as before, fingerprints
 included. `origin=` answers 501 `param_origin`.
 
+The large-read worker (`large-read-main.ts`), which the pipeline Lambda hands
+large scopes, reads the same variable. Set it on both together, so that a
+scope moving between them keeps one fingerprint and is labelled either way.
+
+**Rollout order.** One flag spans separately deployed services.
+
+1. Turn it on in the writers first: the pipeline Lambda, the large-read
+   worker and the self-host consumer.
+2. Turn it on in the readers once scopes have been re-indexed.
+
+A reader turned on earlier answers `origin=` over rows that are not labelled
+yet, which leaves them out of a human-only search. Scopes not indexed since the
+writers turned it on stay unlabelled.
+
+Browsers see `X-Sessions-Read-Origin` because it is in
+`Access-Control-Expose-Headers` when the flag is on.
+
 Turning it on in a writer changes the fingerprint of every labelled row. Each
 scope's next index pass therefore rewrites that scope's rows once, in the
 search index and in the directory events. Nothing is backfilled: a scope is

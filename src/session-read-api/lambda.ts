@@ -52,8 +52,8 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
  * them, so the flag has no effect here.
  */
-import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import pg from "pg";
+import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
