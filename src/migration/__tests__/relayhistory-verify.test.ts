@@ -12,6 +12,12 @@ import {
   fingerprintSql,
   quoteIdent,
   selectUsableKey,
+  FINGERPRINT_SESSION_SETTINGS,
+  fingerprintSettingsSql,
+  parseTableFilter,
+  sequenceReady,
+  ctidRanges,
+  ctidRangeFingerprintSql,
   type CatalogObjects,
   type ColumnDefinition,
   type RoleAccess,
@@ -333,5 +339,49 @@ describe("runtime-role grants", () => {
       catalog(),
       target,
     )).toEqual(["target role supabase_app is subject to row security on jobs; source role neon_app is not"]);
+  });
+});
+
+describe("frozen full-copy verification", () => {
+  test("pins every setting row_to_json output depends on", () => {
+    const sql = fingerprintSettingsSql();
+    for (const [name] of FINGERPRINT_SESSION_SETTINGS) expect(sql).toContain(`SET ${name} = `);
+    expect(sql).toContain("SET TimeZone = 'UTC'");
+    expect(sql).toContain("SET DateStyle = 'ISO, MDY'");
+    expect(sql).toContain("SET bytea_output = 'hex'");
+  });
+
+  test("parses --tables and refuses blank entries", () => {
+    expect(parseTableFilter(["bun", "x"])).toBeNull();
+    expect(parseTableFilter(["--tables=a, b"])).toEqual(new Set(["a", "b"]));
+    expect(() => parseTableFilter(["--tables="])).toThrow();
+    expect(() => parseTableFilter(["--tables=a,,b"])).toThrow();
+  });
+
+  test("a frozen copy requires sequence equality; the T0 fence requires target >= source", () => {
+    expect(sequenceReady("10", "11", false)).toBe(true);
+    expect(sequenceReady("10", "11", true)).toBe(false);
+    expect(sequenceReady("10", "10", true)).toBe(true);
+    expect(sequenceReady(null, null, true)).toBe(true);
+    expect(sequenceReady(null, "1", true)).toBe(false);
+    expect(sequenceReady("10", null, false)).toBe(false);
+    expect(sequenceReady(null, null, false)).toBe(true);
+  });
+});
+
+describe("parallel ctid-range fingerprints", () => {
+  test("covers every page exactly once and leaves the last range open", () => {
+    expect(ctidRanges(10, 3)).toEqual([[0, 4], [4, 8], [8, null]]);
+    expect(ctidRanges(0, 4)).toEqual([[0, null]]);
+    expect(ctidRanges(2, 8)).toEqual([[0, 1], [1, null]]);
+    expect(() => ctidRanges(10, 0)).toThrow();
+  });
+
+  test("bounds a range by ctid and hashes only the listed columns", () => {
+    const bounded = ctidRangeFingerprintSql("sessions", "events", ["id", "body"], true);
+    expect(bounded).toContain(`SELECT "id", "body" FROM "sessions"."events"`);
+    expect(bounded).toContain("ctid >= format('(%s,0)', $1::bigint)::tid");
+    expect(bounded).toContain("ctid < format('(%s,0)', $2::bigint)::tid");
+    expect(ctidRangeFingerprintSql("sessions", "events", ["id"], false)).not.toContain("$2");
   });
 });
