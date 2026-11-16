@@ -8,9 +8,9 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: migration ledger required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062020_legacy_export_scope_authority.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062030_legacy_export_scope_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_legacy_export_scope_authority.sql' FOR UPDATE;
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql' FOR UPDATE;
  IF NOT FOUND OR v_sha<>'a602c8c28e17efb64962a6d84d315a3daef4c95af776c2adcf217e55ac976ca4'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)
@@ -36,5 +36,5 @@ DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb),
  sessions.ingest_legacy_export_scope_authority_register(jsonb);
 DROP TABLE sessions.legacy_export_scope_authority;
 REVOKE USAGE ON SCHEMA sessions FROM bulls96_legacy_export_privacy;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_legacy_export_scope_authority.sql';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql';
 COMMIT;
