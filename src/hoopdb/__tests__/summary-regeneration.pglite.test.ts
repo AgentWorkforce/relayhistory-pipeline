@@ -25,9 +25,11 @@ describe("20261105062040 summary regeneration", () => {
   let db: PGlite;
   const as = <R,>(role: string, run: (tx: Transaction) => Promise<R>) =>
     db.transaction(async (tx) => { await tx.exec(`SET LOCAL ROLE ${role}`); return run(tx); });
+  // The writer path: the SECURITY DEFINER batch append (the runtime has no table write grant).
   const insertAudit = (r: Row, role = "service_role") => as(role, (tx) => tx.query(
-    `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [r.org ?? "org-a", r.ws ?? "ws-a", r.harness ?? "codex", r.session, r.system ?? "bob_costas", r.kind ?? "short", r.reason ?? "turns_gained"]));
+    "SELECT sessions.summary_regeneration_audit_append_v1($1::jsonb) AS n",
+    [JSON.stringify([{ org_id: r.org ?? "org-a", workspace_id: r.ws ?? "ws-a", harness: r.harness ?? "codex", session_id: r.session,
+      system: r.system ?? "bob_costas", kind: r.kind ?? "short", reason: r.reason ?? "turns_gained" }])]));
   const count = async (session?: string) => Number((await db.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM sessions.summary_regeneration_audit ${session ? "WHERE session_id=$1" : ""}`,
     session ? [session] : [])).rows[0]!.n);
@@ -52,6 +54,15 @@ describe("20261105062040 summary regeneration", () => {
       expect(await code(as(role, (tx) => tx.query("SELECT 1 FROM sessions.summary_regeneration_audit")))).toBe("42501");
       expect(await code(as(role, (tx) => tx.query("SELECT sessions.summary_regeneration_audit_purge_v1(90)")))).toBe("42501");
     }
+    // No direct table write for the runtime: only the append function writes.
+    expect(await code(as("service_role", (tx) => tx.query(
+      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}) VALUES ('org-a','ws-a','codex','grant-3','brief','brief','turns_gained')`)))).toBe("42501");
+    // The append refuses a non-array and a batch over 1000 rows; CHECKs still apply to each row.
+    const append = (rows: unknown) => as("service_role", (tx) => tx.query("SELECT sessions.summary_regeneration_audit_append_v1($1::jsonb)", [JSON.stringify(rows)]));
+    expect(await code(append({ org_id: "org-a" }))).toBe("22023");
+    expect(await code(append(Array.from({ length: 1001 }, () => ({ org_id: "org-a" }))))).toBe("22023");
+    expect(await code(append([{ org_id: "org-a", workspace_id: "ws-a", harness: "codex", session_id: "grant-4", system: "brief", kind: "short", reason: "turns_gained" }]))).toBe("23514");
+    expect(await count("grant-4")).toBe(0);
   });
 
   test("append-only: UPDATE, DELETE and TRUNCATE are refused, also for the owner without the marker", async () => {
@@ -73,10 +84,11 @@ describe("20261105062040 summary regeneration", () => {
     expect(await code(insertAudit({ session: "chk", system: "brief", kind: "short" }))).toBe("23514");
     expect(await code(insertAudit({ session: "chk", system: "bob_costas", kind: "brief" }))).toBe("23514");
     expect(await code(insertAudit({ session: "chk", kind: "medium" }))).toBe("23514");
-    expect(await code(as("service_role", (tx) => tx.query(
-      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, request_id) VALUES ('o','w','codex','chk','brief','brief','operator_requeue','req-1')`)))).toBe("23514");
-    expect(await code(as("service_role", (tx) => tx.query(
-      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, prior_failure_code) VALUES ('o','w','codex','chk','brief','brief','retry_backoff','Not A Code')`)))).toBe("23514");
+    // Direct INSERTs run as the owner: the runtime role has no table write grant.
+    expect(await code(db.query(
+      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, request_id) VALUES ('o','w','codex','chk','brief','brief','operator_requeue','req-1')`))).toBe("23514");
+    expect(await code(db.query(
+      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, prior_failure_code) VALUES ('o','w','codex','chk','brief','brief','retry_backoff','Not A Code')`))).toBe("23514");
     expect(await count("chk")).toBe(0);
   });
 
@@ -88,8 +100,9 @@ describe("20261105062040 summary regeneration", () => {
   });
 
   test("operator requeue idempotency: one row per (request_id, scope_hash)", async () => {
-    const ins = () => as("service_role", (tx) => tx.query(
-      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, request_id, scope_hash) VALUES ('org-a','ws-a','codex','req','brief','brief','operator_requeue','req-9',repeat('a',64))`));
+    // Owner INSERT: push B's idempotent writer is not built yet; this pins the unique index only.
+    const ins = () => db.query(
+      `INSERT INTO sessions.summary_regeneration_audit (${AUDIT_COLS}, request_id, scope_hash) VALUES ('org-a','ws-a','codex','req','brief','brief','operator_requeue','req-9',repeat('a',64))`);
     await ins();
     expect(await code(ins())).toBe("23505");
   });

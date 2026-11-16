@@ -1,8 +1,8 @@
 /**
  * Lane: summary-regeneration (slot 062040).
  * The append-only sessions.summary_regeneration_audit table: two trigger functions (append-only
- * guard and forget/erase cleanup, no grants) and one SECURITY DEFINER retention purge entry point
- * for the worker (service_role). The runtime role inserts audit rows through its table grant.
+ * guard and forget/erase cleanup, no grants) and two SECURITY DEFINER worker entry points
+ * (service_role): the batch append and the retention purge. The runtime has no table write grant.
  */
 import type { LaneManifest } from "../types.ts";
 
@@ -17,6 +17,7 @@ export const summaryRegeneration: LaneManifest = {
   functions: {
     "sessions.summary_regeneration_audit_append_only()": { secdef: false, grants: [] },
     "sessions.summary_regeneration_audit_forget()": { secdef: true, grants: [] },
+    "sessions.summary_regeneration_audit_append_v1(jsonb)": { secdef: true, grants: ["service_role"] },
     "sessions.summary_regeneration_audit_purge_v1(integer)": { secdef: true, grants: ["service_role"] },
   },
   replaces: {},
