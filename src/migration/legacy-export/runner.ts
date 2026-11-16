@@ -403,7 +403,10 @@ async function exportScope(
       });
     const userId = prior?.user_id ?? resolvedUserId;
     boundUserId = userId;
-    const registration = { machineId: legacyMachineId(scope.workspaceId === "" ? "default" : scope.workspaceId, userId), existing: !!prior?.manifest_key };
+    // The authority key normalizes the empty/default workspace alias, but the
+    // machine is evidence of the writer's actual stored workspace spelling.
+    // Keep that hash exact so the eraser can reach an older `ws=_` export.
+    const registration = { machineId: legacyMachineId(scope.workspaceId, userId), existing: !!prior?.manifest_key };
     if (!opts.force && prior?.fingerprint === fingerprint && prior.status === "exported") {
       const privacy = await withLegacyPrivacyFence(deps.privacyDb, scope, userId, async () => undefined, opts.export ? registration : undefined);
       if (privacy.fenced) {
