@@ -191,14 +191,33 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect((await allKeys(store)).length).toBeGreaterThan(0);
   });
 
-  test("coverage: a turns-only legacy scope (no events, no outcomes) is exported, not left behind as legacy_user_unbound", async () => {
-    // Pending a product decision: if turns-only scopes are intentionally not exported, replace this
-    // with a test that they are counted and documented as data left behind. Until then it gates.
+  test("owner rule: a turns-only scope whose session_owner is unverified free text is not exported, writes nothing, and is counted unbound_turns_only (not failed)", async () => {
+    // Lead's rule: events user, then outcomes user, then session_owner ONLY if it is a verified Cloud user id. A label
+    // that appears in no authenticated user evidence is never an erasure identity; the scope stays on the frozen copy.
     const n = await neon(), p = await supabase();
     await n.pg.query("DELETE FROM sessions.session_outcomes");
-    const store = createFsStore({ root: await tmp("a0t") });
-    const { counters } = await run(n.db, p.db, store, "a0t");
-    expect(counters).toMatchObject({ exported: 1, fenced: 0, failed: 0 });
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_owner='Agent Smith <agent@example.invalid>'");
+    const store = createFsStore({ root: await tmp("unbound") });
+    const { counters } = await run(n.db, p.db, store, "unbound");
+    expect(counters).toMatchObject({ exported: 0, fenced: 0, failed: 0 });
+    expect(await allKeys(store)).toEqual([]);
+    const flat = Object.entries(counters as unknown as Record<string, unknown>);
+    expect(flat.filter(([k, v]) => /unbound_?turns_?only/iu.test(k) && v === 1).length).toBe(1);
+  });
+
+  test("owner rule: two distinct event users, or two distinct outcome users, are not exported, write nothing, and are counted unbound_multi_owner (not failed)", async () => {
+    for (const evidence of ["events", "outcomes"] as const) {
+      const n = await neon(), p = await supabase();
+      if (evidence === "events")
+        await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,$4,'u_a'),($1,$2,$3,$4,'u_b')", [S.orgId, S.workspaceId, S.source, S.sessionId]);
+      else await outcome(n.pg, S, "f00d").then(() => n.pg.query("UPDATE sessions.session_outcomes SET user_id='u_b' WHERE commit_sha='f00d'"));
+      const store = createFsStore({ root: await tmp(`multi-${evidence}`) });
+      const { counters } = await run(n.db, p.db, store, `multi-${evidence}`);
+      expect({ evidence, ...counters }).toMatchObject({ evidence, exported: 0, fenced: 0, failed: 0 });
+      expect(await allKeys(store)).toEqual([]);
+      const flat = Object.entries(counters as unknown as Record<string, unknown>);
+      expect({ evidence, hits: flat.filter(([k, v]) => /unbound_?multi_?owner/iu.test(k) && v === 1).length }).toEqual({ evidence, hits: 1 });
+    }
   });
 
   test("Supabase turn_session_fences (legacy_import, no user) fences the scope: nothing reaches S3", async () => {
