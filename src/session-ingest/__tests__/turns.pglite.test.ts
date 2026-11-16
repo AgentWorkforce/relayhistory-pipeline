@@ -25,12 +25,13 @@ const root=join(import.meta.dir,"../../.."),generation="a".repeat(64),epoch="3".
 const open:Array<()=>Promise<unknown>|void>=[];
 afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 
-/** Same harness as frozen-custody.pglite.test.ts: every migration, the ingest role, a sealed empty frozen copy. */
-async function fixture(){
+/** Same harness as frozen-custody.pglite.test.ts: every migration, the ingest role, a sealed empty frozen copy.
+ * The aux job re-runs this suite under HOOPDB_MIGRATE_UNTIL (G4 cutoff): default-flag tests honour it; tests that exercise the 062020 turn gates pass `null` to apply every migration. */
+async function fixture(until?:string|null){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
  for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
- for(const f of migrationFiles(root))await db.exec(read("supabase/migrations/"+f));
+ for(const f of migrationFiles(root,until))await db.exec(read("supabase/migrations/"+f));
  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','"+generation+"','pass')");
  const owner=async(name:string,p:unknown)=>(await db.query("SELECT sessions."+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0]!.r as any;
  await owner("ingest_lazy_policy_set",{baselineMode:"lazy-current",generation,sourceIdentitySha256:identity,controlEpoch:epoch,privacyBaselineSha256:baseline,retentionContractSha256:"b".repeat(64),sourceProofSha256:"d".repeat(64),validUntil:new Date(Date.now()+3600000).toISOString(),issuer:"relayhistory-cloud"});
@@ -99,7 +100,7 @@ test("parse: accepts only conversation_turn upserts of one session, bound to the
 test("HTTP: turns land in the buffered stage through the normal custody + claim path, idempotently",async()=>{
  const {createIngestApp}=await import("../app.ts");
  const {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER}=await import("../custody-protocol.ts");
- const f=await fixture();const logs:Record<string,unknown>[]=[];
+ const f=await fixture(null);const logs:Record<string,unknown>[]=[];
  const mk=(custodySource:"relayhistory"|"frozen-supabase")=>createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:(x)=>logs.push(x),custodySource,turnFenceRegister:true});
  const capability=await mk("frozen-supabase").request("/v1/turns/capabilities");
  expect(capability.status).toBe(204);
@@ -170,7 +171,7 @@ test("HTTP: turn-fence registration and capability are independently default-off
 });
 
 test("cross-origin erasure fences registered turns whether erasure or registration commits first",async()=>{
- const f=await fixture();
+ const f=await fixture(null);
  await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
  await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'another-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  const materialized=await f.db.query("SELECT origin_id,source,session_id FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID]);
@@ -187,7 +188,7 @@ test("cross-origin erasure fences registered turns whether erasure or registrati
 });
 
 test("operator user erase removes writer ids and refuses re-registration",async()=>{
- const f=await fixture();
+ const f=await fixture(null);
  await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]});
  const begun=await f.db.query<{result:{state:string}}>("SELECT sessions.operator_user_erase_begin('turn-user-erase',$1,$2,$3) AS result",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
  expect(begun.rows[0]!.result.state).toBe("purging");
@@ -205,14 +206,14 @@ test("migration backfills exact-session deletions that predate the turn trigger"
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
  for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
- for(const f of migrationFiles(root).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"))await db.exec(read("supabase/migrations/"+f));
+ for(const f of migrationFiles(root,null).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"))await db.exec(read("supabase/migrations/"+f));
  await db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'older-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  await db.exec(read("supabase/migrations/20261105062020_turns_forward_gates.sql"));
  expect((await db.query("SELECT fence_basis,registered_writer_seen FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{fence_basis:"live",registered_writer_seen:false}]);
 });
 
 test("turn-only canonical pointers stay addressable but their directory projection is tombstoned",async()=>{
- const f=await fixture();
+ const f=await fixture(null);
  // Production's post-migration operator bootstrap grants this exact direct-DML surface.
  // Keep the fixture narrow: it has no search_index schema, which the full bootstrap also manages.
  await f.db.exec("GRANT USAGE ON SCHEMA sessions TO search_consumer_runtime;GRANT SELECT,INSERT,UPDATE ON sessions.session_directory TO search_consumer_runtime;CREATE POLICY search_consumer_trusted ON sessions.session_directory FOR ALL TO search_consumer_runtime USING(true) WITH CHECK(true)");
@@ -267,7 +268,7 @@ test("turn-only canonical pointers stay addressable but their directory projecti
 });
 
 test("the service-role legacy fence import is bounded, idempotent, and fences a later writer",async()=>{
- const f=await fixture();
+ const f=await fixture(null);
  const body=(await f.db.query<{s:string}>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_turn_fences_import(jsonb)'::regprocedure")).rows[0]!.s;
  expect(body).toContain('ORDER BY org_id COLLATE "C",workspace_id COLLATE "C",source COLLATE "C",session_id COLLATE "C"');
  const legacy="7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a7b";
