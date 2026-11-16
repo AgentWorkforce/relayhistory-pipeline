@@ -363,13 +363,14 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 
 /**
  * INGEST_LEDGER_LOG_COMMIT (ledger-log.ts, docs/design/s3-ledger-log-commit.md): off (unset, the default) is today.
- * `on` is refused until the admission path is wired to the log writer, so no deployment can half-enable it.
+ * `on` (INGEST_LEDGER=s3 only): the legacy claim and commit refuse a stream whose log mode marker exists
+ * (ledger-s3.ts logModeGuard), and the async consumer admits such a stream through its log (ledger-log-admit.ts).
+ * A stream enters log mode ONLY through its durable marker, which nothing here writes, so `on` alone changes no
+ * stream's admission; it adds one parallel HEAD per legacy claim and commit. Until the materializer ships, a
+ * log-mode stream's batches are not visible to readers (docs/design/s3-ledger-log-commit.md).
  */
-export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" {
-  let mode;
-  try { mode = ledgerLogCommitMode(env[INGEST_LEDGER_LOG_COMMIT_VAR]); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR} must be off or on`); }
-  if (mode === "on") throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR}=on is not available yet (the admission path is not wired to the log commit)`);
-  return mode;
+export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" | "on" {
+  try { return ledgerLogCommitMode(env[INGEST_LEDGER_LOG_COMMIT_VAR]); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR} must be off or on`); }
 }
 
 /**
@@ -381,8 +382,11 @@ export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" {
 function selfhostLedger(env: NodeJS.ProcessEnv, s: { sessionSelection: boolean; sessionErase: { enabled: boolean }; uploadConsent: UploadConsentEnforcement; eraseRuntime: { eraseFenceEnforced?: true; eraseBytesEnabled?: true } }): "s3" | undefined {
   let mode;
   try { mode = ingestLedgerMode(env[INGEST_LEDGER_VAR]?.trim() === "" ? undefined : env[INGEST_LEDGER_VAR]?.trim()); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_VAR} must be sql or s3`); }
-  selfhostLedgerLogCommit(env);
-  if (mode === "sql") return undefined;
+  const logCommit = selfhostLedgerLogCommit(env);
+  if (mode === "sql") {
+    if (logCommit === "on") throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
+    return undefined;
+  }
   const refuse = (what: string) => { throw new Error(`96bulls: ${INGEST_LEDGER_VAR}=s3 refuses ${what} (its state is SQL-only)`); };
   if (s.sessionSelection) refuse("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
   if (s.sessionErase.enabled || s.eraseRuntime.eraseFenceEnforced || s.eraseRuntime.eraseBytesEnabled) refuse("the operator session erase");

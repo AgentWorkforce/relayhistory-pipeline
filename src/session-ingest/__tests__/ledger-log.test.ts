@@ -72,8 +72,8 @@ describe("flag", () => {
     expect(ledgerLogCommitMode("on")).toBe("on");
     expect(() => ledgerLogCommitMode("yes")).toThrow();
   });
-  test("self-host refuses on until the admission path is wired", () => {
-    expect(() => selfhostLedgerLogCommit({ INGEST_LEDGER_LOG_COMMIT: "on" } as NodeJS.ProcessEnv)).toThrow(/not available yet/);
+  test("self-host parses the flag (on needs INGEST_LEDGER=s3, checked in selfhostIngestConfig)", () => {
+    expect(selfhostLedgerLogCommit({ INGEST_LEDGER_LOG_COMMIT: "on" } as NodeJS.ProcessEnv)).toBe("on");
     expect(() => selfhostLedgerLogCommit({ INGEST_LEDGER_LOG_COMMIT: "1" } as NodeJS.ProcessEnv)).toThrow(/must be off or on/);
     expect(selfhostLedgerLogCommit({} as NodeJS.ProcessEnv)).toBe("off");
   });

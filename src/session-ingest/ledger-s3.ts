@@ -72,6 +72,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import { admissionUserDir } from "./async-admission.ts";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
+import { logKeys } from "./ledger-log.ts";
 import { orderedControl, type OrderedControl, type OrderedControlResult } from "./control-protocol.ts";
 import {
   LedgerUnavailableError,
@@ -603,6 +604,13 @@ export interface S3LedgerOptions {
    */
   claimCompletesResets?: boolean;
   /**
+   * true (INGEST_LEDGER_LOG_COMMIT=on): a legacy claim or commit on a stream that is in log mode (its log entry 0, the
+   * durable mode marker of ledger-log.ts, exists) is refused as a retry (`ledger_stream_log_mode`), so a legacy writer
+   * can never commit behind a stream's log. The marker HEAD runs in parallel with the claim's (and commit's) first
+   * reads, so it adds a request but no serial round trip. Default false: no extra request, byte-identical to before.
+   */
+  logModeGuard?: boolean;
+  /**
    * true: a reset only BEGINS (records the request id, resets + 1, lastResetAtMs: one fence CAS) and answers at
    * once; it never lists owner stubs. For a caller with a hard subrequest budget (the Worker's fence mirror,
    * INGEST_S3_FENCE_MIRROR): the next claim that completes resets, or a reset retry through a full ledger, finishes
@@ -852,6 +860,15 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   const { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, writeRearm } = io;
   const newToken = opts.newToken ?? randomUUID;
   const claimCompletesResets = opts.claimCompletesResets ?? true;
+  /** logModeGuard: the stream's log mode marker, read beside the first reads; absent when the guard is off. */
+  const logModeRead = (tenant: LedgerTenant, originId: string): Promise<boolean> =>
+    opts.logModeGuard
+      ? store.head(objectKey(logKeys(keyRoot, tenant, originId).entry(0))).then((m) => m !== undefined, () => { throw new LedgerUnavailableError("ledger_log_mode_unreadable"); })
+      : Promise.resolve(false);
+  const refuseLogMode = (r: PromiseSettledResult<boolean>) => {
+    if (r.status === "rejected") throw r.reason;
+    if (r.value) throw new LedgerUnavailableError("ledger_stream_log_mode");
+  };
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
   if (!count(authorityTtl)) throw new LedgerUnavailableError("ledger_s3_options_refused");
   /** Per org: until when a valid marker read is trusted. Bounded (cleared when full): only a cache. */
@@ -1124,8 +1141,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         // used, so a failure is answered in the same order as sequential reads would: the batch record's first.
         // The index shards (c) are read only after both, and only for records the fence has not deleted: a replay
         // or a batch-id 409 reads no shard, and a deleted session's shard (even a corrupt one) never fails a batch.
-        const [storedR, readR] = await Promise.allSettled([
-          readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence)]);
+        const [storedR, readR, modeR] = await Promise.allSettled([
+          readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence), logModeRead(input.tenant, input.originId)]);
+        // A stream in log mode is never claimed here (logModeGuard): its log is the only writer.
+        refuseLogMode(modeR);
         if (storedR.status === "rejected") throw storedR.reason;
         const stored = storedR.value;
         // (a) A known batch id: its receipt, a resume, or a batch-id 409.
@@ -1199,7 +1218,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       const batchKey = keys.batch(input.originId, input.batchId);
       // The batch record and the fence read at once. Both reads follow the canonical writes (the caller commits
       // only after them), which is all the fence recheck needs; a batch-record failure is answered first.
-      const [storedR, fenceR] = await Promise.allSettled([readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence)]);
+      const [storedR, fenceR, modeR] = await Promise.allSettled([readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence),
+        logModeRead(input.tenant, input.originId)]);
+      // A stream switched to log mode between this claim and its commit never gets a legacy commit (logModeGuard).
+      refuseLogMode(modeR);
       if (storedR.status === "rejected") throw storedR.reason;
       const stored = storedR.value;
       if (!stored || stored.doc.digest !== input.batchDigest || stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId)

@@ -1,7 +1,9 @@
 # S3 ledger: numbered-log-entry commit
 
-Status: proposed, first slice implemented behind `INGEST_LEDGER_LOG_COMMIT=off` (default). Nothing in the
-admission path calls it yet, and `on` is refused at startup until that wiring lands.
+Status: proposed. Slice 1 (writer and reader) and slice 2 (admission wiring, below) are implemented behind
+`INGEST_LEDGER_LOG_COMMIT` (default off). With `on`, only a stream whose entry 0 exists is admitted through its log,
+and nothing writes entry 0 outside tests yet. The materializer is not built, so no stream may be put into log mode in
+production: its batches would be durable but invisible to readers.
 
 Builds on the group-commit design (`docs/design/s3-ledger-group-commit.md`, rev 3) and the hosted ledger
 decision record (0008, benchmark first). It replaces that design's per-session manifest CAS on the critical path
@@ -160,14 +162,15 @@ today.
 - Rollback: turn the flag off for new streams. A log-mode stream rolls back only after the materializer has
   applied every entry. Then a "close" marker (planned) hands the stream back to legacy.
 
-## This slice
+## Slice 1: writer and reader
 
 - `src/session-ingest/ledger-log.ts`: the keys, entry and checkpoint schema, validation, `enableLogMode`,
   `takeStream`, `appendBatches` (dedupe, create-if-absent, read-back, pending resend), `openStream` (from a
   verified checkpoint or entry 0), `readEntries`, `putPayload`, and the `INGEST_LEDGER_LOG_COMMIT` parse.
-- `selfhost-config.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is refused at startup; `off` changes nothing. The hosted
-  upload-admission runtime (`upload-admission-hosted.ts`) refuses `on` too (`ledger_log_commit_unsupported`); the
-  hosted Worker never runs the S3 ledger at all (it refuses `INGEST_LEDGER=s3`).
+- `selfhost-config.ts`: in slice 1, `INGEST_LEDGER_LOG_COMMIT=on` was refused at startup (slice 2 accepts it with
+  `INGEST_LEDGER=s3`); `off` changes nothing. The hosted upload-admission runtime (`upload-admission-hosted.ts`)
+  refuses `on` (`ledger_log_commit_unsupported`); the hosted Worker never runs the S3 ledger at all (it refuses
+  `INGEST_LEDGER=s3`).
 - A checkpoint is trusted only as far as its hash plus its fields cross-checked against entry `seq`: the entry's
   epoch and writer must equal the checkpoint's epoch and epoch writer, and for a batches entry its inbox cursor must
   equal the checkpoint's and every batch in it must be in the checkpoint's remembered window. One that fails any
@@ -201,13 +204,48 @@ today.
   - a checkpoint with another `legacyCutover`, or an oversized window, is ignored;
   - payloads are idempotent.
 
+## Slice 2: admission wiring
+
+- `ledger-log-admit.ts` `LogStreams`: per batch, in order:
+  1. the fence: a pending reset or an unfinished one is a retry, and records of deleted sessions (tombstones plus
+     pending ordered disables) are dropped, as the legacy judge drops them;
+  2. the privacy journal: a reset completed after the upload began refuses it (409), and one in flight is a retry;
+  3. consent at admit;
+  4. the payload PUT (the kept records and the receipt);
+  5. consent at commit;
+  6. the entry append. Replay and conflict come from the window, and a conflict is the legacy `batchIdConflict`
+     409.
+
+  One owner per stream per process: the first write takes the stream with an epoch entry and caches the state. A
+  `LogFenced` (`log_take_lost`, `log_not_owner`, `log_entry_taken`) drops the cached state, so the queue retry reopens
+  and takes again. A `LogUnavailable` keeps the state, so the retry resends the pending entry.
+- `admission-consumer.ts`: with `logStreams` set, a batch whose stream has entry 0 goes through `LogStreams.admit`;
+  every other batch takes the unchanged legacy path. The outcome markers and tombstones are the same, so
+  `/v1/delivery/admission` answers the same.
+- `ledger-s3.ts` `logModeGuard`: the legacy claim and commit HEAD entry 0 in parallel with their first reads, adding
+  no serial round trip, and refuse a log-mode stream with `ledger_stream_log_mode` (a retry). So a legacy writer
+  never commits behind the log, and that includes the synchronous HTTP path, which therefore answers 503 for a
+  log-mode stream. Log mode needs async admission for that stream.
+- `selfhost-config.ts` / `selfhost-server.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is accepted with `INGEST_LEDGER=s3`
+  (refused with sql). It turns on `logModeGuard` and gives the consumer its `LogStreams`. With `off` (the default)
+  every byte is unchanged.
+- Tests (`ledger-log-admit.test.ts`, the self-host edge end to end, fs store):
+  - `on` alone changes nothing (legacy admits, the log stays empty);
+  - a log-mode stream is admitted through its log (open, epoch, batches), never the legacy chain, and a conflicting
+    batch id is refused;
+  - the synchronous legacy claim refuses a log-mode stream (mutation-checked);
+  - a fence-deleted session's records are dropped, a pending reset is a retry, and a later completed reset refuses;
+  - fault injection on the entry PUT, before and after landing: exactly one entry and one admission;
+  - equivalence: the same uploads reach the same per-upload outcome on a legacy edge and a log-mode edge.
+
 ## Remaining
 
-1. Wire the admission consumer behind the flag. That means claim, gates and outcome per member, the legacy
-   writers refusing log-mode streams, and per-stream single-writer ownership with actor or lease and takeover.
-2. The materializer (manifests, revision index, search feed), with its cursor and checkpoints.
-3. The same suite against the MinIO, GCS and Azure emulators. The conformance cases cover the primitive; the
-   protocol suite should run there too.
-4. A property and fault-injection suite comparing log admission against legacy admission on the same inputs:
-   the same records visible, no loss, no duplicates.
-5. Compaction and retention, the close marker for rollback, and metrics.
+1. The materializer (manifests, revision index, search feed), with its cursor and checkpoints, and the erase paths
+   for `ledger/log/.../p/` payloads. Until it ships, a log-mode stream's batches are invisible to readers. The
+   equivalence suite then extends to the canonical, read and search state, not just the per-upload outcomes.
+2. The ledger-log and log-admission suites against the MinIO, GCS and Azure emulators. The object-store
+   conformance cases cover the primitive; the protocol suites still run only on the fs store.
+3. An operator tool that drains a stream and writes entry 0 with its `legacyCutover`, plus the close marker for
+   rollback.
+4. The hosted Worker must refuse `on` before any hosted wiring. `readEntries` starting from a checkpoint.
+   Compaction and retention, and metrics.

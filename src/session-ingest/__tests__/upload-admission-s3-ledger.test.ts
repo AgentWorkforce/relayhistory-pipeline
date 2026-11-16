@@ -212,6 +212,10 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
     expect(() => selfhostIngestConfig({ ...enabled, INGEST_LEDGER: "postgres" })).toThrow(/INGEST_LEDGER must be sql or s3/);
     expect(() => selfhostIngestConfig({ ...enabled, INGEST_LEDGER: "s3", RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true" })).toThrow(/INGEST_LEDGER=s3 refuses/);
     expect(() => selfhostIngestConfig({ ...enabled, INGEST_LEDGER: "s3", INGEST_UPLOAD_CONSENT: "enforce" })).toThrow(/INGEST_LEDGER=s3 refuses/);
+    // INGEST_LEDGER_LOG_COMMIT: on is an S3-ledger feature; off (or unset) changes nothing.
+    expect(selfhostIngestConfig({ ...enabled, INGEST_LEDGER: "s3", INGEST_LEDGER_LOG_COMMIT: "on" })).toMatchObject({ enabled: true, ledger: "s3" });
+    expect(selfhostIngestConfig({ ...enabled, INGEST_LEDGER_LOG_COMMIT: "off" })).toEqual(base);
+    expect(() => selfhostIngestConfig({ ...enabled, INGEST_LEDGER_LOG_COMMIT: "on" })).toThrow(/INGEST_LEDGER_LOG_COMMIT=on needs INGEST_LEDGER=s3/);
   });
 
   test("upload object -> the consumer's scan -> promoteUpload -> admitMessage over the S3 ledger -> admitted; the SQL runner is never called", async () => {
@@ -295,7 +299,7 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
   test("the synchronous runtime (no admission mode, no direct upload) is built on that gated ledger", async () => {
     const src = readFileSync(join(import.meta.dir, "../selfhost-server.ts"), "utf8");
     expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined) : sqlLedger(');
-    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}) })');
+    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),\n      ...(selfhostLedgerLogCommit(process.env) === "on" ? { logModeGuard: true } : {}) })');
   });
 
   test("a direct caller cannot combine the S3 ledger with a SQL-only feature", async () => {

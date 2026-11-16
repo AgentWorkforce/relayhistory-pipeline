@@ -94,7 +94,9 @@ import { tenantLimiter, type TenantLimiter } from "./tenant-limiter.ts";
 import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
-import { SELFHOST_INGEST_ROLE, defaultAsyncMaxPerOrg, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
+import { SELFHOST_INGEST_ROLE, defaultAsyncMaxPerOrg, selfhostIngestConfig, selfhostLedgerLogCommit, type SelfhostIngestSettings } from "./selfhost-config.ts";
+import { LogStreams } from "./ledger-log-admit.ts";
+import { randomUUID } from "node:crypto";
 import { isSessionErasePath } from "./session-erase.ts";
 import type { SessionEraseService } from "./session-erase.ts";
 import { buildSelfhostEraseRuntime } from "../session-erase/selfhost-runtime.ts";
@@ -214,7 +216,9 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
     // INGEST_S3_TENANT_LIMIT=on: the synchronous path's tenant limiter (one per process / replica). Off: no limiter, unchanged.
-    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}) }),
+    // INGEST_LEDGER_LOG_COMMIT=on: legacy claims and commits refuse a stream in log mode (its log is the only writer).
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),
+      ...(selfhostLedgerLogCommit(process.env) === "on" ? { logModeGuard: true } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
@@ -305,6 +309,10 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // INGEST_S3_TENANT_LIMIT=on: the per-replica tenant limit defers an object (never dead-letters it). Off: unchanged.
     ...(asyncLimiter ? { deferTenantLimit: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
+    // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
+    ...(s3 && selfhostLedgerLogCommit(process.env) === "on"
+      ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
+      : {}),
   });
   options.onConsumer?.(consumer);
   const app = withSelfhostCapabilities(createIngestApp({
