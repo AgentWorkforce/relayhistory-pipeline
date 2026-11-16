@@ -25,7 +25,7 @@ const ADMISSION_PHASE_FIELDS_LIST = [...ADMISSION_PHASE_FIELDS.values()];
  * digest read, and the caps it logs at startup. Bounded counts only.
  */
 const SUMMARY_INPUT_FIELDS = [
-  "chunks_read", "chunks_total", "bytes_read", "text_dropped", "names_dropped", "turns_dropped",
+  "chunks_read", "chunks_total", "bytes_read", "names_dropped", "turns_dropped",
   "max_chunks", "max_input_bytes", "max_chunk_bytes",
 ];
 

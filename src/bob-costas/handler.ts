@@ -127,8 +127,16 @@ interface Outcome {
   tokensIn: number;
   tokensOut: number;
   records: number;
-  /** Set when an input cap fired: the digest describes part of the session. */
+  /** Set when an input cap fired that makes the digest's counts lower bounds. */
   input?: DigestInputTruncation;
+  /** User turns read but not kept (sampling on): the counts are exact, the turns a sample. */
+  turnsDropped?: number;
+  /**
+   * Publish this (text-free) outcome, clearing any earlier summary, then fail the delivery
+   * with this code: a session of delivery envelopes that could not be read whole, where a
+   * summary kept from before might show content since deleted or revised.
+   */
+  failAfterPublish?: string;
 }
 
 /**
@@ -165,13 +173,21 @@ async function buildOutcome(
   const s = m.session;
   // Streamed chunk by chunk within the input caps (session-input.ts): never the whole
   // session in memory, whatever its chunk count or size.
-  const digest = await readSessionDigest({
-    manifest: m,
-    location: sessionLocation(m, manifestKey),
-    store: deps.store,
-    ...(deps.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: deps.readerMaxRuleset }),
-    ...(deps.inputCaps ? { caps: deps.inputCaps } : {}),
-  });
+  let digest;
+  try {
+    digest = await readSessionDigest({
+      manifest: m,
+      location: sessionLocation(m, manifestKey),
+      store: deps.store,
+      ...(deps.readerMaxRuleset === undefined ? {} : { readerMaxRuleset: deps.readerMaxRuleset }),
+      ...(deps.inputCaps ? { caps: deps.inputCaps } : {}),
+    });
+  } catch (err) {
+    // Privacy first: clear the envelope session's summary, then dead-letter.
+    if (err instanceof PipelineError && err.code === "summary_input_incomplete")
+      return { status: "quarantined", ...none, failAfterPublish: err.code };
+    throw err;
+  }
   if (digest.records === 0) {
     // A capped read that found nothing says nothing about the session: never publish it as
     // empty, which would clear a ready summary object.
@@ -194,6 +210,7 @@ async function buildOutcome(
     tokensOut: summary.tokensOut,
     records: digest.records,
     ...(digest.input ? { input: digest.input } : {}),
+    ...(digest.userTurnsSampled ? { turnsDropped: digest.userTurnCount - digest.userTurns.length } : {}),
   };
 }
 
@@ -373,6 +390,7 @@ export function bobCostasHandler(
             model: outcome.model!,
             source_content_sha256: m.raw.content_sha256,
             ...(outcome.input ? { input_truncated: true as const } : {}),
+            ...(outcome.turnsDropped ? { turns_sampled: true as const } : {}),
           }
         : {}),
       built_at: (deps.now?.() ?? new Date()).toISOString(),
@@ -498,18 +516,20 @@ export function bobCostasHandler(
       revision: m.revision,
       session_uuid: ctx.session_uuid,
       count: outcome.records,
-      // Counts only: how much of a capped session the digest read.
+      // Counts only: how much of a capped session the digest read, and how many turns it kept.
       ...(outcome.input
         ? {
             reason: "input_truncated",
             chunks_read: outcome.input.chunksRead,
             chunks_total: outcome.input.chunksTotal,
             bytes_read: outcome.input.bytesRead,
-            text_dropped: outcome.input.textDropped,
             names_dropped: outcome.input.namesDropped,
-            turns_dropped: outcome.input.turnsDropped,
           }
         : {}),
+      ...(outcome.turnsDropped ? { turns_dropped: outcome.turnsDropped } : {}),
+      ...(outcome.failAfterPublish ? { reason: outcome.failAfterPublish, error_code: outcome.failAfterPublish, retryable: false } : {}),
     });
+    if (outcome.failAfterPublish)
+      throw new PipelineError(outcome.failAfterPublish, "the summary input could not be read whole; the summary was cleared", false);
   };
 }

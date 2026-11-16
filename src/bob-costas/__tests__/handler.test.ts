@@ -201,7 +201,7 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
     await expect(bobCostasHandler("long", {
       ...deps,
       reader: { provider: "fs", read: async () => ({ manifest: next }) } as never,
-      inputCaps: { sampling: false, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 },
+      inputCaps: { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 },
     })(message, recorder)).rejects.toMatchObject({ code: "summary_input_unreadable", retryable: false });
     const after = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256, revision FROM sessions.session_summaries`)).rows[0]!;
     expect(after).toMatchObject({ status: "ready", object_key: before.object_key, object_sha256: before.object_sha256 });
@@ -210,6 +210,43 @@ describe("Bob Costas stores summaries as encrypted Locker objects, pointers in H
       key: String(before.object_key), sha256: String(before.object_sha256), kind: "long", revision: 2,
     });
     expect(rec?.summary).toContain("PLANTED-PROMPT");
+  });
+
+  it("an envelope session that cannot be read whole has its summary cleared, then fails non-retryably", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const env = (uid: string, text: string, revision = 1) => JSON.stringify({
+      kind: "session_event", origin_id: "o1", record_id: uid, revision: String(revision), operation: "upsert",
+      received_at: "2026-11-16T00:00:00Z", payload: { kind: "text", role: "user", text, ts_ms: 1_763_251_200_000 },
+    });
+    await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(env("r1", "PLANTED-SECRET-PROMPT") + "\n")));
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const deps = { db, store, summarizer: extractiveSummarizer, directory: noDirectory, keyring };
+    const first = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
+    await bobCostasHandler("long", { ...deps, reader: { provider: "fs", read: async () => ({ manifest: first }) } as never })(message, recorder);
+    const before = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(before.status).toBe("ready");
+    // Revision 3 adds a chunk past the per-chunk cap (it might hold the tombstone): it cannot be read whole.
+    await store.put(rawChunkKey(loc, 1, 100, "abcdef13", "jsonl"), zstdCompressSync(Buffer.from(env("r2", "z".repeat(200 * 1024)) + "\n")));
+    const next = { ...manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }, { seq: 1, start_offset: 100, sha256_8: "abcdef13" }]), revision: 3 };
+    await expect(bobCostasHandler("long", {
+      ...deps,
+      reader: { provider: "fs", read: async () => ({ manifest: next }) } as never,
+      inputCaps: { sampling: true, maxChunks: 512, maxInputBytes: 1 << 20, maxChunkBytes: 64 * 1024 },
+    })(message, recorder)).rejects.toMatchObject({ code: "summary_input_incomplete", retryable: false });
+    const after = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, revision FROM sessions.session_summaries`)).rows[0]!;
+    expect(after).toMatchObject({ status: "quarantined", object_key: null });
+    expect(Number(after.revision)).toBe(3);
+    // The object at the old key no longer holds the text.
+    const head = await store.head(objectKey(String(before.object_key)));
+    if (head) {
+      const raw = new TextDecoder().decode(await new Response(await store.get(objectKey(String(before.object_key)))).arrayBuffer());
+      expect(raw).not.toContain("PLANTED-SECRET-PROMPT");
+      expect(await readSummaryObject({
+        store, keyring, ids: { orgId: "o", workspaceId: "w" },
+        key: String(before.object_key), sha256: String(before.object_sha256), kind: "long", revision: 2,
+      })).toBeNull();
+    }
   });
 
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {

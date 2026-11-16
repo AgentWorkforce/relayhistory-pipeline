@@ -893,10 +893,12 @@ key.
 
 Bob Costas streams a session's chunks into the digest one at a time and folds
 delivery envelopes as they arrive (`src/bob-costas/session-input.ts`, whose
-header is the reference), so its memory does not grow with the session's
-chunk count or size. With `BOB_COSTAS_INPUT_SAMPLING` off (the default) every
+header is the reference), so it never holds more than one chunk of the
+session at a time. With `BOB_COSTAS_INPUT_SAMPLING` off (the default) every
 chunk is read and the digest, and so every summary and prompt, is exactly what
-the whole-session read produced.
+the whole-session read produced; memory then still grows with the session's
+user-turn text and its number of envelope records, though not with its bytes
+or chunk count. With sampling on it is bounded whatever the session's size.
 
 With sampling on, a transcript session past the caps is summarised from a
 sample of its chunks (the first and the last, then an evenly spaced selection
@@ -904,19 +906,23 @@ between), user turns are sampled and clipped, and tool names, models and
 envelope text are capped. A session of delivery envelopes is always read
 whole, so every revision and tombstone is applied.
 
-Whenever a cap fires, the summary object carries `input_truncated: true`, the
-long summary says so, and the `bob costas summary` log line adds
-`reason: input_truncated` with `chunks_read`, `chunks_total`, `bytes_read`,
-`text_dropped`, `names_dropped` and `turns_dropped`. A capped read that finds
-no record, or an envelope session with an unreadable chunk, fails the summary
-(non-retryable) rather than publishing an empty or partial one.
+When chunks are skipped or names dropped, the counts are lower bounds: the
+summary object carries `input_truncated: true`, the long summary says so, and
+the `bob costas summary` log line adds `reason: input_truncated` with
+`chunks_read`, `chunks_total`, `bytes_read` and `names_dropped`. When only the
+user turns were sampled the counts are exact: the object carries
+`turns_sampled: true` and the log line `turns_dropped`. A capped read that
+finds no record fails the summary (non-retryable) rather than publishing an
+empty one; an envelope session with an unreadable chunk has its summary
+cleared (`quarantined`) and then fails (non-retryable), so no summary of
+content since deleted or revised stays visible.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BOB_COSTAS_INPUT_SAMPLING` | `off` | `on` turns on chunk, turn and name sampling as above |
 | `BOB_COSTAS_MAX_CHUNKS` | 512 | chunks read per summary (sampling on) |
 | `BOB_COSTAS_MAX_INPUT_BYTES` | 268435456 (256 MiB) | decompressed chunk bytes read per summary (sampling on); never below the per-chunk cap |
-| `BOB_COSTAS_MAX_CHUNK_BYTES` | 33554432 (32 MiB) | per chunk, decompressed, always; a bigger chunk is never inflated |
+| `BOB_COSTAS_MAX_CHUNK_BYTES` | 33554432 (32 MiB) | per chunk, decompressed, always; a bigger chunk is never inflated. With sampling off, never below 24 MiB (the ingest writes at most 16 MiB) |
 
 The defaults fit a 4 GiB container: the worker handles one message at a time,
 and a summary's peak is one inflated chunk plus the digest's state. A value

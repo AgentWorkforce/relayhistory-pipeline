@@ -85,6 +85,11 @@ export interface SummaryRecord {
    * input caps: a sample of its chunks, lines or envelopes). Absent otherwise.
    */
   input_truncated?: true;
+  /**
+   * Ready only: true when the summary saw a sample of the session's user turns (Bob Costas
+   * with sampling on); every turn was still counted. Absent otherwise.
+   */
+  turns_sampled?: true;
   trace_id: string;
 }
 

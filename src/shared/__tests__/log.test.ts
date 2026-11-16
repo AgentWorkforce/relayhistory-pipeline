@@ -77,7 +77,7 @@ describe("telemetry allowlist", () => {
   });
 
   test("the Bob Costas summary input fields are bounded counts only", () => {
-    for (const f of ["chunks_read", "chunks_total", "bytes_read", "text_dropped", "names_dropped", "turns_dropped",
+    for (const f of ["chunks_read", "chunks_total", "bytes_read", "names_dropped", "turns_dropped",
       "max_chunks", "max_input_bytes", "max_chunk_bytes"]) {
       expect(ALLOWED_LOG_FIELDS.has(f)).toBe(true);
       expect(BOUNDED_COUNT_FIELDS.has(f)).toBe(true);

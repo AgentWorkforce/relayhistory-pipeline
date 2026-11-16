@@ -23,7 +23,7 @@ import {
   type SessionDigest,
 } from "../summarizer.ts";
 import { buildModelRequest, buildPromptInput, modelSummarizerConfig, promptTurns } from "../model-summarizer.ts";
-import { legacyDigestRecords, legacyExtractiveSummarizer } from "./fixtures/legacy-digest.ts";
+import { legacyBuildPromptInput, legacyDigestRecords, legacyExtractiveSummarizer } from "./fixtures/legacy-digest.ts";
 import { codexRollout } from "./fixtures/codex-rollout.ts";
 import { T0, deliveredSession, envelope, sessionEvent, toolCall } from "./fixtures/delivery-envelopes.ts";
 
@@ -149,27 +149,37 @@ describe("TurnSampler and clipTurn (sampling on)", () => {
     expect([...kept].sort((a, b) => a - b)).toEqual(kept);
   });
 
-  test("clipTurn collapses whitespace before it clips", () => {
+  test("clipTurn scrubs, then collapses whitespace, then clips", () => {
     expect(clipTurn("a \n\t b")).toBe("a b");
     expect(clipTurn("x".repeat(TURN_TEXT_CHARS * 3)).length).toBe(TURN_TEXT_CHARS);
+    expect(clipTurn("key ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 end")).not.toContain("ghp_");
   });
 
-  test("whitespace padding cannot pull a token cut by the clip into a summary", async () => {
+  test("no token cut by the clip reaches a summary or a prompt, whatever the scrub shrinks first", async () => {
     const token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
-    const padded = [
-      // Padding alone: collapsed, the whole token survives and the re-scrub matches it.
-      user(" ".repeat(8_178) + token),
-      // Padding plus filler: the token straddles the clip, far past what any summariser reads.
-      user(" ".repeat(20_000) + "y".repeat(TURN_TEXT_CHARS - 10) + " " + token),
+    // A multi-KB PEM the ingest scrub missed: the re-scrub turns it into one short marker.
+    const pemBody = Array.from({ length: 118 }, () => "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj").join("\n");
+    const pem = `-----BEGIN PRIVATE KEY-----\n${pemBody}\n-----END PRIVATE KEY-----`;
+    const straddle = (prefix: string) => prefix + "f".repeat(Math.max(0, TURN_TEXT_CHARS - 6 - prefix.length)) + " " + token;
+    const turns = [
+      // Padding alone: the whole token is scrubbed.
+      " ".repeat(8_178) + token,
+      // Padding plus filler: the token straddles the clip.
+      " ".repeat(20_000) + "y".repeat(TURN_TEXT_CHARS - 10) + " " + token,
+      // The lander's repro: a ~7.7k PEM, filler, and a token across the 8,192 cut.
+      straddle(pem + " "),
+      straddle(pem + "\n\n" + " ".repeat(300)),
     ];
-    const d = digestRecords("claude", padded, { sampling: true });
-    const outputs = [
-      (await extractiveSummarizer.summarize("short", d)).text,
-      (await extractiveSummarizer.summarize("long", d)).text,
-      buildPromptInput("short", d),
-      buildPromptInput("long", d),
-    ];
-    for (const out of outputs) expect(out).not.toContain("ghp_A1b2C3d4E5");
+    for (const turn of turns) {
+      const d = digestRecords("claude", [user(turn)], { sampling: true });
+      const outputs = [
+        (await extractiveSummarizer.summarize("short", d)).text,
+        (await extractiveSummarizer.summarize("long", d)).text,
+        buildPromptInput("short", d),
+        buildPromptInput("long", d),
+      ];
+      for (const out of outputs) expect(out).not.toContain("ghp_");
+    }
   });
 });
 
@@ -217,12 +227,30 @@ describe("readSessionDigest", () => {
     expect(session.fetched.length).toBeLessThanOrEqual(d.input!.chunksRead + 1);
   });
 
-  test("a chunk past the per-chunk cap is never inflated, and the digest is marked", async () => {
+  test("sampling on: a chunk past the per-chunk cap is never inflated, and the digest is marked", async () => {
+    const session = lazySession(3, bulky(256 * 1024), { declare: () => undefined });
+    const d = await readSessionDigest({ manifest: session.manifest, location: loc, store: session.store,
+      caps: { ...ON, maxChunkBytes: 128 * 1024 } });
+    expect(d.records).toBe(0);
+    expect(d.input).toMatchObject({ chunksRead: 0, chunksTotal: 3 });
+  });
+
+  test("sampling off: the per-chunk cap never drops below 24 MiB, so every chunk main reads is read", async () => {
     const session = lazySession(3, bulky(256 * 1024), { declare: () => undefined });
     const d = await readSessionDigest({ manifest: session.manifest, location: loc, store: session.store,
       caps: { ...DEFAULT_SUMMARY_INPUT_CAPS, maxChunkBytes: 128 * 1024 } });
-    expect(d.records).toBe(0);
-    expect(d.input).toMatchObject({ chunksRead: 0, chunksTotal: 3 });
+    expect(d.input).toBeUndefined();
+    expect(d.userTurnCount).toBe(3);
+  });
+
+  test("sampling on, turns sampled but every chunk read: counts exact, not marked truncated", async () => {
+    const lines = Array.from({ length: 1_000 }, (_, i) => user(`u${i}`));
+    const session = lazySession(10, chunked(lines, 100));
+    const d = await readSessionDigest({ manifest: session.manifest, location: loc, store: session.store, caps: ON });
+    expect(d.input).toBeUndefined();
+    expect(d.userTurnsSampled).toBe(true);
+    expect(d.userTurnCount).toBe(1_000);
+    expect((await extractiveSummarizer.summarize("long", d)).text).not.toContain("- Input:");
   });
 
   test("a missing chunk is retryable chunk_missing, as before", async () => {
@@ -275,7 +303,7 @@ describe("delivery envelopes are always folded whole", () => {
     const lines = [prompt(1), envelope("session_event", "m-9:0", sessionEvent(9, "user", "x".repeat(300 * 1024)))];
     const session = lazySession(2, chunked(lines, 1), { declare: () => undefined });
     await expect(readSessionDigest({ manifest: session.manifest, location: loc, store: session.store,
-      caps: { ...DEFAULT_SUMMARY_INPUT_CAPS, maxChunkBytes: 128 * 1024 } }))
+      caps: { ...ON, maxChunkBytes: 128 * 1024 } }))
       .rejects.toMatchObject({ code: "summary_input_incomplete", retryable: false });
   });
 });
@@ -342,6 +370,8 @@ describe("sampling off: byte-identical to the whole-session digest", () => {
       for (const kind of ["short", "long"] as const)
         expect((await extractiveSummarizer.summarize(kind, fresh)).text).toBe((await legacyExtractiveSummarizer.summarize(kind, legacy)).text);
       expect(promptTurns(fresh, 20)).toEqual(legacy.userTurns.slice(0, 20));
+      for (const kind of ["short", "long"] as const)
+        expect(buildPromptInput(kind, fresh)).toBe(legacyBuildPromptInput(kind, legacy));
       expect(buildModelRequest("long", fresh, modelSummarizerConfig("m1", {})).instructions).not.toContain("input_sampled");
       // Streamed in chunks of three lines, the same digest.
       const session = lazySession(Math.max(1, Math.ceil(lines.length / 3)), chunked(lines, 3));

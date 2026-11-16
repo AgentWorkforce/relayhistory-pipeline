@@ -48,20 +48,18 @@ export interface SessionDigest {
 }
 
 /**
- * Which caps fired while a digest was built. Counts only, never content. The digest's
- * counts (records, turns, tools) are then lower bounds for the whole session.
+ * The caps that fired and make the digest's counts (records, turns, tools) lower bounds for
+ * the whole session: chunks not read, or tool names and models not tracked. Counts only,
+ * never content. Turn sampling alone (`userTurnsSampled`) is not truncation: every turn
+ * is still counted.
  */
 export interface DigestInputTruncation {
   chunksTotal: number;
   chunksRead: number;
   /** Decompressed bytes read. */
   bytesRead: number;
-  /** User turns counted without their text (the envelope text budget). */
-  textDropped: number;
   /** Tool names or models not tracked (past their caps). */
   namesDropped: number;
-  /** User turns read but not kept (the turn sample). */
-  turnsDropped: number;
 }
 
 /** Sampling on: the user turns kept, the first, the last, and an evenly spaced sample between. */
@@ -70,10 +68,9 @@ export const RETAINED_MIDDLE_TURNS = 32;
 export const RETAINED_TAIL_TURNS = 16;
 export const RETAINED_USER_TURNS = RETAINED_HEAD_TURNS + RETAINED_MIDDLE_TURNS + RETAINED_TAIL_TURNS;
 /**
- * Sampling on: a kept turn's text, whitespace runs collapsed first, is clipped to this many
- * characters. The summarisers collapse whitespace too and then read at most 800 (model,
- * after a re-scrub) and 200 (extractive), so a token cut by the clip lies thousands of
- * characters past anything they read, however the turn was padded.
+ * Sampling on: a kept turn's text is scrubbed, its whitespace runs collapsed, and then
+ * clipped to this many characters (`clipTurn`). The summarisers read at most 800 (model)
+ * and 200 (extractive) characters of it.
  */
 export const TURN_TEXT_CHARS = 8_192;
 /** Sampling on: distinct tool names and models tracked; further names are not counted. */
@@ -105,12 +102,15 @@ export interface Summarizer {
 }
 
 /**
- * A fresh string holding `s` with whitespace runs collapsed and clipped to TURN_TEXT_CHARS.
- * Collapsing before the clip keeps padding from pulling a cut token into the part the
- * summarisers read; the copy (Buffer round trip) keeps a slice from holding its parent.
+ * A fresh string holding `s` scrubbed, with whitespace runs collapsed, clipped to
+ * TURN_TEXT_CHARS: the summarisers' own order (scrub, collapse, bound), so the clip only ever
+ * cuts text that is already scrubbed and collapsed. Re-scrubbing it later cannot shrink
+ * the part before the cut, so a token the clip cuts stays thousands of characters past
+ * anything a summariser reads, however the turn was padded or what the scrub redacted.
+ * The copy (Buffer round trip) keeps a slice from holding its parent alive.
  */
 export function clipTurn(s: string): string {
-  const collapsed = s.replace(/\s+/g, " ");
+  const collapsed = scrubText(s).replace(/\s+/g, " ");
   const clipped = collapsed.length > TURN_TEXT_CHARS ? collapsed.slice(0, TURN_TEXT_CHARS) : collapsed;
   return Buffer.from(clipped, "utf16le").toString("utf16le");
 }
@@ -228,11 +228,6 @@ export class DigestBuilder {
   /** True once a delivery envelope was folded: the session must be read whole. */
   get hasEnvelopes(): boolean {
     return this.sawEnvelopes;
-  }
-
-  /** Counts a line the caller did not parse (over its line cap) as one record, like bad JSON. */
-  countUnparsed(): void {
-    this.d.records += 1;
   }
 
   addLine(line: string): void {
@@ -355,8 +350,16 @@ export class DigestBuilder {
     if (flagged(p.control_kind)) out.control_kind = true;
     if (truthy(p.is_meta)) out.is_meta = true;
     if (truthy(p.is_sidechain)) out.is_sidechain = true;
-    if (typeof p.model === "string" && p.model) out.model = p.model;
-    if (kind === "tool_call" && typeof p.name === "string") out.name = p.name;
+    // Sampling off: kept whole, so the digest stays byte-identical. Sampling on: a value past
+    // MAX_NAME_CHARS is never tracked (addModel, countTool), so only that fact is held.
+    if (typeof p.model === "string" && p.model) {
+      if (this.sampling && p.model.length > MAX_NAME_CHARS) out.model_too_long = true;
+      else out.model = p.model;
+    }
+    if (kind === "tool_call" && typeof p.name === "string") {
+      if (this.sampling && p.name.length > MAX_NAME_CHARS) out.name_too_long = true;
+      else out.name = p.name;
+    }
     if (kind === "session_event" && p.kind === "text" && p.role === "user" && typeof p.text === "string") {
       if (!this.sampling) out.text = p.text;
       else if (p.text.trim()) {
@@ -437,8 +440,10 @@ export class DigestBuilder {
         if (last === undefined || ms > last) last = ms;
       }
       if (typeof p.model === "string" && p.model) this.addModel(p.model);
+      else if (p.model_too_long === true) this.namesDropped += 1;
       if (record.kind === "tool_call") {
         if (typeof p.name === "string" && p.name.trim()) this.countTool(p.name);
+        else if (p.name_too_long === true) this.namesDropped += 1;
         continue;
       }
       if (record.kind !== "session_event" || p.kind !== "text" || flagged(p.control_kind) || truthy(p.is_meta)) continue;
@@ -463,7 +468,7 @@ export class DigestBuilder {
     if (this.sawEnvelopes) this.digestEnvelopes();
     d.userTurns = this.turns.turns();
     d.userTurnCount = this.turns.count;
-    if (d.userTurns.length < d.userTurnCount) d.userTurnsSampled = true;
+    if (d.userTurns.length < d.userTurnCount || this.textDropped > 0) d.userTurnsSampled = true;
     return d;
   }
 }

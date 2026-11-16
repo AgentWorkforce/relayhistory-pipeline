@@ -250,3 +250,35 @@ export const legacyExtractiveSummarizer: Summarizer = {
     return { text: scrubText(text), modelId: this.id, tokensIn: 0, tokensOut: 0 };
   },
 };
+
+// Frozen from src/bob-costas/model-summarizer.ts at the same commit (LIMITS, clean, buildPromptInput).
+const LEGACY_LIMITS = {
+  short: { turns: 5, turnChars: 400, outputChars: 280 },
+  long: { turns: 20, turnChars: 800, outputChars: 4_000 },
+} as const;
+
+/** Scrub first, then bound: clipping first could cut a secret below a rule's match. */
+const clean = (s: string, n: number) => {
+  const scrubbed = scrubText(s).replace(/\s+/g, " ").trim();
+  return scrubbed.length > n ? `${scrubbed.slice(0, n - 1)}…` : scrubbed;
+};
+
+/** The request input: digest fields only, every string scrubbed. */
+export function legacyBuildPromptInput(kind: "short" | "long", d: SessionDigest): string {
+  const lim = LEGACY_LIMITS[kind];
+  const tools = Object.entries(d.toolCalls)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([name, count]) => ({ name: clean(name, 80), count }));
+  return JSON.stringify({
+    harness: clean(d.harness, 64),
+    records: d.records,
+    user_turn_count: d.userTurns.length,
+    assistant_turn_count: d.assistantTurns,
+    user_turns: d.userTurns.slice(0, lim.turns).map((t) => clean(t, lim.turnChars)),
+    tool_calls: tools,
+    models: d.models.slice(0, 10).map((m) => clean(m, 128)),
+    first_ts: d.firstTs ? clean(d.firstTs, 40) : null,
+    last_ts: d.lastTs ? clean(d.lastTs, 40) : null,
+  });
+}
