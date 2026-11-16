@@ -19,6 +19,7 @@ import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/aut
 import { authorityKind, authorityUrl, eraserFor } from "../neon-s3-erasure/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
@@ -376,6 +377,39 @@ async function world() {
 }
 
 describe("supabase privacy authority as the eraser's source", () => {
+  test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {
+    const w = await world();
+    await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+      first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
+      PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+    const machine = legacyMachineId("ws/1", "legacy-owner");
+    const registration = {
+      org_id: "org-1", workspace_id: "ws/1", source: "claude", session_id: "legacy:sess",
+      legacy_user_id: "legacy-owner", legacy_machine_id: machine,
+    };
+    await w.f.db.exec("BEGIN;SET LOCAL ROLE bulls96_legacy_export_privacy");
+    try {
+      const r = (await w.f.db.query(
+        "SELECT sessions.ingest_legacy_export_scope_authority_register($1::jsonb) AS r",
+        [JSON.stringify(registration)],
+      )).rows[0] as { r: typeof registration };
+      expect(r.r).toEqual(registration);
+      await w.f.db.exec("COMMIT");
+    } catch (error) {
+      await w.f.db.exec("ROLLBACK");
+      throw error;
+    }
+    await w.activate();
+    await w.f.db.query(
+      "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'legacy_import')",
+      [registration.org_id, registration.workspace_id, registration.source, registration.session_id],
+    );
+    const authority = supabaseAuthority(w.f.queryable);
+    expect(await authority.legacyFencedPage!(null)).toEqual([registration]);
+    expect(await authority.stillLegacyFenced!(registration)).toBe(true);
+  });
+
   test("before activation the frozen table is NOT the authority: nothing is erased even with a fence row present", async () => {
     const w = await world();
     // A frozen-only row (Neon may already have re-enabled this session while Neon is still the authority).

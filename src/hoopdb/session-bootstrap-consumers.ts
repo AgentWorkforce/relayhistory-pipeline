@@ -20,6 +20,7 @@ export const SESSION_BOOTSTRAP_CONSUMERS: readonly (readonly [role: string, firs
   ["bulls96_project_events", "20261105033000_canonical_project_events.sql"],
   ["bulls96_read_api", "20261105034000_session_directory_read_api.sql"],
   ["bulls96_privacy_eraser", "20261105041000_ingest_privacy_authority.sql"],
+  ["bulls96_legacy_export_privacy", "20261105062020_legacy_export_scope_authority.sql"],
   ["bulls96_babysitter_retention", "20261105042000_babysitter_evidence_retention.sql"],
   ["bulls96_acquisition_installer", "20261105043850_ingest_acquisition_owner.sql"],
   ["buffered_search_feed_runtime", "20261105043870_buffered_search_feed_cursor.sql"],

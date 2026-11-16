@@ -63,13 +63,30 @@ export function selectedPublicTurnPredicateSql(
 ): string {
   if (!/^\$[1-9][0-9]*$/u.test(sourceParameter))
     throw new Error("turn source SQL parameter invalid");
+  return selectedPublicTurnPredicateExpressionSql(alias, sourceParameter, eventWorkspace);
+}
+
+/** Same selected-turn rule for a trusted source column in a joined scope row. */
+export function selectedPublicTurnPredicateColumnSql(
+  alias: string,
+  sourceAlias: string,
+  eventWorkspace: EventWorkspace = "turn",
+): string {
+  return selectedPublicTurnPredicateExpressionSql(alias, `${columns(sourceAlias)}."source"`, eventWorkspace);
+}
+
+function selectedPublicTurnPredicateExpressionSql(
+  alias: string,
+  sourceExpression: string,
+  eventWorkspace: EventWorkspace,
+): string {
   const t = columns(alias),
     e = ref(alias + "_other_event"),
     attributed = publicTurnSourceSql(alias, eventWorkspace);
-  return `(${attributed}=${sourceParameter} OR (${attributed} IS NULL AND NOT EXISTS(
+  return `(${attributed}=${sourceExpression} OR (${attributed} IS NULL AND NOT EXISTS(
  SELECT 1 FROM sessions.convergence_events ${e} WHERE ${e}.org_id=${t}.org_id
  ${eventWorkspaceSql(e, t, eventWorkspace)} AND ${e}.session_id=${t}.session_id
- AND ${e}.source<>${sourceParameter})))`;
+ AND ${e}.source<>${sourceExpression})))`;
 }
 
 const orderEncoder = new TextEncoder();

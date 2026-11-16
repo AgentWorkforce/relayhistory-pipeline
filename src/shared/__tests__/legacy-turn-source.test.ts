@@ -5,6 +5,7 @@ import {
   comparePublicTurnRows,
   publicTurnSourceSql,
   resolvedPublicTurnSourceSql,
+  selectedPublicTurnPredicateColumnSql,
   selectedPublicTurnPredicateSql,
 } from "../legacy-turn-source.ts";
 const pg = new PGlite();
@@ -174,6 +175,8 @@ test("SQL helpers refuse caller fragments and ambiguous identifier truncation", 
   expect(() => publicTurnSourceSql("t".repeat(33))).toThrow();
   expect(() => selectedPublicTurnPredicateSql("t", "'claude'")).toThrow();
   expect(() => selectedPublicTurnPredicateSql("t", "$1 OR true")).toThrow();
+  expect(selectedPublicTurnPredicateColumnSql("t", "f")).toContain('="f"."source"');
+  expect(() => selectedPublicTurnPredicateColumnSql("t", "f.source")).toThrow();
   expect(() => publicTurnSourceSql("t".repeat(32))).not.toThrow();
 });
 

@@ -41,6 +41,22 @@ const all = (n: string) => args.filter((a) => a.startsWith(`--${n}=`)).map((a) =
 const log = (f: Record<string, unknown>) =>
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "legacy-export", ...f })}\n`);
 
+/**
+ * Dedicated direct privacy connection. The login remains table-SELECT-only,
+ * but its transactions must be write-capable so the one narrow SECURITY
+ * DEFINER authority registration RPC can insert before an S3 PUT.
+ */
+export async function legacyPrivacySession(client: Queryable): Promise<Queryable> {
+  await client.query(`SET default_transaction_read_only = off; SET statement_timeout = 20000;
+    SET lock_timeout = 5000; SET idle_in_transaction_session_timeout = 30000; SET TimeZone = 'UTC'`);
+  const { rows } = await client.query<{ ro: string; tz: string }>(
+    "SELECT current_setting('transaction_read_only') AS ro, current_setting('TimeZone') AS tz",
+  );
+  if (rows[0]?.ro !== "off" || rows[0]?.tz !== "UTC")
+    throw Object.assign(new Error("the privacy session cannot register export authority"), { code: "privacy_session_not_rpc_capable" });
+  return client;
+}
+
 /** Secrets from stdin only; refuses when stdin is a terminal (no echo, no history). */
 export async function readSecrets(text?: string): Promise<{ neonUrl: string; privacyUrl: string; s3?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string } }> {
   if (text === undefined) {
@@ -64,21 +80,39 @@ export async function assertPrivacySelectOnly(db: Queryable) {
   for (const table of [
     "session_erasure_receipts",
     "upload_deletions",
+    "ingest_frozen_source_deletions",
     "upload_resets",
     "turn_session_fences",
     "operator_user_erasures",
   ]) {
-    const { rows } = await db.query<{ w: boolean; r: boolean; rls: boolean }>(
+    const { rows } = await db.query<{ w: boolean; r: boolean; visible: boolean }>(
       `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
               has_table_privilege(current_user,'sessions.${table}','SELECT') AS r,
-              row_security_active('sessions.${table}'::regclass) AS rls`,
+              (NOT row_security_active('sessions.${table}'::regclass) OR (
+                EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid='sessions.${table}'::regclass
+                  AND p.polcmd='r' AND p.polpermissive
+                  AND (SELECT oid FROM pg_roles WHERE rolname=current_user)=ANY(p.polroles)
+                  AND pg_get_expr(p.polqual,p.polrelid) IN ('true','(true)'))
+                AND NOT EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid='sessions.${table}'::regclass
+                  AND p.polcmd IN('r','*') AND NOT p.polpermissive
+                  AND (0=ANY(p.polroles) OR (SELECT oid FROM pg_roles WHERE rolname=current_user)=ANY(p.polroles)))
+              )) AS visible`,
     );
-    if (rows[0]?.w !== false || rows[0]?.r !== true || rows[0]?.rls !== false)
+    if (rows[0]?.w !== false || rows[0]?.r !== true || rows[0]?.visible !== true)
       throw Object.assign(
-        new Error("the privacy role must read every erasure row without write access or active RLS"),
+        new Error("the privacy role must read every erasure row without table write access"),
         { code: "privacy_role_not_read_only" },
       );
   }
+  const authority = await db.query<{ w: boolean; x: boolean }>(
+    `SELECT has_table_privilege(current_user,'sessions.legacy_export_scope_authority','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+            has_function_privilege(current_user,'sessions.ingest_legacy_export_scope_authority_register(jsonb)','EXECUTE') AS x`,
+  );
+  if (authority.rows[0]?.w !== false || authority.rows[0]?.x !== true)
+    throw Object.assign(new Error("the privacy role must have only the legacy authority register RPC"), { code: "privacy_role_not_register_only" });
+  const identity = await db.query<{ who: string }>("SELECT current_user::text AS who");
+  if (identity.rows[0]?.who !== "bulls96_legacy_export_privacy")
+    throw Object.assign(new Error("the dedicated legacy-export privacy role is required"), { code: "privacy_role_identity" });
 }
 
 /** The Neon role must not be able to write any legacy table. */
@@ -129,9 +163,7 @@ export async function main() {
   const checkpoint = new Checkpoint(flag("plan") ? ":memory:" : statePath);
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
-    const privacyDb = await sessionReadOnly(
-      privacyClient as unknown as Queryable,
-    );
+    const privacyDb = await legacyPrivacySession(privacyClient as unknown as Queryable);
     await assertSelectOnly(db);
     await assertPrivacySelectOnly(privacyDb);
     const needsS3 = !flag("plan");
@@ -223,6 +255,6 @@ export async function main() {
 
 if (import.meta.main)
   main().catch((error) => {
-    log({ message: "exit on error", error_code: String((error as { code?: unknown })?.code ?? (error as Error)?.message ?? "error").slice(0, 120) });
+    log({ message: "exit on error", error_code: String((error as { code?: unknown; name?: unknown })?.code ?? (error as { name?: unknown })?.name ?? "error").slice(0, 64) });
     process.exit(1);
   });
