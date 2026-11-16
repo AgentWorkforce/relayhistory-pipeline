@@ -529,6 +529,15 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       const hadTurnFences = ((await f.db.query("SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
       await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
         first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+      // Arm the exporter the only legitimate way: one healthy, non-dry-run sweep of the real Supabase eraser.
+      {
+        const st = new SyncState(join(await tmp("race-arm"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+        try {
+          await new ErasureJob(supabaseAuthority(f.queryable), st, storeEraser(createFsStore({ root: await tmp("race-arm-store") })), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {}).sweep();
+        } finally {
+          st.close();
+        }
+      }
       const LEDGERS = ["session_erasure_receipts", "upload_deletions", "ingest_frozen_source_deletions", "upload_resets", "turn_session_fences", "operator_user_erasures"];
       // The production privacy role, bootstrapped and granted by the repo's own bootstrap and migrations (never by this test).
       const ROLE = "bulls96_legacy_export_privacy";
@@ -665,6 +674,16 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       expect(logs.some((l) => l.message === "erasure sweep" && l.authority === "supabase")).toBe(true);
       return logs;
     };
+    // Arm the exporter the only legitimate way: one healthy, non-dry-run sweep of the real Supabase eraser (which writes
+    // the readiness heartbeat on heads that have it). An empty store, so it erases nothing.
+    if (activate) {
+      const state = new SyncState(join(await tmp("hosted-arm"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+      try {
+        await new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(createFsStore({ root: await tmp("hosted-arm-store") })), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {}).sweep();
+      } finally {
+        state.close();
+      }
+    }
     return { f, asExporter, authorityRow, sweep };
   }
   /** A Neon fixture holding two layout-safe legacy-only scopes owned by OWNER. */
@@ -976,7 +995,9 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
     return { f, exportAs, sweepSupabase };
   }
   const refusedFor = (r: { thrown?: string; codes?: string[] }, re: RegExp) => (r.thrown !== undefined ? re.test(r.thrown) : (r.codes ?? []).some((c) => re.test(c)));
-  const HB = /heartbeat|stale|ready|readiness/iu;
+  // Any authority/readiness refusal code: within (g) the authority is active and the control proves an active authority
+  // plus a fresh heartbeat exports, so a refusal here can only be about the heartbeat.
+  const HB = /heartbeat|stale|ready|readiness|authority_not_active/iu;
 
   test("control: after a real Supabase eraser sweep (fresh heartbeat) the exporter exports", async () => {
     const n = await neon();
