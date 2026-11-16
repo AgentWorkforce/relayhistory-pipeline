@@ -722,7 +722,7 @@ async function streamedReconcile(
     inserted,
     deleted: deletedCount,
     complete,
-    reasons: [...reasons, ...(truncated ? ["search_index_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
+    reasons: [...read.reasons, ...reasons, ...(truncated ? ["search_index_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
     stream: stream(),
   };
 }
