@@ -14,8 +14,6 @@
  * erasing from it could destroy a session the user re-enabled.
  */
 import type { Queryable } from "../relayhistory-export.ts";
-import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
-import { selectedPublicTurnPredicateColumnSql } from "../../shared/legacy-turn-source.ts";
 import {
   activityPage,
   catalogPage,
@@ -63,97 +61,13 @@ export interface ErasureAuthority {
   stillFenced(g: LiveFencedGroup): Promise<boolean>;
   /**
    * Legacy-export scope fences, already joined to their exporter-bound owner.
-   * Optional only for small in-process test authorities; both production
-   * authority factories install it before legacy erasure is activated.
+   * Only the Supabase authority installs this production feed: it reads the
+   * durable row written before export. Neon has no copy of that row and must
+   * never re-derive an owner from mutable evidence.
    */
   legacyFencedPage?(after: LegacyFencedGroup | null, limit?: number): Promise<LegacyFencedGroup[]>;
   /** Re-read the exact scope-level fence immediately before every delete page. */
   stillLegacyFenced?(g: LegacyFencedGroup): Promise<boolean>;
-}
-
-const LEGACY_FENCE_PAGE = 5_000;
-
-/**
- * Neon-era legacy scopes.  The owner expression is deliberately identical to
- * the legacy exporter's binding order: one delivery-event user, otherwise one
- * outcome user, otherwise one owner across the selected public turns. A
- * deleting member's user id is never substituted for it.
- */
-async function neonLegacyFencedPage(
-  db: Queryable,
-  after: LegacyFencedGroup | null,
-  limit = LEGACY_FENCE_PAGE,
-): Promise<LegacyFencedGroup[]> {
-  const { rows } = await db.query<Omit<LegacyFencedGroup, "legacy_machine_id">>(
-    `WITH fences AS (
-       SELECT org_id,CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END AS workspace_id,source,session_id
-         FROM sessions.deleted_upload_sessions
-       UNION
-       SELECT org_id,CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END AS workspace_id,source,session_id
-         FROM sessions.conversation_turn_fences),
-     bound AS (
-       SELECT f.*,
-         CASE
-           WHEN EXISTS(SELECT 1 FROM sessions.convergence_events e
-             WHERE e.org_id=f.org_id AND (e.workspace_id=f.workspace_id OR (f.workspace_id='default' AND e.workspace_id=''))
-               AND e.source=f.source AND e.session_id=f.session_id AND e.user_id<>'')
-           THEN (SELECT min(e.user_id) FROM sessions.convergence_events e
-             WHERE e.org_id=f.org_id AND (e.workspace_id=f.workspace_id OR (f.workspace_id='default' AND e.workspace_id=''))
-               AND e.source=f.source AND e.session_id=f.session_id AND e.user_id<>''
-             HAVING count(DISTINCT e.user_id)=1)
-           WHEN EXISTS(SELECT 1 FROM sessions.session_outcomes o
-             WHERE o.org_id=f.org_id AND (o.workspace_id=f.workspace_id OR (f.workspace_id='default' AND o.workspace_id=''))
-               AND o.source=f.source AND o.session_id=f.session_id AND o.user_id<>'')
-           THEN (SELECT min(o.user_id) FROM sessions.session_outcomes o
-             WHERE o.org_id=f.org_id AND (o.workspace_id=f.workspace_id OR (f.workspace_id='default' AND o.workspace_id=''))
-               AND o.source=f.source AND o.session_id=f.session_id AND o.user_id<>''
-             HAVING count(DISTINCT o.user_id)=1)
-           WHEN EXISTS(SELECT 1 FROM sessions.conversation_turns t
-             WHERE t.org_id=f.org_id AND (t.workspace_id=f.workspace_id OR (f.workspace_id='default' AND t.workspace_id='')) AND t.session_id=f.session_id
-               AND ${selectedPublicTurnPredicateColumnSql("t", "f")} AND t.session_owner<>'')
-           THEN (SELECT min(t.session_owner) FROM sessions.conversation_turns t
-             WHERE t.org_id=f.org_id AND (t.workspace_id=f.workspace_id OR (f.workspace_id='default' AND t.workspace_id='')) AND t.session_id=f.session_id
-               AND ${selectedPublicTurnPredicateColumnSql("t", "f")} AND t.session_owner<>''
-             HAVING count(DISTINCT t.session_owner)=1)
-           ELSE NULL
-         END AS legacy_user_id
-       FROM fences f)
-     SELECT org_id,workspace_id,source,session_id,legacy_user_id
-       FROM bound
-      WHERE legacy_user_id IS NOT NULL
-        AND ($1::text IS NULL OR (org_id,workspace_id,source,session_id,legacy_user_id) > ($1,$2,$3,$4,$5))
-      ORDER BY org_id,workspace_id,source,session_id,legacy_user_id
-      LIMIT $6`,
-    after
-      ? [after.org_id, after.workspace_id, after.source, after.session_id, after.legacy_user_id, Math.min(limit, LEGACY_FENCE_PAGE)]
-      : [null, null, null, null, null, Math.min(limit, LEGACY_FENCE_PAGE)],
-  );
-  // `default` and the historical empty workspace are one privacy scope, but
-  // old exports hashed the stored spelling. Queue both narrowly-derived
-  // candidates under a default fence; a missing candidate is an idempotent
-  // no-op and no arbitrary machine id is ever followed.
-  return rows.flatMap((r) => {
-    const workspaces = r.workspace_id === "default" ? ["", "default"] : [r.workspace_id];
-    return workspaces.map((workspace) => ({
-      ...r,
-      legacy_machine_id: legacyMachineId(workspace, r.legacy_user_id),
-    }));
-  });
-}
-
-async function neonStillLegacyFenced(db: Queryable, g: LegacyFencedGroup): Promise<boolean> {
-  const { rows } = await db.query(
-    `SELECT 1 WHERE
-       EXISTS(SELECT 1 FROM sessions.deleted_upload_sessions
-         WHERE org_id=$1 AND source=$3 AND session_id=$4
-           AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
-       OR EXISTS(SELECT 1 FROM sessions.conversation_turn_fences
-         WHERE org_id=$1 AND source=$3 AND session_id=$4
-           AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
-       LIMIT 1`,
-    [g.org_id, g.workspace_id, g.source, g.session_id],
-  );
-  return rows.length > 0;
 }
 
 export function neonAuthority(db: Queryable): ErasureAuthority {
@@ -176,8 +90,6 @@ export function neonAuthority(db: Queryable): ErasureAuthority {
           [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
         )
       ).rows.length > 0,
-    legacyFencedPage: (after, limit) => neonLegacyFencedPage(db, after, limit),
-    stillLegacyFenced: (g) => neonStillLegacyFenced(db, g),
   };
 }
 
