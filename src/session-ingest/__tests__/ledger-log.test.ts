@@ -205,6 +205,62 @@ describe("append", () => {
     expect([o2.head, o2.remembered.size, o2.remembered.has("f0")]).toEqual([s.head, s.remembered.size, false]);
   });
 
+  test("a hash-valid checkpoint with a forged epoch writer, epoch, cursor or window is ignored (fields cross-checked)", async () => {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, null, W("w1"));
+    for (let i = 1; i <= LOG_CHECKPOINT_EVERY; i++) await appendBatches(store, s, [await batch(store, `b${i}`)], `cur-${i}`, W("w1"));
+    const cpKey = keys.checkpoint(LOG_CHECKPOINT_EVERY);
+    const cp = JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(cpKey))).body)));
+    await putRaw(store, keys.head, enc({ v: 1, seq: LOG_CHECKPOINT_EVERY }));
+    const lastId = `b${LOG_CHECKPOINT_EVERY}`;
+    const forgeries = [
+      { ...cp, epochWriter: "evil" },
+      { ...cp, epoch: cp.epoch + 1 },
+      { ...cp, inboxCursor: "moved" },
+      { ...cp, remembered: (cp.remembered as [string, string][]).filter(([id]) => id !== lastId) },
+    ];
+    for (const forged of forgeries) {
+      await putRaw(store, cpKey, enc(forged));
+      const o = (await openStream(store, keys))!;
+      expect([o.head, o.epochWriter, o.epoch, o.inboxCursor, o.remembered.has(lastId)]).toEqual([s.head, "w1", s.epoch, s.inboxCursor, true]);
+    }
+    // The real owner is not wedged: it still appends after opening over a forged checkpoint.
+    await putRaw(store, cpKey, enc({ ...cp, epochWriter: "evil" }));
+    const o = (await openStream(store, keys))!;
+    await appendBatches(store, o, [await batch(store, "after")], null, W("w1"));
+    expect(o.head).toBe(s.head + 1);
+  });
+
+  test("a checkpoint with epoch 0 is ignored (replay from entry 0)", async () => {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, null, W("w1"));
+    for (let i = 1; i <= LOG_CHECKPOINT_EVERY; i++) await appendBatches(store, s, [await batch(store, `b${i}`)], null, W("w1"));
+    const cpKey = keys.checkpoint(LOG_CHECKPOINT_EVERY);
+    const cp = JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(cpKey))).body)));
+    await putRaw(store, keys.head, enc({ v: 1, seq: LOG_CHECKPOINT_EVERY }));
+    await putRaw(store, cpKey, enc({ ...cp, epoch: 0, remembered: [["forged", "x"]] }));
+    const o = (await openStream(store, keys))!;
+    expect([o.head, o.epoch, o.remembered.has("forged")]).toEqual([s.head, s.epoch, false]);
+  });
+
+  test("an open lists exactly the two entry directories that could hold head+1 and its successors", async () => {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, null, W("w1"));
+    for (let i = 1; i <= 3; i++) await appendBatches(store, s, [await batch(store, `b${i}`)], null, W("w1"));
+    const prefixes: string[] = [];
+    const o = (await openStream(interleaved(store, async (prefix) => { prefixes.push(prefix); }), keys))!;
+    expect(o.head).toBe(3);
+    expect(prefixes.sort()).toEqual([String(objectKey(keys.entryDir(4))), String(objectKey(keys.entryDir(4 + LOG_ENTRIES_PER_DIR)))].sort());
+  });
+
+  test("a transient failure listing e/ when entry 0 is missing is LogUnavailable", async () => {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, null, W("w1"));
+    await appendBatches(store, s, [await batch(store, "b1")], null, W("w1"));
+    await store.delete(objectKey(keys.entry(0)));
+    await expect(openStream(interleaved(store, async () => {}, true), keys)).rejects.toBeInstanceOf(LogUnavailable);
+  });
+
   test("a payload key that is not the stream's content address is refused before any write", async () => {
     const store = fresh();
     const s = await enableLogMode(store, keys, null, W("w"));
