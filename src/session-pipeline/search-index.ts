@@ -39,10 +39,14 @@
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 import {
+  STREAM_DEADLINE,
   STREAM_PASSES,
+  STREAM_READ_EVENTS_BUDGET,
   StreamBudgetError,
   streamCanonicalScope,
+  streamDeadlinePassed,
   streamIndexKey,
+  type StreamDeadline,
   type StreamReadLimits,
 } from "../session-read-api/canonical-stream-projection.ts";
 import { nodeReadBudget } from "../session-read-api/node-read-profile.ts";
@@ -124,13 +128,25 @@ export interface SearchIndexDeps {
    */
   outputFactsStore?: (tx: SqlExecutor) => OutputFactsStore;
   /**
-   * SEARCH_INDEX_STREAMING_ENABLED=true only (the self-host consumer, adapter binding, no
-   * output facts): a scope past the whole-read bound (`scope_too_large` alone) is reconciled
+   * SEARCH_INDEX_STREAMING_ENABLED=true (the self-host consumer, adapter binding) or
+   * SEARCH_INDEX_STREAMING_CH=1 (the hosted consumer Lambda, ClickHouse binding), never with
+   * output facts: a scope past the whole-read bound (`scope_too_large` alone) is reconciled
    * by the streaming reader (canonical-stream-projection.ts) within these read budgets,
-   * summed over its passes, instead of being marked partial. Absent: such a scope is marked
-   * partial exactly as before, and every other scope never reaches the streaming reader.
+   * summed over its passes, instead of being marked partial. On the ClickHouse binding the
+   * index rows are read by keyset pages, at most `maxReadEvents` of them. Absent: such a
+   * scope is marked partial exactly as before, and every other scope never reaches the
+   * streaming reader.
    */
   stream?: StreamReadLimits;
+  /**
+   * Only with `stream` (the hosted Lambda sets it per invocation from its remaining time less
+   * SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS): checked between chunks, between index scan pages,
+   * before the regenerate (pass 4) and before any delete. Once crossed, the scope stops
+   * there, deletes nothing, keeps what pass 4 already wrote, and is recorded partial
+   * (`scope_too_large`, `stream_deadline`, needs_full=1); the pass does not throw. Absent:
+   * no deadline.
+   */
+  streamDeadline?: StreamDeadline;
   /** Tests only: how often the streaming reader keeps its transaction busy (default 20 s). */
   streamKeepaliveMs?: number;
 }
@@ -415,7 +431,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const fromMs = await io.fromMs(at);
     const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
     if (
-      deps.stream && deps.adapter && !deps.outputFacts && !deps.outputFactsStore && siblingKeys.length &&
+      deps.stream && !deps.outputFacts && !deps.outputFactsStore && siblingKeys.length &&
       s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
     )
       return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
@@ -556,7 +572,7 @@ const STREAM_KEEPALIVE_MS = 20_000;
  */
 async function streamedReconcile(
   tx: SqlExecutor,
-  io: SearchProjectionIo,
+  io: SearchProjectionIo & Partial<Pick<LegacyProjectionIo, "scanPages">>,
   scope: SessionScope,
   deps: SearchIndexDeps,
   budget: StreamReadLimits,
@@ -583,6 +599,7 @@ async function streamedReconcile(
     {
       readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
       originLabels: deps.originLabels === true, // as the whole read (readCanonicalScope) labels rows
+      ...(deps.streamDeadline ? { deadline: deps.streamDeadline } : {}), // between chunks of every pass
       keepalive: { everyMs: 0, ping: () => keepalive() }, // throttled here, shared with the scan and deletes
     },
     budget, version, fromMs,
@@ -596,10 +613,30 @@ async function streamedReconcile(
   if (!read.complete || read.directorySessionId !== pointerSnapshot.canonicalId || read.events === null)
     return owing(read.reasons.length ? read.reasons : ["canonical_metadata_incomplete"], read.partial);
 
+  const deadline = deps.streamDeadline;
+  const atDeadline = () => {
+    if (streamDeadlinePassed(deadline)) throw new StreamBudgetError(STREAM_DEADLINE);
+  };
   // A large scan may take a while: start it with a fresh transaction and ping when it ends.
-  await keepalive(true);
-  const scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
-  await keepalive(true);
+  let scan: Awaited<ReturnType<SearchProjectionIo["scan"]>>;
+  try {
+    atDeadline();
+    await keepalive(true);
+    // ClickHouse: keyset pages of one insert batch each, never the single LIMIT maxRows+1
+    // read; past the events budget the scope is partial, never a delete. The adapter binding
+    // keeps its own bounded scan.
+    scan = io.scanPages
+      ? await io.scanPages(scope, pointerSnapshot.canonicalId, fromMs, limits.insertBatch, budget.maxReadEvents, async () => {
+          atDeadline();
+          await keepalive();
+        })
+      : await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+    await keepalive(true);
+  } catch (error) {
+    if (error instanceof StreamBudgetError) return owing(["scope_too_large", error.budget], true);
+    throw error;
+  }
+  if (io.scanPages && scan.truncated) return owing(["scope_too_large", STREAM_READ_EVENTS_BUDGET], true);
   const truncated = scan.truncated;
   const existing = new Map<string, ScopeIdentity[]>();
   for (const r of scan.rows) {
@@ -613,6 +650,8 @@ async function streamedReconcile(
     if (!same.some((c) => c.sessionId === owner.sessionId && c.workspaceId === owner.workspaceId && c.tsMs === w.tsMs && c.fingerprint === w.fingerprint))
       toInsert.add(key);
   }
+  // Before pass 4: past the deadline nothing is written or deleted.
+  if (streamDeadlinePassed(deadline)) return owing(["scope_too_large", STREAM_DEADLINE], true);
   let inserted = 0;
   try {
     await read.regenerate(toInsert, limits.insertBatch, async (rows) => {
@@ -626,6 +665,8 @@ async function streamedReconcile(
 
   const staleWrite = inserted !== toInsert.size;
   let complete = !truncated && !staleWrite;
+  // Before any delete: what pass 4 wrote stays, nothing is deleted, the scope still owes a pass.
+  if (complete && streamDeadlinePassed(deadline)) return owing(["scope_too_large", STREAM_DEADLINE], true, inserted);
   const reasons: string[] = [];
   let deletedCount = 0;
   if (!complete) await invalidateDirectoryEvents(tx, scope);
@@ -700,22 +741,99 @@ export function searchIndexStreamFromEnv(
   if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED must be true or false");
   if (outputFacts)
     throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
-  const MiB = 1024 * 1024;
   const cap = STREAM_READ_CEILING;
   const defaults = searchIndexStreamDefaults(limits);
-  const fmt = (bytes: boolean, n: number) => (bytes ? `${n / MiB}MiB` : String(n));
-  const read = (name: string, bytes: boolean, min: number, max: number): number => {
-    const raw = env[name];
-    if (raw === undefined || raw === "") return min;
-    const m = (bytes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
-    const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
-    if (!Number.isSafeInteger(value) || value < min || value > max)
-      throw new Error(`pipeline consumer: ${name} must be ${bytes ? "a whole number of bytes (optional MiB or GiB suffix)" : "a whole number"} in ${fmt(bytes, min)}..${fmt(bytes, max)}`);
-    return value;
-  };
+  const read = (name: string, bytes: boolean, min: number, max: number) =>
+    readStreamBudget(env, "pipeline consumer", name, bytes, min, min, max);
   return {
     maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, defaults.maxReadBytes, cap.maxReadBytes),
     maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, defaults.maxReadEvents, cap.maxReadEvents),
+  };
+}
+
+const MiB = 1024 * 1024;
+
+/** One streaming budget variable: unset or "" is `fallback`; set, a whole number in min..max. */
+function readStreamBudget(
+  env: Record<string, string | undefined>,
+  prefix: string,
+  name: string,
+  bytes: boolean,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const fmt = (n: number) => (bytes ? `${n / MiB}MiB` : String(n));
+  const raw = env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const m = (bytes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
+  const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
+  if (!Number.isSafeInteger(value) || value < min || value > max)
+    throw new Error(`${prefix}: ${name} must be ${bytes ? "a whole number of bytes (optional MiB or GiB suffix)" : "a whole number"} in ${fmt(min)}..${fmt(max)}`);
+  return value;
+}
+
+/** The hosted Lambda's streaming budgets when SEARCH_INDEX_STREAMING_CH=1 sets none. */
+export const SEARCH_INDEX_STREAM_CH_DEFAULTS: Readonly<StreamReadLimits> = Object.freeze({
+  maxReadBytes: 1024 * MiB,
+  maxReadEvents: 1_000_000,
+});
+export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_DEFAULT_MS = 60_000;
+export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MIN_MS = 10_000;
+export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MAX_MS = 240_000;
+
+/** The hosted Lambda's streaming settings: the read budgets and the deadline margin. */
+export interface SearchIndexStreamCh extends StreamReadLimits {
+  deadlineMarginMs: number;
+}
+
+/**
+ * Streaming reconcile for the hosted consumer LAMBDA (lambda.ts only; ClickHouse binding),
+ * from the environment, given the effective whole-read `limits`:
+ *
+ *   SEARCH_INDEX_STREAMING_CH              exactly "1" turns it on; unset, "" or "0" leave it
+ *                                          off (returns undefined, the knobs below are not
+ *                                          read); anything else fails
+ *   SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES  default 1 GiB (optional MiB / GiB suffix)
+ *   SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS default 1,000,000
+ *   SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS default 60000, in 10000..240000
+ *
+ * Each budget must lie between four times the effective whole-read bound and the cap
+ * STREAM_READ_CEILING (2 GiB / 2,000,000); a default under that floor (the replay profile's
+ * events) is raised to it. The self-host SEARCH_INDEX_STREAMING_ENABLED and
+ * SEARCH_INDEX_STREAM_MAX_READ_* are not read here. The caller checks the dependencies
+ * (SEARCH_INDEX_ENABLED=1, the clickhouse backend, no SEARCH_INDEX_OUTPUT_FACTS=1).
+ * Errors name the variable and its range, never the value.
+ */
+export function searchIndexStreamChFromEnv(
+  env: Record<string, string | undefined>,
+  limits: Partial<SearchIndexLimits>,
+): SearchIndexStreamCh | undefined {
+  const flag = env.SEARCH_INDEX_STREAMING_CH;
+  if (flag === undefined || flag === "" || flag === "0") return undefined;
+  if (flag !== "1") throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH must be 1 or 0");
+  const prefix = "session pipeline";
+  const cap = STREAM_READ_CEILING;
+  const floor = searchIndexStreamDefaults(limits);
+  const budget = (name: string, bytes: boolean, fallback: number, min: number, max: number) =>
+    readStreamBudget(env, prefix, name, bytes, Math.max(fallback, min), min, max);
+  const marginRaw = env.SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS;
+  let deadlineMarginMs = SEARCH_INDEX_STREAM_DEADLINE_MARGIN_DEFAULT_MS;
+  if (marginRaw !== undefined && marginRaw !== "") {
+    deadlineMarginMs = /^[1-9][0-9]{0,8}$/u.test(marginRaw) ? Number(marginRaw) : NaN;
+    if (
+      !Number.isSafeInteger(deadlineMarginMs) ||
+      deadlineMarginMs < SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MIN_MS ||
+      deadlineMarginMs > SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MAX_MS
+    )
+      throw new Error(
+        `${prefix}: SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS must be a whole number of milliseconds in ${SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MIN_MS}..${SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MAX_MS}`,
+      );
+  }
+  return {
+    maxReadBytes: budget("SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES", true, SEARCH_INDEX_STREAM_CH_DEFAULTS.maxReadBytes, floor.maxReadBytes, cap.maxReadBytes),
+    maxReadEvents: budget("SEARCH_INDEX_STREAM_CH_MAX_READ_EVENTS", false, SEARCH_INDEX_STREAM_CH_DEFAULTS.maxReadEvents, floor.maxReadEvents, cap.maxReadEvents),
+    deadlineMarginMs,
   };
 }
 
@@ -763,10 +881,97 @@ function factsScope(scope: SessionScope, canonicalId: string, projectionRows: Ar
   };
 }
 
+/** The ClickHouse io, plus the streamed reconcile's keyset-paged scan. */
+interface LegacyProjectionIo extends SearchProjectionIo {
+  /**
+   * The scope's in-window index identities in keyset pages of `pageSize` (ORDER BY the sort
+   * key's scope-varying suffix), `between` awaited before each page after the first. Stops
+   * at `maxRows + 1` rows: `truncated` then, and the caller must not delete.
+   */
+  scanPages(
+    scope: SessionScope,
+    canonicalId: string,
+    fromMs: number,
+    pageSize: number,
+    maxRows: number,
+    between: () => Promise<void>,
+  ): Promise<{ rows: ScopeIdentity[]; truncated: boolean }>;
+}
+
+/**
+ * One keyset page of a scope's index identities. Keyed on the vendored sort key
+ * (org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id): with org,
+ * workspace and source fixed by the scope, (ts, session_id, machine_id, kind, event_id) is
+ * the ReplacingMergeTree identity, unique under FINAL, so `WHERE tuple > last ORDER BY tuple`
+ * visits every row once. There is no row_id column; no DDL is needed for this order.
+ */
+export async function clickhouseScopePage(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  canonicalSessionId: string,
+  fromMs: number,
+  limit: number,
+  after?: Pick<ScopeIdentity, "tsMs" | "sessionId" | "machineId" | "kind" | "eventId">,
+): Promise<ScopeIdentity[]> {
+  const rows = await ch.select<{
+    workspace_id: string;
+    session_id: string;
+    machine_id: string;
+    source: string;
+    kind: string;
+    event_id: string;
+    ts_ms: number;
+    fingerprint: string;
+  }>(
+    `SELECT workspace_id, session_id, machine_id, source, kind, event_id,
+        toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint
+     FROM ${EVENTS_TABLE} FINAL
+     WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String})
+       AND workspace_id = {workspace:String} AND source = {source:String}
+       AND toUnixTimestamp64Milli(ts) >= {from:Int64}${after ? `
+       AND (ts, session_id, machine_id, kind, event_id) >
+           (fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC'), {after_session:String}, {after_machine:String}, {after_kind:String}, {after_event:String})` : ""}
+     ORDER BY ts, session_id, machine_id, kind, event_id
+     LIMIT {limit:UInt32}`,
+    {
+      params: {
+        org: scope.orgId, session: scope.sessionId, canonical: canonicalSessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit,
+        ...(after ? { after_ts: after.tsMs, after_session: after.sessionId, after_machine: after.machineId, after_kind: after.kind, after_event: after.eventId } : {}),
+      },
+      timeoutMs: 20_000,
+    },
+  );
+  return rows.map((r) => ({
+    workspaceId: r.workspace_id,
+    sessionId: r.session_id,
+    machineId: r.machine_id,
+    source: r.source,
+    kind: r.kind,
+    eventId: r.event_id,
+    tsMs: Number(r.ts_ms),
+    fingerprint: r.fingerprint,
+  }));
+}
+
 /** Preserve the existing SQL, retention and state behavior for an unselected
  * legacy deployment. Portable adapters never implement a fake SQL client. */
-function legacyProjectionIo(ch: ClickHouseClient): SearchProjectionIo {
+export function legacyProjectionIo(ch: ClickHouseClient): LegacyProjectionIo {
   return {
+    async scanPages(scope, canonicalId, fromMs, pageSize, maxRows, between) {
+      if (!Number.isSafeInteger(pageSize) || pageSize < 1 || !Number.isSafeInteger(maxRows) || maxRows < 0)
+        throw new Error("search keyset scan bounds invalid");
+      const rows: ScopeIdentity[] = [];
+      let after: ScopeIdentity | undefined;
+      for (;;) {
+        if (after) await between();
+        const want = Math.min(pageSize, maxRows + 1 - rows.length);
+        const page = await clickhouseScopePage(ch, scope, canonicalId, fromMs, want, after);
+        for (const r of page) rows.push(r);
+        if (rows.length > maxRows) return { rows, truncated: true };
+        if (page.length < want) return { rows, truncated: false };
+        after = page[page.length - 1];
+      }
+    },
     async fromMs(at) { return Date.parse(await windowStart(ch, at)); },
     async scan(scope, canonicalId, fromMs, limit) {
       const rows = await clickhouseScope(ch, scope, fromMs, limit + 1, canonicalId);

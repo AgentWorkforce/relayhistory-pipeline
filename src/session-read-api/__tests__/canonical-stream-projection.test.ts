@@ -9,6 +9,7 @@ import type { ManifestV1 } from "../../../packages/object-store/src/index.ts";
 import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { readCanonicalScope, type ScopeRead } from "../canonical-projection.ts";
 import {
+  STREAM_DEADLINE,
   STREAM_READ_BYTES_BUDGET,
   STREAM_READ_EVENTS_BUDGET,
   STREAM_SOURCE_CHANGED,
@@ -389,3 +390,34 @@ test("D0: with origin labels on, the streamed read labels rows exactly as the wh
   }
   expect(labelled).toBeGreaterThan(0);
 }, 60_000);
+
+test("the deadline is checked before every chunk: a passed one stops the stream as a budget, never a throw", async () => {
+  const meter = new StreamReadMeter(UNLIMITED, { at: 10, now: () => 10 });
+  expect(() => meter.chunk({ bytes: 1 })).toThrow(expect.objectContaining({ budget: STREAM_DEADLINE, code: "scope_too_large" }));
+  const f = await fixture(generate(9));
+  const a = await admitted(f);
+  // Already passed: refused before the first chunk.
+  const passed = await streamCanonicalScope(SCOPE, a, { ...f.streamDeps, deadline: { at: 5, now: () => 5 } }, UNLIMITED, VERSION, 0);
+  expect(passed).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large", STREAM_DEADLINE] });
+  expect(passed.meter.chunks).toBe(0);
+  // Crossed after three chunk checks: stops in pass 1 with three chunks read.
+  let reads = 0;
+  const mid = await streamCanonicalScope(SCOPE, a, { ...f.streamDeps, deadline: { at: 3, now: () => reads++ } }, UNLIMITED, VERSION, 0);
+  expect(mid).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large", STREAM_DEADLINE] });
+  expect(mid.meter.chunks).toBe(3);
+  // During regeneration (pass 4): the batches already handed over stay handed over, then it stops.
+  let late = false;
+  const s = await streamCanonicalScope(SCOPE, a, { ...f.streamDeps, deadline: { at: 1, now: () => (late ? 1 : 0) } }, UNLIMITED, VERSION, 0);
+  expect(s.complete).toBe(true);
+  const written: number[] = [];
+  const all = new Set(s.wanted.keys());
+  await expect(s.regenerate(all, 1, async (rows) => { written.push(rows.length); late = true; })).rejects.toThrow(
+    expect.objectContaining({ budget: STREAM_DEADLINE }),
+  );
+  expect(written.length).toBeGreaterThanOrEqual(1);
+  expect(written.reduce((n, k) => n + k, 0)).toBeLessThan(all.size);
+  // Never passing: the same result as no deadline.
+  const never = await streamCanonicalScope(SCOPE, a, { ...f.streamDeps, deadline: { at: Number.POSITIVE_INFINITY } }, UNLIMITED, VERSION, 0);
+  const plain = await streamCanonicalScope(SCOPE, a, f.streamDeps, UNLIMITED, VERSION, 0);
+  expect(await regenerateAll(never)).toEqual(await regenerateAll(plain));
+}, 30_000);

@@ -322,3 +322,25 @@ test("streaming on with both budgets at their defaults warns at startup; a raise
   // At 500,000 records and more the default events budget is the 2,000,000 cap: still no scope fits.
   expect(warn(on, { maxScopeBytes: 64 * MiB, maxScopeEvents: 500_000 })).toMatchObject({ max_read_events: 2_000_000, largest_streamed_scope_events: 500_000 });
 });
+
+test("gate matrix, adapter binding: output facts never stream, even with stream set", async () => {
+  const x = await scope(generate(42));
+  // The ClickHouse facts on the adapter binding are refused before any read, as before.
+  const ch = await backend(x, { limits: TINY, stream: UNLIMITED, outputFacts: true });
+  await expect(indexSearchScope(SCOPE, ch.deps)).rejects.toThrow("output facts require the ClickHouse search binding");
+  // The Postgres facts store: the scope is marked partial exactly as before, not streamed.
+  const states: boolean[] = [];
+  const store = {
+    previousState: async () => ({ range: null, version: 0 }),
+    recordState: async (_s: unknown, state: { complete: boolean }) => { states.push(state.complete); return true; },
+    reconcile: async () => { throw new Error("not on a partial scope"); },
+    erase: async () => {},
+    schemaReady: async () => ({ ready: true, present: true }),
+  };
+  const pg = await backend(x, { limits: TINY, stream: UNLIMITED, outputFactsStore: () => store });
+  const result = await indexSearchScope(SCOPE, pg.deps);
+  expect(result).toMatchObject({ complete: false, partial: true, inserted: 0, deleted: 0, reasons: ["scope_too_large"] });
+  expect(result.stream).toBeUndefined();
+  expect(states).toEqual([false]);
+  expect(await pg.scan()).toEqual([]);
+}, 60_000);
