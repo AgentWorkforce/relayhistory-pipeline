@@ -8,6 +8,7 @@ import {runLargeReadOnce,type LargeReadDeps} from "./large-read-worker.ts";
 import {errorFields,log} from "../shared/log.ts";
 import {classifyReplayFailure} from "./replay-publication.ts";
 import {readerMaxRuleset} from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import {MESSAGE_ORIGIN_LABELS_VAR,messageOriginLabelsEnabled} from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 export interface LargeReadRuntime { deps:LargeReadDeps;close:()=>Promise<void> }
 export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  const need=(key:string)=>{const value=env[key];if(!value)throw new Error(`large worker missing ${key}`);return value};
@@ -19,7 +20,9 @@ export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  if(env.PIPELINE_RAW_S3_KMS_KEY_ID&&encryption!=="aws:kms")throw new Error("large worker invalid encryption key mode");
  const maximum=readerMaxRuleset(env); // Unset: legacy reads. Checked before a pool opens.
  const db=supabasePool(secret.hoopdb_url,4),store=createS3Store({bucket,region,credentials:async()=>lambdaCredentials(env),serverSideEncryption:encryption,sseKmsKeyId:env.PIPELINE_RAW_S3_KMS_KEY_ID});
- const deps:LargeReadDeps={db,search:{transact:work=>transaction(db,work),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`,readerMaxRuleset:maximum},replay:{db,store,provider:"s3",bucket,prefix:{PIPELINE_KEY_PREFIX:prefix,PIPELINE_ORG_FROM_PREFIX:"true"},readerMaxRuleset:maximum}};
+ const deps:LargeReadDeps={db,search:{transact:work=>transaction(db,work),reader:objectStoreManifestReader(store,{provider:"s3",bucket}),store,ch:createClickHouseClient(secret.clickhouse),prefixFor:org=>`${prefix}/${org}`,readerMaxRuleset:maximum,
+  // The same labels as the Lambda that hands it large scopes: a scope moving between them keeps one fingerprint.
+  ...(messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR])?{originLabels:true as const}:{})},replay:{db,store,provider:"s3",bucket,prefix:{PIPELINE_KEY_PREFIX:prefix,PIPELINE_ORG_FROM_PREFIX:"true"},readerMaxRuleset:maximum}};
  return {deps,close:()=>db.end()};
 }
 export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(env:NodeJS.ProcessEnv)=>LargeReadRuntime=largeReadRuntime){

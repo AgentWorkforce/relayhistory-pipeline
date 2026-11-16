@@ -93,6 +93,7 @@ import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
+import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
@@ -222,6 +223,13 @@ export interface ReadApiDeps {
    * 501 `param_includeShortSummary`; without the param the list shape is unchanged either way.
    */
   listShortSummary?: boolean;
+  /**
+   * MESSAGE_ORIGIN_LABELS_ENABLED=true (exactly "true"): GET /v1/events serves `origin=`
+   * (who wrote the event, message-origin.ts). Not true = 501 `param_origin`. A served
+   * page carries `X-Sessions-Read-Origin: <label>`; a client must treat a page without
+   * it (an older reader, or another backend) as unfiltered.
+   */
+  messageOrigin?: boolean;
   /** READ_API_BRIEF_TITLES_WORKSPACES (parseDirectoryWorkspaces syntax): "*" = all. Absent/empty = none. */
   briefTitleWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
@@ -388,6 +396,11 @@ export interface Continuation {
   backend: "relayhistory";
   reason: "history_floor";
   until: string;
+  /**
+   * Set when the page was an `origin=` search: the backend the rest is handed to does not
+   * apply that filter, so its rows are every author's (docs/message-origin.md).
+   */
+  originFilter?: "not_applied";
 }
 
 /**
@@ -423,6 +436,17 @@ class HttpError extends Error {
 const unsupported = (reason: string, details: readonly string[] = []) =>
   new HttpError(501, "unsupported_by_backend", `not served by this backend: ${reason}`, reason, details);
 const bad = (message: string) => new HttpError(400, "bad_request", message);
+
+/**
+ * `origin` on /v1/events: only events this label wrote (message-origin.ts), e.g.
+ * `origin=human` for human-typed messages without agent-to-agent, subagent,
+ * peer or task-notification traffic. Absent or empty: no filter.
+ */
+function eventOrigin(raw: string | undefined): MessageOrigin | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  if (!isMessageOrigin(raw)) throw bad(`origin must be one of ${MESSAGE_ORIGINS.join(", ")}`);
+  return raw;
+}
 
 /** relayhistory clampLimit: truncate, clamp to [1, max]; junk gives the default. */
 export function clampLimit(raw: string | undefined, fallback: number, max: number): number {
@@ -600,7 +624,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}`);
+        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}`);
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -858,7 +882,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
       rejectUnsupported(c, deps.eventMessageIds ? ["includeMessageId"] : []);
-      for (const p of ["q", "since", "until", "kind", "session", "project"]) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      for (const p of ["q", "since", "until", "kind", "session", "project", "origin"]) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
       const includeMessageId = deps.eventMessageIds !== undefined && single(c, "includeMessageId") === "true";
       const sessionId = c.req.param("sessionId");
       if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
@@ -960,12 +984,18 @@ export function createReadApi(deps: ReadApiDeps) {
       const source = single(c, "source") || undefined;
       const project = single(c, "project") || undefined;
       const kind = single(c, "kind") || undefined;
+      const origin = eventOrigin(single(c, "origin"));
+      // Off by default (MESSAGE_ORIGIN_LABELS_ENABLED), and a backend that cannot filter by
+      // who wrote an event must not answer a human-only search with agent traffic.
+      if (origin !== undefined && (deps.messageOrigin !== true || deps.adapter && !deps.adapter.index.capabilities().filters.includes("actor"))) throw unsupported("param_origin");
+      // Every answered page says the filter was applied; a page without it is unfiltered.
+      if (origin !== undefined) c.header("X-Sessions-Read-Origin", origin);
       const order: "asc" | "desc" = single(c, "order") === "asc" ? "asc" : "desc";
       const sinceMs = parseTime(single(c, "since"), "since");
       const untilMs = parseTime(single(c, "until"), "until");
       const maxContent = positiveInt(single(c, "maxContent"));
       const cursor = decodeCursor(single(c, "cursor"));
-      const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
+      const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, ...(origin === undefined ? {} : { actorName: origin }), q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
 
       if (sessionId !== undefined) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);
@@ -1016,7 +1046,7 @@ export function createReadApi(deps: ReadApiDeps) {
         // First page: nothing was issued yet, so the whole read falls back.
         if (cursor === undefined) throw unsupported("history_floor");
         // Cursor page: end this backend's part cleanly and hand the rest over.
-        const continuation: Continuation = { backend: "relayhistory", reason: "history_floor", until: continuationUntil(deps.completeSinceMs) };
+        const continuation: Continuation = { backend: "relayhistory", reason: "history_floor", until: continuationUntil(deps.completeSinceMs), ...(origin !== undefined ? { originFilter: "not_applied" as const } : {}) };
         log({ route: c.req.routePath, reason: "history_floor_continuation", status: 200, correlation_id: c.get("correlationId") });
         // Flags the page so the caller finishes it without parsing every page body.
         c.header("X-Sessions-Read-Continuation", "history_floor");
@@ -1032,6 +1062,8 @@ export function createReadApi(deps: ReadApiDeps) {
       }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
+      // The origin header only marks an answered, filtered page.
+      c.header("X-Sessions-Read-Origin", undefined);
       return fail(c, error);
     }
   });

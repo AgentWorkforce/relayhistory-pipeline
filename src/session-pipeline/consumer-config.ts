@@ -51,6 +51,9 @@
  *                                   failures force an exit (for a compose
  *                                   healthcheck or watcher); default
  *                                   /tmp/session-pipeline-consumer.unhealthy
+ *   MESSAGE_ORIGIN_LABELS_ENABLED             enabled only: exactly "true" labels who wrote
+ *                                   each event in the index rows (actor_name /
+ *                                   subagent_id, docs/message-origin.md); default off.
  *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
  *                                   case-sensitive) also writes output facts
  *                                   (sessions.session_event_facts /
@@ -98,6 +101,7 @@ import { searchSecret } from "../shared/search-composition.ts";
 import { parseCompleteSince } from "../session-read-api/config.ts";
 import { destinationPolicy } from "../shared/destination-url.ts";
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
+import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 
 export const CONSUMER_SERVICE_FLAG = "RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER";
 export const CONSUMER_SECRET_VAR = "RELAYHISTORY_PIPELINE_CONSUMER_SECRET";
@@ -130,6 +134,8 @@ export type ConsumerServiceConfig =
       unhealthyFile: string;
       /** RELAYHISTORY_SELFHOST_OUTPUT_FACTS is exactly "true" (default off). */
       outputFacts: boolean;
+      /** MESSAGE_ORIGIN_LABELS_ENABLED is exactly "true" (default off): index rows label who wrote each event. */
+      originLabels: boolean;
       /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
       analytics?: AnalyticsConfig;
     };
@@ -202,6 +208,7 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   return {
     enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
     outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
+    originLabels: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
   };
 }

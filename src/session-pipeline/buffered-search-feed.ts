@@ -461,7 +461,7 @@ const admitted = (v: string) => v.length > 0 && Array.from(v).length <= 255 && !
  * `received_at` epoch ms (the defect; see the header). `received_at` is parse-checked either way.
  * `stageToken` binds each row's fingerprint to this stage (bufferedFingerprint) for the erasure lane.
  */
-export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string, encoded?: number): StageProjection {
+export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string, encoded?: number, originLabels = false): StageProjection {
   const { header, groups, spec } = decoded;
   if (!spec.key.startsWith(`${keyRoot}/${header.org_id}/buffered-batches/v1/`)) throw new BufferedFeedError("stage_key_tenant_mismatch");
   const received = Date.parse(header.received_at);
@@ -497,7 +497,7 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
     for (const { table, row } of projected.rows) {
       if (table !== "convergence_events") continue;
       const canonicalRow = { ...row, session_id: row.delivery_record_id ? sessionId : row.session_id, user_id: row.user_id ?? userId };
-      const base = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId), version);
+      const base = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId, originLabels), version);
       const recordId = String(row.delivery_record_id ?? row.event_id);
       const ordinals = byRecord.get(recordId) ?? [];
       const indexRow: BufferedIndexRow = { ...base, fingerprint: bufferedFingerprint(base.fingerprint, stageToken, ordinals), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
@@ -659,6 +659,8 @@ export interface BufferedFeedDeps {
    * BUFFERED_VERSION_CEILING.
    */
   secondVersion?: { ledger: BufferedTieLedger; versionCeiling?: number };
+  /** MESSAGE_ORIGIN_LABELS_ENABLED: label rows as the canonical indexer does (SearchIndexDeps.originLabels). */
+  originLabels?: boolean;
 }
 
 const originChecked = new WeakMap<ClickHouseClient, Promise<void>>();
@@ -706,7 +708,7 @@ async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: numbe
     if (error instanceof BufferedFeedError) return { skip: error.code };
     throw error;
   }
-  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken, version);
+  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken, version, deps.originLabels === true);
   // The canonical indexer's window: older rows are not indexed by either path.
   projection.rows = projection.rows.filter((r) => tsMillis(`${r.row.ts.replace(" ", "T")}Z`) >= fromMs);
   return { state, projection };

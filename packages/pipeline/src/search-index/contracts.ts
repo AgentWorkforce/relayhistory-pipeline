@@ -99,8 +99,11 @@ export interface SearchScope extends SearchTenant {
  * adapter that does not declare it may ignore the field, so a caller that
  * relies on exclusion must check for it before serving (the read API refuses
  * READ_API_SEARCH_PARTIAL_SESSIONS=skip at startup without it).
+ *
+ * `actor`: the adapter applies SearchQuery.actorName. Same rule: a caller must
+ * check for it and refuse the filter when it is absent, never answer unfiltered.
  */
-export type SearchFilter = "session" | "source" | "kind" | "project" | "since" | "until" | "exclude_session";
+export type SearchFilter = "session" | "source" | "kind" | "project" | "since" | "until" | "exclude_session" | "actor";
 
 export interface SearchQuery {
   readonly tenant: SearchTenant;
@@ -115,6 +118,12 @@ export interface SearchQuery {
   readonly source?: string;
   readonly kind?: string;
   readonly projectId?: string;
+  /**
+   * Exact `actorName` match: who wrote the event (message-origin.ts labels,
+   * e.g. `human` for human-typed messages only). Applied only by an adapter
+   * declaring the `actor` filter.
+   */
+  readonly actorName?: string;
   /** Literal substring; `%`, `_`, `*`, `?` and `\` carry no wildcard meaning. */
   readonly q?: string;
   /** Inclusive lower bound, epoch ms. */
@@ -281,7 +290,7 @@ export function assertQuery(query: SearchQuery): void {
   if (query.q !== undefined && (typeof query.q !== "string" || query.q.length === 0 || [...query.q].length > MAX_QUERY_CHARS)) {
     throw new SearchIndexError("invalid_argument");
   }
-  for (const id of [query.sessionId, query.source, query.kind, query.projectId]) {
+  for (const id of [query.sessionId, query.source, query.kind, query.projectId, query.actorName]) {
     if (id !== undefined && !nonEmpty(id)) throw new SearchIndexError("invalid_argument");
   }
   const excluded = query.excludeSessionIds;

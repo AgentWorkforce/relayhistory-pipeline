@@ -159,6 +159,29 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
       expect(await ids({ sessionId: "s1", source: "claude", projectId: "p2" })).toEqual(["d"]);
     });
 
+    it("actorName keeps only that author's events (a human-only search) and composes with q", async () => {
+      // Optional filter: the read API refuses `origin=` for an adapter without it.
+      if (!a.capabilities().filters.includes("actor")) return;
+      const org = `org-${rand()}`;
+      const t = 1_767_225_600_000;
+      await a.upsert([
+        syntheticDoc({ orgId: org, eventId: "h1", tsMs: t, actorName: "human", actorRole: "user", content: "yes, ship it" }),
+        syntheticDoc({ orgId: org, eventId: "p1", tsMs: t + 1, actorName: "peer", actorRole: "user", content: "yes, ship it" }),
+        syntheticDoc({ orgId: org, eventId: "t1", tsMs: t + 2, actorName: "task-notification", actorRole: "user", content: "yes, ship it" }),
+        syntheticDoc({ orgId: org, eventId: "s1", tsMs: t + 3, actorName: "subagent", actorRole: "user", content: "yes, ship it" }),
+        syntheticDoc({ orgId: org, eventId: "u1", tsMs: t + 4, actorName: "", actorRole: "user", content: "yes, ship it" }),
+        syntheticDoc({ orgId: org, eventId: "h2", tsMs: t + 5, actorName: "human", actorRole: "user", content: "no, wait" }),
+      ]);
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const ids = async (f: Partial<SearchQuery>) =>
+        (await a.query({ tenant, order: "asc", limit: 50, ...f })).hits.map((h) => h.eventId);
+      expect(await ids({ actorName: "human" })).toEqual(["h1", "h2"]);
+      expect(await ids({ actorName: "human", q: "YES" })).toEqual(["h1"]);
+      expect(await ids({ actorName: "peer" })).toEqual(["p1"]);
+      expect(await ids({ q: "yes" })).toEqual(["h1", "p1", "t1", "s1", "u1"]);
+      await expect(a.query({ tenant, order: "asc", limit: 5, actorName: "" })).rejects.toMatchObject({ code: "invalid_argument" });
+    });
+
     it("excludeSessionIds removes those sessions on every page and composes with the session filter", async () => {
       // Optional filter: an adapter that does not declare it may ignore the field
       // (and the read API refuses READ_API_SEARCH_PARTIAL_SESSIONS=skip for it).

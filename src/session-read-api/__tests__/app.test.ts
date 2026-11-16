@@ -88,7 +88,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   return { ch, queries, eventQueries, params, eventParams };
 }
 
-function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string> } = {}) {
+function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string>; messageOrigin?: boolean } = {}) {
   const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: over.verify ?? (async (t) => {
@@ -100,6 +100,7 @@ function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?:
     completeSinceMs: over.completeSinceMs ?? 0,
     ...(over.searchSkipsPartialSessions ? { searchSkipsPartialSessions: true } : {}),
     ...(over.corsAllowedOrigins ? { corsAllowedOrigins: over.corsAllowedOrigins } : {}),
+    ...(over.messageOrigin ? { messageOrigin: true } : {}),
     log: (f) => logs.push(f),
   });
   const get = (path: string, token: string | null = "good") =>
@@ -528,6 +529,15 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
       expect(off.headers.get("access-control-expose-headers")).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
       const on = await api({ corsAllowedOrigins: origins, searchSkipsPartialSessions: true }).app.request("/v1/sessions/s-1/events?workspace=ws-a", { headers });
       expect(on.headers.get("access-control-expose-headers")).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Incomplete");
+    });
+
+    test("CORS exposes X-Sessions-Read-Origin only with MESSAGE_ORIGIN_LABELS_ENABLED, so a browser can see a filtered page", async () => {
+      const origins = new Set(["https://app.example.test"]);
+      const headers = { authorization: "Bearer good", origin: "https://app.example.test" };
+      const on = await api({ corsAllowedOrigins: origins, messageOrigin: true }).app.request("/v1/sessions/s-1/events?workspace=ws-a", { headers });
+      expect(on.headers.get("access-control-expose-headers")).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Origin");
+      const both = await api({ corsAllowedOrigins: origins, messageOrigin: true, searchSkipsPartialSessions: true }).app.request("/v1/sessions/s-1/events?workspace=ws-a", { headers });
+      expect(both.headers.get("access-control-expose-headers")).toContain("X-Sessions-Read-Incomplete, X-Sessions-Read-Origin");
     });
   });
 

@@ -16,6 +16,7 @@ import {
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
+import { labelledActorName, messageSubagent } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import {
   chunkKeys,
   parseSessionKey,
@@ -60,6 +61,8 @@ interface SearchIndexDeps {
   decompress: (stored: Uint8Array, maxBytes: number) => Uint8Array;
   /** Self-host READ_API_CANONICAL_FETCH_CONCURRENCY (CanonicalDeps.fetchConcurrency); absent: 1, sequential. */
   fetchConcurrency?: number;
+  /** MESSAGE_ORIGIN_LABELS_ENABLED on an index writer (projectedToNeonRow). Absent: off. */
+  originLabels?: boolean;
 }
 interface SearchIndexLimits {
   maxScopeBytes: number;
@@ -249,11 +252,18 @@ export function projectedToNeonRow(
   row: Json,
   scope: SessionScope,
   userId: string,
+  /** MESSAGE_ORIGIN_LABELS_ENABLED on the writer: label who wrote the event (message-origin.ts). Off: unchanged. */
+  originLabels = false,
 ): NeonEventRow {
   const taskRef =
     row.task_ref && typeof row.task_ref === "object"
       ? (row.task_ref as Json)
       : {};
+  // Who wrote the event (message-origin.ts), only with the flag on. The parity
+  // projection leaves both NULL or as relayhistory sent them.
+  const record = row.record && typeof row.record === "object" ? (row.record as { payload?: unknown }) : null;
+  const payload = record?.payload && typeof record.payload === "object" ? (record.payload as Json) : null;
+  const kind = String(row.kind);
   const base: Omit<NeonEventRow, "fingerprint"> = {
     org_id: scope.orgId,
     workspace_id: scope.workspaceId,
@@ -262,12 +272,12 @@ export function projectedToNeonRow(
     source: String(row.source),
     session_id: String(row.session_id),
     event_id: String(row.event_id),
-    kind: String(row.kind),
-    type: str(row.type) ?? String(row.kind),
+    kind,
+    type: str(row.type) ?? kind,
     ts_text: String(row.ts),
-    actor_name: str(row.actor_name),
+    actor_name: originLabels ? labelledActorName(kind, payload, str(row.actor_name)) : str(row.actor_name),
     actor_role: str(row.actor_role),
-    subagent_id: str(row.subagent_id),
+    subagent_id: originLabels ? (str(row.subagent_id) ?? messageSubagent(kind, payload)) : str(row.subagent_id),
     project_id: str(row.project_id),
     task_title: str(row.task_title),
     task_ref: JSON.stringify(taskRef),
@@ -344,6 +354,8 @@ export function projectEventRows(
   identity: EventProjectionIdentity,
   version: number,
   owner?: EventRowOwner,
+  /** MESSAGE_ORIGIN_LABELS_ENABLED (projectedToNeonRow). Off by default. */
+  originLabels = false,
 ):
   | { error: unknown }
   | {
@@ -382,7 +394,7 @@ export function projectEventRows(
       user_id: row.user_id ?? found?.userId ?? identity.userId,
     };
     const indexRow = toIndexRow(
-      projectedToNeonRow(canonicalRow, scope, identity.userId),
+      projectedToNeonRow(canonicalRow, scope, identity.userId, originLabels),
       version,
     );
     events.push({ row: canonicalRow, indexRow });
@@ -640,6 +652,7 @@ export async function readCanonicalScope(
       // not the uploader/first-manifest owner of a multi-machine logical scope.
       (row) =>
         ownerByEvent.get(JSON.stringify([row.machine_id, row.delivery_record_id])),
+      deps.originLabels === true,
     );
     if ("error" in projected) {
       complete = false;

@@ -157,6 +157,12 @@ describe("consumer service config", () => {
     expect("outputFactsStore" in outputFactsDeps({ outputFacts: false })).toBe(false);
     expect(outputFactsDeps({ outputFacts: true })).toEqual({ outputFactsStore: postgresOutputFactsStore });
   });
+  test("MESSAGE_ORIGIN_LABELS_ENABLED: exactly true labels index rows; anything else is off, never an error", () => {
+    expect(consumerServiceConfig(env())).toMatchObject({ enabled: true, originLabels: false });
+    expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: "true" }))).toMatchObject({ enabled: true, originLabels: true });
+    for (const raw of ["", "false", "TRUE", " true", "1", "on"])
+      expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: raw }))).toMatchObject({ enabled: true, originLabels: false });
+  });
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());
     expect(config).toMatchObject({ enabled: true, backendId: "selfhost-pg", keyPrefix: "96bulls", floorMs: 0 });

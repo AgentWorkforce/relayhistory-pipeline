@@ -55,6 +55,20 @@ for (const [label, value, expected] of [["unset", undefined, undefined], ["set",
   });
 }
 
+test("largeReadRuntime: MESSAGE_ORIGIN_LABELS_ENABLED labels like the Lambda that hands it large scopes", async () => {
+  const env = { SESSION_PIPELINE_SECRET_JSON: secret, AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls",
+    PIPELINE_ORG_FROM_PREFIX: "true", AWS_ACCESS_KEY_ID: "synthetic", AWS_SECRET_ACCESS_KEY: "synthetic" };
+  for (const [value, expected] of [[undefined, false], ["true", true], ["1", false], ["TRUE", false]] as const) {
+    const runtime = largeReadRuntime({ ...env, ...(value === undefined ? {} : { MESSAGE_ORIGIN_LABELS_ENABLED: value }) });
+    try {
+      expect(runtime.deps.search.originLabels === true).toBe(expected);
+      expect(lambdaEnv({ ...base, ...(value === undefined ? {} : { MESSAGE_ORIGIN_LABELS_ENABLED: value }) }).originLabelsEnabled).toBe(expected);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
 test("largeReadRuntime: a malformed maximum refuses before a pool opens", () => {
   expect(() => largeReadRuntime({
     SESSION_PIPELINE_SECRET_JSON: secret, AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls",

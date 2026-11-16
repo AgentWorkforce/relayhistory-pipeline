@@ -1216,6 +1216,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     ...(Object.keys(searchLimits).length ? { limits: searchLimits } : {}),
     ...(searchStream ? { stream: searchStream } : {}),
     ...outputFactsDeps(config),
+    ...(config.originLabels ? { originLabels: true as const } : {}),
   };
 
   let lastRun = 0;

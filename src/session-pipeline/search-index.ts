@@ -93,6 +93,13 @@ export interface SearchIndexDeps {
    * (docs/session-desktop-catalog.md, Activation blockers).
    */
   desktopCatalog?: boolean;
+  /**
+   * MESSAGE_ORIGIN_LABELS_ENABLED=true only: index rows carry who wrote each event in
+   * actor_name / subagent_id (message-origin.ts). Absent or false: rows exactly as before.
+   * Turning it on changes the fingerprint of every labelled row, so each scope's next
+   * pass rewrites its rows once.
+   */
+  originLabels?: boolean;
   /** Test seam (replaces the writer `desktopCatalog` selects); production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
