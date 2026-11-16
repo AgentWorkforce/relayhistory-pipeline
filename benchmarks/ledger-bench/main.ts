@@ -110,7 +110,7 @@ async function runChild(config: RunConfig): Promise<void> {
 
 async function runLane(config: RunConfig): Promise<boolean> {
   for (const id of LANE_TARGETS[config.lane]) if (!config.targets[id]) throw new Error(`ledger-bench: lane ${config.lane} needs target ${id}`);
-  const meter = new RequestMeter(config.profile.requestBudgetPerLane);
+  const meter = new RequestMeter(config.profile.requestBudgetPerLane, config.profile.byteBudgetPerLane);
   const credentials = credentialsFor(config);
   const lines: string[] = [];
   const write = (record: Record<string, unknown>) => {
@@ -183,7 +183,7 @@ async function runLane(config: RunConfig): Promise<boolean> {
   }
 
   const complete = failure === undefined && !meter.exhausted && stagesFailed === 0;
-  write({ event: "end", complete, stages_failed: stagesFailed, requests: meter.used, request_budget: meter.limit, statuses: meter.statuses.toJSON(), express_sessions: ctx.expressStats, cpu_stat: cpuStat(), max_rss_kib: Math.round(process.resourceUsage().maxRSS) });
+  write({ event: "end", complete, stages_failed: stagesFailed, requests: meter.used, request_budget: meter.limit, bytes: meter.bytes, byte_budget: meter.byteLimit, statuses: meter.statuses.toJSON(), express_sessions: ctx.expressStats, cpu_stat: cpuStat(), max_rss_kib: Math.round(process.resourceUsage().maxRSS) });
   // A second copy of the results next to the data, in case the pod's log is lost. Outside the meter (one
   // request), so it is written even when the budget is spent. Best effort.
   if (targets.R2) {

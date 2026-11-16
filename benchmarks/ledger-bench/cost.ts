@@ -22,11 +22,15 @@ export const PRICE = {
 } as const;
 
 /**
- * What the request budget does not price, rounded up: KMS key-months, a few GiB-days of storage, S3 Express
- * storage and per-GiB charges for hours, DynamoDB reads, cross-region transfer for R1, and NAT data processing
- * (billed to the cluster's account).
+ * What neither budget prices, rounded up: KMS key-months, a few GiB-days of storage, DynamoDB reads, the
+ * requests of the credential hop, and LIST or retry requests the store client makes on its own.
  */
 export const FIXED_USD = 15;
+/**
+ * USD per GiB sent or received, taken together and rounded up: NAT data processing (billed to the cluster's
+ * account), cross-region transfer for R1, and S3 Express upload and retrieval.
+ */
+export const PRICE_PER_GIB = 0.07;
 /** The approved ceiling for the whole benchmark, every run included. */
 export const APPROVED_CAP_USD = 300;
 
@@ -35,7 +39,7 @@ export interface CostBound {
   s3_lanes: number;
   repeats: number;
   requests_max: number;
-  /** Every budgeted request priced as an SSE-KMS PUT without Bucket Keys. */
+  /** Every budgeted request priced as an SSE-KMS PUT without Bucket Keys, plus every budgeted byte. */
   s3_and_kms_usd: number;
   dynamo_write_units_max: number;
   dynamo_usd: number;
@@ -55,7 +59,7 @@ export function dynamoWriteUnitsMax(profile: Profile): number {
 
 /** The most one run of one lane can cost: what `ops.ts run` adds to the spend ledger before it starts the lane. */
 export function laneCostBound(profile: Profile, lane: Lane): number {
-  const s3 = lane === "dynamo" ? 0 : profile.requestBudgetPerLane * (PRICE.s3Write + PRICE.kmsCall);
+  const s3 = lane === "dynamo" ? 0 : profile.requestBudgetPerLane * (PRICE.s3Write + PRICE.kmsCall) + (profile.byteBudgetPerLane / 1024 ** 3) * PRICE_PER_GIB;
   let units = 0;
   if (lane === "dynamo") {
     for (const items of TRANSACT_ITEMS) units += TRANSACT_WRITERS.length * transactOpCap(profile, items) * items * 2;
@@ -67,7 +71,8 @@ export function laneCostBound(profile: Profile, lane: Lane): number {
 
 export function costBound(profile: Profile, repeats: number, lanes: number = S3_LANES): CostBound {
   const requests = profile.requestBudgetPerLane * lanes * repeats;
-  const s3 = requests * (PRICE.s3Write + PRICE.kmsCall);
+  const bytes = (profile.byteBudgetPerLane / 1024 ** 3) * PRICE_PER_GIB * lanes * repeats;
+  const s3 = requests * (PRICE.s3Write + PRICE.kmsCall) + bytes;
   const units = dynamoWriteUnitsMax(profile) * repeats;
   const dynamo = units * PRICE.dynamoWriteUnit;
   const round = (v: number) => Math.ceil(v * 100) / 100;

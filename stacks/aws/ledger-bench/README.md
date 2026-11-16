@@ -15,7 +15,7 @@ temporary: it is created for one benchmark and deleted when the benchmark has ru
 | Throwaway data account, the compute's Region | `client-role.yaml` | The role `ledger-bench-client`, in its own stack so that the storage can be created by an identity that may not create IAM roles |
 | Throwaway data account, another Region | `data-east.yaml` | R1 (general-purpose bucket, Bucket Keys off) and key K1 |
 | The EKS cluster's account | `cluster-identity.yaml` | The role `ledger-bench-pod` and its EKS Pod Identity association |
-| The EKS cluster | `namespace.yaml`, `job.template.yaml` | Namespace `ledger-bench` with a ServiceAccount, a NetworkPolicy and a quota; three ConfigMaps (the client bundle, its config, the spend ledger); one Job per lane |
+| The EKS cluster | `namespace.yaml`, `job.template.yaml` | Namespace `ledger-bench` with a ServiceAccount, a NetworkPolicy and a quota; two ConfigMaps (the client bundle and its config); one Job per lane |
 
 Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 days>` and `owner=<session>`.
 
@@ -34,16 +34,18 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
 
 ## Bounds
 
-- **Cost.** Each lane refuses to make more than its request budget (2.5 million requests in the standard
-  profile). Priced as the dearest request type, three repeats of all lanes cost at most the figure printed
-  by `bun benchmarks/ledger-bench/main.ts plan`, which a test keeps under 300 USD. `ops.ts run` keeps a
-  spend ledger in the namespace and refuses any run (smoke runs and re-runs included) that would take the
-  total bound past 300 USD. The optional AWS budget is a backstop only: its data lags by hours.
+- **Cost.** Each lane refuses to go past its request budget (2.2 million requests in the standard profile)
+  or its byte budget (40 GiB sent and received). Priced as the dearest request type and per GiB, three
+  repeats of all lanes cost at most the figure printed by `bun benchmarks/ledger-bench/main.ts plan`, which
+  a test keeps under 300 USD. `ops.ts run` keeps a spend ledger in a file the operator holds next to the
+  results (so it survives a teardown) and refuses any run, smoke runs and re-runs included, that would
+  take the total bound past 300 USD. The optional AWS budget is a backstop only: its data lags by hours.
 - **Time.** Each Job has `activeDeadlineSeconds: 14400` (4 hours). A finished Job is kept for 2 days,
   because its log is the results.
 - **Shared nodes.** The pod has a CPU limit, and with `avoidPods` in the inputs a required anti-affinity
   keeps it off any node that runs the named pods (the production ingest pods). Run one lane at a time
-  (`--lanes`) on a cluster that serves production.
+  (`--lanes`) on a cluster that serves production. If no node in the pinned zone is free of those pods, or
+  none has room, the pod stays Pending until the deadline: check it after `run` and delete the Job.
 - **Throughput.** The table has a maximum on-demand throughput, and a cell stops at its operation cap.
 
 ## Differences from the plan
@@ -61,6 +63,15 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
   activate) and only notifies; the client's request budget and the spend ledger are the cap.
 - **S3 Express** goes through the object-store package with a fetch wrapper that re-signs for
   `s3express`; the package itself cannot sign for directory buckets today.
+
+## Known limits of the measurements
+
+- A percentile covers the operations that returned; failed operations are counted beside it by class.
+- `collect` reads the Jobs' logs. A second copy of each lane's results is written to R2 under
+  `bench/<run id>/results/` and expires with the bucket's 1-day lifecycle; nothing fetches it automatically.
+- The client role may use any KMS key in the data account tagged `purpose=ledger-bench`. That is fine for a
+  throwaway account; in a shared one, grant the keys by ARN instead.
+- The dual-AZ cell's background copies to R2 are started, not awaited.
 
 ## Running it
 
@@ -82,8 +93,8 @@ The cluster side's operator, with `keys` from `outputs-data` in their inputs, ru
 ```sh
 bun stacks/aws/ledger-bench/ops.ts up-identity  --inputs <file> --confirm-account <cluster account id>
 bun stacks/aws/ledger-bench/ops.ts up-namespace --inputs <file>
-bun stacks/aws/ledger-bench/ops.ts run     --inputs <file> --run-id smoke-1 --profile smoke
-bun stacks/aws/ledger-bench/ops.ts run     --inputs <file> --run-id <date>-a --lanes r2
+bun stacks/aws/ledger-bench/ops.ts run     --inputs <file> --run-id smoke-1 --profile smoke --ledger <private dir>/ledger.json --fresh-ledger
+bun stacks/aws/ledger-bench/ops.ts run     --inputs <file> --run-id <date>-a --lanes r2 --ledger <private dir>/ledger.json
 bun stacks/aws/ledger-bench/ops.ts collect --inputs <file> --run-id <date>-a --out <private results dir>
 ```
 
@@ -93,7 +104,7 @@ The plan's three repeats at different times of day are three run ids.
 ## Teardown
 
 ```sh
-bun stacks/aws/ledger-bench/ops.ts down-cluster   --inputs <file> --confirm-account <cluster account id> --collected <private results dir>
+bun stacks/aws/ledger-bench/ops.ts down-cluster   --inputs <file> --confirm-account <cluster account id> --collected <private results dir> --ledger <private dir>/ledger.json
 bun stacks/aws/ledger-bench/ops.ts down-data      --inputs <file> --confirm-account <data account id>
 bun stacks/aws/ledger-bench/ops.ts verify-cluster --inputs <file> --confirm-account <cluster account id>
 bun stacks/aws/ledger-bench/ops.ts verify-data    --inputs <file> --confirm-account <data account id>

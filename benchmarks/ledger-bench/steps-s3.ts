@@ -5,6 +5,7 @@
 import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { isObjectStoreError } from "../../packages/object-store/src/errors.ts";
 import type { ObjectStore, ObjectVersion } from "../../packages/object-store/src/types.ts";
+import { bigObjectOpCap } from "./caps.ts";
 import type { TargetId } from "./config.ts";
 import { cell, jsonDoc, key, KIB, need, randomBytes, readBody, readOptional, type Ctx } from "./context.ts";
 import { errorClass, mapLimit } from "./load.ts";
@@ -48,8 +49,8 @@ export async function step1(ctx: Ctx, target: BucketId): Promise<void> {
   // 256 KiB only at concurrency 8, as the plan says.
   await seed(store, `${root}/pool-256k`, 16, 256 * KIB);
   const big = randomBytes(256 * KIB);
-  await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, op: async (w, i) => void (await store.put(key(root, "put-256k-c8", (w * 7919 + i) % 256), big)) });
-  await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, op: async (w, i) => void (await readBody(store, key(`${root}/pool-256k`, (w + i) % 16))) });
+  await cell(ctx, { step: 1, cell: "put", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: bigObjectOpCap(ctx.profile), op: async (w, i) => void (await store.put(key(root, "put-256k-c8", (w * 7919 + i) % 256), big)) });
+  await cell(ctx, { step: 1, cell: "get", target, params: { concurrency: 8, kib: 256, sse: "kms" } }, { concurrency: 8, maxOps: bigObjectOpCap(ctx.profile), op: async (w, i) => void (await readBody(store, key(`${root}/pool-256k`, (w + i) % 16))) });
 
   // The KMS share: the same requests against SSE-S3 objects in the same bucket (R1 and R2 only).
   const plain = target === "R1" || target === "R2" ? ctx.sseS3[target] : undefined;
@@ -202,7 +203,10 @@ export interface AmbiguousTotals {
   /** Writes that were in flight when the client died. */
   in_flight: number;
   present_whole: number;
+  /** Absent at the first readback and still absent at the recheck. */
   absent: number;
+  /** Absent at the first readback, whole at the recheck: an ambiguous write must never be assumed failed. */
+  late_landed: number;
   /** Present with other bytes or another size: a torn write. Must be 0. */
   torn: number;
   /** Writes the child saw acknowledged that are not readable afterwards. Must be 0. */
@@ -218,8 +222,10 @@ export async function ambiguousCommit(
   prefix: string,
   kills: number,
   spawnChild: (roundPrefix: string, runTag: string) => Promise<{ started: number[]; done: number[] }>,
+  recheck: { afterMs: number; sleep?: (ms: number) => Promise<void> } = { afterMs: 0 },
 ): Promise<AmbiguousTotals> {
-  const totals: AmbiguousTotals = { kills, empty_rounds: 0, in_flight: 0, present_whole: 0, absent: 0, torn: 0, acknowledged_lost: 0 };
+  const pending: { k: ReturnType<typeof key>; expected: string }[] = [];
+  const totals: AmbiguousTotals = { kills, empty_rounds: 0, in_flight: 0, present_whole: 0, absent: 0, late_landed: 0, torn: 0, acknowledged_lost: 0 };
   for (let round = 0; round < kills; round++) {
     const roundPrefix = `${prefix}/k${round}`;
     const runTag = crypto.randomUUID();
@@ -234,10 +240,18 @@ export async function ambiguousCommit(
         continue;
       }
       totals.in_flight++;
-      if (got === undefined) totals.absent++;
+      if (got === undefined) pending.push({ k: key(roundPrefix, i), expected: await sha256Hex(ambiguousBody(runTag, i)) });
       else if (whole) totals.present_whole++;
       else totals.torn++;
     }
+  }
+  // S3 may complete a request whose client died. One later look settles each absent write.
+  if (pending.length > 0 && recheck.afterMs > 0) await (recheck.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms))))(recheck.afterMs);
+  for (const p of pending) {
+    const got = await readOptional(store, p.k);
+    if (got === undefined) totals.absent++;
+    else if ((await sha256Hex(got.body)) === p.expected) totals.late_landed++;
+    else totals.torn++;
   }
   return totals;
 }
@@ -272,7 +286,7 @@ export async function step2(ctx: Ctx, target: BucketId, spawnChild?: SpawnAmbigu
     emit("race_cas", { writers: 8 }, await raceCas(store, `${root}/race-cas`, 8, rounds));
     emit("race_delete", {}, await raceDelete(store, `${root}/race-delete`, rounds));
   }
-  if (spawnChild) emit("ambiguous_commit", { kib: 256 }, await ambiguousCommit(store, `${root}/ambiguous`, Math.max(3, Math.floor(rounds / 10)), (p, tag) => spawnChild(target, p, tag)));
+  if (spawnChild) emit("ambiguous_commit", { kib: 256 }, await ambiguousCommit(store, `${root}/ambiguous`, Math.max(3, Math.floor(rounds / 10)), (p, tag) => spawnChild(target, p, tag), { afterMs: ctx.profile.ambiguousRecheckSeconds * 1000 }));
 }
 
 /** Step 6: ramp in-flight requests in this one process and record where transients and latency start to rise. */

@@ -1,16 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { createS3Store } from "../../../packages/object-store/src/s3.ts";
 import type { ObjectStore } from "../../../packages/object-store/src/types.ts";
-import { assumeRole, BudgetExhausted, Dynamo, expressStore, expressZone, meteredFetch, RequestMeter } from "../aws.ts";
-import { LANES, parseConfig, SMOKE, STANDARD, type Profile } from "../config.ts";
-import { key, type Cell, type Ctx } from "../context.ts";
-import { costBound, FIXED_USD, laneCostBound } from "../cost.ts";
-import { errorClass, runLoad } from "../load.ts";
-import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../protocols.ts";
-import { Histogram, median, Tally } from "../stats.ts";
-import { step3Log, step3P13, step3Race, step5 } from "../steps-protocols.ts";
-import { ambiguousBody, ambiguousCommit, probeIfMatch, raceCas, raceCreate, raceDelete, step1, step2, step6 } from "../steps-s3.ts";
-import { FakeDynamo, FakeS3, type FakeS3Options } from "./fake-aws.ts";
+import { assumeRole, BudgetExhausted, Dynamo, expressStore, expressZone, meteredFetch, RequestMeter } from "../../../benchmarks/ledger-bench/aws.ts";
+import { LANES, parseConfig, SMOKE, STANDARD, type Profile } from "../../../benchmarks/ledger-bench/config.ts";
+import { key, type Cell, type Ctx } from "../../../benchmarks/ledger-bench/context.ts";
+import { costBound, FIXED_USD, laneCostBound } from "../../../benchmarks/ledger-bench/cost.ts";
+import { errorClass, runLoad } from "../../../benchmarks/ledger-bench/load.ts";
+import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../../../benchmarks/ledger-bench/protocols.ts";
+import { Histogram, median, Tally } from "../../../benchmarks/ledger-bench/stats.ts";
+import { step3Log, step3P13, step3Race, step5 } from "../../../benchmarks/ledger-bench/steps-protocols.ts";
+import { ambiguousBody, ambiguousCommit, probeIfMatch, raceCas, raceCreate, raceDelete, step1, step2, step6 } from "../../../benchmarks/ledger-bench/steps-s3.ts";
+import { FakeDynamo, FakeS3, type FakeS3Options } from "./ledger-bench-fake-aws.ts";
 
 const CREDS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret" };
 const storeOn = (fake: FakeS3, fetcher: typeof fetch = fake.fetch): ObjectStore => createS3Store({ bucket: "ledger-bench-test", region: "us-west-2", endpoint: "http://localhost:9000", credentials: CREDS, fetch: fetcher });
@@ -133,6 +133,8 @@ describe("config and cost", () => {
     const lanes = LANES.reduce((a, lane) => a + laneCostBound(STANDARD, lane), 0);
     expect(Math.abs(lanes * 3 + FIXED_USD - bound.total_usd)).toBeLessThan(0.25);
     expect(laneCostBound(STANDARD, "dynamo")).toBeLessThan(laneCostBound(STANDARD, "r2"));
+    // The byte budget is priced into the bound: a larger one must show.
+    expect(costBound({ ...STANDARD, byteBudgetPerLane: STANDARD.byteBudgetPerLane * 10 }, 3).total_usd).toBeGreaterThan(300);
   });
 });
 
@@ -146,6 +148,15 @@ describe("request meter", () => {
     expect(meter.used).toBe(2);
     expect(meter.exhausted).toBe(true);
     expect(meter.statuses.toJSON()).toEqual({ "R2 GET 204": 1, "R2 PUT 204": 1 });
+    // Bytes sent and received are budgeted too: what is priced per GiB cannot run away.
+    const bytes = new RequestMeter(100, 1000);
+    const g = meteredFetch(bytes, "R2", (async () => new Response("x".repeat(400), { status: 200, headers: { "content-length": "400" } })) as unknown as typeof fetch);
+    await g("http://localhost/a", { method: "PUT", body: new Uint8Array(300) });
+    expect(bytes.bytes).toBe(700);
+    await g("http://localhost/b");
+    expect(bytes.exhausted).toBe(true);
+    await expect(g("http://localhost/c")).rejects.toBeInstanceOf(BudgetExhausted);
+    expect(bytes.used).toBe(2);
     // A child's allowance is reserved whole, and refused whole when it does not fit.
     const parent = new RequestMeter(10);
     parent.take(6);
@@ -223,6 +234,24 @@ describe("conditional-write checks", () => {
     expect(await probeIfMatch(store, "t/probe")).toEqual({ support: "supported", fresh: "ok", stale: "http_412" });
     expect((await raceDelete(store, "t/delete", 10)).violations).toBe(0);
   });
+  test("an ambiguous write that lands after the first readback is found by the recheck, not counted absent", async () => {
+    const { store } = fakeStore();
+    let tag = "";
+    let prefix = "";
+    const totals = await ambiguousCommit(
+      store,
+      "t/late",
+      1,
+      async (p, runTag) => {
+        prefix = p;
+        tag = runTag;
+        return { started: [0, 1], done: [] };
+      },
+      // The store completes write 0 while the harness waits; write 1 never lands.
+      { afterMs: 30_000, sleep: async () => void (await store.put(key(prefix, 0), ambiguousBody(tag, 0))) },
+    );
+    expect(totals).toMatchObject({ in_flight: 2, present_whole: 0, late_landed: 1, absent: 1, torn: 0 });
+  });
   test("a round nobody wins is a liveness event, not a safety violation, and does not end the check", async () => {
     const fake = new FakeS3();
     const failing = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => (init?.method === "PUT" ? new Response("<Error><Code>SlowDown</Code></Error>", { status: 503 }) : fake.fetch(input, init))) as typeof fetch;
@@ -255,7 +284,7 @@ describe("conditional-write checks", () => {
     });
     // A child that crashed before its first write proves nothing, and is counted as such.
     expect(await ambiguousCommit(store, "t/amb-empty", 2, async () => ({ started: [], done: [] }))).toMatchObject({ kills: 2, empty_rounds: 2, in_flight: 0 });
-    expect(totals).toEqual({ kills: 1, empty_rounds: 0, in_flight: 3, present_whole: 1, absent: 1, torn: 1, acknowledged_lost: 1 });
+    expect(totals).toEqual({ kills: 1, empty_rounds: 0, in_flight: 3, present_whole: 1, absent: 1, late_landed: 0, torn: 1, acknowledged_lost: 1 });
   });
 });
 

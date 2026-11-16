@@ -39,6 +39,10 @@ export interface Profile {
   maxOpsPerCell: number;
   /** Hard cap on HTTP requests per lane: the cost bound (cost.ts). */
   requestBudgetPerLane: number;
+  /** Hard cap on bytes sent and received per lane: bounds what is priced per byte (cost.ts). */
+  byteBudgetPerLane: number;
+  /** A write that was in flight at the kill and is absent is read again after this long: it may land late. */
+  ambiguousRecheckSeconds: number;
 }
 
 /**
@@ -55,7 +59,9 @@ export const STANDARD: Profile = {
   refreshSoakSeconds: 660,
   poolRamp: [64, 128, 256, 384, 512],
   maxOpsPerCell: 40_000,
-  requestBudgetPerLane: 2_500_000,
+  requestBudgetPerLane: 2_200_000,
+  byteBudgetPerLane: 40 * 1024 ** 3,
+  ambiguousRecheckSeconds: 45,
 };
 
 /** A seconds-long pass over every cell, to prove the harness and the permissions before the real run. */
@@ -69,6 +75,8 @@ export const SMOKE: Profile = {
   poolRamp: [64],
   maxOpsPerCell: 2_000,
   requestBudgetPerLane: 100_000,
+  byteBudgetPerLane: 2 * 1024 ** 3,
+  ambiguousRecheckSeconds: 5,
 };
 
 export const PROFILES: Record<string, Profile> = { standard: STANDARD, smoke: SMOKE };

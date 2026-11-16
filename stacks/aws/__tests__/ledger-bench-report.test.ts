@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { markdown, merge, parseLines, thresholds, type Record_ } from "../report.ts";
+import { markdown, merge, parseLines, thresholds, type Record_ } from "../../../benchmarks/ledger-bench/report.ts";
 
 const lat = (p50: number, p99: number, n = 100) => ({ n, min_ms: 1, p50_ms: p50, p90_ms: p99, p99_ms: p99, max_ms: p99 * 2, mean_ms: p50 });
 const cell = (run: string, step: number, name: string, target: string, params: Record<string, string | number>, result: Record<string, unknown>): Record_ => ({ ledger_bench: 1, run, lane: "x", step, cell: name, target, params, result });
