@@ -1474,6 +1474,30 @@ ${secret}
 });
 
 // ---------------------------------------------------------------------------
+describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
+  test("secret-shaped tokens in a legacy turn never appear in any stored object (raw chunks decompressed, manifests included)", async () => {
+    // Assembled at runtime so no secret-shaped literal sits in the source (push protection, secret scanners).
+    const aws = ["AK", "IA", "ZQXWVUTSRPONMLKJ"].join("");
+    const slack = ["xo", "xb", "-", "1".repeat(12), "-", "2".repeat(13), "-", "AbCdEfGhIjKlMnOpQrStUvWx"].join("");
+    const n = await neon(), p = await supabase();
+    await n.pg.query("UPDATE sessions.conversation_turns SET content=$1", [`deploy with ${aws} and ${slack} please`]);
+    const store = createFsStore({ root: await tmp("scrub") });
+    const { counters } = await run(n.db, p.db, store, "scrub");
+    expect(counters).toMatchObject({ exported: 1, failed: 0 });
+    const keys = await allKeys(store);
+    expect(keys.some((k) => k.endsWith(".zst"))).toBe(true);
+    let text = "";
+    for (const k of keys) {
+      const bytes = await readAll(await store.get(objectKey(k)));
+      text += k.endsWith(".zst") ? new TextDecoder().decode(decompress(bytes)) : new TextDecoder().decode(bytes);
+    }
+    expect(text).not.toContain(aws);
+    expect(text).not.toContain(slack);
+    expect(text).toMatch(/REDACTED|\[redacted/iu); // the turn was stored, scrubbed (not dropped)
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("(d) forged/stale legacy parts are dropped visibly; invalid evidence is a 503", () => {
   test("a forged legacy part keeps the read available and surfaces a provenance reason or counter", async () => {
     const n = await neon();
