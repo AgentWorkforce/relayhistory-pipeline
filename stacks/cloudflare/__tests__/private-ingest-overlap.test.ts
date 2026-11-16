@@ -1,8 +1,9 @@
 /**
  * Generation overlap on the private-ingest release contract: a dormant contract is byte-identical to the
  * no-overlap contract, and with a reviewed pair exactly G -> G+H -> H plus the rollback G+H -> G.
- * For the planned 062010 release (step 1 of the required order) the production contract carries the
- * reviewed pair {8a7cf72a.., 3eef01d7..}; the synthetic tests below pass their contract explicitly.
+ * For the 062010 release (step 6 of the required order, H-only Worker) the production contract is at
+ * 3eef01d7.. and retains the reviewed pair {8a7cf72a.., 3eef01d7..} solely for the G+H -> H cleanup;
+ * the synthetic tests below pass their contract explicitly.
  */
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -31,7 +32,7 @@ const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-000
 const sha = "a".repeat(40), planRun = "90";
 const trackedFile = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
 // The tracked baseline base without the recovery overlap: the synthetic pair tests build on it.
-const { overlapGeneration: REAL_H, ...trackedBase } = trackedFile.sessionIngest;
+const trackedBase = trackedFile.sessionIngest;
 const tracked = { ...trackedFile, sessionIngest: trackedBase };
 const G: string = tracked.sessionIngest.expectedGeneration;
 const DORMANT: PrivateIngestGenerationContract = { generation: G, overlap: null };
@@ -50,18 +51,16 @@ test("dormant profile: the tracked H-only baseline plans, confirms and reads bac
   // Digests capture the reviewed H-only baseline profile, with the test KMS target. The reviewed
   // G/H pair remains source-only transition authority; no overlap binding is rendered.
   const file = readFileSync("config/cloudflare/private-ingest-production.json", "utf8");
-  // The tracked file minus the 062010 release overlapGeneration is still that exact profile.
-  const baseFile = file.replace(/,\n {4}"overlapGeneration": "[0-9a-f]{64}"(?=\n {2}\})/u, "");
-  expect(baseFile).not.toBe(file);
-  expect(REAL_H).toBe("3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c");
-  expect(sha256(baseFile)).toBe("26b6d07a0f9cae462908b4237ecb46f2975c80e2445d42a4aed22d8e1792b920");
+  const baseFile = file;
+  expect(trackedFile.sessionIngest.overlapGeneration).toBeUndefined();
+  expect(sha256(baseFile)).toBe("90afe01d9ac5dee2c63f3b42333b21674a5f9d7f11b85de364341301bd6521a2");
   const input = withTarget(tracked.sessionIngest);
   expect(inputsDigest(JSON.stringify(input, null, 2) + "\n"))
-    .toBe("fb52eecb43926a92a90f26becfa77892cc63f1f3da8fbee3f3a4b2581207a969");
+    .toBe("93290d564baf5b51fb7162d6a84783927133996a80ff1ea369a77e5b9f73b793");
   expect(sha256(JSON.stringify(sessionIngestVars(input.sessionIngest))))
-    .toBe("1142fef2bdf8b302682d5f32ba19311442c1b413fa9dde0de915d268eb91ae09");
+    .toBe("f53af942956c1a8f7eaf57b623bd88002d6ccefd7089acb08807ca8578a788d7");
   expect(sha256(JSON.stringify(input.sessionIngest)))
-    .toBe("5995f39db47e81ab79800979fae5b0f1ee3a914beb97e0620ea10f99d44a4aee");
+    .toBe("86314aa425e4d29f7d1263cc342e3ce63e559c265501265ab219a7cf87dd2c7a");
   expect(sessionIngestVars(input.sessionIngest).INGEST_ACCEPT_GENERATIONS).toBeUndefined();
   expect(privateIngestReleasePhase(input, DORMANT)).toBe("baseline-drain");
   expect(privateIngestReleaseInputs({
@@ -82,41 +81,52 @@ test("dormant profile: the tracked H-only baseline plans, confirms and reads bac
   }), DORMANT))).toBe("private_ingest_profile_overlap_unreviewed");
 });
 
-test("062010 release step (1): the real tracked profile is G+H at the unchanged baseline-drain phase", () => {
-  // Before the window opens the Worker must accept {G, H}: reviewed pair {G, H}, tracked overlapGeneration H,
-  // expectedGeneration still G; the deploy is baseline-drain -> baseline-drain-overlap.
+test("062010 release step (6): the real tracked profile finishes at H-only without changing rollout phase", () => {
+  // Rebind 43944063000 moved the policy and all admission rows to H; retaining the reviewed pair
+  // authorizes exactly the live G+H -> H Worker cleanup.
   const realG = "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8";
   const realH = "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c";
-  expect(G).toBe(realG);
-  expect(REAL_H).toBe(realH);
+  const releaseAtG: PrivateIngestGenerationContract = { generation: realG, overlap: { from: realG, to: realH } };
+  expect(G).toBe(realH);
   expect(PRIVATE_INGEST_OVERLAP).toEqual({ from: realG, to: realH });
-  expect(PRIVATE_INGEST_GENERATION_CONTRACT).toEqual({ generation: realG, overlap: { from: realG, to: realH } });
-  expect(trackedOverlapGeneration()).toBe(realH);
+  expect(PRIVATE_INGEST_GENERATION_CONTRACT).toEqual({ generation: realH, overlap: { from: realG, to: realH } });
+  expect(trackedOverlapGeneration()).toBeUndefined();
+  // The real tracked file parses as the same baseline phase with one accepted generation.
   const target = { ...trackedFile, sessionIngest: { ...trackedFile.sessionIngest, kmsKeyArn } } as CloudflareStageInputs;
-  expect(privateIngestReleasePhase(target)).toBe("baseline-drain-overlap");
-  expect(target).toEqual(privateIngestProfileForPhase("baseline-drain-overlap", kmsKeyArn));
+  expect(privateIngestReleasePhase(target)).toBe("baseline-drain");
+  expect(target).toEqual(privateIngestProfileForPhase("baseline-drain", kmsKeyArn));
   const vars = sessionIngestVars(target.sessionIngest);
-  expect(vars.INGEST_EXPECT_GENERATION).toBe(realG);
-  expect(vars.INGEST_ACCEPT_GENERATIONS).toBe(`${realG},${realH}`);
-  // Live production is baseline-drain at G only: G -> G+H at the same phase is the one permitted move.
-  const liveG = liveFixture(privateIngestProfileForPhase("baseline-drain", kmsKeyArn, { generation: realG, overlap: null }));
-  expect(privateIngestTransitionReadback(target, liveG.active, liveG.version)).toMatchObject({
-    status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain-overlap",
+  expect(vars.INGEST_EXPECT_GENERATION).toBe(realH);
+  expect(vars.INGEST_ACCEPT_GENERATIONS).toBeUndefined();
+  // Live production is baseline-drain-overlap after the step-1 G+H deploy. The cleanup removes only G
+  // from the accept set; it cannot carry a custody or rollout-phase move.
+  const liveGH = liveFixture(privateIngestProfileForPhase("baseline-drain-overlap", kmsKeyArn, releaseAtG));
+  expect(privateIngestTransitionReadback(target, liveGH.active, liveGH.version)).toMatchObject({
+    status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain-overlap", to: "baseline-drain",
+    generationFrom: "G+H", generationTo: "H",
   });
-  // No rollout-phase or custody move can ride along.
+  const liveH = liveFixture(target);
+  expect(privateIngestVersionReadback(target, liveH.active, liveH.version)).toMatchObject({ phase: "baseline-drain" });
+  // A direct G -> H remains forbidden, and no custody move can ride along with the cleanup.
+  const liveG = liveFixture(privateIngestProfileForPhase("baseline-drain", kmsKeyArn, { generation: realG, overlap: null }));
+  expect(code(() => privateIngestTransitionReadback(target, liveG.active, liveG.version)))
+    .toBe("private_ingest_live_transition");
   const liveShadow = liveFixture(privateIngestProfileForPhase("step-0-shadow", kmsKeyArn, { generation: realG, overlap: null }));
   expect(code(() => privateIngestTransitionReadback(target, liveShadow.active, liveShadow.version)))
     .toBe("private_ingest_live_transition");
-  // The G+H deploy confirmation must carry exactly OVERLAP <H>.
+  const liveCustody = liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn, { generation: realG, overlap: null }));
+  expect(code(() => privateIngestTransitionReadback(target, liveCustody.active, liveCustody.version)))
+    .toBe("private_ingest_live_transition");
+  // The H-only deploy confirmation must not carry an overlap suffix.
   const deploy = {
     PRIVATE_INGEST_RELEASE_MODE: "deploy",
     PRIVATE_INGEST_RELEASE_SHA: sha,
     PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
-    PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun} OVERLAP ${realH}`,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`,
   };
   expect(privateIngestReleaseInputs(deploy, trackedOverlapGeneration()).mode).toBe("deploy");
   expect(code(() => privateIngestReleaseInputs({ ...deploy,
-    PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}` }, trackedOverlapGeneration())))
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `${deploy.PRIVATE_INGEST_RELEASE_CONFIRMATION} OVERLAP ${realH}` }, trackedOverlapGeneration())))
     .toBe("private_ingest_release_confirmation");
 });
 
@@ -206,8 +216,8 @@ const liveOverlap = (base = "step-1-custody" as const) =>
 test("live readback admits INGEST_ACCEPT_GENERATIONS only when declared; refuses undeclared, mismatched and unknown bindings", () => {
   const overlapInput = privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn, atG);
   const live = liveOverlap();
-  // The production contract's reviewed pair is {G, real H}: an overlap at the synthetic H is not it.
-  expect(() => privateIngestVersionReadback(overlapInput, live.active, live.version)).toThrow("private_ingest_profile_overlap_unexpected");
+  // The production contract is already at its reviewed H, so any live overlap is stale.
+  expect(() => privateIngestVersionReadback(overlapInput, live.active, live.version)).toThrow("private_ingest_profile_overlap_stale");
   // Causal revert: the profile (and contract) dropped the overlap while the live Worker still accepts {G, H}.
   const single = privateIngestProfileForPhase("step-1-custody", kmsKeyArn, DORMANT);
   expect(code(() => privateIngestVersionReadback(single, live.active, live.version))).toBe("private_ingest_live_undeclared_overlap");
