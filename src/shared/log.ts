@@ -20,6 +20,9 @@ export const ADMISSION_PHASE_FIELDS: ReadonlyMap<string, string> = new Map([
 ]);
 const ADMISSION_PHASE_FIELDS_LIST = [...ADMISSION_PHASE_FIELDS.values()];
 
+/** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */
+const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
+
 export const ALLOWED_LOG_FIELDS = new Set([
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
@@ -59,6 +62,10 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "reason_codes",
   // Analytics export counters (src/shared/analytics-config.ts analyticsCounterFields): bounded counts only.
   ...ANALYTICS_COUNTER_FIELDS,
+  // The consumer's streaming reconcile startup line (search-index.ts searchIndexStreamStartup):
+  // `streaming` is on / off only (STREAMING_VALUES), the budgets bounded counts (STREAM_BUDGET_FIELDS).
+  "streaming",
+  ...STREAM_BUDGET_FIELDS,
 ]);
 
 /**
@@ -80,6 +87,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["store_status", 599],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {
@@ -100,7 +108,9 @@ function boundedCount(v: unknown, max: number): number | undefined {
 export const STORE_CAUSE_VALUES: ReadonlySet<string> = new Set([
   "econnreset", "etimedout", "econnrefused", "epipe", "abort", "timeout", "dns", "tls", "socket", "other",
 ]);
-const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["store_cause", STORE_CAUSE_VALUES]]);
+/** `streaming` on the consumer's streaming reconcile startup line. */
+export const STREAMING_VALUES: ReadonlySet<string> = new Set(["on", "off"]);
+const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES]]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;

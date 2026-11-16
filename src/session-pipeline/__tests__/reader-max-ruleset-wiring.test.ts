@@ -69,6 +69,30 @@ test("largeReadRuntime: MESSAGE_ORIGIN_LABELS_ENABLED labels like the Lambda tha
   }
 });
 
+test("hosted never streams: the Lambda and the large-read Job build search deps without `stream`, whatever the streaming env says", async () => {
+  // Only the self-host consumer (consumer-service.ts serve()) reads SEARCH_INDEX_STREAMING_ENABLED and
+  // SEARCH_INDEX_STREAM_MAX_READ_*; the hosted paths ignore them, malformed values included.
+  for (const streaming of [{}, { SEARCH_INDEX_STREAMING_ENABLED: "true", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" },
+    { SEARCH_INDEX_STREAMING_ENABLED: "1", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }]) {
+    const rt = runtimeFromSecret(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", ...streaming }), secret, "synthetic-generation");
+    try {
+      expect(rt.deps.search).toBeDefined();
+      expect("stream" in rt.deps.search!).toBe(false);
+    } finally {
+      await (rt.deps.pointer.db as unknown as { end(): Promise<void> }).end();
+    }
+    const runtime = largeReadRuntime({
+      SESSION_PIPELINE_SECRET_JSON: secret, AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls",
+      PIPELINE_ORG_FROM_PREFIX: "true", AWS_ACCESS_KEY_ID: "synthetic", AWS_SECRET_ACCESS_KEY: "synthetic", ...streaming,
+    });
+    try {
+      expect("stream" in runtime.deps.search).toBe(false);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
 test("largeReadRuntime: a malformed maximum refuses before a pool opens", () => {
   expect(() => largeReadRuntime({
     SESSION_PIPELINE_SECRET_JSON: secret, AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls",

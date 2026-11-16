@@ -66,6 +66,16 @@ describe("telemetry allowlist", () => {
     for (const bad of ["ECONNRESET", "socket hang up at https://bucket/96bulls/key", "", 104, null]) expect(sanitizeLogField("store_cause", bad)).toBeUndefined();
   });
 
+  test("the streaming reconcile startup fields: streaming is on / off or nothing, the budgets bounded counts", () => {
+    expect(sanitizeLogField("streaming", "off")).toBe("off");
+    expect(sanitizeLogField("streaming", "on")).toBe("on");
+    for (const bad of ["OFF", "true", "", 1, null]) expect(sanitizeLogField("streaming", bad)).toBeUndefined();
+    for (const f of ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"]) {
+      expect(sanitizeLogField(f, 2048 * 1024 * 1024)).toBe(2048 * 1024 * 1024);
+      for (const bad of ["2GiB", -1, 1.5]) expect(sanitizeLogField(f, bad)).toBeUndefined();
+    }
+  });
+
   test("storeTransportCause classifies by code / name / errno only (one cause level), never the message", () => {
     const e = (code?: string, name?: string, message = "https://bucket/96bulls/secret") => Object.assign(new Error(message), code ? { code } : {}, name ? { name } : {});
     expect(storeTransportCause(e("ECONNRESET"))).toBe("econnreset");

@@ -381,10 +381,36 @@ test("startup: unset with output facts logs why streaming is off; budgets at the
     message: expect.stringContaining("no scope past the whole-read bound fits"),
     fields: { max_read_bytes: 256 * MiB, max_read_events: 400_000, largest_streamed_scope_bytes: 64 * MiB, largest_streamed_scope_events: 100_000 },
   });
-  // One budget above its floor lets the scopes past that bound stream: no warning.
+  // One budget that fits the smallest scope past its bound lets those scopes stream: no warning.
   expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "257MiB" }).notice).toBeUndefined();
-  expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400001" }).notice).toBeUndefined();
+  expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400004" }).notice).toBeUndefined();
+  // Above the floor but below four times (bound + 1): still no scope fits, still a warning.
+  expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400001" }).notice?.level).toBe("warn");
   expect(searchIndexStreamBudgetWarning(undefined, limits)).toBeUndefined();
+});
+
+test("budget warning boundary: a scope streams only strictly past the bound, so a budget needs four times (bound + 1)", () => {
+  // canonical-projection.ts hands a scope to the streaming reader only when bytes > maxScopeBytes
+  // or events > maxScopeEvents; canonical-stream-projection.ts refuses size * 4 > budget. The
+  // smallest streamable scope is bound + 1, so 4 * bound .. 4 * bound + 3 fits none of them.
+  const bound = { maxScopeBytes: 64 * 1024 * 1024, maxScopeEvents: 100_000 };
+  const floor = searchIndexStreamFloor(bound);
+  expect(floor).toEqual({ maxReadBytes: 4 * bound.maxScopeBytes, maxReadEvents: 4 * bound.maxScopeEvents });
+  const warn = (maxReadBytes: number, maxReadEvents: number) => searchIndexStreamBudgetWarning({ maxReadBytes, maxReadEvents }, bound);
+  for (const [axis, b] of [["bytes", bound.maxScopeBytes], ["events", bound.maxScopeEvents]] as const) {
+    const at = (budget: number) => (axis === "bytes" ? warn(budget, floor.maxReadEvents) : warn(floor.maxReadBytes, budget));
+    expect(at(4 * b)).toBeDefined(); // exactly four whole reads (the accepted floor): no scope fits
+    expect(at(4 * b + 3)).toBeDefined(); // one short of four times (bound + 1)
+    expect(at(4 * b + 4)).toBeUndefined(); // four times (bound + 1): the smallest scope past the bound fits
+    expect(at(4 * b + 5)).toBeUndefined(); // above it
+  }
+  // The floor is still accepted (values valid before stay valid) and warns at startup.
+  const env = { SEARCH_INDEX_STREAM_MAX_READ_BYTES: String(floor.maxReadBytes), SEARCH_INDEX_STREAM_MAX_READ_EVENTS: String(floor.maxReadEvents) };
+  expect(searchIndexStreamFromEnv(env, bound, false)).toEqual(floor);
+  expect(searchIndexStreamStartup(env, bound, false).notice?.level).toBe("warn");
+  // Four times (bound + 1) on the events axis is accepted and quiet.
+  const events = { ...env, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: String(4 * (bound.maxScopeEvents + 1)) };
+  expect(searchIndexStreamStartup(events, bound, false).notice).toBeUndefined();
 });
 
 test("streaming at the default budgets: a scope past the whole-read bound is streamed, not left partial", async () => {
