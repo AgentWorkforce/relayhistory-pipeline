@@ -81,6 +81,7 @@ import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
 import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
+import { ledgerRoutedStore } from "./ledger-store.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
@@ -190,7 +191,13 @@ export interface SelfhostIngestRuntime {
 
 export interface RuntimeParts {
   run: SqlRun;
+  /** The Locker store; with INGEST_LEDGER_BUCKET, the routed store over it and the ledger bucket (ledger-store.ts). */
   store: ObjectStore;
+  /**
+   * INGEST_LEDGER=s3: the ledger-home fork guard (ledger-s3.ts `ledgerHome`). Production always sets it: `expect` is
+   * the ledger's bucket, `required` true only with a separate ledger bucket. Absent (tests): no check.
+   */
+  ledgerHome?: { expect: string; required: boolean };
   verify: (authorization: string | undefined) => Promise<IngestIdentity>;
   ready: () => Promise<boolean>;
   close: () => Promise<void>;
@@ -218,7 +225,7 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
-export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean } = {}): Ledger {
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean } = {}): Ledger {
   // The log materializer's ledger passes logModeGuard false: it is the one legacy writer allowed on a log-mode stream.
   // Callers pass the parsed mode (selfhostIngestRuntime); the env read is only for a direct caller that does not.
   const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";
@@ -228,7 +235,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
     // INGEST_S3_TENANT_LIMIT=on: the synchronous path's tenant limiter (one per process / replica). Off: no limiter, unchanged.
     // INGEST_LEDGER_LOG_COMMIT=on: legacy claims and commits refuse a stream in log mode (its log is the only writer).
     s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),
-      ...(guard ? { logModeGuard: true } : {}) }),
+      ...(guard ? { logModeGuard: true } : {}), ...(parts.ledgerHome ? { ledgerHome: parts.ledgerHome } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
@@ -521,9 +528,25 @@ export function conditionalWriteProbeKey(keyRoot: string, nonce: string = crypto
  * need conditional writes the backend really honours, so prove them once or refuse to start. Sync (the default)
  * never touches the store here.
  */
-export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings, "keyRoot" | "admission"> & Partial<Pick<SelfhostIngestSettings, "ledger">>, store: ObjectStore): Promise<void> {
+export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings, "keyRoot" | "admission"> & Partial<Pick<SelfhostIngestSettings, "ledger">>, store: ObjectStore, ledgerStore?: ObjectStore): Promise<void> {
   // The S3 ledger (INGEST_LEDGER=s3) is create-only claims and CAS merges throughout: prove them in every mode.
   if (settings.admission || settings.ledger === "s3") await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
+  // INGEST_LEDGER_BUCKET: the ledger's own bucket is where its creates and CAS merges land: prove it too.
+  if (ledgerStore) await assertConditionalWrites(ledgerStore, conditionalWriteProbeKey(settings.keyRoot));
+}
+
+/**
+ * The Locker store, and with INGEST_LEDGER_BUCKET the routed store over it and the ledger bucket (same provider,
+ * endpoint and credential source). `ledgerHome`: the fork guard's expectation (INGEST_LEDGER=s3).
+ */
+export function selfhostStores(settings: Pick<SelfhostIngestSettings, "keyRoot"> & Partial<Pick<SelfhostIngestSettings, "ledger" | "ledgerStore">>, env: NodeJS.ProcessEnv,
+  build: typeof buildLockerStore = buildLockerStore): { store: ObjectStore; main: ObjectStore; ledgerStore?: ObjectStore; ledgerHome?: { expect: string; required: boolean } } {
+  const sep = settings.ledgerStore;
+  const main = build(env).store as unknown as ObjectStore;
+  if (settings.ledger !== "s3") return { store: main, main };
+  if (!sep) return { store: main, main, ledgerHome: { expect: env.LOCKER_BUCKET!, required: false } };
+  const ledgerStore = build({ ...env, LOCKER_BUCKET: sep.bucket, LOCKER_REGION: sep.region }).store as unknown as ObjectStore;
+  return { store: ledgerRoutedStore(main, ledgerStore, settings.keyRoot), main, ledgerStore, ledgerHome: { expect: sep.bucket, required: true } };
 }
 
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
@@ -547,10 +570,11 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
   let startupAnalytics: ReturnType<typeof createAnalyticsSink> | undefined;
   try {
     await assertIngestRole(run, { supabase: env.SESSION_POSTGRES_TLS_PROFILE === "supabase" });
-    const store = buildLockerStore(env).store as unknown as ObjectStore;
+    // INGEST_LEDGER_BUCKET: `store` routes the ledger's own keys to its bucket (ledger-store.ts); unset, the Locker store.
+    const { store, main, ledgerStore, ledgerHome } = selfhostStores(settings, env);
     // Async admission needs create-only and compare-and-swap PUTs (the inbox, the privacy journal): prove the
     // backend honours them, or refuse to start. Never run for sync (the default).
-    await admissionStartupGate(settings, store);
+    await admissionStartupGate(settings, main, ledgerStore);
     const verify = relaycontrolIngestIdentity(settings, selfhostIntrospector(settings, env));
     const analytics = createAnalyticsSink(settings.analytics ?? ANALYTICS_OFF, "session-ingest", "service", {
       report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analytics.destination, counters)),
@@ -562,6 +586,7 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
     const runtime = selfhostIngestRuntime(settings, {
       run,
       store,
+      ...(ledgerHome ? { ledgerHome } : {}),
       verify,
       ready: async () => {
         try {

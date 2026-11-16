@@ -108,6 +108,13 @@
  *                                    takes INGEST_MAX_PER_USER / _ORG slots (429 delivery_busy at the cap); the
  *                                    async consumer has its own pool, INGEST_MAX_PER_USER per user and
  *                                    INGEST_ASYNC_MAX_PER_ORG per org, and defers (never dead-letters) at the cap.
+ *   INGEST_LEDGER_BUCKET             unset | "" (default: the ledger lives in LOCKER_BUCKET, unchanged) | a bucket name other
+ *                                    than LOCKER_BUCKET: the S3 ledger's own objects (ledger-store.ts: each user's ledger/
+ *                                    and the ledger-home marker) live there; everything else, the fences included, stays
+ *                                    in LOCKER_BUCKET. Same provider, endpoint and credentials as the Locker
+ *                                    store. Needs INGEST_LEDGER=s3. Claims then also need the ledger-home marker in that
+ *                                    bucket naming it (docs/ledger-relocation.md). Proven for conditional writes at startup.
+ *   INGEST_LEDGER_REGION             the ledger bucket's signing region; default LOCKER_REGION. Only with INGEST_LEDGER_BUCKET.
  *   INGEST_ASYNC_MAX_PER_ORG         the async consumer's per-org cap with INGEST_S3_TENANT_LIMIT=on and
  *                                    SELFHOST_INGEST_ADMISSION=async|drain: 1..SELFHOST_ADMISSION_CONCURRENCY,
  *                                    default max(1, floor(concurrency / 2)), so one org never holds more than half
@@ -192,6 +199,29 @@ export interface SelfhostIngestSettings {
   claimLockBusy?: true;
   /** INGEST_S3_TENANT_LIMIT=on (INGEST_LEDGER=s3 only). Absent (the default): no tenant limit on the S3 ledger. */
   s3TenantLimit?: SelfhostS3TenantLimitSettings;
+  /** INGEST_LEDGER_BUCKET (+ INGEST_LEDGER_REGION), INGEST_LEDGER=s3 only. Absent (the default): the ledger is in LOCKER_BUCKET. */
+  ledgerStore?: SelfhostLedgerStoreSettings;
+}
+
+/** The S3 ledger's own bucket (ledger-store.ts). `region`: INGEST_LEDGER_REGION, else LOCKER_REGION, else us-east-1. */
+export interface SelfhostLedgerStoreSettings { bucket: string; region: string }
+export const INGEST_LEDGER_BUCKET_VAR = "INGEST_LEDGER_BUCKET";
+export const INGEST_LEDGER_REGION_VAR = "INGEST_LEDGER_REGION";
+
+/** INGEST_LEDGER_BUCKET / INGEST_LEDGER_REGION. Errors name the variable, never the value. */
+export function selfhostLedgerStore(env: NodeJS.ProcessEnv, ledger: "s3" | undefined): SelfhostLedgerStoreSettings | undefined {
+  const bucket = env[INGEST_LEDGER_BUCKET_VAR]?.trim() ?? "";
+  const regionRaw = env[INGEST_LEDGER_REGION_VAR]?.trim() ?? "";
+  if (!bucket) {
+    if (regionRaw) throw new Error(`96bulls: ${INGEST_LEDGER_REGION_VAR} needs ${INGEST_LEDGER_BUCKET_VAR}`);
+    return undefined;
+  }
+  if (ledger !== "s3") throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} needs ${INGEST_LEDGER_VAR}=s3`);
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must be a bucket name`);
+  if (bucket === env.LOCKER_BUCKET?.trim()) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must differ from LOCKER_BUCKET (unset it to keep the ledger there)`);
+  const region = regionRaw || env.LOCKER_REGION?.trim() || "us-east-1";
+  if (!/^[a-z0-9-]{1,63}$/.test(region)) throw new Error(`96bulls: ${INGEST_LEDGER_REGION_VAR} must be a region name`);
+  return { bucket, region };
 }
 
 /** INGEST_S3_TENANT_LIMIT=on. `asyncMaxPerOrg` (INGEST_ASYNC_MAX_PER_ORG): present only with async/drain admission. */
@@ -429,6 +459,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
+  const ledgerStore = selfhostLedgerStore(env, ledger);
   return {
     enabled: true,
     port: port(env),
@@ -452,5 +483,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
     ...(ledger ? { ledger, ledgerLogCommit } : {}),
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
+    ...(ledgerStore ? { ledgerStore } : {}),
   };
 }

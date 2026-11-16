@@ -90,6 +90,7 @@ import {
 import { MAX_DELIVERY_CONFLICTS } from "./vendor/delivery/delivery-contracts.ts";
 import { assertTenantSegment, backoffMs, liveMachineId } from "./writer.ts";
 import type { TenantLimiter } from "./tenant-limiter.ts";
+import { ledgerHomeKey, ledgerHomeVerdict, validLedgerHome } from "./ledger-store.ts";
 
 // ---- INGEST_LEDGER ----
 
@@ -646,6 +647,14 @@ export interface S3LedgerOptions {
   /** How long a VALID marker read is trusted (default 60 s). A missing or invalid one is never cached. */
   fenceAuthorityTtlMs?: number;
   /**
+   * The fork guard of a ledger relocation (ledger-store.ts LedgerHomeDoc, docs/ledger-relocation.md), checked with the
+   * fence-authority marker and cached with it (needs `fenceAuthority: "required"`): the marker
+   * `<keyRoot>/.ledger/ledger-home.json` in THIS ledger's store naming another bucket than `expect` refuses every claim
+   * (`ledger_home_moved`); absent, a claim refuses only when `required` (a separate ledger bucket is configured).
+   * Unset: no check, no request.
+   */
+  ledgerHome?: { expect: string; required: boolean };
+  /**
    * false: a claim never completes a reset another attempt left running; it admits against the fence as it is
    * (a running reset is a state claims already handle) and only the reset's own retry completes it. Self-host
    * sets false, because its SQL mirror runs on the control path only: a claim-side completion would land the
@@ -933,6 +942,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   };
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
   if (!count(authorityTtl)) throw new LedgerUnavailableError("ledger_s3_options_refused");
+  if (opts.ledgerHome && (opts.fenceAuthority !== "required" || !str(opts.ledgerHome.expect))) throw new LedgerUnavailableError("ledger_s3_options_refused");
   /** Per org: until when a valid marker read is trusted. Bounded (cleared when full): only a cache. */
   const authorityUntil = new Map<string, number>();
 
@@ -952,6 +962,11 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       if (org.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");
     } else if (!(await readDoc(store, fenceAuthorityKey(keyRoot), validFenceAuthority, "ledger_fence_authority_invalid"))) {
       throw new LedgerUnavailableError("ledger_fence_authority_missing");
+    }
+    if (opts.ledgerHome) {
+      const home = await readDoc(store, ledgerHomeKey(keyRoot), validLedgerHome, "ledger_home_invalid");
+      const verdict = ledgerHomeVerdict(home?.doc ?? null, opts.ledgerHome.expect, opts.ledgerHome.required);
+      if (verdict !== "ok") throw new LedgerUnavailableError(verdict);
     }
     if (authorityUntil.size >= 10_000) authorityUntil.clear();
     authorityUntil.set(orgId, now + authorityTtl);

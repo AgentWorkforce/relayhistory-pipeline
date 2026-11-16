@@ -7,6 +7,14 @@
  *   INGEST_REARM_BUCKET              the transcripts bucket (the S3 ledger and the canonical layout)
  *   INGEST_REARM_REGION              signing region
  *   INGEST_REARM_ENDPOINT            bare origin of an S3-compatible store (MinIO); unset = AWS S3
+ *   INGEST_REARM_LEDGER_BUCKET       unset (default: the ledger is in INGEST_REARM_BUCKET) | the S3 ledger's own bucket
+ *                                    (= the ingest edge's INGEST_LEDGER_BUCKET, ledger-store.ts): markers, completion
+ *                                    records and ownership stubs are read there; the fences, the cursor and the canonical
+ *                                    layout (and the erase) stay in INGEST_REARM_BUCKET. Same endpoint and credentials.
+ *   INGEST_REARM_LEDGER_REGION       its signing region; default INGEST_REARM_REGION. Only with INGEST_REARM_LEDGER_BUCKET.
+ *                                    With it, every pass first checks the ledger-home marker in that bucket (ledger-store.ts):
+ *                                    missing (`ledger_home_missing`) or naming another bucket (`ledger_home_moved`) refuses
+ *                                    (exit 2). Without it no marker is read (the sweeper's role may not read that prefix).
  *   INGEST_REARM_KEY_ROOT            object key root, default "96bulls" (= INGEST_KEY_ROOT)
  *   INGEST_REARM_ORGS                optional comma-separated org ids (org scope); unset = every org
  *   INGEST_REARM_DRY_RUN             "1": classify and count only (or `--dry-run`)
@@ -37,6 +45,7 @@ import type { ObjectStore } from "../shared/vendor.ts";
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
+import { isRoutedCursor, ledgerHomeVerdict, ledgerRoutedStore, readLedgerHome } from "./ledger-store.ts";
 import { readRearmCursor, rearmCursorKey, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
 
 export const REARM_ENABLE_FLAG = "INGEST_REARM_SWEEPER_ENABLED";
@@ -53,6 +62,8 @@ export function rearmSweeperEnabled(env: NodeJS.ProcessEnv): boolean {
 export interface RearmSweeperConfig {
   bucket: string;
   region: string;
+  /** INGEST_REARM_LEDGER_BUCKET / _REGION: the S3 ledger's own bucket. Absent: the ledger is in `bucket`. */
+  ledger?: { bucket: string; region: string };
   endpoint?: string;
   keyRoot: string;
   orgs?: string[];
@@ -73,6 +84,9 @@ const int = (raw: string | undefined, dflt: number, min: number, max: number): n
 export function rearmSweeperConfig(env: NodeJS.ProcessEnv, argv: readonly string[] = []): RearmSweeperConfig {
   const bucket = env.INGEST_REARM_BUCKET ?? "", region = env.INGEST_REARM_REGION ?? "";
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket) || !/^[a-z0-9-]{1,63}$/.test(region)) refuse("config_invalid");
+  const ledgerBucket = env.INGEST_REARM_LEDGER_BUCKET ?? "", ledgerRegion = env.INGEST_REARM_LEDGER_REGION || region;
+  if (!ledgerBucket && env.INGEST_REARM_LEDGER_REGION) refuse("config_invalid");
+  if (ledgerBucket && (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(ledgerBucket) || ledgerBucket === bucket || !/^[a-z0-9-]{1,63}$/.test(ledgerRegion))) refuse("config_invalid");
   let endpoint: string | undefined;
   if (env.INGEST_REARM_ENDPOINT) {
     try { endpoint = assertDestinationUrl("INGEST_REARM_ENDPOINT", env.INGEST_REARM_ENDPOINT, destinationPolicy(env), { allowPath: false }).origin; }
@@ -92,7 +106,7 @@ export function rearmSweeperConfig(env: NodeJS.ProcessEnv, argv: readonly string
   const credentials = env.INGEST_REARM_CREDENTIALS || "role";
   if (credentials !== "role" && credentials !== "keys" && credentials !== "podIdentity") refuse("config_invalid");
   return {
-    bucket, region, ...(endpoint ? { endpoint } : {}), keyRoot, ...(orgs ? { orgs } : {}),
+    bucket, region, ...(ledgerBucket ? { ledger: { bucket: ledgerBucket, region: ledgerRegion } } : {}), ...(endpoint ? { endpoint } : {}), keyRoot, ...(orgs ? { orgs } : {}),
     dryRun: dry === "1" || argv.includes("--dry-run"),
     concurrency: int(env.INGEST_REARM_CONCURRENCY, 4, 1, REARM_MAX_CONCURRENCY),
     maxMarkers: int(env.INGEST_REARM_MAX_MARKERS, 500, 1, 10_000),
@@ -167,7 +181,21 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   const cfg = rearmSweeperConfig(env, argv);
   const { snapshot, provider } = await rearmSweeperCredentials(env, cfg, overrides.fetcher);
   const s3 = { bucket: cfg.bucket, region: cfg.region, ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}), credentials: snapshot };
-  const store = (overrides.store ?? createS3Store)({ ...s3, credentials: provider }) as unknown as ObjectStore;
+  const main = (overrides.store ?? createS3Store)({ ...s3, credentials: provider }) as unknown as ObjectStore;
+  // INGEST_REARM_LEDGER_BUCKET: the ledger's keys (markers, completion records, fences, stubs) route to its bucket.
+  const store = cfg.ledger
+    ? ledgerRoutedStore(main, (overrides.store ?? createS3Store)({ ...s3, bucket: cfg.ledger.bucket, region: cfg.ledger.region, credentials: provider }) as unknown as ObjectStore, cfg.keyRoot)
+    : main;
+  // The fork guard: never sweep a ledger bucket the deployment has not moved to (or has moved away from again).
+  if (cfg.ledger) {
+    let home;
+    try { home = await readLedgerHome(store, cfg.keyRoot); } catch (error) {
+      if (error instanceof Error && error.message === "ledger_home_invalid") refuse("ledger_home_invalid");
+      throw error;
+    }
+    const verdict = ledgerHomeVerdict(home, cfg.ledger.bucket, true);
+    if (verdict !== "ok") refuse(verdict);
+  }
   const eraser = (overrides.eraser ?? createS3Eraser)(s3);
   const now = overrides.now ?? Date.now;
   // Expiring credentials (Pod Identity): the eraser's snapshot must outlive the pass.
@@ -177,7 +205,13 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
     extra = { ...extra, deadlineAt: Math.min(extra.deadlineAt ?? Infinity, until) };
   }
   const cursorKey = rearmCursorKey(cfg.keyRoot, rearmScopes(cfg.keyRoot, cfg.orgs ?? null));
-  const saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
+  let saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
+  // A position saved before INGEST_REARM_LEDGER_BUCKET was set holds a plain listing cursor, which the routed store's
+  // merged listing cannot continue: restart that scope (completion records make re-reading a marker a no-op).
+  if (saved?.resume?.cursor !== undefined && cfg.ledger && !isRoutedCursor(saved.resume.cursor)) {
+    const { cursor: _stale, afterKey: _after, ...rest } = saved.resume;
+    saved = { ...saved, resume: rest };
+  }
   // Saved after every finished marker whose erase ran and at every page end (onProgress), then once at the end; each
   // save is If-Match the previous one. Once another sweeper wins a save, this pass stops saving (its position stands).
   let version = saved?.version, contended = false;
