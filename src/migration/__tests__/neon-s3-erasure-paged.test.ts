@@ -219,6 +219,40 @@ describe("hosted legacy-export scope erasure", () => {
     expect(j.counters.legacyFenceFailed).toBeGreaterThan(0);
     st.close();
   });
+
+  test("a normalized default authority row follows the validated historical empty-workspace machine", async () => {
+    const row: LegacyFencedGroup = {
+      ...L,
+      workspace_id: "default",
+      legacy_machine_id: legacyMachineId("", L.legacy_user_id),
+    };
+    const target = liveTargets("96bulls", {
+      org_id: row.org_id,
+      workspace_id: "",
+      user_id: row.legacy_user_id,
+      origin_id: LEGACY_EXPORT_ORIGIN_ID,
+      source: row.source,
+      session_id: row.session_id,
+    });
+    const normalizedNeighbour = liveTargets("96bulls", {
+      org_id: row.org_id,
+      workspace_id: "default",
+      user_id: row.legacy_user_id,
+      origin_id: LEGACY_EXPORT_ORIGIN_ID,
+      source: row.source,
+      session_id: row.session_id,
+    });
+    const s = new FakeS3Versions();
+    s.put(`${target.base}d=2026/10/30/${target.sessionSegment}/manifest.json`, OLD);
+    s.put(target.pointerKey, OLD);
+    s.put(`${normalizedNeighbour.base}d=2026/10/30/${normalizedNeighbour.sessionSegment}/manifest.json`, OLD);
+    const st = await state();
+    await job(s, st, legacyAuthority(row)).sweep();
+    expect(s.count(target.base)).toBe(0);
+    expect(s.count(target.pointerKey)).toBe(0);
+    expect(s.count(normalizedNeighbour.base)).toBe(1);
+    st.close();
+  });
 });
 
 describe("the live pointer and staged objects go through the same reserve gate", () => {

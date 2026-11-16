@@ -634,13 +634,17 @@ export class ErasureJob {
         // The stored machine is evidence, not destructive authority by
         // itself: derive it again from the canonical owner tuple and refuse
         // corruption instead of following an arbitrary machine id.
-        if (legacyMachineId(g.workspace_id, g.legacy_user_id) !== g.legacy_machine_id)
+        const storageWorkspaces = g.workspace_id === "default" ? ["", "default"] : [g.workspace_id];
+        const storageWorkspace = storageWorkspaces.find(
+          (workspace) => legacyMachineId(workspace, g.legacy_user_id) === g.legacy_machine_id,
+        );
+        if (storageWorkspace === undefined)
           throw refusal("legacy_erasure_machine_mismatch");
         let t;
         try {
           t = liveTargets(this.cfg.keyRoot, {
             org_id: g.org_id,
-            workspace_id: g.workspace_id,
+            workspace_id: storageWorkspace,
             user_id: g.legacy_user_id,
             origin_id: LEGACY_EXPORT_ORIGIN_ID,
             source: g.source,
