@@ -599,7 +599,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
    * with 062010's turn_session_fences (062010 then 062020's own grant block when the stack lacks it), the provisioned
    * bulls96_legacy_export_privacy role, and the exporter's own privacy-session initializer and preflight.
    */
-  async function hostedWorld() {
+  async function hostedWorld(activate = true) {
     const main = (await import("../legacy-export/main.ts")) as Record<string, unknown>;
     const initPrivacy = main.legacyPrivacySession as ((q: Queryable) => Promise<Queryable>) | undefined;
     const preflight = main.assertPrivacySelectOnly as (q: Queryable) => Promise<void>;
@@ -607,10 +607,12 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     expect(existsSync(AUTHORITY_MIGRATION)).toBe(true);
     const f = await authorityFixture();
     await f.seal();
-    await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
-    const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
-    const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
-    await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+    if (activate) {
+      await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+      const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+      await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+    }
     const had = ((await f.db.query("SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
     if (!had) {
       await f.db.exec(`CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
@@ -669,23 +671,61 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   const legacyKeys = async (store: ObjectStore, session: string) =>
     (await allKeys(store)).filter((k) => k.startsWith(liveObjectPrefix("96bulls", legacyGroup(OWNER))) && k.includes(`/s=${session}/`));
 
-  test("owner rule (Neon authority, today's default): the eraser targets the owner bound at export, even after Neon later re-derives a different one", async () => {
-    const n = await neon(), p = await supabase();
-    const store = createFsStore({ root: await tmp("drift-neon") });
-    const { counters } = await run(n.db, p.db, store, "drift-neon");
-    expect(counters.exported).toBe(1);
-    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
-    expect((await allKeys(store)).some((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"))).toBe(true);
-    // A later delivery event by another user: re-deriving from live Neon would now bind 'u_drift' (events outrank outcomes).
-    await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,$4,'u_drift')", [S.orgId, S.workspaceId, S.source, S.sessionId]);
-    await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
-    const state = new SyncState(join(await tmp("drift-neon-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
-    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
-    await job.sweep();
-    await job.sweep();
-    state.close();
-    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"))).toEqual([]);
+  test("owner rule (Neon authority, today's default): a legacy copy found while erasure runs under the neon authority fails LOUD; it is never erased via a re-derived owner and never reported erased", async () => {
+    // Lead decision: no legacy copy may exist under the neon authority; if one is found, alert and do not mark it erased.
+    for (const drift of [false, true]) {
+      const n = await neon(), p = await supabase();
+      const store = createFsStore({ root: await tmp(`neon-loud-${drift}`) });
+      // The copy is put in place directly (the exporter itself must refuse under neon; see the next test).
+      const unit = (await legacyUnit(n.db, S))!;
+      await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+      const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+      const before = (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"));
+      expect(before.length).toBeGreaterThan(0);
+      if (drift) await n.pg.query("INSERT INTO sessions.convergence_events VALUES($1,$2,$3,$4,'u_drift')", [S.orgId, S.workspaceId, S.source, S.sessionId]);
+      await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
+      const state = new SyncState(join(await tmp(`neon-loud-state-${drift}`), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+      const logs: Record<string, unknown>[] = [];
+      const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+      await job.sweep().catch((e: unknown) => logs.push({ message: "sweep threw", error_code: (e as { code?: string }).code ?? "error" }));
+      await job.sweep().catch((e: unknown) => logs.push({ message: "sweep threw", error_code: (e as { code?: string }).code ?? "error" }));
+      state.close();
+      // LOUD: a legacy-specific failure/refusal is logged (an operator alert keys on it).
+      const loud = logs.filter((l) => /legacy/iu.test(`${String(l.message)} ${String(l.error_code ?? "")}`) && /fail|refus|unsupported|not_?allowed|authority/iu.test(`${String(l.message)} ${String(l.error_code ?? "")}`));
+      expect({ drift, loud: loud.length > 0 }).toEqual({ drift, loud: true });
+      // Never a silent erasure through a re-derived owner, and no false "erased" accounting.
+      expect({ drift, left: (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/")) }).toEqual({ drift, left: before });
+      expect({ drift, legacyDeleted: (job.counters as Record<string, number>).legacyVersionsDeleted ?? 0 }).toEqual({ drift, legacyDeleted: 0 });
+      void p;
+    }
   });
+
+  test("owner rule: the legacy exporter REFUSES unless the Supabase eraser authority is active (no legacy copy can start under neon)", async () => {
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    const w = await hostedWorld(false); // real stack, legacy eraser RPCs installed, privacy authority NOT activated
+    try {
+      const store = createFsStore({ root: await tmp("refuse-neon") });
+      let puts = 0;
+      const counting = withPutHook(store, async () => void (puts += 1));
+      const outcome = await w.asExporter(async (privacyDb) => {
+        const r = await run(n.db, privacyDb, counting, "refuse-neon");
+        r.checkpoint.close();
+        return { counters: r.counters, logs: r.logs };
+      }).then((v) => ({ ok: v }), (e: unknown) => ({ code: String((e as { code?: string }).code ?? "error") }));
+      // Refused before any PUT, with an authority-specific code (thrown by the preflight, or logged per scope).
+      expect(puts).toBe(0);
+      expect(await allKeys(store)).toEqual([]);
+      expect(await w.authorityRow(SR)).toEqual([]);
+      const codes = "code" in outcome ? [outcome.code] : outcome.ok.logs.map((l) => String(l.error_code ?? ""));
+      expect(codes.some((c) => /authority/iu.test(c))).toBe(true);
+      if ("ok" in outcome) expect(outcome.ok.counters.exported).toBe(0);
+    } finally {
+      await w.f.close();
+    }
+  });
+
 
   test("owner rule: the hosted eraser targets the owner registered at export, even after Neon later re-derives a different one", async () => {
     const n = await neon();
