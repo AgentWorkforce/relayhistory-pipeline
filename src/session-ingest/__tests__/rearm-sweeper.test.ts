@@ -15,6 +15,7 @@ import { s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
 import { parseRearmKey, rearmCorruptKey, rearmCursorKey, rearmDoneKey, rearmScopes, REARM_SKEW_MS, RearmSweepRefused, sweepRearmMarkers, type RearmSweepOptions } from "../rearm-sweeper.ts";
 import { exitCodeForError, exitCodeForPass, rearmSweeperConfig, rearmSweeperEnabled, runRearmSweeperLoop, runRearmSweeperPass } from "../rearm-sweeper-main.ts";
 import { liveMachineId } from "../writer.ts";
+import { ledgerHomeKey, ledgerRoutedStore } from "../ledger-store.ts";
 import { TENANT, scratchStore } from "./support.ts";
 
 const ROOT = "96bulls";
@@ -729,5 +730,49 @@ describe("re-arm sweeper entry", () => {
     await runRearmSweeperLoop(ENV, [], (l) => lines.push(l), () => passes >= 2, async () => { passes++; }, overrides);
     expect(lines).toHaveLength(2);
     expect(lines[1]).toMatchObject({ event: "rearm_sweep", counts: { alreadyDone: 1 } });
+  });
+});
+
+describe("re-arm sweeper with a separate ledger bucket (INGEST_REARM_LEDGER_BUCKET, ledger-store.ts)", () => {
+  const ENV = { ...ENTRY_ENV, INGEST_REARM_LEDGER_BUCKET: "ledger-b", INGEST_REARM_LEDGER_REGION: "us-west-2" };
+  const home = (h: string) => new TextEncoder().encode(JSON.stringify({ v: 1, home: h, writtenAtMs: 1 }));
+
+  test("config: the ledger bucket must differ, its region needs it", () => {
+    expect(rearmSweeperConfig(ENV).ledger).toEqual({ bucket: "ledger-b", region: "us-west-2" });
+    expect(rearmSweeperConfig({ ...ENV, INGEST_REARM_LEDGER_REGION: "" }).ledger).toEqual({ bucket: "ledger-b", region: "us-east-1" });
+    expect(rearmSweeperConfig(ENTRY_ENV).ledger).toBeUndefined();
+    for (const bad of [{ INGEST_REARM_LEDGER_BUCKET: "transcripts" }, { INGEST_REARM_LEDGER_BUCKET: "Bad_B" }, { INGEST_REARM_LEDGER_BUCKET: "", INGEST_REARM_LEDGER_REGION: "us-west-2" }])
+      expect(() => rearmSweeperConfig({ ...ENV, ...bad })).toThrow(RearmSweepRefused);
+  });
+
+  test("markers, completion records and stubs are read in the ledger bucket; the fence and the erase in the transcripts bucket; the home marker gates the pass", async () => {
+    const main = fresh(), ledger = fresh(), routed = ledgerRoutedStore(main, ledger, ROOT);
+    const marker = await rearmed(routed, TENANT, "b1");
+    await seed(main, canonical(TENANT));
+    expect(await exists(ledger, marker)).toBe(true);
+    expect(await exists(main, marker)).toBe(false);
+    const overrides = { store: (c: { bucket: string }) => (c.bucket === "ledger-b" ? ledger : main), eraser: () => storeEraser(main), now: LATER };
+    await expect(runRearmSweeperPass(ENV, [], overrides as never)).rejects.toMatchObject({ code: "ledger_home_missing" });
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), home("ledger-b"));
+    const { output } = await runRearmSweeperPass(ENV, [], overrides as never);
+    expect(output).toMatchObject({ enabled: true, complete: true, counts: { listed: 1, erased: 1 } });
+    for (const k of canonical(TENANT)) expect(await exists(main, k)).toBe(false);
+    expect(await doneOf(routed, marker)).toMatchObject({ outcome: "erased" });
+    expect(await exists(main, rearmDoneKey(marker, hex(await text(ledger, marker)).slice(0, 32)))).toBe(false);
+    // Moved away again (a rollback): the marker in the ledger bucket names another bucket.
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), home("transcripts"));
+    await expect(runRearmSweeperPass(ENV, [], overrides as never)).rejects.toMatchObject({ code: "ledger_home_moved" });
+  });
+
+  test("a position saved before the switch (a plain listing cursor) restarts its scope instead of failing every pass", async () => {
+    const main = fresh(), ledger = fresh(), routed = ledgerRoutedStore(main, ledger, ROOT);
+    await rearmed(routed, TENANT, "b1");
+    await seed(main, canonical(TENANT));
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), home("ledger-b"));
+    const cursorKey = rearmCursorKey(ROOT, rearmScopes(ROOT, null));
+    await main.put(objectKey(cursorKey), new TextEncoder().encode(JSON.stringify({ v: 1, resume: { scope: 0, cursor: "plain-s3-token", afterKey: `${ROOT}/zzz` }, atMs: 1 })));
+    const overrides = { store: (c: { bucket: string }) => (c.bucket === "ledger-b" ? ledger : main), eraser: () => storeEraser(main), now: LATER };
+    const { output } = await runRearmSweeperPass(ENV, [], overrides as never);
+    expect(output).toMatchObject({ complete: true, counts: { erased: 1 } });
   });
 });
