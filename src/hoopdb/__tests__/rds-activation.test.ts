@@ -350,14 +350,16 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
 });
 
 describe("role counts (v1)", () => {
-  test("20 roles, 11 LOGIN: operator erase search stays NOLOGIN until separately provisioned", () => {
-    expect(SPEC.length).toBe(20);
-    expect(LOGINS.length).toBe(11);
+  test("21 roles, 12 LOGIN: operator erase search stays NOLOGIN while legacy export is provisioned", () => {
+    expect(SPEC.length).toBe(21);
+    expect(LOGINS.length).toBe(12);
     expect(LOGINS).toContain("bulls96_analysis_admit");
     expect(LOGINS).toContain("bulls96_digest_narrative");
     expect(LOGINS).not.toContain("bulls96_babysitter_retention");
     expect(SPEC.find(r=>r.name==="bulls96_session_erase_search")).toMatchObject({login:false});
     expect(LOGINS).not.toContain("bulls96_session_erase_search");
+    expect(SPEC.find(r=>r.name==="bulls96_legacy_export_privacy")).toMatchObject({login:true});
+    expect(LOGINS).toContain("bulls96_legacy_export_privacy");
   });
 });
 
