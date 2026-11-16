@@ -1509,6 +1509,43 @@ ${secret}
 
 // ---------------------------------------------------------------------------
 describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
+  // ---- (i2) the STREAMED read (search-index source) enforces the same legacy provenance gate as the whole read ----
+  async function streamOf(store: ObjectStore, manifestKey: string, s: LegacyScope = S) {
+    const { streamCanonicalScope } = (await import("../../session-read-api/canonical-stream-projection.ts")) as typeof import("../../session-read-api/canonical-stream-projection.ts");
+    const manifest = await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(manifestKey)))), manifestKey);
+    const scope = { orgId: s.orgId, workspaceId: s.workspaceId, harness: s.source, sessionId: s.sessionId };
+    const deps = { store, prefixFor: (org: string) => `96bulls/${org}`, decompress: (b: Uint8Array, max: number) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: max })) };
+    const streamed = await streamCanonicalScope(scope as never, [{ manifest, key: manifestKey }], deps as never, { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } as never, 7, 0);
+    const rows: unknown[] = [];
+    if (streamed.complete) await streamed.regenerate(new Set(streamed.wanted.keys()), 50, async (batch: unknown[]) => void rows.push(...batch));
+    return { streamed, rowsText: JSON.stringify(rows) };
+  }
+
+  test("(i2) streamed read: a FORGED legacy part (legacy records outside the exporter-owned manifest) is dropped with legacy_provenance_invalid and never reaches the search index", async () => {
+    const canary = "streamed_forged_canary_9f3";
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET content=$1", [canary]);
+    const store = createFsStore({ root: await tmp("stream-forged") });
+    const forged = await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, (await legacyUnit(n.db, S))!, {
+      fenced: async () => false,
+      async *lines(unit) {
+        for await (const line of legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER).lines(unit)) yield { ...line, machine: "srv_forged" };
+      },
+    });
+    const { streamed, rowsText } = await streamOf(store, forged.manifests[0]!.manifestKey);
+    expect(streamed.reasons).toContain("legacy_provenance_invalid");
+    expect([...streamed.kinds].filter((k) => /^legacy_/u.test(k))).toEqual([]);
+    expect(rowsText).not.toContain(canary);
+  });
+
+  test("(i2) streamed read: a GENUINE exporter-owned legacy manifest streams without the provenance reason (positive control)", async () => {
+    const n = await neon();
+    const store = createFsStore({ root: await tmp("stream-genuine") });
+    const real = await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, (await legacyUnit(n.db, S))!, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+    const { streamed } = await streamOf(store, real.manifests[0]!.manifestKey);
+    expect(streamed.reasons).not.toContain("legacy_provenance_invalid");
+  });
+
   test("secret-shaped tokens in a legacy turn never appear in any stored object (raw chunks decompressed, manifests included)", async () => {
     // Assembled at runtime so no secret-shaped literal sits in the source (push protection, secret scanners).
     const aws = ["AK", "IA", "ZQXWVUTSRPONMLKJ"].join("");
