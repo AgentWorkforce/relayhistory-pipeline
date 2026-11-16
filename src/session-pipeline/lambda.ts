@@ -72,7 +72,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
-import { searchIndexLimits } from "./search-index.ts";
+import { searchIndexLimits, searchIndexStreamChFromEnv, type SearchIndexStreamCh } from "./search-index.ts";
 import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
@@ -139,6 +139,12 @@ export interface LambdaEnv {
   outputFactsEnabled?: boolean;
   /** MESSAGE_ORIGIN_LABELS_ENABLED=true: index rows label who wrote each event (message-origin.ts). Default off. */
   originLabelsEnabled?: boolean;
+  /**
+   * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
+   * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
+   * remaining time less `deadlineMarginMs`. Absent: such a scope is marked partial exactly as before.
+   */
+  searchStreamCh?: SearchIndexStreamCh;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
   /** Explicitly identifies analysis_source_readonly_url as the frozen Supabase legacy copy. */
@@ -202,6 +208,15 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   // The fact tables are ClickHouse DDL: a portable search backend has nowhere to put them.
   if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && selected.search !== "clickhouse")
     throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs the clickhouse search backend");
+  // Hosted streaming reconcile: its own flag; the self-host SEARCH_INDEX_STREAMING_ENABLED is never read here.
+  const searchStreamCh = searchIndexStreamChFromEnv(env, searchIndexLimits(env.SESSION_REPLAY_PAGES_ENABLED === "1"));
+  if (searchStreamCh && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs SEARCH_INDEX_ENABLED=1");
+  if (searchStreamCh && selected.search !== "clickhouse")
+    throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs the clickhouse search backend");
+  // The facts are built from a whole read; the streamed path never writes them.
+  if (searchStreamCh && env.SEARCH_INDEX_OUTPUT_FACTS === "1")
+    throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 cannot be combined with SEARCH_INDEX_OUTPUT_FACTS=1");
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   return {
@@ -222,6 +237,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
+    ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     ...(legacyReadSource === "frozen-supabase" ? { legacyReadSource } : {}),
@@ -467,6 +483,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.outputFactsEnabled ? { outputFacts: true as const } : {}),
       // Default off; on, each scope's next pass rewrites its labelled rows once (new fingerprints).
       ...(env.originLabelsEnabled ? { originLabels: true as const } : {}),
+      // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
+      ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
   }
   let bufferedErasure: BufferedErasureDeps | undefined;
@@ -738,7 +756,25 @@ export function semanticTickState(stats:{failed:number;eventComplete:boolean;bri
 
 
 
-async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>): Promise<BatchResponse | { ok: boolean }> {
+/** The part of the Lambda context the pipeline reads. */
+export interface LambdaInvocationContext {
+  getRemainingTimeInMillis(): number;
+}
+
+/**
+ * The consumer deps for one SQS batch: unchanged unless streaming is armed and the invocation has a
+ * context, then the search stage stops streaming at the remaining time less the configured margin.
+ */
+export function invocationDeps(rt: Pick<Runtime, "env" | "deps">, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const search = rt.deps.search;
+  const margin = rt.env.searchStreamCh?.deadlineMarginMs;
+  if (!search?.stream || margin === undefined || typeof context?.getRemainingTimeInMillis !== "function") return rt.deps;
+  const remaining = context.getRemainingTimeInMillis();
+  if (!Number.isFinite(remaining)) return rt.deps;
+  return { ...rt.deps, search: { ...search, streamDeadline: { at: now() + remaining - margin } } };
+}
+
+async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {
   if(event?.semanticCopy===true){
     // Default off before secret lookup, connection pools or source access.
     if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};
@@ -757,7 +793,7 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
     const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
-    return processBatch(records, rt.deps);
+    return processBatch(records, invocationDeps(rt, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();
@@ -896,8 +932,8 @@ export function createPipelineLambdaHandler(options: { search?: SearchCompositio
     pending ??= init(options.search).catch(error => { pending = undefined; throw error; });
     return pending;
   });
-  return async (event: PipelineLambdaEvent): Promise<BatchResponse | { ok: boolean }> => {
-    const invoke = (input: PipelineLambdaEvent) => dispatchLambdaEvent(input, ready);
+  return async (event: PipelineLambdaEvent, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> => {
+    const invoke = (input: PipelineLambdaEvent) => dispatchLambdaEvent(input, ready, context);
     if (!options.runtime) return invoke(event);
     try {
       if (process.env.PIPELINE_RUNTIME !== "lambda") throw new Error("registered Lambda runtime must be selected explicitly");
