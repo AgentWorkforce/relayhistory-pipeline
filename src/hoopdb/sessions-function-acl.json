@@ -1575,6 +1575,16 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.summary_regeneration_audit_append_only()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.summary_regeneration_audit_forget()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.summary_regeneration_audit_purge_v1(integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
