@@ -175,7 +175,7 @@ export async function readLedgerHome(store: ObjectStore, keyRoot: string): Promi
     throw error;
   }
   let v: unknown;
-  try { v = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { throw new Error("ledger_home_invalid"); }
+  try { v = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(raw)); } catch { throw new Error("ledger_home_invalid"); }
   if (!validLedgerHome(v)) throw new Error("ledger_home_invalid");
   return v;
 }
