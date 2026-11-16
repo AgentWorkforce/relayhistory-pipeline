@@ -25,6 +25,8 @@ import { Checkpoint, newCounters, runOrg, withLegacyPrivacyFence } from "../lega
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
 import { liveObjectPrefix, livePointerPrefix, liveTargets } from "../neon-s3-erasure/live.ts";
+import { supabaseAuthority } from "../neon-s3-erasure/authority.ts";
+import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { eraseDiscoveredSessionBytes } from "../../session-erase/selfhost-eraser.ts";
 import { canonicalSnapshot, CanonicalReadError, type CanonicalPointer } from "../../session-read-api/canonical.ts";
@@ -418,15 +420,47 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
   });
 
-  test("race loser fenced by turn_session_fences alone (no tombstone): the ordinary deletion job removes the legacy manifest and raw object", async () => {
-    const { n, store, objectRoot } = await raceLoser("turn_session_fences");
-    // A legacy-only session has no registered turn writer, so the fence materializes no upload_deletions row.
-    const state = new SyncState(join(await tmp("race-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
-    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
-    await job.sweep();
-    await job.sweep();
-    state.close();
-    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
+  test("race loser fenced by turn_session_fences alone (no tombstone): the HOSTED deletion job under the Supabase authority removes the legacy manifest and raw object", async () => {
+    // The fence exists only in Supabase, so the hosted job runs with the real Supabase privacy authority (the repo's
+    // migration stack in PGlite, activated exactly as neon-s3-erasure-authority.test.ts does) - the same seam the
+    // production eraser uses (S3X_PRIVACY_AUTHORITY=supabase). The exporter race is reduced to its end state: legacy
+    // objects in S3, a turn_session_fences row, and NO upload_deletions/frozen-deletion tombstone.
+    const n = await neon();
+    await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
+    const store = createFsStore({ root: await tmp("race-hosted") });
+    const unit = (await legacyUnit(n.db, SR))!;
+    await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/")).length).toBeGreaterThan(0);
+
+    const f = await authorityFixture();
+    try {
+      await f.seal();
+      await f.ownerRpc("ingest_privacy_authority_fence", { controlEpoch: epoch });
+      const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
+      const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
+      await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
+      // turn_session_fences is created by the turns-forward migration (20261105062010, pipeline-ingest branch); when the
+      // stack under test lacks it, create it with that migration's exact shape so the fence row can exist.
+      await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+        first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+      await f.db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'legacy_import') ON CONFLICT DO NOTHING", [SR.orgId, SR.workspaceId, SR.source, SR.sessionId]);
+      const tomb = async (t: string) => ((await f.db.query(`SELECT count(*)::int AS n FROM sessions.${t} WHERE session_id=$1`, [SR.sessionId])).rows[0] as { n: number }).n;
+      expect(await tomb("upload_deletions")).toBe(0); // fence-only: no ordinary tombstone to lean on
+      expect(await tomb("ingest_frozen_source_deletions")).toBe(0);
+
+      const state = new SyncState(join(await tmp("race-hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+      const logs: Record<string, unknown>[] = [];
+      const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+      await job.sweep();
+      await job.sweep();
+      state.close();
+      expect(logs.some((l) => l.message === "erasure sweep" && l.authority === "supabase")).toBe(true); // the authority was live
+      expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
+    } finally {
+      await f.close();
+    }
   });
 });
 
