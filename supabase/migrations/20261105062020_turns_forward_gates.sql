@@ -22,6 +22,10 @@ CREATE TABLE sessions.turn_session_fences (
   session_id text NOT NULL,
   first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),
+  -- Set only by the independently gated registration RPC. Ordinary erasures and the frozen
+  -- legacy import may populate the privacy census while the runtime gate is off, but they must
+  -- not change directory projection until an authenticated turns writer has registered.
+  registered_writer_seen boolean NOT NULL DEFAULT false,
   PRIMARY KEY (org_id,workspace_id,source,session_id)
 );
 
@@ -62,6 +66,14 @@ CREATE FUNCTION sessions.ingest_turn_materialize_fence(
 SET search_path=pg_catalog,pg_temp AS $materialize$
 DECLARE w record;v_n integer:=0;v_inserted integer;
 BEGIN
+ -- Preserve a non-personal activation witness before erasure removes the per-user writer row.
+ -- This is the database side of INGEST_TURN_FENCE_REGISTER: flag-off erasure census rows keep
+ -- registered_writer_seen=false and therefore cannot affect directory projection.
+ UPDATE sessions.turn_session_fences f SET registered_writer_seen=true
+  WHERE f.org_id=p_org AND f.workspace_id=p_ws AND f.source=p_source AND f.session_id=p_session
+   AND NOT f.registered_writer_seen
+   AND EXISTS(SELECT 1 FROM sessions.turn_writers tw
+    WHERE tw.org_id=p_org AND tw.workspace_id=p_ws AND tw.source=p_source AND tw.session_id=p_session);
  FOR w IN SELECT user_id FROM sessions.turn_writers
    WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=p_session
    ORDER BY user_id COLLATE "C"
@@ -129,8 +141,9 @@ CREATE TRIGGER ingest_turn_capture_erasure
 
 -- Whole-user erase takes the global privacy lock before inserting this ledger row. Registration
 -- takes the shared side through operator_user_erase_control_gate, so whichever commits first makes
--- the other wait and observe it. The ledger insert removes the auxiliary personal writer ids; the
--- durable logical/session fences and synthetic pointer marker contain no erased user content.
+-- the other wait and observe it. The ledger insert removes the auxiliary personal writer ids;
+-- whole-user erasure owns its separate bytes and index cleanup and does not synthesize one logical
+-- fence per session.
 CREATE FUNCTION sessions.ingest_turn_capture_user_erasure() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $capture_user$
 BEGIN
@@ -238,10 +251,11 @@ BEGIN
 END $sources$;
 
 -- Turn-only canonical pointers remain addressable by GET turns but never become a live directory
--- row. Registration is the activation gate; after erasure removes its personal writer row, the
--- permanent logical fence is the durable witness. The synthetic machine id is server-derived from
--- (workspace, fixed turns origin, authenticated user), never accepted from a client. A later
--- non-turn pointer makes the predicate false and the normal projector can restore the row.
+-- row. Registration is the activation gate; after exact-session erasure removes its personal
+-- writer row, registered_writer_seen is the durable non-personal witness. The public delivery route
+-- rejects the reserved turns origin, while the private turns route derives the synthetic machine id
+-- from (workspace, fixed turns origin, authenticated user). A later non-turn pointer makes the
+-- predicate false and the normal projector can restore the row.
 CREATE FUNCTION sessions.aa_session_directory_hide_turn_only() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $hide_turn_only$
 BEGIN
@@ -257,7 +271,8 @@ BEGIN
          AND w.source=s.harness AND w.session_id=s.session_id)
        OR EXISTS(SELECT 1 FROM sessions.turn_session_fences f
         WHERE f.org_id=s.org_id AND f.workspace_id=s.workspace_id
-         AND f.source=s.harness AND f.session_id=s.session_id)))
+         AND f.source=s.harness AND f.session_id=s.session_id
+         AND f.registered_writer_seen)))
   )
  THEN NEW.deleted_at:=clock_timestamp();END IF;
  RETURN NEW;

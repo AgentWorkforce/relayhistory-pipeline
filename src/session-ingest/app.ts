@@ -56,7 +56,7 @@ import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, 
 import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
-import { parseTurnBatch } from "./turns.ts";
+import { parseTurnBatch, TURN_ORIGIN_ID } from "./turns.ts";
 import { HttpAdmissionStopped } from "./http-admission-stop.ts";
 import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
@@ -876,7 +876,14 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
   };
 
-  app.post("/v1/delivery/batches", (c) => acceptBatch(c, "delivery.batches", (value) => parseDeliveryRequest(value)));
+  app.post("/v1/delivery/batches", (c) => acceptBatch(c, "delivery.batches", (value) => {
+    const batch = parseDeliveryRequest(value);
+    // The reserved origin creates the synthetic server pointer used by the turns directory gate.
+    // Only the private turns parser may select it; public delivery records stay on their ordinary path.
+    if (batch.origin_id === TURN_ORIGIN_ID)
+      throw new DeliveryError("invalid_delivery", 400, "Delivery origin is reserved for relay turns");
+    return batch;
+  }));
 
   // Relay session journal turns (relayhistory TURNS_WRITE_PATH=dual|forward): turns.ts.
   // Same signed binding, rth:sync and custody as a batch; only the turn record shape.

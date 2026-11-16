@@ -6,6 +6,7 @@ import {readFileSync} from "node:fs";
 import {join} from "node:path";
 import {zstdDecompressSync} from "node:zlib";
 import {sqlLedger} from "../ledger-sql.ts";
+import {LedgerUnavailableError} from "../ledger.ts";
 import {prepareDelivery,deliveryAccount} from "../vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../vendor/delivery/delivery-contracts.ts";
 import {readBufferedStage} from "../staging.ts";
@@ -143,6 +144,9 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
  const pub=await app.request("/v1/delivery/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await turnBatch([turn(0)]))});
  expect(pub.status).toBe(422);expect((await pub.json() as any).error.code).toBe("unsupported_evidence");
  expect(pub.headers.get("x-relay-turn-fence")).toBeNull();
+ const reserved=await batch([record({record_id:"reserved-origin",origin_id:TURN_ORIGIN_ID})],{origin_id:TURN_ORIGIN_ID});
+ const reservedResponse=await app.request("/v1/delivery/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(reserved)});
+ expect(reservedResponse.status).toBe(400);expect((await reservedResponse.json() as any).error.code).toBe("invalid_delivery");
  const priv=await app.request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(await batch([record({record_id:"r1"})]))});
  expect(priv.status).toBe(400);
  const noScope=createIngestApp({identify:()=>({...TENANT,scopes:["rth:read"]}),deliver:f.deps,log:()=>{},custodySource:"frozen-supabase"});
@@ -184,7 +188,10 @@ test("operator user erase removes writer ids and refuses re-registration",async(
  const begun=await f.db.query<{result:{state:string}}>("SELECT sessions.operator_user_erase_begin('turn-user-erase',$1,$2,$3) AS result",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
  expect(begun.rows[0]!.result.state).toBe("purging");
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:0}]);
- await expect(f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})).rejects.toThrow();
+ let refused:unknown;
+ try{await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})}catch(error){refused=error}
+ expect(refused).toBeInstanceOf(LedgerUnavailableError);
+ expect((refused as LedgerUnavailableError).code).toBe("ledger_sqlstate_55000");
  await f.db.query("UPDATE sessions.operator_user_erasures SET state='bytes_verified',origins='{}',metadata_purged_at=clock_timestamp(),bytes_verified_at=clock_timestamp() WHERE request_id='turn-user-erase'");
  expect(await f.deps.ledger.registerTurnSessions!({tenant:TENANT,sessions:[["claude",SESSION]]})).toEqual([]);
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3",[TENANT.orgId,TENANT.workspaceId,TENANT.userId])).rows).toEqual([{n:1}]);
@@ -197,7 +204,7 @@ test("migration backfills exact-session deletions that predate the turn trigger"
  for(const f of migrationFiles(root).filter((f)=>f!=="20261105062020_turns_forward_gates.sql"))await db.exec(read("supabase/migrations/"+f));
  await db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'older-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  await db.exec(read("supabase/migrations/20261105062020_turns_forward_gates.sql"));
- expect((await db.query("SELECT fence_basis FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{fence_basis:"live"}]);
+ expect((await db.query("SELECT fence_basis,registered_writer_seen FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{fence_basis:"live",registered_writer_seen:false}]);
 });
 
 test("turn-only canonical pointers stay addressable but their directory projection is tombstoned",async()=>{
@@ -221,6 +228,7 @@ test("turn-only canonical pointers stay addressable but their directory projecti
  // still keep a retry/unpublished-head projection hidden afterwards.
  await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'another-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.turn_writers WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{n:0}]);
+ expect((await f.db.query("SELECT registered_writer_seen FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{registered_writer_seen:true}]);
  await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  expect((await f.db.query("SELECT deleted_at IS NOT NULL AS hidden FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{hidden:true}]);
  // The same durable witness also covers a fresh projector INSERT after the row was removed.
@@ -237,9 +245,11 @@ test("turn-only canonical pointers stay addressable but their directory projecti
  await f.db.query("UPDATE sessions.session_directory SET deleted_at=NULL WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION]);
  expect((await f.db.query("SELECT deleted_at IS NULL AS visible FROM sessions.session_directory WHERE org_id=$1 AND workspace_id=$2 AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,SESSION])).rows).toEqual([{visible:true}]);
 
- // Marker shape alone is not authority: with the independently default-off registration absent,
- // even the exact server-derived value stays on the ordinary visible directory path.
+ // Marker shape plus an ordinary erasure census row is not activation authority: with the
+ // independently default-off registration absent, the exact marker stays on the ordinary path.
  const markerOnly="7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a9b";
+ await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,'another-user','desktop-origin','claude',$3)",[TENANT.orgId,TENANT.workspaceId,markerOnly]);
+ expect((await f.db.query("SELECT registered_writer_seen FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND source='claude' AND session_id=$3",[TENANT.orgId,TENANT.workspaceId,markerOnly])).rows).toEqual([{registered_writer_seen:false}]);
  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
   VALUES($1,$2,'claude',$3,$4,$5,'2026-11-05','2026-11-05','s3','bucket','marker-only','33333333-3333-4333-8333-333333333333')`,
   [TENANT.orgId,TENANT.workspaceId,markerOnly,liveMachineId(TENANT.workspaceId,TURN_ORIGIN_ID,TENANT.userId),TENANT.userId]);

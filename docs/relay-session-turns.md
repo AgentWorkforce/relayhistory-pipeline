@@ -59,8 +59,8 @@ Khaliq's explicit approval. In order:
    compare the source and target ordered key counts/digests.
    Operator whole-user erase does not manufacture one exact-session deletion per registered writer;
    registration shares its global privacy lock, and the erase-ledger insert removes that user's
-   auxiliary writer rows. The durable session fence and synthetic pointer marker contain no erased
-   content and keep later directory retries hidden.
+   auxiliary writer rows. Its separate erase path removes the user's bytes and index rows; it does
+   not claim a per-session directory witness.
 3. **Custody.** Cloud forward is Neon-free only in `frozen-supabase`. `supabase-authority` continues
    to refuse all non-empty turn writes and must not be used for this migration. Flip custody first,
    under its own runbook and approval.
@@ -69,12 +69,14 @@ Khaliq's explicit approval. In order:
    buffered GC and publication-retire paths. A forward racing an erasure is either dropped at claim/
    commit or retired and purged; there is no log-driven manual privacy gap.
 5. **Publication.** `aa_session_directory_hide_turn_only` tombstones a directory projection whose
-   live pointers are exclusively synthetic turns-origin pointers with a registration or permanent
-   fence witness. The machine id is server-derived from workspace, the fixed turns origin and the
-   authenticated user; client machine ids are not trusted or copied into this namespace. The
-   canonical pointer stays live for GET turns. A normal pointer makes the predicate false and the
-   ordinary projector restores the directory row. With registration off, a marker-shaped pointer
-   without a writer/fence witness remains byte-for-byte on the ordinary directory path.
+   live pointers are exclusively synthetic turns-origin pointers with a current writer or the
+   non-personal `registered_writer_seen` witness preserved by exact-session erasure. The public
+   delivery route rejects the reserved origin; the private turns route derives the machine id from
+   workspace, that fixed origin and the authenticated user. The canonical pointer stays live for
+   GET turns. A normal pointer makes the predicate false and the ordinary projector restores the
+   directory row. With registration off, ordinary/legacy fence census rows keep
+   `registered_writer_seen=false`, so even a marker-shaped pointer remains byte-for-byte on the
+   ordinary directory path.
 6. **Backfill.** `migration:legacy-export` is the bounded, resumable one-shot exporter/verifier for
    `conversation_turns`, links and outcomes. Its manifest is accepted only on the dedicated legacy
    machine. The read merge remains live-over-legacy per

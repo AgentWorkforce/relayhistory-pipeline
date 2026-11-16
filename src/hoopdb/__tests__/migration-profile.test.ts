@@ -1476,6 +1476,12 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
   test("turn-gates historical deletion backfill is derived and does not make rollback one-way", async () => {
     const db = await fresh();
     const tg = "upstream:20261105062020_turns_forward_gates.sql";
+    const down = readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8");
+    const privacyLock = down.indexOf("SELECT pg_advisory_xact_lock(961996,50000)");
+    const privacyGuard = down.indexOf("DO $rollback_privacy_guard$");
+    expect(privacyLock).toBeGreaterThan(0);
+    expect(privacyGuard).toBeGreaterThan(privacyLock);
+    expect(down).toContain("sessions.upload_deletions,sessions.operator_user_erasures IN SHARE ROW EXCLUSIVE MODE");
     const steps = await plan(LOCAL);
     const prefix = steps.filter((step) => !step.name.startsWith("upstream:") || step.name < tg);
     await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps: prefix });
@@ -1489,12 +1495,12 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     // Whole-user erase can remove the source ledger while the permanent logical fence must survive.
     // Such an orphan is no longer derivable, so rollback refuses until its witness exists again.
     await db.exec("DELETE FROM sessions.upload_deletions WHERE org_id='historical-org'");
-    expect((await failure(db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8"))))?.code).toBe("55000");
+    expect((await failure(db.exec(down)))?.code).toBe("55000");
     await db.exec("ROLLBACK");
     await db.query(
       "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
     );
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8"));
+    await db.exec(down);
     expect((await db.query<{ n: number }>(
       "SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id='historical-org'",
     )).rows).toEqual([{ n: 1 }]);
