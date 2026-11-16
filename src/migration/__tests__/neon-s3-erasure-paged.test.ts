@@ -86,9 +86,14 @@ describe("E3 job on the shared paged eraser", () => {
       ...base,
       legacyFencedPage: async () => { throw Object.assign(new Error("broken"), { code: "legacy_rpc_broken" }); },
     });
-    const j = job(s, st, broken);
+    const logs: Record<string, unknown>[] = [];
+    const j = new ErasureJob(broken, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
     await j.sweep();
     expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs).toContainEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+    }));
     expect(heartbeats).toBe(1);
     st.close();
   });

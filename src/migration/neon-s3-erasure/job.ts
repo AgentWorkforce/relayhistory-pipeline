@@ -426,7 +426,22 @@ export class ErasureJob {
     }
     this.counters.swept += 1;
     if (!dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions, legacy_fenced: legacy.groups, legacy_versions: legacy.versions });
+    this.log({
+      message: dryRun ? "erasure sweep (dry run)" : "erasure sweep",
+      authority: authority.kind,
+      sweep: id,
+      count: seen,
+      gone,
+      fenced,
+      live_fenced: live.groups,
+      live_versions: live.versions,
+      legacy_fenced: legacy.groups,
+      legacy_versions: legacy.versions,
+      // Stable per-sweep alarm input as well as the edge metric emitted at
+      // failure time. A monitor that consumes only summaries must not turn a
+      // loud Neon-authority refusal into a silent successful sweep.
+      legacy_fence_failed: this.counters.legacyFenceFailed,
+    });
   }
 
   /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */
