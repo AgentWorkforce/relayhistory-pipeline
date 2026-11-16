@@ -8,9 +8,10 @@
  *
  * Secrets come ONLY on stdin, one per line, never argv, env or files:
  *   line 1  the Neon URL of a SELECT-only role (direct, not the pooler)
- *   line 2  S3 access key id       (--export / --verify)
- *   line 3  S3 secret access key   (--export / --verify)
- *   line 4  S3 session token       (optional)
+ *   line 2  HoopDb/Supabase SELECT-only direct URL (live erasure authority)
+ *   line 3  S3 access key id       (--export / --verify)
+ *   line 4  S3 secret access key   (--export / --verify)
+ *   line 5  S3 session token       (optional)
  * Non-secret configuration is flags:
  *   --bucket= --expect-bucket= (must be equal) --region=us-east-1 --sse=aws:kms --kms-key=ARN
  *   --key-root=96bulls --grant-id=neon-legacy-export --state=~/.agent-tmp/legacy-export/state.sqlite
@@ -41,19 +42,39 @@ const log = (f: Record<string, unknown>) =>
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "legacy-export", ...f })}\n`);
 
 /** Secrets from stdin only; refuses when stdin is a terminal (no echo, no history). */
-export async function readSecrets(text?: string): Promise<{ neonUrl: string; s3?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string } }> {
+export async function readSecrets(text?: string): Promise<{ neonUrl: string; privacyUrl: string; s3?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string } }> {
   if (text === undefined) {
     if (process.stdin.isTTY) throw new Error("pipe the secrets on stdin (see the runbook); a terminal is refused");
     const chunks: Buffer[] = [];
     for await (const c of process.stdin) chunks.push(Buffer.from(c as Uint8Array));
     text = Buffer.concat(chunks).toString("utf8");
   }
-  const [neonUrl, accessKeyId, secretAccessKey, sessionToken] = text.split(/\r?\n/u).map((l) => l.trim());
+  const [neonUrl, privacyUrl, accessKeyId, secretAccessKey, sessionToken] = text.split(/\r?\n/u).map((l) => l.trim());
   if (!neonUrl || !/^postgres(ql)?:\/\//u.test(neonUrl)) throw new Error("stdin line 1 must be the Neon URL");
+  if (!privacyUrl || !/^postgres(ql)?:\/\//u.test(privacyUrl)) throw new Error("stdin line 2 must be the live privacy-authority URL");
   return {
     neonUrl,
+    privacyUrl,
     ...(accessKeyId && secretAccessKey ? { s3: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) } } : {}),
   };
+}
+
+/** The privacy-authority role may observe erasure ledgers but never mutate them. */
+export async function assertPrivacySelectOnly(db: Queryable) {
+  for (const table of [
+    "session_erasure_receipts",
+    "upload_deletions",
+    "operator_user_erasures",
+  ]) {
+    const { rows } = await db.query<{ w: boolean }>(
+      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w`,
+    );
+    if (rows[0]?.w !== false)
+      throw Object.assign(
+        new Error("the privacy role can write erasure ledgers; use a SELECT-only role"),
+        { code: "privacy_role_not_read_only" },
+      );
+  }
 }
 
 /** The Neon role must not be able to write any legacy table. */
@@ -73,24 +94,41 @@ const iso = (v: string | undefined) => {
   return ms;
 };
 
+export function assertDirectUrl(raw: string, label: string): URL {
+  const url = new URL(raw);
+  if (/-pooler\./u.test(url.hostname) || url.port === "6543")
+    throw new Error(`use a direct (unpooled) ${label} URL`);
+  return url;
+}
+
 export async function main() {
   const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
   if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
   const secrets = await readSecrets();
-  const url = new URL(secrets.neonUrl);
-  if (/-pooler\./u.test(url.hostname)) throw new Error("use a direct (unpooled) Neon URL");
+  assertDirectUrl(secrets.neonUrl, "Neon");
+  assertDirectUrl(secrets.privacyUrl, "privacy");
   const window = { sinceMs: iso(arg("since")), untilMs: iso(arg("until")) };
   const statePath = arg("state") ?? `${homedir()}/.agent-tmp/legacy-export/state.sqlite`;
-  mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
+  if (!flag("plan"))
+    mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
   const { default: pg } = await import("pg");
   const client = new pg.Client({ connectionString: secrets.neonUrl, application_name: "96bulls-legacy-export" });
+  const privacyClient = new pg.Client({
+    connectionString: secrets.privacyUrl,
+    application_name: "96bulls-legacy-export-privacy",
+  });
   await client.connect();
+  await privacyClient.connect();
   let stop = false;
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => (stop = true));
-  const checkpoint = new Checkpoint(statePath);
+  const checkpoint = new Checkpoint(flag("plan") ? ":memory:" : statePath);
   try {
     const db = await sessionReadOnly(client as unknown as Queryable);
+    const privacyDb = await sessionReadOnly(
+      privacyClient as unknown as Queryable,
+    );
     await assertSelectOnly(db);
+    await assertPrivacySelectOnly(privacyDb);
     const needsS3 = !flag("plan");
     let store;
     if (needsS3) {
@@ -112,7 +150,14 @@ export async function main() {
     }
     const decompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: 256 * 1024 * 1024 }));
     if (flag("verify")) {
-      const report = await verifyExported(db, store!, checkpoint, decompress, arg("org"));
+      const report = await verifyExported(
+        db,
+        store!,
+        checkpoint,
+        decompress,
+        arg("org"),
+        privacyDb,
+      );
       process.stdout.write(`${JSON.stringify({ service: "legacy-export", mode: "verify", ...report })}\n`);
       if (!report.ok) process.exitCode = 2;
       return;
@@ -131,11 +176,16 @@ export async function main() {
       await throttle.take(rows, bytes);
     };
     const exporting = flag("export");
+    let remainingScopes = arg("max-scopes")
+      ? Number(arg("max-scopes"))
+      : undefined;
     for (const org of orgs) {
+      if (remainingScopes !== undefined && remainingScopes <= 0) break;
       const counters = newCounters();
       await runOrg(
         {
           db,
+          privacyDb,
           target: { store: store!, keyRoot: arg("key-root") ?? "96bulls", grantId: arg("grant-id") ?? "neon-legacy-export" },
           checkpoint,
           hook,
@@ -143,15 +193,26 @@ export async function main() {
           stopped: () => stop,
         },
         org,
-        { export: exporting, window, refresh: flag("refresh"), force: flag("force"), ...(arg("max-scopes") ? { maxScopes: Number(arg("max-scopes")) } : {}) },
+        {
+          export: exporting,
+          window,
+          refresh: flag("refresh"),
+          force: flag("force"),
+          ...(remainingScopes !== undefined
+            ? { maxScopes: remainingScopes }
+            : {}),
+        },
         counters,
       );
       log({ message: exporting ? "org exported" : "org plan", org, ...counters });
+      if (remainingScopes !== undefined)
+        remainingScopes -= counters.exported;
       if (stop) break;
     }
   } finally {
     checkpoint.close();
     await client.end().catch(() => undefined);
+    await privacyClient.end().catch(() => undefined);
   }
 }
 
