@@ -14,6 +14,7 @@ import {
 } from "../output-facts.ts";
 import { OutputScopeError, readSessionOutput } from "../../session-read-api/output-query.ts";
 import { LINK_SHA, OUTCOME_SHA, outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
+import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
 
 describe("normalizeStats (session-output.ts stat_entries + normalized_stats)", () => {
   test("array of numstat entries sums each side", () => {
@@ -117,6 +118,45 @@ describe("outputFactsFromScope", () => {
     facts = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, uncovered, 1);
     expect(facts.complete).toBe(false);
     expect(facts.reasons).toContain("output_facts_legacy_invalid");
+  });
+  test("a live-turn-only session is complete without a legacy coverage marker", () => {
+    const source = OUTPUT_FIXTURE_SCOPE.harness;
+    const sessionId = OUTPUT_FIXTURE_SCOPE.canonicalId;
+    const payload = {
+      id: "11111111-1111-4111-8111-111111111111",
+      org_id: OUTPUT_FIXTURE_SCOPE.orgId,
+      workspace_id: OUTPUT_FIXTURE_SCOPE.workspaceId,
+      source,
+      session_id: sessionId,
+      turn_index: 0,
+      session_owner: "person",
+      role: "assistant",
+      content: "live answer",
+      actor_name: "Agent",
+      actor_role: "owner",
+      metadata_json: "{}",
+      ts: "2026-11-05T12:00:00.000Z",
+      tagged: false,
+    };
+    const live = outputFactsFromScope(
+      OUTPUT_FIXTURE_SCOPE,
+      {
+        projectionRows: [],
+        complete: true,
+        records: [{
+          kind: TURN_KIND,
+          origin_id: TURN_ORIGIN_ID,
+          record_id: turnRecordId(OUTPUT_FIXTURE_SCOPE.workspaceId, source, sessionId, 0),
+          revision: "1",
+          operation: "upsert",
+          received_at: "2026-11-05T12:00:00.000000Z",
+          payload,
+        }],
+      },
+      1,
+    );
+    expect(live.complete).toBe(true);
+    expect(live.reasons).not.toContain("output_facts_legacy_invalid");
   });
   test("P1-c: a bad legacy or event timestamp marks the facts inexact and never throws", () => {
     const fx = outputFixture();

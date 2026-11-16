@@ -64,16 +64,18 @@ export async function assertPrivacySelectOnly(db: Queryable) {
   for (const table of [
     "session_erasure_receipts",
     "upload_deletions",
+    "upload_resets",
     "turn_session_fences",
     "operator_user_erasures",
   ]) {
-    const { rows } = await db.query<{ w: boolean; r: boolean }>(
+    const { rows } = await db.query<{ w: boolean; r: boolean; rls: boolean }>(
       `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
-              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r`,
+              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r,
+              row_security_active('sessions.${table}'::regclass) AS rls`,
     );
-    if (rows[0]?.w !== false || rows[0]?.r !== true)
+    if (rows[0]?.w !== false || rows[0]?.r !== true || rows[0]?.rls !== false)
       throw Object.assign(
-        new Error("the privacy role can write erasure ledgers; use a SELECT-only role"),
+        new Error("the privacy role must read every erasure row without write access or active RLS"),
         { code: "privacy_role_not_read_only" },
       );
   }
@@ -99,7 +101,7 @@ const iso = (v: string | undefined) => {
 
 export function assertDirectUrl(raw: string, label: string): URL {
   const url = new URL(raw);
-  if (/-pooler\./u.test(url.hostname) || url.port === "6543")
+  if (/(?:^|[.-])pooler(?:[.-]|$)/u.test(url.hostname) || url.port === "6543")
     throw new Error(`use a direct (unpooled) ${label} URL`);
   return url;
 }
