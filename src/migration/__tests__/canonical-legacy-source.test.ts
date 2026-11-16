@@ -446,6 +446,7 @@ test("legacy authority readiness fails closed when its RPC is absent", async () 
       async query<T>() {
         n += 1;
         if (n === 1) return { rows: [{ installed: true }] as T[] };
+        if (n === 2) return { rows: [{ set_config: "legacy-export-preactivation-v1" }] as T[] };
         throw Object.assign(new Error("relation missing"), { code: "42P01" });
       },
     }),

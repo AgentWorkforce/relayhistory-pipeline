@@ -24,6 +24,7 @@ REVOKE ALL ON sessions.legacy_export_scope_authority
 CREATE TABLE sessions.legacy_export_privacy_eraser_readiness(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
  authority text NOT NULL CHECK(authority='supabase'),
+ generation text NOT NULL CHECK(generation IN ('legacy-export-preactivation-v1','legacy-export-activation-v1')),
  last_success_at timestamptz NOT NULL
 );
 ALTER TABLE sessions.legacy_export_privacy_eraser_readiness ENABLE ROW LEVEL SECURITY;
@@ -76,15 +77,18 @@ END $register$;
 -- "supabase".
 CREATE FUNCTION sessions.legacy_export_privacy_eraser_heartbeat() RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $heartbeat$
-DECLARE v_has_mappings boolean;v_at timestamptz;
+DECLARE v_has_mappings boolean;v_at timestamptz;v_generation text;
 BEGIN
  PERFORM sessions.ingest_privacy_eraser_require_active();
+ v_generation:=current_setting('s3x.legacy_export_generation',true);
+ IF v_generation IS NULL OR v_generation NOT IN ('legacy-export-preactivation-v1','legacy-export-activation-v1') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: eraser generation missing or invalid';END IF;
  SELECT EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority LIMIT 1) INTO v_has_mappings;
  v_at:=clock_timestamp();
- INSERT INTO sessions.legacy_export_privacy_eraser_readiness(singleton,authority,last_success_at)
-  VALUES(true,'supabase',v_at)
-  ON CONFLICT(singleton) DO UPDATE SET authority=EXCLUDED.authority,last_success_at=EXCLUDED.last_success_at;
- RETURN jsonb_build_object('authority','supabase','last_success_at',v_at,'has_mappings',v_has_mappings);
+ INSERT INTO sessions.legacy_export_privacy_eraser_readiness(singleton,authority,generation,last_success_at)
+  VALUES(true,'supabase',v_generation,v_at)
+  ON CONFLICT(singleton) DO UPDATE SET authority=EXCLUDED.authority,generation=EXCLUDED.generation,last_success_at=EXCLUDED.last_success_at;
+ RETURN jsonb_build_object('authority','supabase','generation',v_generation,'last_success_at',v_at,'has_mappings',v_has_mappings);
 END $heartbeat$;
 
 -- The exporter must never create a legacy copy while Neon is still the
@@ -93,11 +97,16 @@ END $heartbeat$;
 -- stale deployment. This is evaluated afresh for every export run.
 CREATE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $ready$
+DECLARE v_generation text;
 BEGIN
  PERFORM sessions.ingest_privacy_eraser_require_active();
+ v_generation:=current_setting('s3x.legacy_export_generation',true);
+ IF v_generation IS NULL OR v_generation NOT IN ('legacy-export-preactivation-v1','legacy-export-activation-v1') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: exporter generation missing or invalid';END IF;
  IF NOT EXISTS(SELECT 1 FROM sessions.legacy_export_privacy_eraser_readiness
-   WHERE singleton AND authority='supabase' AND last_success_at>=clock_timestamp()-interval '30 minutes') THEN
-  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: supabase eraser readiness missing or stale';END IF;
+   WHERE singleton AND authority='supabase' AND generation=v_generation
+     AND last_success_at>=clock_timestamp()-interval '30 minutes') THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: supabase eraser readiness missing, stale, or from another generation';END IF;
  RETURN true;
 END $ready$;
 

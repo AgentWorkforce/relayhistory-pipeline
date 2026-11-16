@@ -15,6 +15,10 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import {
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+} from "../../shared/legacy-export-generation.ts";
+import {
   activityPage,
   catalogPage,
   fencedGroups,
@@ -154,6 +158,10 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
       // still has no direct table writes or any other write-capable function.
       await db.query("BEGIN READ WRITE");
       try {
+        await db.query("SELECT set_config($1,$2,true)", [
+          LEGACY_EXPORT_GENERATION_SETTING,
+          LEGACY_EXPORT_GENERATION,
+        ]);
         await rpc("SELECT sessions.legacy_export_privacy_eraser_heartbeat() AS r");
         await db.query("COMMIT");
       } catch (error) {

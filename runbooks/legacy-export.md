@@ -9,7 +9,19 @@ without Khaliq's explicit words for that exact run. Design and gate status:
 The landing branch's `--export` entry point refuses unconditionally with
 `legacy_export_requires_activation_heartbeat`. Only the separately reviewed
 activation follow-up may replace that refusal with its fresh, eraser-written
-heartbeat gate; landing or applying 062030 alone cannot enable exports.
+heartbeat gate. Landing heartbeats carry a pre-activation code generation;
+activation requires its own generation, so a recent landing-era row is never
+readiness. Landing or applying 062030 alone cannot enable exports.
+
+The reviewed landing and activation commits are one release pair even though
+their shared 062030 migration bytes are identical. Between those two Git
+landings there must be **no** services-image, fast-path, ECR or Artifact
+Registry publication; no `versions.lock.json` approval; no chart cut; and no
+EKS, GCP or self-host deployment. A landing-only image must never be approved
+or referenced. Khaliq confirms the exact pair before landing. Applying live
+062030, provisioning the privacy role, running the exporter and activation
+each remain separately approved operations; code landing authorizes none of
+them.
 
 ## Rules
 

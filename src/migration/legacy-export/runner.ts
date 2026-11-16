@@ -35,6 +35,10 @@ import {
 } from "../neon-s3-sync/legacy-source.ts";
 import { selectedPublicTurnPredicateSql } from "../../shared/legacy-turn-source.ts";
 import {
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+} from "../../shared/legacy-export-generation.ts";
+import {
   objectKey,
   parseManifest,
   readAll,
@@ -234,6 +238,10 @@ export async function assertLegacyErasureAuthorityReady(
       { code: "legacy_export_authority_not_active" },
     );
   try {
+    await db.query("SELECT set_config($1,$2,false)", [
+      LEGACY_EXPORT_GENERATION_SETTING,
+      LEGACY_EXPORT_GENERATION,
+    ]);
     const { rows } = await db.query<{ ready: boolean }>(
       "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
     );
@@ -324,6 +332,10 @@ export async function withLegacyPrivacyFence<T>(
       // Recheck the authority in every transaction, including after the PUT,
       // so a mid-run fallback to Neon refuses the export.
       if (registration) {
+        await db.query("SELECT set_config($1,$2,false)", [
+          LEGACY_EXPORT_GENERATION_SETTING,
+          LEGACY_EXPORT_GENERATION,
+        ]);
         const { rows: readiness } = await db.query<{ ready: boolean }>(
           "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
         );
