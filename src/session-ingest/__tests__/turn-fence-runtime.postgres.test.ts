@@ -140,6 +140,34 @@ describe.skipIf(!url)("turn fence registration on real PostgreSQL", () => {
         "SELECT session_id FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND session_id=ANY($3::text[]) ORDER BY session_id",
         [tenant.orgId, tenant.workspaceId, [a, b]],
       )).rows.map((row) => row.session_id)).toEqual([a, b]);
+
+      // A descending multi-row erasure statement uses the same sorted lock
+      // order as import. Hold A, start erasing [B,A], then import [A,B]. A
+      // row trigger would let the eraser own B and deadlock; the statement
+      // transition table blocks on A before it can own B.
+      const ea = "erase-import-a", eb = "erase-import-b";
+      await writer.query("BEGIN;SET LOCAL ROLE service_role;SET LOCAL statement_timeout='10s'");
+      await eraser.query("BEGIN;SET LOCAL statement_timeout='10s'");
+      await writer.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1||chr(31)||$2||chr(31)||'claude'||chr(31)||$3,0))",
+        [tenant.orgId, tenant.workspaceId, ea],
+      );
+      const descendingErase = eraser.query(
+        `INSERT INTO sessions.upload_deletions
+          (org_id,workspace_id,user_id,origin_id,source,session_id)
+         VALUES($1,$2,'other-user','desktop-origin','claude',$3),
+               ($1,$2,'other-user','desktop-origin','claude',$4)`,
+        [tenant.orgId, tenant.workspaceId, eb, ea],
+      );
+      await waitForLock(eraserPid, writerPid);
+      await writer.query("SELECT sessions.ingest_turn_fences_import($1::jsonb)", [rows([ea, eb])]);
+      await writer.query("COMMIT");
+      await descendingErase;
+      await eraser.query("COMMIT");
+      expect((await pool.query<{ session_id: string }>(
+        "SELECT session_id FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND session_id=ANY($3::text[]) ORDER BY session_id",
+        [tenant.orgId, tenant.workspaceId, [ea, eb]],
+      )).rows.map((row) => row.session_id)).toEqual([ea, eb]);
     } finally {
       for (const client of held) {
         await client.query("ROLLBACK").catch(() => {});

@@ -2525,21 +2525,29 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062010 (per-origin claim fence) is the newest: 062000's down refuses (55000) while it is applied; its
-    // checksum-pinned down restores 058010's exact ingest_lock_fences, drops the five functions and the mark table,
-    // removes its ledger row and refuses on a rerun.
+    // Turns gates is newest. Its rollback refuses while privacy state exists, then
+    // removes only its own objects and exposes the per-origin claim fence as newest.
+    const TG = "upstream:20261105062010_turns_forward_gates.sql";
+    await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','live')");
+    expect((await failure(rollback("20261105062010_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.turn_session_fences")).toBe("sessions.turn_session_fences");
+    await db.query("DELETE FROM sessions.turn_session_fences WHERE org_id='rollback-org'");
+    await rollback("20261105062010_turns_forward_gates.down.sql");
+    expect(await names()).not.toContain(TG);
+    expect(await relation("sessions.turn_session_fences")).toBeNull();
+    expect(await relation("sessions.turn_writers")).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_capability(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_register(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    expect((await failure(rollback("20261105062010_turns_forward_gates.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
-    const TG = "upstream:20261105062010_turns_forward_gates.sql";
-    expect(await names()).toContain(CA);
     await rollback("20261105062010_ingest_origin_claim_fence.down.sql");
     expect(await names()).not.toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toBe(bodyOf("20261105058010_operator_user_erase.sql", "ingest_lock_fences", "$lock$"));
     expect(await relation("sessions.ingest_origin_claim_marks")).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'ingest\\_origin\\_%'")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
-    // 20261105062000 (coordination advisories) is the newest: 059000's down refuses (55000) while it is applied;
     // 20261105062000 (coordination advisories) is then the newest: 059000's down refuses (55000) while it is applied;
     // its checksum-pinned down drops the five functions, the table and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CA);
