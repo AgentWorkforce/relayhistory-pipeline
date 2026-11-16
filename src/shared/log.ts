@@ -86,6 +86,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
   ...SUMMARY_INPUT_FIELDS,
+  // Summary regeneration (src/summary-regen/audit.ts): the session id is logged only as session_hash (sha256);
+  // system and regeneration_reason are closed sets (ENUM_FIELDS); prior_* and failure_code are controlled codes.
+  "session_hash", "system", "request_id", "prior_status", "prior_failure_code", "regeneration_reason", "failure_code",
 ]);
 
 /**
@@ -141,9 +144,15 @@ export const DB_REFUSAL_VALUES: ReadonlySet<string> = new Set([
 /** `client_kind` / `client_os` mirror session-ingest client-agent.ts CLIENT_KINDS / CLIENT_OSES (pinned in ingest-refusal-log.test.ts). */
 export const CLIENT_KIND_VALUES: ReadonlySet<string> = new Set(["desktop", "other"]);
 export const CLIENT_OS_VALUES: ReadonlySet<string> = new Set(["macos", "linux", "windows", "other"]);
+/** Summary regeneration reasons and systems (src/summary-regen/settings.ts REGEN_REASONS pins the same set). */
+export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
+  "turns_gained", "idle_uncovered", "ended_uncovered", "retry_backoff", "config_changed", "operator_requeue", "version_backfill",
+]);
+export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
+  ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
