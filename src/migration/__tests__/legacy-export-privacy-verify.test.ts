@@ -1125,6 +1125,46 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
     }
   });
 
+  test("PARTIAL sweep: when one legacy scope's erasure fails, the sweep does NOT refresh the heartbeat and the exporter stays refused", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-partial") });
+      await w.sweepSupabase(store); // arm
+      const first = await w.exportAs(n, store, "hb-partial-1");
+      expect(first).toMatchObject({ counters: { exported: 1, failed: 0 } });
+      const objectRoot = liveObjectPrefix("96bulls", { org_id: S.orgId, workspace_id: S.workspaceId, user_id: OWNER, origin_id: LEGACY_EXPORT_ORIGIN_ID });
+      const legacyOf = async () => (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_1/"));
+      expect((await legacyOf()).length).toBeGreaterThan(0);
+      await w.f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
+      await heartbeatAge(w.f, HEARTBEAT.staleAfterMinutes + 5); // stale before the partial sweep
+      const staleAt = ((await w.f.db.query(`SELECT ${HEARTBEAT.at}::text AS t FROM ${HEARTBEAT.table}`)).rows[0] as { t: string }).t;
+      // Every delete of that scope's legacy objects fails: the sweep is partial.
+      let failedDeletes = 0;
+      const failing = new Proxy(store, {
+        get(target, prop, recv) {
+          if (prop === "delete") return async (...a: unknown[]) => {
+            if (String(a[0]).includes(objectRoot) && String(a[0]).includes("/s=sess_1/")) { failedDeletes += 1; throw Object.assign(new Error("simulated S3 delete failure"), { code: "ECONNRESET" }); }
+            return (target.delete as (...x: unknown[]) => unknown).apply(target, a);
+          };
+          const v = Reflect.get(target, prop, recv);
+          return typeof v === "function" ? v.bind(target) : v;
+        },
+      }) as ObjectStore;
+      await w.sweepSupabase(failing).catch(() => {});
+      expect(failedDeletes).toBeGreaterThan(0); // the failure really happened
+      expect((await legacyOf()).length).toBeGreaterThan(0); // and the copy is still there
+      const after = ((await w.f.db.query(`SELECT ${HEARTBEAT.at}::text AS t FROM ${HEARTBEAT.table}`)).rows[0] as { t: string }).t;
+      expect(after).toBe(staleAt); // NOT refreshed by a partial sweep
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-partial-2");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
   test("ROLLBACK ORDER: the down migration ACCESS EXCLUSIVE-locks the authority table before its populated-row guard, inside one transaction", () => {
     // Static order (a one-connection PGlite cannot run the true race; that is the reviewer's real-PG lane): a registration
     // committing between the row check and the DROP would otherwise be destroyed. The lock must precede the check.
