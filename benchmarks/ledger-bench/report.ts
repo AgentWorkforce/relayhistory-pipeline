@@ -227,8 +227,9 @@ export function markdown(all: Record_[], profile = "standard"): string {
   const lines: string[] = [`Profile: ${profile}. Repeats (run ids): ${runs.join(", ") || "none"}.`, ""];
   const throttled = ends.filter((e) => Number((e.cpu_stat as { nr_throttled?: number } | null)?.nr_throttled ?? 0) > 0);
   if (throttled.length > 0) lines.push(`The client was CPU-throttled in ${throttled.length} lane run(s): treat the high-concurrency cells there as client-bound.`, "");
-  lines.push("## Lanes", "", "| Run | Lane | Complete | Requests | Budget | CPU throttled periods | Peak RSS KiB |", "| --- | --- | --- | --- | --- | --- | --- |");
-  for (const e of ends) lines.push(`| ${e.run} | ${e.lane} | ${e.complete ? "yes" : "NO"} | ${e.requests} | ${e.request_budget} | ${(e.cpu_stat as { nr_throttled?: number } | null)?.nr_throttled ?? "-"} | ${e.max_rss_kib ?? "-"} |`);
+  lines.push("## Lanes", "", "| Run | Lane | Complete | Requests | Budget | GiB | GiB budget | CPU throttled periods | Peak RSS KiB |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  const gib = (v: unknown) => (typeof v === "number" ? String(Math.round((v / 1024 ** 3) * 100) / 100) : "-");
+  for (const e of ends) lines.push(`| ${e.run} | ${e.lane} | ${e.complete ? "yes" : e.stopped_by ? `NO (${String(e.stopped_by)})` : "NO"} | ${e.requests} | ${e.request_budget} | ${gib(e.bytes)} | ${gib(e.byte_budget)} | ${(e.cpu_stat as { nr_throttled?: number } | null)?.nr_throttled ?? "-"} | ${e.max_rss_kib ?? "-"} |`);
   for (const f of records.filter((r) => r.event === "stage_failed" || r.event === "skipped")) lines.push("", `- ${f.run} ${f.lane}: ${f.event} ${String(f.stage)}${f.error ? `: ${String(f.error)}` : ""}`);
   lines.push("", "## Threshold outcomes", "", "| Option | Check | Outcome | Detail |", "| --- | --- | --- | --- |");
   for (const t of thresholds(cells)) lines.push(`| ${t.option} | ${t.check} | ${t.verdict} | ${t.detail} |`);

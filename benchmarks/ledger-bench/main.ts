@@ -45,8 +45,9 @@ function buildContext(config: RunConfig, credentials: CredentialProvider, meter:
   return ctx;
 }
 
-/** Requests one ambiguous-commit child may make. The parent takes them from its own budget when it starts the child. */
+/** Requests and bytes one ambiguous-commit child may use. The parent takes both from its own budgets when it starts the child. */
 const CHILD_REQUESTS = 500;
+const CHILD_BYTES = CHILD_REQUESTS * 256 * 1024;
 
 /** CPU throttling of this container (cgroup v2), when readable: a throttled client bounds the fast cells itself. */
 function cpuStat(): Record<string, number> | null {
@@ -102,7 +103,7 @@ async function runChild(config: RunConfig): Promise<void> {
   const { target, prefix, runTag } = JSON.parse(process.env.LEDGER_BENCH_CHILD ?? "{}") as { target: BucketId; prefix: string; runTag: string };
   if (!prefix?.startsWith(`bench/${config.runId}/`)) throw new Error("ledger-bench: the child writes only under the run's prefix");
   // The parent reserved exactly this many requests in its own budget before starting the child.
-  const ctx = buildContext(config, credentialsFor(config), new RequestMeter(CHILD_REQUESTS), () => {});
+  const ctx = buildContext(config, credentialsFor(config), new RequestMeter(CHILD_REQUESTS, CHILD_BYTES), () => {});
   const store = ctx.stores[target];
   if (!store) throw new Error("ledger-bench: the child's target is not configured");
   await ambiguousChild(store, prefix, runTag, (line) => process.stdout.write(`${line}\n`));
@@ -124,6 +125,7 @@ async function runLane(config: RunConfig): Promise<boolean> {
   // The ambiguous-commit children are separate processes; their requests come out of this lane's budget.
   const spawnChild: SpawnAmbiguousChild = (target, prefix, runTag) => {
     meter.take(CHILD_REQUESTS);
+    meter.addBytes(CHILD_BYTES);
     return spawnAmbiguousChild(target, prefix, runTag);
   };
   write({ event: "start", profile_name: config.profileName, bundle_sha256: process.env.LEDGER_BENCH_BUNDLE_SHA256 ?? null, bun_max_http_requests: process.env.BUN_CONFIG_MAX_HTTP_REQUESTS ?? "default", profile: config.profile, bun: process.versions.bun ?? null, node: process.versions.node, steps: config.steps ?? "all", targets: Object.keys(targets) });
@@ -133,7 +135,7 @@ async function runLane(config: RunConfig): Promise<boolean> {
   const stage = async (step: number, name: string, work: () => Promise<void>) => {
     if (!wanted(step) || failure) return;
     if (meter.exhausted) {
-      write({ event: "skipped", step, stage: name, reason: "request budget spent" });
+      write({ event: "skipped", step, stage: name, reason: `${meter.spent ?? "request"} budget spent` });
       return;
     }
     ctx.log(`stage ${name} (requests so far ${meter.used})`);
@@ -144,7 +146,7 @@ async function runLane(config: RunConfig): Promise<boolean> {
       // Only the closed error class is written: a store's message can quote ARNs and bucket names.
       stagesFailed++;
       write({ event: "stage_failed", step, stage: name, error: errorClass(error) });
-      if (meter.exhausted) failure = "request budget spent";
+      if (meter.exhausted) failure = `${meter.spent ?? "request"} budget spent`;
     }
   };
 
@@ -185,7 +187,7 @@ async function runLane(config: RunConfig): Promise<boolean> {
   }
 
   const complete = failure === undefined && !meter.exhausted && stagesFailed === 0;
-  write({ event: "end", complete, stages_failed: stagesFailed, requests: meter.used, request_budget: meter.limit, bytes: meter.bytes, byte_budget: meter.byteLimit, statuses: meter.statuses.toJSON(), express_sessions: ctx.expressStats, cpu_stat: cpuStat(), max_rss_kib: Math.round(process.resourceUsage().maxRSS) });
+  write({ event: "end", complete, ...(meter.spent ? { stopped_by: `${meter.spent} budget` } : {}), stages_failed: stagesFailed, requests: meter.used, request_budget: meter.limit, bytes: meter.bytes, byte_budget: meter.byteLimit, statuses: meter.statuses.toJSON(), express_sessions: ctx.expressStats, cpu_stat: cpuStat(), max_rss_kib: Math.round(process.resourceUsage().maxRSS) });
   // A second copy of the results next to the data, in case the pod's log is lost. Outside the meter (one
   // request), so it is written even when the budget is spent. Best effort.
   if (targets.R2) {

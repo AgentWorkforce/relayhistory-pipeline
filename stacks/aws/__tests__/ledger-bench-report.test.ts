@@ -92,8 +92,8 @@ describe("report", () => {
   });
 
   test("the write-up lists lanes, thresholds and each step, and flags an incomplete lane", () => {
-    const md = markdown([start("a", "x"), start("a", "r2"), p13("a", "R2", 100, 400, 80), cell("a", 2, "if_match_support", "R4", {}, { support: "rejected", fresh: "http_501", stale: "http_501" }), { ledger_bench: 1, run: "a", lane: "r2", event: "end", complete: false, requests: 10, request_budget: 20, cpu_stat: { nr_throttled: 7 }, max_rss_kib: 5 } as Record_]);
-    expect(md).toContain("| a | r2 | NO | 10 | 20 | 7 | 5 |");
+    const md = markdown([start("a", "x"), start("a", "r2"), p13("a", "R2", 100, 400, 80), cell("a", 2, "if_match_support", "R4", {}, { support: "rejected", fresh: "http_501", stale: "http_501" }), { ledger_bench: 1, run: "a", lane: "r2", event: "end", complete: false, stopped_by: "byte budget", requests: 10, request_budget: 20, bytes: 3 * 1024 ** 3, byte_budget: 3 * 1024 ** 3, cpu_stat: { nr_throttled: 7 }, max_rss_kib: 5 } as Record_]);
+    expect(md).toContain("| a | r2 | NO (byte budget) | 10 | 20 | 3 | 3 | 7 | 5 |");
     expect(md).toContain("CPU-throttled in 1 lane run");
     expect(md).toContain("## Step 3");
     expect(md).toContain("R4: rejected");

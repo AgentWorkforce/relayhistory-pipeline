@@ -11,26 +11,38 @@ import { LANES, type Lane, type Profile } from "./config.ts";
 /** Lanes whose budgeted requests are S3 requests; the dynamo lane's are priced by write units instead. */
 const S3_LANES = LANES.filter((lane) => lane !== "dynamo").length;
 
-/** USD per unit, rounded up. */
+/** USD per unit: public list prices, rounded up. */
 export const PRICE = {
-  /** S3 Standard PUT/COPY/POST/LIST: $0.005 per 1,000 (GET and S3 Express requests cost less). */
+  /** S3 Standard PUT/COPY/POST/LIST: $0.005 per 1,000. */
   s3Write: 0.005 / 1000,
+  /** S3 Standard GET/HEAD: $0.0004 per 1,000. Named for the reader; the bound prices every request as a write. */
+  s3Read: 0.0004 / 1000,
   /** One KMS call per request on a bucket without Bucket Keys: $0.03 per 10,000. */
   kmsCall: 0.03 / 10_000,
   /** DynamoDB on-demand write request unit, at the older $1.25 per million. */
   dynamoWriteUnit: 1.25 / 1_000_000,
 } as const;
 
+/** USD per GiB, public list prices. */
+export const PRICE_GIB = {
+  /** NAT gateway data processing (billed to the cluster's account): $0.045. */
+  natProcessing: 0.045,
+  /** Transfer between us-east-1 and us-west-2 (R1 only): $0.02. */
+  interRegion: 0.02,
+  /** S3 Express One Zone upload $0.0032 and retrieval $0.0006 (R4, R5 only), taken as the larger. */
+  expressData: 0.0032,
+} as const;
+/**
+ * What one budgeted GiB can cost at most. No lane pays all three (inter-region is R1's, Express is R4/R5's),
+ * so their sum is an upper bound for every lane, rounded up to the cent.
+ */
+export const PRICE_PER_GIB = Math.ceil((PRICE_GIB.natProcessing + PRICE_GIB.interRegion + PRICE_GIB.expressData) * 100) / 100;
+
 /**
  * What neither budget prices, rounded up: KMS key-months, a few GiB-days of storage, DynamoDB reads, the
- * requests of the credential hop, and LIST or retry requests the store client makes on its own.
+ * requests of the credential hop, and each lane's one results copy (written outside the meter).
  */
 export const FIXED_USD = 15;
-/**
- * USD per GiB sent or received, taken together and rounded up: NAT data processing (billed to the cluster's
- * account), cross-region transfer for R1, and S3 Express upload and retrieval.
- */
-export const PRICE_PER_GIB = 0.07;
 /** The approved ceiling for the whole benchmark, every run included. */
 export const APPROVED_CAP_USD = 300;
 

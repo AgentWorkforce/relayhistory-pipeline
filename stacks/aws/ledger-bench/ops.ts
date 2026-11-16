@@ -345,7 +345,12 @@ export function readLedger(path: string | undefined, fresh: boolean): LedgerEntr
     throw new Error("ledger-bench: the spend ledger file does not exist; pass --fresh-ledger only for the benchmark's first run. Nothing was started.");
   }
   if (fresh) throw new Error("ledger-bench: --fresh-ledger given but the ledger exists; refusing to reset the spend. Nothing was started.");
-  const entries = JSON.parse(readFileSync(path, "utf8")) as LedgerEntry[];
+  let entries: LedgerEntry[];
+  try {
+    entries = JSON.parse(readFileSync(path, "utf8")) as LedgerEntry[];
+  } catch {
+    throw new Error("ledger-bench: the spend ledger file is malformed. Nothing was started.");
+  }
   if (!Array.isArray(entries) || entries.some((e) => typeof e?.run !== "string" || typeof e?.usd !== "number" || !(e.usd >= 0))) throw new Error("ledger-bench: the spend ledger file is malformed. Nothing was started.");
   return entries;
 }
@@ -376,9 +381,17 @@ function applyConfigMap(i: Inputs, name: string, from: string): void {
   must("kubectl", kubectl(i, ["apply", "--server-side", "--force-conflicts", "--field-manager=ledger-bench", "-f", "-"]), manifest);
 }
 
+/** Jobs (running or finished) in the namespace. */
+function existingJobs(i: Inputs): number {
+  const out = JSON.parse(must("kubectl", kubectl(i, ["-n", NAMESPACE, "get", "jobs", "-l", "app.kubernetes.io/name=ledger-bench", "-o", "json"]))) as { items?: unknown[] };
+  return (out.items ?? []).length;
+}
+
 function run(i: Inputs, runId: string, profile: string, lanes: Lane[], steps: string, ledgerPath: string | undefined, fresh: boolean): void {
   if (!i.keys) throw new Error("ledger-bench: run needs inputs.keys (from outputs-data)");
   confirmCluster(i, "run");
+  // A fresh ledger is for a benchmark that has never run: Jobs in the namespace mean spend it would forget.
+  if (fresh && existingJobs(i) > 0) throw new Error("ledger-bench: --fresh-ledger refused: the namespace already holds ledger-bench Jobs, so runs have happened; use their ledger file. Nothing was started.");
   const entries = readLedger(ledgerPath, fresh);
   if (entries.some((e) => e.run === runId && lanes.includes(e.lane))) throw new Error("ledger-bench: that run id already ran one of these lanes; choose a new run id. Nothing was started.");
   const ledger = ledgerAdd(entries, runId, profile, lanes);
