@@ -25,7 +25,7 @@ import {
   legacyDiscoveryPage,
   legacyGroupScopes,
   legacyScopeFenced,
-  legacyScopeUser,
+  legacyScopeOwner,
   legacyMachineId,
   legacyUnit,
   legacyUnitSource,
@@ -175,6 +175,8 @@ export interface Counters {
   skippedCheckpoint: number;
   fenced: number;
   unboundTurns: number;
+  unboundTurnsOnly: number;
+  unboundMultiOwner: number;
   userUnknown: number;
   manifestsWritten: number;
   failed: number;
@@ -188,6 +190,8 @@ export const newCounters = (): Counters => ({
   skippedCheckpoint: 0,
   fenced: 0,
   unboundTurns: 0,
+  unboundTurnsOnly: 0,
+  unboundMultiOwner: 0,
   userUnknown: 0,
   manifestsWritten: 0,
   failed: 0,
@@ -223,21 +227,29 @@ export async function withLegacyPrivacyFence<T>(
   registration?: { machineId: string; existing: boolean },
 ): Promise<{ fenced: true } | { fenced: false; value: T }> {
   let phase: "privacy" | "action" = "privacy";
+  let transactionOpen = false;
   let actionValue: { set: false } | { set: true; value: T } = { set: false };
   try {
     // The login has no table-write grants, but this transaction must be able
     // to invoke the narrow SECURITY DEFINER authority-row register before a
     // PUT. The privilege preflight, not transaction_read_only, is the write
     // boundary on this connection.
-    await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
-    await db.query("SET LOCAL lock_timeout='30s'");
-    await db.query("SET LOCAL statement_timeout='15min'");
-    // The connection's session default is 30 s. A large scope intentionally
-    // idles this connection while Neon is streamed and S3 is written; keep the
-    // privacy transaction and its locks alive for this operator-controlled scope.
-    await db.query("SET LOCAL idle_in_transaction_session_timeout='0'");
-    await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
-    await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
+    const begin = async () => {
+      await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+      transactionOpen = true;
+      await db.query("SET LOCAL lock_timeout='30s'");
+      await db.query("SET LOCAL statement_timeout='15min'");
+      // The connection's session default is 30 s. A large scope intentionally
+      // idles this connection while Neon is streamed and S3 is written; keep the
+      // privacy transaction and its locks alive for this operator-controlled scope.
+      await db.query("SET LOCAL idle_in_transaction_session_timeout='0'");
+      await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
+      await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
+    };
+    const commit = async () => {
+      await db.query("COMMIT");
+      transactionOpen = false;
+    };
     const privacyQuery = `SELECT (
         EXISTS(SELECT 1 FROM sessions.session_erasure_receipts
           WHERE org_id=$1 AND CASE WHEN workspace_id='' THEN 'default' ELSE workspace_id END=CASE WHEN $2='' THEN 'default' ELSE $2 END AND source=$3 AND session_id=$4)
@@ -277,19 +289,37 @@ export async function withLegacyPrivacyFence<T>(
       if (!got || (Object.keys(expected) as Array<keyof typeof expected>).some((k) => got[k] !== expected[k]))
         throw Object.assign(new Error("legacy export authority registration mismatch"), { code: "legacy_authority_register_mismatch" });
     };
-    // Repair an already-exported checkpoint even when a fence now exists, so
-    // the eraser can find the pre-registration object. A brand-new scope is
-    // registered only after its initial no-fence check below.
-    if (registration?.existing) await register();
-    const { rows } = await db.query<{ fenced: boolean }>(
-      privacyQuery,
-      privacyParams,
-    );
-    if (rows[0]?.fenced !== false) {
-      await db.query("COMMIT");
+    const fenced = async () => {
+      const { rows } = await db.query<{ fenced: boolean }>(
+        privacyQuery,
+        privacyParams,
+      );
+      return rows[0]?.fenced !== false;
+    };
+
+    if (registration) {
+      // Authority is durable before the first PUT. Existing checkpoints are
+      // repaired even if already fenced; a new, already-fenced scope was never
+      // exported and therefore must not acquire an authority row.
+      await begin();
+      if (!registration.existing && (await fenced())) {
+        await commit();
+        return { fenced: true };
+      }
+      await register();
+      const fencedAfterRegistration = await fenced();
+      await commit();
+      if (fencedAfterRegistration) return { fenced: true };
+    }
+
+    // A separate transaction closes the registration-to-PUT window. Its
+    // precheck catches an erasure committed immediately after registration;
+    // its postcheck catches one committed while the object write is running.
+    await begin();
+    if (await fenced()) {
+      await commit();
       return { fenced: true };
     }
-    if (registration && !registration.existing) await register();
     phase = "action";
     const value = await action();
     actionValue = { set: true, value };
@@ -297,17 +327,24 @@ export async function withLegacyPrivacyFence<T>(
     // Ordinary deletion fences need not take the operator's exclusive lock.
     // Recheck before releasing; a race is a failed export, never an accepted
     // checkpoint. The user-scoped legacy machine is swept by user erasure.
-    const after = await db.query<{ fenced: boolean }>(privacyQuery, privacyParams);
-    if (after.rows[0]?.fenced)
+    if (await fenced())
       throw Object.assign(new Error("privacy fence raced legacy export"), {
         code: "legacy_privacy_race",
         privacyValue: value,
       });
-    await db.query("COMMIT");
+    await commit();
     return { fenced: false, value };
   } catch (error) {
     let rollbackOk = true;
-    await db.query("ROLLBACK").catch(() => { rollbackOk = false; });
+    if (transactionOpen)
+      await db.query("ROLLBACK").then(
+        () => {
+          transactionOpen = false;
+        },
+        () => {
+          rollbackOk = false;
+        },
+      );
     if ((error as { code?: unknown })?.code === "legacy_privacy_race") throw error;
     if (phase === "privacy" || !rollbackOk) {
       throw Object.assign(new Error("privacy fence unavailable"), {
@@ -388,11 +425,22 @@ async function exportScope(
       if (opts.export) deps.checkpoint.setScope(key, scope.orgId, "fenced", fingerprint, null);
       return;
     }
-    const resolvedUserId = await legacyScopeUser(deps.db, scope);
-    if (resolvedUserId === null)
-      throw Object.assign(new Error("legacy scope has no unambiguous owner"), {
-        code: "legacy_user_unbound",
-      });
+    const owner = await legacyScopeOwner(deps.db, scope);
+    const resolvedUserId = owner.userId;
+    if (resolvedUserId === null) {
+      if (owner.reason === "unbound_multi_owner") counters.unboundMultiOwner += 1;
+      else if (owner.reason === "unbound_turns_only") counters.unboundTurnsOnly += 1;
+      else counters.userUnknown += 1;
+      if (opts.export)
+        deps.checkpoint.setScope(
+          key,
+          scope.orgId,
+          owner.reason,
+          fingerprint,
+          null,
+        );
+      return;
+    }
     if (prior?.user_id && prior.user_id !== resolvedUserId)
       throw Object.assign(new Error("legacy scope owner changed"), {
         code: "legacy_user_changed",
