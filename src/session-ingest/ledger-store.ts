@@ -26,7 +26,10 @@
  * The ledger-home marker is the fork guard (ledger-s3.ts `ledgerHome`): a ledger whose own store holds a marker naming
  * ANOTHER bucket refuses every claim (`ledger_home_moved`), and one configured with a separate ledger bucket refuses
  * without a marker naming it (`ledger_home_missing`). A relocation writes "moved" into the old location before the
- * new one, so a process left on the old configuration can never admit against the stale copy.
+ * new one, so a process left on the old configuration can never admit against the stale copy. Without a separate
+ * bucket the read is opt-in (INGEST_LEDGER_HOME_GUARD=on, default off: byte-identical to before); the runbook turns it
+ * on for every Locker-bucket ledger writer before a relocation starts. The single-bucket operator tools refuse
+ * through `assertLedgerHomeHere`.
  */
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { INBOX_NAMESPACE } from "./async-admission.ts";
@@ -43,6 +46,15 @@ export function validLedgerHome(v: unknown): v is LedgerHomeDoc {
   const o = v as Record<string, unknown>;
   return Object.keys(o).length === 3 && o.v === 1 && typeof o.home === "string" && o.home.length > 0
     && typeof o.writtenAtMs === "number" && Number.isSafeInteger(o.writtenAtMs) && o.writtenAtMs > 0;
+}
+
+/** INGEST_LEDGER_HOME_GUARD: unset | "" | "off" (default: no marker read) | exactly "on". Anything else throws. */
+export const LEDGER_HOME_GUARD_VAR = "INGEST_LEDGER_HOME_GUARD";
+export function ledgerHomeGuard(env: Record<string, string | undefined>): boolean {
+  const raw = env[LEDGER_HOME_GUARD_VAR]?.trim();
+  if (raw === undefined || raw === "" || raw === "off") return false;
+  if (raw === "on") return true;
+  throw new Error(`96bulls: ${LEDGER_HOME_GUARD_VAR} must be on or off`);
 }
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -108,6 +120,14 @@ export function ledgerRoutedStore(main: ObjectStore, ledger: ObjectStore, keyRoo
     const [pm, pl] = await Promise.all([fetch(main, s.m, (x) => !isLedger(x)), fetch(ledger, s.l, isLedger)]);
     // Everything up to the smallest last key of a side that has more pages is final; the rest waits for that side.
     const lastOf = (p: Page) => (p.items.length ? k(p.items[p.items.length - 1]!) : undefined);
+    // A side with more pages but an EMPTY page says nothing about where it stands: emit nothing this round and advance
+    // only the empty side(s), or a later key of it could sort below what the other side already emitted (and be lost).
+    const stalled = [pm, pl].some((p) => p !== null && p.page.nextCursor !== undefined && p.page.items.length === 0);
+    if (stalled) {
+      const step = (p: typeof pm, at: string | null | undefined) => (p && p.page.nextCursor !== undefined && p.page.items.length === 0 ? p.page.nextCursor : at);
+      const next: MergeState = { m: step(pm, s.m), l: step(pl, s.l), ...(s.a !== undefined ? { a: s.a } : {}) };
+      return { items: [], nextCursor: encode(next) };
+    }
     let bound: string | undefined;
     for (const p of [pm, pl]) {
       if (!p || p.page.nextCursor === undefined) continue;
@@ -158,6 +178,16 @@ export async function readLedgerHome(store: ObjectStore, keyRoot: string): Promi
   try { v = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { throw new Error("ledger_home_invalid"); }
   if (!validLedgerHome(v)) throw new Error("ledger_home_invalid");
   return v;
+}
+
+/**
+ * For the single-bucket operator tools (the buffered drain, the fence backfill, the revision reshard, the log-stream
+ * tool): refuse when this bucket's ledger-home marker names another bucket (the ledger moved away), or is unreadable.
+ * Absent, or naming `bucket`: the ledger is here. Throws Error("ledger_home_moved" | "ledger_home_invalid").
+ */
+export async function assertLedgerHomeHere(store: ObjectStore, keyRoot: string, bucket: string): Promise<void> {
+  const home = await readLedgerHome(store, keyRoot);
+  if (ledgerHomeVerdict(home, bucket, false) !== "ok") throw new Error("ledger_home_moved");
 }
 
 /**

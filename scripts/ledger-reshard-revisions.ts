@@ -17,6 +17,7 @@
  */
 import { parseArgs } from "node:util";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
+import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
 import { reshardRevisions } from "../src/session-ingest/revision-reshard.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../src/shared/locker.ts";
 
@@ -77,6 +78,12 @@ if (import.meta.main) {
     credentials,
     ...(values.execute ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: kms! } : {}),
   }) as unknown as ObjectStore;
+  // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
+  // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
+  try { await assertLedgerHomeHere(store, keyRoot, values.bucket!); } catch (error) {
+    process.stdout.write(JSON.stringify({ refused: (error as Error).message === "ledger_home_invalid" ? "ledger_home_invalid" : "ledger_home_moved" }) + "\n");
+    process.exit(1);
+  }
   const prefixes = values.org?.length ? values.org.map((o) => `${keyRoot}/.admission-inbox/${o}/`) : [`${keyRoot}/.admission-inbox/`];
   let failed = false;
   for (const [i, prefix] of prefixes.entries()) {

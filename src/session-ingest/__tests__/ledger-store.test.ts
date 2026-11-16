@@ -11,9 +11,10 @@ import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { journalKey } from "../async-admission.ts";
 import { LedgerUnavailableError } from "../ledger.ts";
 import { fenceAuthorityKey, fenceAuthorityStopKey, s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
-import { isLedgerKey, isRoutedCursor, ledgerHomeKey, ledgerHomeVerdict, ledgerListScope, ledgerRoutedStore, readLedgerHome } from "../ledger-store.ts";
+import { assertLedgerHomeHere, isLedgerKey, isRoutedCursor, ledgerHomeGuard, ledgerHomeKey, ledgerHomeVerdict, ledgerListScope, ledgerRoutedStore, readLedgerHome } from "../ledger-store.ts";
 import { parseRelocateArgs, relocateLedger, RelocateRefused, type RelocateArgs, type RelocateDeps } from "../ledger-relocate.ts";
-import { selfhostLedgerStore } from "../selfhost-config.ts";
+import { selfhostLedgerHomeGuard, selfhostLedgerStore } from "../selfhost-config.ts";
+import { hostedUploadAdmissionConfig } from "../upload-admission-hosted.ts";
 import { selfhostStores } from "../selfhost-server.ts";
 import { TENANT } from "./support.ts";
 
@@ -112,6 +113,21 @@ describe("the routed store", () => {
     expect(await listAll(routed, `${dir}/ledger`)).toEqual([b]);
   });
 
+  test("a side whose page is empty but not the last (e.g. only stale keys filtered server-side) never loses keys", async () => {
+    const single = fsStore(2), main = fsStore(2), ledger = fsStore(2);
+    const keysAll = [keys.batch("o1", "a"), keys.batch("o1", "b"), keys.batch("o1", "c"), journalKey(ROOT, TENANT), `${dir}/r=${"0".repeat(64)}/x.json`, `${dir}/r=${"1".repeat(64)}/x.json`];
+    const routedReal = ledgerRoutedStore(main, ledger, ROOT);
+    for (const k of keysAll) { await put(single, k); await put(routedReal, k); }
+    // The ledger side answers an empty page with a cursor first (S3 may), then its real pages.
+    let first = true;
+    const flaky = { ...ledger, backend: ledger.backend, list: async (p: never, c?: string) => {
+      if (c === undefined && first) { first = false; return { items: [], nextCursor: "__restart__" }; }
+      return ledger.list(p, c === "__restart__" ? undefined : c);
+    } } as ObjectStore;
+    const routed = ledgerRoutedStore(main, flaky, ROOT);
+    expect(await listAll(routed, dir)).toEqual(await listAll(single, dir));
+  });
+
   test("merged cursors are recognisable; a foreign cursor is refused, never silently restarted", async () => {
     const main = fsStore(1), ledger = fsStore(1), routed = ledgerRoutedStore(main, ledger, ROOT);
     for (const k of [keys.batch("o1", "b2"), keys.batch("o1", "b1"), journalKey(ROOT, TENANT), `${dir}/r=${"a".repeat(64)}/x.json`]) await put(routed, k);
@@ -193,13 +209,56 @@ describe("configuration", () => {
     const built: Record<string, string | undefined>[] = [];
     const build = ((env: NodeJS.ProcessEnv) => { built.push({ bucket: env.LOCKER_BUCKET, region: env.LOCKER_REGION }); return { provider: "s3", bucket: env.LOCKER_BUCKET, store: fsStore() }; }) as never;
     expect(selfhostStores({ keyRoot: ROOT }, base, build).ledgerHome).toBeUndefined();
-    expect(selfhostStores({ keyRoot: ROOT, ledger: "s3" }, base, build).ledgerHome).toEqual({ expect: "locker-b", required: false });
+    // Flag off (the default): byte-identical, no marker read at all.
+    expect(selfhostStores({ keyRoot: ROOT, ledger: "s3" }, base, build).ledgerHome).toBeUndefined();
+    expect(selfhostStores({ keyRoot: ROOT, ledger: "s3", ledgerHomeGuard: true }, base, build).ledgerHome).toEqual({ expect: "locker-b", required: false });
     built.length = 0;
     const r = selfhostStores({ keyRoot: ROOT, ledger: "s3", ledgerStore: { bucket: "ledger-b", region: "us-west-2" } }, base, build);
     expect(r.ledgerHome).toEqual({ expect: "ledger-b", required: true });
     expect(r.ledgerStore).toBeDefined();
     expect(r.store).not.toBe(r.main);
     expect(built).toEqual([{ bucket: "locker-b", region: "us-east-1" }, { bucket: "ledger-b", region: "us-west-2" }]);
+  });
+
+  test("INGEST_LEDGER_HOME_GUARD: default off, exactly on, needs s3", () => {
+    expect(ledgerHomeGuard({})).toBe(false);
+    expect(ledgerHomeGuard({ INGEST_LEDGER_HOME_GUARD: "off" })).toBe(false);
+    expect(ledgerHomeGuard({ INGEST_LEDGER_HOME_GUARD: "on" })).toBe(true);
+    expect(() => ledgerHomeGuard({ INGEST_LEDGER_HOME_GUARD: "true" })).toThrow();
+    expect(selfhostLedgerHomeGuard({ INGEST_LEDGER_HOME_GUARD: "on" }, "s3")).toBe(true);
+    expect(() => selfhostLedgerHomeGuard({ INGEST_LEDGER_HOME_GUARD: "on" }, undefined)).toThrow("INGEST_LEDGER=s3");
+  });
+
+  test("an endpoint is reused only in the same region; otherwise INGEST_LEDGER_ENDPOINT is required", () => {
+    const ep = { ...base, LOCKER_ENDPOINT: "https://minio.example:9000", INGEST_LEDGER_BUCKET: "ledger-b" };
+    expect(selfhostLedgerStore(ep, "s3")).toEqual({ bucket: "ledger-b", region: "us-east-1", endpoint: "https://minio.example:9000" });
+    expect(() => selfhostLedgerStore({ ...ep, INGEST_LEDGER_REGION: "us-west-2" }, "s3")).toThrow("set INGEST_LEDGER_ENDPOINT");
+    expect(selfhostLedgerStore({ ...ep, INGEST_LEDGER_REGION: "us-west-2", INGEST_LEDGER_ENDPOINT: "https://s3.us-west-2.amazonaws.com" }, "s3"))
+      .toEqual({ bucket: "ledger-b", region: "us-west-2", endpoint: "https://s3.us-west-2.amazonaws.com" });
+    expect(() => selfhostLedgerStore({ ...ep, INGEST_LEDGER_ENDPOINT: "https://x/path" }, "s3")).toThrow("bare origin");
+    const built: Record<string, string | undefined>[] = [];
+    const build = ((env: NodeJS.ProcessEnv) => { built.push({ bucket: env.LOCKER_BUCKET, endpoint: env.LOCKER_ENDPOINT }); return { provider: "s3", bucket: env.LOCKER_BUCKET, store: fsStore() }; }) as never;
+    selfhostStores({ keyRoot: ROOT, ledger: "s3", ledgerStore: { bucket: "ledger-b", region: "us-west-2" } }, { ...base, LOCKER_ENDPOINT: "https://e" }, build);
+    expect(built[1]).toEqual({ bucket: "ledger-b", endpoint: undefined });
+  });
+
+  test("the hosted upload-admission Lambda: the guard is opt-in, and a separate ledger bucket refuses", () => {
+    const env = { INGEST_LEDGER: "s3", AWS_REGION: "us-east-1", UPLOAD_ADMISSION_BUCKET: "locker-b", UPLOAD_ADMISSION_SECRET_ID: "96bulls/prod/upload-admission" };
+    expect(hostedUploadAdmissionConfig(env).ledgerHomeGuard).toBeUndefined();
+    expect(hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_HOME_GUARD: "on" }).ledgerHomeGuard).toBe(true);
+    expect(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_HOME_GUARD: "yes" })).toThrow();
+    expect(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_BUCKET: "ledger-b" })).toThrow();
+  });
+
+  test("assertLedgerHomeHere (the single-bucket operator tools)", async () => {
+    const s = fsStore();
+    await assertLedgerHomeHere(s, ROOT, "locker-b");
+    await put(s, ledgerHomeKey(ROOT), { v: 1, home: "locker-b", writtenAtMs: 1 });
+    await assertLedgerHomeHere(s, ROOT, "locker-b");
+    await put(s, ledgerHomeKey(ROOT), { v: 1, home: "ledger-b", writtenAtMs: 2 });
+    await expect(assertLedgerHomeHere(s, ROOT, "locker-b")).rejects.toThrow("ledger_home_moved");
+    await put(s, ledgerHomeKey(ROOT), { v: 1 });
+    await expect(assertLedgerHomeHere(s, ROOT, "locker-b")).rejects.toThrow("ledger_home_invalid");
   });
 });
 

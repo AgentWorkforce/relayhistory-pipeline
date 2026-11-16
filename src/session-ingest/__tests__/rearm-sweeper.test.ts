@@ -764,6 +764,20 @@ describe("re-arm sweeper with a separate ledger bucket (INGEST_REARM_LEDGER_BUCK
     await expect(runRearmSweeperPass(ENV, [], overrides as never)).rejects.toMatchObject({ code: "ledger_home_moved" });
   });
 
+  test("INGEST_LEDGER_HOME_GUARD=on without a ledger bucket: a sweeper left on the Locker bucket refuses once it says moved", async () => {
+    const main = fresh();
+    await rearmed(main, TENANT, "b1");
+    await seed(main, canonical(TENANT));
+    const overrides = { store: () => main, eraser: () => storeEraser(main), now: LATER };
+    await main.put(objectKey(ledgerHomeKey(ROOT)), home("ledger-b"));
+    // Off (the default): no marker read, unchanged.
+    expect((await runRearmSweeperPass(ENTRY_ENV, [], overrides)).output).toMatchObject({ enabled: true });
+    await expect(runRearmSweeperPass({ ...ENTRY_ENV, INGEST_LEDGER_HOME_GUARD: "on" }, [], overrides)).rejects.toMatchObject({ code: "ledger_home_moved" });
+    await main.put(objectKey(ledgerHomeKey(ROOT)), home("transcripts"));
+    expect((await runRearmSweeperPass({ ...ENTRY_ENV, INGEST_LEDGER_HOME_GUARD: "on" }, [], overrides)).output).toMatchObject({ enabled: true });
+    await expect(runRearmSweeperPass({ ...ENTRY_ENV, INGEST_LEDGER_HOME_GUARD: "x" }, [], overrides)).rejects.toMatchObject({ code: "config_invalid" });
+  });
+
   test("a position saved before the switch (a plain listing cursor) restarts its scope instead of failing every pass", async () => {
     const main = fresh(), ledger = fresh(), routed = ledgerRoutedStore(main, ledger, ROOT);
     await rearmed(routed, TENANT, "b1");

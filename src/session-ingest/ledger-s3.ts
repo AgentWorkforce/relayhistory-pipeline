@@ -649,7 +649,7 @@ export interface S3LedgerOptions {
   /**
    * The fork guard of a ledger relocation (ledger-store.ts LedgerHomeDoc, docs/ledger-relocation.md), checked with the
    * fence-authority marker and cached with it (needs `fenceAuthority: "required"`): the marker
-   * `<keyRoot>/.ledger/ledger-home.json` in THIS ledger's store naming another bucket than `expect` refuses every claim
+   * `<keyRoot>/.ledger/fence-authority/.ledger-home.json` in THIS ledger's store naming another bucket than `expect` refuses every claim
    * (`ledger_home_moved`); absent, a claim refuses only when `required` (a separate ledger bucket is configured).
    * Unset: no check, no request.
    */

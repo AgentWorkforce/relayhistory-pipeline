@@ -14,7 +14,12 @@
  *   INGEST_REARM_LEDGER_REGION       its signing region; default INGEST_REARM_REGION. Only with INGEST_REARM_LEDGER_BUCKET.
  *                                    With it, every pass first checks the ledger-home marker in that bucket (ledger-store.ts):
  *                                    missing (`ledger_home_missing`) or naming another bucket (`ledger_home_moved`) refuses
- *                                    (exit 2). Without it no marker is read (the sweeper's role may not read that prefix).
+ *                                    (exit 2).
+ *   INGEST_LEDGER_HOME_GUARD         without INGEST_REARM_LEDGER_BUCKET: "on" reads the marker in INGEST_REARM_BUCKET each
+ *                                    pass and refuses (exit 2) when it names another bucket; unset/"off" (default) reads
+ *                                    nothing. Its role needs GetObject on `<root>/.ledger/fence-authority/.ledger-home.json`
+ *                                    for "on" (a 403 is `access_denied`, exit 2); the relocation runbook also stops the
+ *                                    sweeper for the window.
  *   INGEST_REARM_KEY_ROOT            object key root, default "96bulls" (= INGEST_KEY_ROOT)
  *   INGEST_REARM_ORGS                optional comma-separated org ids (org scope); unset = every org
  *   INGEST_REARM_DRY_RUN             "1": classify and count only (or `--dry-run`)
@@ -45,7 +50,8 @@ import type { ObjectStore } from "../shared/vendor.ts";
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
-import { isRoutedCursor, ledgerHomeVerdict, ledgerRoutedStore, readLedgerHome } from "./ledger-store.ts";
+import { isRoutedCursor, ledgerHomeGuard, ledgerHomeVerdict, ledgerRoutedStore, readLedgerHome } from "./ledger-store.ts";
+import { isObjectStoreError } from "../shared/vendor.ts";
 import { readRearmCursor, rearmCursorKey, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
 
 export const REARM_ENABLE_FLAG = "INGEST_REARM_SWEEPER_ENABLED";
@@ -187,13 +193,16 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
     ? ledgerRoutedStore(main, (overrides.store ?? createS3Store)({ ...s3, bucket: cfg.ledger.bucket, region: cfg.ledger.region, credentials: provider }) as unknown as ObjectStore, cfg.keyRoot)
     : main;
   // The fork guard: never sweep a ledger bucket the deployment has not moved to (or has moved away from again).
-  if (cfg.ledger) {
+  let homeGuard = false;
+  try { homeGuard = ledgerHomeGuard(env); } catch { refuse("config_invalid"); }
+  if (cfg.ledger || homeGuard) {
     let home;
     try { home = await readLedgerHome(store, cfg.keyRoot); } catch (error) {
       if (error instanceof Error && error.message === "ledger_home_invalid") refuse("ledger_home_invalid");
+      if (isObjectStoreError(error, "unauthorized")) refuse("access_denied");
       throw error;
     }
-    const verdict = ledgerHomeVerdict(home, cfg.ledger.bucket, true);
+    const verdict = ledgerHomeVerdict(home, cfg.ledger?.bucket ?? cfg.bucket, cfg.ledger !== undefined);
     if (verdict !== "ok") refuse(verdict);
   }
   const eraser = (overrides.eraser ?? createS3Eraser)(s3);

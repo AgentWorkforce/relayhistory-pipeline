@@ -45,6 +45,7 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
+import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
@@ -219,6 +220,9 @@ if (import.meta.main) {
       bucket: args.bucket, region: args.region, credentials,
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
     }) as unknown as ObjectStore;
+    // A relocated ledger (docs/ledger-relocation.md): this bucket's ledger-home marker names another bucket, so its
+    // ledger/** objects are stale copies. Writing or judging them would fork the ledger: refuse.
+    await assertLedgerHomeHere(store, KEY_ROOT, args.bucket);
     const summary = await runDrain(args, { store, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {
