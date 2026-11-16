@@ -10,7 +10,9 @@ export function semanticReadonlyPool(url: string): Pool {
         throw new Error("feature source URL invalid");
     for (const key of ["sslmode", "sslrootcert", "sslcert", "sslkey", "ssl", "options"])
         u.searchParams.delete(key);
-    const pool = new pg.Pool({ connectionString: u.toString(), max: 1, connectionTimeoutMillis:1000, ssl: { rejectUnauthorized: true }, application_name: "96bulls-feature-copy-readonly", options: "-c default_transaction_read_only=on -c statement_timeout=15000", idleTimeoutMillis: 60000 });
+    // Supavisor drops startup options. SemanticPostgresExecutor explicitly uses
+    // BEGIN READ ONLY and transaction-local statement/lock timeouts instead.
+    const pool = new pg.Pool({ connectionString: u.toString(), max: 1, connectionTimeoutMillis:1000, ssl: { rejectUnauthorized: true }, application_name: "96bulls-feature-copy-readonly", idleTimeoutMillis: 60000 });
     pool.on("error", () => { });
     return pool;
 }
