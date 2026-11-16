@@ -422,7 +422,9 @@ export class LogMaterializer {
     const consentOn = (uploadConsent && uploadConsent.enforcement !== "off") || consentCap;
     // Always installed: at the admit phase (after the legacy claim, BEFORE any canonical write) it reads the skip record
     // again, so a batch another materializer skipped after this run's first read is not written either (a retry: the
-    // next run finds the skip record and finishes the skip). Then consent, when it applies.
+    // next run finds the skip record and finishes the skip). Then consent, when it applies. NOT closed: a materializer
+    // that passed this gate before another one wrote its skip still commits (two materializers, consent changing
+    // between their gate reads); docs/design/s3-ledger-log-commit.md, slice 6, "Residual window".
     const consentGate = async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => {
       if (phase !== "admit") return;
       if (await readLogSkip(store, logKeys(keyRoot, tenant, originId), b.batchId)) throw new LedgerUnavailableError("log_batch_skipped");

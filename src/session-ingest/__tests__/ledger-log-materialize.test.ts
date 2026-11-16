@@ -545,7 +545,7 @@ describe("Remaining 1: consent re-checked at apply time", () => {
     expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
   });
 
-  test("a batch mixing a capped and an uncapped payload is refused as payload_invalid", async () => {
+  test("a batch mixing a capped and an uncapped payload is refused as payload_invalid, in either order", async () => {
     const store = await fresh();
     await admitted(store, "b1", "r1", { mode: "selected" });
     const keys = logKeys(ROOT, TENANT, ORIGIN);
@@ -559,8 +559,13 @@ describe("Remaining 1: consent re-checked at apply time", () => {
     const ref = await putPayload(store, keys, new TextEncoder().encode(JSON.stringify(uncapped)));
     const s = (await openStream(store, keys))!;
     await appendBatches(store, s, [{ ...b!, batchId: "b2", payloads: [capped, ref] }], null, { writer: "w_test", now: () => T0 });
+    // And the other order: uncapped first, then capped.
+    await appendBatches(store, s, [{ ...b!, batchId: "b3", payloads: [
+      await putPayload(store, keys, new TextEncoder().encode(JSON.stringify({ ...uncapped, attempt: "third" }))),
+      await putPayload(store, keys, new TextEncoder().encode(JSON.stringify({ ...p, attempt: "fourth" }))),
+    ] }], null, { writer: "w_test", now: () => T0 });
     const r = await (await materializer(store)).materialize(TENANT, ORIGIN);
-    expect(r.outcomes).toEqual(["skipped:upload_consent_required", "skipped:payload_invalid"]);
+    expect(r.outcomes).toEqual(["skipped:upload_consent_required", "skipped:payload_invalid", "skipped:payload_invalid"]);
   });
 
   test("a malformed cap in the payload is refused as payload_invalid", async () => {
