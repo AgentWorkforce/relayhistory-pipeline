@@ -207,6 +207,9 @@ const STICKY_MAX = 256;
 /** INGEST_CLAIM_LOCK_WAIT_MS bounds (ms): the claim's own lock wait, below the role's lock_timeout (2 s). */
 export const CLAIM_LOCK_WAIT_MS_MIN = 25;
 export const CLAIM_LOCK_WAIT_MS_MAX = 2000;
+/** The claim transaction's own idle-in-transaction bound (the role's is 10 s, session_ingest_role.sql). */
+export const CLAIM_IDLE_IN_TRANSACTION_MS = 1000;
+export const CLAIM_LOCK_WAIT_SET = "SELECT set_config('lock_timeout', $1, true), set_config('idle_in_transaction_session_timeout', $2, true)";
 
 /**
  * One claim attempt in its own short transaction whose lock_timeout is `ms` (set_config(..., true) is SET
@@ -229,7 +232,10 @@ export async function inClaimLockWait<T>(run: SqlRun, ms: number, work: () => Pr
   };
   const rollback = () => run("ROLLBACK", []).then(() => undefined, () => undefined);
   try { await run("BEGIN", []); } catch (error) { await rollback(); throw mapped(error); }
-  try { await run("SELECT set_config('lock_timeout', $1, true)", [`${ms}ms`]); } catch (error) { await rollback(); throw mapped(error); }
+  // Both in ONE statement (no extra round trip). idle_in_transaction_session_timeout bounds how long a
+  // transaction stranded between statements (a Worker that died before COMMIT/ROLLBACK) can keep holding the
+  // user's fence row: CLAIM_IDLE_IN_TRANSACTION_MS instead of the role's 10 s.
+  try { await run(CLAIM_LOCK_WAIT_SET, [`${ms}ms`, `${CLAIM_IDLE_IN_TRANSACTION_MS}ms`]); } catch (error) { await rollback(); throw mapped(error); }
   let value: T;
   try { value = await work(); } catch (error) { await rollback(); throw error; }
   try { await run("COMMIT", []); } catch (error) { await rollback(); throw mapped(error); }

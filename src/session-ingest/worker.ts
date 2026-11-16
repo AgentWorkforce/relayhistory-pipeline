@@ -206,6 +206,12 @@ interface Ctx {
   waitUntil(work: Promise<unknown>): void;
 }
 
+/** INGEST_CLAIM_LOCK_WAIT_MS: decimal digits only (no sign, exponent, hex or fraction), then bounded. */
+function claimLockWaitMs(raw: string): number {
+  if (!/^\d+$/.test(raw.trim())) throw new Error(`session ingest: INGEST_CLAIM_LOCK_WAIT_MS must be an integer from ${CLAIM_LOCK_WAIT_MS_MIN} to ${CLAIM_LOCK_WAIT_MS_MAX}`);
+  return bounded(raw, CLAIM_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, "INGEST_CLAIM_LOCK_WAIT_MS");
+}
+
 /** A required integer setting within [lo, hi]; never echoes the value. */
 function bounded(raw: string, lo: number, hi: number, name: string): number {
   const n = Number(raw.trim());
@@ -362,7 +368,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
-    ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: bounded(env.INGEST_CLAIM_LOCK_WAIT_MS, CLAIM_LOCK_WAIT_MS_MIN, CLAIM_LOCK_WAIT_MS_MAX, "INGEST_CLAIM_LOCK_WAIT_MS") } : {}),
+    ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),

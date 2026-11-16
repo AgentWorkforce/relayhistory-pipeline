@@ -29,6 +29,7 @@ describe.skipIf(!url)("claim lock wait (owned PostgreSQL)", () => {
     await holder.query(`INSERT INTO ${table}(id) VALUES (1)`);
     // The role's production setting, so the bound is visibly shorter than what an unwrapped claim would wait.
     await claimant.query("SET lock_timeout = '2s'");
+    await claimant.query("SET idle_in_transaction_session_timeout = '10s'");
   });
   afterAll(async () => {
     await holder?.query("ROLLBACK").catch(() => {});
@@ -60,6 +61,26 @@ describe.skipIf(!url)("claim lock wait (owned PostgreSQL)", () => {
     expect(r.rows[0].n).toBe(1);
     expect((await holder.query(`SELECT n FROM ${table} WHERE id=1`)).rows[0].n).toBe(1);
     expect((await claimant.query("SHOW lock_timeout")).rows[0].lock_timeout).toBe("2s");
+    expect((await claimant.query("SHOW idle_in_transaction_session_timeout")).rows[0].idle_in_transaction_session_timeout).toBe("10s");
+  });
+
+  test("a transaction stranded inside the wrapper is ended by the local idle-in-transaction bound (~1 s), releasing the row", async () => {
+    const stranded = new pg.Client({ connectionString: url });
+    await stranded.connect();
+    stranded.on("error", () => {}); // the server terminating the idle session is the expected outcome
+    await stranded.query("SET idle_in_transaction_session_timeout = '10s'");
+    // A Worker that dies after the claim statement: BEGIN + the wrapper's SET + a row lock, never COMMIT/ROLLBACK.
+    const strandedRun = run(stranded);
+    const never = new Promise<never>(() => {});
+    void inClaimLockWait(strandedRun, 100, async () => { await stranded.query(`SELECT 1 FROM ${table} WHERE id=1 FOR UPDATE`); return never; });
+    await new Promise((r) => setTimeout(r, 200));
+    const t0 = Date.now();
+    await claimant.query("SET lock_timeout = '5s'");
+    const r = await claimant.query(`UPDATE ${table} SET n=n+0 WHERE id=1 RETURNING n`);
+    expect(r.rows.length).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(3000); // released by the 1 s bound, far below the role's 10 s
+    await claimant.query("SET lock_timeout = '2s'");
+    await stranded.end().catch(() => {});
   });
 
   test("a held lock released within the wait: the statement proceeds and commits (only a real contention gives up)", async () => {
