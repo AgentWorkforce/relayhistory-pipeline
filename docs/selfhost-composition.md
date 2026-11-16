@@ -918,6 +918,13 @@ publishes `empty` or keeps an older summary: the summary is cleared
 delivery fails (non-retryable). The row is recorded as not current, so a
 replay of the same revision reads the session again.
 
+Lowering a cap with sampling on (`BOB_COSTAS_MAX_CHUNK_BYTES`,
+`BOB_COSTAS_MAX_INPUT_BYTES`) can therefore clear summaries that were ready:
+the next summary of a session whose chunks no longer fit is cleared and
+dead-lettered. Nothing retries it on its own (the failure is non-retryable, and
+a new summary is only queued by a new revision), so recovery is manual: raise
+the cap again, then replay those deliveries from the summary dead-letter queue.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BOB_COSTAS_INPUT_SAMPLING` | `off` | `on` turns on chunk, turn and name sampling as above |

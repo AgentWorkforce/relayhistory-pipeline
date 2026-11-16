@@ -103,7 +103,17 @@ export interface Summarizer {
 
 /** The model summariser's `clean` before its bound: scrub, then collapse whitespace runs. */
 const scrubCollapse = (t: string) => scrubText(t).replace(/\s+/g, " ");
-const bound = (t: string) => (t.length > TURN_TEXT_CHARS ? t.slice(0, TURN_TEXT_CHARS) : t);
+/**
+ * The first `n` UTF-16 units of `s`, one fewer when the last kept unit would be a high
+ * surrogate: a cut never splits a surrogate pair, which the scrubber refuses as
+ * `scrub_input_not_well_formed` (dead-lettering the summary).
+ */
+export function cutAt(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const code = n > 0 ? s.charCodeAt(n - 1) : 0;
+  return s.slice(0, code >= 0xd800 && code <= 0xdbff ? n - 1 : n);
+}
+const bound = (t: string) => cutAt(t, TURN_TEXT_CHARS);
 /** Rounds of scrub-and-collapse a turn may take to settle before it is given up. */
 const SETTLE_ROUNDS = 8;
 
@@ -116,19 +126,25 @@ const SETTLE_ROUNDS = 8;
  * whatever a scrub redacted or a collapse glued together before it. Settling runs both
  * before the clip (a collapse can glue a value that a second scrub then matches) and after
  * it (a re-scrub of the clipped text must not shrink it). A turn that does not settle in
- * SETTLE_ROUNDS rounds is dropped to "". The copy (Buffer round trip) keeps a slice from
- * holding its parent alive.
+ * SETTLE_ROUNDS rounds, before the clip or after it, is dropped to "". The copy (Buffer
+ * round trip) keeps a slice from holding its parent alive. `step` is the scrub-and-collapse
+ * step (a parameter only so a test can force a turn that never settles).
  */
-export function clipTurn(s: string): string {
-  let t = scrubCollapse(s);
+export function clipTurn(s: string, step: (t: string) => string = scrubCollapse): string {
+  let t = step(s);
+  let settled = false;
   for (let round = 0; round < SETTLE_ROUNDS; round++) {
-    const next = scrubCollapse(t);
-    if (next === t) break;
+    const next = step(t);
+    if (next === t) {
+      settled = true;
+      break;
+    }
     t = next;
   }
+  if (!settled) return "";
   t = bound(t);
   for (let round = 0; round < SETTLE_ROUNDS; round++) {
-    const next = scrubCollapse(t);
+    const next = step(t);
     if (next === t) return Buffer.from(t, "utf16le").toString("utf16le");
     t = bound(next);
   }
@@ -535,7 +551,8 @@ function textOf(content: unknown, partTypes: readonly string[] = ["text"]): stri
   return undefined;
 }
 
-const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+/** `s` bounded to `n` characters with an ellipsis; never splits a surrogate pair (`cutAt`). */
+const clip = (s: string, n: number) => (s.length > n ? `${cutAt(s, n - 1)}…` : s);
 
 /** The long summary's note on a capped digest: which part of the session it describes. */
 function inputNote(input: DigestInputTruncation | undefined): string[] {

@@ -149,6 +149,49 @@ describe("TurnSampler and clipTurn (sampling on)", () => {
     expect([...kept].sort((a, b) => a - b)).toEqual(kept);
   });
 
+  test("a turn that never settles is dropped to an empty string", () => {
+    let calls = 0;
+    // Every step changes the text: the pre-clip settle never reaches a fixed point.
+    expect(clipTurn("abc", (t) => (calls++, `${t}x`))).toBe("");
+    expect(calls).toBeGreaterThan(1);
+    // A step that settles at once keeps the turn.
+    expect(clipTurn("abc", (t) => t)).toBe("abc");
+  });
+
+  test("no cut splits a surrogate pair: an emoji across the 8,192, 160, 200 and 280 cuts", async () => {
+    const emoji = "\u{1F600}";
+    // The wasm scrubber refuses a string that is not well formed (scrub_input_not_well_formed,
+    // scrub-engine-bindgen.test.ts): a split pair would dead-letter the summary.
+    const wellFormed = (s: string) => (s as unknown as { isWellFormed(): boolean }).isWellFormed();
+    expect(wellFormed(`a${emoji.slice(0, 1)}`)).toBe(false);
+    // The 8,192 turn clip (sampling on).
+    for (const at of [TURN_TEXT_CHARS - 1, TURN_TEXT_CHARS]) {
+      const turn = "a".repeat(at - 1) + emoji + " tail";
+      const kept = clipTurn(turn);
+      expect(kept.length).toBeLessThanOrEqual(TURN_TEXT_CHARS);
+      expect(wellFormed(kept)).toBe(true);
+      // A plain UTF-16 cut at this offset would split the pair.
+      if (at === TURN_TEXT_CHARS) expect(wellFormed(turn.slice(0, TURN_TEXT_CHARS))).toBe(false);
+      const d = digestRecords("claude", [user(turn)], { sampling: true });
+      for (const kind of ["short", "long"] as const) {
+        expect(wellFormed((await extractiveSummarizer.summarize(kind, d)).text)).toBe(true);
+        expect(wellFormed(JSON.parse(buildPromptInput(kind, d)).user_turns.join(""))).toBe(true);
+      }
+    }
+    // The extractive clips (sampling off as on): the first prompt at 160, prompts at 200,
+    // the short summary at 280 (pushed there by a long tool name).
+    for (let at = 150; at < 290; at++) {
+      const lines = [user("p".repeat(at) + emoji + " rest"), assistant("t".repeat(Math.max(0, at - 60)) + emoji)];
+      for (const sampling of [false, true]) {
+        const d = digestRecords("claude", lines, { sampling });
+        for (const kind of ["short", "long"] as const) {
+          const out = (await extractiveSummarizer.summarize(kind, d)).text;
+          expect(wellFormed(out)).toBe(true);
+        }
+      }
+    }
+  });
+
   test("clipTurn scrubs, then collapses whitespace, then clips", () => {
     expect(clipTurn("a \n\t b")).toBe("a b");
     expect(clipTurn("x".repeat(TURN_TEXT_CHARS * 3)).length).toBe(TURN_TEXT_CHARS);
