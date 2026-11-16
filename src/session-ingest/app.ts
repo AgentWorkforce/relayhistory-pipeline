@@ -15,6 +15,7 @@ import { assertUserDeleteAllowed, CAPTURE_POLICY_REVISION_HEADER, uploadPolicyEr
  *
  *   POST /v1/delivery/batches   rth:sync   one batch -> receipt (same shapes, same codes)
  *   GET  /v1/delivery/limits    rth:sync   DELIVERY_LIMITS + contentEncodings
+ *   GET  /v1/turns/capabilities rth:sync   migration-backed turn-fence preflight
  *   POST /v1/turns/batches      rth:sync   relay session turns as records (turns.ts), same receipt
  *   GET  /healthz                          liveness only
  *   POST|GET /internal/v1/session-erase/... operator per-session erase (session-erase.ts; default
@@ -78,6 +79,7 @@ export const SIGNATURE_HEADER = "x-relay-ingest-signature";
 /** Set only after the mandatory cross-origin turn writer registration commits to this request. */
 export const TURN_FENCE_HEADER = "x-relay-turn-fence";
 export const TURN_FENCE_REGISTERED = "registered-v1";
+export const TURN_FENCE_CAPABILITY_PATH = "/v1/turns/capabilities";
 /** How old (or how far ahead) a signature may be. */
 export const SIGNATURE_WINDOW_SECONDS = 60;
 
@@ -742,6 +744,20 @@ export function createIngestApp(deps: IngestAppDeps) {
   });
 
   app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
+
+  // Cloud's deployment-order interlock. This reads an RPC created atomically with the
+  // turn-fence tables/functions, so new Worker code against old ingest code OR an old
+  // database refuses before the first turn batch is posted.
+  app.get(TURN_FENCE_CAPABILITY_PATH, async (c) => {
+    try {
+      if (!deps.deliver.ledger.turnFenceCapability || !(await deps.deliver.ledger.turnFenceCapability()))
+        throw new IngestUnavailable("fence", "turn_fence_unavailable");
+      c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
+      return c.body(null, 204);
+    } catch (error) {
+      return failure(c, error);
+    }
+  });
 
   // One acceptance path for the public delivery shape and the private turns shape: the
   // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.

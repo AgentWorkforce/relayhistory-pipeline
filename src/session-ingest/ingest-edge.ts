@@ -57,7 +57,7 @@ import {
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { log } from "../shared/log.ts";
 import { AuthError } from "../session-read-api/app.ts";
-import { createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE, type IngestAppDeps, type IngestIdentity } from "./app.ts";
+import { createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE, TURN_FENCE_CAPABILITY_PATH, type IngestAppDeps, type IngestIdentity } from "./app.ts";
 import { createRthVerifier, RTH_ACCESS_TOKEN_PREFIX, rthVerifierConfig, type RthVerifierOptions, type RthVerifierSettings } from "./rth-verifier.ts";
 import { bearerOf, relaycontrolIngestIdentity } from "./selfhost-auth.ts";
 
@@ -76,6 +76,7 @@ export const INGEST_EDGE_RETRY_AFTER_MAX_S = 10;
 export const INGEST_EDGE_ROUTES: Readonly<Record<string, "GET" | "POST">> = Object.freeze({
   "/v1/delivery/batches": "POST",
   "/v1/turns/batches": "POST",
+  [TURN_FENCE_CAPABILITY_PATH]: "GET",
   "/v1/delivery/limits": "GET",
 });
 

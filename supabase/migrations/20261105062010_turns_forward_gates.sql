@@ -38,6 +38,17 @@ ALTER TABLE sessions.turn_writers ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.turn_session_fences,sessions.turn_writers
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_read_api;
 
+-- A source-free deployment preflight. Its existence proves this entire migration committed;
+-- the fixed response is understood only by ingest code that also registers before admission.
+CREATE FUNCTION sessions.ingest_turn_capability(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $capability$
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ IF p IS NULL OR p<>'{}'::jsonb
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='turn capability: empty input required';END IF;
+ RETURN jsonb_build_object('turnFence','registered-v1');
+END $capability$;
+
 -- Materialize one permanent logical turn fence for every registered writer. The ordinary
 -- fence-version update is the invalidation signal; upload_deletions is the keep predicate.
 CREATE FUNCTION sessions.ingest_turn_materialize_fence(
@@ -192,12 +203,13 @@ CREATE TRIGGER aa_session_directory_hide_turn_only
  FOR EACH ROW EXECUTE FUNCTION sessions.aa_session_directory_hide_turn_only();
 
 REVOKE ALL ON FUNCTION sessions.ingest_turn_materialize_fence(text,text,text,text),
- sessions.ingest_turn_capture_erasure(),sessions.ingest_turn_register(jsonb),
+ sessions.ingest_turn_capture_erasure(),sessions.ingest_turn_capability(jsonb),sessions.ingest_turn_register(jsonb),
  sessions.ingest_turn_fences_import(jsonb),
  sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text),
  sessions.aa_session_directory_hide_turn_only()
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_read_api;
 GRANT EXECUTE ON FUNCTION sessions.ingest_turn_register(jsonb) TO bulls96_session_ingest;
+GRANT EXECUTE ON FUNCTION sessions.ingest_turn_capability(jsonb) TO bulls96_session_ingest;
 GRANT EXECUTE ON FUNCTION sessions.ingest_turn_fences_import(jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text) TO bulls96_read_api;
 

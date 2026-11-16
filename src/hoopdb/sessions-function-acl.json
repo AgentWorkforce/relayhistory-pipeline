@@ -1072,6 +1072,10 @@
     "sessions.ingest_stage_intent_retired_attempt_guard()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_turn_capability(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_turn_capture_erasure()": [
       "<owner>:EXECUTE"
     ],

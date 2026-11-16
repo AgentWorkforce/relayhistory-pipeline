@@ -185,6 +185,8 @@ export interface SourceControlCompleteInput { epoch: string; tenant: LedgerTenan
 /** C3 Supabase-first privacy authority head: the mirror head plus Neon's reset count (null for a selection). */
 export interface PrivacyAuthorityHead extends SourceControlHead { deleted: string | null }
 export interface Ledger {
+  /** True only when the atomic turn-fence migration and its ingest-only RPC are installed. */
+  turnFenceCapability?(): Promise<boolean>;
   /** Register relay-turn session writers and materialize any cross-origin erasure fence. */
   registerTurnSessions?(input: { tenant: LedgerTenant; sessions: [string, string][] }): Promise<[string, string][]>;
   /** Frozen-source custody witness (refuses unless the sealed copy and policy agree). */

@@ -99,6 +99,9 @@ test("HTTP: turns land in the buffered stage through the normal custody + claim 
  const {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER}=await import("../custody-protocol.ts");
  const f=await fixture();const logs:Record<string,unknown>[]=[];
  const mk=(custodySource:"relayhistory"|"frozen-supabase")=>createIngestApp({identify:()=>({...TENANT,scopes:["rth:sync"]}),deliver:f.deps,log:(x)=>logs.push(x),custodySource});
+ const capability=await mk("frozen-supabase").request("/v1/turns/capabilities");
+ expect(capability.status).toBe(204);
+ expect(capability.headers.get("x-relay-turn-fence")).toBe("registered-v1");
  const b1=await turnBatch([turn(0),turn(1,{role:"assistant",content:"card 4111 1111 1111 1111 here"})]);
  const r1=await mk("frozen-supabase").request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:body(b1)});
  expect(r1.status).toBe(200);

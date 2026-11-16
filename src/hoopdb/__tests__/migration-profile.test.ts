@@ -2531,6 +2531,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
+    const TG = "upstream:20261105062010_turns_forward_gates.sql";
     expect(await names()).toContain(CA);
     await rollback("20261105062010_ingest_origin_claim_fence.down.sql");
     expect(await names()).not.toContain(OCF);
@@ -2539,6 +2540,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'ingest\\_origin\\_%'")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
     // 20261105062000 (coordination advisories) is the newest: 059000's down refuses (55000) while it is applied;
+    // 20261105062000 (coordination advisories) is then the newest: 059000's down refuses (55000) while it is applied;
     // its checksum-pinned down drops the five functions, the table and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CA);
     expect((await failure(rollback("20261105059000_ingest_publication_gcs_provider.down.sql")))?.code).toBe("55000");

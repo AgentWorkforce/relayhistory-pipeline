@@ -10,7 +10,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062010_turns_forward_gates.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_turns_forward_gates.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'203862a63bdac7d291c06a0a19403d595fe97b8216d54a165d2c4f3ec2b70d5e'
+ IF NOT FOUND OR v_sha<>'70e0390796a5c0f774042dd6c9114c6b89127560aa6c282086e6709a09a6cc7d'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP TRIGGER aa_session_directory_hide_turn_only ON sessions.session_directory;
@@ -18,6 +18,7 @@ DROP FUNCTION sessions.aa_session_directory_hide_turn_only();
 DROP FUNCTION sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text);
 DROP FUNCTION sessions.ingest_turn_fences_import(jsonb);
 DROP FUNCTION sessions.ingest_turn_register(jsonb);
+DROP FUNCTION sessions.ingest_turn_capability(jsonb);
 DROP TRIGGER ingest_turn_capture_erasure ON sessions.upload_deletions;
 DROP FUNCTION sessions.ingest_turn_capture_erasure();
 DROP FUNCTION sessions.ingest_turn_materialize_fence(text,text,text,text);
