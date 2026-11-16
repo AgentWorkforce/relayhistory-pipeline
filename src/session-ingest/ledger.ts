@@ -265,6 +265,8 @@ export interface BabysitterWriteOutcome {
 
 /** The ledger is unreachable or refused: the batch answers 503 (retryable), never a fallback. */
 export class LedgerUnavailableError extends Error {
+  /** `ledger_store_*` only: the object store's HTTP status (100..599), diagnostic only, never a key or message. */
+  storeStatus?: number;
   /** `db`: the closed diagnosis (class, safe code, basis) of the underlying failure (diagnostic only). */
   constructor(readonly code: string, readonly db?: DbErrorDiagnosis) {
     super(`session ingest ledger unavailable: ${code}`);

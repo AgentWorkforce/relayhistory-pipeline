@@ -127,6 +127,25 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const entries = new Map<string, Entry>();
   const inflight = new Set<string>();
   const running = new Set<Promise<void>>();
+  // Tenant-cap HINT (deferTenantLimit only): skip, without starting, an entry whose org or machine directory is
+  // already at the consumer's tenant cap, or whose directory was just deferred by it. The authoritative guard is
+  // still deliver.ts's post-claim acquire (a race still defers safely); this only stops a deferred attempt from
+  // spending a consumer slot and its full S3 claim first. A machine directory (`…/m=<hash of ws, origin, user>`)
+  // belongs to exactly one user, so its in-flight count never exceeds that user's: skipping at
+  // `dir >= maxPerUser` never skips a start the limiter would have allowed. The org count is exact: the consumer's
+  // limiter pool is its own (selfhost-server.ts asyncLimiter).
+  const caps = opts.deferTenantLimit ? opts.deliver.slots : undefined;
+  const inboxPrefix = `${keyRoot}/${INBOX_NAMESPACE}/`;
+  const tenantOf = (key: string): { org: string; dir: string } | undefined => {
+    if (!key.startsWith(inboxPrefix)) return undefined;
+    const r = key.indexOf("/r=", inboxPrefix.length), slash = key.indexOf("/", inboxPrefix.length);
+    if (r < 0 || slash < 0 || slash > r) return undefined;
+    return { org: key.slice(inboxPrefix.length, slash), dir: key.slice(0, r) };
+  };
+  const inflightOrg = new Map<string, number>(), inflightDir = new Map<string, number>();
+  /** Directory -> no start before (ms): set by a tenant-limit deferral, cleared when one of its admissions ends. */
+  const dirBusyUntil = new Map<string, number>();
+  const bump = (m: Map<string, number>, k: string, d: number) => { const n = (m.get(k) ?? 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
   /** Inbox keys with a dead-letter marker seen by this process (to clear it after a later terminal outcome). */
   const marked = new Set<string>();
   let deadLetters = 0;
@@ -248,7 +267,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     }
   }
 
-  async function admitOne(key: string, entry: Entry): Promise<void> {
+  async function admitOne(key: string, entry: Entry): Promise<"deferred" | void> {
     entry.attempts += 1;
     const t0 = Date.now();
     const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
@@ -265,10 +284,14 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       // At the tenant cap: wait for a slot. Nothing was written past the pending claim, which the retry resumes.
       entry.attempts -= 1;
       entry.notBefore = now() + r.delaySeconds * 1000;
+      // Its siblings in the same machine directory (the same user) wait as long, unless one of them ends first.
+      const tenant = caps ? tenantOf(key) : undefined;
+      if (tenant) dirBusyUntil.set(tenant.dir, Math.max(dirBusyUntil.get(tenant.dir) ?? 0, entry.notBefore));
       logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
-      return;
+      return "deferred";
     }
-    const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
+    const storeStatus = (r.error as { storeStatus?: unknown } | undefined)?.storeStatus;
+    const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
     const db = (r.error as { db?: { db_error_class: string; db_error_code: string; db_error_basis: string } } | undefined)?.db;
     if (db) Object.assign(fields, { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis });
     logger.warn("session ingest admission", fields);
@@ -296,10 +319,34 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     for (const [key, entry] of waiting) {
       if (entry.notBefore > at) { next = Math.min(next, entry.notBefore); continue; }
       if (inflight.size >= opts.concurrency) break;
+      const tenant = caps ? tenantOf(key) : undefined;
+      if (tenant && caps) {
+        // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
+        // re-pumps (finally), and a deferral's window is woken below.
+        const busy = dirBusyUntil.get(tenant.dir);
+        if (busy !== undefined && busy > at) { next = Math.min(next, busy); continue; }
+        if (busy !== undefined) dirBusyUntil.delete(tenant.dir);
+        // Only a positive cap is a hint (a 0 cap is left to the limiter, as before, so this never parks an entry
+        // with nothing in flight to re-pump it). The counts can only be stricter than the limiter's (a lease past its
+        // TTL frees the limiter slot before the admission ends here), so the hint never over-admits.
+        if ((caps.maxPerOrg >= 1 && (inflightOrg.get(tenant.org) ?? 0) >= caps.maxPerOrg)
+          || (caps.maxPerUser >= 1 && (inflightDir.get(tenant.dir) ?? 0) >= caps.maxPerUser)) continue;
+        bump(inflightOrg, tenant.org, 1); bump(inflightDir, tenant.dir, 1);
+      }
       inflight.add(key);
+      let deferred = false;
       const p: Promise<void> = admitOne(key, entry)
+        .then((outcome) => { deferred = outcome === "deferred"; })
         .catch(() => { entry.notBefore = now() + 300_000; })
-        .finally(() => { inflight.delete(key); running.delete(p); pump(); });
+        .finally(() => {
+          inflight.delete(key);
+          if (tenant) {
+            bump(inflightOrg, tenant.org, -1); bump(inflightDir, tenant.dir, -1);
+            // A finished (non-deferred) admission freed this user's slot: its siblings may try again now.
+            if (!deferred) dirBusyUntil.delete(tenant.dir);
+          }
+          running.delete(p); pump();
+        });
       running.add(p);
     }
     if (started && next !== Infinity) {

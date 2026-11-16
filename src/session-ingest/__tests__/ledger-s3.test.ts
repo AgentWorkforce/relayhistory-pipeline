@@ -499,10 +499,12 @@ describe("refusals: never a fallback", () => {
   test("a store failure is a coded ledger error, never a message", async () => {
     const base = fresh();
     const store: ObjectStore = { ...base, backend: base.backend, head: (k) => base.head(k), get: (k, r) => base.get(k, r), list: (p, c) => base.list(p, c), presignGet: (k, t) => base.presignGet(k, t), delete: (k) => base.delete(k), put: (k, b, o) => base.put(k, b, o),
-      getObject: async () => { throw new ObjectStoreError("transient", "fs", "secret key path"); } };
+      getObject: async () => { throw new ObjectStoreError("transient", "fs", "secret key path", { status: 503 }); } };
     const err = await ledgerOn(store).claim(claimInput("b1", [rec("r1", 1)])).catch((e) => e);
     expect(err).toBeInstanceOf(LedgerUnavailableError);
     expect(err.code).toBe("ledger_store_transient");
+    // The store's HTTP status is carried for diagnosis (bounded integer), never the message.
+    expect(err.storeStatus).toBe(503);
     expect(String(err)).not.toContain("secret key path");
   });
 });

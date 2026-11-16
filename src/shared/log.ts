@@ -45,6 +45,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // ...its upload-inbox promotion pass: bounded counts, and `upload_results` (`code:n,...`, built from fixed
   // result codes by uploadResultsField, never a key or id).
   "promoted", "waiting", "upload_due", "upload_origins", "upload_results",
+  // ...a `ledger_store_*` retry's object-store HTTP status (LedgerUnavailableError.storeStatus): a bounded integer.
+  "store_status",
   // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
   ...ADMISSION_PHASE_FIELDS_LIST,
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
@@ -73,6 +75,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["waiting", 10_000_000],
   ["upload_due", 10_000_000],
   ["upload_origins", 1_000_000],
+  ["store_status", 599],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);

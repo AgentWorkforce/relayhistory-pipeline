@@ -57,6 +57,11 @@ describe("telemetry allowlist", () => {
     }
     expect(sanitizeLogField("prompt", "x")).toBeUndefined();
   });
+  test("store_status (a ledger_store_* retry's HTTP status) is a bounded integer only", () => {
+    expect(sanitizeLogField("store_status", 503)).toBe(503);
+    expect(sanitizeLogField("store_status", 9999)).toBe(599);
+    expect(sanitizeLogField("store_status", "503 SlowDown on 96bulls/key")).toBeUndefined();
+  });
   test("error fields are code-only", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));
     expect(f).toEqual({ error_code: "chunk_empty", retryable: false });

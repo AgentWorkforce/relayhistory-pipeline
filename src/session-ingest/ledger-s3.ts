@@ -520,7 +520,12 @@ const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 /** A store failure as a ledger code: never the message (it can quote a key). */
 function storeFailure(error: unknown): LedgerUnavailableError {
   if (error instanceof LedgerUnavailableError) return error;
-  if (isObjectStoreError(error)) return new LedgerUnavailableError(`ledger_store_${error.code}`);
+  if (isObjectStoreError(error)) {
+    const failure = new LedgerUnavailableError(`ledger_store_${error.code}`);
+    const status = error.status;
+    if (typeof status === "number" && Number.isSafeInteger(status) && status >= 100 && status <= 599) failure.storeStatus = status;
+    return failure;
+  }
   return new LedgerUnavailableError("ledger_store_error");
 }
 
