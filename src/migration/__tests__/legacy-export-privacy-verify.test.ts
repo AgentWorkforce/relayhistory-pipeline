@@ -1356,6 +1356,54 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
 });
 
 // ---------------------------------------------------------------------------
+/**
+ * (s) SHIP-BRANCH ONLY (lead ruling): until the activation branch's heartbeat replaces it, the shipped exporter's only
+ * production entry point refuses unconditionally, even with every legacy flag on, before reading secrets or connecting.
+ * Run on the LANDING branch; excluded on the ACTIVATION branch (which instead requires a fresh eraser heartbeat, see (g)).
+ */
+describe("(s) ship branch: the exporter CLI refuses unconditionally before activation", () => {
+  test("main() is the ONLY production caller of runOrg: no other non-test module in src/, scripts/ or packages/ imports it", () => {
+    const root = new URL("../../../", import.meta.url).pathname;
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of readdirSync(join(root, dir), { withFileTypes: true })) {
+        const rel = `${dir}/${e.name}`;
+        if (e.isDirectory()) {
+          if (["node_modules", "__tests__", "test", "tests", "dist", ".git"].includes(e.name)) continue;
+          walk(rel);
+        } else if (/\.(m?[jt]sx?)$/u.test(e.name) && !/\.test\.|\.spec\./u.test(e.name)) {
+          const text = readFileSync(join(root, rel), "utf8");
+          // Any import/re-export of runOrg, or of the runner module's runOrg via a namespace.
+          if (/\brunOrg\b/u.test(text) && rel !== "src/migration/legacy-export/main.ts" && rel !== "src/migration/legacy-export/runner.ts") offenders.push(rel);
+        }
+      }
+    };
+    for (const d of ["src", "scripts", "packages"]) if (existsSync(join(root, d))) walk(d);
+    expect(offenders).toEqual([]);
+  });
+
+  test("--export with every legacy flag on exits 1 with legacy_export_requires_activation_heartbeat, before any connection", () => {
+    const secret = "S3CR3T_ship_canary";
+    const r = spawnSync(process.execPath, [new URL("../legacy-export/main.ts", import.meta.url).pathname, "--export", "--org=org_1", "--bucket=b", "--expect-bucket=b"], {
+      // Direct (non-pooler) synthetic URLs to a closed local port plus a fake S3 key: a connection attempt would surface as
+      // ECONNREFUSED instead of the refusal code, so the exact code proves the refusal precedes any connection.
+      input: `postgres://u:${secret}@127.0.0.1:1/db
+postgres://u:${secret}@127.0.0.1:1/db
+AKIAFAKE
+${secret}
+`,
+      encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", TMPDIR: process.env.TMPDIR ?? "", S3X_LEGACY_EXPORT_ERASURE_ENABLED: "true" },
+      timeout: 30_000,
+    });
+    expect(r.status).toBe(1);
+    expect(`${r.stdout}${r.stderr}`).not.toContain(secret);
+    const line = r.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).find((l) => l.message === "exit on error");
+    expect(line?.error_code).toBe("legacy_export_requires_activation_heartbeat");
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe("(d) forged/stale legacy parts are dropped visibly; invalid evidence is a 503", () => {
   test("a forged legacy part keeps the read available and surfaces a provenance reason or counter", async () => {
     const n = await neon();
