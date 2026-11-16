@@ -97,6 +97,7 @@ import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
 import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
 import {assertNoNeonEdge,neonExitProfile} from "../shared/neon-exit.ts";
+import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -136,6 +137,8 @@ export interface LambdaEnv {
   desktopCatalogEnabled: boolean;
   /** SEARCH_INDEX_OUTPUT_FACTS=1: the search stage also writes the Output/digest facts. */
   outputFactsEnabled?: boolean;
+  /** MESSAGE_ORIGIN_LABELS_ENABLED=true: index rows label who wrote each event (message-origin.ts). Default off. */
+  originLabelsEnabled?: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
   /** SESSIONS_NEON_EXIT=true: the legacy readonly source (analysis_source_readonly_url) is never carried or built. */
@@ -216,6 +219,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
+    originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     ...(neonExit.enabled ? { neonExit: true } : {}),
@@ -447,6 +451,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
       // Default off; the fact tables are owner-applied DDL (output-facts-schema.ts).
       ...(env.outputFactsEnabled ? { outputFacts: true as const } : {}),
+      // Default off; on, each scope's next pass rewrites its labelled rows once (new fingerprints).
+      ...(env.originLabelsEnabled ? { originLabels: true as const } : {}),
     };
   }
   let bufferedErasure: BufferedErasureDeps | undefined;
@@ -466,7 +472,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       if (env.bufferedSearchFeed?.enabled) {
         const secondVersion = env.bufferedSearchFeed.secondVersion;
         deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, secondVersion ? { secondVersion } : {}), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
-          ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}) };
+          ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}),
+          // Same labels as the canonical indexer, so buffered and canonical rows of one event agree.
+          ...(env.originLabelsEnabled ? { originLabels: true as const } : {}) };
       }
       // The erasure lane reads only `stage` status and retention, never sameSecond or createdAt, so it keeps the
       // legacy (non-strict) source: its deletes do not depend on 045010 or the version flag.

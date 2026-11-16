@@ -1206,6 +1206,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
     ...(Object.keys(searchLimits).length ? { limits: searchLimits } : {}),
     ...outputFactsDeps(config),
+    ...(config.originLabels ? { originLabels: true as const } : {}),
   };
 
   let lastRun = 0;

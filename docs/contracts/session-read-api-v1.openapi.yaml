@@ -264,6 +264,15 @@ paths:
         - {name: source, in: query, schema: {type: string}}
         - {name: project, in: query, schema: {type: string}}
         - {name: kind, in: query, schema: {type: string}}
+        - name: origin
+          in: query
+          description: >-
+            Only events this author wrote (`human` for human-typed messages).
+            Served only with `MESSAGE_ORIGIN_LABELS_ENABLED=true` on a backend
+            that filters by author; otherwise 501 `param_origin`. An answered
+            page carries `X-Sessions-Read-Origin`; treat a page without it as
+            unfiltered. See docs/message-origin.md.
+          schema: {type: string, enum: [human, agent, subagent, peer, task-notification, system, other]}
         - {name: since, in: query, schema: {type: string, format: date-time}}
         - {name: until, in: query, schema: {type: string, format: date-time}}
         - {name: order, in: query, schema: {type: string, enum: [asc, desc]}}
@@ -273,6 +282,10 @@ paths:
       responses:
         "200":
           description: One page of events.
+          headers:
+            X-Sessions-Read-Origin:
+              description: The `origin` filter this page applied. Absent when the page is unfiltered.
+              schema: {type: string}
           content:
             application/json:
               schema:
@@ -288,6 +301,7 @@ paths:
                       backend: {type: string}
                       reason: {type: string}
                       until: {type: string}
+                      originFilter: {type: string, enum: [not_applied], description: "An `origin=` page: the backend the rest is handed to does not apply the filter."}
                   incomplete:
                     type: object
                     description: Self-host `READ_API_SEARCH_PARTIAL_SESSIONS=skip`, on every search page, checked again per page. The page holds no row of the listed `sessions`. `sessions` is absent for `session_partial_unbounded`, which excludes nothing, so stale rows may remain.

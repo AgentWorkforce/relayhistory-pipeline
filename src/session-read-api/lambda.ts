@@ -52,6 +52,7 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
  * them, so the flag has no effect here.
  */
+import { MESSAGE_ORIGIN_LABELS_VAR, messageOriginLabelsEnabled } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import pg from "pg";
 import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
@@ -586,6 +587,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
+  const messageOrigin = messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
     throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
@@ -692,6 +694,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(analysis ? { analysis } : {}),
     ...(briefSummaryWired ? { briefSummary: sqlBriefSummary(poolTenantRunner(pool as never)) } : {}),
     ...(listShortSummary ? { listShortSummary: true } : {}),
+    ...(messageOrigin ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,

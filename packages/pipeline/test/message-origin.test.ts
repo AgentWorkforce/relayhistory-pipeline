@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   MESSAGE_ORIGINS,
   isMessageOrigin,
+  labelledActorName,
   messageOrigin,
+  messageOriginLabelsEnabled,
   messageSubagent,
   originKindLabel,
 } from "../src/lib/pipeline/message-origin.js";
@@ -47,11 +49,16 @@ describe("messageOrigin", () => {
     expect(messageOrigin("session_event", user({ origin_kind: "coordinator" }))).toBe("other");
     expect(originKindLabel("TASK_NOTIFICATION")).toBe("task-notification");
     expect(originKindLabel("Human")).toBe("human");
+    // Not a kind Claude Code is known to write: never human.
+    expect(originKindLabel("user")).toBe("other");
   });
 
-  it("labels assistant output agent, history prompts human, and leaves tool activity unlabeled", () => {
+  it("labels assistant output agent; leaves history prompts and tool activity unlabeled", () => {
     expect(messageOrigin("session_event", { role: "assistant", text: "done" })).toBe("agent");
-    expect(messageOrigin("history", { prompt: "yes" })).toBe("human");
+    // A prompt-log row carries no origin (a broker-typed prompt lands there too), and
+    // the same prompt is its own session_event row: no label, so no false or duplicate human.
+    expect(messageOrigin("history", { prompt: "yes" })).toBeNull();
+    expect(messageOrigin("history", {})).toBeNull();
     expect(messageOrigin("tool_call", { name: "Bash" })).toBeNull();
     expect(messageOrigin("file_edit", { file_path: "a.ts" })).toBeNull();
     expect(messageOrigin("session_event", null)).toBeNull();
@@ -72,5 +79,24 @@ describe("messageSubagent", () => {
     expect(messageSubagent("session_event", user({ is_sidechain: 1, agent_id: "a-7" }))).toBe("a-7");
     expect(messageSubagent("session_event", user({ agent_id: "a-7" }))).toBeNull();
     expect(messageSubagent("tool_call", { subagent_session_id: "sub-1" })).toBeNull();
+  });
+});
+
+describe("labelledActorName", () => {
+  it("uses the derived label, and never lets an uploaded value claim a label", () => {
+    expect(labelledActorName("session_event", user({ origin_kind: "human" }), null)).toBe("human");
+    expect(labelledActorName("session_event", user({ origin_kind: "peer" }), "human")).toBe("peer");
+    // A direct convergence_event (or any row with no derivable origin) keeps its own
+    // free-form name, but not one that spells a label.
+    expect(labelledActorName("convergence_event", { text: "x" }, "human")).toBeNull();
+    expect(labelledActorName("convergence_event", { text: "x" }, "Ada")).toBe("Ada");
+    expect(labelledActorName("tool_call", { name: "Bash" }, null)).toBeNull();
+  });
+});
+
+describe("messageOriginLabelsEnabled", () => {
+  it("is on only for the exact string true", () => {
+    expect(messageOriginLabelsEnabled("true")).toBe(true);
+    for (const raw of [undefined, "", "1", "TRUE", " true", "on", true]) expect(messageOriginLabelsEnabled(raw)).toBe(false);
   });
 });

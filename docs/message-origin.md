@@ -2,31 +2,51 @@
 
 Shared session histories mix messages a person typed with traffic between
 agents: an agent prompting its subagent, a peer agent's message, a background
-task's notification. This page is how the pipeline tells them apart and how
-search filters to human-typed messages only.
+task's notification. This page explains how the pipeline tells them apart and
+how search filters to human-typed messages only.
+
+## Switch
+
+Everything below is **default off**. `MESSAGE_ORIGIN_LABELS_ENABLED`, exactly
+`true`, turns it on. Any other value or unset is off. It is read by:
+
+| Service | Effect when on |
+| --- | --- |
+| session pipeline Lambda (`SEARCH_INDEX_ENABLED=1`) and its buffered search feed | index rows carry the labels below |
+| self-host `session-pipeline-consumer` | the same, on the Postgres index |
+| read API (Lambda, self-host service, Cloudflare Worker) | serves `origin=` on `GET /v1/events` |
+
+When the flag is off, index rows are written exactly as before, fingerprints
+included. `origin=` answers 501 `param_origin`.
+
+Turning it on in a writer changes the fingerprint of every labelled row. Each
+scope's next index pass therefore rewrites that scope's rows once, in the
+search index and in the directory events. Nothing is backfilled: a scope is
+relabelled only when it is next indexed. The read paths that build events
+straight from canonical objects (session reads, owner-buffered reads) are not
+labelled.
 
 ## Where the origin comes from
 
 Claude Code records each user message's `origin.kind` (`human`, `peer`,
 `task-notification`, ...). relayhistory stores it verbatim as
-`session_events.origin_kind`, and the change feed exports it with the row, so
-the desktop uploads it like any other `session_event` column. The delivery
-ingest keeps every column the client sent (`servicePayload`), so the value is
-stored in the canonical records and in each projected event's
+`session_events.origin_kind`, and the change feed exports it with the row. The
+desktop therefore uploads it like any other `session_event` column. The
+delivery ingest keeps every column the client sent (`servicePayload`), so the
+value is stored in the canonical records and in each projected event's
 `record.payload.origin_kind`.
 
-Uploads from a client before origin capture carry no `origin_kind`.
+Uploads from a client before origin capture carry no `origin_kind`. They are
+not backfilled.
 
 ## `actor_name` and `subagent_id`
 
 `packages/pipeline/src/lib/pipeline/message-origin.ts` turns the payload into
-one label per event, written to `actor_name` where a projected event becomes an
-index row (`projectedToNeonRow`, shared by the canonical indexer, the buffered
-search feed, canonical event reads and owner-buffered reads):
+one label per event. With the flag on, it is written to `actor_name` where a
+projected event becomes an index row (`projectedToNeonRow`):
 
 | Event | `actor_name` |
 | --- | --- |
-| `history` (the harness's log of prompts typed at its input) | `human` |
 | user `session_event`, `origin_kind = human`, not a control/meta row | `human` |
 | user `session_event`, `origin_kind = peer` | `peer` |
 | user `session_event`, `origin_kind = task-notification` or `control_kind = task_notification` | `task-notification` |
@@ -34,30 +54,46 @@ search feed, canonical event reads and owner-buffered reads):
 | user `session_event`, other control or meta row | `system` |
 | user `session_event`, an unknown `origin_kind` | `other` |
 | assistant `session_event` | `agent` |
-| user `session_event` with no origin recorded, tool calls, file edits | none |
+| user `session_event` with no origin recorded | none |
+| `history` (prompt log), tool calls, file edits | none |
 
-`human` is only ever claimed from positive evidence. A message whose author is
-unknown gets no label and is never answered to a human-only search.
+`human` is only ever claimed from positive evidence, which is
+`origin_kind = human` on the message row. A `history` row carries no origin. A
+prompt a broker typed at the harness input also lands in the prompt log, and
+the same prompt is already its own `session_event` row. So prompt-log rows are
+not labelled, and a human-only search answers each typed prompt once.
+
+A message whose author is unknown gets no label and is never answered to a
+human-only search.
+
+An uploaded `actor_name` cannot claim a label: a value that spells one is
+dropped unless it was derived here. A free-form name is kept.
 
 `subagent_id` is `subagent_session_id`, else, on a sidechain row only, its
-`agent_id`. A root-session row's `agent_id` is not used (it can name the
-delegated child a tool result reports on).
+`agent_id`. A root-session row's `agent_id` is not used, because it can name
+the delegated child a tool result reports on.
 
 Sidechain user rows and control rows are not projected as events at all (the
-hosted projection's rule, `relayhistory-projection.ts`), so subagent prompts
-and classified task notifications never reached search; the labels matter for
-the peer messages and unclassified notices that do.
+hosted projection's rule, `relayhistory-projection.ts`). Subagent prompts and
+classified task notifications therefore never reached search. The labels
+matter for the peer messages and unclassified notices that do.
 
-`relayhistory-projection.ts` is unchanged: it is the parity port of the hosted
-plpgsql projection, which leaves `actor_name` NULL.
+`relayhistory-projection.ts` is unchanged. It is the parity port of the hosted
+plpgsql projection, which leaves `actor_name` NULL, so rows from the hosted
+Neon tail stay unlabelled.
 
 ## Search: `origin=`
 
-`GET /v1/events?origin=<label>` keeps only events with that `actor_name`, e.g.
-`origin=human&q=yes` for human confirmations. It composes with every other
-filter. An unknown label is a 400. A search backend must declare the `actor`
-filter (`SearchIndexCapabilities.filters`) for it to be served; one that does
-not answers 501 `param_origin`, never an unfiltered page:
+`GET /v1/events?origin=<label>` keeps only events with that `actor_name`, for
+example `origin=human&q=yes` for human confirmations. It composes with every
+other filter. An unknown label is a 400.
+
+It is served only when both of these hold; otherwise the answer is 501
+`param_origin`, never an unfiltered page:
+
+- the read API has `MESSAGE_ORIGIN_LABELS_ENABLED=true`;
+- the search backend declares the `actor` filter
+  (`SearchIndexCapabilities.filters`).
 
 | Backend | `actor` filter |
 | --- | --- |
@@ -69,11 +105,14 @@ not answers 501 `param_origin`, never an unfiltered page:
 
 No schema change: `actor_name` already exists in every index.
 
-## Existing rows
+### What a client must check
 
-Rows indexed before this change keep an empty `actor_name` until their scope is
-re-indexed. A re-index labels `history` and assistant rows from the columns
-already uploaded; a user message uploaded
-without `origin_kind` stays unlabeled, because nothing recorded who wrote it.
-Labelling those needs the client to re-export the rows with the origin, which
-is a separate decision.
+- Every answered filtered page carries `X-Sessions-Read-Origin: <label>`.
+- A read API from before this change ignores `origin=` and answers every
+  author, without that header. **Treat a page without the header as
+  unfiltered.**
+- When a filtered search reaches the history floor, its `continuation` carries
+  `originFilter: "not_applied"`. The backend the rest is handed to
+  (relayhistory) does not apply the filter. A 501 (`history_floor`,
+  `session_partial`) on an `origin=` search means the same thing for a
+  fallback read: it would be unfiltered.

@@ -16,12 +16,25 @@
  * producing its rows. The hosted live projection leaves `actor_name` NULL.
  *
  * "human" is only ever claimed from positive evidence: an explicit
- * `origin_kind = human`, or a `history` record (the harness's own log of
- * prompts typed at its input). A user message with no origin recorded (an
- * upload from a client before origin capture, or a harness that records none)
- * gets no label, so a human-only search never includes a message whose author
- * is unknown.
+ * `origin_kind = human` on the message row. A `history` record (the harness's
+ * prompt log) carries no origin and is not labelled: a prompt a broker typed
+ * at the harness input lands there too, and the same prompt is already its own
+ * `session_event` row. A user message with no origin recorded (an upload from a
+ * client before origin capture, or a harness that records none) gets no label,
+ * so a human-only search never includes a message whose author is unknown.
+ *
+ * Default off: MESSAGE_ORIGIN_LABELS_ENABLED (exactly "true") turns the
+ * labelling on in the index writers and `origin=` on the read API
+ * (docs/message-origin.md).
  */
+
+/** The one switch for the labels (writers) and the `origin=` filter (readers). */
+export const MESSAGE_ORIGIN_LABELS_VAR = "MESSAGE_ORIGIN_LABELS_ENABLED";
+
+/** Only the exact string "true" enables; unset or anything else is off. */
+export function messageOriginLabelsEnabled(raw: unknown): boolean {
+  return raw === "true";
+}
 
 /** Event-level origin labels written to `actor_name`. */
 export const MESSAGE_ORIGINS = [
@@ -60,7 +73,7 @@ const truthy = (payload: Json, key: string) =>
 /** Claude's `origin.kind` (as stored by relayhistory) to a label. */
 export function originKindLabel(kind: string): MessageOrigin {
   const normalized = kind.trim().toLowerCase().replace(/_/g, "-");
-  if (normalized === "human" || normalized === "user") return "human";
+  if (normalized === "human") return "human";
   if (normalized === "peer") return "peer";
   if (normalized === "task-notification") return "task-notification";
   return "other";
@@ -72,7 +85,6 @@ export function originKindLabel(kind: string): MessageOrigin {
  */
 export function messageOrigin(kind: string, payload: Json | null | undefined): MessageOrigin | null {
   if (!payload) return null;
-  if (kind === "history") return "human";
   if (kind !== "session_event") return null;
   const role = field(payload, "role");
   if (role === "assistant") return "agent";
@@ -109,4 +121,16 @@ export function messageSubagent(kind: string, payload: Json | null | undefined):
 /** Whether a stored `actor_name` is one of this module's labels. */
 export function isMessageOrigin(value: unknown): value is MessageOrigin {
   return typeof value === "string" && KNOWN.has(value);
+}
+
+/**
+ * The `actor_name` an index row stores with labelling on: the derived label,
+ * else the projected value unless it spells a label. A client cannot claim a
+ * label by uploading it (a direct `convergence_event` line keeps its own
+ * fields), so `origin=human` only ever matches a derived `human`.
+ */
+export function labelledActorName(kind: string, payload: Json | null | undefined, projected: string | null): string | null {
+  const derived = messageOrigin(kind, payload);
+  if (derived !== null) return derived;
+  return isMessageOrigin(projected) ? null : projected;
 }
