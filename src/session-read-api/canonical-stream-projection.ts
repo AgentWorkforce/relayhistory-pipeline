@@ -70,6 +70,10 @@ import {
   type ChunkReadObserver,
   type SessionScope,
 } from "./canonical-projection.ts";
+import {
+  LEGACY_PROVENANCE_INVALID,
+  legacyProvenanceGate,
+} from "./legacy-provenance.ts";
 
 type Json = Record<string, unknown>;
 const SEP = "\u001f";
@@ -358,12 +362,23 @@ export async function streamCanonicalScope(
   let winners: Seat[];
   const ownerByEvent = new Map<string, number>();
   const legacyFirst = new Map<string, number>();
+  const legacyGate = legacyProvenanceGate(
+    scope,
+    admitted.map(({ manifest }, part) => ({ manifest, userId: userIds[part]! })),
+  );
   try {
     const seats = new Map<string, Seat>();
+    // Keep legacy seats separate until the provenance gate has observed the
+    // whole pass. An invalid legacy record may share a fold key with a valid
+    // live record; dropping it must never delete or replace that live seat.
+    const legacySeats = new Map<string, Seat>();
     await pass(async () => {
       for await (const { part, record } of read()) {
+        legacyGate.observe(part, record);
         const key = relayhistoryRecordKey(record);
-        const previous = seats.get(key);
+        const legacy = isLegacyRelayhistoryRecord(record);
+        const target = legacy ? legacySeats : seats;
+        const previous = target.get(key);
         const seat: Seat = {
           kind: record.kind,
           origin_id: record.origin_id,
@@ -383,8 +398,8 @@ export async function streamCanonicalScope(
           throw new StreamStop(codeOf(error, "fold_failed"));
         }
         // The owning manifest is the first one that carried the record, whichever copy wins.
-        seats.set(key, previous && chosen.firstPart !== previous.firstPart ? { ...chosen, firstPart: previous.firstPart } : chosen);
-        if (isLegacyRelayhistoryRecord(record)) {
+        target.set(key, previous && chosen.firstPart !== previous.firstPart ? { ...chosen, firstPart: previous.firstPart } : chosen);
+        if (legacy) {
           const at = `${record.origin_id}${SEP}${record.record_id}`;
           if (!legacyFirst.has(at)) legacyFirst.set(at, part);
           continue;
@@ -398,6 +413,21 @@ export async function streamCanonicalScope(
         } else if (userIds[part] || prior === undefined) ownerByEvent.set(identity, part);
       }
     });
+    if (legacyGate.invalid) {
+      reasons.push(LEGACY_PROVENANCE_INVALID);
+      legacyFirst.clear();
+    } else {
+      for (const [key, candidate] of legacySeats) {
+        const previous = seats.get(key);
+        let chosen: Seat;
+        try {
+          chosen = chooseRelayhistoryRevision(previous, candidate, (a, b) => a.digest === b.digest);
+        } catch (error) {
+          throw new StreamStop(codeOf(error, "fold_failed"));
+        }
+        seats.set(key, previous && chosen.firstPart !== previous.firstPart ? { ...chosen, firstPart: previous.firstPart } : chosen);
+      }
+    }
     // The declared sizes may undercount (records are optional): check what pass 1 read. Each
     // later pass checks every chunk's declared size against what was read before it, so the
     // last pass needs three passes' bytes plus pass 1's peak: a chunk declared larger than it
@@ -733,13 +763,16 @@ export async function streamCanonicalScope(
       reasons.push("directory_event_metadata_invalid");
     }
   const catalogOut = directoryCatalogFromProjection(projErr.has(D) ? [] : catalogRows);
-  const complete = reasons.length === 0;
   const unique = [...new Set(reasons)];
+  // Invalid legacy evidence is dropped while valid live canonical rows remain
+  // complete, matching readCanonicalScope. The reason is retained for the
+  // operator warn log and read-path response marker.
+  const complete = unique.every((reason) => reason === LEGACY_PROVENANCE_INVALID);
   if (!complete) return result({ reasons: unique, catalog: catalogOut, events });
 
   return result({
     complete: true,
-    reasons: [],
+    reasons: unique,
     catalog: catalogOut,
     events,
     wanted,

@@ -93,6 +93,10 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     const files = readdirSync(join(REPO_ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
     expect([...POST_G4_MIGRATIONS]).toEqual(files.slice(files.indexOf(G4_LAST_MIGRATION) + 1));
     expect([...g4, ...POST_G4_MIGRATIONS]).toEqual(files);
+    // Registry order: the legacy authority reads the user-erasure ledger, so
+    // 062030 must remain after 058010 even as later post-G4 slots are added.
+    expect(files.indexOf("20261105062030_legacy_export_scope_authority.sql"))
+      .toBeGreaterThan(files.indexOf("20261105058010_operator_user_erase.sql"));
     // Drift alarm: a migration landing on main after G4 fails here, so its G4 impact is reviewed (the
     // absence checks and the function-body scan below already include it through the derived list).
     expect([...POST_G4_MIGRATIONS]).toEqual([
