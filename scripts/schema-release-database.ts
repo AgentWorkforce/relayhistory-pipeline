@@ -27,6 +27,7 @@ import {
 } from "../src/hoopdb/schema-release-contract.ts";
 import {
   inspectBootstrap,
+  inspectIngestOverlap,
   inspectRelease,
   releaseClient,
   releaseProfile,
@@ -45,6 +46,10 @@ import {
   validateBootstrapSection,
 } from "../src/hoopdb/schema-release-bootstrap.ts";
 import { githubGet, githubReleaseGate } from "./schema-release-github.ts";
+import {
+  checkIngestOverlap,
+  releaseOverlapContract,
+} from "../src/hoopdb/schema-release-overlap.ts";
 import {
   refreshReleaseBoundary,
   releaseBoundaryDigest,
@@ -337,6 +342,14 @@ export async function releaseDatabase() {
     if (!split.held.length && targetGeneration !== input.generation)
       refuse("release_target_generation_changed");
     if (input.mode === "plan") {
+      // The buffered-ingest overlap gate (src/hoopdb/schema-release-overlap.ts): its own READ ONLY
+      // transaction under the same xact lock; refuses release_ingest_overlap_required when the release
+      // would move readiness off the lazy policy's generation without an open window G -> targetGeneration
+      // and the release sha's reviewed PRIVATE_INGEST_OVERLAP {G, targetGeneration}.
+      const ingestOverlap = await inspectIngestOverlap(client, {
+        targetGeneration,
+        contract: releaseOverlapContract(process.cwd(), input.sha),
+      });
       // The bootstrap section: its own READ ONLY transaction under the same xact lock.
       const bootstrap = await inspectBootstrap(client, { ...input, steps: anchorSteps(anchor) });
       await mkdir("release-plan", { recursive: true });
@@ -356,6 +369,7 @@ export async function releaseDatabase() {
             targetManifest: anchor.manifest,
             runId: process.env.GITHUB_RUN_ID,
             ...inspection,
+            ingestOverlap,
             bootstrap,
           },
           null,
@@ -393,6 +407,8 @@ export async function releaseDatabase() {
       if (bootstrap.release_drift.length)
         console.log("release_bootstrap_release_drift " + bootstrap.release_drift.join(","));
       if (bootstrap.required) console.log(BOOTSTRAP_REQUIRED_NOTE);
+      // The gate verdict only (generations are in the artifact).
+      console.log("release_ingest_overlap " + ingestOverlap.gate);
       console.log("release_readonly_plan_complete");
       return;
     }
@@ -416,6 +432,12 @@ export async function releaseDatabase() {
     // Fail fast before the migrator when a target-required chain role is absent;
     // beforeWrite rechecks from the anchor recomputed under the lock.
     await requireBootstrapRolesLive(client, input.target, anchor);
+    // Fail fast on the buffered-ingest overlap gate (release_ingest_overlap_required); beforeWrite
+    // rechecks it under the migrator lock.
+    await inspectIngestOverlap(client, {
+      targetGeneration: approvedPlan!.targetGeneration,
+      contract: releaseOverlapContract(process.cwd(), input.sha),
+    });
     const result = await runMigrations(client, {
       profile,
       expectedLedgerSha256: approvedPlan!.ledgerSha256,
@@ -438,6 +460,13 @@ export async function releaseDatabase() {
         // (the CI bootstrap stage provisions them); else release_bootstrap_required,
         // names on stderr.
         await requireBootstrapRolesLive(client, input.target, fresh);
+        // Under the migrator lock, before the first write (the boundary refresh): the buffered-ingest
+        // overlap gate once more. The window cannot be closed while this lock is held (close and rebind
+        // take it); it can only expire, so the remaining TTL is measured here.
+        await checkIngestOverlap(client, {
+          targetGeneration: approvedPlan!.targetGeneration,
+          contract: releaseOverlapContract(process.cwd(), input.sha),
+        });
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
       },
     });

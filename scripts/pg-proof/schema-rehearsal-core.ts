@@ -27,6 +27,10 @@ export const INJECTIONS = [
   "anchor-extra-file",
   "anchor-missing-verifier",
   "anchor-ref-moved",
+  // The buffered-ingest overlap gate (src/hoopdb/schema-release-overlap.ts): the lazy
+  // policy is installed but no window is open (plan refusal), then the window closes
+  // after the plan (apply refusal).
+  "ingest-overlap-missing",
 ] as const;
 export type Injection = (typeof INJECTIONS)[number];
 
@@ -48,6 +52,9 @@ export const INJECTION_REFUSAL: Record<Exclude<Injection, "none">, string> = {
   // R4-anchor-ref-moved: planned at the tip, then the branch moves; the apply's first
   // anchor recompute refuses before connecting.
   "anchor-ref-moved": "release_anchor_ref_mismatch",
+  // R1-/R4-ingest-overlap-missing: production's overlap gate refuses the plan without a
+  // window and the apply once the window is closed.
+  "ingest-overlap-missing": "release_ingest_overlap_required",
 };
 /** The injections that mutate the anchor tip before the plan (stage R1-<inject>). */
 export const PLAN_ANCHOR_INJECTIONS = ["anchor-tampered", "anchor-nonlinear", "anchor-extra-file", "anchor-missing-verifier"] as const;

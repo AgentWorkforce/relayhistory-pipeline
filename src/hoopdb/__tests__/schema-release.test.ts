@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import {
   releaseAnchorBranch,
   releaseInputs,
@@ -2020,4 +2021,102 @@ test("bootstrap mode passes the same GitHub prerequisite gate as apply, plan run
   await expect(
     githubReleaseGate({ ...env, GITHUB_RUN_ATTEMPT: "2" }, get(moved), true),
   ).rejects.toThrow("release_context");
+});
+
+// ---- Buffered-ingest overlap gate (src/hoopdb/schema-release-overlap.ts). The database cases run on
+// PGlite in schema-release-ingest-overlap.pglite.test.ts; these pin the contract parser and the wiring.
+test("overlap gate: PRIVATE_INGEST_OVERLAP is read from the release sha as data and equals the reviewed module's value", async () => {
+  const { parseReleaseOverlapContract, releaseOverlapContract, PRIVATE_INGEST_RELEASE_MODULE } = await import("../schema-release-overlap.ts");
+  const { PRIVATE_INGEST_OVERLAP } = await import("../../session-ingest/private-ingest-release.ts");
+  const repo = new URL("../../../", import.meta.url).pathname;
+  const text = readFileSync(new URL("../../../" + PRIVATE_INGEST_RELEASE_MODULE, import.meta.url), "utf8");
+  expect(parseReleaseOverlapContract(text)).toEqual(PRIVATE_INGEST_OVERLAP);
+  // From the Git object database at a commit (HEAD here), never the working tree.
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+  const committed = execFileSync("git", ["cat-file", "blob", `${head}:${PRIVATE_INGEST_RELEASE_MODULE}`], { cwd: repo, encoding: "utf8" });
+  expect(releaseOverlapContract(repo, head)).toEqual(parseReleaseOverlapContract(committed));
+  // Unknown or malformed commits are unreadable, never dormant.
+  expect(releaseOverlapContract(repo, "0".repeat(40))).toBeUndefined();
+  expect(releaseOverlapContract(repo, "HEAD")).toBeUndefined();
+});
+
+test("overlap gate: the contract parser accepts only null or a literal {from, to} pair of distinct 64-hex strings", async () => {
+  const { parseReleaseOverlapContract } = await import("../schema-release-overlap.ts");
+  const G = "7a".repeat(32), H = "5c".repeat(32);
+  const decl = (rhs: string) => `// header\nexport const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = ${rhs};\n\nexport const X = 1;\n`;
+  expect(parseReleaseOverlapContract(decl("null"))).toBeNull();
+  // The shape a reviewed pair has had on main.
+  expect(parseReleaseOverlapContract(decl(`{\n  from: "${G}",\n  to: "${H}",\n}`))).toEqual({ from: G, to: H });
+  expect(parseReleaseOverlapContract(decl(`{ from: "${G}", to: "${H}" }`))).toEqual({ from: G, to: H });
+  for (const bad of [
+    decl(`{ to: "${H}", from: "${G}" }`),
+    decl(`{ from: "${G}", to: "${G}" }`),
+    decl(`{ from: "${G.toUpperCase()}", to: "${H}" }`),
+    decl(`{ from: "${G}", to: "${H}", extra: 1 }`),
+    decl(`{ from: G, to: H }`),
+    decl("OVERLAP_PAIR"),
+    decl(`{ from: "${G}", to: "${H}" } as const`),
+    decl("null") + decl("null"),
+    "export const PRIVATE_INGEST_OVERLAP = null;\n",
+    "",
+  ])
+    expect(parseReleaseOverlapContract(bad)).toBeUndefined();
+});
+
+test("overlap gate: pure verdict over policy, marker, window and contract", async () => {
+  const { ingestOverlapVerdict, requireIngestOverlap } = await import("../schema-release-overlap.ts");
+  const G = "a".repeat(64), H = "f".repeat(64);
+  const w = { from: G, to: H, admitDuringApply: false, expiresAt: "2026-01-01T00:00:00.000Z", expired: false, remainingSeconds: 3600 };
+  const state = { policyGeneration: G, marker: { generation: G, status: "pass" }, overlapInstalled: true, window: w };
+  const v = (s: Partial<typeof state> & Record<string, unknown> = {}, ...c: [unknown?]) =>
+    ingestOverlapVerdict({ ...state, ...s } as any, { targetGeneration: H, contract: (c.length ? c[0] : { from: G, to: H }) as any });
+  expect(v().gate).toBe("overlap_ready");
+  expect(v({ policyGeneration: null as any, window: null as any }, null).gate).toBe("no_lazy_policy");
+  expect(v({ marker: { generation: H, status: "pass" }, window: null as any }, null).gate).toBe("no_generation_move");
+  expect(v({ policyGeneration: H, window: null as any }, null).gate).toBe("policy_at_target");
+  // No marker at all with a policy present: readiness moves, the gate is engaged.
+  expect(v({ marker: null as any, window: null as any }).reasons).toEqual(["no_window"]);
+  expect(v({ overlapInstalled: false, window: null as any }).reasons).toEqual(["overlap_not_installed"]);
+  expect(v({ window: { ...w, remainingSeconds: 899 } }).reasons).toEqual(["window_ttl_short"]);
+  expect(v({ window: { ...w, remainingSeconds: 900 } }).gate).toBe("overlap_ready");
+  expect(v({ window: { ...w, expired: true, remainingSeconds: 0 } }).reasons).toEqual(["window_expired"]);
+  expect(v({ window: { ...w, to: G } }).reasons).toEqual(["window_to_mismatch"]);
+  expect(v({}, { from: H, to: G }).reasons).toEqual(["contract_mismatch"]);
+  expect(v({}, null).reasons).toEqual(["contract_dormant"]);
+  expect(v({}, undefined).reasons).toEqual(["contract_unreadable"]);
+  const lines: string[] = [];
+  let code: unknown;
+  try {
+    requireIngestOverlap(v({ window: null as any }, null), (l) => lines.push(l));
+  } catch (e) {
+    code = (e as { code?: string }).code;
+  }
+  expect(code).toBe("release_ingest_overlap_required");
+  expect(lines).toEqual(["release_ingest_overlap_required no_window,contract_dormant"]);
+  expect(requireIngestOverlap(v(), (l) => lines.push(l)).gate).toBe("overlap_ready");
+  expect(lines).toHaveLength(1);
+});
+
+test("overlap gate: plan records it before writing the artifact, apply fails fast before the migrator and rechecks under the lock before the first write", () => {
+  const src = readFileSync(new URL("../../../scripts/schema-release-database.ts", import.meta.url), "utf8");
+  const plan = src.slice(src.indexOf('if (input.mode === "plan") {'), src.indexOf("release_readonly_plan_complete"));
+  expect(plan.indexOf("await inspectIngestOverlap(client, {")).toBeGreaterThan(0);
+  expect(plan.indexOf("await inspectIngestOverlap(client, {")).toBeLessThan(plan.indexOf("writeFile("));
+  expect(plan).toContain("contract: releaseOverlapContract(process.cwd(), input.sha),");
+  expect(plan).toMatch(/\.\.\.inspection,\n\s+ingestOverlap,\n\s+bootstrap,\n/);
+  const apply = src.slice(src.indexOf('refuse("release_ledger_changed");'));
+  const failFast = apply.indexOf("await inspectIngestOverlap(client, {");
+  expect(failFast).toBeGreaterThan(apply.indexOf("await requireBootstrapRolesLive(client, input.target, anchor);"));
+  expect(failFast).toBeLessThan(apply.indexOf("await runMigrations(client, {"));
+  const bw = apply.slice(apply.indexOf("beforeWrite: async () => {"));
+  expect(bw.indexOf("await checkIngestOverlap(client, {")).toBeGreaterThan(bw.indexOf("await requireBootstrapRolesLive(client, input.target, fresh);"));
+  expect(bw.indexOf("await checkIngestOverlap(client, {")).toBeLessThan(bw.indexOf("await refreshReleaseBoundary("));
+  expect(bw).toMatch(/checkIngestOverlap\(client, \{\n\s+targetGeneration: approvedPlan!\.targetGeneration,\n\s+contract: releaseOverlapContract\(process\.cwd\(\), input\.sha\),/);
+  // The gate never imports or executes the Worker release module.
+  const gate = readFileSync(new URL("../schema-release-overlap.ts", import.meta.url), "utf8");
+  expect(gate).not.toMatch(/from ["'][^"']*private-ingest-release/);
+  expect(gate).not.toMatch(/import\(/);
+  // The operator plan-only entry records the same section.
+  const op = readFileSync(new URL("../../../scripts/schema-release-operator-plan.ts", import.meta.url), "utf8");
+  expect(op).toContain("const ingestOverlap = await inspectIngestOverlap(client, {");
 });

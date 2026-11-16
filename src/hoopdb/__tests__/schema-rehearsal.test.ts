@@ -849,7 +849,7 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
 
   test("anchor injections are appended after the earlier rows, each with its refusal code", () => {
     expect(INJECTIONS.slice(0, 7)).toEqual(["none", "ledger-gap", "boundary-drift", "late-step", "wrong-generation", "stale-plan", "missing-bootstrap"]);
-    expect(INJECTIONS.slice(7)).toEqual(["anchor-tampered", "anchor-nonlinear", "anchor-extra-file", "anchor-missing-verifier", "anchor-ref-moved"]);
+    expect(INJECTIONS.slice(7, 12)).toEqual(["anchor-tampered", "anchor-nonlinear", "anchor-extra-file", "anchor-missing-verifier", "anchor-ref-moved"]);
     expect([...PLAN_ANCHOR_INJECTIONS]).toEqual(INJECTIONS.slice(7, 11));
     expect(INJECTION_REFUSAL["anchor-tampered"]).toBe("release_anchor_file_drift");
     expect(INJECTION_REFUSAL["anchor-nonlinear"]).toBe("release_anchor_nonlinear");
@@ -861,6 +861,32 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     expect(drv).toContain("stage(`R1-${planInject}`");
     expect(drv).toContain('stage("R4-anchor-ref-moved"');
     expect(drv).toContain("discoverReleaseAnchor(");
+  });
+
+  test("ingest-overlap-missing is appended last and replays production's overlap gate in plan, apply and under the lock", () => {
+    expect(INJECTIONS.slice(12)).toEqual(["ingest-overlap-missing"]);
+    expect(INJECTION_REFUSAL["ingest-overlap-missing"]).toBe("release_ingest_overlap_required");
+    const drv = read("scripts/pg-proof/schema-rehearsal.ts");
+    expect(drv).toContain('stage("R1-ingest-overlap-missing"');
+    expect(drv).toContain('stage("R4-ingest-overlap-missing"');
+    // Plan and the apply's fail-fast: production's READ ONLY inspection; beforeWrite: the lock-held recheck.
+    expect(drv.match(/I\.inspectIngestOverlap\((owner|client), /g)).toHaveLength(2);
+    expect(drv.match(/OG!\.checkIngestOverlap\(client, /g)).toHaveLength(1);
+    // The recheck sits inside beforeWrite, before the boundary refresh (the first write).
+    const bw = drv.slice(drv.indexOf("beforeWrite: async () => {\n        if (!sameAnchor"));
+    expect(bw.indexOf("OG!.checkIngestOverlap(")).toBeGreaterThan(0);
+    expect(bw.indexOf("OG!.checkIngestOverlap(")).toBeLessThan(bw.indexOf("BD.refreshReleaseBoundary("));
+    // The clean row's window is A -> B (the target generation) and R7-pre withholds it only for the injection.
+    expect(drv).toContain("openGenerationOverlap(ownerOps, { from: A, to: B, ttlSeconds: 3600");
+    expect(drv).toContain('if (inject === "ingest-overlap-missing") return { old: "admitted", both: "admitted", overlap: "withheld" };');
+    // Production wires the same three calls.
+    const prod = read("scripts/schema-release-database.ts");
+    expect(prod.match(/await inspectIngestOverlap\(client, \{/g)).toHaveLength(2);
+    expect(prod.match(/await checkIngestOverlap\(client, \{/g)).toHaveLength(1);
+    const pbw = prod.slice(prod.indexOf("beforeWrite: async () => {"));
+    expect(pbw.indexOf("checkIngestOverlap(")).toBeGreaterThan(0);
+    expect(pbw.indexOf("checkIngestOverlap(")).toBeLessThan(pbw.indexOf("refreshReleaseBoundary("));
+    expect(pbw.indexOf("githubReleaseGate(")).toBeLessThan(pbw.indexOf("checkIngestOverlap("));
   });
 });
 

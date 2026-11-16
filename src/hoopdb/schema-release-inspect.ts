@@ -14,6 +14,7 @@ import {
   releaseBootstrapContract,
   releaseBootstrapFiles,
 } from "./schema-release-bootstrap.ts";
+import { checkIngestOverlap, type ReleaseOverlapContract } from "./schema-release-overlap.ts";
 export function releaseClient(url: string | undefined, opts: { keepAlive?: boolean } = {}) {
   // Individual fields prevent URL sslmode/options from replacing TLS configuration.
   const client = new pg.Client({
@@ -114,6 +115,25 @@ export async function inspectBootstrap(
       state: await readBootstrapState(client),
       supabaseMode: releaseProfile("global-default-revoke").mode === "supabase",
     });
+  } finally {
+    await client.query("ROLLBACK");
+  }
+}
+/**
+ * The plan's (and the apply's fail-fast) buffered-ingest overlap gate (schema-release-overlap.ts), READ
+ * ONLY under the migrator's xact lock: refuses release_ingest_overlap_required, else returns the plan
+ * artifact's ingestOverlap evidence (gate no_lazy_policy / no_generation_move / policy_at_target /
+ * overlap_ready). The apply rechecks it under runMigrations' lock in beforeWrite.
+ */
+export async function inspectIngestOverlap(
+  client: pg.Client,
+  input: { targetGeneration: string; contract: ReleaseOverlapContract },
+) {
+  await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await requireReleaseOwner(client);
+    await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
+    return await checkIngestOverlap(client, input);
   } finally {
     await client.query("ROLLBACK");
   }

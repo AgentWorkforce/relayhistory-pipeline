@@ -27,7 +27,12 @@
  *   R1 plan      inspectRelease (READ ONLY; refuses function_acl_drift, ledger_gap, ...),
  *                migrationTargetSplit checked against an independent window, the target
  *                commit (below) bound by production's targetAnchor at the dispatched
- *                generation, validateReleasePlan on the plan exactly as production builds it
+ *                generation, production's buffered-ingest overlap gate (inspectIngestOverlap,
+ *                src/hoopdb/schema-release-overlap.ts; a no-op without R7-pre's lazy policy),
+ *                validateReleasePlan on the plan exactly as production builds it. The gate's
+ *                reviewed Worker pair is the fixture {from: A, to: B} (the pair R6 deploys),
+ *                not the release sha's PRIVATE_INGEST_OVERLAP, which names production's
+ *                generations
  *   R2 boundary  the planned boundary is safe and still the previous body (prosrc not exact)
  *   R2-bootstrap the operator's pre-apply chain refresh: every SESSION_BOOTSTRAP_FILES file
  *                at the RELEASE sha's bytes (git objects) applied as the owner exactly as
@@ -61,6 +66,11 @@
  * plan refuses with production's code) and anchor-ref-moved (stage R4-anchor-ref-moved:
  * after the plan the anchor branch moves to a twin commit; the apply's first anchor
  * recompute refuses release_anchor_ref_mismatch before connecting, nothing written).
+ * ingest-overlap-missing: R7-pre installs the lazy policy but opens no window; stage
+ * R1-ingest-overlap-missing proves the plan refuses release_ingest_overlap_required, then
+ * opens the window A -> B and plans clean (R1); stage R4-ingest-overlap-missing closes the
+ * window after the plan and proves the apply refuses the same code with ledger, marker and
+ * boundary unchanged.
  * Every stage writes rehearsal-out/<stage>.json; the first FAIL stops the run.
  * REHEARSAL_EXPECT_REFUSAL (`<stage>:<code>`) marks a known-negative row: the run then
  * passes only if exactly that stage FAILs with exactly that code.
@@ -466,6 +476,9 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   const I = await mod("src/hoopdb/schema-release-inspect.ts");
   const BD = await mod("src/hoopdb/schema-release-boundary.ts");
   const D = await mod("scripts/schema-release-database.ts");
+  // Production's buffered-ingest overlap gate; a release sha before it has none to replay.
+  const OG = existsSync(join(ROOT, "src/hoopdb/schema-release-overlap.ts")) ? await mod("src/hoopdb/schema-release-overlap.ts") : undefined;
+  const overlapGate = !!OG && typeof I.inspectIngestOverlap === "function" && typeof OG.checkIngestOverlap === "function";
   const O = await mod("src/hoopdb/owner-operator-apply.ts");
   const G = await mod("src/hoopdb/migrate-guards.ts");
   const DB = await mod("src/shared/db.ts");
@@ -700,8 +713,12 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
 
   let fence: Awaited<ReturnType<typeof ingest>> | undefined;
   let overlapOpen = false;
-  if (inject === "none") {
-    const OV = existsSync(join(ROOT, "src/hoopdb/ingest-generation-overlap.ts")) ? await mod("src/hoopdb/ingest-generation-overlap.ts") : undefined;
+  const OV = existsSync(join(ROOT, "src/hoopdb/ingest-generation-overlap.ts")) ? await mod("src/hoopdb/ingest-generation-overlap.ts") : undefined;
+  // The window R7-pre opens (and ingest-overlap-missing opens only after its plan refusal):
+  // from the policy generation A to exactly the target generation B, with a TTL covering
+  // plan, apply and the R7 rebind (production's gate requires >= 15 minutes left).
+  const openOverlap = () => OV!.openGenerationOverlap(ownerOps, { from: A, to: B, ttlSeconds: 3600, admitDuringApply: true, approvalSha256: APPROVAL });
+  if (inject === "none" || inject === "ingest-overlap-missing") {
     if (OV && (await OV.overlapInstalled(ownerOps))) {
       await stage("R7-pre", async () => {
         await ownerFn("ingest_lazy_policy_set", {
@@ -739,7 +756,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
         fence = await ingest();
         await fence.ok("old", fence.worker(A));
         await fence.ok("both", fence.worker(B, [B, A]));
-        await OV.openGenerationOverlap(ownerOps, { from: A, to: B, ttlSeconds: 3600, admitDuringApply: true, approvalSha256: APPROVAL });
+        if (inject === "ingest-overlap-missing") return { old: "admitted", both: "admitted", overlap: "withheld" };
+        await openOverlap();
         overlapOpen = true;
         return { old: "admitted", both: "admitted", overlap: "open", ttlSeconds: 3600 };
       });
@@ -786,6 +804,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     anchorInfo = { source: fixtureMade ? "fixture" : r.source, branch: r.branch };
     return r.targetSha;
   };
+  // The rehearsal's reviewed Worker pair (production reads PRIVATE_INGEST_OVERLAP at the release sha).
+  const REHEARSAL_WORKER_PAIR = () => ({ from: A, to: B });
   const makePlan = async () => {
     const inspection = await I.inspectRelease(owner, BOUNDARY, target);
     const split = M.migrationTargetSplit(inspection.inventory, target);
@@ -799,6 +819,10 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     if (!split.held.length && anchor.targetGeneration !== fullGen) C.refuse("release_target_generation_changed");
     if (split.held.length && anchor.targetGeneration !== B)
       rehearsalRefuse("rehearsal_generation_mismatch", { candidates: [anchor.targetGeneration], source: anchorInfo.source });
+    // Production's overlap gate, in production's order (before the bootstrap section).
+    const ingestOverlap = overlapGate
+      ? await I.inspectIngestOverlap(owner, { targetGeneration: anchor.targetGeneration, contract: REHEARSAL_WORKER_PAIR() })
+      : undefined;
     // As production writes release-plan/plan.json and reads it back.
     const plan = JSON.parse(
       JSON.stringify({
@@ -814,6 +838,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
         targetManifest: anchor.manifest,
         runId: RUN_ID,
         ...inspection,
+        ...(ingestOverlap ? { ingestOverlap } : {}),
       }),
     );
     const input = {
@@ -909,6 +934,17 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     return;
   }
 
+  if (inject === "ingest-overlap-missing") {
+    await stage("R1-ingest-overlap-missing", async () => {
+      if (!overlapGate || !OV || !fence) rehearsalRefuse("rehearsal_injection_unavailable", { inject, reason: overlapGate ? "overlap_not_installed_at_baseline" : "no_overlap_gate" });
+      const r = await expectRefusal(INJECTION_REFUSAL["ingest-overlap-missing"], makePlan);
+      // The operator's remedy: open the window G -> H, then the clean plan (R1) passes.
+      await openOverlap();
+      overlapOpen = true;
+      return { ...r, overlap: "opened_after_refusal" };
+    });
+  }
+
   let planned!: Awaited<ReturnType<typeof makePlan>>;
   await stage("R1", async () => {
     planned = await makePlan();
@@ -923,6 +959,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       held: a.held.length,
       inventory: planned.plan.inventory.length,
       anchorSource: anchorInfo.source,
+      ingestOverlap: planned.plan.ingestOverlap?.gate ?? "absent",
     };
   });
   const firstPending: string[] = planned.approved.expectedPending;
@@ -990,6 +1027,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       C.refuse("release_target_pending_changed");
     if (anchor.targetGeneration !== approved.targetGeneration) C.refuse("release_target_generation_changed");
     if (!sameAnchor(anchor, approved)) C.refuse("release_target_manifest_changed");
+    // Production's fail-fast overlap gate before the migrator; beforeWrite rechecks it under the lock.
+    if (overlapGate) await I.inspectIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR() });
     let refreshed: any;
     const result = await M.runMigrations(client, {
       profile,
@@ -1001,6 +1040,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       // Production also re-runs the GitHub release gate here; the rehearsal has no approval to recheck.
       beforeWrite: async () => {
         if (!sameAnchor(await anchorAt(approved.targetSha, approved.held), approved)) C.refuse("release_target_manifest_changed");
+        if (overlapGate) await OG!.checkIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR() });
         refreshed = await BD.refreshReleaseBoundary(client, approved.existingBoundary);
       },
     });
@@ -1033,6 +1073,17 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       const r = await expectRefusal(INJECTION_REFUSAL["boundary-drift"], () => apply(planned, owner));
       if ((await ledgerDigest()) !== ledgerBefore) rehearsalRefuse("rehearsal_ledger_written");
       return { ...r, ledgerUnchanged: true };
+    });
+    return;
+  }
+  if (inject === "ingest-overlap-missing") {
+    await stage("R4-ingest-overlap-missing", async () => {
+      // The window closes after a clean plan (owner close): the apply refuses before any write.
+      await OV!.closeGenerationOverlap(ownerOps, { from: A, to: B, reason: "owner" });
+      overlapOpen = false;
+      const before = await snapshot();
+      const r = await expectRefusal(INJECTION_REFUSAL["ingest-overlap-missing"], () => apply(planned, owner));
+      return { ...r, ...(await unchanged(before)) };
     });
     return;
   }

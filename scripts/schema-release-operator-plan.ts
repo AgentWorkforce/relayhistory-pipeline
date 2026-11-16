@@ -20,10 +20,12 @@ import {
 } from "../src/hoopdb/schema-release-contract.ts";
 import {
   inspectBootstrap,
+  inspectIngestOverlap,
   inspectRelease,
   releaseClient,
   releaseErrorCode,
 } from "../src/hoopdb/schema-release-inspect.ts";
+import { releaseOverlapContract } from "../src/hoopdb/schema-release-overlap.ts";
 export async function operatorPlan() {
   const input = releaseInputs(process.env);
   if (input.mode !== "plan" || process.argv.length !== 2)
@@ -59,6 +61,12 @@ export async function operatorPlan() {
     const targetGeneration = anchor.targetGeneration;
     if (!split.held.length && targetGeneration !== input.generation)
       refuse("release_target_generation_changed");
+    // The same buffered-ingest overlap gate the CI plan records (READ ONLY; refuses
+    // release_ingest_overlap_required).
+    const ingestOverlap = await inspectIngestOverlap(client, {
+      targetGeneration,
+      contract: releaseOverlapContract(process.cwd(), input.sha),
+    });
     // The same bootstrap section the CI plan records (READ ONLY; refuses role drift).
     const bootstrap = await inspectBootstrap(client, {
       ...input,
@@ -81,6 +89,7 @@ export async function operatorPlan() {
           targetManifest: anchor.manifest,
           ...report,
           bootstrap,
+          ingestOverlap,
         },
         null,
         2,
