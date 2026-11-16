@@ -139,10 +139,16 @@ const COMMON_PROFILE = {
  * This is lifecycle step (2): deploy H-only at the same baseline phase while retaining the reviewed
  * pair solely to authorize the G+H -> H transition. Step (3) removes the pair in a later reviewed
  * source change after the live Worker reads back exactly H.
+ *
+ * Post-apply recovery (2026-11-16): guarded apply run 43898859679 at 6a430915 (release target
+ * 96bulls:0005, nothing held) moved readiness to PASS at H = 8a7cf72a... while the Worker, the lazy
+ * policy and the admission rows are still at G = 52a3f2f0... with no window open. Lifecycle step (1)
+ * again: the pair is now {G, H} (the 11-13 pair's step (3) had not yet removed it), the tracked
+ * profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then rebind G -> H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
-  from: "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
-  to: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
+  from: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
+  to: "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8",
 };
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
