@@ -37,14 +37,17 @@ export function legacyProvenanceGate(
 ) {
   const legacyParts = new Set<number>();
   const liveParts = new Set<number>();
+  const ownedByPart = new Map<number, boolean>();
   let invalidRecord = false;
 
   const owned = (part: number) => {
+    const cached = ownedByPart.get(part);
+    if (cached !== undefined) return cached;
     const { manifest, userId } = parts[part]!;
     const marker = manifest.extensions?.["client.relayhistory_export"] as
       | { grant_id?: unknown }
       | undefined;
-    return (
+    const valid = (
       typeof marker?.grant_id === "string" &&
       manifest.raw.owner === `migration:${marker.grant_id}` &&
       manifest.raw.epochs.length === 1 &&
@@ -52,6 +55,8 @@ export function legacyProvenanceGate(
       canonicalManifestIdentity(manifest).machineId ===
         legacyMachineId(manifest.session.workspace_id, userId)
     );
+    ownedByPart.set(part, valid);
+    return valid;
   };
 
   const inScope = (record: RelayhistoryStreamRecord) => {

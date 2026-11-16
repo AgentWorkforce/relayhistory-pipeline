@@ -362,6 +362,7 @@ export async function streamCanonicalScope(
   let winners: Seat[];
   const ownerByEvent = new Map<string, number>();
   const legacyFirst = new Map<string, number>();
+  let legacyFoldFailure: string | null = null;
   const legacyGate = legacyProvenanceGate(
     scope,
     admitted.map(({ manifest }, part) => ({ manifest, userId: userIds[part]! })),
@@ -369,8 +370,9 @@ export async function streamCanonicalScope(
   try {
     const seats = new Map<string, Seat>();
     // Keep legacy seats separate until the provenance gate has observed the
-    // whole pass. An invalid legacy record may share a fold key with a valid
-    // live record; dropping it must never delete or replace that live seat.
+    // whole pass. In particular, do not let conflicts between legacy copies
+    // stop the stream before the gate can reject their manifests: the whole
+    // read drops invalid legacy evidence before it folds those records.
     const legacySeats = new Map<string, Seat>();
     await pass(async () => {
       for await (const { part, record } of read()) {
@@ -395,7 +397,9 @@ export async function streamCanonicalScope(
         try {
           chosen = chooseRelayhistoryRevision(previous, seat, (a, b) => a.digest === b.digest);
         } catch (error) {
-          throw new StreamStop(codeOf(error, "fold_failed"));
+          if (!legacy) throw new StreamStop(codeOf(error, "fold_failed"));
+          legacyFoldFailure ??= codeOf(error, "fold_failed");
+          chosen = previous ?? seat;
         }
         // The owning manifest is the first one that carried the record, whichever copy wins.
         target.set(key, previous && chosen.firstPart !== previous.firstPart ? { ...chosen, firstPart: previous.firstPart } : chosen);
@@ -414,9 +418,17 @@ export async function streamCanonicalScope(
       }
     });
     if (legacyGate.invalid) {
-      reasons.push(LEGACY_PROVENANCE_INVALID);
+      // The whole read records provenance before fold/owner errors.
+      reasons.unshift(LEGACY_PROVENANCE_INVALID);
       legacyFirst.clear();
     } else {
+      // One valid legacy manifest with internally conflicting copies fails the
+      // all-record fold and its per-manifest fallback in the whole reader.
+      if (legacyFoldFailure)
+        return result({
+          reasons: [legacyFoldFailure, "manifest_fold_failed", ...reasons],
+          events: new DirectoryEventsBuilder().finish(),
+        });
       for (const [key, candidate] of legacySeats) {
         const previous = seats.get(key);
         let chosen: Seat;
@@ -446,7 +458,14 @@ export async function streamCanonicalScope(
     }
   } catch (error) {
     if (error instanceof StreamBudgetError) return budgetStop(error.budget);
-    if (error instanceof StreamStop) return result({ reasons: [...new Set([error.code, ...reasons])] });
+    if (error instanceof StreamStop) {
+      // The whole read evaluates legacy provenance before folding. Preserve
+      // that reason order even when another pass-1 failure stops the stream.
+      const ordered = legacyGate.invalid
+        ? [LEGACY_PROVENANCE_INVALID, error.code, ...reasons.filter((reason) => reason !== LEGACY_PROVENANCE_INVALID)]
+        : [error.code, ...reasons];
+      return result({ reasons: [...new Set(ordered)] });
+    }
     throw error;
   }
 
