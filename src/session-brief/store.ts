@@ -567,7 +567,9 @@ const READY_COVERAGE = {
  */
 function failedCoverage(cov: BriefCoverageWrite): { cols: string; vals: string; set: string; params: unknown[] } {
   if (!cov.retry) {
-    return { cols: ", config_hash", vals: ", $9", set: ", config_hash = excluded.config_hash", params: [cov.configHash] };
+    // next_retry_at = NULL drops a sweep hold (sweepUnbriefedSql): the attempt ran, so the next
+    // config change may revive the row at once.
+    return { cols: ", config_hash", vals: ", $9", set: ", config_hash = excluded.config_hash, next_retry_at = NULL", params: [cov.configHash] };
   }
   const attempts = `CASE WHEN $11::boolean AND b.config_hash IS DISTINCT FROM $9::text THEN 1
                                  ELSE least(coalesce(b.retry_attempts, 0) + 1, 32767) END`;
@@ -856,8 +858,14 @@ export interface SweepUnbriefedOptions {
    * stops counting as coverage when (2b) its config hash differs from `configHash` (a refused
    * canonical input keeps its own recovery), or (2) it is on the backoff ladder (retry_attempts 1..max)
    * and next_retry_at has passed. A terminal row (next_retry_at NULL) is never armed by the clock.
+   *
+   * Arming a regeneration also holds the row: next_retry_at = now() + holdSeconds. An attempt that
+   * runs rewrites it (a failure from the ladder, a success clears it), so the hold only matters when
+   * nothing is written: the session was gone (no live pointer) or admission refused it without a
+   * publish. Such a row is then re-armed and re-audited at most once per hold, not on every sweep.
+   * A config change waits for a pending hold or backoff (next_retry_at in the future) to pass.
    */
-  regen?: { configHash: string; configReset: boolean; retry: boolean; maxAttempts: number };
+  regen?: { configHash: string; configReset: boolean; retry: boolean; maxAttempts: number; holdSeconds: number };
 }
 
 export interface RegenArmedBrief {
@@ -887,12 +895,14 @@ function sweepUnbriefedParams(limit: number, options: SweepUnbriefedOptions): un
       options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
       SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true, options.recoverRateLimited === true,
       ...(options.regen
-        ? [options.regen.configReset, options.regen.configHash, options.regen.retry, options.regen.maxAttempts]
+        ? [options.regen.configReset, options.regen.configHash, options.regen.retry, options.regen.maxAttempts,
+           options.regen.holdSeconds]
         : [])];
 }
 
 const REGEN_CONFIG_DUE = `$8::boolean AND b.status = 'failed' AND b.error IS DISTINCT FROM 'canonical_input_refused'
-                                  AND b.config_hash IS DISTINCT FROM $9::text`;
+                                  AND b.config_hash IS DISTINCT FROM $9::text
+                                  AND (b.next_retry_at IS NULL OR b.next_retry_at <= now())`;
 const REGEN_RETRY_DUE = `$10::boolean AND b.status = 'failed'
                                   AND b.retry_attempts BETWEEN 1 AND $11::integer AND b.next_retry_at <= now()`;
 
@@ -936,7 +946,12 @@ function sweepUnbriefedSql(options: SweepUnbriefedOptions, rows: boolean): strin
        INSERT INTO sessions.session_brief_wakeups
          (org_id, workspace_id, harness, session_id, admission, due_at)
        SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing
-       ON CONFLICT DO NOTHING RETURNING ${rows ? "org_id, workspace_id, harness, session_id" : "1"})
+       ON CONFLICT DO NOTHING RETURNING ${rows ? "org_id, workspace_id, harness, session_id" : "1"})${regen ? `,
+     held AS (
+       UPDATE sessions.session_briefs AS b SET next_retry_at = now() + make_interval(secs => $12::integer)
+         FROM armed AS a
+        WHERE b.org_id = a.org_id AND b.workspace_id = a.workspace_id AND b.harness = a.harness AND b.session_id = a.session_id
+          AND b.status = 'failed' AND ((${REGEN_CONFIG_DUE}) OR (${REGEN_RETRY_DUE})))` : ""}
      ${rows ? `SELECT a.org_id, a.workspace_id, a.harness, a.session_id,
             CASE WHEN b.status IS DISTINCT FROM 'failed' THEN NULL
                  WHEN ${REGEN_CONFIG_DUE} THEN 'config_changed'

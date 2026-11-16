@@ -19,7 +19,16 @@
 --
 -- session_briefs: covered_turns, retry_attempts, next_retry_at, config_hash, pipeline_version. Nullable or
 -- constant-defaulted, no CHECK and no backfill, so no table rewrite or validation scan. The partial
--- next_retry_at index starts empty (every existing row is NULL).
+-- next_retry_at index starts empty (every existing row is NULL), but it is built non-concurrently inside
+-- the transactional migrator: CREATE INDEX holds a SHARE lock and blocks writes to session_briefs while it
+-- scans the table, briefly on a large one.
+--
+-- Rollout order: re-apply supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql BEFORE this
+-- step (the same pattern as 20261105062000). Its embedded manifest and function lists now name the four
+-- functions below, so the installed event-trigger function's prosrc (and its sha) changes; with the old
+-- bootstrap installed the function boundary refuses this step. With SUMMARY_REGEN_TURNS_ENABLED first
+-- turned on, legacy Bob Costas summaries (hoopdb 0006 covered_turns NULL) that are current by revision are
+-- stamped with their turn count (no model call), not regenerated; a legacy brief is stamped by its next write.
 
 CREATE TABLE sessions.summary_regeneration_audit (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -122,6 +131,14 @@ $purge$;
 
 -- The writer entry point (Bob Costas sweep, brief sweep): one batch per sweep, at most 1000 rows, each
 -- checked by the table's CHECK constraints and the operator erase guard. Returns the rows written.
+-- A forgotten session never gains a row, by the same keys the forget triggers use: a row is written only
+-- while the session has a live pointer (session_index, deleted_at NULL) and no pointer or directory row
+-- of that key is tombstoned. A key with no pointer at all (deleted) writes nothing. A missing directory
+-- row does not block: the directory is a projection that may lag or carry a canonical id that differs
+-- from the physical one; its tombstone or deletion is caught by the forget triggers. The live pointer and
+-- directory rows are locked FOR SHARE (key order) first, so a concurrent tombstone or delete waits for
+-- this transaction and its forget trigger then removes what this call wrote; one that committed first
+-- is seen by the INSERT (READ COMMITTED takes a new snapshot per statement) and the row is skipped.
 CREATE FUNCTION sessions.summary_regeneration_audit_append_v1(p_rows jsonb) RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $append$
@@ -130,6 +147,22 @@ BEGIN
   IF p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array' OR jsonb_array_length(p_rows) > 1000 THEN
     RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='summary regeneration audit: rows must be a JSON array of at most 1000';
   END IF;
+  PERFORM 1
+     FROM sessions.session_index AS i
+     JOIN (SELECT DISTINCT k.org_id, k.workspace_id, k.harness, k.session_id
+             FROM jsonb_to_recordset(p_rows) AS k(org_id text, workspace_id text, harness text, session_id text)) AS k
+       ON i.org_id = k.org_id AND i.workspace_id = k.workspace_id AND i.harness = k.harness AND i.session_id = k.session_id
+    WHERE i.deleted_at IS NULL
+    ORDER BY i.org_id, i.workspace_id, i.harness, i.session_id, i.machine_id
+      FOR SHARE OF i;
+  PERFORM 1
+     FROM sessions.session_directory AS d
+     JOIN (SELECT DISTINCT k.org_id, k.workspace_id, k.harness, k.session_id
+             FROM jsonb_to_recordset(p_rows) AS k(org_id text, workspace_id text, harness text, session_id text)) AS k
+       ON d.org_id = k.org_id AND d.workspace_id = k.workspace_id AND d.harness = k.harness AND d.session_id = k.session_id
+    WHERE d.deleted_at IS NULL
+    ORDER BY d.org_id, d.workspace_id, d.harness, d.session_id
+      FOR SHARE OF d;
   INSERT INTO sessions.summary_regeneration_audit
     (org_id, workspace_id, harness, session_id, system, kind, reason, prior_status, prior_failure_code,
      prior_pipeline_version, request_id, scope_hash, requested_by)
@@ -137,7 +170,16 @@ BEGIN
          r.prior_failure_code, r.prior_pipeline_version, r.request_id, r.scope_hash, r.requested_by
     FROM jsonb_to_recordset(p_rows) AS r(org_id text, workspace_id text, harness text, session_id text, system text,
          kind text, reason text, prior_status text, prior_failure_code text, prior_pipeline_version text,
-         request_id text, scope_hash text, requested_by text);
+         request_id text, scope_hash text, requested_by text)
+   WHERE EXISTS (SELECT 1 FROM sessions.session_index AS i
+                  WHERE i.org_id = r.org_id AND i.workspace_id = r.workspace_id AND i.harness = r.harness
+                    AND i.session_id = r.session_id AND i.deleted_at IS NULL)
+     AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS i
+                      WHERE i.org_id = r.org_id AND i.workspace_id = r.workspace_id AND i.harness = r.harness
+                        AND i.session_id = r.session_id AND i.deleted_at IS NOT NULL)
+     AND NOT EXISTS (SELECT 1 FROM sessions.session_directory AS d
+                      WHERE d.org_id = r.org_id AND d.workspace_id = r.workspace_id AND d.harness = r.harness
+                        AND d.session_id = r.session_id AND d.deleted_at IS NOT NULL);
   GET DIAGNOSTICS v_count = ROW_COUNT;
   RETURN v_count;
 END

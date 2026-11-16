@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
 import type { ManifestV1 } from "../../shared/vendor.ts";
+import type { HoopDb } from "../../shared/db.ts";
 import { captureLogs } from "../../shared/__tests__/golden.ts";
 import { resetDetection } from "../../summary-regen/detect.ts";
 import { configHashMaterial } from "../../summary-regen/config-hash.ts";
@@ -53,14 +54,14 @@ async function setup() {
     await pointer(pg, { machine: "m-1", revision, manifestKey });
     await armWakeup(hoopDb(pg), KEY, { idleSeconds: 600, maxWaitSeconds: 3600 });
   };
-  const tick = (r: BriefRegen | null, opts: { sweep?: boolean; now?: Date } = {}) =>
+  const tick = (r: BriefRegen | null, opts: { sweep?: boolean; now?: Date; via?: (db: HoopDb) => HoopDb } = {}) =>
     briefTick({
       reader: mapReader(manifests),
       store,
       transport: model,
       config: testConfig({ throttleSeconds: 0, sessionDailyCap: 1000, sweepSeconds: opts.sweep ? 1 : 0 }),
       regen: r,
-    })(hoopDb(pg), opts.now ?? new Date());
+    })((opts.via ?? ((db) => db))(hoopDb(pg)), opts.now ?? new Date());
   const row = async () =>
     (await pg.query<Record<string, unknown>>(
       `SELECT status, error, covered_turns, retry_attempts, config_hash, pipeline_version, next_retry_at,
@@ -312,6 +313,8 @@ describe("(4) audit retention", () => {
   test("the prune tick purges rows past the retention, at most hourly", async () => {
     const s = await setup();
     const entry = { orgId: KEY.orgId, workspaceId: KEY.workspaceId, harness: KEY.harness, system: "brief" as const, kind: "brief" as const, reason: "retry_backoff" as const };
+    // The audit only records sessions with a live pointer (append_v1 skips absent or tombstoned ones).
+    for (const sessionId of ["old-one", "new-one"]) await pointer(s.pg, { key: { ...KEY, sessionId } });
     await writeRegenAudit(hoopDb(s.pg), [{ ...entry, sessionId: "old-one" }, { ...entry, sessionId: "new-one" }]);
     await s.pg.transaction(async (tx) => {
       await tx.query("ALTER TABLE sessions.summary_regeneration_audit DISABLE TRIGGER summary_regeneration_audit_append_only");
@@ -324,6 +327,87 @@ describe("(4) audit retention", () => {
     const out = await captureLogs(() => s.tick(regen({ SUMMARY_REGEN_AUDIT_ENABLED: "true" })));
     expect(byMessage(out.lines, "summary regeneration audit purged")).toEqual([expect.objectContaining({ count: 1 })]);
     expect((await s.audit()).map((a) => a.session_id)).toEqual(["new-one"]);
+  });
+
+  test("a failing purge is logged and the tick still generates", async () => {
+    const s = await setup();
+    await s.upload(2);
+    await dueNow(s.pg);
+    const failingPurge = (db: HoopDb): HoopDb => {
+      const query = ((text: string, params?: unknown[]) =>
+        text.includes("summary_regeneration_audit_purge_v1") ? Promise.reject(new Error("purge boom")) : db.query(text as never, params as never)) as HoopDb["query"];
+      return { ...db, query, pool: { connect: async () => ({ query, release() {} }) } } as unknown as HoopDb;
+    };
+    const out = await captureLogs(() => s.tick(regen({ SUMMARY_REGEN_AUDIT_ENABLED: "true" }), { via: failingPurge }));
+    expect(out.result).toEqual({ generated: 1 });
+    expect(byMessage(out.lines, "summary regeneration audit purge failed"))
+      .toEqual([expect.objectContaining({ level: "warn", stage: "session-brief", error_code: "Error" })]);
+    expect(await s.row()).toMatchObject({ status: "ready" });
+  });
+});
+
+/** The pointer vanishes between the sweep and the claim (a race): the claimed attempt is "gone" and writes nothing. */
+const goneAtClaim = (db: HoopDb): HoopDb => {
+  const query = ((text: string, params?: unknown[]) =>
+    text.includes("SELECT machine_id, manifest_key, revision::text AS revision FROM sessions.session_index")
+      ? Promise.resolve({ rows: [] })
+      : db.query(text as never, params as never)) as HoopDb["query"];
+  return { ...db, query, pool: { connect: async () => ({ query, release() {} }) } } as unknown as HoopDb;
+};
+
+describe("(P3) armed rows that write nothing", () => {
+  test("a gone config_changed row is re-armed and re-audited at most once per hold, then due again", async () => {
+    const s = await setup();
+    const env = { ...RETRY, SUMMARY_RETRY_CONFIG_RESET_ENABLED: "true" };
+    await s.upload(2);
+    s.model.next.push(authFailed());
+    await dueNow(s.pg);
+    expect(await s.tick(regen(env, "hash-a"))).toEqual({ failed: 1 });
+    await s.pg.exec("UPDATE sessions.session_briefs SET retry_attempts = 4, next_retry_at = NULL");
+
+    const first = await captureLogs(() => s.tick(regen(env, "hash-b"), { sweep: true, via: goneAtClaim }));
+    expect(first.result).toEqual({ gone: 1 });
+    expect(byMessage(first.lines, "summary regeneration queued")).toEqual([expect.objectContaining({ reason: "config_changed" })]);
+    const held = await s.pg.query<{ hold: number }>("SELECT extract(epoch FROM next_retry_at - now())::int AS hold FROM sessions.session_briefs");
+    expect(held.rows[0]!.hold).toBeGreaterThan(21_000);
+    expect(held.rows[0]!.hold).toBeLessThanOrEqual(21_600);
+    expect(await s.row()).toMatchObject({ status: "failed", retry_attempts: 4, config_hash: "hash-a" });
+
+    // Held: later sweeps arm nothing and audit nothing.
+    for (let i = 0; i < 3; i++) {
+      const again = await captureLogs(() => s.tick(regen(env, "hash-b"), { sweep: true }));
+      expect(again.result).toEqual({});
+      expect(byMessage(again.lines, "summary regeneration queued")).toEqual([]);
+    }
+    expect(await s.wakeups()).toEqual([]);
+    expect((await s.audit()).map((a) => a.reason)).toEqual(["config_changed"]);
+    expect(s.model.requests).toHaveLength(1);
+
+    // After the hold: due once more.
+    await s.elapse();
+    const later = await captureLogs(() => s.tick(regen(env, "hash-b"), { sweep: true, via: goneAtClaim }));
+    expect(later.result).toEqual({ gone: 1 });
+    expect((await s.audit()).map((a) => a.reason)).toEqual(["config_changed", "config_changed"]);
+  });
+
+  test("a gone retry_backoff row is held the same way; a real attempt replaces the hold with its ladder step", async () => {
+    const s = await setup();
+    const r = regen(RETRY);
+    await s.upload(2);
+    s.model.next.push(authFailed());
+    await dueNow(s.pg);
+    expect(await s.tick(r)).toEqual({ failed: 1 });
+    await s.elapse();
+    expect(await s.tick(r, { sweep: true, via: goneAtClaim })).toEqual({ gone: 1 });
+    expect(await s.tick(r, { sweep: true })).toEqual({});
+    expect((await s.audit()).map((a) => a.reason)).toEqual(["retry_backoff"]);
+    expect(await s.row()).toMatchObject({ retry_attempts: 1 });
+
+    // After the hold the retry runs and the ladder moves on (+3600).
+    await s.elapse();
+    s.model.next.push(authFailed());
+    expect(await s.tick(r, { sweep: true })).toEqual({ failed: 1 });
+    expect(await s.row()).toMatchObject({ retry_attempts: 2, backoff: 3600 });
   });
 });
 

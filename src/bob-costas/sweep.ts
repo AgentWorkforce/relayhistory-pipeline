@@ -88,7 +88,7 @@ export function sweepMessage(stage: (typeof SWEEP_STAGES)[number], row: MissingR
 }
 
 interface RegenDueRow extends MissingRow {
-  reason: "config_changed" | "retry_backoff" | "turns";
+  reason: "config_changed" | "retry_backoff" | "turns" | "stamp";
   ended: boolean;
   prior_status: string;
   prior_failure_code: string | null;
@@ -101,8 +101,10 @@ interface RegenDueRow extends MissingRow {
  * - config_changed (2b): degraded under a different summariser config hash;
  * - retry_backoff (2): degraded, still on the ladder (attempts <= L) and next_retry_at passed;
  *   a terminal row (next_retry_at NULL) is never selected, however far the clock moves;
- * - turns (1): an ended (done/abandoned) or idle session whose row is uncovered (covered_turns NULL,
- *   written before the migration) or behind the index revision.
+ * - turns (1): an ended (done/abandoned) or idle session whose row is behind the index revision;
+ * - stamp (1): the same, but the row is uncovered (covered_turns NULL, written before the migration)
+ *   and current by revision. It is queued only so the handler stamps its coverage with the guarded
+ *   UPDATE (no model call); it is not a regeneration, so it is neither logged as one nor audited.
  * The same live-job and DLQ guards as the missing sweep, so a due row is queued once.
  */
 export async function findRegenDue(
@@ -118,6 +120,7 @@ export async function findRegenDue(
             i.trace_id::text AS trace_id, i.revision::text AS revision, e.session_uuid::text AS session_uuid,
             CASE WHEN $4::boolean AND s.degraded AND s.config_hash IS DISTINCT FROM $5 THEN 'config_changed'
                  WHEN $6::boolean AND s.degraded AND s.attempts BETWEEN 1 AND $7 AND s.next_retry_at <= $8::timestamptz THEN 'retry_backoff'
+                 WHEN s.covered_turns IS NULL AND s.revision = i.revision THEN 'stamp'
                  ELSE 'turns' END AS reason,
             (i.state IN ('done', 'abandoned')) AS ended,
             s.status AS prior_status, s.failure_code AS prior_failure_code, s.pipeline_version AS prior_pipeline_version
@@ -158,15 +161,21 @@ export async function findRegenDue(
   return r.rows;
 }
 
-function regenReason(row: RegenDueRow): RegenReason {
-  if (row.reason !== "turns") return row.reason;
-  return row.ended ? "ended_uncovered" : "idle_uncovered";
+function regenReason(reason: "config_changed" | "retry_backoff" | "turns", ended: boolean): RegenReason {
+  if (reason !== "turns") return reason;
+  return ended ? "ended_uncovered" : "idle_uncovered";
 }
 
 export function regenSweepMessage(stage: (typeof SWEEP_STAGES)[number], row: RegenDueRow): StageMessage {
   const base = sweepMessage(stage, row);
   const suffix =
-    row.reason === "config_changed" ? REGEN_WORK_SUFFIX.config : row.reason === "retry_backoff" ? REGEN_WORK_SUFFIX.retry : REGEN_WORK_SUFFIX.turns;
+    row.reason === "config_changed"
+      ? REGEN_WORK_SUFFIX.config
+      : row.reason === "retry_backoff"
+        ? REGEN_WORK_SUFFIX.retry
+        : row.reason === "stamp"
+          ? REGEN_WORK_SUFFIX.stamp
+          : REGEN_WORK_SUFFIX.turns;
   return { ...base, workKey: `${base.workKey}${suffix}` };
 }
 
@@ -200,7 +209,11 @@ export function summarySweep(opts: {
     // Bob Costas without the brief worker, whose prune tick purges the same table.
     if (auditOn && now.getTime() - lastPurge >= 3_600_000 && (await hasRelation(db, AUDIT_RELATION))) {
       lastPurge = now.getTime();
-      const purged = await purgeRegenAudit(db, regenConfig!.settings.audit.retentionDays);
+      // Best effort, like the audit write: a failing purge never aborts the sweep's regen pass.
+      const purged = await purgeRegenAudit(db, regenConfig!.settings.audit.retentionDays).catch((error: unknown) => {
+        log.warn("summary regeneration audit purge failed", { stage: "summary-sweep", error_code: error instanceof Error ? error.name : "unknown" });
+        return 0;
+      });
       if (purged) log.info("summary regeneration audit purged", { stage: "summary-sweep", count: purged });
     }
     if (!coverage || !(await hasColumns(db, "sessions.session_summaries", SUMMARY_COVERAGE_COLUMNS))) return;
@@ -208,8 +221,13 @@ export function summarySweep(opts: {
     for (const stage of SWEEP_STAGES) {
       const rows = await findRegenDue(db, stage, limit, coverage, now);
       const entries: RegenAuditEntry[] = [];
+      let stamps = 0;
       for (const row of rows) {
         await queue.send(await enrichMessage(regenSweepMessage(stage, row)));
+        if (row.reason === "stamp") {
+          stamps += 1;
+          continue;
+        }
         const entry: RegenAuditEntry = {
           orgId: row.org_id,
           workspaceId: row.workspace_id,
@@ -217,7 +235,7 @@ export function summarySweep(opts: {
           sessionId: row.session_id,
           system: "bob_costas",
           kind: KIND[stage],
-          reason: regenReason(row),
+          reason: regenReason(row.reason, row.ended),
           priorStatus: row.prior_status,
           priorFailureCode: row.prior_failure_code,
           priorPipelineVersion: row.prior_pipeline_version,
@@ -225,6 +243,7 @@ export function summarySweep(opts: {
         logRegenQueued(entry, stage);
         entries.push(entry);
       }
+      if (stamps) log.info("summary coverage stamp queued", { stage, count: stamps });
       // One batch insert per stage; the flag gates only this write, never the enqueue or the log.
       if (audit && entries.length) {
         await writeRegenAudit(db, entries).catch((error: unknown) =>

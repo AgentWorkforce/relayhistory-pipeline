@@ -79,9 +79,9 @@ async function world() {
   const row = async (id: string, kind = "long") => (await pg.query<Record<string, unknown>>(
     `SELECT status, revision, covered_turns, failure_code, degraded, attempts, next_retry_at, config_hash, pipeline_version
        FROM sessions.session_summaries WHERE session_id=$1 AND kind=$2`, [id, kind])).rows[0];
-  async function sweep(regen: BobCostasRegen | null, now: Date) {
+  async function sweep(regen: BobCostasRegen | null, now: Date, via: typeof db = db) {
     await pg.exec("DELETE FROM sessions.pipeline_jobs");
-    const { lines } = await captureLogs(() => summarySweep({ keyring, regen, everyMs: 0 })(db, now));
+    const { lines } = await captureLogs(() => summarySweep({ keyring, regen, everyMs: 0 })(via, now));
     const jobs = (await pg.query<{ session_id: string; work_key: string }>(
       "SELECT session_id, work_key FROM sessions.pipeline_jobs WHERE stage='summary-long' AND work_key LIKE '%:regen-%' ORDER BY session_id")).rows;
     return { jobs, lines };
@@ -92,91 +92,184 @@ async function world() {
 }
 
 const summaryLine = (lines: Record<string, unknown>[]) => lines.find((l) => l.message === "bob costas summary");
+/** A summarizer that counts its calls (a regeneration is a call; a coverage stamp is not). */
+const counting = () => {
+  const calls = { n: 0 };
+  const summarizer = { ...extractiveSummarizer, summarize: (...args: Parameters<Summarizer["summarize"]>) => {
+    calls.n += 1;
+    return extractiveSummarizer.summarize(...args);
+  } } as Summarizer;
+  return { calls, summarizer };
+};
 
 describe("turn coverage (SUMMARY_REGEN_TURNS_ENABLED)", () => {
   const TURNS = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "3", SUMMARY_REGEN_IDLE_SECONDS: "600" });
 
-  test("a legacy row: N-1 turns active is stamped and skipped; N turns, idle and ended regenerate with their reason", async () => {
+  test("a legacy row current by revision is stamped, never regenerated: below N, at N, idle, ended, abandoned", async () => {
     const w = await world();
     const cases = [
-      { id: "below", turns: 2, state: "active", last: T0, expect: null },
-      { id: "at-n", turns: 3, state: "active", last: T0, expect: "turns_gained" },
-      { id: "idle", turns: 2, state: "active", last: at(-601), expect: "idle_uncovered" },
-      { id: "not-idle-yet", turns: 2, state: "active", last: at(-599), expect: null },
-      { id: "ended", turns: 1, state: "done", last: T0, expect: "ended_uncovered" },
-      { id: "abandoned", turns: 1, state: "abandoned", last: T0, expect: "ended_uncovered" },
+      { id: "below", turns: 2, state: "active", last: T0 },
+      { id: "at-n", turns: 3, state: "active", last: T0 },
+      { id: "idle", turns: 2, state: "active", last: at(-601) },
+      { id: "not-idle-yet", turns: 2, state: "active", last: at(-599) },
+      { id: "ended", turns: 1, state: "done", last: T0 },
+      { id: "abandoned", turns: 1, state: "abandoned", last: T0 },
     ];
     for (const c of cases) {
       await w.session(c.id, c.turns, 2, c.state, c.last);
       await w.handle(c.id, { regen: null }); // written before the flag: covered_turns NULL
       expect((await w.row(c.id))!.covered_turns).toBeNull();
     }
+    const { calls, summarizer } = counting();
     for (const c of cases) {
-      const { result, lines } = await w.handle(c.id, { regen: TURNS });
+      const { result, lines } = await w.handle(c.id, { regen: TURNS, summarizer });
       const r = (await w.row(c.id))!;
-      expect(r.covered_turns).toBe(c.turns);
-      if (c.expect === null) {
-        expect(result).toEqual({ status: "skipped", reason: "summary_current" });
-        expect(r.pipeline_version).toBeNull();
-      } else {
-        expect(result ?? null).toBeNull();
-        expect(summaryLine(lines)?.regeneration_reason).toBe(c.expect);
-        expect(r.pipeline_version).toBe(BOB_COSTAS_PIPELINE_VERSION);
-        expect(r.config_hash).toBe(HASH_A);
-        expect(r.degraded).toBe(false);
-      }
+      expect(result).toEqual({ status: "skipped", reason: "summary_current" });
+      expect(summaryLine(lines)).toBeUndefined();
+      expect(r).toMatchObject({ covered_turns: c.turns, pipeline_version: null, config_hash: null, revision: 2 });
     }
+    expect(calls.n).toBe(0);
     // A stamped, current row is not read again: the next delivery is a plain skip.
-    const again = await w.handle("below", { regen: TURNS });
+    const again = await w.handle("below", { regen: TURNS, summarizer });
     expect(again.result).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(calls.n).toBe(0);
+  });
+
+  test("a legacy row stale by revision regenerates and is stamped by the new write", async () => {
+    const w = await world();
+    await w.session("stale", 2, 2, "done");
+    await w.handle("stale", { regen: null });
+    await w.session("stale", 4, 3, "done");
+    const { calls, summarizer } = counting();
+    const { result } = await w.handle("stale", { regen: TURNS, summarizer });
+    expect(result ?? null).toBeNull();
+    expect(calls.n).toBe(1);
+    expect(await w.row("stale")).toMatchObject({ revision: 3, covered_turns: 4, pipeline_version: BOB_COSTAS_PIPELINE_VERSION, config_hash: HASH_A });
   });
 
   test("the threshold is configurable", async () => {
     const w = await world();
     await w.session("t", 2);
     await w.handle("t", { regen: null });
-    const { lines } = await w.handle("t", { regen: regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "2" }) });
+    const two = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "2" });
+    await w.handle("t", { regen: two }); // stamps covered_turns 2
+    expect((await w.row("t"))!.covered_turns).toBe(2);
+    await w.session("t", 4, 3);
+    const { lines } = await w.handle("t", { regen: two });
     expect(summaryLine(lines)?.regeneration_reason).toBe("turns_gained");
+    await w.session("t", 5, 4);
+    const three = await w.handle("t", { regen: regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "2", SUMMARY_REGEN_IDLE_SECONDS: "600" }) });
+    expect(summaryLine(three.lines)?.regeneration_reason).toBeUndefined();
   });
 
-  test("the sweep queues ended or idle uncovered rows once, with :regen-turns, one audit row and a hashed log line", async () => {
+  test("the sweep queues revision-current legacy rows for a stamp only (no model call, no audit), and stale ended or idle rows once with :regen-turns", async () => {
     const w = await world();
     await w.session("sess-ended-5", 2, 2, "done");
     await w.session("sess-idle-6", 2, 2, "active", at(-3600));
     await w.session("sess-active-7", 2, 2, "active", T0);
     for (const id of ["sess-ended-5", "sess-idle-6", "sess-active-7"]) await w.handle(id, { regen: null });
     const on = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_AUDIT_ENABLED: "true" });
+
+    // Current by revision: queued for the stamp only.
     const first = await w.sweep(on, T0);
     expect(first.jobs.map((j) => j.session_id)).toEqual(["sess-ended-5", "sess-idle-6"]);
-    for (const j of first.jobs) expect(j.work_key.endsWith(":regen-turns")).toBe(true);
+    for (const j of first.jobs) expect(j.work_key.endsWith(":regen-stamp")).toBe(true);
+    expect(await w.audit()).toEqual([]);
+    expect(first.lines.filter((l) => l.message === "summary regeneration queued")).toEqual([]);
+    expect(first.lines.filter((l) => l.message === "summary coverage stamp queued" && l.stage === "summary-long"))
+      .toEqual([expect.objectContaining({ count: 2 })]);
+    expect(JSON.stringify(first.lines)).not.toContain("sess-ended-5");
+    const { calls, summarizer } = counting();
+    for (const j of first.jobs) {
+      const { result, lines } = await w.handle(j.session_id, { regen: on, workKey: j.work_key, summarizer });
+      expect(result).toEqual({ status: "skipped", reason: "summary_current" });
+      expect(summaryLine(lines)).toBeUndefined();
+      expect((await w.row(j.session_id))!.covered_turns).toBe(2);
+    }
+    expect(calls.n).toBe(0);
+    expect((await w.sweep(on, T0)).jobs).toEqual([]);
+
+    // Stale by revision: a real regeneration, audited and logged hashed, once.
+    await w.session("sess-ended-5", 3, 3, "done");
+    await w.session("sess-idle-6", 3, 3, "active", at(-3600));
+    await w.session("sess-active-7", 3, 3, "active", T0);
+    const second = await w.sweep(on, T0);
+    expect(second.jobs.map((j) => j.session_id)).toEqual(["sess-ended-5", "sess-idle-6"]);
+    for (const j of second.jobs) expect(j.work_key.endsWith(":regen-turns")).toBe(true);
     expect(await w.audit()).toEqual([
       { session_id: "sess-ended-5", system: "bob_costas", kind: "long", reason: "ended_uncovered", prior_status: "ready", prior_failure_code: null, prior_pipeline_version: null },
       { session_id: "sess-idle-6", system: "bob_costas", kind: "long", reason: "idle_uncovered", prior_status: "ready", prior_failure_code: null, prior_pipeline_version: null },
     ]);
-    const queued = first.lines.filter((l) => l.message === "summary regeneration queued" && l.stage === "summary-long");
+    const queued = second.lines.filter((l) => l.message === "summary regeneration queued" && l.stage === "summary-long");
     // Log order follows the sweep (newest activity first); compare as a set.
     expect(queued.map((l) => l.session_hash).sort()).toEqual([
       sessionHash({ orgId: "o", workspaceId: "w", harness: "claude", sessionId: "sess-ended-5" }),
       sessionHash({ orgId: "o", workspaceId: "w", harness: "claude", sessionId: "sess-idle-6" }),
     ].sort());
-    expect(JSON.stringify(first.lines)).not.toContain("sess-ended-5");
-    // The handler regenerates them (stamping coverage); the next sweep selects nothing.
-    for (const j of first.jobs) {
-      const { lines } = await w.handle(j.session_id, { regen: on, workKey: j.work_key });
+    expect(JSON.stringify(second.lines)).not.toContain("sess-ended-5");
+    for (const j of second.jobs) {
+      const { lines } = await w.handle(j.session_id, { regen: on, workKey: j.work_key, summarizer });
       expect(summaryLine(lines)?.regeneration_reason).toBe(j.session_id === "sess-ended-5" ? "ended_uncovered" : "idle_uncovered");
     }
+    expect(calls.n).toBe(2);
     expect((await w.sweep(on, T0)).jobs).toEqual([]);
     expect(await w.audit()).toHaveLength(2);
+  });
+
+  test("first turns-flag-on rollout: a backlog of revision-current legacy rows is stamped with no model call", async () => {
+    const w = await world();
+    const ids = Array.from({ length: 12 }, (_, i) => `backlog-${String(i).padStart(2, "0")}`);
+    for (const [i, id] of ids.entries()) {
+      const state = i % 3 === 0 ? "done" : i % 3 === 1 ? "abandoned" : "active";
+      await w.session(id, 1 + (i % 5), 2, state, state === "active" ? at(-7200) : T0);
+      await w.handle(id, { regen: null });
+    }
+    const on = regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_TURN_THRESHOLD: "1", SUMMARY_REGEN_AUDIT_ENABLED: "true" });
+    const { calls, summarizer } = counting();
+    const { jobs, lines } = await w.sweep(on, T0);
+    expect(jobs).toHaveLength(ids.length);
+    for (const j of jobs) {
+      expect(j.work_key.endsWith(":regen-stamp")).toBe(true);
+      expect((await w.handle(j.session_id, { regen: on, workKey: j.work_key, summarizer })).result).toEqual({ status: "skipped", reason: "summary_current" });
+    }
+    expect(calls.n).toBe(0);
+    expect(lines.filter((l) => l.message === "summary regeneration queued")).toEqual([]);
+    expect(await w.audit()).toEqual([]);
+    for (const [i, id] of ids.entries()) expect(await w.row(id)).toMatchObject({ covered_turns: 1 + (i % 5), revision: 2, pipeline_version: null });
+    expect((await w.sweep(on, T0)).jobs).toEqual([]);
   });
 
   test("audit off: the enqueue and its log line still happen, no audit row is written", async () => {
     const w = await world();
     await w.session("e", 2, 2, "done");
     await w.handle("e", { regen: null });
+    await w.session("e", 3, 3, "done");
     const { jobs, lines } = await w.sweep(regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true" }), T0);
     expect(jobs).toHaveLength(1);
     expect(lines.some((l) => l.message === "summary regeneration queued")).toBe(true);
     expect(await w.audit()).toEqual([]);
+  });
+
+  test("a failing audit purge is logged and does not stop the regeneration pass", async () => {
+    const w = await world();
+    await w.session("p", 2, 2, "done");
+    await w.handle("p", { regen: null });
+    await w.session("p", 3, 3, "done");
+    const failingPurge = new Proxy(w.db, {
+      get(target, prop, receiver) {
+        if (prop === "query") {
+          return (text: string, params?: unknown[]) =>
+            text.includes("summary_regeneration_audit_purge_v1") ? Promise.reject(new Error("purge boom")) : target.query(text as never, params as never);
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const { jobs, lines } = await w.sweep(regenOf({ SUMMARY_REGEN_TURNS_ENABLED: "true", SUMMARY_REGEN_AUDIT_ENABLED: "true" }), T0, failingPurge);
+    expect(lines.filter((l) => l.message === "summary regeneration audit purge failed"))
+      .toEqual([expect.objectContaining({ level: "warn", stage: "summary-sweep", error_code: "Error" })]);
+    expect(jobs.map((j) => j.work_key.endsWith(":regen-turns"))).toEqual([true]);
+    expect((await w.audit()).map((a) => a.reason)).toEqual(["ended_uncovered"]);
   });
 });
 

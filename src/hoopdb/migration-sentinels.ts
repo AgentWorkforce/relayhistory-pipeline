@@ -471,8 +471,14 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_capability(jsonb)') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_register(jsonb)') IS NOT NULL AS applied",
   },
   "upstream:20261105062040_summary_regeneration.sql": {
-    evidence: "function sessions.summary_regeneration_audit_purge_v1 and table sessions.summary_regeneration_audit",
-    sql: "SELECT to_regprocedure('sessions.summary_regeneration_audit_purge_v1(integer)') IS NOT NULL AND to_regclass('sessions.summary_regeneration_audit') IS NOT NULL AS applied",
+    evidence:
+      "functions sessions.summary_regeneration_audit_purge_v1 and sessions.summary_regeneration_audit_append_v1, table sessions.summary_regeneration_audit, and the five session_briefs coverage/retry columns",
+    sql: `SELECT to_regprocedure('sessions.summary_regeneration_audit_purge_v1(integer)') IS NOT NULL
+         AND to_regprocedure('sessions.summary_regeneration_audit_append_v1(jsonb)') IS NOT NULL
+         AND to_regclass('sessions.summary_regeneration_audit') IS NOT NULL
+         AND (SELECT count(*) FROM pg_attribute
+               WHERE attrelid = to_regclass('sessions.session_briefs') AND NOT attisdropped
+                 AND attname IN ('covered_turns', 'retry_attempts', 'next_retry_at', 'config_hash', 'pipeline_version')) = 5 AS applied`,
   },
   "upstream:20261105062060_turns_selection_origin_guard.sql": {
     evidence: "public selection rejects the reserved turns origin; owner-only helper preserves internal erasure",
