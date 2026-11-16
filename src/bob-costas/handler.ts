@@ -288,8 +288,8 @@ async function sessionQuiet(deps: BobCostasDeps, pk: unknown[], idleSeconds: num
 /**
  * Whether a current, ready summary is due for regeneration anyway (flags (1), (2), (2b)). Returns the
  * reason, plus the digest when it had to be read for the turn check so the rebuild does not read it again.
- * A legacy row (covered_turns NULL) that is not due is stamped with the turns it covers, so the sweep's
- * "uncovered" branch does not queue it again.
+ * A legacy row (covered_turns NULL) that is current is never due for turns: it is stamped with the
+ * turns it covers (guarded UPDATE, no model call), so the sweep's "uncovered" branch does not queue it again.
  */
 async function regenDue(
   regen: BobCostasRegen,
@@ -321,9 +321,10 @@ async function regenDue(
   // No digest (empty, or a manifest no longer readable): nothing to regenerate from; the stamp of 0
   // below keeps the sweep's "uncovered" branch from queueing the row again every tick.
   const turnsNow = digest.status === "digest" ? digest.digest.userTurnCount : 0;
-  if (digest.status === "digest" && turnsNow >= turns.threshold) return { reason: "turns_gained", digest };
-  const quiet = turnsNow > 0 ? await sessionQuiet(deps, pk, turns.idleSeconds, now) : null;
-  if (quiet) return { reason: quiet, digest };
+  // A legacy row that is current by revision and content already summarizes every turn the manifest
+  // holds: it is stamped with that count, never regenerated (no model call). Only a later revision, or
+  // the retry/config reasons above, regenerates it. This keeps the first turns-flag-on rollout from
+  // re-summarizing the whole pre-migration backlog.
   await deps.db.query(
     `UPDATE sessions.session_summaries SET covered_turns = $8
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6

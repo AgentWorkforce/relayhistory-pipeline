@@ -46,6 +46,8 @@ export const REGEN_WORK_SUFFIX = {
   turns: ":regen-turns",
   retry: ":regen-retry",
   config: ":regen-config",
+  /** A legacy row current by revision: the handler stamps its coverage, no model call, no audit. */
+  stamp: ":regen-stamp",
 } as const;
 
 /** The reason a regeneration job was queued for, from its workKey suffix (completion log only). */
