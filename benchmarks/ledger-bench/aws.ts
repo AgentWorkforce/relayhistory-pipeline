@@ -49,9 +49,13 @@ export class RequestMeter {
   get exhausted(): boolean {
     return this.#used >= this.limit;
   }
-  take(): void {
-    if (this.#used >= this.limit) throw new BudgetExhausted(this.limit);
-    this.#used++;
+  /** Spend `n` requests; `n` above 1 reserves a child process's whole allowance up front. */
+  take(n = 1): void {
+    if (this.#used + n > this.limit) {
+      this.#used = this.limit;
+      throw new BudgetExhausted(this.limit);
+    }
+    this.#used += n;
   }
 }
 

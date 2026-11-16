@@ -31,7 +31,7 @@ export interface Profile {
   concurrencies: number[];
   /** Rounds per racing-writer correctness check. */
   raceRounds: number;
-  /** The Express session-refresh soak; must exceed the 300 s session lifetime to cross a refresh. */
+  /** The Express session-refresh soak; must exceed the 300 s session lifetime to cross a refresh. Paced: it needs time, not volume. */
   refreshSoakSeconds: number;
   /** In-flight levels for the step 6 pool ramp. */
   poolRamp: number[];
@@ -81,12 +81,16 @@ export interface RunConfig {
   targets: Targets;
   /** The bench role in the throwaway account, assumed from the pod's role. Absent for a same-account or local run. */
   assumeRoleArn?: string;
+  /** A bench key that is not any bucket's default key: the single-key probe names it on a directory-bucket put. */
+  foreignKmsKeyArn?: string;
+  profileName: string;
   /** Region of the STS endpoint used for the hop (the cluster's region). */
   stsRegion: string;
   /** Step filter (`1`..`6`), for re-running one step. Default: every step of the lane. */
   steps?: number[];
 }
 
+const KMS_KEY_ARN = /^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/;
 const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const REGION = /^[a-z]{2}(?:-[a-z]+)+-\d$/;
 
@@ -94,7 +98,7 @@ function s3Target(id: string, v: unknown): S3Target {
   const o = v as Partial<S3Target> | undefined;
   if (!o || typeof o.bucket !== "string" || !BUCKET.test(o.bucket)) throw new Error(`ledger-bench: ${id}.bucket is not a bucket name`);
   if (typeof o.region !== "string" || !REGION.test(o.region)) throw new Error(`ledger-bench: ${id}.region is not a region`);
-  if (o.kmsKeyArn !== undefined && !/^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/.test(o.kmsKeyArn)) throw new Error(`ledger-bench: ${id}.kmsKeyArn is not a KMS key ARN`);
+  if (o.kmsKeyArn !== undefined && !KMS_KEY_ARN.test(o.kmsKeyArn)) throw new Error(`ledger-bench: ${id}.kmsKeyArn is not a KMS key ARN`);
   if (o.endpoint !== undefined && !localEndpoint(o.endpoint)) throw new Error(`ledger-bench: ${id}.endpoint may only be a loopback emulator`);
   return { bucket: o.bucket, region: o.region, ...(o.kmsKeyArn ? { kmsKeyArn: o.kmsKeyArn } : {}), ...(o.endpoint ? { endpoint: o.endpoint } : {}) };
 }
@@ -128,7 +132,7 @@ export function parseConfig(json: string, env: NodeJS.ProcessEnv = process.env):
   const runId = String(env.LEDGER_BENCH_RUN_ID ?? raw.runId ?? "");
   if (!/^[a-z0-9][a-z0-9-]{2,40}$/.test(runId)) throw new Error("ledger-bench: runId must be 3-41 characters of [a-z0-9-]");
   const profileName = String(env.LEDGER_BENCH_PROFILE ?? raw.profile ?? "standard");
-  const profile = PROFILES[profileName];
+  const profile = Object.hasOwn(PROFILES, profileName) ? PROFILES[profileName] : undefined;
   if (!profile) throw new Error(`ledger-bench: unknown profile ${profileName}`);
   const t = (raw.targets ?? {}) as Record<string, unknown>;
   const targets: Targets = {};
@@ -152,12 +156,15 @@ export function parseConfig(json: string, env: NodeJS.ProcessEnv = process.env):
     if (!name.replaceAll("_", "-").includes(NAME_MARKER)) throw new Error(`ledger-bench: ${id} is not a ${NAME_MARKER} resource; refusing to write to it`);
   }
   const assumeRoleArn = raw.assumeRoleArn === undefined ? undefined : String(raw.assumeRoleArn);
+  const foreignKmsKeyArn = raw.foreignKmsKeyArn === undefined ? undefined : String(raw.foreignKmsKeyArn);
+  if (foreignKmsKeyArn !== undefined && !KMS_KEY_ARN.test(foreignKmsKeyArn)) throw new Error("ledger-bench: foreignKmsKeyArn is not a KMS key ARN");
+  if (foreignKmsKeyArn !== undefined && Object.values(targets).some((t) => "kmsKeyArn" in t && t.kmsKeyArn === foreignKmsKeyArn)) throw new Error("ledger-bench: foreignKmsKeyArn must not be a bucket's own key");
   const stsRegion = String(raw.stsRegion ?? "us-west-2");
   if (!REGION.test(stsRegion)) throw new Error("ledger-bench: stsRegion is not a region");
   const stepsRaw = env.LEDGER_BENCH_STEPS ?? (Array.isArray(raw.steps) ? raw.steps.join(",") : undefined);
   const steps = stepsRaw ? String(stepsRaw).split(",").map((s) => Number(s.trim())) : undefined;
   if (steps && steps.some((s) => !Number.isInteger(s) || s < 1 || s > 6)) throw new Error("ledger-bench: steps are 1..6");
-  return { runId, lane, profile, targets, stsRegion, ...(assumeRoleArn ? { assumeRoleArn } : {}), ...(steps ? { steps } : {}) };
+  return { runId, lane, profile, profileName, targets, stsRegion, ...(assumeRoleArn ? { assumeRoleArn } : {}), ...(foreignKmsKeyArn ? { foreignKmsKeyArn } : {}), ...(steps ? { steps } : {}) };
 }
 
 /** The targets a lane needs; a lane refuses to start without them. */

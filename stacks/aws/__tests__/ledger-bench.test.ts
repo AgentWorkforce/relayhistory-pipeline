@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseConfig } from "../../../benchmarks/ledger-bench/config.ts";
-import { clientConfig, parseInputs, renderJob, resourceNames, type Inputs } from "../ledger-bench/ops.ts";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { STANDARD } from "../../../benchmarks/ledger-bench/config.ts";
+import { BUNDLE_MAX_BYTES, clientConfig, insideRepo, isClean, ledgerAdd, parseInputs, renderJob, resourceNames, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
 
 const DIR = join(import.meta.dir, "..", "ledger-bench");
 const read = (name: string) => readFileSync(join(DIR, name), "utf8");
@@ -11,14 +14,20 @@ const INPUTS: Inputs = {
   region: "us-west-2", eastRegion: "us-east-1", expressZoneA: "usw2-az1", expressZoneB: "usw2-az3", image: `registry.example/services@sha256:${"a".repeat(64)}`,
   nodeSelector: { "example/role": "general" }, tolerations: [], cpu: "500m", cpuLimit: "1", memory: "1536Mi", owner: "s3-spike-finn", ttl: "2026-11-18",
 };
-const KEYS = { east: `arn:aws:kms:us-east-1:111111111111:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`, west: `arn:aws:kms:us-west-2:111111111111:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}` };
+const keyArn = (region: string, n: string) => `arn:aws:kms:${region}:111111111111:key/${n.repeat(8)}-${n.repeat(4)}-${n.repeat(4)}-${n.repeat(4)}-${n.repeat(12)}`;
+const KEYS = { east: keyArn("us-east-1", "0"), west: keyArn("us-west-2", "1"), probe: keyArn("us-west-2", "2") };
+const SHA = "b".repeat(64);
 
 describe("ledger-bench inputs", () => {
   test("accepts a complete record and defaults the scheduling fields", () => {
-    const { nodeSelector, tolerations, ...rest } = INPUTS;
+    const { nodeSelector: _n, tolerations: _t, dataProfile: _d, ...rest } = INPUTS;
+    // The cluster side's operator has no data profile, and the reverse.
     expect(parseInputs(JSON.stringify(rest))).toMatchObject({ nodeSelector: {}, tolerations: [] });
-    expect(nodeSelector).toBeDefined();
-    expect(tolerations).toBeDefined();
+    expect(parseInputs(JSON.stringify({ ...INPUTS, keys: KEYS })).keys).toEqual(KEYS);
+  });
+  test("refuses key ARNs that are malformed or not three different keys", () => {
+    expect(() => parseInputs(JSON.stringify({ ...INPUTS, keys: { ...KEYS, probe: KEYS.west } }))).toThrow(/three different keys/);
+    expect(() => parseInputs(JSON.stringify({ ...INPUTS, keys: { ...KEYS, east: "alias/x" } }))).toThrow(/keys.east/);
   });
   test("refuses the cluster's account as the data account, one zone twice, one Region twice, and an image by tag", () => {
     const bad = (patch: Partial<Inputs>) => () => parseInputs(JSON.stringify({ ...INPUTS, ...patch }));
@@ -36,6 +45,9 @@ describe("ledger-bench client config", () => {
     const config = parseConfig(JSON.stringify({ ...clientConfig(INPUTS, KEYS), runId: "run-1", lane: "express" }), {});
     expect(Object.keys(config.targets)).toEqual(["R1", "R2", "R3", "R4", "R5", "R6"]);
     expect(config.assumeRoleArn).toBe("arn:aws:iam::111111111111:role/ledger-bench-client");
+    // The single-key probe names a key that is no bucket's default.
+    expect(config.foreignKmsKeyArn).toBe(KEYS.probe);
+    expect(Object.values(config.targets).map((t) => ("kmsKeyArn" in t ? t.kmsKeyArn : undefined))).not.toContain(KEYS.probe);
     expect(config.targets.R4!.bucket).toBe("ledger-bench-r4-111111111111--usw2-az1--x-s3");
     expect(config.targets.R4!.bucket.length).toBeLessThanOrEqual(63);
   });
@@ -60,11 +72,13 @@ describe("ledger-bench client config", () => {
 describe("ledger-bench Job", () => {
   const template = read("job.template.yaml");
   test("renders every value, pins the deadline and runs without privileges", () => {
-    const job = renderJob(template, INPUTS, { runId: "run-1", lane: "r2", profile: "standard", steps: "" });
+    const job = renderJob(template, INPUTS, { runId: "run-1", lane: "r2", profile: "standard", steps: "", bundleSha256: SHA });
     expect(job).not.toContain("${");
     expect(job).toContain("name: ledger-bench-run-1-r2");
     expect(job).toContain("activeDeadlineSeconds: 14400");
-    expect(job).toContain("ttlSecondsAfterFinished: 3600");
+    // The finished Job is the results: it must outlive a night, not an hour.
+    expect(job).toContain("ttlSecondsAfterFinished: 172800");
+    expect(job).toContain(`{ name: LEDGER_BENCH_BUNDLE_SHA256, value: "${SHA}" }`);
     expect(job).toContain("backoffLimit: 0");
     expect(job).toContain(`image: ${INPUTS.image}`);
     expect(job).toContain('nodeSelector: {"example/role":"general"}');
@@ -74,11 +88,14 @@ describe("ledger-bench Job", () => {
     expect(job).toContain("namespace: ledger-bench");
   });
   test("refuses a run id, lane, profile or step list that could alter the manifest", () => {
-    const render = (p: Partial<Parameters<typeof renderJob>[2]>) => () => renderJob(template, INPUTS, { runId: "run-1", lane: "r2", profile: "standard", steps: "", ...p });
+    const render = (p: Partial<Parameters<typeof renderJob>[2]>) => () => renderJob(template, INPUTS, { runId: "run-1", lane: "r2", profile: "standard", steps: "", bundleSha256: SHA, ...p });
     expect(render({ runId: 'x"\n  hostNetwork: true' })).toThrow(/run id/);
     expect(render({ lane: "prod" as never })).toThrow(/lane/);
     expect(render({ profile: "huge" })).toThrow(/profile/);
     expect(render({ steps: "1;rm" })).toThrow(/steps/);
+    expect(render({ runId: "run-1-" })).toThrow(/run id/);
+    expect(render({ profile: "constructor" })).toThrow(/profile/);
+    expect(render({ bundleSha256: 'x"' })).toThrow(/bundle hash/);
   });
 });
 
@@ -91,7 +108,8 @@ describe("ledger-bench templates", () => {
   test("the pod role can only assume the client role, and only the bench ServiceAccount gets it", () => {
     const policies = identity.slice(identity.indexOf("      Policies:"), identity.indexOf("      Tags:"));
     expect(policies.match(/Action:/g)!.length).toBe(1);
-    expect(policies).toContain('Action: "sts:AssumeRole"');
+    // TagSession with AssumeRole: Pod Identity session tags are transitive, and the hop fails without it.
+    expect(policies).toContain('Action: ["sts:AssumeRole", "sts:TagSession"]');
     expect(policies).toContain("role/ledger-bench-client");
     expect(policies).not.toContain("*");
     expect(identity).toContain("AllowedValues: [ledger-bench]");
@@ -99,6 +117,9 @@ describe("ledger-bench templates", () => {
     expect(identity).toContain('"aws:RequestTag/kubernetes-service-account": !Ref ServiceAccount');
   });
   test("the client role is trusted only by that pod role and reaches only bench resources", () => {
+    const trust = west.slice(west.indexOf("      AssumeRolePolicyDocument:", west.indexOf("  ClientRole:")), west.indexOf("        - PolicyName: ledger-bench-targets"));
+    expect(trust).toContain('Action: ["sts:AssumeRole", "sts:TagSession"]');
+    expect(trust.match(/Effect: Allow/g)!.length).toBe(1);
     expect(west).toContain('"aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"');
     const policy = west.slice(west.indexOf("        - PolicyName: ledger-bench-targets"), west.indexOf("  # A backstop"));
     // Every S3 object grant is under bench/, every bucket is a ledger-bench bucket, KMS is the bench keys only (by ARN and by tag).
@@ -118,5 +139,60 @@ describe("ledger-bench templates", () => {
     expect(west).toContain("MaxWriteRequestUnits: 10000");
     expect(west).toContain("BillingMode: PAY_PER_REQUEST");
     expect(west.match(/BucketKeyEnabled: false/g)!.length).toBe(1);
+    // The probe key is a key of its own: no bucket's encryption refers to it.
+    expect(west).toContain("ProbeKeyArn: { Value: !GetAtt ProbeKey.Arn }");
+    expect(west).not.toContain("KMSMasterKeyID: !GetAtt ProbeKey.Arn");
+  });
+  test("the pod cannot open a connection to another pod: every private and shared range is excluded", () => {
+    const ns = read("namespace.yaml");
+    for (const cidr of ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"]) expect(ns).toContain(cidr);
+    expect(ns).toContain("cidr: 169.254.170.23/32");
+    expect(ns).toContain("ingress: []");
+    expect(ns).toContain("pod-security.kubernetes.io/enforce: restricted");
+  });
+});
+
+describe("ledger-bench ops guards", () => {
+  const entry = (run: string, lane: LedgerEntry["lane"], usd: number): LedgerEntry => ({ run, lane, profile: "standard", usd });
+  test("the spend ledger holds the approved cap over every run together", () => {
+    const lanes = ["r1", "r2", "r3", "express", "dynamo"] as const;
+    let ledger: LedgerEntry[] = [];
+    for (const run of ["smoke-1", "a", "b", "c"]) ledger = ledgerAdd(ledger, run, run === "smoke-1" ? "smoke" : "standard", [...lanes]);
+    expect(ledger.length).toBe(20);
+    // Three repeats and a smoke run fit; a fourth repeat, or one more lane, does not.
+    expect(() => ledgerAdd(ledger, "d", "standard", [...lanes])).toThrow(/over the approved 300 USD/);
+    expect(() => ledgerAdd(ledger, "d", "standard", ["r2"])).toThrow(/Nothing was started/);
+    expect(ledgerAdd(ledger, "smoke-2", "smoke", ["r2"]).length).toBe(21);
+    expect(() => ledgerAdd([], "a", "constructor", ["r2"])).toThrow(/profile/);
+    expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008, 1);
+  });
+  test("teardown refuses while a lane's results are not collected", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-bench-test-"));
+    const ledger = [entry("a", "r1", 1), entry("a", "r2", 1), entry("a", "r3", 1)];
+    writeFileSync(join(dir, "a-r1.jsonl"), '{"ledger_bench":1,"event":"end"}\n');
+    writeFileSync(join(dir, "a-r2.jsonl"), '{"ledger_bench":1,"event":"start"}\n'); // collected mid-run
+    expect(uncollected(ledger, dir)).toEqual(["a-r2", "a-r3"]);
+    expect(uncollected(ledger, join(dir, "missing"))).toEqual(["a-r1", "a-r2", "a-r3"]);
+    expect(uncollected([entry("a", "r1", 1)], dir)).toEqual([]);
+  });
+  test("verify is clean only when every lookup said gone and only keys pending deletion remain", () => {
+    const gone = [{ what: "a", gone: true }, { what: "b", gone: true }];
+    expect(isClean(gone, [])).toBe(true);
+    expect(isClean(gone, [{ region: "us-west-2", type: "kms", state: "PendingDeletion" }])).toBe(true);
+    expect(isClean(gone, [{ region: "us-west-2", type: "kms", state: "Enabled" }])).toBe(false);
+    expect(isClean(gone, [{ region: "us-west-2", type: "s3", state: "exists" }])).toBe(false);
+    expect(isClean([...gone, { what: "c", gone: false, detail: "lookup failed" }], [])).toBe(false);
+    // No check at all proves nothing.
+    expect(isClean([], [])).toBe(false);
+  });
+  test("results and inputs are kept out of the repository, also through a symlink", () => {
+    expect(insideRepo(join(import.meta.dir, "new-results-dir"))).toBe(true);
+    const link = join(mkdtempSync(join(tmpdir(), "ledger-bench-test-")), "link");
+    symlinkSync(join(import.meta.dir, "..", "ledger-bench"), link);
+    expect(insideRepo(join(link, "results"))).toBe(true);
+    expect(insideRepo(tmpdir())).toBe(false);
+  });
+  test("the bundle limit is the ConfigMap's, under 1 MiB", () => {
+    expect(BUNDLE_MAX_BYTES).toBeLessThan(1024 * 1024);
   });
 });

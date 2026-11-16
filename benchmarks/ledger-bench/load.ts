@@ -31,7 +31,7 @@ export interface LoadOptions {
   op: (worker: number, i: number) => Promise<string | void>;
   /** Checked before every operation; a true result ends the cell early and marks it truncated. */
   stop?: () => boolean;
-  /** End the cell once this many operations have been started (warm-up included): bounds a fast cell's cost. */
+  /** End the cell once this many steady-state operations have been started (warm-up is bounded by its time): bounds a fast cell's cost. */
   maxOps?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -76,11 +76,13 @@ export async function runLoad(options: LoadOptions): Promise<CellResult> {
         truncated = true;
         return;
       }
-      if (options.maxOps !== undefined && started >= options.maxOps) {
-        capped = true;
-        return;
+      if (t0 >= steadyFrom) {
+        if (options.maxOps !== undefined && started >= options.maxOps) {
+          capped = true;
+          return;
+        }
+        started++;
       }
-      started++;
       let label: string | undefined;
       let failed: string | undefined;
       try {

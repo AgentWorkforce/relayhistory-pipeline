@@ -19,7 +19,8 @@ metadata:
 automountServiceAccountToken: false
 ---
 # No pod in this namespace accepts a connection, and none may open one to another pod in the cluster:
-# egress is DNS, the Pod Identity agent, and HTTPS to addresses outside the private ranges (AWS endpoints).
+# egress is DNS, the Pod Identity agent, and HTTPS to addresses outside the private and shared ranges (the
+# public AWS endpoints; this relies on the VPC having no interface endpoint for S3, STS or DynamoDB).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -41,7 +42,7 @@ spec:
       ports:
         - { protocol: TCP, port: 80 }
     - to:
-        - ipBlock: { cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16] }
+        - ipBlock: { cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 198.18.0.0/15, 169.254.0.0/16] }
       ports:
         - { protocol: TCP, port: 443 }
 ---
@@ -54,10 +55,10 @@ metadata:
   labels: { purpose: ledger-bench }
 spec:
   hard:
-    pods: "8"
+    pods: "6"
     requests.cpu: "4"
-    requests.memory: 8Gi
-    limits.cpu: "5"
-    limits.memory: 8Gi
+    requests.memory: 10Gi
+    limits.cpu: "6"
+    limits.memory: 10Gi
     services: "0"
     persistentvolumeclaims: "0"

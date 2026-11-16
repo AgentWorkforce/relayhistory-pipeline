@@ -6,7 +6,7 @@
  * list prices in USD, rounded up.
  */
 import { GROUP_SIZES, logOpCap, STREAM_COUNTS, TRANSACT_ITEMS, TRANSACT_WRITERS, HOT_HEAD_LEVELS, transactOpCap } from "./caps.ts";
-import { LANES, type Profile } from "./config.ts";
+import { LANES, type Lane, type Profile } from "./config.ts";
 
 /** Lanes whose budgeted requests are S3 requests; the dynamo lane's are priced by write units instead. */
 const S3_LANES = LANES.filter((lane) => lane !== "dynamo").length;
@@ -21,8 +21,14 @@ export const PRICE = {
   dynamoWriteUnit: 1.25 / 1_000_000,
 } as const;
 
-/** KMS key-months, a few GiB-days of storage, Express storage for hours, cross-region transfer for R1: rounded up. */
-const FIXED_USD = 10;
+/**
+ * What the request budget does not price, rounded up: KMS key-months, a few GiB-days of storage, S3 Express
+ * storage and per-GiB charges for hours, DynamoDB reads, cross-region transfer for R1, and NAT data processing
+ * (billed to the cluster's account).
+ */
+export const FIXED_USD = 15;
+/** The approved ceiling for the whole benchmark, every run included. */
+export const APPROVED_CAP_USD = 300;
 
 export interface CostBound {
   /** Lanes that make S3 requests. */
@@ -45,6 +51,18 @@ export function dynamoWriteUnitsMax(profile: Profile): number {
   for (const group of GROUP_SIZES) units += STREAM_COUNTS.length * logOpCap(profile, group) * (group + 2) * 2;
   units += HOT_HEAD_LEVELS.length * profile.maxOpsPerCell;
   return units;
+}
+
+/** The most one run of one lane can cost: what `ops.ts run` adds to the spend ledger before it starts the lane. */
+export function laneCostBound(profile: Profile, lane: Lane): number {
+  const s3 = lane === "dynamo" ? 0 : profile.requestBudgetPerLane * (PRICE.s3Write + PRICE.kmsCall);
+  let units = 0;
+  if (lane === "dynamo") {
+    for (const items of TRANSACT_ITEMS) units += TRANSACT_WRITERS.length * transactOpCap(profile, items) * items * 2;
+    units += HOT_HEAD_LEVELS.length * profile.maxOpsPerCell;
+  }
+  if (lane === "r2") for (const group of GROUP_SIZES) units += STREAM_COUNTS.length * logOpCap(profile, group) * (group + 2) * 2;
+  return Math.ceil((s3 + units * PRICE.dynamoWriteUnit) * 100) / 100;
 }
 
 export function costBound(profile: Profile, repeats: number, lanes: number = S3_LANES): CostBound {

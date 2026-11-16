@@ -5,7 +5,7 @@ import { GROUP_SIZES, HOT_HEAD_LEVELS, logOpCap, STREAM_COUNTS, TRANSACT_ITEMS, 
 import type { TargetId } from "./config.ts";
 import { cell, jsonDoc, key, KIB, need, randomBytes, readBody, type Ctx } from "./context.ts";
 import { errorClass } from "./load.ts";
-import { checkLog, commitSummary, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "./protocols.ts";
+import { checkLog, commitSummary, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, SHARDS_PER_BATCH, type CommitStats, type StreamWriter } from "./protocols.ts";
 import { Histogram, Tally } from "./stats.ts";
 
 type BucketId = Exclude<TargetId, "R6">;
@@ -29,7 +29,7 @@ export async function step3P13(ctx: Ctx, target: BucketId): Promise<void> {
     const retries = new Tally();
     await cell(
       ctx,
-      { step: 3, cell: "p13", target, params: { streams, in_flight: CLIENT_CONCURRENCY, round_trips: P13_ROUND_TRIPS } },
+      { step: 3, cell: "p13", target, params: { streams, in_flight: CLIENT_CONCURRENCY, round_trips: P13_ROUND_TRIPS, shards: SHARDS_PER_BATCH } },
       { concurrency: CLIENT_CONCURRENCY, seconds: ctx.profile.protocolSeconds, op: async (w, i) => void (await p13Batch(store, root, streams === 1 ? 0 : (w * 8 + (i % 8)) % streams, w, `w${w}-b${i}`, retries)) },
       () => ({ batches_per_op: 1, cas_retries: retries.toJSON() }),
     );
@@ -54,7 +54,8 @@ export async function step3Log(ctx: Ctx, target: BucketId, protocol: "plog" | "p
       const concurrency = Math.min(CLIENT_CONCURRENCY, streams);
       const result = await cell(
         ctx,
-        { step: 3, cell: protocol, target, params: { streams, group, writers: concurrency } },
+        // Every stream keeps one payload PUT pipelined, so up to `streams` payload PUTs are in flight.
+        { step: 3, cell: protocol, target, params: { streams, group, writers: concurrency, pipelined_payloads: streams } },
         {
           concurrency,
           seconds: ctx.profile.protocolSeconds,
@@ -80,7 +81,7 @@ export async function step3Log(ctx: Ctx, target: BucketId, protocol: "plog" | "p
         step: 3,
         cell: `${protocol}_readback`,
         target,
-        params: { streams, group },
+        params: { streams, group, checked_streams: Math.min(streams, 8), entries_read: protocol === "plog" && group <= 4 },
         result: { ...check, committed_all_streams: committed, committed_checked_streams: expected, violations: check.gaps + check.duplicate_batches + (check.entries === expected ? 0 : 1), batches_per_sec: Math.round(result.ops_per_sec * group * 100) / 100 },
       });
     }
@@ -121,7 +122,17 @@ export async function step4(ctx: Ctx, credentials: CredentialProvider, fetcher: 
     await cell(
       ctx,
       { step: 4, cell: "session_refresh_soak", target: "R4", params: { concurrency: 8, seconds: ctx.profile.refreshSoakSeconds, refresh_before_s: 60 } },
-      { concurrency: 8, seconds: ctx.profile.refreshSoakSeconds, maxOps: Number.MAX_SAFE_INTEGER, op: async (w, i) => void (i % 2 === 0 ? await r4.put(key(root, "soak", (w * 131 + i) % 512), body) : await readBody(r4, key(root, "soak", (w * 131 + i - 1) % 512))) },
+      {
+        concurrency: 8,
+        seconds: ctx.profile.refreshSoakSeconds,
+        maxOps: Number.MAX_SAFE_INTEGER,
+        // Paced to about 300 requests a second: the soak has to span two refreshes, not spend the budget.
+        op: async (w, i) => {
+          if (i % 2 === 0) await r4.put(key(root, "soak", (w * 131 + i) % 512), body);
+          else await readBody(r4, key(root, "soak", (w * 131 + i - 1) % 512));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        },
+      },
       () => ({ create_session_calls: (ctx.expressStats.R4?.createSessionCalls ?? 0) - before, create_session_failures: ctx.expressStats.R4?.createSessionFailures ?? 0 }),
     );
   }
@@ -163,14 +174,17 @@ export async function step4(ctx: Ctx, credentials: CredentialProvider, fetcher: 
   if (foreignKmsKeyArn) {
     const other = expressStore(targets.R4, credentials, fetcher, { sseKmsKeyArn: foreignKmsKeyArn });
     let outcome: string;
+    let violations = 0;
     try {
       await other.store.put(key(root, "foreign-key"), jsonDoc({ probe: "foreign-key" }, KIB));
       const stored = await r4.head(key(root, "foreign-key"));
       outcome = stored?.sseKmsKeyId === foreignKmsKeyArn ? "accepted_with_foreign_key" : "accepted_with_bucket_key";
+      // Enforced only if the foreign key was not used; a refusal or the bucket's key both count.
+      violations = outcome === "accepted_with_foreign_key" ? 1 : 0;
     } catch (error) {
       outcome = `refused_${errorClass(error)}`;
     }
-    ctx.emit({ step: 4, cell: "single_kms_key", target: "R4", params: {}, result: { outcome } });
+    ctx.emit({ step: 4, cell: "single_kms_key", target: "R4", params: {}, result: { outcome, violations } });
   }
 }
 
