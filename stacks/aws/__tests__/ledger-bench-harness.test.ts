@@ -9,7 +9,7 @@ import { errorClass, runLoad } from "../../../benchmarks/ledger-bench/load.ts";
 import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../../../benchmarks/ledger-bench/protocols.ts";
 import { Histogram, median, Tally } from "../../../benchmarks/ledger-bench/stats.ts";
 import { step3Log, step3P13, step3Race, step5 } from "../../../benchmarks/ledger-bench/steps-protocols.ts";
-import { ambiguousBody, ambiguousCommit, probeIfMatch, raceCas, raceCreate, raceDelete, step1, step2, step6 } from "../../../benchmarks/ledger-bench/steps-s3.ts";
+import { ambiguousBody, ambiguousCommit, endpointRoundTrips, probeIfMatch, raceCas, raceCreate, raceDelete, step1, step2, step6 } from "../../../benchmarks/ledger-bench/steps-s3.ts";
 import { FakeDynamo, FakeS3, type FakeS3Options } from "./ledger-bench-fake-aws.ts";
 
 const CREDS = { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret" };
@@ -219,6 +219,26 @@ describe("credentials and S3 Express", () => {
   test("names the zone of a directory bucket and refuses anything else", () => {
     expect(expressZone("ledger-bench-a--usw2-az3--x-s3")).toBe("usw2-az3");
     expect(() => expressZone("ledger-bench-a")).toThrow();
+  });
+});
+
+describe("endpoint round trips", () => {
+  test("times the kept-alive round trip apart from the first request, and reports a failure by class", async () => {
+    const { ctx, cells } = context(new FakeS3());
+    const seen: string[] = [];
+    const fetcher = (async (input: Parameters<typeof fetch>[0]) => {
+      seen.push(String(input));
+      if (String(input).includes("kms")) throw Object.assign(new Error("no route"), { code: "ECONNREFUSED" });
+      return new Response("<Error/>", { status: 403 });
+    }) as unknown as typeof fetch;
+    await endpointRoundTrips(ctx, "R2", [{ service: "s3", region: "us-west-2" }, { service: "kms", region: "us-west-2" }], fetcher);
+    expect(new Set(seen)).toEqual(new Set(["https://s3.us-west-2.amazonaws.com/", "https://kms.us-west-2.amazonaws.com/"]));
+    const [s3, kms] = cells.map((c) => c.result as { first_request_ms: number | string; latency: { n: number }; errors: Record<string, number> });
+    expect(typeof s3!.first_request_ms).toBe("number");
+    expect(s3!.latency.n).toBeGreaterThan(0);
+    expect(kms!.first_request_ms).toBe("thrown_Error");
+    expect(kms!.latency.n).toBe(0);
+    expect(cells.every((c) => c.cell === "endpoint_round_trip" && c.step === 1)).toBe(true);
   });
 });
 
@@ -478,5 +498,8 @@ describe("steps end to end on the fakes", () => {
     await step6(ctx, "R2").catch(() => {});
     expect(meter.used).toBe(200);
     expect(fake.requests.length).toBe(200);
+    // The stop is reported as the harness's own, not as a store fault.
+    const error = await store.put(key("bench/test/r2/x"), new Uint8Array(1)).catch((e: unknown) => e);
+    expect(errorClass(error)).toBe("budget_exhausted");
   });
 });

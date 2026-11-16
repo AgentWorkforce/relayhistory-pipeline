@@ -75,7 +75,7 @@ export const SMOKE: Profile = {
   poolRamp: [64],
   maxOpsPerCell: 2_000,
   requestBudgetPerLane: 100_000,
-  byteBudgetPerLane: 2 * 1024 ** 3,
+  byteBudgetPerLane: 8 * 1024 ** 3,
   ambiguousRecheckSeconds: 5,
 };
 
