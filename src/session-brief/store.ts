@@ -374,9 +374,13 @@ export async function recordBrief(
   key: SessionDirectoryKey,
   sourceRevisions: Record<string, number>,
   outcome: BriefOutcome,
-  options: { canonicalSessionId?: string } = {},
+  options: { canonicalSessionId?: string; coverage?: BriefCoverageWrite } = {},
 ): Promise<{ written: boolean }> {
   const revision = Math.max(0, ...Object.values(sourceRevisions));
+  // Summaries regeneration (push A): only with a coverage flag on and the columns present does a
+  // write touch covered_turns/retry_attempts/next_retry_at/config_hash/pipeline_version. Without
+  // `coverage` every statement and parameter list below is today's, byte for byte.
+  const cov = options.coverage;
   const client = await db.pool.connect();
   try {
     await client.query("BEGIN");
@@ -428,9 +432,9 @@ export async function recordBrief(
             source_fingerprint, title, description, state, brief_revision, brief_source_revisions,
             brief_fingerprint, scrub_ruleset, scrub_version, prompt_version, engine_version,
             model, message_count, shortened_messages, input_tokens, output_tokens, duration_ms,
-            error, generated_at, attempted_at, updated_at)
+            error, generated_at, attempted_at, updated_at${cov ? READY_COVERAGE.cols : ""})
          VALUES ($1, $2, $3, $4, 'ready', $5, $6::jsonb, $7, $8, $9, $21, $5, $6::jsonb, $7, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, NULL, $20::timestamptz, now(), now())
+                 $12, $13, $14, $15, $16, $17, $18, $19, NULL, $20::timestamptz, now(), now()${cov ? READY_COVERAGE.vals : ""})
          ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET
            status = 'ready', revision = excluded.revision, source_revisions = excluded.source_revisions,
            source_fingerprint = excluded.source_fingerprint, title = excluded.title,
@@ -443,7 +447,7 @@ export async function recordBrief(
            message_count = excluded.message_count, shortened_messages = excluded.shortened_messages,
            input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
            duration_ms = excluded.duration_ms, generated_at = excluded.generated_at,
-           error = NULL, attempted_at = now(), updated_at = now()`,
+           error = NULL, attempted_at = now(), updated_at = now()${cov ? READY_COVERAGE.set : ""}`,
         [
           ...keyParams(key),
           revision,
@@ -463,6 +467,7 @@ export async function recordBrief(
           t.durationMs,
           t.generatedAt.toISOString(),
           t.state,
+          ...(cov ? [cov.coveredTurns ?? null, cov.pipelineVersion ?? null, cov.configHash] : []),
         ],
       );
     } else if (outcome.status === "reused") {
@@ -470,7 +475,7 @@ export async function recordBrief(
         `UPDATE sessions.session_briefs
             SET status = 'ready', revision = $5, source_revisions = $6::jsonb,
                 source_fingerprint = $7, brief_revision = $5, brief_source_revisions = $6::jsonb,
-                error = NULL, attempted_at = now(), updated_at = now()
+                error = NULL, attempted_at = now(), updated_at = now()${cov ? ", retry_attempts = 0, next_retry_at = NULL" : ""}
           WHERE ${KEY} AND brief_fingerprint = $7 AND title IS NOT NULL AND prompt_version = $8
           RETURNING title, description, model`,
         [...keyParams(key), revision, revisions, outcome.fingerprint, SESSION_BRIEF_PROMPT_VERSION],
@@ -484,15 +489,18 @@ export async function recordBrief(
       reusedText = row;
     } else {
       const clear = outcome.status === "quarantined";
+      // A final failure with a coverage flag on: stamp the config hash, and with the retry flag
+      // move the backoff ladder (failedCoverage). Any other non-ready outcome is unchanged.
+      const failed = cov && outcome.status === "failed" ? failedCoverage(cov) : null;
       await client.query(
         `INSERT INTO sessions.session_briefs AS b
            (org_id, workspace_id, harness, session_id, status, revision, source_revisions, error,
-            attempted_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now())
+            attempted_at, updated_at${failed ? failed.cols : ""})
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, now(), now()${failed ? failed.vals : ""})
          ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET
            status = excluded.status, revision = excluded.revision,
            source_revisions = excluded.source_revisions, error = excluded.error,
-           attempted_at = now(), updated_at = now()
+           attempted_at = now(), updated_at = now()${failed ? failed.set : ""}
            ${
              clear
                ? `, source_fingerprint = NULL, title = NULL, description = NULL, state = NULL,
@@ -503,7 +511,7 @@ export async function recordBrief(
                   output_tokens = 0, duration_ms = NULL, generated_at = NULL`
                : ""
            }`,
-        [...keyParams(key), outcome.status, revision, revisions, outcome.error],
+        [...keyParams(key), outcome.status, revision, revisions, outcome.error, ...(failed ? failed.params : [])],
       );
     }
     const projected = outcome.status === "ready" ? outcome.text : reusedText;
@@ -529,6 +537,87 @@ export async function recordBrief(
   } finally {
     client.release();
   }
+}
+
+/** What a regeneration-aware write stamps (recordBrief options.coverage). */
+export interface BriefCoverageWrite {
+  /** The summariser config hash (src/session-brief/regen.ts briefConfigHash). */
+  configHash: string;
+  /** User turns in the input (ready only). */
+  coveredTurns?: number;
+  /** The engine version that wrote the brief, copied to pipeline_version (ready only). */
+  pipelineVersion?: string;
+  /** Final failure with SUMMARY_RETRY_BACKOFF_ENABLED: the ladder; configReset restarts it on a new hash. */
+  retry?: { backoffSeconds: readonly number[]; configReset: boolean };
+}
+
+/** Ready: $22 covered_turns, $23 pipeline_version, $24 config_hash; a success leaves the retry ladder. */
+const READY_COVERAGE = {
+  cols: ", covered_turns, pipeline_version, config_hash, retry_attempts, next_retry_at",
+  vals: ", $22, $23, $24, 0, NULL",
+  set: `, covered_turns = excluded.covered_turns, pipeline_version = excluded.pipeline_version,
+           config_hash = excluded.config_hash, retry_attempts = 0, next_retry_at = NULL`,
+};
+
+/**
+ * Failed: $9 config_hash; with retry, $10 the backoff ladder (seconds) and $11 configReset. Failure n
+ * (1-based) waits ladder[n]; past the end the array read is NULL, so next_retry_at is NULL and the row is
+ * terminal until the config hash changes or an operator requeues it. The new count reads the stored row
+ * (b), so the reset after a config change is lazy, per row, on its next write.
+ */
+function failedCoverage(cov: BriefCoverageWrite): { cols: string; vals: string; set: string; params: unknown[] } {
+  if (!cov.retry) {
+    return { cols: ", config_hash", vals: ", $9", set: ", config_hash = excluded.config_hash", params: [cov.configHash] };
+  }
+  const attempts = `CASE WHEN $11::boolean AND b.config_hash IS DISTINCT FROM $9::text THEN 1
+                                 ELSE least(coalesce(b.retry_attempts, 0) + 1, 32767) END`;
+  return {
+    cols: ", config_hash, retry_attempts, next_retry_at",
+    vals: ", $9, 1, now() + make_interval(secs => ($10::integer[])[1])",
+    set: `, config_hash = excluded.config_hash,
+           retry_attempts = ${attempts},
+           next_retry_at = now() + make_interval(secs => ($10::integer[])[${attempts}])`,
+    params: [cov.configHash, [...cov.retry.backoffSeconds], cov.retry.configReset],
+  };
+}
+
+/** The stored coverage of a brief (regeneration flags only; the columns must exist). */
+export async function briefCoverage(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+): Promise<{ coveredTurns: number | null; retryAttempts: number; configHash: string | null; pipelineVersion: string | null } | null> {
+  const { rows } = await db.query<Record<string, unknown>>(
+    `SELECT covered_turns, retry_attempts, config_hash, pipeline_version FROM sessions.session_briefs WHERE ${KEY}`,
+    keyParams(key),
+  );
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    coveredTurns: r.covered_turns === null || r.covered_turns === undefined ? null : Number(r.covered_turns),
+    retryAttempts: Number(r.retry_attempts ?? 0),
+    configHash: (r.config_hash as string | null) ?? null,
+    pipelineVersion: (r.pipeline_version as string | null) ?? null,
+  };
+}
+
+/**
+ * Whether the session is quiet, from its live pointers: ended when every one is done/abandoned,
+ * idle when the newest activity is older than `idleSeconds` (database clock). null otherwise.
+ */
+export async function briefSessionQuiet(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+  idleSeconds: number,
+): Promise<"ended_uncovered" | "idle_uncovered" | null> {
+  const { rows } = await db.query<{ ended: boolean | null; idle: boolean | null }>(
+    `SELECT bool_and(state IN ('done', 'abandoned')) AS ended,
+            max(last_activity_at) < now() - make_interval(secs => $5::integer) AS idle
+       FROM sessions.session_index WHERE ${KEY} AND deleted_at IS NULL`,
+    [...keyParams(key), Math.floor(idleSeconds)],
+  );
+  const r = rows[0];
+  if (r?.ended === true) return "ended_uncovered";
+  return r?.idle === true ? "idle_uncovered" : null;
 }
 
 /** True when `rows` (machine_id, revision) are exactly the brief's source revisions. */
@@ -751,8 +840,65 @@ export async function rearmAdmissibleParked(
  * enabling). `recoverRateLimited` (canonical mode) also arms a session whose brief is
  * rate_limited and whose wakeup is gone (pruned), so it is retried; admit() still gates it.
  */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; recoverJsonlInputFailures?: boolean; recoverRateLimited?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
-  const { rows } = await db.query<{ n: number }>(
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: SweepUnbriefedOptions = {}): Promise<number> {
+  const { rows } = await db.query<{ n: number }>(sweepUnbriefedSql(options, false), sweepUnbriefedParams(limit, options));
+  return rows[0]?.n ?? 0;
+}
+
+export interface SweepUnbriefedOptions {
+  includeChanged?: boolean;
+  refreshCanonicalInput?: boolean;
+  recoverJsonlInputFailures?: boolean;
+  recoverRateLimited?: boolean;
+  workspaceIds?: readonly string[];
+  /**
+   * Summaries regeneration (push A; the session_briefs coverage columns must exist). A failed brief
+   * stops counting as coverage when (2b) its config hash differs from `configHash` (a refused
+   * canonical input keeps its own recovery), or (2) it is on the backoff ladder (retry_attempts 1..max)
+   * and next_retry_at has passed. A terminal row (next_retry_at NULL) is never armed by the clock.
+   */
+  regen?: { configHash: string; configReset: boolean; retry: boolean; maxAttempts: number };
+}
+
+export interface RegenArmedBrief {
+  org_id: string;
+  workspace_id: string;
+  harness: string;
+  session_id: string;
+  /** Why it was armed: null for a session armed for today's reasons (no brief, changed input, ...). */
+  reason: "config_changed" | "retry_backoff" | null;
+  prior_status: string | null;
+  prior_failure_code: string | null;
+  prior_pipeline_version: string | null;
+}
+
+/** sweepUnbriefed with `options.regen`, returning the armed sessions and why, for the audit. */
+export async function sweepUnbriefedRegen(
+  db: SqlExecutor,
+  limit: number,
+  options: SweepUnbriefedOptions & { regen: NonNullable<SweepUnbriefedOptions["regen"]> },
+): Promise<RegenArmedBrief[]> {
+  const { rows } = await db.query<RegenArmedBrief>(sweepUnbriefedSql(options, true), sweepUnbriefedParams(limit, options));
+  return rows;
+}
+
+function sweepUnbriefedParams(limit: number, options: SweepUnbriefedOptions): unknown[] {
+  return [limit, options.includeChanged === true, options.workspaceIds ?? null,
+      options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
+      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true, options.recoverRateLimited === true,
+      ...(options.regen
+        ? [options.regen.configReset, options.regen.configHash, options.regen.retry, options.regen.maxAttempts]
+        : [])];
+}
+
+const REGEN_CONFIG_DUE = `$8::boolean AND b.status = 'failed' AND b.error IS DISTINCT FROM 'canonical_input_refused'
+                                  AND b.config_hash IS DISTINCT FROM $9::text`;
+const REGEN_RETRY_DUE = `$10::boolean AND b.status = 'failed'
+                                  AND b.retry_attempts BETWEEN 1 AND $11::integer AND b.next_retry_at <= now()`;
+
+function sweepUnbriefedSql(options: SweepUnbriefedOptions, rows: boolean): string {
+  const regen = options.regen !== undefined;
+  return (
     `WITH missing AS (
        SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
          FROM sessions.session_directory AS d
@@ -765,7 +911,9 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
                              AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM ${liveRevisions("d", "physical.session_id")})
                              -- Canonical mode: a rate_limited brief is not coverage. Its parked
                              -- wakeup can be pruned after SESSION_WAKE_MAX_AGE_HOURS; re-arm it.
-                             AND NOT ($7::boolean AND b.status = 'rate_limited')
+                             AND NOT ($7::boolean AND b.status = 'rate_limited')${regen ? `
+                             AND NOT (${REGEN_CONFIG_DUE})
+                             AND NOT (${REGEN_RETRY_DUE})` : ""}
                              AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'
                                   OR b.engine_version LIKE 'neon-backfill:%'
                                   OR (b.engine_version IS NOT DISTINCT FROM $4::text
@@ -788,11 +936,14 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
        INSERT INTO sessions.session_brief_wakeups
          (org_id, workspace_id, harness, session_id, admission, due_at)
        SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing
-       ON CONFLICT DO NOTHING RETURNING 1)
-     SELECT count(*)::int AS n FROM armed`,
-    [limit, options.includeChanged === true, options.workspaceIds ?? null,
-      options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
-      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true, options.recoverRateLimited === true],
+       ON CONFLICT DO NOTHING RETURNING ${rows ? "org_id, workspace_id, harness, session_id" : "1"})
+     ${rows ? `SELECT a.org_id, a.workspace_id, a.harness, a.session_id,
+            CASE WHEN b.status IS DISTINCT FROM 'failed' THEN NULL
+                 WHEN ${REGEN_CONFIG_DUE} THEN 'config_changed'
+                 WHEN ${REGEN_RETRY_DUE} THEN 'retry_backoff' END AS reason,
+            b.status AS prior_status, b.error AS prior_failure_code, b.pipeline_version AS prior_pipeline_version
+       FROM armed AS a
+       LEFT JOIN sessions.session_briefs AS b
+         ON b.org_id = a.org_id AND b.workspace_id = a.workspace_id AND b.harness = a.harness AND b.session_id = a.session_id` : "SELECT count(*)::int AS n FROM armed"}`
   );
-  return rows[0]?.n ?? 0;
 }
