@@ -45,6 +45,14 @@ export const LOG_REMEMBERED_BATCHES = 4096;
 export const LOG_PUT_ATTEMPTS = 4;
 
 const SEQ_DIGITS = 20;
+/**
+ * Entries live in DIRECTORIES of 1000 seqs (`e/<first 17 digits>/<20 digits>.json`), so the "nothing past head"
+ * proof lists only the directory holding head+1 and the next one: at most two pages, never the whole `e/` prefix
+ * (an ever-growing stream would otherwise cost O(N/1000) LIST pages per open). `list` works on `/` boundaries on every
+ * backend (S3, GCS, Azure, fs), so this needs no start-after support in the ObjectStore interface.
+ */
+const BUCKET_DIGITS = SEQ_DIGITS - 3;
+export const LOG_ENTRIES_PER_DIR = 1000;
 const sha256 = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
 const h = (v: string) => sha256(v).slice(0, 32);
 const pad = (seq: number) => {
@@ -56,12 +64,16 @@ export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string)
   const root = `${admissionUserDir(keyRoot, tenant)}/ledger/log/o=${h(originId)}`;
   return {
     root,
-    entry: (seq: number) => `${root}/e/${pad(seq)}.json`,
+    entry: (seq: number) => { const p = pad(seq); return `${root}/e/${p.slice(0, BUCKET_DIGITS)}/${p}.json`; },
+    /** The directory holding `seq` (a list prefix). */
+    entryDir: (seq: number) => `${root}/e/${pad(seq).slice(0, BUCKET_DIGITS)}`,
     checkpoint: (seq: number) => `${root}/c/${pad(seq)}.json`,
     /** A HINT only (the newest checkpoint seq); overwritten without CAS, may lag, never trusted alone. */
     head: `${root}/head.json`,
     /** Content-addressed payloads: the same bytes always land at the same key. */
     payload: (sha: string) => `${root}/p/${sha}.json.zst`,
+    /** The whole entry prefix: listed (first page only) to tell "no entries at all" from "entry 0 lost". */
+    entries: `${root}/e`,
   };
 }
 export type LogKeys = ReturnType<typeof logKeys>;
@@ -187,7 +199,9 @@ async function createEntry(store: ObjectStore, keys: LogKeys, seq: number, bytes
       return "landed";
     } catch (error) {
       if (taken(error)) {
-        const there = await readBytes(store, key);
+        let there: Uint8Array | undefined;
+        try { there = await readBytes(store, key); }
+        catch (readError) { if (transient(readError)) throw new LogUnavailable("log_entry_conflict_unreadable"); throw readError; }
         if (there === undefined) throw new LogUnavailable("log_entry_conflict_unreadable");
         return equalBytes(there, bytes) ? "landed" : "taken";
       }
@@ -202,29 +216,74 @@ async function createEntry(store: ObjectStore, keys: LogKeys, seq: number, bytes
   return equalBytes(there, bytes) ? "landed" : "taken";
 }
 
-/** Every entry seq stored for the stream (a listing of e/). Used to prove there is nothing past a head. */
-async function storedSeqs(store: ObjectStore, keys: LogKeys): Promise<number[]> {
-  const prefix = `${keys.root}/e/`, out: number[] = [];
+/** Seqs stored in one entry directory (at most LOG_ENTRIES_PER_DIR keys). A store fault is LogUnavailable. */
+async function seqsIn(store: ObjectStore, prefix: string): Promise<number[]> {
+  const out: number[] = [];
   let cursor: string | undefined;
-  do {
-    const page = await store.list(objectKey(`${keys.root}/e`), cursor);
-    for (const item of page.items) {
-      const k = String(item.key);
-      if (!k.startsWith(prefix)) continue;
-      const m = /^(\d{20})\.json$/.exec(k.slice(prefix.length));
-      if (m) out.push(Number(m[1]));
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
+  try {
+    do {
+      const page = await store.list(objectKey(prefix), cursor);
+      for (const item of page.items) {
+        const m = /\/(\d{20})\.json$/.exec(String(item.key));
+        if (m) out.push(Number(m[1]));
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+  } catch (error) {
+    if (transient(error)) throw new LogUnavailable("log_list_unavailable");
+    throw error;
+  }
   return out;
 }
 /**
- * A dense chain ends at `head`: anything stored past it is a deleted or lost entry in the middle (LogCorrupt), never a
- * shorter log. With no entry 0, any stored entry means entry 0 was lost: the stream must not read as legacy.
+ * Seqs stored past `head` in the two directories that could hold head+1 and its successors. A real gap (an entry
+ * deleted or lost in the middle) leaves head+2.. in place, so it is found unless 1000+ CONSECUTIVE entries were lost.
+ * A deleted TAIL (the newest entries, nothing after them) is indistinguishable from a shorter log: see the design.
  */
-async function assertNothingPast(store: ObjectStore, keys: LogKeys, head: number | null): Promise<void> {
-  const seqs = await storedSeqs(store, keys);
-  if (head === null ? seqs.length > 0 : seqs.some((s) => s > head)) throw new LogCorrupt(head === null ? "log_open_missing" : "log_entry_gap");
+async function seqsPast(store: ObjectStore, keys: LogKeys, head: number): Promise<number[]> {
+  const [a, b] = await Promise.all([seqsIn(store, keys.entryDir(head + 1)), seqsIn(store, keys.entryDir(head + 1 + LOG_ENTRIES_PER_DIR))]);
+  return [...a, ...b].filter((x) => x > head);
+}
+/** Whether any entry exists at all (the first page of `e/` is enough). */
+async function anyEntry(store: ObjectStore, keys: LogKeys): Promise<boolean> {
+  try {
+    const page = await store.list(objectKey(keys.entries));
+    return page.items.some((item) => /\/(\d{20})\.json$/.test(String(item.key)));
+  } catch (error) {
+    if (transient(error)) throw new LogUnavailable("log_list_unavailable");
+    throw error;
+  }
+}
+
+/**
+ * Entry 0's bytes, or undefined for a legacy stream. Concurrency-safe: when entry 0 reads missing but entries exist,
+ * entry 0 is read AGAIN before declaring it lost (a concurrent enableLogMode may have created it between the read
+ * and the list). Only a direct re-read still missing, with other entries present, is log_open_missing.
+ */
+async function readZero(store: ObjectStore, keys: LogKeys): Promise<Uint8Array | undefined> {
+  const zero = await readBytes(store, keys.entry(0));
+  if (zero !== undefined) return zero;
+  if (!(await anyEntry(store, keys))) return undefined;
+  const again = await readBytes(store, keys.entry(0));
+  if (again !== undefined) return again;
+  throw new LogCorrupt("log_open_missing");
+}
+
+/**
+ * Replay entries after state.head, applying each, to the end of the chain. Concurrency-safe: a stream being appended
+ * to keeps growing, so an entry listed past head is not a gap until head+1 is read DIRECTLY again and is still
+ * missing. Only then: LogCorrupt("log_entry_gap").
+ */
+async function* replay(store: ObjectStore, state: LogState): AsyncGenerator<LogEntry> {
+  for (;;) {
+    const bytes = await readBytes(store, state.keys.entry(state.head + 1));
+    if (bytes !== undefined) { yield applyEntry(state, bytes); continue; }
+    const past = await seqsPast(store, state.keys, state.head);
+    if (past.length === 0) return;
+    const again = await readBytes(store, state.keys.entry(state.head + 1));
+    if (again !== undefined) { yield applyEntry(state, again); continue; }
+    throw new LogCorrupt("log_entry_gap");
+  }
 }
 
 // ---- open / replay ----
@@ -237,8 +296,8 @@ function opened(keys: LogKeys, zero: Uint8Array): LogState {
 
 /** `undefined`: the stream is not in log mode (no entry 0, and no entry at all), so it is a legacy stream. */
 export async function openStream(store: ObjectStore, keys: LogKeys): Promise<LogState | undefined> {
-  const zero = await readBytes(store, keys.entry(0));
-  if (zero === undefined) { await assertNothingPast(store, keys, null); return undefined; }
+  const zero = await readZero(store, keys);
+  if (zero === undefined) return undefined;
   let state = opened(keys, zero);
   // Start from the newest checkpoint the hint names, if it verifies against its entry; else from entry 0. The hint
   // and the checkpoint are optional: a missing, malformed or unreadable one (a transient store error) falls back.
@@ -247,19 +306,16 @@ export async function openStream(store: ObjectStore, keys: LogKeys): Promise<Log
     if (hint && isNat(hint.seq) && hint.seq > 0) {
       const cp = parse((await readBytes(store, keys.checkpoint(hint.seq))) ?? new Uint8Array());
       const at = await readBytes(store, keys.entry(hint.seq));
-      if (validCheckpoint(cp) && cp.seq === hint.seq && at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover)
+      // Bounded on read: a checkpoint is trusted only as far as its hash, and an oversized window is ignored.
+      if (validCheckpoint(cp) && cp.seq === hint.seq && cp.remembered.length <= LOG_REMEMBERED_BATCHES && cp.epoch >= 1 &&
+        at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover)
         state = { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, epochWriter: cp.epochWriter, legacyCutover: cp.legacyCutover,
           inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
     }
   } catch (error) {
     if (!isObjectStoreError(error)) throw error;
   }
-  for (;;) {
-    const bytes = await readBytes(store, keys.entry(state.head + 1));
-    if (bytes === undefined) break;
-    applyEntry(state, bytes);
-  }
-  await assertNothingPast(store, keys, state.head);
+  for await (const _ of replay(store, state)) { /* applied in order */ }
   return state;
 }
 
@@ -298,21 +354,20 @@ function remember(m: Map<string, string>, batchId: string, digest: string) {
  * reader may still replay through; entry 0 is never deleted.
  */
 export async function* readEntries(store: ObjectStore, keys: LogKeys, fromSeq = 0): AsyncGenerator<LogEntry> {
-  const zero = await readBytes(store, keys.entry(0));
-  if (zero === undefined) { await assertNothingPast(store, keys, null); return; }
+  const zero = await readZero(store, keys);
+  if (zero === undefined) return;
   const state = opened(keys, zero);
   if (fromSeq === 0) yield parse(zero) as LogEntry;
-  for (;;) {
-    const bytes = await readBytes(store, keys.entry(state.head + 1));
-    if (bytes === undefined) break;
-    const e = applyEntry(state, bytes);
-    if (e.seq > fromSeq) yield e;
-  }
-  await assertNothingPast(store, keys, state.head);
+  for await (const e of replay(store, state)) if (e.seq > fromSeq) yield e;
 }
 
 // ---- writing ----
 
+/**
+ * `writer` IS the ownership identity: the same writer id is the same owner (a restart reusing it regains the stream
+ * without a take, and two processes sharing one would interleave appends; the chain stays linear, but the inbox cursor
+ * could move backwards). The wiring MUST use a per-process-lifetime id (minted at process start, never configured).
+ */
 export interface WriteDeps { writer: string; now?: () => number; sleep?: (ms: number) => Promise<void> }
 const deps = (d: WriteDeps) => ({ now: d.now ?? Date.now, sleep: d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))) });
 

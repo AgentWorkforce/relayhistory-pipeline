@@ -36,6 +36,7 @@ import { admitMessage } from "./admission-consumer.ts";
 import type { AdmissionMessage } from "./async-admission.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 import type { DeliverDeps } from "./deliver.ts";
+import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode, s3Ledger, serverLedgerParallel } from "./ledger-s3.ts";
 import { uploadConsentEnforcement, UPLOAD_CONSENT_VAR } from "./upload-consent.ts";
 import type { PromoteUploadDeps, UploadDirectConfig } from "./upload-admission.ts";
@@ -88,6 +89,10 @@ export function hostedUploadAdmissionConfig(env: Record<string, string | undefin
   let consent;
   try { consent = uploadConsentEnforcement(env[UPLOAD_CONSENT_VAR]); } catch { return no("upload_consent_invalid"); }
   if (consent !== "off") no("upload_consent_unsupported");
+  // The numbered-log commit (ledger-log.ts) is not wired to this hosted path: "on" refuses to start, never ignored.
+  let logCommit;
+  try { logCommit = ledgerLogCommitMode(env[INGEST_LEDGER_LOG_COMMIT_VAR]); } catch { return no("ledger_log_commit_invalid"); }
+  if (logCommit !== "off") no("ledger_log_commit_unsupported");
   let ledgerParallel;
   try { ledgerParallel = serverLedgerParallel(env); } catch { return no("ledger_parallel_invalid"); }
   return { region, bucket, keyRoot, secretId, ledgerParallel };

@@ -30,7 +30,8 @@ lives on one origin. Key root:
 
 ```
 <keyRoot>/<admissionUserDir>/ledger/log/o=<h(origin)>/
-  e/<seq, 20 digits>.json     immutable entries, written once
+  e/<first 17 digits>/<seq, 20 digits>.json
+                              immutable entries, written once, 1000 per directory
   c/<seq>.json                checkpoints (optional, every 64 entries)
   head.json                   hint: newest checkpoint seq (no CAS; may lag; always verified)
   p/<sha256>.json.zst         content-addressed payloads
@@ -53,9 +54,20 @@ kind "batches" batches: [{ batchId, digest, receiptId, sessions: [[source, sessi
 ```
 
 The `prev` hash chain makes a reorder or a torn write detectable, and the reader fails closed (`LogCorrupt`). A
-deleted or lost entry is caught too: after following the chain to its head, the reader lists `e/` and refuses
-anything stored past the head (`log_entry_gap`). With no entry 0, any stored entry means entry 0 was lost, and the
-stream must not read as legacy (`log_open_missing`). A batches entry must carry the current epoch AND be written by
+deleted or lost MIDDLE entry is caught too: when head + 1 reads missing, the reader lists the two entry
+directories that could hold head + 1 and its successors (at most two LIST pages, whatever the stream's length).
+If an entry is stored past head, it reads head + 1 AGAIN: a stream being appended to keeps growing, so a concurrent
+append is replayed, not mistaken for a gap. Only a direct re-read still missing, with a later entry present, is
+`log_entry_gap`. With no entry 0, the first page of `e/` is listed; if any entry exists, entry 0 is read again
+(a concurrent `enableLogMode` may have just created it) and only a re-read still missing is `log_open_missing`, so
+the stream never reads as legacy. A store fault on any listing or on the conflict read-back is `LogUnavailable`
+(retryable), never a raw store error.
+
+What is detectable: a lost entry 0, and a lost middle entry while one of its next 1000 successors still exists. What
+is NOT: a deleted TAIL (the newest entries, with nothing stored after them) reads as a shorter log; the next append
+then writes that seq again. Bounding that harm (for example by having the materializer's durable cursor refuse a head
+below it) is for the materializer slice. The entry directories (rather than a
+start-after LIST) keep the proof bounded on every backend with no change to the ObjectStore interface. A batches entry must carry the current epoch AND be written by
 the writer whose open or epoch entry set it. Its payload keys must be this stream's content addresses, and an entry
 whose `stream` names another stream is refused.
 
@@ -81,6 +93,11 @@ Two openers racing for entry 0 therefore get the same state, but only the one wh
 stale writer's next append targets a seq that is already taken: the create conflicts, the writer reads the entry
 back, finds different bytes, and stops (`LogFenced`). There is no fence object to CAS, and the fence changes only
 when ownership changes, never per batch.
+
+The writer id IS the ownership identity: the same id is the same owner. A restart reusing an id regains the stream
+without a take, and two processes sharing one would interleave appends (the chain stays linear, but the inbox
+cursor could move backwards). The wiring therefore uses a per-process-lifetime id minted at process start, never a
+configured or host-derived one.
 
 `takeStream` first resolves any pending entry. It keeps its own epoch entry pending until that resolves, so an
 ambiguous take resends exactly that entry. A take that loses its race does NOT take again: it catches the state up
@@ -148,7 +165,10 @@ today.
   `takeStream`, `appendBatches` (dedupe, create-if-absent, read-back, pending resend), `openStream` (from a
   verified checkpoint or entry 0), `readEntries`, `putPayload`, and the `INGEST_LEDGER_LOG_COMMIT` parse.
 - `selfhost-config.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is refused at startup; `off` changes nothing. The hosted
-  Worker does not read the flag at all: it must refuse `on` too before any hosted wiring (planned).
+  upload-admission runtime (`upload-admission-hosted.ts`) refuses `on` too (`ledger_log_commit_unsupported`); the
+  hosted Worker never runs the S3 ledger at all (it refuses `INGEST_LEDGER=s3`).
+- A checkpoint is trusted only as far as its hash: one with another `legacyCutover`, an epoch below 1 or a window
+  larger than `LOG_REMEMBERED_BATCHES` is ignored, and the open replays from entry 0.
 - Tests (`ledger-log.test.ts`, fs store):
   - flag parsing and the refusal;
   - the mode marker: idempotent; only the opener whose entry 0 landed owns it (two openers racing); a different
@@ -164,10 +184,17 @@ today.
   - an ambiguous take keeps its epoch entry pending and resends it;
   - landed-but-503 counts as landed;
   - never-landed gives `LogUnavailable`, and the retry resends the same bytes first;
-  - crash at every PUT prefix, failing before or after the write, with the process state dropped and the work
-    finished by a new writer: a valid chain, and every batch exactly once;
-  - readers refuse a missing middle entry, a lost entry 0, a bad prev hash, a stale-epoch batches entry, malformed
-    JSON and an entry from another stream;
+  - crash at every PUT prefix, failing before the write OR the process dying after it landed (each asserted to
+    fail), with the process state dropped and the work finished by a new writer: a valid chain, and every batch
+    exactly once;
+  - readers refuse a missing middle entry (also when its successor sits in the next entry directory), a lost
+    entry 0, a bad prev hash, a stale-epoch batches entry, malformed JSON and an entry from another stream;
+  - concurrency is not corruption: an entry appended between a reader's last read and its listing is replayed
+    (open and readEntries), and entry 0 created between an opener's read and its listing is read again;
+  - two openers genuinely racing for entry 0, and an owner's append racing another writer's take: exactly one
+    lands, the other backs off;
+  - a store fault on the gap listing is `LogUnavailable`;
+  - a checkpoint with another `legacyCutover`, or an oversized window, is ignored;
   - payloads are idempotent.
 
 ## Remaining
