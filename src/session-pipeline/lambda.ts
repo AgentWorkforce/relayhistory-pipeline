@@ -141,7 +141,9 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
-  /** SESSIONS_NEON_EXIT=true: the legacy readonly source (analysis_source_readonly_url) is never carried or built. */
+  /** Explicitly identifies analysis_source_readonly_url as the frozen Supabase legacy copy. */
+  legacyReadSource?: "frozen-supabase";
+  /** SESSIONS_NEON_EXIT=true: legacy source readers require legacyReadSource=frozen-supabase. */
   neonExit?: boolean;
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
@@ -189,11 +191,11 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   // is a misconfiguration (docs/search-and-runtime-adapters.md).
   const selected = validateAdapterEnv(env, { runtime: ["lambda"], runtimeDefault: "lambda", search: ["clickhouse", ...(composition?.registry.registered().filter(name => name !== "clickhouse") ?? [])], searchDefault: "clickhouse" });
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
-  // Both read the legacy readonly source, which has no non-Neon replacement; no host check substitutes.
+  const legacyReadSource = legacyReadSourceFromEnv(env);
   const neonExit = neonExitProfile(env);
   assertNoNeonEdge(neonExit, "the session pipeline", {
-    "SESSION_ANALYSIS_CACHE_ENABLED=1": env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
-    "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1",
+    "SESSION_ANALYSIS_CACHE_ENABLED=1": env.SESSION_ANALYSIS_CACHE_ENABLED === "1" && legacyReadSource !== "frozen-supabase",
+    "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1" && legacyReadSource !== "frozen-supabase",
   });
   if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs SEARCH_INDEX_ENABLED=1");
@@ -222,12 +224,20 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
+    ...(legacyReadSource === "frozen-supabase" ? { legacyReadSource } : {}),
     ...(neonExit.enabled ? { neonExit: true } : {}),
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
   };
+}
+
+export function legacyReadSourceFromEnv(env: NodeJS.ProcessEnv): "legacy" | "frozen-supabase" {
+  const value = env.SESSION_LEGACY_READ_SOURCE;
+  if (value === undefined || value === "") return "legacy";
+  if (value === "frozen-supabase") return value;
+  throw new Error('session pipeline: SESSION_LEGACY_READ_SOURCE must be "frozen-supabase" or unset');
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -274,11 +284,29 @@ function bufferedFeedLogin(secret: PipelineSecret): pg.ClientConfig | undefined 
  * Validate the readonly analysis source field. Called only from the analysis
  * branch with the flag on; never echoes the value.
  */
-export function analysisSourceReadonlyUrl(value: unknown): string {
+export function analysisSourceReadonlyUrl(
+  value: unknown,
+  source: "legacy" | "frozen-supabase" = "legacy",
+): string {
   if (value === undefined || value === null || value === "")
     throw new Error("analysis cache enabled without readonly source configuration (secret analysis_source_readonly_url is missing)");
   if (typeof value !== "string" || !/^postgres(ql)?:\/\//u.test(value))
     throw new Error("session pipeline secret analysis_source_readonly_url must be a postgres URL");
+  if (source === "frozen-supabase") {
+    let url: URL, database: string;
+    try {
+      url = new URL(postgresConnectionString(value));
+      database = decodeURIComponent(url.pathname).replace(/^\//u, "");
+    } catch {
+      throw new Error("session pipeline frozen legacy source is invalid");
+    }
+    const host = url.hostname.replace(/\.$/u, "").toLowerCase();
+    if (
+      !(host.endsWith(".supabase.co") || host.endsWith(".pooler.supabase.com")) ||
+      database !== "relayhistory_legacy"
+    )
+      throw new Error("session pipeline frozen legacy source must select Supabase relayhistory_legacy");
+  }
   return value;
 }
 
@@ -521,8 +549,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
-  // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
-  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
+  // Under Neon exit, carry the source only when the explicit frozen-Supabase selector passed startup.
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit && env.legacyReadSource !== "frozen-supabase" ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
 }
 
 /**
@@ -538,7 +566,7 @@ export function semanticCopyDeps(rt: Runtime): () => Promise<SemanticCopyStats> 
     if (!clickhouse || !sourceUrl || !sourceId) throw Object.assign(new Error("semantic copier configuration incomplete"), { reason: "config_incomplete" });
     let source: SemanticPostgresExecutor, db: SemanticPostgresExecutor;
     try {
-      source = semanticFeatureReader(semanticReadonlyPool(analysisSourceReadonlyUrl(sourceUrl)));
+      source = semanticFeatureReader(semanticReadonlyPool(analysisSourceReadonlyUrl(sourceUrl, rt.env.legacyReadSource ?? "legacy")));
       db = new SemanticPostgresExecutor(semanticMetadataPool(hoopdbUrl));
     } catch { throw Object.assign(new Error("semantic copier configuration invalid"), { reason: "config_invalid" }); }
     const ch = createSemanticClickHouseClient(clickhouse), endpoint = clickhouse.url;
@@ -555,7 +583,7 @@ export function semanticCopyDeps(rt: Runtime): () => Promise<SemanticCopyStats> 
 export function analysisDeps(rt: Runtime): AnalysisRefreshDeps {
   if (!rt.env.analysisCacheEnabled) throw new Error("analysis cache runtime unavailable");
   if (!rt.analysis) {
-    const url = analysisSourceReadonlyUrl(rt.analysisSourceUrl);
+    const url = analysisSourceReadonlyUrl(rt.analysisSourceUrl, rt.env.legacyReadSource ?? "legacy");
     rt.analysis = { db: rt.deps.pointer.db, store: rt.store, source: readonlyAnalysisSource(readonlyAnalysisPool(url, code => log.error("analysis source pool error", { stage: "analysis-cache", error_code: code }))) };
   }
   return rt.analysis;

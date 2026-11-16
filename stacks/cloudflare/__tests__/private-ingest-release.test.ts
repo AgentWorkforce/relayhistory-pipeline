@@ -58,8 +58,10 @@ test("typed release confirmation binds mode, main SHA and prior plan", () => {
   })).toThrow("private_ingest_release_confirmation");
 });
 
-function readbackFixture(phase: PrivateIngestReleasePhase) {
-  const input = privateIngestProfileForPhase(phase, kmsKeyArn), vars = sessionIngestVars(input.sessionIngest);
+function readbackFixture(phase: PrivateIngestReleasePhase, neonExit = false) {
+  const base = privateIngestProfileForPhase(phase, kmsKeyArn);
+  const input = neonExit ? { sessionIngest: { ...base.sessionIngest, neonExit: "on" as const } } : base;
+  const vars = sessionIngestVars(input.sessionIngest);
   const bindings: any[] = Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }));
   bindings.push(
     { name: "HYPERDRIVE", type: "hyperdrive", id: input.sessionIngest.hyperdriveId },
@@ -83,6 +85,60 @@ function readbackFixture(phase: PrivateIngestReleasePhase) {
   };
   return { input, active, version };
 }
+
+test("Neon exit is an explicit, frozen-custody release axis with exact live readback", () => {
+  for (const phase of ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
+    const fixture = readbackFixture(phase, true);
+    expect(privateIngestReleasePhase(fixture.input)).toBe(phase);
+    expect(privateIngestVersionReadback(fixture.input, fixture.active, fixture.version)).toMatchObject({
+      status: "PRIVATE_INGEST_LIVE_READBACK_PASS",
+      phase,
+    });
+    expect(fixture.version.resources!.bindings).toContainEqual({
+      name: "SESSIONS_NEON_EXIT",
+      type: "plain_text",
+      text: "true",
+    });
+  }
+
+  for (const phase of ["baseline-drain", "step-0-shadow"] as const) {
+    const profile = privateIngestProfileForPhase(phase, kmsKeyArn);
+    expect(() => privateIngestReleasePhase({
+      sessionIngest: { ...profile.sessionIngest, neonExit: "on" },
+    })).toThrow("private_ingest_profile_neon_exit");
+  }
+  const frozen = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
+  for (const neonExit of ["off", "true", true, false] as const)
+    expect(() => privateIngestReleasePhase({
+      sessionIngest: { ...frozen.sessionIngest, neonExit },
+    } as any)).toThrow("private_ingest_profile_neon_exit");
+
+  const legacy = readbackFixture("step-1-custody");
+  legacy.version.resources!.bindings!.push({ name: "SESSIONS_NEON_EXIT", type: "plain_text", text: "true" });
+  expect(() => privateIngestVersionReadback(legacy.input, legacy.active, legacy.version))
+    .toThrow("private_ingest_live_neon_exit");
+});
+
+test("Neon exit may toggle in-place, but cannot be combined with a rollout phase move", () => {
+  const current = readbackFixture("step-1-custody");
+  const target = { sessionIngest: { ...current.input.sessionIngest, neonExit: "on" as const } };
+  expect(privateIngestTransitionReadback(target, current.active, current.version))
+    .toMatchObject({ from: "step-1-custody", to: "step-1-custody" });
+
+  const currentExit = readbackFixture("step-1-custody", true);
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("step-1-custody", kmsKeyArn),
+    currentExit.active,
+    currentExit.version,
+  )).toMatchObject({ from: "step-1-custody", to: "step-1-custody" });
+
+  const nextPhase = privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn);
+  expect(() => privateIngestTransitionReadback(
+    { sessionIngest: { ...nextPhase.sessionIngest, neonExit: "on" } },
+    current.active,
+    current.version,
+  )).toThrow("private_ingest_live_transition");
+});
 
 test("post-deploy readback requires one 100% version and every targeted binding", () => {
   const selected = privateIngestActiveVersion({ deployments: [{

@@ -878,26 +878,39 @@ describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
     }
   });
 
-  it("refuses analysisCache: true and semanticCopy.enabled: true together with it, naming the flag", () => {
+  it("requires explicit frozen-source provenance for analysis and semantic readers", () => {
     expect(() => validate(withPipeline({ neonExit: true, analysisCache: true }))).toThrow(
-      "transcriptStore.sessionPipeline.neonExit refuses analysisCache: true (SESSION_ANALYSIS_CACHE_ENABLED reads the Neon readonly source)");
+      'transcriptStore.sessionPipeline.neonExit with analysisCache: true requires legacyReadSource: "frozen-supabase"');
     expect(() => validate(withPipeline({ neonExit: true, semanticCopy }))).toThrow(
-      "transcriptStore.sessionPipeline.neonExit refuses semanticCopy.enabled: true (SESSION_SEMANTIC_COPY_ENABLED reads the Neon readonly source)");
+      'transcriptStore.sessionPipeline.neonExit with semanticCopy.enabled: true requires legacyReadSource: "frozen-supabase"');
+    expect(() => validate(withPipeline({ neonExit: true, analysisCache: true, legacyReadSource: "frozen-supabase" }))).toThrow(
+      "analysisCache requires the reviewed normalized-prefix PutObject/KMS grant");
+    expect(() => validate(withPipeline({ neonExit: true, semanticCopy, legacyReadSource: "frozen-supabase", schedules: { semanticCopy: true } }))).not.toThrow(/sessionPipeline/);
+    expect(env({ neonExit: true, semanticCopy, legacyReadSource: "frozen-supabase" })).toMatchObject({
+      SESSIONS_NEON_EXIT: "true",
+      SESSION_LEGACY_READ_SOURCE: "frozen-supabase",
+      SESSION_SEMANTIC_COPY_ENABLED: "1",
+    });
     // Without the profile, semantic copy stays accepted as before.
     expect(() => validate(withPipeline({ semanticCopy, schedules: { semanticCopy: true } }))).not.toThrow(/sessionPipeline/);
   });
 
-  it("stack and runtime agree: the rendered env passes lambdaEnv's Neon-exit gate, and either flag on it is refused", () => {
+  it("stack and runtime agree on the frozen source selector", () => {
     // AWS_REGION is supplied by the Lambda runtime, not the stack.
     const rendered = { ...env({ neonExit: true }), AWS_REGION: REGION };
     expect(() => lambdaEnv(rendered)).not.toThrow();
     for (const flag of ["SESSION_ANALYSIS_CACHE_ENABLED", "SESSION_SEMANTIC_COPY_ENABLED"])
       expect(() => lambdaEnv({ ...rendered, [flag]: "1", SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main" })).toThrow(NeonExitRefusal);
+    const frozen = { ...env({ neonExit: true, legacyReadSource: "frozen-supabase" }), AWS_REGION: REGION };
+    for (const flag of ["SESSION_ANALYSIS_CACHE_ENABLED", "SESSION_SEMANTIC_COPY_ENABLED"])
+      expect(() => lambdaEnv({ ...frozen, [flag]: "1", SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main" })).not.toThrow();
   });
 
   it("is refused for any value but true", () => {
     for (const value of ["true", "on", false, 1, null, "", {}])
       expect(() => validate(withPipeline({ neonExit: value }))).toThrow("transcriptStore.sessionPipeline.neonExit must be true (omit for off)");
+    for (const value of ["supabase", "legacy", true, false, null, "", {}])
+      expect(() => validate(withPipeline({ legacyReadSource: value }))).toThrow('legacyReadSource must be "frozen-supabase"');
     expect(() => validate(withPipeline({ SESSIONS_NEON_EXIT: "true" }))).toThrow(/sessionPipeline.SESSIONS_NEON_EXIT is not a known setting/);
   });
 });

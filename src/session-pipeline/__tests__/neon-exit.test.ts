@@ -8,14 +8,16 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import pg from "pg";
-import { analysisDeps, handler, lambdaEnv, runtimeFromSecret, semanticCopyDeps } from "../lambda.ts";
+import { analysisDeps, analysisSourceReadonlyUrl, handler, lambdaEnv, runtimeFromSecret, semanticCopyDeps } from "../lambda.ts";
 import { processBatch } from "../consumer.ts";
 import { semanticCopyMain } from "../../search-features/semantic-copy-main.ts";
 
 const POISON = "postgres://poison:poison@neon.invalid:5432/poison";
+const FROZEN = "postgresql://reader:secret@aws-0-us-west-1.pooler.supabase.com:6543/relayhistory_legacy";
 const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs.invalid/q" };
 const ch = { url: "https://ch.invalid", user: "u", password: "p", database: "d" };
 const secret = JSON.stringify({ hoopdb_url: "postgres://u:p@127.0.0.1:1/db", clickhouse: ch, analysis_source_readonly_url: POISON });
+const frozenSecret = JSON.stringify({ hoopdb_url: "postgres://u:p@127.0.0.1:1/db", clickhouse: ch, analysis_source_readonly_url: FROZEN });
 
 const RealPool = pg.Pool;
 const realFetch = globalThis.fetch;
@@ -46,6 +48,7 @@ describe("SESSIONS_NEON_EXIT=true refuses the readonly-source flags at startup",
     expect(message(() => lambdaEnv({ ...base, SESSIONS_NEON_EXIT: "true", SESSION_ANALYSIS_CACHE_ENABLED: "1" }))).toBe("96bulls: SESSIONS_NEON_EXIT=true refuses the session pipeline: SESSION_ANALYSIS_CACHE_ENABLED=1");
     expect(message(() => lambdaEnv({ ...base, SESSIONS_NEON_EXIT: "true", SESSION_SEMANTIC_COPY_ENABLED: "1", SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main" }))).toBe("96bulls: SESSIONS_NEON_EXIT=true refuses the session pipeline: SESSION_SEMANTIC_COPY_ENABLED=1");
     expect(message(() => lambdaEnv({ ...base, SESSIONS_NEON_EXIT: "yes" }))).toContain("SESSIONS_NEON_EXIT must be");
+    expect(message(() => lambdaEnv({ ...base, SESSION_LEGACY_READ_SOURCE: "supabase" }))).toContain("SESSION_LEGACY_READ_SOURCE");
     expect(lambdaEnv({ ...base, SESSIONS_NEON_EXIT: "true" })).toMatchObject({ neonExit: true, analysisCacheEnabled: false, semanticCopyEnabled: false });
   });
 
@@ -72,6 +75,48 @@ describe("SESSIONS_NEON_EXIT=true refuses the readonly-source flags at startup",
     expect(await semanticCopyMain({ SESSIONS_NEON_EXIT: "true" }, factory)).toEqual({ enabled: false });
     expect(calls).toBe(0);
     expect(pools).toEqual([]);
+  });
+});
+
+describe("SESSIONS_NEON_EXIT=true admits the sealed Supabase legacy copy", () => {
+  test("both readers build only the explicit relayhistory_legacy source", () => {
+    const env = lambdaEnv({
+      ...base,
+      SESSIONS_NEON_EXIT: "true",
+      SESSION_LEGACY_READ_SOURCE: "frozen-supabase",
+      SESSION_ANALYSIS_CACHE_ENABLED: "1",
+      SESSION_SEMANTIC_COPY_ENABLED: "1",
+      SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main",
+    });
+    expect(env).toMatchObject({ neonExit: true, legacyReadSource: "frozen-supabase", analysisCacheEnabled: true, semanticCopyEnabled: true });
+    const rt = runtimeFromSecret(env, frozenSecret, "fixture-generation");
+    expect(rt.analysisSourceUrl).toBe(FROZEN);
+    analysisDeps(rt);
+    semanticCopyDeps(rt);
+    expect(pools.filter((url) => url === FROZEN)).toHaveLength(2);
+    expect(neonPools()).toEqual([]);
+    expect(connects).toEqual([]);
+  });
+
+  test("the selector verifies provider, database, and routing before a source pool exists", () => {
+    expect(analysisSourceReadonlyUrl(FROZEN, "frozen-supabase")).toBe(FROZEN);
+    for (const url of [
+      POISON,
+      "postgres://reader:secret@db.example.supabase.co/postgres",
+      "postgres://reader:secret@db.example.supabase.co/relayhistory_legacy?host=neon.invalid",
+    ]) expect(() => analysisSourceReadonlyUrl(url, "frozen-supabase")).toThrow(/frozen legacy source|relayhistory_legacy/);
+    expect(pools).toEqual([]);
+  });
+
+  test("the standalone copier passes its gate only with the frozen selector", async () => {
+    let calls = 0;
+    const result = await semanticCopyMain({
+      SESSIONS_NEON_EXIT: "true",
+      SESSION_LEGACY_READ_SOURCE: "frozen-supabase",
+      SESSION_SEMANTIC_COPY_ENABLED: "1",
+    }, () => ({ run: async () => { calls++; return { published: 0 } as never; }, close: async () => {} }));
+    expect(result).toMatchObject({ enabled: true });
+    expect(calls).toBe(1);
   });
 });
 
