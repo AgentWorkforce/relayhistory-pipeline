@@ -1,9 +1,11 @@
 # S3 ledger: numbered-log-entry commit
 
-Status: proposed. Slices 1 (writer and reader), 2 (admission wiring), 3 (materializer, operator tool) and 4 (review fixes) are
-implemented behind `INGEST_LEDGER_LOG_COMMIT` (default off). With `on`, only a stream whose entry 0 exists is
-admitted through its log; entry 0 is written only by the operator tool (`scripts/ledger-log-stream.ts switch`). No
-stream should be switched in production before the items in Remaining marked "before production" are done.
+Status: proposed. Slices 1 (writer and reader), 2 (admission wiring), 3 (materializer, operator tool), 4 and 5 (review
+fixes) and 6 (the before-production items of Remaining) are implemented behind `INGEST_LEDGER_LOG_COMMIT` (default
+off). With `on`, only a stream whose entry 0 exists is admitted through its log; entry 0 is written only by the
+operator tool (`scripts/ledger-log-stream.ts switch`). Production still needs: the review of slice 6, the
+`OnlyTheEraserDeletes` carve-out and the operator role's grants (Remaining 10), lifting the hosted and stack refusals
+together, and an explicit OK to deploy; the hosted runtime and the stack input both still refuse `on`.
 
 Builds on the group-commit design (`docs/design/s3-ledger-group-commit.md`, rev 3) and the hosted ledger
 decision record (0008, benchmark first). It replaces that design's per-session manifest CAS on the critical path
@@ -264,7 +266,7 @@ today.
     is never collected. Admission answers a batch id its window already holds without writing a payload.
   - Running: the consumer kicks the stream after each append (never awaited); every scan kicks every stream named in
     the registry `<keyRoot>/.ledger/log-streams/` (written when a writer first takes a stream and by the operator
-    tool), so a stream another process admitted is applied too.
+    tool; hash-keyed pointers since slice 6), so a stream another process admitted is applied too.
 - `ledger-log-stream-ops.ts` + `scripts/ledger-log-stream.ts` (dry run unless `--apply`):
   - `status`: legacy | log | closed, the head, the cursor, legacy batches pending and committed;
   - `switch`: refused while a legacy batch of the stream is pending (drain first) or the stream is not legacy; writes
@@ -367,6 +369,23 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
 
 ## Slice 6: the before-production items
 
+Closes the Remaining items marked before production (1, 2) and items 9, 10 and 8, in the order below, each with tests.
+Compaction (Remaining 5) stays out of scope beyond what the checkpoint start makes possible.
+
+- **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
+  written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
+  malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
+  (`checkUploadConsent` with the cap as `operator` and `LogMaterializerDeps.uploadConsent`, which the self-host runtime
+  wires from the same config). It runs in the admit phase only: after the legacy claim, before any canonical write, so
+  a refusal leaves nothing written. The commit-phase re-check runs after the canonical writes, where a skip would strand
+  them; it is skipped at apply. `UploadConsentRequired` (a 503 on the request path, where the inbox keeps the bytes for
+  a redrive) is a final skip here: the batch's inbox is already retired, and holding the stream would block every later
+  entry behind a consent that may never come. The person's upload reads refused (`upload_consent_required`); a
+  re-upload after they confirm is a fresh admission. Under `INGEST_LEDGER=s3` today `INGEST_UPLOAD_CONSENT` is refused
+  (SQL only), so in practice only the operator cap applies.
+  - Tests (`ledger-log-materialize.test.ts`): the cap rides in the payload and refuses at apply with no consent store;
+    a hold that lands between the append and the apply skips the batch while an earlier allowed batch is written; a
+    consent store fault is a retry (no skip record, payload kept); a malformed cap is `payload_invalid`.
 - **Start from a checkpoint (Remaining 2).** `readEntries(fromSeq)` always reads entry 0 (the mode marker, and the
   `legacyCutover` a checkpoint must match), then tries the checkpoint boundary at or below `fromSeq` and the one before
   it (deterministic keys, no listing of `c/`; a checkpoint PUT is best effort). The first that passes
@@ -399,20 +418,24 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
     keys the code writes (from the real key functions); with the statements rendered, the consumer reads and writes
     every log object, gets nothing else and no other principal does, and the eraser-only deny still refuses its
     deletes; the operator's grants are exactly the drain reads, the four writes and registry deletes.
-- **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
-  written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
-  malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
-  (`checkUploadConsent` with the cap as `operator` and `LogMaterializerDeps.uploadConsent`, which the self-host runtime
-  wires from the same config). It runs in the admit phase only: after the legacy claim, before any canonical write, so
-  a refusal leaves nothing written. The commit-phase re-check runs after the canonical writes, where a skip would strand
-  them; it is skipped at apply. `UploadConsentRequired` (a 503 on the request path, where the inbox keeps the bytes for
-  a redrive) is a final skip here: the batch's inbox is already retired, and holding the stream would block every later
-  entry behind a consent that may never come. The person's upload reads refused (`upload_consent_required`); a
-  re-upload after they confirm is a fresh admission. Under `INGEST_LEDGER=s3` today `INGEST_UPLOAD_CONSENT` is refused
-  (SQL only), so in practice only the operator cap applies.
-  - Tests (`ledger-log-materialize.test.ts`): the cap rides in the payload and refuses at apply with no consent store;
-    a hold that lands between the append and the apply skips the batch while an earlier allowed batch is written; a
-    consent store fault is a retry (no skip record, payload kept); a malformed cap is `payload_invalid`.
+- **A hash-only registry (Remaining 8).** `registerLogStream` writes the stream's identity doc
+  (`<stream root>/stream.json`: org, workspace, user and origin ids) inside the user's admission directory first, then the
+  registry doc `{v: 2, root}` at `.ledger/log-streams/<sha256(["log-stream-v2", root])[:40]>.json`. The root names the
+  org and workspace as path segments (as every key under them does) and the user and origin only as hashes. The sweep
+  resolves a pointer only when its root has the stream-root shape under this key root's admission inbox, its identity
+  doc reads back, and the identity, the root and the registry key all name the same stream; a pointer whose identity
+  doc is gone (the user's directory was erased) or that lies is skipped. Erasing the user's directory therefore leaves
+  no raw user or origin id behind.
+  - Migration: v1 docs (raw ids in the body, keyed by a hash of the ids) are still listed, once per stream even
+    alongside a v2 doc. `migrateLogStreamRegistry` (CLI: `scripts/ledger-log-stream.ts migrate-registry --bucket <b>`,
+    dry run unless `--apply`, which needs `--i-know-this-is-not-prod` and a non-production-like bucket name) registers
+    each v1 stream in the v2 layout and then deletes its v1 doc. It is idempotent and resumable. Only the operator tool
+    and non-production test runs ever wrote v1 docs (log mode never ran in production).
+  - Tests (`ledger-log-materialize.test.ts`): the registry doc and key carry no user or origin id and the identity doc
+    sits in the user's directory; after that directory is erased, nothing under `.ledger/` names the user or origin and
+    the stream is no longer listed; a pointer to another root, outside the inbox, or copied under another key names
+    nothing; the migration's dry run, crash midway (listed once), apply and idempotent re-run. The CLI guard covers
+    `migrate-registry` (`ledger-log-admit.test.ts`).
 
 ## Remaining
 
@@ -428,13 +451,18 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
 4. The GCS protocol run on a backend that honours generation preconditions (real GCS or a newer emulator). The local
    fake-gcs-server 1.52.2 also answered the adapter's create with `400 invalid uploadType`, so the GCS case did not run
    here.
-5. Compaction and retention: entries, materializer markers (`m/`) and the stream registry grow forever. Metrics.
+5. Compaction and retention: entries, materializer markers (`m/`) and the stream registry grow forever. Metrics. Slice 6
+   makes compaction possible (readers start from a verified checkpoint, Remaining 2) but does not implement it: it must
+   keep entry 0, the checkpoint readers start from and everything after it, and stop while a checkpoint fails to
+   verify. Registry pointers whose user directory was erased stay behind (they carry no raw id, and the sweep skips
+   them at one GET each) until retention removes them.
 6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel), reads the legacy batch doc,
    the fence and the shards of its live records; each apply reads the fence once more.
 7. Closed in slice 5 (the skip record, read before and after the consumer's admitted write). Kept as a number so the
    references stay stable.
-8. Stream registry docs hold the user id and raw origin id outside the user's directory: erasure must delete them (or
-   key them by hash only).
+8. Closed in slice 6: a registry doc is a hash-keyed pointer to the stream root, and the ids live in the stream's
+   identity doc inside the user's directory. v1 docs are still read; `scripts/ledger-log-stream.ts migrate-registry`
+   rewrites them and deletes the originals.
 9. Closed in slice 6: admission registers the stream before it takes it, and `takeStream` is idempotent for the
    writer that already holds the epoch, so a retry adds no epoch entry.
 10. Documented in the stack in slice 6 (`stacks/aws/ledger-log-commit-policy.ts`), behind

@@ -198,7 +198,9 @@ describe("equivalence: log mode plus materialization against legacy admission", 
       // The log entries, payloads, inbox and status objects are left alone: admission is slice 2's subject.
       const failed = new Set<string>();
       const log = await scenario("log", (e) => e.setFault((key) => {
-        if (key.includes("/ledger/log/e/") || key.includes("/ledger/log/o=") && key.includes("/p/") || key.includes("/.upload-inbox/") || key.includes("/log-streams/")) return "ok";
+        // The registry and the stream identity doc are admission's writes (registerLogStream, before the take), as is
+        // every log entry and payload: left alone, so admission's timing (and so received_at) matches legacy.
+        if (key.includes("/ledger/log/e/") || key.includes("/ledger/log/o=") && (key.includes("/p/") || key.endsWith("/stream.json")) || key.includes("/.upload-inbox/") || key.includes("/log-streams/")) return "ok";
         if (key.includes("/.admission-inbox/") && !key.includes("/ledger/")) return "ok";
         if (failed.has(key)) return "ok";
         failed.add(key);
@@ -493,5 +495,90 @@ describe("Remaining 1: consent re-checked at apply time", () => {
     const p = await json(store, b!.payloads[0]!.key);
     await putJson(store, b!.payloads[0]!.key, { ...p, consentCap: { mode: "all" } });
     expect((await (await materializer(store)).materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:payload_invalid"]);
+  });
+});
+
+describe("Remaining 8: the stream registry holds no raw user or origin id outside the user's directory", () => {
+  const fresh = () => { const sc = scratchStore(); cleanups.push(sc.done); return sc.store; };
+  const raw = async (store: ObjectStore, key: string) => new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body));
+  async function streams(store: ObjectStore) {
+    const { listLogStreams } = await import("../ledger-log-materialize.ts");
+    const out: { tenant: typeof TENANT; originId: string }[] = [];
+    for await (const s of listLogStreams(store, ROOT)) out.push(s as never);
+    return out;
+  }
+
+  test("a registry doc is a hash-keyed pointer; the ids live in the identity doc inside the user's directory", async () => {
+    const { logStreamRegistryKey, registerLogStream } = await import("../ledger-log-materialize.ts");
+    const { admissionUserDir } = await import("../async-admission.ts");
+    const store = fresh();
+    await registerLogStream(store, ROOT, TENANT, ORIGIN);
+    await registerLogStream(store, ROOT, TENANT, ORIGIN); // idempotent
+    const key = logStreamRegistryKey(ROOT, TENANT, ORIGIN);
+    const body = await raw(store, key);
+    expect(JSON.parse(body)).toEqual({ v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
+    for (const id of [TENANT.userId, ORIGIN]) { expect(body.includes(id)).toBe(false); expect(key.includes(id)).toBe(false); }
+    expect(logKeys(ROOT, TENANT, ORIGIN).identity.startsWith(admissionUserDir(ROOT, TENANT) + "/")).toBe(true);
+    expect(await json(store, logKeys(ROOT, TENANT, ORIGIN).identity)).toEqual({ v: 1, ...TENANT, originId: ORIGIN });
+    expect(await streams(store)).toEqual([{ tenant: TENANT, originId: ORIGIN }]);
+  });
+
+  test("after the user's directory is erased, no object outside it names the user or the origin, and the stream is no longer listed", async () => {
+    const { registerLogStream } = await import("../ledger-log-materialize.ts");
+    const { admissionUserDir } = await import("../async-admission.ts");
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    await upload(e.base, "b1", ["r1"]);
+    await rounds(e, 2);
+    await registerLogStream(e.base, ROOT, TENANT, ORIGIN);
+    const userDir = admissionUserDir(ROOT, TENANT) + "/";
+    for (const k of await keysUnder(e.base, userDir)) await e.base.delete(objectKey(k));
+    expect(await streams(e.base)).toEqual([]);
+    // The registry and the deployment markers: nothing outside the user's directory carries the raw ids.
+    for (const k of await keysUnder(e.base, `${ROOT}/.ledger/`)) {
+      const body = await raw(e.base, k);
+      for (const id of [TENANT.userId, ORIGIN]) { expect(k.includes(id)).toBe(false); expect(body.includes(id)).toBe(false); }
+    }
+  });
+
+  test("a pointer that lies (another root, a root outside the inbox, or a doc copied under another key) names nothing", async () => {
+    const { logStreamRegistryKey, logStreamsRoot, registerLogStream } = await import("../ledger-log-materialize.ts");
+    const store = fresh();
+    await registerLogStream(store, ROOT, TENANT, ORIGIN);
+    const key = logStreamRegistryKey(ROOT, TENANT, ORIGIN);
+    const other = logKeys(ROOT, { ...TENANT, userId: "user-2" }, ORIGIN).root;
+    await putJson(store, key, { v: 2, root: other });
+    expect(await streams(store)).toEqual([]);
+    await putJson(store, key, { v: 2, root: `${ROOT}/elsewhere/ledger/log/o=${"0".repeat(32)}` });
+    expect(await streams(store)).toEqual([]);
+    await putJson(store, key, { v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
+    await putJson(store, `${logStreamsRoot(ROOT)}${"e".repeat(40)}.json`, { v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
+    expect(await streams(store)).toEqual([{ tenant: TENANT, originId: ORIGIN }]);
+  });
+
+  test("migration: v1 docs are read until rewritten; dry run writes nothing; apply rewrites, deletes them and is idempotent", async () => {
+    const { legacyLogStreamRegistryKey, logStreamRegistryKey, migrateLogStreamRegistry } = await import("../ledger-log-materialize.ts");
+    const store = fresh();
+    const O2 = "origin-2";
+    const v1 = (originId: string) => ({ v: 1, orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, userId: TENANT.userId, originId });
+    await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, ORIGIN), v1(ORIGIN));
+    await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, O2), v1(O2));
+    const listed = async () => (await streams(store)).map((s) => s.originId).sort();
+    expect(await listed()).toEqual([ORIGIN, O2]);
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: false })).toEqual({ legacy: 2, migrated: 0 });
+    expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(false);
+    // A crash mid-migration (one stream registered in v2, its v1 doc not yet deleted) lists it once.
+    const { registerLogStream } = await import("../ledger-log-materialize.ts");
+    await registerLogStream(store, ROOT, TENANT, ORIGIN);
+    expect(await listed()).toEqual([ORIGIN, O2]);
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 2, migrated: 2 });
+    for (const o of [ORIGIN, O2]) {
+      expect(await exists(store, legacyLogStreamRegistryKey(ROOT, TENANT, o))).toBe(false);
+      expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, o))).toBe(true);
+      expect(await exists(store, logKeys(ROOT, TENANT, o).identity)).toBe(true);
+    }
+    expect(await listed()).toEqual([ORIGIN, O2]);
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 0, migrated: 0 });
   });
 });

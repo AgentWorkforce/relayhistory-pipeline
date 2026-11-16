@@ -35,10 +35,15 @@
  *
  * Streams: the registry `<keyRoot>/.ledger/log-streams/<h>.json` names every log-mode stream (written by the
  * consumer when it takes a stream and by the operator tool), so the sweeper finds streams this process never saw.
+ * A registry doc (v2) is keyed by a hash and holds only a pointer to the stream's root (`{v: 2, root}`: the org and
+ * workspace ids as path segments, the user and origin only as hashes); the ids themselves live in the stream's
+ * identity doc (`<root>/stream.json`) inside the user's directory, so erasing that directory leaves no raw user or
+ * origin id behind (Remaining 8). A pointer whose identity doc is gone (erased) is skipped. Registry docs written
+ * before that (v1: raw ids, another key) are still read, and migrateLogStreamRegistry rewrites them.
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
-import { assertNoLaterPrivacyControl, inboxConsentCap, outcomeKey, receiptDir, writeOutcome } from "./async-admission.ts";
+import { assertNoLaterPrivacyControl, INBOX_NAMESPACE, inboxConsentCap, outcomeKey, receiptDir, writeOutcome } from "./async-admission.ts";
 import { deliverPrepared, type DeliverDeps } from "./deliver.ts";
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
 import { logKeys, readEntries, type LogEntry, type LogKeys } from "./ledger-log.ts";
@@ -51,34 +56,105 @@ const sha256 = (v: string) => createHash("sha256").update(v).digest("hex");
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
 
 export const logStreamsRoot = (keyRoot: string) => `${keyRoot}/.ledger/log-streams/`;
+/** A stream's registry doc (v2): keyed by a hash of its root, so the key names no id either. */
 export const logStreamRegistryKey = (keyRoot: string, tenant: LedgerTenant, originId: string) =>
+  `${logStreamsRoot(keyRoot)}${sha256(JSON.stringify(["log-stream-v2", logKeys(keyRoot, tenant, originId).root])).slice(0, 40)}.json`;
+/** Where a v1 registry doc (raw ids in its body) was written: read until migrateLogStreamRegistry rewrites it. */
+export const legacyLogStreamRegistryKey = (keyRoot: string, tenant: LedgerTenant, originId: string) =>
   `${logStreamsRoot(keyRoot)}${sha256(JSON.stringify([tenant.orgId, tenant.workspaceId, tenant.userId, originId])).slice(0, 40)}.json`;
 
 export interface LogStreamRef { tenant: LedgerTenant; originId: string }
 
-/** Name a stream in the registry. Idempotent (create-if-absent of identical bytes). */
-export async function registerLogStream(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string): Promise<void> {
-  const doc = { v: 1, orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId };
-  try { await store.put(objectKey(logStreamRegistryKey(keyRoot, tenant, originId)), enc(doc), { ifNoneMatch: true, contentType: "application/json" }); }
+const isStrs = (...v: unknown[]) => v.every((x) => typeof x === "string");
+async function putOnce(store: ObjectStore, key: string, doc: unknown) {
+  try { await store.put(objectKey(key), enc(doc), { ifNoneMatch: true, contentType: "application/json" }); }
   catch (error) { if (!(isObjectStoreError(error) && error.code === "already_exists")) throw error; }
 }
 
-export async function* listLogStreams(store: ObjectStore, keyRoot: string): AsyncGenerator<LogStreamRef> {
+/**
+ * Name a stream in the registry. Idempotent (create-if-absent of identical bytes). The identity doc (inside the user's
+ * directory) is written FIRST, so a registry pointer never names a stream whose identity was not yet written; a
+ * pointer left behind by an erasure only reads as gone.
+ */
+export async function registerLogStream(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string): Promise<void> {
+  const keys = logKeys(keyRoot, tenant, originId);
+  await putOnce(store, keys.identity, { v: 1, orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId });
+  await putOnce(store, logStreamRegistryKey(keyRoot, tenant, originId), { v: 2, root: keys.root });
+}
+
+/** A stream root a v2 pointer may name: under this key root's admission inbox, ending in one stream's directory. */
+const streamRootShape = (keyRoot: string, root: string) =>
+  root.startsWith(`${keyRoot}/${INBOX_NAMESPACE}/`) && !root.split("/").includes("..") && /\/ledger\/log\/o=[0-9a-f]{32}$/.test(root);
+
+/** One registry doc, resolved: the stream it names, or undefined (corrupt, malformed, erased, or a pointer that lies). */
+async function resolveRegistryDoc(store: ObjectStore, keyRoot: string, key: string): Promise<(LogStreamRef & { v: 1 | 2 }) | undefined> {
+  // One corrupt registry doc never stops the sweep: it is skipped (a store fault still throws).
+  let doc: unknown;
+  try { doc = await readJson(store, key); } catch (error) { if (error instanceof SyntaxError) return undefined; throw error; }
+  const d = doc as { v?: unknown; orgId?: unknown; workspaceId?: unknown; userId?: unknown; originId?: unknown; root?: unknown } | undefined;
+  if (d?.v === 1 && isStrs(d.orgId, d.workspaceId, d.userId, d.originId))
+    return { v: 1, tenant: { orgId: d.orgId as string, workspaceId: d.workspaceId as string, userId: d.userId as string }, originId: d.originId as string };
+  if (d?.v !== 2 || typeof d.root !== "string" || !streamRootShape(keyRoot, d.root)) return undefined;
+  let id: unknown;
+  try { id = await readJson(store, `${d.root}/stream.json`); } catch (error) { if (error instanceof SyntaxError) return undefined; throw error; }
+  const x = id as { v?: unknown; orgId?: unknown; workspaceId?: unknown; userId?: unknown; originId?: unknown } | undefined;
+  // Gone (the user's directory was erased) or malformed: skipped.
+  if (x?.v !== 1 || !isStrs(x.orgId, x.workspaceId, x.userId, x.originId)) return undefined;
+  const ref = { tenant: { orgId: x.orgId as string, workspaceId: x.workspaceId as string, userId: x.userId as string }, originId: x.originId as string };
+  // The pointer, its key and the identity must all name the same stream: a doc copied elsewhere names nothing.
+  let bound: string;
+  try { bound = logKeys(keyRoot, ref.tenant, ref.originId).root; } catch { return undefined; }
+  if (bound !== d.root || logStreamRegistryKey(keyRoot, ref.tenant, ref.originId) !== key) return undefined;
+  return { v: 2, ...ref };
+}
+
+async function* registryKeys(store: ObjectStore, keyRoot: string): AsyncGenerator<string> {
   let cursor: string | undefined;
   do {
     const page = await store.list(objectKey(logStreamsRoot(keyRoot).slice(0, -1)), cursor);
     for (const item of page.items) {
       const key = String(item.key);
-      if (!key.startsWith(logStreamsRoot(keyRoot)) || !key.endsWith(".json")) continue;
-      // One corrupt registry doc never stops the sweep: it is skipped (a store fault still throws).
-      let doc: unknown;
-      try { doc = await readJson(store, key); } catch (error) { if (error instanceof SyntaxError) continue; throw error; }
-      const d = doc as { v?: unknown; orgId?: unknown; workspaceId?: unknown; userId?: unknown; originId?: unknown } | undefined;
-      if (!d || d.v !== 1 || typeof d.orgId !== "string" || typeof d.workspaceId !== "string" || typeof d.userId !== "string" || typeof d.originId !== "string") continue;
-      yield { tenant: { orgId: d.orgId, workspaceId: d.workspaceId, userId: d.userId }, originId: d.originId };
+      if (key.startsWith(logStreamsRoot(keyRoot)) && key.endsWith(".json")) yield key;
     }
     cursor = page.nextCursor;
   } while (cursor);
+}
+
+/** Every registered stream, once each (a stream with both a v1 and a v2 doc mid-migration is listed once). */
+export async function* listLogStreams(store: ObjectStore, keyRoot: string): AsyncGenerator<LogStreamRef> {
+  const seen = new Set<string>();
+  for await (const key of registryKeys(store, keyRoot)) {
+    const ref = await resolveRegistryDoc(store, keyRoot, key);
+    if (!ref) continue;
+    let root: string;
+    try { root = logKeys(keyRoot, ref.tenant, ref.originId).root; } catch { continue; }
+    if (seen.has(root)) continue;
+    seen.add(root);
+    yield { tenant: ref.tenant, originId: ref.originId };
+  }
+}
+
+export interface RegistryMigration { legacy: number; migrated: number }
+
+/**
+ * Rewrite every v1 registry doc (raw ids, outside the user's directory) as the v2 layout: the identity doc and the
+ * hash-keyed pointer (registerLogStream), then the v1 doc deleted. Dry run unless `apply`. Idempotent and resumable: a
+ * crash between the steps leaves a v1 doc whose stream is also registered (listed once), and the next run finishes it.
+ */
+export async function migrateLogStreamRegistry(store: ObjectStore, keyRoot: string, opts: { apply: boolean }): Promise<RegistryMigration> {
+  const legacy: { key: string; ref: LogStreamRef }[] = [];
+  for await (const key of registryKeys(store, keyRoot)) {
+    const ref = await resolveRegistryDoc(store, keyRoot, key);
+    if (ref?.v === 1) legacy.push({ key, ref });
+  }
+  if (!opts.apply) return { legacy: legacy.length, migrated: 0 };
+  let migrated = 0;
+  for (const { key, ref } of legacy) {
+    await registerLogStream(store, keyRoot, ref.tenant, ref.originId);
+    await store.delete(objectKey(key)).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
+    migrated++;
+  }
+  return { legacy: legacy.length, migrated };
 }
 
 /** Record a batch the materializer skipped for good (idempotent: the same code every time for a final refusal). */

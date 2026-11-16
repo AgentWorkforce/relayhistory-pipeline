@@ -89,6 +89,11 @@ export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string)
      * a later replay of the same batch id answers refused, never admitted (ledger-log-admit.ts, admission-consumer.ts).
      */
     skipped: (batchId: string) => `${root}/s/${h(batchId)}.json`,
+    /**
+     * The stream's identity (org, workspace, user, origin ids), inside the user's directory so erasing that directory
+     * erases it. The registry outside it (ledger-log-materialize.ts) holds only a hash-keyed pointer to this root.
+     */
+    identity: `${root}/stream.json`,
   };
 }
 export type LogKeys = ReturnType<typeof logKeys>;
