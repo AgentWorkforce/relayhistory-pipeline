@@ -118,6 +118,14 @@ const READINESS_STANDINS = [
     ddl: "CREATE OR REPLACE FUNCTION sessions.legacy_export_privacy_authority_ready() RETURNS boolean LANGUAGE sql AS $$ SELECT true $$" },
 ] as const;
 
+/**
+ * The erasure job as production runs it for legacy export copies: the legacy feed is independently default-off and enabled
+ * only by the exact-true S3X_LEGACY_EXPORT_ERASURE_ENABLED (legacyExportErasure). Harmless on heads without the flag.
+ */
+const ERASE_CFG = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true } as typeof DEFAULT_ERASURE_CONFIG;
+/** The same job with the legacy feed OFF (the default). */
+const ERASE_CFG_LEGACY_OFF = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: false } as typeof DEFAULT_ERASURE_CONFIG;
+
 /** Supabase privacy authority: the real column sets of the ledgers the exporter may read. */
 async function supabase() {
   const pg = new PGlite();
@@ -549,7 +557,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       {
         const st = new SyncState(join(await tmp("race-arm"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
         try {
-          await new ErasureJob(supabaseAuthority(f.queryable), st, storeEraser(createFsStore({ root: await tmp("race-arm-store") })), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {}).sweep();
+          await new ErasureJob(supabaseAuthority(f.queryable), st, storeEraser(createFsStore({ root: await tmp("race-arm-store") })), () => {}, ERASE_CFG, later, async () => {}).sweep();
         } finally {
           st.close();
         }
@@ -616,7 +624,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
         expect(await tomb("ingest_frozen_source_deletions")).toBe(0);
         const state = new SyncState(join(await tmp("race-hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
         const logs: Record<string, unknown>[] = [];
-        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), ERASE_CFG, later, async () => {});
         await job.sweep();
         await job.sweep();
         state.close();
@@ -680,7 +688,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     const sweep = async (store: ObjectStore) => {
       const state = new SyncState(join(await tmp("hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
       const logs: Record<string, unknown>[] = [];
-      const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+      const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), ERASE_CFG, later, async () => {});
       try {
         await job.sweep();
         await job.sweep();
@@ -695,7 +703,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     if (activate) {
       const state = new SyncState(join(await tmp("hosted-arm"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
       try {
-        await new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(createFsStore({ root: await tmp("hosted-arm-store") })), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {}).sweep();
+        await new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(createFsStore({ root: await tmp("hosted-arm-store") })), () => {}, ERASE_CFG, later, async () => {}).sweep();
       } finally {
         state.close();
       }
@@ -732,7 +740,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       await n.pg.query("INSERT INTO sessions.deleted_upload_sessions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
       const state = new SyncState(join(await tmp(`neon-loud-state-${drift}`), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
       const logs: Record<string, unknown>[] = [];
-      const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+      const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), ERASE_CFG, later, async () => {});
       await job.sweep().catch((e: unknown) => logs.push({ message: "sweep threw", error_code: (e as { code?: string }).code ?? "error" }));
       await job.sweep().catch((e: unknown) => logs.push({ message: "sweep threw", error_code: (e as { code?: string }).code ?? "error" }));
       state.close();
@@ -841,8 +849,13 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       const verify = readFileSync(new URL("../../../supabase/bootstrap/privacy_eraser_verify.sql", import.meta.url), "utf8");
       // Control: with 062030 applied the verifier accepts the provisioned role.
       expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
-      // A prefix database: 062030's two eraser RPCs absent. The verifier must allow, not require, them.
+      // Half-applied (owner table present, eraser RPCs missing): the verifier must still REFUSE (fail closed).
       await w.f.db.exec("DROP FUNCTION sessions.legacy_export_privacy_eraser_page(jsonb); DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb);");
+      expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).not.toBe("ok");
+      // A real prefix database (production today): NO 062030 objects at all. The verifier must allow, not require, them.
+      await w.f.db.exec("DROP TABLE sessions.legacy_export_scope_authority CASCADE");
+      for (const fn of ["sessions.ingest_legacy_export_scope_authority_register(jsonb)", "sessions.legacy_export_privacy_authority_ready()"])
+        await w.f.db.exec(`DROP FUNCTION IF EXISTS ${fn}`);
       expect(await w.f.db.exec(verify).then(() => "ok", (e) => String((e as Error).message))).toBe("ok");
     } finally {
       await w.f.close();
@@ -1096,10 +1109,10 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
       }
     };
     /** The ONLY heartbeat writer used here: a real hosted sweep on the Supabase authority. */
-    const sweepSupabase = async (store: ObjectStore, opts: { dryRun?: boolean } = {}) => {
+    const sweepSupabase = async (store: ObjectStore, opts: { dryRun?: boolean; legacyOff?: boolean } = {}) => {
       const state = new SyncState(join(await tmp("hb-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
       try {
-        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
+        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), () => {}, opts.legacyOff ? ERASE_CFG_LEGACY_OFF : ERASE_CFG, later, async () => {});
         await job.sweep(opts.dryRun ? { dryRun: true } : undefined);
       } finally {
         state.close();
@@ -1149,6 +1162,21 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
       await w.sweepSupabase(store, { dryRun: true });
       let puts = 0;
       const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-dry");
+      expect(puts).toBe(0);
+      expect(refusedFor(r, HB)).toBe(true);
+    } finally {
+      await w.f.close();
+    }
+  });
+
+  test("LEGACY ERASURE OFF: a healthy Supabase sweep with the legacy feed disabled does not arm the exporter (no copy without an eraser)", async () => {
+    const n = await neon();
+    const w = await world();
+    try {
+      const store = createFsStore({ root: await tmp("hb-legacy-off") });
+      await w.sweepSupabase(store, { legacyOff: true });
+      let puts = 0;
+      const r = await w.exportAs(n, withPutHook(store, async () => void (puts += 1)), "hb-legacy-off");
       expect(puts).toBe(0);
       expect(refusedFor(r, HB)).toBe(true);
     } finally {
@@ -1312,7 +1340,7 @@ describe("(g) activation gate: the exporter runs only on a fresh, eraser-written
     });
     const state = new SyncState(join(await tmp("alarm-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const logs: Record<string, unknown>[] = [];
-    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+    const job = new ErasureJob(jobDb(n.pg), state, storeEraser(store), (x) => void logs.push(x), ERASE_CFG, later, async () => {});
     await job.sweep().catch(() => {});
     state.close();
     expect((job.counters as Record<string, number>).legacyFenceFailed ?? 0).toBeGreaterThan(0);
