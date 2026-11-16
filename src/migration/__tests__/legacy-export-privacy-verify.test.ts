@@ -15,7 +15,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
@@ -1375,6 +1375,16 @@ describe("(s) ship branch: the exporter CLI refuses unconditionally before activ
           const text = readFileSync(join(root, rel), "utf8");
           // Any import/re-export of runOrg, or of the runner module's runOrg via a namespace.
           if (/\brunOrg\b/u.test(text) && rel !== "src/migration/legacy-export/main.ts" && rel !== "src/migration/legacy-export/runner.ts") offenders.push(rel);
+          // Module-path check (catches export *, barrels, aliases): no static from / export-from / dynamic import() /
+          // require() of a specifier that resolves to src/migration/legacy-export/runner, except main.ts.
+          if (rel !== "src/migration/legacy-export/main.ts" && rel !== "src/migration/legacy-export/runner.ts") {
+            for (const m of text.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|^\s*import\s+)["'`]([^"'`]+)["'`]/gmu)) {
+              const spec = m[1]!;
+              if (!spec.startsWith(".")) continue;
+              const resolved = join(dirname(join(root, rel)), spec).replace(/\.(m?[jt]sx?)$/u, "");
+              if (resolved === join(root, "src/migration/legacy-export/runner") || resolved === join(root, "src/migration/legacy-export/runner/index")) offenders.push(`${rel} -> ${spec}`);
+            }
+          }
         }
       }
     };
