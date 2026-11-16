@@ -5,7 +5,7 @@ import { parseConfig } from "../../../benchmarks/ledger-bench/config.ts";
 import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { STANDARD } from "../../../benchmarks/ledger-bench/config.ts";
-import { BUNDLE_MAX_BYTES, clientConfig, contextMatches, insideRepo, isClean, ledgerAdd, parseInputs, readLedger, renderJob, resourceNames, settleLedger, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
+import { BUNDLE_MAX_BYTES, clientConfig, contextMatches, insideRepo, isClean, ledgerAdd, parseInputs, parseLanes, readLedger, renderJob, resourceNames, settleLedger, uncollected, type Inputs, type LedgerEntry } from "../ledger-bench/ops.ts";
 
 const DIR = join(import.meta.dir, "..", "ledger-bench");
 const read = (name: string) => readFileSync(join(DIR, name), "utf8");
@@ -176,6 +176,13 @@ describe("ledger-bench ops guards", () => {
     expect(() => ledgerAdd(ledger, "d", "standard", ["r2"])).toThrow(/Nothing was started/);
     expect(ledgerAdd(ledger, "smoke-2", "smoke", ["r2"]).length).toBe(21);
     expect(() => ledgerAdd([], "a", "constructor", ["r2"])).toThrow(/profile/);
+    // A lane that does not exist is never charged (a space-separated list pasted as one argument was, once).
+    expect(() => ledgerAdd([], "a", "standard", ["r2 r3 express dynamo" as never])).toThrow(/not a lane/);
+    expect(() => parseLanes("r2 r3 express dynamo")).toThrow(/not a lane: "r2 r3 express dynamo"/);
+    expect(() => parseLanes("r2,r2")).toThrow(/twice/);
+    expect(() => parseLanes("")).toThrow(/not a lane/);
+    expect(parseLanes("r2, r3")).toEqual(["r2", "r3"]);
+    expect(parseLanes(undefined)).toEqual(["r1", "r2", "r3", "express", "dynamo"]);
     // A lane is its request budget at the dearest request price plus its byte budget per GiB.
     expect(ledger.find((e) => e.run === "a" && e.lane === "r1")!.usd).toBeCloseTo(STANDARD.requestBudgetPerLane * 0.000008 + (STANDARD.byteBudgetPerLane / 1024 ** 3) * 0.07, 0);
   });
