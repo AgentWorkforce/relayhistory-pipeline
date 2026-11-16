@@ -62,7 +62,8 @@
     "scripts/backlog-ops.ts",
     "scripts/backlog-ops-github.ts",
     "scripts/ledger-reshard-revisions.ts",
-    "scripts/bench/s3-ledger-admission.ts"
+    "scripts/bench/s3-ledger-admission.ts",
+    "benchmarks/ledger-bench"
   ],
   "exclude": [
     "node_modules",
