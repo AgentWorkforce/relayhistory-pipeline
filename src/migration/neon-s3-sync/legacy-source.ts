@@ -8,8 +8,8 @@ import {
  * a caller (the one-shot `legacy-export` runner) asks for them.
  *
  * Each (org, workspace, source, session) scope gets ITS OWN manifest under the
- * dedicated machine id `RELAYHISTORY_LEGACY_MACHINE_ID`, holding only legacy
- * records plus one `legacy_scope` coverage marker. Ordinary delivery manifests
+ * dedicated user-scoped machine derived from `legacy:tables:v1`, holding only
+ * legacy records plus one `legacy_scope` coverage marker. Ordinary delivery manifests
  * are never touched, so their keys (`d=` start date) and seed proofs are
  * unchanged (activation gate 2).
  */
@@ -25,8 +25,11 @@ import {
   type UnitSource,
   type PageHook,
 } from "./neon-reader.ts";
-import { RELAYHISTORY_LEGACY_MACHINE_ID } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
-export { RELAYHISTORY_LEGACY_MACHINE_ID };
+export {
+  LEGACY_EXPORT_ORIGIN_ID,
+  legacyMachineId,
+} from "../../shared/legacy-export-machine.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 
 export const LEGACY_TABLES = [
   {
@@ -82,11 +85,21 @@ export async function legacyScopeUser(
   s: LegacyScope,
 ): Promise<string | null> {
   const { rows } = await db.query<{ user_id: string | null }>(
-    `SELECT COALESCE(
-  (SELECT min(e.user_id) FROM sessions.convergence_events e WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>''),
-  (SELECT min(o.user_id) FROM sessions.session_outcomes o WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''),
-  (SELECT min(t.session_owner) FROM sessions.conversation_turns t WHERE ${turnScopeSql} AND t.session_owner<>'' AND t.session_owner<>t.source AND t.session_owner<>$3)
- ) AS user_id`,
+    `SELECT CASE
+  WHEN EXISTS(SELECT 1 FROM sessions.convergence_events e
+    WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>'')
+  THEN (SELECT min(e.user_id) FROM sessions.convergence_events e
+    WHERE e.org_id=$1 AND e.workspace_id=$2 AND e.source=$3 AND e.session_id=$4 AND e.user_id<>''
+    HAVING count(DISTINCT e.user_id)=1)
+  WHEN EXISTS(SELECT 1 FROM sessions.session_outcomes o
+    WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>'')
+  THEN (SELECT min(o.user_id) FROM sessions.session_outcomes o
+    WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''
+    HAVING count(DISTINCT o.user_id)=1)
+  ELSE (SELECT min(t.session_owner) FROM sessions.conversation_turns t
+    WHERE ${turnScopeSql} AND t.session_owner<>'' AND t.session_owner<>t.source AND t.session_owner<>$3
+    HAVING count(DISTINCT t.session_owner)=1)
+ END AS user_id`,
     scopeParams(s),
   );
   return rows[0]?.user_id ?? null;
@@ -168,14 +181,15 @@ export function legacyUnitSource(
   onPage: PageHook,
   pageRows = 500,
   stats?: { userUnknown: number },
+  resolvedUserId?: string,
 ): UnitSource {
   return {
     fenced: (unit) => legacyScopeFenced(db, unit),
     async *lines(unit) {
-      const user = await legacyScopeUser(db, unit);
+      const user = resolvedUserId ?? (await legacyScopeUser(db, unit));
       if (user === null && stats) stats.userUnknown += 1;
       const userId = user ?? "unknown";
-      const machine = RELAYHISTORY_LEGACY_MACHINE_ID;
+      const machine = legacyMachineId(unit.workspaceId, userId);
       for (const spec of LEGACY_TABLES) {
         let after: string | undefined;
         for (;;) {
@@ -283,6 +297,16 @@ export async function legacyDiscoveryPage(
   limit = 1000,
 ): Promise<LegacyGroup[]> {
   const spec = LEGACY_TABLES.find((s) => s.table === table)!;
+  const malformed = await db.query(
+    `SELECT 1 FROM sessions.${table}
+      WHERE org_id=$1 AND (workspace_id IS NULL OR source IS NULL OR session_id IS NULL)
+      LIMIT 1`,
+    [orgId],
+  );
+  if (malformed.rows.length)
+    throw Object.assign(new Error("legacy discovery group contains null"), {
+      code: "legacy_group_null",
+    });
   const turns = table === "conversation_turns";
   const order = turns
     ? ["workspace_id", "source", "session_id"]

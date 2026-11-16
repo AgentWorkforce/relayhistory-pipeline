@@ -606,8 +606,9 @@ test("replay pages admit a legally large first event and bind view/content bound
 
 // Gate 4: legacy records are accepted only from an exporter-owned legacy-machine
 // manifest (the positive path is canonical-legacy-source.test.ts); a live
-// delivery manifest carrying them is refused, never served.
-test("provider refuses legacy records carried by a live delivery manifest", async () => {
+// delivery manifest carrying them is dropped without making valid live state
+// unavailable.
+test("provider drops legacy records carried by a live delivery manifest", async () => {
   const scope = {
     org_id: "org_1",
     workspace_id: "ws_1",
@@ -654,7 +655,13 @@ test("provider refuses legacy records carried by a live delivery manifest", asyn
     fetch,
     deps,
   );
-  expect(response.status).toBe(503);
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as {
+    rows: unknown[];
+    legacyCoverage: unknown;
+  };
+  expect(body.rows).toEqual([]);
+  expect(body.legacyCoverage).toBeNull();
 });
 
 test("immutable publication snapshot uses existing canonical fold and generation-qualified raw namespace",async()=>{
@@ -804,7 +811,14 @@ test("display values are lazy: a raw snapshot without the request is the pre-#18
   // ...and the default read is exactly the opt-in read minus that table: no new table key,
   // no displayOmitted key, same generation, same rows in the same order. (neonDerived is
   // always present since the never-in-Neon objects half fails closed on absence.)
-  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "neonDerived", "rows"]);
+  expect(Object.keys(plain).sort()).toEqual([
+    "exists",
+    "generation",
+    "legacyCoverage",
+    "legacyRowsMerged",
+    "neonDerived",
+    "rows",
+  ]);
   expect(plain.rows.some((r) => r.table === "session_directory_event_values")).toBe(false);
   expect(JSON.stringify(plain)).toBe(JSON.stringify({ ...requested, rows: requested.rows.filter((r) => r.table !== "session_directory_event_values") }));
   // Raw route: other tables never carry display rows; the display table is served on request.
