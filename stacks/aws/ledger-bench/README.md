@@ -44,6 +44,22 @@ Every taggable resource carries `purpose=ledger-bench`, `ttl=<apply date + 2 day
   other workloads. Run one lane at a time (`--lanes`) on a cluster that serves production.
 - **Throughput.** The table has a maximum on-demand throughput, and a cell stops at its operation cap.
 
+## Differences from the plan
+
+- **Identity.** EKS Pod Identity, not IRSA: it is what every other workload of these stacks uses.
+- **Cell length.** 60 s of steady state per latency cell and 120 s per protocol cell, not 300 s, so that
+  a lane ends well inside the 4-hour deadline. Each cell also stops at an operation cap.
+- **Timings.** Each cell records a 2%-precision latency histogram, not one row per request.
+- **The per-batch chain** follows the group-commit design's table for a 1-session batch with two revision
+  shards: 17 dependent round trips and 22 requests, not "about 13".
+- **KMS share.** Measured as SSE-KMS against SSE-S3 objects in the same bucket, at concurrency 8.
+- **No production endpoint is contacted.** The plan's optional HEAD of the production bucket's endpoint is
+  left out; R1 reproduces the cross-region baseline.
+- **Budget.** The AWS budget cannot filter by the `purpose` tag in time (cost-allocation tags take a day to
+  activate) and only notifies; the client's request budget and the spend ledger are the cap.
+- **S3 Express** goes through the object-store package with a fetch wrapper that re-signs for
+  `s3express`; the package itself cannot sign for directory buckets today.
+
 ## Running it
 
 The operator's inputs (account ids, the cluster's name, the image digest, zone ids) go in a JSON file kept
