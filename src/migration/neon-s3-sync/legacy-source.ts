@@ -75,9 +75,9 @@ const scopeParams = (s: LegacyScope) => [
 
 /**
  * The scope's user, for the manifest (activation gate 8), in a fixed order:
- * the delivery user of its own events, else an outcome's user_id. A turn's
- * `session_owner` is an actor/owner label, not a user id, and is never accepted
- * as erasure identity. `null` when neither real-user source is unambiguous;
+ * the delivery user of its own events, else an outcome's user_id, else the
+ * unambiguous `session_owner` of its attributed public turns. `null` when no
+ * owner source is unambiguous;
  * the caller records that explicitly (never silently "unknown").
  */
 export async function legacyScopeUser(
@@ -96,6 +96,11 @@ export async function legacyScopeUser(
   THEN (SELECT min(o.user_id) FROM sessions.session_outcomes o
     WHERE o.org_id=$1 AND o.workspace_id=$2 AND o.source=$3 AND o.session_id=$4 AND o.user_id<>''
     HAVING count(DISTINCT o.user_id)=1)
+  WHEN EXISTS(SELECT 1 FROM sessions.conversation_turns t
+    WHERE ${turnScopeSql} AND t.session_owner<>'')
+  THEN (SELECT min(t.session_owner) FROM sessions.conversation_turns t
+    WHERE ${turnScopeSql} AND t.session_owner<>''
+    HAVING count(DISTINCT t.session_owner)=1)
   ELSE NULL
  END AS user_id`,
     scopeParams(s),

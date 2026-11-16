@@ -81,8 +81,8 @@ test("gate 6: an invalid row is counted and makes coverage unknown, never failin
   expect(canonicalLegacy([marker], identity).coverage).not.toBeNull();
 });
 
-test("gate 6: a record outside the scope retains the established invalid-evidence error", () => {
-  expect(() =>
-    canonicalLegacy([record({ org_id: "foreign" })], identity),
-  ).toThrow("canonical legacy evidence invalid");
+test("gate 6: a record outside the scope uses the canonical 503 invalid-evidence contract", () => {
+  expect(() => canonicalLegacy([record({ org_id: "foreign" })], identity)).toThrow(
+    expect.objectContaining({ reason: "legacy_evidence_invalid", status: 503 }),
+  );
 });
