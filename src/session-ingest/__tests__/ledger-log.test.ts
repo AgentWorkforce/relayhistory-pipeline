@@ -340,9 +340,9 @@ describe("fencing: exactly one writer per stream", () => {
     await expect(takeStream(store, s, W("t"))).rejects.toBeInstanceOf(LogUnavailable);
     expect(s.pending?.entry.kind).toBe("epoch");
     failing = false;
-    await takeStream(store, s, W("t")); // resolves the pending epoch entry, then takes again on top of it
+    await takeStream(store, s, W("t")); // resolves the pending epoch entry; already the owner, so no second take
     const o = (await openStream(inner, keys))!;
-    expect([o.head, o.epoch, o.epochWriter]).toEqual([2, 3, "t"]);
+    expect([o.head, o.epoch, o.epochWriter]).toEqual([1, 2, "t"]);
   });
 });
 

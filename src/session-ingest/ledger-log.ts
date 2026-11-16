@@ -472,10 +472,16 @@ export async function enableLogMode(store: ObjectStore, keys: LogKeys, legacyCut
  * pending until it resolves, exactly as a batches entry. Losing the race (another writer appended first) does NOT
  * retry: the state is caught up and LogFenced("log_take_lost") is thrown, so two takers back off (the caller's
  * retry decides) instead of fencing each other in a loop. The previous owner's next append is refused.
+ *
+ * Idempotent for the same writer: once the state (after the pending entry is settled) already names `d.writer` as the
+ * epoch's writer, nothing is appended. So a caller that retries after its take landed (an ambiguous take resolved on
+ * the retry, or a failure after the take, such as the registry write) never adds another epoch entry. The writer id
+ * is the ownership identity (WriteDeps), so this regains nothing another process holds.
  */
 export async function takeStream(store: ObjectStore, state: LogState, d: WriteDeps): Promise<LogState> {
   const { now, sleep } = deps(d);
   if (state.pending) await settlePending(store, state, d);
+  if (state.epochWriter === d.writer) return state;
   const entry: LogEntry = { v: 1, stream: state.keys.root, seq: state.head + 1, prev: state.headHash, kind: "epoch", epoch: state.epoch + 1, writer: d.writer, atMs: now() };
   state.pending = { seq: entry.seq, bytes: encode(entry), entry, atMs: now() };
   try {

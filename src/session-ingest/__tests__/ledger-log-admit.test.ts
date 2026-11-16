@@ -456,3 +456,49 @@ describe("slice 5: a skipped batch stays refused, retries write fresh payloads, 
     expect(mutationRefusal("status", "sessionsprod", true, false)).toBeUndefined();
   });
 });
+
+describe("Remaining 9: a retry never adds an epoch entry", () => {
+  const prep = async (batchId: string, recordId: string) => {
+    const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
+    return prepareDelivery(TENANT, await batch([record({ record_id: recordId, session_id: `sess-${recordId}`, origin_id: ORIGIN })],
+      { batch_id: batchId, origin_id: ORIGIN, account_id: await deliveryAccount(TENANT) }));
+  };
+  const epochs = async (store: ObjectStore) => (await entries(store)).filter((x) => x.kind === "epoch").length;
+
+  test("the registry write failing fails the admission BEFORE the take; the retry takes once and registers", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const { logStreamRegistryKey } = await import("../ledger-log-materialize.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    const f = faulty(sc.store);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    const streams = new LogStreams({ store: f.store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0 });
+    const registry = logStreamRegistryKey(ROOT, TENANT, ORIGIN);
+    // Fails before AND after landing, attempt by attempt: never an epoch entry from a failed attempt.
+    for (const mode of ["before", "after"] as const) {
+      f.setFault((key) => (key === registry ? mode : "ok"));
+      await expect(streams.admit(TENANT, await prep("b1", "r1"), { journalSeq: 0 })).rejects.toThrow();
+      expect(await epochs(sc.store)).toBe(0);
+    }
+    f.setFault(undefined);
+    expect(await streams.admit(TENANT, await prep("b1", "r1"), { journalSeq: 0 })).toBe("accepted");
+    expect(await epochs(sc.store)).toBe(1);
+    expect(await exists(sc.store, registry)).toBe(true);
+  });
+
+  test("the same writer id reopening a stream it already owns (its cache dropped) appends no second epoch entry", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    expect(await new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_same", nowMs: () => T0 }).admit(TENANT, await prep("b1", "r1"), { journalSeq: 0 })).toBe("accepted");
+    // A new LogStreams with the same writer id (no cached state): it reads itself as the owner and appends directly.
+    expect(await new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_same", nowMs: () => T0 }).admit(TENANT, await prep("b2", "r2"), { journalSeq: 0 })).toBe("accepted");
+    expect(await epochs(sc.store)).toBe(1);
+    // Another writer still takes it (one more epoch entry), and the first is fenced on its next append.
+    expect(await new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_other", nowMs: () => T0 }).admit(TENANT, await prep("b3", "r3"), { journalSeq: 0 })).toBe("accepted");
+    expect(await epochs(sc.store)).toBe(2);
+  });
+});
