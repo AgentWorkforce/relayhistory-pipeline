@@ -187,7 +187,8 @@ describe("model summariser", () => {
     const cap = captureLog();
     const s = summarizerFromEnv({ BOB_COSTAS_MODEL: "gpt-test-mini", OPENAI_API_KEY: "sk-disabled" }, { fetch: fetchFn, log: cap.log });
     const out = await s.summarize("short", digest, ctx);
-    expect(out).toEqual(await extractiveSummarizer.summarize("short", digest));
+    // The extractive text, tagged with the fallback reason (read by the regeneration retry path).
+    expect(out).toEqual({ ...(await extractiveSummarizer.summarize("short", digest)), fallbackReason: "no_api_key" });
     expect(calls).toHaveLength(0);
     expect(parsed(cap.lines[0]!)).toMatchObject({ outcome: "fallback", reason: "no_api_key", attempt: 0 });
     assertNoContentInLogs(cap.lines);
@@ -233,7 +234,7 @@ describe("model summariser", () => {
     const { fetchFn, calls } = fakeFetch([{ status: 400, body: { error: { message: `bad request echoing ${PROMPT_MARKER}` } } }]);
     const cap = captureLog();
     const out = await summarizerFromEnv(env(), { fetch: fetchFn, log: cap.log }).summarize("short", digest, ctx);
-    expect(out).toEqual(await extractiveSummarizer.summarize("short", digest));
+    expect(out).toEqual({ ...(await extractiveSummarizer.summarize("short", digest)), fallbackReason: "model_failed" });
     expect(calls).toHaveLength(1);
     expect(cap.lines).toHaveLength(1);
     expect(parsed(cap.lines[0]!)).toMatchObject({ outcome: "fallback", reason: "model_failed", error_code: "model_request_failed", retryable: false, attempt: 1, model_id: "gpt-test-mini" });

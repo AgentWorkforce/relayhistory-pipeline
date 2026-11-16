@@ -6,6 +6,7 @@ import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
 import { perChunkCap, summaryInputCapsFromEnv } from "./session-input.ts";
+import { bobCostasRegenFromEnv } from "./regen.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const raw = lockerStore();
@@ -26,6 +27,8 @@ log.info("bob costas input caps", {
   max_chunk_bytes: perChunkCap(inputCaps),
   state: inputCaps.sampling ? "sampling_on" : "sampling_off",
 });
+// Summaries regeneration flags (all default off: null keeps today's code path); read once, shared.
+const regen = bobCostasRegenFromEnv();
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
@@ -33,6 +36,7 @@ await runWorker({
   // Queues summaries for indexed sessions that have none (e.g. after migration 0004).
   tick: summarySweep({
     keyring,
+    regen,
     everyMs: Number(process.env.SUMMARY_SWEEP_SECONDS ?? 300) * 1000,
   }),
   handlers: (db) => {
@@ -44,6 +48,7 @@ await runWorker({
       keyring,
       readerMaxRuleset: maximum,
       inputCaps,
+      regen,
     };
     return {
       "summary-short": bobCostasHandler("short", deps),
