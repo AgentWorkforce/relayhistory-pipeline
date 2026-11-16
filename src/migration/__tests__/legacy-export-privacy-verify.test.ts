@@ -50,6 +50,10 @@ const S: LegacyScope = { orgId: "org_1", workspaceId: "ws_1", source: "claude", 
 const SR: LegacyScope = { ...S, sessionId: "sess_r" };
 const SD: LegacyScope = { ...S, workspaceId: "default", sessionId: "sess:d" };
 
+/** The scope's real user (a turn's session_owner is not accepted as erasure identity since 5b0fa79a). */
+const outcome = (pg: PGlite, s: LegacyScope, sha = "c0ffee") =>
+  pg.query("INSERT INTO sessions.session_outcomes VALUES($1,$2,'claude',$3,$4,$5,false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z')", [s.orgId, s.workspaceId, s.sessionId, sha, OWNER]);
+
 /** Neon: legacy tables, the vendored deleted_upload_sessions, and 0074's conversation_turn_fences. */
 async function neon() {
   const sql = await readFile(new URL("../../../vendor/relayhistory-cloud/migrations/0038_session_upload_deletion.sql", import.meta.url), "utf8");
@@ -71,6 +75,7 @@ async function neon() {
     `INSERT INTO sessions.conversation_turns VALUES($1,$2,$3,'owner',$4,$5,0,'assistant','erase me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
     [TURN, S.orgId, S.workspaceId, S.sessionId, OWNER],
   );
+  await outcome(pg, S);
   return { pg, db: pg as unknown as Queryable };
 }
 
@@ -119,8 +124,15 @@ async function run(n: Queryable, p: Queryable, store: ObjectStore, name: string,
   const checkpoint = new Checkpoint(join(await tmp(name), "c.sqlite"));
   const counters = newCounters();
   const logs: Record<string, unknown>[] = [];
-  await runOrg({ db: n, privacyDb: p, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: (f) => void logs.push(f) }, S.orgId, opts, counters);
-  return { counters, checkpoint, logs };
+  // A privacy race may either fail the scope and continue, or halt the run (5b0fa79a halts): both are accepted.
+  let halted: string | undefined;
+  await runOrg({ db: n, privacyDb: p, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: (f) => void logs.push(f) }, S.orgId, opts, counters)
+    .catch((e: unknown) => {
+      const code = (e as { code?: string }).code;
+      if (code !== "legacy_privacy_race") throw e;
+      halted = code;
+    });
+  return { counters, checkpoint, logs, halted };
 }
 
 async function pointerFor(store: ObjectStore, key: string, s: LegacyScope = S): Promise<CanonicalPointer> {
@@ -184,6 +196,8 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
       `INSERT INTO sessions.conversation_turns VALUES($1,$2,'default','owner',$3,$4,0,'assistant','erase me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
       [TURN, SD.orgId, SD.sessionId, OWNER],
     );
+    await n.pg.query("DELETE FROM sessions.session_outcomes");
+    await outcome(n.pg, SD);
     await n.pg.query("INSERT INTO sessions.conversation_turn_fences VALUES($1,'',$2,$3,$4)", [SD.orgId, OTHER, SD.source, SD.sessionId]);
     const store = createFsStore({ root: await tmp("a3") });
     const { counters } = await run(n.db, p.db, store, "a3");
@@ -204,6 +218,8 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
         `INSERT INTO sessions.conversation_turns VALUES($1,$2,'default','owner',$3,$4,0,'assistant','erase me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
         [TURN, SD.orgId, SD.sessionId, OWNER],
       );
+      await n.pg.query("DELETE FROM sessions.session_outcomes");
+      await outcome(n.pg, SD);
       await p.pg.query(insert, [SD.orgId, SD.source, SD.sessionId]);
       const store = createFsStore({ root: await tmp("a3s") });
       const { counters } = await run(n.db, p.db, store, "a3s");
@@ -309,6 +325,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
         `INSERT INTO sessions.conversation_turns VALUES('33333333-3333-4333-8333-333333333333',$1,$2,'owner','sess:keep',$3,0,'assistant','keep me','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00Z')`,
         [S.orgId, S.workspaceId, OWNER],
       );
+    if (opts.neighbour) await outcome(n.pg, { ...S, sessionId: "sess:keep" }, "beef");
     const { counters } = await run(n.db, p.db, store, "c-export");
     expect(counters.exported).toBe(opts.neighbour ? 2 : 1);
     const exported = await allKeys(store);
@@ -358,6 +375,7 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
     const n = await neon(), p = await supabase();
     // A layout-safe id: the discovery eraser refuses lossy ids such as `sess:1` by design.
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
+    await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
     const store = createFsStore({ root: await tmp(`race-${ledger}`) });
     const insert = ledger === "turn_session_fences"
       ? "INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) SELECT $1,$2,$3,$4,'legacy_import' WHERE NOT EXISTS(SELECT 1 FROM sessions.turn_session_fences)"
