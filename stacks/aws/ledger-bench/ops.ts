@@ -329,6 +329,8 @@ export interface LedgerEntry {
  */
 export function ledgerAdd(entries: LedgerEntry[], run: string, profile: string, lanes: Lane[], cap = APPROVED_CAP_USD): LedgerEntry[] {
   if (!Object.hasOwn(PROFILES, profile)) throw new Error(`ledger-bench: unknown profile ${profile}`);
+  const unknown = lanes.filter((lane) => !LANES.includes(lane));
+  if (unknown.length > 0) throw new Error(`ledger-bench: not a lane: ${unknown.map((l) => JSON.stringify(l)).join(", ")}. Nothing was started.`);
   const added = lanes.map((lane) => ({ run, lane, profile, usd: laneCostBound(PROFILES[profile]!, lane) }));
   const next = [...entries, ...added];
   const total = next.reduce((a, e) => a + e.usd, 0) + FIXED_USD;
@@ -412,6 +414,19 @@ function run(i: Inputs, runId: string, profile: string, lanes: Lane[], steps: st
   } finally {
     rmSync(bundle.dir, { recursive: true, force: true });
   }
+}
+
+/**
+ * The lanes named on the command line, each checked: a value that is not a lane (a space-separated list
+ * pasted as one argument, a typo) is refused before the spend ledger or the cluster is touched.
+ */
+export function parseLanes(arg: string | undefined): Lane[] {
+  if (arg === undefined) return [...LANES];
+  const lanes = arg.split(",").map((l) => l.trim());
+  const bad = lanes.filter((l) => !(LANES as readonly string[]).includes(l));
+  if (lanes.length === 0 || bad.length > 0) throw new Error(`ledger-bench: --lanes takes a comma-separated list of ${LANES.join(", ")}; not a lane: ${bad.map((l) => JSON.stringify(l)).join(", ")}. Nothing was started.`);
+  if (new Set(lanes).size !== lanes.length) throw new Error("ledger-bench: --lanes names a lane twice. Nothing was started.");
+  return lanes as Lane[];
 }
 
 /** True for a path inside this repository, also when reached through a symlink or (on a case-insensitive volume) another letter case. */
@@ -603,7 +618,7 @@ if (import.meta.main) {
   if (insideRepo(values.inputs)) throw new Error("ledger-bench: keep the inputs file outside this (public) repository");
   const inputs = parseInputs(readFileSync(values.inputs, "utf8"));
   const runId = values["run-id"] ?? "";
-  const lanes = (values.lanes ? values.lanes.split(",") : [...LANES]) as Lane[];
+  const lanes = parseLanes(values.lanes);
   const report = (v: Verification) => {
     console.log(JSON.stringify(v, null, 2));
     if (!v.clean) process.exit(1);
