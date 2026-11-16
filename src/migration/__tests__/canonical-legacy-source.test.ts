@@ -637,19 +637,10 @@ test("disagreement across authenticated owner evidence is unbound_multi_owner an
   }
 });
 
-test("the Neon hosted eraser derives that same turns-only owner for a fenced scope", async () => {
-  await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1';
-    DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1';
-    INSERT INTO sessions.deleted_upload_sessions VALUES('org_1','ws_1','claude','sess:1')`);
-  try {
-    expect(await neonAuthority(db).legacyFencedPage!(null)).toEqual([{
-      org_id: "org_1", workspace_id: "ws_1", source: "claude", session_id: "sess:1",
-      legacy_user_id: "person", legacy_machine_id: legacyMachineId("ws_1", "person"),
-    }]);
-  } finally {
-    await pg.exec("DELETE FROM sessions.deleted_upload_sessions");
-    await restoreBaseOwner();
-  }
+test("the Neon hosted eraser never re-derives a legacy export owner", () => {
+  const authority = neonAuthority(db);
+  expect(authority.legacyFencedPage).toBeUndefined();
+  expect(authority.stillLegacyFenced).toBeUndefined();
 });
 
 test("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {
