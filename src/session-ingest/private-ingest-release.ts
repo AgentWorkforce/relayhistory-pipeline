@@ -191,12 +191,14 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             incident: a deploy may add, change or remove both, like the other cutover controls, so
  *                             they live here and not in COMMON_PROFILE (a COMMON_PROFILE change can never match the
  *                             live version it replaces, private_ingest_live_phase).
+ *   originClaimFence          "on" only (omit for off): INGEST_ORIGIN_CLAIM_FENCE, buffered claim/stage/commit through
+ *                             the 20261105062010 origin-scoped entry points (docs/design/per-origin-claim-fence.md).
  * Neither is ever tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "claimLockWaitMs"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "claimLockWaitMs", "originClaimFence"] as const;
 export type PrivateIngestCutover = {
-  s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; claimLockWaitMs?: number;
+  s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; claimLockWaitMs?: number; originClaimFence?: "on";
 };
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
 const claimLockWaitOk = (ms: unknown): ms is number =>
@@ -205,13 +207,15 @@ const STOPPED_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 
 function checkedCutover(profile: Record<string, unknown>, live = false): PrivateIngestCutover {
   const mirror = profile.s3FenceMirror, orgs = profile.httpAdmissionStoppedOrgs;
-  const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs;
+  const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs, originFence = profile.originClaimFence;
   if (mirror !== undefined && mirror !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_fence_mirror");
   if (timeoutBusy !== undefined && timeoutBusy !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_timeout_busy");
   if (lockWait !== undefined && !claimLockWaitOk(lockWait))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_lock_wait");
+  if (originFence !== undefined && originFence !== "on")
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_origin_claim_fence");
   if (orgs !== undefined && (!Array.isArray(orgs) || orgs.length === 0 || new Set(orgs).size !== orgs.length ||
       orgs.some((org) => typeof org !== "string" || !STOPPED_ORG.test(org))))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_stopped_orgs");
@@ -220,6 +224,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: [...(orgs as string[])] }),
     ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" as const } : {}),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
+    ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
   };
 }
 
@@ -231,6 +236,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY          "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS          decimal digits, 25..2000, or unset/empty; signs, spaces, exponents,
  *                                              hex and fractions refuse.
+ *   PRIVATE_INGEST_ORIGIN_CLAIM_FENCE          "on" or unset/empty; anything else refuses.
  */
 export function privateIngestCutoverFromEnv(env: Record<string, string | undefined>): PrivateIngestCutover {
   const mirror = env.PRIVATE_INGEST_S3_FENCE_MIRROR ?? "", orgs = env.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS ?? "";
@@ -238,11 +244,14 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   if (mirror !== "" && mirror !== "on") privateIngestRefuse("private_ingest_profile_fence_mirror");
   if (timeoutBusy !== "" && timeoutBusy !== "on") privateIngestRefuse("private_ingest_profile_claim_timeout_busy");
   if (lockWait !== "" && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_profile_claim_lock_wait");
+  const originFence = env.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE ?? "";
+  if (originFence !== "" && originFence !== "on") privateIngestRefuse("private_ingest_profile_origin_claim_fence");
   return checkedCutover({
     ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
     ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
     ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" } : {}),
     ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(originFence === "on" ? { originClaimFence: "on" } : {}),
   });
 }
 
@@ -258,12 +267,14 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   };
   const mirror = text("INGEST_S3_FENCE_MIRROR"), orgs = text("INGEST_HTTP_ADMISSION_STOPPED_ORGS");
   const timeoutBusy = text("INGEST_CLAIM_TIMEOUT_BUSY"), lockWait = text("INGEST_CLAIM_LOCK_WAIT_MS");
+  const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
   if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
   return checkedCutover({
     ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
     ...(timeoutBusy === undefined ? {} : { claimTimeoutBusy: timeoutBusy }),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
+    ...(originFence === undefined ? {} : { originClaimFence: originFence }),
   }, true);
 }
 

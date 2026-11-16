@@ -159,3 +159,25 @@ test("claim lock controls: env shapes, and add / change / remove at a held phase
     expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
   }
 });
+
+// Per-origin claim fence (migration 20261105062010): a cutover control like the claim lock controls.
+test("origin claim fence control: env shape, and add / remove at a held phase", () => {
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: "on" })).toEqual({ originClaimFence: "on" });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: "" })).toEqual({});
+  for (const v of ["off", "ON", "true", " on", "1"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: v }))).toBe("private_ingest_profile_origin_claim_fence");
+  for (const phase of ["baseline-drain", "step-4-async-on"] as const)
+    expect(privateIngestReleasePhase(at(phase, { originClaimFence: "on" }))).toBe(phase);
+  expect(code(() => privateIngestReleasePhase(at("baseline-drain", { originClaimFence: "off" } as never)))).toBe("private_ingest_profile_origin_claim_fence");
+  const plain = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  const fenced = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, originClaimFence: "on" });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromFenced = live(fenced);
+  expect(privateIngestTransitionReadback(fenced, fromPlain.active, fromPlain.version)).toMatchObject(pass);  // add
+  expect(privateIngestTransitionReadback(plain, fromFenced.active, fromFenced.version)).toMatchObject(pass); // remove (rollback)
+  expect(privateIngestVersionReadback(fenced, fromFenced.active, fromFenced.version)).toMatchObject({ phase: "baseline-drain" });
+  for (const bad of [[{ name: "INGEST_ORIGIN_CLAIM_FENCE", type: "plain_text", text: "off" }], [{ name: "INGEST_ORIGIN_CLAIM_FENCE", type: "secret_text" }]]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+});

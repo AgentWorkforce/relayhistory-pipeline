@@ -854,3 +854,22 @@ describe("session ingest: INGEST_CLAIM_LOCK_WAIT_MS (claimLockWaitMs, default ab
     for (const value of [25, 250, 2000]) expect(() => assertSessionIngestInputs({ ...inputs, claimLockWaitMs: value }, refuse)).not.toThrow();
   });
 });
+
+describe("session ingest: INGEST_ORIGIN_CLAIM_FENCE (originClaimFence, default absent)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  it("omitted: no var, props byte-identical to a stack without the input", () => {
+    expect(Object.hasOwn(sessionIngestVars(buffered), "INGEST_ORIGIN_CLAIM_FENCE")).toBe(false);
+    expect(JSON.stringify(props(buffered))).toBe(JSON.stringify(props({ ...buffered, originClaimFence: undefined })));
+  });
+  it("on (buffered): exactly one more var, no new binding", () => {
+    const on: SessionIngestInputs = { ...buffered, originClaimFence: "on" };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(buffered), INGEST_ORIGIN_CLAIM_FENCE: "on" });
+    expect(Object.keys(props(on).env).sort()).toEqual([...Object.keys(props(buffered).env), "INGEST_ORIGIN_CLAIM_FENCE"].sort());
+  });
+  it("is refused for any other value and in canonical acceptance", () => {
+    for (const value of ["off", "ON", "true", true, 1, "", null])
+      expect(() => assertSessionIngestInputs({ ...buffered, originClaimFence: value } as never, refuse)).toThrow('sessionIngest.originClaimFence must be "on", in buffered mode only (omit for off)');
+    expect(() => assertSessionIngestInputs({ ...inputs, originClaimFence: "on" }, refuse)).toThrow('sessionIngest.originClaimFence must be "on", in buffered mode only (omit for off)');
+  });
+});

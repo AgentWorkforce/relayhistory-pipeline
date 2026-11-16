@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
 import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions-reader.ts";
+import { ingestOriginClaimFence, originalBodies as originalOriginFenceBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-origin-claim-fence.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -92,6 +93,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105050020_operator_session_erase_runtime.down.sql",
       "supabase/rollbacks/20261105057030_selfhost_erase_directory_membership.down.sql",
       "supabase/rollbacks/20261105059000_ingest_publication_gcs_provider.down.sql",
+      "supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql",
     ]);
   });
 
@@ -236,6 +238,35 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("WHERE singleton FOR UPDATE;v_last:=c.last_seat;");
     expect(down).not.toContain("FOR NO KEY UPDATE");
     expect(down).not.toContain("FUNCTION sessions.ingest_lazy_records"); // only the ACK is restored (its comment names the claim fn)
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 062010 per-origin claim fence grants exactly three SECDEF entry points to the ingest role and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    expect(withLane.summary.lanes["ingest-origin-claim-fence"]).toEqual({ functions: 5, replaces: 1, grants: 3 });
+    const acl = JSON.parse(withLane.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const lane = Object.entries(acl).filter(([k]) => k.startsWith("sessions.ingest_origin_")).sort(([a], [b]) => (a < b ? -1 : 1));
+    expect(lane).toEqual([
+      ["sessions.ingest_origin_claim_buffered_batch(jsonb)", ["<owner>:EXECUTE", "bulls96_session_ingest:EXECUTE"]],
+      ["sessions.ingest_origin_claim_enter(jsonb)", ["<owner>:EXECUTE"]],
+      ["sessions.ingest_origin_claim_leave(xid8)", ["<owner>:EXECUTE"]],
+      ["sessions.ingest_origin_commit_buffered_batch(jsonb)", ["<owner>:EXECUTE", "bulls96_session_ingest:EXECUTE"]],
+      ["sessions.ingest_origin_prepare_buffer_stage(jsonb)", ["<owner>:EXECUTE", "bulls96_session_ingest:EXECUTE"]],
+    ]);
+    expect(acl["sessions.ingest_lock_fences(text,text,text)"]).toEqual(["<owner>:EXECUTE"]);
+    const downPath = "supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql";
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestOriginClaimFence.migration!), "utf8")).digest("hex"));
+    const bodies = originalOriginFenceBodies(readFileSync(join(root, "supabase/migrations/20261105058010_operator_user_erase.sql"), "utf8"));
+    expect(bodies).toHaveLength(1);
+    expect(down).toContain(bodies[0]!);
+    expect(bodies[0]).toContain("FOR UPDATE;");
+    expect(bodies[0]).not.toContain("ingest_origin_claim_marks");
+    expect(down.indexOf(bodies[0]!)).toBeLessThan(down.indexOf("DROP TABLE sessions.ingest_origin_claim_marks;"));
+    expect(down).not.toContain("status='pending'");
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");

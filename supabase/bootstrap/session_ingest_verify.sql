@@ -47,6 +47,9 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_operator_runtime_write_begin(jsonb)',
  'sessions.ingest_operator_runtime_write_failed(text,text,uuid)',
  'sessions.ingest_operator_runtime_write_finish(text,text,uuid)',
+ 'sessions.ingest_origin_claim_buffered_batch(jsonb)',
+ 'sessions.ingest_origin_commit_buffered_batch(jsonb)',
+ 'sessions.ingest_origin_prepare_buffer_stage(jsonb)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
  'sessions.ingest_privacy_authority_begin(jsonb)',
  'sessions.ingest_privacy_authority_complete(jsonb)',
@@ -90,6 +93,9 @@ BEGIN
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.ingest\_operator\_erase\_%');
  -- Allowed, not required: the upload consent entry points (before 20261105057010 is applied).
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.upload\_consent\_%');
+ -- Allowed, not required: the origin-scoped buffered entry points (before 20261105062010 is applied, and after
+ -- its guarded rollback).
+ v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.ingest\_origin\_%');
  -- Runtime RPCs are required once their table is installed, and absent on a validated prefix release.
  IF to_regclass('sessions.session_erasure_writes') IS NULL THEN
   v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.ingest\_operator\_runtime\_%');

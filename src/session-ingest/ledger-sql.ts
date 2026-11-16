@@ -80,7 +80,7 @@ type LedgerFunction =
   | "ingest_privacy_authority_complete"
   | "ingest_frozen_source_receipt";
 
-async function call(run: SqlRun, fn: LedgerFunction, input: unknown): Promise<unknown> {
+async function call(run: SqlRun, fn: LedgerFunction | OriginScopedFunction, input: unknown): Promise<unknown> {
   let rows: Record<string, unknown>[];
   try {
     ({ rows } = await run(`SELECT sessions.${fn}($1::jsonb) AS result`, [JSON.stringify(input)]));
@@ -242,12 +242,51 @@ export async function inClaimLockWait<T>(run: SqlRun, ms: number, work: () => Pr
   return value;
 }
 
+/**
+ * INGEST_ORIGIN_CLAIM_FENCE (docs/design/per-origin-claim-fence.md, migration 20261105062010): the buffered claim,
+ * stage prepare and commit go to origin-scoped entry points with the SAME input and result. They serialize per
+ * (org, workspace, user, origin) on a transaction advisory lock and take the user's fence row FOR SHARE instead of
+ * FOR UPDATE, so one user's different machines no longer wait for each other; every per-user control, the operator
+ * erase and the GC still take it FOR UPDATE and exclude them. Off (the default): the per-user functions, unchanged.
+ */
+type OriginScopedFunction = "ingest_origin_claim_buffered_batch" | "ingest_origin_prepare_buffer_stage" | "ingest_origin_commit_buffered_batch";
+const ORIGIN_SCOPED = {
+  ingest_claim_buffered_batch: "ingest_origin_claim_buffered_batch",
+  ingest_prepare_buffer_stage: "ingest_origin_prepare_buffer_stage",
+  ingest_commit_buffered_batch: "ingest_origin_commit_buffered_batch",
+} as const satisfies Partial<Record<LedgerFunction, OriginScopedFunction>>;
+type OriginScopable = keyof typeof ORIGIN_SCOPED;
+/** How long an isolate keeps using the per-user functions after the database answered 42883 (062010 absent). */
+export const ORIGIN_FENCE_ABSENT_MS = 60_000;
+/** Isolate-wide: until when the origin-scoped functions are known absent. Only a routing hint, never an authority. */
+let originFenceAbsentUntil = 0;
+/** Tests only. */
+export function resetOriginFenceHint(): void { originFenceAbsentUntil = 0; }
+/**
+ * One origin-scoped call, falling back to the per-user function when the database does not have 062010 yet (or had
+ * it rolled back): 42883 undefined_function is raised before the function runs, so the failed call wrote nothing
+ * (each `attempt` is one statement or one whole claim transaction). Every other outcome passes through unchanged.
+ */
+async function originScoped<T>(enabled: boolean, fn: OriginScopable, attempt: (fn: LedgerFunction | OriginScopedFunction) => Promise<T>): Promise<T> {
+  if (!enabled || Date.now() < originFenceAbsentUntil) return attempt(fn);
+  try { return await attempt(ORIGIN_SCOPED[fn]); }
+  catch (error) {
+    if (!(error instanceof LedgerUnavailableError) || error.code !== "ledger_sqlstate_42883") throw error;
+    originFenceAbsentUntil = Date.now() + ORIGIN_FENCE_ABSENT_MS;
+    return attempt(fn);
+  }
+}
+
 export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string;acceptGenerations?:readonly string[];selfhostSelectionErase?:boolean;
   /** INGEST_CLAIM_LOCK_WAIT_MS: each claim attempt waits at most this long for a lock (25..2000 ms). Absent: the role's lock_timeout, unchanged. */
-  claimLockWaitMs?: number } = {}): Ledger {
+  claimLockWaitMs?: number;
+  /** INGEST_ORIGIN_CLAIM_FENCE=on: buffered claim/stage/commit through the 062010 origin-scoped entry points. Absent: per-user, unchanged. */
+  originClaimFence?: boolean } = {}): Ledger {
   if(options.claimLockWaitMs!==undefined&&(!Number.isSafeInteger(options.claimLockWaitMs)||options.claimLockWaitMs<CLAIM_LOCK_WAIT_MS_MIN||options.claimLockWaitMs>CLAIM_LOCK_WAIT_MS_MAX))throw new LedgerUnavailableError("ledger_claim_lock_wait_invalid");
   const claimLockWaitMs=options.claimLockWaitMs;
-  const claimCall=(fn:LedgerFunction,input:unknown):Promise<unknown>=>claimLockWaitMs===undefined?call(run,fn,input):inClaimLockWait(run,claimLockWaitMs,()=>call(run,fn,input));
+  if(options.originClaimFence&&options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_origin_fence_refused");
+  const originFence=options.originClaimFence===true;
+  const claimCall=(fn:LedgerFunction|OriginScopedFunction,input:unknown):Promise<unknown>=>claimLockWaitMs===undefined?call(run,fn,input):inClaimLockWait(run,claimLockWaitMs,()=>call(run,fn,input));
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
   if(options.acceptGenerations!==undefined&&options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_generation_set_refused");
   // Bounded overlap (docs/design/zero-503-schema-windows.md): a call that STARTS an operation (claim, ordered
@@ -328,7 +367,7 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     async claim(input: ClaimInput): Promise<ClaimResult> {
       let raw:Record<string,unknown>;
       if(options.acceptanceMode==="buffered"){
-        const claimed=await admitted((g)=>claimCall("ingest_claim_buffered_batch",buffered(input,g)));
+        const claimed=await admitted((g)=>originScoped(originFence,"ingest_claim_buffered_batch",(fn)=>claimCall(fn,buffered(input,g))));
         raw=claimed.value as Record<string,unknown>;remember(raw.claimToken,claimed.generation);
       }else raw=(await claimCall("ingest_claim_batch",input)) as Record<string,unknown>;
       const result=parseClaimResult(raw);
@@ -338,14 +377,14 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     },
     async prepareBufferStage(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await call(run, "ingest_prepare_buffer_stage", buffered(input,forClaim(input.claimToken))) as Record<string,unknown>;
+      const r = await originScoped(originFence, "ingest_prepare_buffer_stage", (fn) => call(run, fn, buffered(input,forClaim(input.claimToken)))) as Record<string,unknown>;
       if (typeof r.stageToken !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(r.stageToken) ||
           typeof r.expiresAt !== "string" || !Number.isFinite(Date.parse(r.expiresAt))) throw new LedgerUnavailableError("ledger_bad_result");
       return {stageToken:r.stageToken,expiresAt:r.expiresAt};
     },
     async commitBuffered(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await call(run,"ingest_commit_buffered_batch",buffered(input,forClaim(input.claimToken))) as Record<string,unknown>;
+      const r = await originScoped(originFence,"ingest_commit_buffered_batch",(fn)=>call(run,fn,buffered(input,forClaim(input.claimToken)))) as Record<string,unknown>;
       if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
       if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
       if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}

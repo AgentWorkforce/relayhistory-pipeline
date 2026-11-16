@@ -2467,13 +2467,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const UE = "upstream:20261105058010_operator_user_erase.sql";
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
     const CA = "upstream:20261105062000_coordination_advisories.sql";
+    const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2524,6 +2525,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062010 (per-origin claim fence) is the newest: 062000's down refuses (55000) while it is applied; its
+    // checksum-pinned down restores 058010's exact ingest_lock_fences, drops the five functions and the mark table,
+    // removes its ledger row and refuses on a rerun.
+    expect(await names()).toContain(OCF);
+    expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
+    expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(CA);
+    await rollback("20261105062010_ingest_origin_claim_fence.down.sql");
+    expect(await names()).not.toContain(OCF);
+    expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toBe(bodyOf("20261105058010_operator_user_erase.sql", "ingest_lock_fences", "$lock$"));
+    expect(await relation("sessions.ingest_origin_claim_marks")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'ingest\\_origin\\_%'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
     // 20261105062000 (coordination advisories) is the newest: 059000's down refuses (55000) while it is applied;
     // its checksum-pinned down drops the five functions, the table and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CA);

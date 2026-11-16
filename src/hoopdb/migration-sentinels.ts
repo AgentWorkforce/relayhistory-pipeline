@@ -461,6 +461,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories",
     sql: "SELECT to_regprocedure('sessions.coordination_advisories_upsert_v1(text,text,jsonb)') IS NOT NULL AND to_regclass('sessions.coordination_advisories') IS NOT NULL AS applied",
   },
+  "upstream:20261105062010_ingest_origin_claim_fence.sql": {
+    evidence: "table sessions.ingest_origin_claim_marks, the origin-scoped buffered entry points and the mark check in sessions.ingest_lock_fences",
+    sql: "SELECT to_regclass('sessions.ingest_origin_claim_marks') IS NOT NULL AND to_regprocedure('sessions.ingest_origin_claim_buffered_batch(jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%ingest_origin_claim_marks%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

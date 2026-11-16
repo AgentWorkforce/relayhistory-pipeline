@@ -183,6 +183,14 @@ export interface SessionIngestInputs {
    */
   claimLockWaitMs?: number;
   /**
+   * INGEST_ORIGIN_CLAIM_FENCE (docs/design/per-origin-claim-fence.md): the buffered claim, stage prepare and commit
+   * call the 20261105062010 origin-scoped entry points, so one user's machines serialize per origin instead of per
+   * user. Buffered acceptance only. Without 062010 applied every call falls back to the per-user function (42883),
+   * so it is safe before the migration, but it changes nothing until then. Present: the var only. Omit for off (no
+   * var rendered, vars byte-identical to before).
+   */
+  originClaimFence?: "on";
+  /**
    * INGEST_UPLOAD_CONSENT (src/session-ingest/upload-consent.ts, docs/upload-consent.md): server-owned upload
    * consent. "report" logs what would be held and never refuses an upload (also when the consent store is
    * unreadable); "hold-only" refuses principals under a containment hold; "enforce" refuses every upload
@@ -245,7 +253,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "claimLockWaitMs", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "claimLockWaitMs", "originClaimFence", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -361,6 +369,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.claimTimeoutBusy must be "on" (omit for off)');
   if (v.claimLockWaitMs !== undefined && (typeof v.claimLockWaitMs !== "number" || !Number.isSafeInteger(v.claimLockWaitMs) || v.claimLockWaitMs < 25 || v.claimLockWaitMs > 2000))
     refuse("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
+  if (v.originClaimFence !== undefined && (v.originClaimFence !== "on" || v.acceptanceMode !== "buffered"))
+    refuse('sessionIngest.originClaimFence must be "on", in buffered mode only (omit for off)');
   if (v.uploadConsent !== undefined && v.uploadConsent !== "report" && v.uploadConsent !== "hold-only" && v.uploadConsent !== "enforce")
     refuse('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
   if (v.s3FenceMirror !== undefined && v.s3FenceMirror !== "on")
@@ -406,6 +416,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.claimLockBusy === "on" ? { INGEST_CLAIM_LOCK_BUSY: "on" } : {}),
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
+    ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
     ...(p.neonExit === "on" ? { SESSIONS_NEON_EXIT: "true" } : {}),
     ...(p.uploadConsent ? { INGEST_UPLOAD_CONSENT: p.uploadConsent } : {}),
     ...(p.s3FenceMirror === "on" ? { INGEST_S3_FENCE_MIRROR: "on" } : {}),

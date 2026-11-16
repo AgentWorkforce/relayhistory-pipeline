@@ -88,6 +88,8 @@ jobs:
       # 2026-11-16 claim lock controls (deliver.ts / ledger-sql.ts). Unset or empty = off / role default.
       PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: ${{ vars.PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY }}
       PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: ${{ vars.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS }}
+      # Per-origin claim fence (ledger-sql.ts originClaimFence, migration 20261105062010). Unset or empty = off.
+      PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: ${{ vars.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE }}
     steps:
       - uses: actions/checkout@v4
         with:

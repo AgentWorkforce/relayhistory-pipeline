@@ -837,6 +837,24 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_origin_claim_buffered_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_origin_claim_enter(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_origin_claim_leave(xid8)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_origin_commit_buffered_batch(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_origin_prepare_buffer_stage(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_prepare_buffer_stage(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

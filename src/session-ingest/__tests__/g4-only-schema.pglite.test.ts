@@ -175,6 +175,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105059000_ingest_publication_gcs_provider.sql",
       // Coordination live advisories: one new owner-only table and five SECURITY DEFINER entry points; no G4 function names them.
       "20261105062000_coordination_advisories.sql",
+      // Per-origin claim fence: an owner-only mark table, two owner-only helpers and three SECURITY DEFINER origin-scoped
+      // entry points; replaces ingest_lock_fences (FOR SHARE only under a mark). A G4 Worker never calls the new names.
+      "20261105062010_ingest_origin_claim_fence.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

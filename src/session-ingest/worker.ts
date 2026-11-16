@@ -48,6 +48,13 @@
  *                              with INGEST_CLAIM_LOCK_BUSY the 429) instead of waiting the role's 2 s.
  *                              Same function, input and lock order; a free lock is unchanged. The
  *                              Cloudflare stack renders it only from sessionIngest.claimLockWaitMs
+ *   INGEST_ORIGIN_CLAIM_FENCE  unset/off (default) | on (any case; buffered acceptance only): the buffered claim,
+ *                              stage prepare and commit call the 20261105062010 origin-scoped entry points
+ *                              (ledger-sql.ts originClaimFence, docs/design/per-origin-claim-fence.md), so one
+ *                              user's machines no longer serialize on the user's fence row. Same input, result and
+ *                              per-user exclusions. On a database without 062010 every call falls back to the
+ *                              per-user function (42883). The Cloudflare stack renders it only from
+ *                              sessionIngest.originClaimFence: "on"
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
@@ -173,6 +180,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
   /** 25..2000 ms: a claim's own lock wait (ledger-sql.ts inClaimLockWait). Unset (default): the role's lock_timeout. */
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
+  /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
+  INGEST_ORIGIN_CLAIM_FENCE?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
   SESSION_ERASE_API_ENABLED?: string;
   /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
@@ -257,6 +266,8 @@ export interface IngestSettings {
   claimTimeoutBusy?: true;
   /** INGEST_CLAIM_LOCK_WAIT_MS (25..2000): each claim waits at most this long for a lock (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
   claimLockWaitMs?: number;
+  /** INGEST_ORIGIN_CLAIM_FENCE=on (buffered only): per-origin claim serialization (ledger-sql.ts). Absent (the default): per-user. */
+  originClaimFence?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
@@ -312,6 +323,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (mode !== "off" && !env.NEON_REPLICA) return null;
   const asyncMode = asyncAdmissionMode(env.INGEST_ASYNC_ADMISSION);
   if (asyncMode !== "off" && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ASYNC_ADMISSION needs buffered acceptance");
+  const originClaimFence = routingFlag(env.INGEST_ORIGIN_CLAIM_FENCE);
+  if (originClaimFence && acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ORIGIN_CLAIM_FENCE needs buffered acceptance");
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
@@ -369,6 +382,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
+    ...(originClaimFence ? { originClaimFence: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
@@ -430,7 +444,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{})}),
+    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{}),...(settings.claimLockWaitMs!==undefined?{claimLockWaitMs:settings.claimLockWaitMs}:{}),...(settings.originClaimFence?{originClaimFence:true}:{})}),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,
