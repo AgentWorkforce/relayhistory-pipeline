@@ -1,10 +1,12 @@
 /**
  * Summaries regeneration, push A: with every SUMMARY_REGEN_* / SUMMARY_RETRY_* flag off
  * (unset, or any value other than exactly "true"), the session brief must be byte-identical
- * to main before the change. The fixture was generated from d83752c2 (GOLDEN_WRITE=1)
- * before any regeneration code existed; it pins every query's text and params in order
- * (recordBrief's writes and sweepUnbriefed included) and the structured log lines, over a
- * generated brief, a retry, a final failure and both sweep modes.
+ * to main before the change. The fixture was regenerated (GOLDEN_WRITE=1) on main 4ff67765,
+ * the memory-bound base with no regeneration code, and this branch's flags-off run
+ * reproduces it byte for byte (the bytes equal the earlier d83752c2 fixture). It pins every
+ * query's text and params in order (recordBrief's writes and sweepUnbriefed included) and
+ * the structured log lines, over a generated brief, a retry, a final failure and both sweep
+ * modes.
  */
 import { afterEach, describe, setDefaultTimeout, setSystemTime, test } from "bun:test";
 import { join } from "node:path";

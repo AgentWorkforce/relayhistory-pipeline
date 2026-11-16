@@ -1,9 +1,16 @@
 /**
  * Summaries regeneration, push A: with every SUMMARY_REGEN_* / SUMMARY_RETRY_* flag off
  * (unset, or any value other than exactly "true"), Bob Costas must be byte-identical to
- * main before the change. The fixture was generated from d83752c2 (GOLDEN_WRITE=1) before
- * any regeneration code existed; it pins every query's text and params in order (the
- * handler's upsert included), the recorder lines and the structured log lines.
+ * main before the change. The fixture was regenerated (GOLDEN_WRITE=1) on main 4ff67765, the
+ * memory-bound base with no regeneration code, and this branch's flags-off run reproduces it
+ * byte for byte (the bytes equal the earlier d83752c2 fixture: none of these cases reaches a
+ * path the memory bound changed). It pins every query's text and params in order (the
+ * handler's upsert included), the recorder lines and the structured log lines for a fresh
+ * write, a current skip, a reconcile, newer and stale revisions, the model_failed and
+ * no_api_key fallbacks, a scrub quarantine and the sweep. It does not reach
+ * summary_input_incomplete, summary_input_unreadable, input_truncated, input sampling or
+ * notCurrentContent; flags-off parity for those rests on handler.test.ts and
+ * session-input.test.ts, which run this handler with regen off.
  */
 import { afterEach, describe, setDefaultTimeout, setSystemTime, test } from "bun:test";
 import { join } from "node:path";
