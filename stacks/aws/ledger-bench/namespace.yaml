@@ -1,0 +1,62 @@
+# ledger-bench: the scratch namespace of the hosted-ledger benchmark. Deleting the namespace removes
+# everything the benchmark put on the cluster. Nothing here references another namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ledger-bench
+  labels:
+    purpose: ledger-bench
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ledger-bench
+  namespace: ledger-bench
+  labels: { purpose: ledger-bench }
+automountServiceAccountToken: false
+---
+# No pod in this namespace accepts a connection, and none may open one to another pod in the cluster:
+# egress is DNS, the Pod Identity agent, and HTTPS to addresses outside the private ranges (AWS endpoints).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ledger-bench-egress-only
+  namespace: ledger-bench
+  labels: { purpose: ledger-bench }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock: { cidr: 169.254.170.23/32 }
+      ports:
+        - { protocol: TCP, port: 80 }
+    - to:
+        - ipBlock: { cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16] }
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# A ceiling on what the namespace can hold, whatever is applied to it.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ledger-bench
+  namespace: ledger-bench
+  labels: { purpose: ledger-bench }
+spec:
+  hard:
+    pods: "8"
+    requests.cpu: "8"
+    requests.memory: 8Gi
+    limits.memory: 8Gi
+    services: "0"
+    persistentvolumeclaims: "0"

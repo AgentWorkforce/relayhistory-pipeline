@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ledger-bench (throwaway): the in-region targets of the hosted-ledger benchmark
+  (docs/design/hosted-ledger-benchmark-plan.md, decision 0008). R2, R3 general-purpose buckets,
+  R4, R5 S3 Express directory buckets, R6 DynamoDB table, key K2 and the client role.
+  Deployed in the cluster's Region, in the throwaway (sessions-dev) account. Delete the stack to remove it.
+
+Parameters:
+  ClusterAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: Account of the EKS cluster whose ledger-bench pod role may assume the client role.
+  PodRoleName:
+    Type: String
+    Default: ledger-bench-pod
+    AllowedPattern: "^ledger-bench-[a-z0-9-]{1,40}$"
+  EastRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region of the R1 bucket (data-east.yaml), named here only to scope the client role.
+  ExpressZoneA:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+-az[0-9]+$"
+    Description: Availability Zone id of R4 (the zone the cluster's nodes run in), e.g. usw2-az1.
+  ExpressZoneB:
+    Type: String
+    AllowedPattern: "^[a-z0-9]+-az[0-9]+$"
+    Description: Availability Zone id of R5, a different zone from ExpressZoneA.
+  Owner:
+    Type: String
+    AllowedPattern: "^[a-z0-9-]{3,40}$"
+  Ttl:
+    Type: String
+    AllowedPattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    Description: Date after which anything of this stack still existing is a leak (apply date + 2 days).
+  BudgetEmail:
+    Type: String
+    Default: ""
+    Description: Optional address for the account budget's notifications. Empty creates no budget.
+  BudgetUsd:
+    Type: Number
+    Default: 300
+
+Rules:
+  DistinctZones:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ExpressZoneA, !Ref ExpressZoneB]]
+        AssertDescription: R4 and R5 must be in different Availability Zones.
+
+Conditions:
+  WithBudget: !Not [!Equals [!Ref BudgetEmail, ""]]
+
+Resources:
+  # K2. The account-root statement delegates to IAM, where only the client role is granted use.
+  Key:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: ledger-bench K2 (throwaway benchmark key)
+      EnableKeyRotation: false
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministersThroughIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  # R2: the production encryption shape (SSE-KMS, Bucket Keys off), in the compute's Region.
+  BucketR2:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "ledger-bench-r2-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: false
+            ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  # R3: the same, with Bucket Keys on.
+  BucketR3:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "ledger-bench-r3-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  BucketR2Policy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketR2
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BucketR2.Arn, !Sub "${BucketR2.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  BucketR3Policy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketR3
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BucketR3.Arn, !Sub "${BucketR3.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # R4 and R5: directory buckets in two zones. SSE-KMS on a directory bucket always uses a Bucket Key.
+  BucketR4:
+    Type: AWS::S3Express::DirectoryBucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "ledger-bench-r4-${AWS::AccountId}--${ExpressZoneA}--x-s3"
+      DataRedundancy: SingleAvailabilityZone
+      LocationName: !Ref ExpressZoneA
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1 }
+
+  BucketR5:
+    Type: AWS::S3Express::DirectoryBucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "ledger-bench-r5-${AWS::AccountId}--${ExpressZoneB}--x-s3"
+      DataRedundancy: SingleAvailabilityZone
+      LocationName: !Ref ExpressZoneB
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault: { SSEAlgorithm: "aws:kms", KMSMasterKeyID: !GetAtt Key.Arn }
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-everything, Status: Enabled, ExpirationInDays: 1 }
+
+  # R6: on demand, with a table-level ceiling so a runaway client cannot buy unbounded throughput.
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: ledger_bench
+      BillingMode: PAY_PER_REQUEST
+      OnDemandThroughput: { MaxReadRequestUnits: 10000, MaxWriteRequestUnits: 10000 }
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      DeletionProtectionEnabled: false
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  # The only identity with data access. Assumable only by the cluster's ledger-bench pod role; the
+  # account-root principal plus the PrincipalArn condition lets this stack exist before that role does.
+  ClientRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ledger-bench-client
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              ArnEquals:
+                "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"
+      Policies:
+        - PolicyName: ledger-bench-targets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListBenchBuckets
+                Effect: Allow
+                Action: "s3:ListBucket"
+                Resource:
+                  - !GetAtt BucketR2.Arn
+                  - !GetAtt BucketR3.Arn
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}"
+              - Sid: BenchObjects
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+                Resource:
+                  - !Sub "${BucketR2.Arn}/bench/*"
+                  - !Sub "${BucketR3.Arn}/bench/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::ledger-bench-r1-${AWS::AccountId}-${EastRegion}/bench/*"
+              - Sid: ExpressSessions
+                Effect: Allow
+                Action: "s3express:CreateSession"
+                Resource:
+                  - !GetAtt BucketR4.Arn
+                  - !GetAtt BucketR5.Arn
+              # K1 lives in the other Region's stack, so both keys are matched by their tag, not by ARN.
+              - Sid: BenchKeysThroughS3Only
+                Effect: Allow
+                Action: ["kms:GenerateDataKey", "kms:Decrypt"]
+                Resource: !Sub "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals: { "aws:ResourceTag/purpose": ledger-bench }
+                  StringLike: { "kms:ViaService": ["s3.*.amazonaws.com", "s3express.*.amazonaws.com"] }
+              - Sid: BenchTable
+                Effect: Allow
+                Action: ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+                Resource: !GetAtt Table.Arn
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
+  # A backstop, not the cap: AWS Budgets lags by hours. The cap is the client's request budget
+  # (benchmarks/ledger-bench/cost.ts). Scoped to the services the benchmark uses, account-wide.
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: WithBudget
+    Properties:
+      Budget:
+        BudgetName: ledger-bench
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetUsd, Unit: USD }
+        CostFilters:
+          Service:
+            - Amazon Simple Storage Service
+            - AWS Key Management Service
+            - Amazon DynamoDB
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref BudgetEmail }]
+
+Outputs:
+  KeyArn: { Value: !GetAtt Key.Arn }
+  BucketR2: { Value: !Ref BucketR2 }
+  BucketR3: { Value: !Ref BucketR3 }
+  BucketR4: { Value: !Ref BucketR4 }
+  BucketR5: { Value: !Ref BucketR5 }
+  Table: { Value: !Ref Table }
+  ClientRoleArn: { Value: !GetAtt ClientRole.Arn }
