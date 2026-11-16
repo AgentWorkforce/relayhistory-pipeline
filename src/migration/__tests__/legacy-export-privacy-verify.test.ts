@@ -13,6 +13,7 @@ import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { mkdtemp, readFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -81,6 +82,24 @@ async function neon() {
   return { pg, db: pg as unknown as Queryable };
 }
 
+const AUTHORITY_MIGRATION = new URL("../../../supabase/migrations/20261105062020_legacy_export_scope_authority.sql", import.meta.url);
+/** The statements a plain ledger fixture needs to run the real register RPC; empty on heads without the migration. */
+function legacyAuthoritySql(): string[] {
+  if (!existsSync(AUTHORITY_MIGRATION)) return [];
+  const pick = (text: string, re: RegExp, what: string) => {
+    const m = re.exec(text);
+    if (!m) throw new Error(`migration no longer defines ${what}`);
+    return m[0];
+  };
+  const ledger = readFileSync(new URL("../../../supabase/migrations/20261104022000_session_ingest_ledger.sql", import.meta.url), "utf8");
+  const authority = readFileSync(AUTHORITY_MIGRATION, "utf8");
+  return [
+    pick(ledger, /CREATE FUNCTION sessions\.ingest_exact_keys\([\s\S]*?\$keys\$;/u, "ingest_exact_keys"),
+    pick(authority, /CREATE TABLE sessions\.legacy_export_scope_authority\([\s\S]*?\n\);/u, "legacy_export_scope_authority"),
+    pick(authority, /CREATE FUNCTION sessions\.ingest_legacy_export_scope_authority_register\([\s\S]*?\$register\$;/u, "the register RPC"),
+  ];
+}
+
 /** Supabase privacy authority: the real column sets of the ledgers the exporter may read. */
 async function supabase() {
   const pg = new PGlite();
@@ -91,6 +110,9 @@ async function supabase() {
  CREATE TABLE sessions.upload_resets(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,request_id text NOT NULL,reset_at timestamptz NOT NULL DEFAULT now(),deleted bigint NOT NULL DEFAULT 0);
  CREATE TABLE sessions.operator_user_erasures(request_id text PRIMARY KEY,org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,state text NOT NULL,origins text[] NOT NULL DEFAULT '{}');
  CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id));`);
+  // The exporter's owner registration (20261105062020), loaded verbatim from the repo when the head has it: the table,
+  // the SECURITY DEFINER register RPC, and the helper it calls. Nothing is hand-written.
+  for (const sql of legacyAuthoritySql()) await pg.exec(sql);
   // Transaction control and advisory locks are stood in (PGlite is single-session); the fence SQL runs for real.
   const db: Queryable = {
     async query<T>(sql: string, params?: unknown[]) {
@@ -421,19 +443,22 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
   });
 
   test("race loser fenced by turn_session_fences alone (no tombstone): the HOSTED deletion job under the Supabase authority removes the legacy manifest and raw object", async () => {
-    // The fence exists only in Supabase, so the hosted job runs with the real Supabase privacy authority (the repo's
-    // migration stack in PGlite, activated exactly as neon-s3-erasure-authority.test.ts does) - the same seam the
-    // production eraser uses (S3X_PRIVACY_AUTHORITY=supabase). The exporter race is reduced to its end state: legacy
-    // objects in S3, a turn_session_fences row, and NO upload_deletions/frozen-deletion tombstone.
+    // Production shape end to end, on the repo's real Supabase migration stack (authorityFixture, activated as in
+    // neon-s3-erasure-authority.test.ts):
+    //  - the exporter runs through runOrg on a restricted privacy role holding only the runbook's grants, using the
+    //    exporter's own privacy-session initializer and preflight (main.ts), with NO transaction-control stubbing;
+    //  - the export loses after its PUT (the object is written, then the scope's transaction fails), which is the
+    //    race loser's end state on a single-connection database;
+    //  - the session is then fenced ONLY by turn_session_fences (no upload_deletions / frozen-deletion tombstone);
+    //  - the hosted ErasureJob runs on the real supabaseAuthority and must leave no legacy object.
+    const main = (await import("../legacy-export/main.ts")) as Record<string, unknown>;
+    const initPrivacy = main.legacyPrivacySession as ((q: Queryable) => Promise<Queryable>) | undefined;
+    const preflight = main.assertPrivacySelectOnly as (q: Queryable) => Promise<void>;
+    expect(typeof initPrivacy).toBe("function"); // the exporter must export its real privacy-connection initializer
+    expect(existsSync(AUTHORITY_MIGRATION)).toBe(true); // the durable owner registration must exist
     const n = await neon();
     await n.pg.query("UPDATE sessions.conversation_turns SET session_id=$1", [SR.sessionId]);
     await n.pg.query("UPDATE sessions.session_outcomes SET session_id=$1", [SR.sessionId]);
-    const store = createFsStore({ root: await tmp("race-hosted") });
-    const unit = (await legacyUnit(n.db, SR))!;
-    await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
-    const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
-    expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/")).length).toBeGreaterThan(0);
-
     const f = await authorityFixture();
     try {
       await f.seal();
@@ -441,23 +466,73 @@ describe("(c) a session erased AFTER export loses its legacy objects and pointer
       const fp = (await f.db.query("SELECT sessions.ingest_privacy_authority_packet('[]','[]','[]') AS f")).rows[0] as { f: string };
       const owned = (await f.ownerRpc("ingest_privacy_authority_owned_digest")).r;
       await f.ownerRpc("ingest_privacy_authority_activate", { controlEpoch: epoch, neonFingerprintSha256: fp.f, heads: [], deletions: [], resets: [], neonOwned: owned });
-      // turn_session_fences is created by the turns-forward migration (20261105062010, pipeline-ingest branch); when the
-      // stack under test lacks it, create it with that migration's exact shape so the fence row can exist.
+      // turn_session_fences comes from the turns-forward migration (20261105062010, pipeline-ingest branch); when the
+      // stack under test lacks it, create it with that migration's exact shape.
       await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
         first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id))`);
-      await f.db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'legacy_import') ON CONFLICT DO NOTHING", [SR.orgId, SR.workspaceId, SR.source, SR.sessionId]);
-      const tomb = async (t: string) => ((await f.db.query(`SELECT count(*)::int AS n FROM sessions.${t} WHERE session_id=$1`, [SR.sessionId])).rows[0] as { n: number }).n;
-      expect(await tomb("upload_deletions")).toBe(0); // fence-only: no ordinary tombstone to lean on
-      expect(await tomb("ingest_frozen_source_deletions")).toBe(0);
-
-      const state = new SyncState(join(await tmp("race-hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
-      const logs: Record<string, unknown>[] = [];
-      const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
-      await job.sweep();
-      await job.sweep();
-      state.close();
-      expect(logs.some((l) => l.message === "erasure sweep" && l.authority === "supabase")).toBe(true); // the authority was live
-      expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
+      const LEDGERS = ["session_erasure_receipts", "upload_deletions", "ingest_frozen_source_deletions", "upload_resets", "turn_session_fences", "operator_user_erasures"];
+      // The runbook's privacy login: SELECT on the ledgers (BYPASSRLS so RLS cannot hide a fence), EXECUTE on register only.
+      await f.db.exec(`DROP ROLE IF EXISTS lep_privacy; CREATE ROLE lep_privacy NOLOGIN BYPASSRLS; GRANT USAGE ON SCHEMA sessions TO lep_privacy;
+        ${LEDGERS.map((t) => `GRANT SELECT ON sessions.${t} TO lep_privacy;`).join(" ")}
+        GRANT EXECUTE ON FUNCTION sessions.ingest_legacy_export_scope_authority_register(jsonb) TO lep_privacy;`);
+      // One session-level SET ROLE for the exporter phase: its BEGIN/COMMIT, advisory locks and RPC run for real.
+      // Like node-postgres: a parameterless query uses the simple protocol (multi-statement allowed, last result).
+      const raw: Queryable = {
+        query: async <T,>(t: string, p?: unknown[]) => {
+          if (p?.length) return (await f.db.query<T>(t, p as never)) as { rows: T[] };
+          const all = await f.db.exec(t);
+          return { rows: (all.at(-1)?.rows ?? []) as T[] };
+        },
+      };
+      await f.db.exec("SET ROLE lep_privacy");
+      let privacyDb: Queryable;
+      try {
+        privacyDb = await initPrivacy!(raw);
+        await preflight(privacyDb);
+        for (const t of [...LEDGERS, "legacy_export_scope_authority"]) // the role still writes no ledger and not the authority table
+          expect(await f.db.query(`DELETE FROM sessions.${t}`).then(() => "wrote", (e) => String((e as Error).message))).toContain("permission denied");
+        const store = createFsStore({ root: await tmp("race-hosted") });
+        let puts = 0;
+        // The PUT lands, then the scope fails (as a race loser does after its recheck): the transaction rolls back.
+        const losing = new Proxy(store, {
+          get(target, prop, recv) {
+            if (prop === "put") return async (...a: unknown[]) => {
+              const r = await (target.put as (...x: unknown[]) => unknown).apply(target, a);
+              puts += 1;
+              throw Object.assign(new Error("simulated loss after PUT"), { code: "legacy_privacy_race" });
+              return r;
+            };
+            const v = Reflect.get(target, prop, recv);
+            return typeof v === "function" ? v.bind(target) : v;
+          },
+        }) as ObjectStore;
+        const { counters, checkpoint } = await run(n.db, privacyDb, losing, "race-hosted");
+        checkpoint.close();
+        expect(puts).toBeGreaterThan(0);
+        expect(counters.exported).toBe(0);
+        await f.db.exec("RESET ROLE");
+        const objectRoot = liveObjectPrefix("96bulls", legacyGroup(OWNER));
+        const written = (await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"));
+        expect(written.length).toBeGreaterThan(0); // the loser's object is really in S3
+        // The owner row must survive the loser's rollback: committed BEFORE the PUT, or the eraser can never find it.
+        const row = (await f.db.query("SELECT legacy_user_id,legacy_machine_id FROM sessions.legacy_export_scope_authority WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4", [SR.orgId, SR.workspaceId, SR.source, SR.sessionId])).rows;
+        expect(row).toEqual([{ legacy_user_id: OWNER, legacy_machine_id: legacyMachineId(SR.workspaceId, OWNER) }]);
+        // Fenced only by turn_session_fences.
+        await f.db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES($1,$2,$3,$4,'legacy_import') ON CONFLICT DO NOTHING", [SR.orgId, SR.workspaceId, SR.source, SR.sessionId]);
+        const tomb = async (t: string) => ((await f.db.query(`SELECT count(*)::int AS n FROM sessions.${t} WHERE session_id=$1`, [SR.sessionId])).rows[0] as { n: number }).n;
+        expect(await tomb("upload_deletions")).toBe(0);
+        expect(await tomb("ingest_frozen_source_deletions")).toBe(0);
+        const state = new SyncState(join(await tmp("race-hosted-state"), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+        const logs: Record<string, unknown>[] = [];
+        const job = new ErasureJob(supabaseAuthority(f.queryable), state, storeEraser(store), (x) => void logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+        await job.sweep();
+        await job.sweep();
+        state.close();
+        expect(logs.some((l) => l.message === "erasure sweep" && l.authority === "supabase")).toBe(true); // the authority was live
+        expect((await allKeys(store)).filter((k) => k.startsWith(objectRoot) && k.includes("/s=sess_r/"))).toEqual([]);
+      } finally {
+        await f.db.exec("RESET ROLE").catch(() => {});
+      }
     } finally {
       await f.close();
     }
