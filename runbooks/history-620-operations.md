@@ -252,12 +252,22 @@ contract and its readback digests are untouched, and the private-ingest deploy n
 - **Signal.** Workers Logs of the private Worker `96bulls-session-ingest`, one terminal line per request on
   `route` `delivery.batches`, `turns.batches` or `delivery.recovery`. Numerator: `outcome`
   `delivery_unavailable` (the 503) with a `db_error_class` from the closed set (`terminated`, `reset`,
-  `timeout`, `pool`, `tls`, `unknown`; `src/session-ingest/db-error-class.ts`). Denominator: every line on those
-  routes except the capture-policy report lines that reuse the route (`outcome` `missing`, `stale`,
-  `session_predates`). A 503 without a DB diagnosis (object store, custody, admission) is not counted. A claim
-  turned into 429 `delivery_busy` by `INGEST_CLAIM_LOCK_BUSY` or `INGEST_CLAIM_TIMEOUT_BUSY` is designed
-  back-pressure: it counts in the denominator only.
-- **Threshold and window.** Fires when `countIf(DB-error 503) / greatest(count(), 20) > 0.2` over the last
+  `timeout`, `pool`, `tls`, `unknown`; `src/session-ingest/db-error-class.ts`), and `db_refusal` absent or a
+  generation-fence class (`generation_not_ready`, `policy_unavailable`). A per-org or per-user 55000 refusal
+  (`user_seal_missing`, `org_admission_closed`, `other`, ...) is not counted, so one stuck user cannot page.
+  Denominator: every line on those routes except the capture-policy report lines that reuse the route
+  (`outcome` `missing`, `stale`, `session_predates`). An absent attribute reads as `''` on both sides
+  (`ifNull`), and the TS model in the module (`countsAsDbErrorDelivery`) is tested against real Worker lines.
+- **Blind spots (not counted).** A 503 without a DB diagnosis (object store, custody, admission). A claim
+  turned into 429 `delivery_busy` by `INGEST_CLAIM_LOCK_BUSY` or `INGEST_CLAIM_TIMEOUT_BUSY` (designed
+  back-pressure: denominator only); with production's flags on, that is most claim-stage 57014/55P03. With
+  `asyncAdmission` on, a queued delivery answers `accepted_queued` and its DB errors land on the consumer's
+  `ingest.admission` lines, which this alert does not read. Control routes (selection, reset, custody).
+- **Workers Logs.** The query needs Workers Logs on for the Worker. `stacks/cloudflare/session-ingest.ts`
+  sets no `observability`, so Alchemy's default applies (`{ enabled: true, logs: { enabled: true,
+  invocationLogs: true } }`, no head sampling). The test pins both; an observability override in the Worker
+  profile must keep logs on and unsampled or this alert under-counts.
+- **Threshold and window.** Fires when `toFloat64(countIf(DB-error 503)) / greatest(count(), 20) > 0.2` over the last
   2 minutes (`timestamp >= NOW() - INTERVAL '2' MINUTE`, threshold short window `2m`). It is evaluated every
   minute and re-notifies every 30 minutes while firing. The floor of 20 means a quiet window needs at least
   5 DB-error 503s to fire.
@@ -289,22 +299,32 @@ contract and its readback digests are untouched, and the private-ingest deploy n
    `POST /accounts/<account>/alerting/v3/destinations/webhooks` (`name`, `url`, `secret`), or in the
    dashboard under Notifications > Destinations. Cloudflare must report its type as `generic`.
 4. Operator, once (Khaliq OK): create the protected GitHub environment `ingest-alerting-production`. It allows
-   deployments only from `main`, with Khaliq as required reviewer. Add the secret
+   deployments only from `main`. Add Khaliq as required reviewer if the repository plan allows it; it did not
+   on 2026-11-04 (GitHub 422, `runbooks/guarded-session-schema-release.md` "Operator read-only plan while
+   reviewer billing is blocked"). Without a reviewer rule the gate falls back, like the schema release, to
+   the first-attempt dispatch by Khaliq's own pinned User account; with one, a recorded approval is
+   required and a rejection refuses. Add the secret
    `CLOUDFLARE_ALERTING_API_TOKEN`: an account API token with Notifications edit and read on this account
    only. Add the variable `INGEST_ALERT_WEBHOOK_ID`: the destination id from step 3.
-5. Before the first apply, check the query against live data. In the dashboard, open Alerts > Monitors >
-   create > custom SQL on `logs.workersLogs` and paste the query from the plan (read-only preview). Confirm
-   that `attributes['route']`, `attributes['outcome']` and `attributes['db_error_class']` resolve for this
-   Worker's lines and that `countIf`/`greatest` are accepted. The SQL API introspection endpoint with
-   `include_attributes=true` lists the indexed keys. If preview fails, adjust the query in a reviewed PR.
-   Cloudflare validates the query on save (`InvalidAlertQuery`), so a bad query fails the apply instead of
-   saving a silent alert.
-6. Dispatch `ingest error alert` with `mode=plan` and `sha=<main head>`. This is read-only. It checks that the
+5. Precondition, recorded before any apply (kept in the apply handoff). In the dashboard, open Alerts >
+   Monitors > create > custom SQL on `logs.workersLogs` and preview the query (read-only), widening only the
+   `timestamp` bound:
+   - over a busy hour, `count()` > 0 with the same `WHERE` (the attribute lookups resolve for this Worker's
+     lines; the SQL API introspection endpoint with `include_attributes=true` lists the indexed keys);
+   - over a known failure window, for example 2026-11-16 15:43-16:19Z, `value` well above 0 (the numerator
+     matches real DB-error 503s, and `toFloat64`, `countIf`, `ifNull` and `greatest` are accepted).
+   Record both results (window, count, value). If either fails, fix the query in a reviewed change; do not
+   apply. Cloudflare also validates the query on save (`InvalidAlertQuery`), so a malformed query fails the
+   apply, but a query that parses and never matches would be a silent alert: that is what this step rules out.
+6. Dispatch `ingest error alert` with `mode=plan` and `sha=<main head>`. This is read-only, but its job still
+   runs in the protected environment, so it waits for the same environment approval. It checks that the
    destination exists, is generic and has that name. It diffs the live policy by name and prints `action`
-   (`create`, `update` or `noop`), the drifted field names, the body `digest` and the exact confirmation.
+   (`create`, `update` or `noop`), the drifted field names, the body `digest` and the exact confirmation. A
+   policy list Cloudflare reports as more than one page refuses (`ingest_error_alert_paginated`).
 7. Dispatch `mode=apply` at the same sha with confirmation `APPLY-INGEST-DB-ERROR-ALERT <sha> BODY <digest>`.
    Khaliq must approve the environment. The apply re-plans, refuses a different body, writes the one policy,
-   reads it back and refuses any drift. A later change to the threshold or the query is a reviewed PR plus
+   reads it back and refuses any drift. A refusal after the write (lost response, readback drift) can leave
+   the new or updated policy live: re-plan to learn the true state before anything else. A later change to the threshold or the query is a reviewed PR plus
    the same plan and apply.
 8. Verify delivery once: in the dashboard, use the policy's test notification, or temporarily lower the
    threshold in a reviewed PR. Confirm that the message arrives in Agent Relay.
@@ -315,8 +335,9 @@ Rollback: disable or delete the policy in the dashboard. The next plan will repo
 failing. Clients keep their batches and retry, so nothing is lost while it lasts, but uploads stall.
 
 1. Split the window by `db_error_code`, `db_error_class` and `stage` in Workers Logs:
-   - `57014` or `55P03` on `stage=claim`: lock waits or timeouts. See "Lock-wait alert" above and the
-     claim-busy flags.
+   - `57014` or `55P03` on `stage=buffer_intent` or `buffer_receipt`: lock waits or statement timeouts on the
+     staged path (claim-stage ones are mostly 429 `delivery_busy` under the claim-busy flags and are not
+     counted). See "Lock-wait alert" above.
    - `pool`, `terminated` or `reset`: connection capacity or a pooler/Hyperdrive drop.
    - `55000` on every request: generation fence (`db_refusal` `generation_not_ready` or
      `policy_unavailable`, see "Route-line refusal class and client" above). Uploads fail closed because the

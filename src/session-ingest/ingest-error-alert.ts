@@ -8,8 +8,11 @@
  * and the recovery route; one terminal line per request):
  *   numerator    `route` in ROUTES, `outcome` = `delivery_unavailable` (the 503) and `db_error_class` in the
  *                closed DB_ERROR_CLASSES set (src/session-ingest/db-error-class.ts), i.e. the 503 carries a
- *                database-client diagnosis. A 503 without one (object store, custody, admission) is not counted.
- *   denominator  every line with `route` in ROUTES, minus the capture-policy report lines that reuse the route
+ *                database-client diagnosis, and that is not a per-org/per-user 55000 refusal: `db_refusal` absent
+ *                (no 55000) or one of the generation-fence classes (GENERATION_REFUSALS, db-refusal-class.ts), so
+ *                one stuck user's `user_seal_missing` (etc.) cannot page. A 503 without a DB diagnosis (object
+ *                store, custody, admission) is not counted.
+ *   denominator  every line with `route` in ROUTES (a missing `outcome` reads as ''), minus the capture-policy report lines that reuse the route
  *                (`outcome` missing / stale / session_predates), floored at MIN_DELIVERIES so a quiet window
  *                cannot fire on one or two failures (below the floor the value is failures / MIN_DELIVERIES).
  * A claim converted to 429 `delivery_busy` (INGEST_CLAIM_LOCK_BUSY / INGEST_CLAIM_TIMEOUT_BUSY) is designed
@@ -24,6 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import { DB_ERROR_CLASSES } from "./db-error-class.ts";
+import { GENERATION_REFUSALS } from "./db-refusal-class.ts";
 
 export const INGEST_ERROR_ALERT = Object.freeze({
   /** Deterministic policy name: the apply finds the live policy by it. */
@@ -60,20 +64,25 @@ export function refuseIngestErrorAlert(code: string): never {
 const refuse: (code: string) => never = refuseIngestErrorAlert;
 
 const list = (values: readonly string[]) => values.map((v) => `'${v}'`).join(", ");
+/** `db_refusal` values that still count (absent = '' and the generation fence), in a fixed order. */
+export const COUNTED_REFUSALS: readonly string[] = Object.freeze(["", ...[...GENERATION_REFUSALS].sort()]);
 
 /** The SQL API query: one row, one numeric `value` column (the DB-error delivery ratio over the window). */
 export function ingestErrorAlertQuery(accountId: string): string {
   if (!ACCOUNT.test(accountId)) refuse("ingest_error_alert_account");
   const A = INGEST_ERROR_ALERT;
   return [
-    `SELECT countIf(attributes['outcome'] = '${A.outcome}' AND attributes['db_error_class'] IN (${list(DB_ERROR_CLASSES)}))`,
+    // A missing attribute reads as '' through ifNull whether the dataset returns '' or NULL for an absent key.
+    `SELECT toFloat64(countIf(ifNull(attributes['outcome'], '') = '${A.outcome}'`,
+    `    AND ifNull(attributes['db_error_class'], '') IN (${list(DB_ERROR_CLASSES)})`,
+    `    AND ifNull(attributes['db_refusal'], '') IN (${list(COUNTED_REFUSALS)})))`,
     `  / greatest(count(), ${A.minDeliveries}) AS value`,
     `FROM logs.workersLogs`,
     `WHERE accountTag = '${accountId}'`,
     `  AND scriptName = '${A.worker}'`,
     `  AND timestamp >= NOW() - INTERVAL '${A.windowMinutes}' MINUTE`,
     `  AND attributes['route'] IN (${list(A.routes)})`,
-    `  AND attributes['outcome'] NOT IN (${list(A.reportOutcomes)})`,
+    `  AND ifNull(attributes['outcome'], '') NOT IN (${list(A.reportOutcomes)})`,
   ].join("\n");
 }
 
@@ -172,8 +181,16 @@ export function cloudflareAlertingApi(
       redirect: "error",
       signal: AbortSignal.timeout(20_000),
     });
-    const json = (await response.json().catch(() => null)) as { success?: boolean; result?: unknown } | null;
+    const json = (await response.json().catch(() => null)) as
+      | { success?: boolean; result?: unknown; result_info?: { total_pages?: unknown; total_count?: unknown } }
+      | null;
     if (!response.ok || json?.success !== true) refuse(response.status === 404 ? "ingest_error_alert_not_found" : "ingest_error_alert_api");
+    // The policy list is read in one page; a list Cloudflare reports as longer is refused, never half-read.
+    const info = json!.result_info;
+    if (path === "/alerting/v3/policies" && method === "GET" && info &&
+        ((typeof info.total_pages === "number" && info.total_pages > 1) ||
+         (typeof info.total_count === "number" && Array.isArray(json!.result) && info.total_count > json!.result.length)))
+      refuse("ingest_error_alert_paginated");
     return json!.result;
   };
 }
@@ -210,7 +227,9 @@ export function ingestErrorAlertConfirmation(sha: string, digest: string): strin
   return `APPLY-INGEST-DB-ERROR-ALERT ${sha} BODY ${digest}`;
 }
 
-/** Re-plan, check the confirmation, create or update once, then read back and require zero drift. */
+/** Re-plan, check the confirmation, create or update once, then read back and require zero drift. A refusal after
+ * the write (lost response, readback drift) can leave the new or updated policy live: re-plan to learn the true
+ * state before anything else. */
 export async function applyIngestErrorAlert(
   api: AlertingApi,
   input: { accountId: string; webhookId: string; sha: string; confirmation: string },
@@ -263,7 +282,8 @@ export function countsAsDelivery(line: Record<string, unknown>): boolean {
 }
 export function countsAsDbErrorDelivery(line: Record<string, unknown>): boolean {
   return countsAsDelivery(line) && line.outcome === INGEST_ERROR_ALERT.outcome &&
-    (DB_ERROR_CLASSES as readonly unknown[]).includes(line.db_error_class);
+    (DB_ERROR_CLASSES as readonly unknown[]).includes(line.db_error_class) &&
+    COUNTED_REFUSALS.includes(typeof line.db_refusal === "string" ? line.db_refusal : "");
 }
 /** The value the query computes over a window's lines. */
 export function ingestErrorAlertValue(lines: readonly Record<string, unknown>[]): number {

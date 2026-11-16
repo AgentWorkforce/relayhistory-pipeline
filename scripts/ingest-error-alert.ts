@@ -21,6 +21,7 @@ import {
   ingestErrorAlertConfirmation,
   ingestErrorAlertDispatch,
   planIngestErrorAlert,
+  refuseIngestErrorAlert,
 } from "../src/session-ingest/ingest-error-alert.ts";
 
 const PROFILE = resolve("config/cloudflare/private-ingest-production.json");
@@ -33,6 +34,8 @@ const stamp = () => ({ at: new Date().toISOString(), sourceCommit: process.env.G
 
 export async function runIngestErrorAlert(env: Record<string, string | undefined>, fetcher: typeof fetch = fetch) {
   const dispatch = ingestErrorAlertDispatch(env);
+  // The checkout is the dispatched commit: the body applied is the body reviewed at that sha.
+  if (env.GITHUB_SHA !== dispatch.sha) refuseIngestErrorAlert("ingest_error_alert_sha_mismatch");
   const accountId = ingestErrorAlertAccount(JSON.parse(readFileSync(PROFILE, "utf8")), env);
   const webhookId = env.INGEST_ALERT_WEBHOOK_ID ?? "";
   const api = cloudflareAlertingApi(env.CLOUDFLARE_ALERTING_API_TOKEN ?? "", accountId, dispatch.mode, fetcher);

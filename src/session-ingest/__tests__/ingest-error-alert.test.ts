@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createIngestApp, SYNC_SCOPE } from "../app.ts";
 import { DB_ERROR_CLASSES } from "../db-error-class.ts";
+import { GENERATION_REFUSALS } from "../db-refusal-class.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
@@ -12,6 +13,7 @@ import { logLine } from "../../shared/log.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import {
   INGEST_ERROR_ALERT as A,
+  COUNTED_REFUSALS,
   applyIngestErrorAlert,
   cloudflareAlertingApi,
   countsAsDbErrorDelivery,
@@ -28,6 +30,7 @@ import {
 } from "../ingest-error-alert.ts";
 import { SESSION_INGEST_WORKER } from "../../../stacks/cloudflare/session-ingest.ts";
 import { ingestErrorAlertGithubGate } from "../../../scripts/ingest-error-alert-github.ts";
+import { runIngestErrorAlert } from "../../../scripts/ingest-error-alert.ts";
 import { SCHEMA_RELEASE as P } from "../../hoopdb/schema-release-contract.ts";
 import { PRIVATE_INGEST_RELEASE } from "../private-ingest-release.ts";
 
@@ -46,8 +49,8 @@ const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
 const enc = (s: string) => new TextEncoder().encode(s);
 
-async function ledgerError(sqlstate: string): Promise<unknown> {
-  const pgErr = Object.assign(new Error("canceling statement"), { code: sqlstate });
+async function ledgerError(sqlstate: string, message = "canceling statement"): Promise<unknown> {
+  const pgErr = Object.assign(new Error(message), { code: sqlstate });
   try { await sqlLedger(async () => { throw pgErr; }).releaseSlot(TENANT as never, "h"); } catch (x) { return x; }
   throw new Error("expected the ledger to throw");
 }
@@ -99,6 +102,24 @@ describe("signal: the Worker's own route lines", () => {
     expect(r.lines.filter((l) => l.route === "ingest.lock_alert").some(countsAsDelivery)).toBe(false);
   });
 
+  test("55000: a generation-fence refusal counts; a per-user refusal does not", async () => {
+    const fence = await ledgerError("55000", "session ingest: generation not ready");
+    const f = await recovery((l) => { l.claim = async () => { throw fence; }; });
+    expect(f.status).toBe(503);
+    const fenceLine = f.lines.filter(countsAsDelivery);
+    expect(fenceLine).toHaveLength(1);
+    expect(fenceLine[0]).toMatchObject({ outcome: "delivery_unavailable", db_error_code: "55000", db_error_class: "unknown", db_refusal: "generation_not_ready" });
+    expect(countsAsDbErrorDelivery(fenceLine[0]!)).toBe(true);
+    const user = await ledgerError("55000", "session ingest: user privacy seal missing");
+    const u = await recovery((l) => { l.claim = async () => { throw user; }; });
+    expect(u.status).toBe(503);
+    const userLine = u.lines.filter(countsAsDelivery);
+    expect(userLine).toHaveLength(1);
+    expect(userLine[0]).toMatchObject({ outcome: "delivery_unavailable", db_error_code: "55000", db_refusal: "user_seal_missing" });
+    expect(countsAsDbErrorDelivery(userLine[0]!)).toBe(false);
+    expect(COUNTED_REFUSALS).toEqual(["", ...[...GENERATION_REFUSALS].sort()]);
+  });
+
   test("a successful delivery counts in the denominator only", async () => {
     const r = await recovery(() => {});
     expect(r.status).toBe(200);
@@ -113,6 +134,9 @@ describe("signal: the Worker's own route lines", () => {
     expect(countsAsDbErrorDelivery({ ...base, outcome: "delivery_busy", db_error_class: "timeout" })).toBe(false);
     expect(countsAsDelivery({ ...base, outcome: "delivery_busy", db_error_class: "timeout" })).toBe(true);
     for (const outcome of A.reportOutcomes) expect(countsAsDelivery({ ...base, outcome })).toBe(false);
+    // A missing outcome reads as '' (the SQL's ifNull): in the denominator, never the numerator.
+    expect(countsAsDelivery(base)).toBe(true);
+    expect(countsAsDbErrorDelivery({ ...base, db_error_class: "pool" })).toBe(false);
     expect(countsAsDelivery({ route: "delivery.sessions.selection", outcome: "delivery_unavailable", db_error_class: "pool" })).toBe(false);
   });
 
@@ -144,7 +168,10 @@ describe("policy body", () => {
     expect(q).toContain(`scriptName = '96bulls-session-ingest'`);
     expect(q).toContain(`timestamp >= NOW() - INTERVAL '2' MINUTE`);
     expect(q).toContain(`attributes['route'] IN ('delivery.batches', 'turns.batches', 'delivery.recovery')`);
-    expect(q).toContain(`attributes['db_error_class'] IN (${DB_ERROR_CLASSES.map((c) => `'${c}'`).join(", ")})`);
+    expect(q).toContain(`SELECT toFloat64(countIf(ifNull(attributes['outcome'], '') = 'delivery_unavailable'`);
+    expect(q).toContain(`ifNull(attributes['db_error_class'], '') IN (${DB_ERROR_CLASSES.map((c) => `'${c}'`).join(", ")})`);
+    expect(q).toContain(`ifNull(attributes['db_refusal'], '') IN ('', 'generation_not_ready', 'policy_unavailable')))`);
+    expect(q).toContain(`ifNull(attributes['outcome'], '') NOT IN ('missing', 'stale', 'session_predates')`);
     expect(q).toContain(`/ greatest(count(), 20) AS value`);
     expect(q).not.toContain(";");
     expect(code(() => ingestErrorAlertQuery("x' OR '1'='1"))).resolves.toBe("ingest_error_alert_account");
@@ -235,8 +262,15 @@ describe("plan and apply", () => {
     expect(await code(() => apply("POST", "/alerting/v3/destinations/webhooks/" + HOOK, {}))).toBe("ingest_error_alert_plan_write");
     expect(await code(() => apply("GET", "/workers/scripts/96bulls-session-ingest"))).toBe("ingest_error_alert_api_path");
     expect(seen).toHaveLength(1);
-    const failing = cloudflareAlertingApi("tok", ACCOUNT, "plan", (async () => new Response("{}", { status: 404 })) as unknown as typeof fetch);
-    expect(await code(() => failing("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_not_found");
+    const answer = (status: number, body: unknown) =>
+      cloudflareAlertingApi("tok", ACCOUNT, "plan", (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch);
+    expect(await code(() => answer(404, {})("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_not_found");
+    expect(await code(() => answer(503, { success: true, result: [] })("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_api");
+    expect(await code(() => answer(200, { success: false, errors: [{ code: 1 }] })("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_api");
+    expect(await code(() => cloudflareAlertingApi("tok", ACCOUNT, "plan", (async () => new Response("not json")) as unknown as typeof fetch)("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_api");
+    expect(await code(() => answer(200, { success: true, result: [{}], result_info: { page: 1, total_pages: 2 } })("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_paginated");
+    expect(await code(() => answer(200, { success: true, result: [{}], result_info: { total_count: 3 } })("GET", "/alerting/v3/policies"))).toBe("ingest_error_alert_paginated");
+    expect(await answer(200, { success: true, result: [{}], result_info: { page: 1, total_pages: 1, total_count: 1 } })("GET", "/alerting/v3/policies")).toEqual([{}]);
   });
 
   test("dispatch and account inputs", async () => {
@@ -246,11 +280,17 @@ describe("plan and apply", () => {
     expect(await code(() => ingestErrorAlertDispatch({ INGEST_ALERT_MODE: "apply", INGEST_ALERT_SHA: sha, INGEST_ALERT_CONFIRMATION: "APPLY" }))).toBe("ingest_error_alert_confirmation");
     expect(ingestErrorAlertAccount(profile, { CLOUDFLARE_ACCOUNT_ID: ACCOUNT })).toBe(ACCOUNT);
     expect(await code(() => ingestErrorAlertAccount(profile, { CLOUDFLARE_ACCOUNT_ID: "f".repeat(32) }))).toBe("ingest_error_alert_account_mismatch");
+    // The checkout must be the dispatched sha, checked before the token or the network is touched.
+    let fetched = 0;
+    const fetcher = (async () => { fetched++; return new Response("{}"); }) as unknown as typeof fetch;
+    expect(await code(() => runIngestErrorAlert({ INGEST_ALERT_MODE: "plan", INGEST_ALERT_SHA: sha, GITHUB_SHA: "2".repeat(40),
+      CLOUDFLARE_ACCOUNT_ID: ACCOUNT, CLOUDFLARE_ALERTING_API_TOKEN: "tok", INGEST_ALERT_WEBHOOK_ID: HOOK }, fetcher))).toBe("ingest_error_alert_sha_mismatch");
+    expect(fetched).toBe(0);
   });
 });
 
 // ---- GitHub gate and workflow ------------------------------------------------------------------------------
-function github(over: { dispatcher?: number; approvals?: any[]; reviewers?: boolean } = {}) {
+function github(over: { dispatcher?: number; approvals?: any[]; reviewers?: boolean; main?: string; ci?: string } = {}) {
   const actor = { id: over.dispatcher ?? P.dispatcher.id, login: P.dispatcher.login, type: "User" };
   const run = { id: 100, head_sha: sha, head_branch: "main", event: "workflow_dispatch", path: A.workflow, run_attempt: 1, actor, triggering_actor: { ...actor } };
   const environment = { id: 7, name: A.environment,
@@ -259,12 +299,12 @@ function github(over: { dispatcher?: number; approvals?: any[]; reviewers?: bool
   const jobs = { total_count: 6, jobs: ["checks", "session-read-worker / worker", "unit-tests", "real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"]
     .map((name) => ({ name, head_sha: sha, status: "completed", conclusion: "success" })) };
   return async (path: string): Promise<any> => {
-    if (path.endsWith("/git/ref/heads/main")) return { object: { sha } };
+    if (path.endsWith("/git/ref/heads/main")) return { object: { sha: over.main ?? sha } };
     if (path.endsWith("/actions/runs/100")) return run;
     if (path.endsWith("/actions/runs/100/approvals")) return over.approvals ?? [];
     if (path.endsWith("/environments/" + A.environment)) return environment;
     if (path.includes("deployment-branch-policies")) return { total_count: 1, branch_policies: [{ name: "main", type: "branch" }] };
-    if (path.includes("/actions/workflows/")) return { workflow_runs: [{ id: 10, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }] };
+    if (path.includes("/actions/workflows/")) return { workflow_runs: [{ id: 10, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: over.ci ?? "success", run_attempt: 1 }] };
     if (path.includes("/runs/10/")) return jobs;
     throw new Error("unexpected " + path);
   };
@@ -286,6 +326,26 @@ describe("GitHub gate", () => {
     expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ reviewers: true }), true))).toBe("ingest_error_alert_gate_human_approval");
     expect(await code(() => ingestErrorAlertGithubGate({ ...ctx("plan"), GITHUB_RUN_ATTEMPT: "2" }, github()))).toBe("ingest_error_alert_gate_context");
   });
+  test("with a required-reviewer rule: a pinned reviewer's approval passes; none or a rejection refuses", async () => {
+    const env = { id: 7, name: A.environment };
+    const approved = { state: "approved", user: { type: "User", id: P.dispatcher.id }, environments: [env] };
+    const rejected = { state: "rejected", user: { type: "User", id: 999 }, environments: [env] };
+    expect(await ingestErrorAlertGithubGate(ctx("plan"), github({ reviewers: true, approvals: [approved] }), true)).toMatchObject({ mode: "plan" });
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ reviewers: true, approvals: [] }), true))).toBe("ingest_error_alert_gate_human_approval");
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ reviewers: true, approvals: [approved, rejected] }), true))).toBe("ingest_error_alert_gate_human_rejected");
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ reviewers: true, approvals: [{ ...approved, user: { type: "User", id: 999 } }] }), true))).toBe("ingest_error_alert_gate_human_approval");
+  });
+  test("without a reviewer rule the human gate is the pinned dispatcher alone (repository plan: no reviewers)", async () => {
+    expect(await ingestErrorAlertGithubGate(ctx("apply", ingestErrorAlertConfirmation(sha, "a".repeat(64))), github({ approvals: [] }), true)).toMatchObject({ mode: "apply" });
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("apply", ingestErrorAlertConfirmation(sha, "a".repeat(64))), github({ dispatcher: 1 }), true))).toBe("ingest_error_alert_gate_run");
+  });
+  test("refuses wrong repository, ref, event, dispatched sha, a moved main and red CI", async () => {
+    for (const bad of [{ GITHUB_REPOSITORY: "someone/fork" }, { GITHUB_REPOSITORY_ID: "1" }, { GITHUB_REF: "refs/heads/review/x" },
+      { GITHUB_EVENT_NAME: "push" }, { GITHUB_SHA: "2".repeat(40) }, { GITHUB_RUN_ID: "0" }])
+      expect(await code(() => ingestErrorAlertGithubGate({ ...ctx("plan"), ...bad }, github()))).toBe("ingest_error_alert_gate_context");
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ main: "3".repeat(40) })))).toBe("ingest_error_alert_gate_main_moved");
+    expect(await code(() => ingestErrorAlertGithubGate(ctx("plan"), github({ ci: "failure" })))).toBe("ingest_error_alert_gate_ci");
+  });
 });
 
 describe("workflow", () => {
@@ -298,6 +358,11 @@ describe("workflow", () => {
     expect(wf).toContain(`CLOUDFLARE_ACCOUNT_ID: ${ACCOUNT}`);
     expect(wf).toContain(`echo "environment=${A.environment}"`);
     expect(wf).toContain("bun scripts/ingest-error-alert-github.ts --approved");
+  });
+  test("Workers Logs stays on: no observability override, and Alchemy's default keeps logs on", () => {
+    expect(readFileSync(new URL("stacks/cloudflare/session-ingest.ts", ROOT), "utf8")).not.toContain("observability");
+    const alchemyWorker = readFileSync(new URL("node_modules/@alchemy.run/cloudflare/src/Workers/Worker.ts", ROOT), "utf8");
+    expect(alchemyWorker).toContain("defaults to `{ enabled: true, logs: { enabled: true,");
   });
   test("the Worker deploy contract does not reference the alert", () => {
     for (const f of ["stacks/cloudflare/session-ingest.ts", "src/session-ingest/private-ingest-release.ts", ".github/workflows/deploy-private-ingest-worker.yml"])

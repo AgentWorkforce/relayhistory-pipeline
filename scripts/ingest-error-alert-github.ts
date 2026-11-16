@@ -5,6 +5,12 @@
  * environment job) it also requires the recorded environment approval. Apply additionally needs a confirmation
  * shaped for this SHA; the alerting job then checks its body digest against the re-planned body. Errors carry fixed
  * codes only.
+ *
+ * trustedDispatcher is true on purpose, as in the schema release and admission renewal gates: the repository plan
+ * cannot hold required environment reviewers (GitHub 422, runbooks/guarded-session-schema-release.md "Operator
+ * read-only plan while reviewer billing is blocked"). With a required_reviewers rule present, a recorded approval
+ * by one of its User reviewers is required and any rejection refuses; without one, the human gate is the
+ * first-attempt dispatch by Khaliq's own pinned User account, which the run check above always requires anyway.
  */
 import { PRIVATE_INGEST_RELEASE } from "../src/session-ingest/private-ingest-release.ts";
 import { SCHEMA_RELEASE as S } from "../src/hoopdb/schema-release-contract.ts";
