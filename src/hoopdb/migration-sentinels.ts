@@ -560,7 +560,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105062020_legacy_export_scope_authority.sql": {
     evidence: "table sessions.legacy_export_scope_authority and its register/page/still-fenced RPCs",
-    sql: "SELECT to_regclass('sessions.legacy_export_scope_authority') IS NOT NULL AND to_regprocedure('sessions.ingest_legacy_export_scope_authority_register(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_page(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_still_fenced(jsonb)') IS NOT NULL AS applied",
+    sql: "SELECT to_regclass('sessions.legacy_export_scope_authority') IS NOT NULL AND to_regprocedure('sessions.ingest_legacy_export_scope_authority_register(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_page(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_still_fenced(jsonb)') IS NOT NULL AS applied",
   },
 };
 
