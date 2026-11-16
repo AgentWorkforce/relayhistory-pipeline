@@ -119,9 +119,17 @@ export function transactionPoolerReason(url: string): string | null {
   } catch {
     return "endpoint URL does not parse";
   }
-  if (parsed.port === "6543") return "port 6543 is a transaction-mode pooler";
-  if (parsed.hostname.includes("-pooler.")) return "Neon -pooler hosts are transaction-mode poolers";
-  if (parsed.searchParams.get("pgbouncer") === "true") return "pgbouncer=true marks a transaction-mode pooler";
+  const parameters = [...parsed.searchParams.entries()].map(([name, value]) => [name.toLowerCase(), value.toLowerCase()]);
+  // node-postgres lets ?host= and ?port= override the URL's own host and port.
+  if (parameters.some(([name]) => name === "host" || name === "port" || name === "hostaddr")) {
+    return "host, hostaddr and port query parameters are refused";
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (parsed.port === "6543" || parsed.port === "6432") return `port ${parsed.port} is a transaction-mode pooler port`;
+  if (host.includes("-pooler.")) return "Neon -pooler hosts are transaction-mode poolers";
+  if (parameters.some(([name, value]) => name === "pgbouncer" && value === "true")) {
+    return "pgbouncer=true marks a transaction-mode pooler";
+  }
   return null;
 }
 
@@ -129,7 +137,7 @@ export function transactionPoolerReason(url: string): string | null {
 export function parseStreams(raw: string | undefined, method: string): number {
   if (raw === undefined) return method === "ctid" ? 8 : 1;
   if (method !== "ctid") throw new Error("--streams applies to --method=ctid only");
-  const value = Number(raw);
+  const value = /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isInteger(value) || value < 1 || value > MAX_CTID_STREAMS) {
     throw new Error(`--streams must be an integer from 1 to ${MAX_CTID_STREAMS}`);
   }
@@ -167,6 +175,9 @@ async function ctidFingerprint(pool: pg.Pool, table: string, columns: string[], 
   let broken = false;
   try {
     await coordinator.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    // The exporter idles in its transaction while the ranges run; a server-side
+    // idle-in-transaction timeout must not end it (that would fail a good run).
+    await coordinator.query("SET LOCAL idle_in_transaction_session_timeout = 0");
     const snapshot = (await coordinator.query<{ id: string }>("SELECT pg_export_snapshot() AS id")).rows[0]!.id;
     const size = await coordinator.query<{ pages: string }>(
       `SELECT (pg_relation_size(c.oid) / current_setting('block_size')::bigint)::text AS pages
@@ -941,7 +952,8 @@ export async function main() {
     pool.on("connect", (client) => {
       client.query(fingerprintSettingsSql()).catch((error: unknown) => {
         settingsFailure ??= error;
-        void client.end().catch(() => undefined);
+        // The pool's types say PoolClient; the runtime object is a pg.Client.
+        void (client as unknown as pg.Client).end().catch(() => undefined);
       });
     });
   }
@@ -1109,6 +1121,7 @@ export async function main() {
       roles,
       sequences: sequenceResults,
     };
+    if (settingsFailure) throw new Error("pinning fingerprint session settings failed");
     if (process.argv.includes("--emit-sequence-fence")) output.sequenceFenceSql = sequenceFenceSql(sourceSequences);
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     if (!passed) process.exitCode = 2;
