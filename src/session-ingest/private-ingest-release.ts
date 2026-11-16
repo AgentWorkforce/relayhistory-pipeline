@@ -105,7 +105,7 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
 const COMMON_PROFILE = {
   acceptanceMode: "buffered",
   accountId: PRIVATE_INGEST_RELEASE.accountId,
-  expectedGeneration: "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8",
+  expectedGeneration: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",
   hyperdriveId: "0fcc0265e96f43a39976b5aa4263f4a6",
   secretsStoreId: "59e0dcc52f0a4bd7863730548299fb2f",
   maxPerUser: 4,
@@ -157,6 +157,10 @@ const COMMON_PROFILE = {
  * targetGeneration (`bun src/hoopdb/migrate.ts --generation` at f905699c, last step 20261105062010).
  * The tracked profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then
  * open the window, apply, rebind G -> H.
+ * Done: the G+H deploy, the guarded apply of 062010 and rebind run 43944063000 (2026-11-16 19:54:34Z)
+ * moved the policy and all admission rows to H. This is lifecycle step (2) (step 6 of the required
+ * order): deploy H-only at the same baseline phase while retaining the pair solely to authorize the
+ * G+H -> H transition; step (3) sets it to null after the live Worker reads back exactly H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
   from: "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8",
