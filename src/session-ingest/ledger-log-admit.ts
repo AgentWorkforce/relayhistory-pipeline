@@ -5,7 +5,9 @@
  *
  * Per batch, in this order (the legacy core answers a replay before any gate, deliver.ts:398-410; so does this):
  *   0. the precheck: the tenant segment and the delivery budget, as deliverPrepared's precheck;
- *   1. the stream: owned (taken on first write), and any unresolved entry settled first, so the window is current;
+ *   1. the stream, READ-ONLY (the cached owned state, or a fresh open that is not taken), and any entry this process
+ *      left unresolved settled first, so the window is current. Nothing is taken here: traffic answered as a replay,
+ *      a conflict or a refusal writes no epoch entry and no registry doc;
  *   2. replay / conflict, BEFORE any gate: the stream's remembered-batches window, then the legacy batch doc (a batch
  *      committed before the switch, or one the window evicted and the materializer committed, is still a replay;
  *      the same id with another digest is the 409), so a retry of a committed batch is never refused or held by a
@@ -15,7 +17,10 @@
  *      rules: two records at one revision with another revision id and digest) refuse the batch as the legacy 409;
  *   4. the privacy journal: a reset / re-enable completed after the upload began refuses it (409); in flight retries;
  *   5. consent at admit, with the dropped sessions (upload-consent sessionKeys, as the legacy core passes them);
- *   6. the payload PUT (content addressed, idempotent), only now: a replay, a conflict or a refusal writes nothing;
+ *   6. the take (only now, the first write of this process to the stream: an epoch entry, the registry doc) and the
+ *      window looked at again (another writer may have appended this batch since the open); then the payload PUT
+ *      (content addressed; a per-attempt nonce makes every attempt a fresh object, so orphan collection never takes a
+ *      stale identical payload between a retry's PUT and its append). A replay, a conflict or a refusal writes nothing;
  *   7. consent again at commit, just before the entry;
  *   8. the entry append: the one request that commits. It carries the admission snapshot (LogBatch.admitted: the
  *      journal seq, the fence's resets, each written session's epoch) the materializer re-judges against.
@@ -44,7 +49,7 @@ import { batchIdConflict, IngestUnavailable, revisionConflict } from "./deliver.
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
 import { appendBatches, LogFenced, logKeys, openStream, putPayload, settlePending, takeStream, type LogAdmitSnapshot, type LogState } from "./ledger-log.ts";
 import { admissionFenceView, batchPairs, fenceEpoch, hasPendingReset, judge, liveRecords, s3LedgerObjects, sessionKeyHash } from "./ledger-s3.ts";
-import { registerLogStream } from "./ledger-log-materialize.ts";
+import { readLogSkip, registerLogStream } from "./ledger-log-materialize.ts";
 import { sessionKey } from "./upload-consent.ts";
 import { assertTenantSegment } from "./writer.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
@@ -56,6 +61,8 @@ export interface LogAdmitDeps {
   writer: string;
   nowMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** How many open streams to keep (default LOG_STREAMS_MAX). */
+  maxStreams?: number;
   /** deliverPrepared's budget precheck (assertWithinBudget over the deliver deps); absent = no budget. */
   budget?: (records: PreparedDelivery["records"], receivedAt: Date) => void;
 }
@@ -75,6 +82,9 @@ export type LogAdmitOutcome = "accepted" | "accepted_all_deleted" | "replay";
  * Beyond it the oldest states with nothing pending are dropped (reopened and taken again on their next batch).
  */
 export const LOG_STREAMS_MAX = 1024;
+
+/** The payload's per-attempt nonce: each admission attempt writes its own payload object (see ledger-log-materialize). */
+const attemptNonce = () => crypto.randomUUID().replace(/-/g, "");
 
 const pairKey = (source: string, sessionId: string) => JSON.stringify([source, sessionId]);
 
@@ -116,20 +126,46 @@ export class LogStreams {
     return zero !== undefined;
   }
 
-  async #owned(tenant: LedgerTenant, originId: string): Promise<LogState> {
-    const id = this.#id(tenant, originId);
-    const cached = this.#states.get(id);
+  /**
+   * The refusal code of a batch the materializer skipped for good (its skip record), or undefined. The consumer reads
+   * it before and after writing a log-mode admitted outcome, so a replay of a skipped batch answers refused.
+   */
+  skipped(tenant: LedgerTenant, originId: string, batchId: string): Promise<string | undefined> {
+    return readLogSkip(this.deps.store, logKeys(this.deps.keyRoot, tenant, originId), batchId);
+  }
+
+  /** The stream as this process knows it: the cached (owned) state, or a fresh read-only open (NOT taken, not cached). */
+  async #view(tenant: LedgerTenant, originId: string): Promise<LogState> {
+    const cached = this.#states.get(this.#id(tenant, originId));
     if (cached) return cached;
     const opened = await openStream(this.deps.store, logKeys(this.deps.keyRoot, tenant, originId));
     if (!opened) throw new LedgerUnavailableError("ledger_log_not_enabled");
-    const state = await takeStream(this.deps.store, opened, this.#w());
+    return opened;
+  }
+
+  /** Owned for writing: the cached state, or `view` taken now (an epoch entry), registered and cached. */
+  async #owned(tenant: LedgerTenant, originId: string, view: LogState): Promise<LogState> {
+    const id = this.#id(tenant, originId);
+    const cached = this.#states.get(id);
+    if (cached) return cached;
+    const state = await takeStream(this.deps.store, view, this.#w());
     await registerLogStream(this.deps.store, this.deps.keyRoot, tenant, originId);
-    // Bounded: drop the oldest states with nothing pending. A dropped stream is reopened and taken again on its next
-    // batch, which is safe (a new epoch entry), only slower. A state with a pending entry is kept until it resolves.
-    if (this.#states.size >= LOG_STREAMS_MAX)
-      for (const [k, s] of this.#states) { if (this.#states.size < LOG_STREAMS_MAX) break; if (!s.pending) this.#states.delete(k); }
+    // Bounded: drop the oldest states with nothing pending and no admission in flight (a stream whose chain is running
+    // keeps its state, so an in-flight admission is never fenced by its own process's reopen). A dropped stream is
+    // reopened and taken again on its next batch: safe (a new epoch entry), only slower.
+    const max = this.deps.maxStreams ?? LOG_STREAMS_MAX;
+    if (this.#states.size >= max)
+      for (const [k, s] of this.#states) { if (this.#states.size < max) break; if (!s.pending && !this.#chains.has(k)) this.#states.delete(k); }
     this.#states.set(id, state);
     return state;
+  }
+
+  /** The window's answer for this batch: replay, a 409 (thrown), or undefined (unknown). */
+  #fromWindow(state: LogState, prepared: PreparedDelivery): "replay" | undefined {
+    const known = state.remembered.get(prepared.batchId);
+    if (known === undefined) return undefined;
+    if (known !== prepared.batchDigest) throw batchIdConflict(prepared, known);
+    return "replay";
   }
 
   /** Admit one prepared batch (the module header's steps). Throws for a retry or a terminal refusal. Serial per stream. */
@@ -149,16 +185,14 @@ export class LogStreams {
     assertTenantSegment(keyRoot, tenant.orgId);
     this.deps.budget?.(prepared.records, new Date(now()));
     const id = this.#id(tenant, prepared.originId);
-    const state = await this.#owned(tenant, prepared.originId);
+    // 1. The stream, read-only: nothing is taken (no epoch entry, no registry write) for traffic answered as a
+    // replay, a conflict or a refusal. An entry this process left unresolved is settled first, so the window reflects
+    // what landed before it answers.
+    let state = await this.#view(tenant, prepared.originId);
     try {
-      // 1. An unresolved entry first: the window must reflect what landed before it answers a replay.
-      await settlePending(store, state, this.#w());
+      if (state.pending) await settlePending(store, state, this.#w());
       // 2. Replay / conflict before any gate: the window, then the legacy batch doc.
-      const known = state.remembered.get(prepared.batchId);
-      if (known !== undefined) {
-        if (known !== prepared.batchDigest) throw batchIdConflict(prepared, known);
-        return "replay";
-      }
+      if (this.#fromWindow(state, prepared) === "replay") return "replay";
       const keys = this.#objects.keysFor(tenant);
       const [stored, read] = await Promise.all([this.#objects.readBatch(keys.batch(prepared.originId, prepared.batchId)), this.#objects.readFence(keys.fence)]);
       if (stored) {
@@ -192,8 +226,12 @@ export class LogStreams {
       const epochs: Record<string, number> = {};
       for (const [s, sid] of batchPairs(written, [])) { const k = sessionKeyHash(s, sid); epochs[k] = fenceEpoch(fence, prepared.originId, k); }
       const admitted: LogAdmitSnapshot = { journalSeq: gates.journalSeq, resets: fence.resets, epochs };
-      // 6. The payload: the kept records, exactly as prepared (only now: nothing above wrote anything).
-      const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, journalSeq: gates.journalSeq, receipt: prepared.receipt, records: kept })));
+      // Only now take the stream (its first write here: an epoch entry), and look again: another writer may have
+      // appended this batch between the read-only open and the take.
+      state = await this.#owned(tenant, prepared.originId, state);
+      if (this.#fromWindow(state, prepared) === "replay") return "replay";
+      // 6. The payload: the kept records, exactly as prepared, plus this attempt's nonce (a fresh object per attempt).
+      const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, journalSeq: gates.journalSeq, attempt: attemptNonce(), receipt: prepared.receipt, records: kept })));
       // 7. Consent again, just before the commit.
       if (gates.consent) await gates.consent(dropped, "commit");
       // 8. The commit.

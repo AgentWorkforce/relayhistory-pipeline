@@ -309,7 +309,7 @@ describe("the materializer", () => {
 
 describe("operator steps (ledger-log-stream-ops.ts)", () => {
   test("switch: dry run writes nothing; refused while a legacy batch is pending; apply opens and registers the stream", async () => {
-    const { closeLogStream, logCommitProofKey, streamStatus, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
+    const { closeLogStream, logCommitProofKey, logModeNonProdKey, streamStatus, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
     const { logStreamRegistryKey } = await import("../ledger-log-materialize.ts");
     const e = edge("on");
     await writeAuthority(e.base);
@@ -318,6 +318,9 @@ describe("operator steps (ledger-log-stream-ops.ts)", () => {
     await upload(e.base, "b1", ["r1"]);
     await rounds(e, 1);
     expect((await streamStatus(e.base, ROOT, TENANT, ORIGIN)).legacyPending).toBe(1);
+    // The allowlist, inside the operation: a bucket not declared non-production is refused first, whatever else holds.
+    expect((await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 0 })).refused).toBe("bucket_not_declared_nonprod");
+    await putJson(e.base, logModeNonProdKey(ROOT), { v: 1 });
     // No deployment-wide proof that every replica runs with the flag on: refused before anything else.
     expect((await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 0 })).refused).toBe("log_commit_not_proven_on");
     await putJson(e.base, logCommitProofKey(ROOT), { v: 1, mode: "on" });
@@ -353,7 +356,7 @@ describe("operator steps (ledger-log-stream-ops.ts)", () => {
     expect((await status(e.base, k4)).state).toBe("admitted");
     expect((await streamStatus(e.base, ROOT, TENANT, ORIGIN)).head).toBe(head);
     expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch(ORIGIN, "b4"))).toMatchObject({ state: "committed" });
-  });
+  }, 30_000); // several consumer and materializer rounds: about 0.5 s alone, past bun's 5 s default on a loaded host
 });
 
 describe("slice 4: the admission snapshot, re-judged at apply", () => {
@@ -398,9 +401,10 @@ describe("slice 4: the admission snapshot, re-judged at apply", () => {
   });
 
   test("switch: a legacy batch that commits during the settle wait is reported as legacy_raced_switch", async () => {
-    const { logCommitProofKey, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
+    const { logCommitProofKey, logModeNonProdKey, switchToLogMode } = await import("../ledger-log-stream-ops.ts");
     const e = edge("on");
     await writeAuthority(e.base);
+    await putJson(e.base, logModeNonProdKey(ROOT), { v: 1 });
     await putJson(e.base, logCommitProofKey(ROOT), { v: 1, mode: "on" });
     const r = await switchToLogMode(e.base, ROOT, TENANT, ORIGIN, { apply: true, writer: "op", settleMs: 1, sleep: async () => {
       // A legacy writer that read "not log mode" just before entry 0 landed commits during the wait.

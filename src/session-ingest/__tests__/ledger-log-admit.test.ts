@@ -311,3 +311,146 @@ describe("slice 4: replay before the gates, legacy batch docs, revision rules, o
     expect(batchesIn(es).map((b) => b.batchId).sort()).toEqual(["c0", "c1", "c2", "c3", "c4", "c5"]);
   });
 });
+
+describe("slice 5: a skipped batch stays refused, retries write fresh payloads, refused traffic takes nothing, eviction", () => {
+  const prep = async (batchId: string, recordId: string, origin = ORIGIN) => {
+    const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
+    return prepareDelivery(TENANT, await batch([record({ record_id: recordId, session_id: `sess-${recordId}`, origin_id: origin })],
+      { batch_id: batchId, origin_id: origin, account_id: await deliveryAccount(TENANT) }));
+  };
+  const listKeys = async (store: ObjectStore, prefix: string) => {
+    const out: string[] = [];
+    let c: string | undefined;
+    do { const p = await store.list(objectKey(prefix.slice(0, -1)), c); for (const i of p.items) if (String(i.key).startsWith(prefix)) out.push(String(i.key)); c = p.nextCursor; } while (c);
+    return out;
+  };
+
+  test("a replay of a batch the materializer skipped answers refused; the admitted outcome is never written over it", async () => {
+    const { writeLogSkip } = await import("../ledger-log-materialize.ts");
+    const { admissionStatus } = await import("../async-admission.ts");
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    // The client POST (async admission): queued with its receipt, then admitted through the log.
+    const first = await e.post("b1", "r1");
+    expect(first.status).toBe(200);
+    const receiptId = ((await first.json()) as { receiptId: string }).receiptId;
+    await drain(e);
+    expect(await admissionStatus(e.base, ROOT, TENANT, ORIGIN, receiptId)).toMatchObject({ state: "admitted" });
+    // The materializer then refused b1 for good at apply time, exactly as it records it: the skip record, the refused
+    // outcome, the admitted outcome retired.
+    const { outcomeKey, receiptDir, writeOutcome } = await import("../async-admission.ts");
+    await writeLogSkip(e.base, logKeys(ROOT, TENANT, ORIGIN), "b1", "delivery_privacy_superseded", T0);
+    const dir = receiptDir(ROOT, TENANT, ORIGIN, receiptId);
+    await writeOutcome(e.base, dir, { v: 1, state: "refused", code: "delivery_privacy_superseded", atMs: T0 });
+    await e.base.delete(objectKey(outcomeKey(dir, "admitted")));
+    expect(await admissionStatus(e.base, ROOT, TENANT, ORIGIN, receiptId)).toMatchObject({ state: "refused" });
+    // The client retries the same batch: the log answers replay, and the receipt must read refused, not admitted.
+    expect((await e.post("b1", "r1")).status).toBe(200);
+    await drain(e);
+    expect(await admissionStatus(e.base, ROOT, TENANT, ORIGIN, receiptId)).toMatchObject({ state: "refused", code: "delivery_privacy_superseded" });
+    // Exactly one logged batch: the replay appended nothing.
+    expect(batchesIn(await entries(e.base)).map((b) => b.batchId)).toEqual(["b1"]);
+  });
+
+  test("the materializer writes the skip record on a final refusal, and a later replay reads refused", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    // Block materialization (canonical writes fail), so the batch is logged but not yet applied.
+    e.setFault((key) => (key.includes("/s=") && key.endsWith("/manifest.json") ? "before" : "ok"));
+    const k1 = await upload(e.base, "b1", ["r1"]);
+    await drain(e);
+    // A reset completes after the append: the materializer refuses the batch at apply time.
+    await s3LedgerObjects(e.base, ROOT).editFence(s3LedgerKeys(ROOT, TENANT).fence,
+      (f) => ({ next: { ...f, resets: (f.resets ?? 0) + 1, resetsCompleted: (f.resetsCompleted ?? 0) + 1 }, result: null }));
+    e.setFault(undefined);
+    await drain(e);
+    expect(await exists(e.base, logKeys(ROOT, TENANT, ORIGIN).skipped("b1"))).toBe(true);
+    expect(await status(e.base, k1)).toMatchObject({ state: "refused" });
+    const again = await upload(e.base, "b1", ["r1"]);
+    await drain(e);
+    expect(await status(e.base, again)).toMatchObject({ state: "refused" });
+  });
+
+  test("a retry writes a FRESH payload: collecting the earlier attempt's identical-content payload loses nothing", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    const streams = new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0 });
+    const prepared = await prep("b1", "r1");
+    // Attempt 1 puts its payload, then consent refuses at commit (nothing appended).
+    let refuse = true;
+    const consent = async (_d: ReadonlySet<string>, phase: "admit" | "commit") => { if (phase === "commit" && refuse) throw new Error("consent_revoked_for_test"); };
+    await expect(streams.admit(TENANT, prepared, { journalSeq: 0, consent })).rejects.toThrow();
+    const payloads = logKeys(ROOT, TENANT, ORIGIN).payloads;
+    const [first] = await listKeys(sc.store, payloads);
+    expect(first).toBeDefined();
+    // Attempt 2 writes a different object; the orphan collector may take attempt 1's (deleted outright here).
+    refuse = false;
+    expect(await streams.admit(TENANT, prepared, { journalSeq: 0, consent })).toBe("accepted");
+    const refs = batchesIn(await entries(sc.store)).flatMap((b) => b.payloads.map((p) => p.key));
+    expect(refs.length).toBe(1);
+    expect(refs[0]).not.toBe(first);
+    await sc.store.delete(objectKey(first!));
+    expect(await exists(sc.store, refs[0]!)).toBe(true);
+  });
+
+  test("refused or replayed traffic writes no epoch entry and no registry doc (the stream is taken only to write)", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const { logStreamRegistryKey } = await import("../ledger-log-materialize.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    const streams = new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0 });
+    // Refused by the journal: a reset completed after the upload began.
+    await putJson(sc.store, journalKey(ROOT, TENANT), { v: 3, seq: 1, pending: [], ambiguous: [] });
+    await expect(streams.admit(TENANT, await prep("b1", "r1"), { journalSeq: 0 })).rejects.toMatchObject({ status: 409 });
+    // Held by a pending ordered reset (a retry).
+    await s3LedgerObjects(sc.store, ROOT).editFence(s3LedgerKeys(ROOT, TENANT).fence, (f) => ({ next: { ...f, pending: { p1: { kind: "reset", requestId: "rq1" } } }, result: null }));
+    await expect(streams.admit(TENANT, await prep("b2", "r2"), { journalSeq: 1 })).rejects.toMatchObject({ code: "ledger_control_pending" });
+    expect((await entries(sc.store)).map((x) => x.kind)).toEqual(["open"]);
+    expect(await exists(sc.store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(false);
+  });
+
+  test("cache eviction never drops a state whose admission is in flight (no extra epoch entry on its next batch)", async () => {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    const O2 = "origin-2";
+    await enable(sc.store);
+    await enableLogMode(sc.store, logKeys(ROOT, TENANT, O2), null, { writer: "operator", now: () => T0 });
+    const streams = new LogStreams({ store: sc.store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0, maxStreams: 1 });
+    // A's first batch is held at its commit-phase consent (taken, payload put, entry not yet appended)...
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    let reached!: () => void;
+    const atCommit = new Promise<void>((r) => { reached = r; });
+    const consent = async (_d: ReadonlySet<string>, phase: "admit" | "commit") => { if (phase === "commit") { reached(); await held; } };
+    const a1 = streams.admit(TENANT, await prep("a1", "ra1"), { journalSeq: 0, consent });
+    await atCommit;
+    // ...while B's first batch takes its stream (the cache is full: max 1).
+    expect(await streams.admit(TENANT, await prep("b1", "rb1", O2), { journalSeq: 0 })).toBe("accepted");
+    release();
+    expect(await a1).toBe("accepted");
+    expect(await streams.admit(TENANT, await prep("a2", "ra2"), { journalSeq: 0 })).toBe("accepted");
+    expect((await entries(sc.store)).filter((x) => x.kind === "epoch").length).toBe(1);
+  });
+
+  test("the CLI guard is an allowlist: mutations need --i-know-this-is-not-prod and a non-production-like bucket", async () => {
+    const { mutationRefusal } = await import("../../../scripts/ledger-log-stream.ts");
+    for (const command of ["switch", "close"]) {
+      expect(mutationRefusal(command, "sessions-dev-bench", true, false)).toBe("not_declared_nonprod");
+      for (const b of ["sessionsprod", "prod2-history", "prd-ledger", "relayhistoryproduction", "acme-live", "hosted-x", "customer-data"])
+        expect(mutationRefusal(command, b, true, true)).toBe("bucket_name_production_like");
+      expect(mutationRefusal(command, "sessions-dev-bench", true, true)).toBeUndefined();
+      // Dry runs stay allowed.
+      expect(mutationRefusal(command, "sessionsprod", false, false)).toBeUndefined();
+    }
+    expect(mutationRefusal("status", "sessionsprod", true, false)).toBeUndefined();
+  });
+});

@@ -84,6 +84,11 @@ export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string)
     markers: `${root}/m/`,
     /** The close marker (rollback to legacy): with it, the stream reads as legacy again. Written once, by the operator tool. */
     closed: `${root}/closed.json`,
+    /**
+     * A batch the materializer skipped for good (a final refusal at apply time): written BEFORE its refused outcome, so
+     * a later replay of the same batch id answers refused, never admitted (ledger-log-admit.ts, admission-consumer.ts).
+     */
+    skipped: (batchId: string) => `${root}/s/${h(batchId)}.json`,
   };
 }
 export type LogKeys = ReturnType<typeof logKeys>;
