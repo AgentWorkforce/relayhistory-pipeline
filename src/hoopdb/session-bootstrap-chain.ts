@@ -21,7 +21,7 @@ export const SESSION_BOOTSTRAP_FILES = [
   // The session ingest roles (bulls96_session_ingest, _seeder): the same
   // contract. 20261102010000 verifies them and fails closed if absent (42704).
   "supabase/bootstrap/session_ingest_roles.sql",
-  // The one-shot legacy exporter privacy reader. 062020 verifies it and
+  // The one-shot legacy exporter privacy reader. 062030 verifies it and
   // grants six ledger SELECTs plus one authority-register RPC.
   "supabase/bootstrap/legacy_export_privacy_roles.sql",
   // The session read API role (bulls96_read_api), bare: the same contract.
