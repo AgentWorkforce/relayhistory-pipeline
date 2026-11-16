@@ -17,6 +17,7 @@ import {
   legacyMachineId,
   legacyDiscoveryPage,
   legacyGroupScopes,
+  legacyScopeUser,
   legacyUnit,
   legacyUnitSource,
   type LegacyScope,
@@ -26,6 +27,7 @@ import { groupExistsInNeon } from "../neon-s3-sync/neon-reader.ts";
 import { Checkpoint, newCounters, runOrg, verifyExported, withLegacyPrivacyFence, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
 import {
   assertDirectUrl,
+  assertPrivacySelectOnly,
   assertSelectOnly,
   readSecrets,
 } from "../legacy-export/main.ts";
@@ -70,6 +72,7 @@ beforeAll(async () => {
  CREATE TABLE sessions.conversation_turn_fences(org_id text,workspace_id text,user_id text,source text,session_id text);
  CREATE TABLE sessions.session_erasure_receipts(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.upload_deletions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+ CREATE TABLE sessions.upload_resets(org_id text,workspace_id text,user_id text,request_id text);
  CREATE TABLE sessions.turn_session_fences(org_id text,workspace_id text,source text,session_id text);
  CREATE TABLE sessions.operator_user_erasures(request_id text,org_id text,workspace_id text,user_id text,state text);
  CREATE TABLE sessions.conversation_turns(id uuid PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,session_owner text,turn_index int,role text,content text,actor_name text,actor_role text,metadata jsonb,ts timestamptz,UNIQUE(org_id,workspace_id,source,session_id,turn_index));
@@ -79,6 +82,7 @@ beforeAll(async () => {
     `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','person',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
     [turnId],
   );
+  await pg.exec(`INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','sess:1','person')`);
 });
 afterAll(async () => {
   await pg.close();
@@ -121,6 +125,11 @@ const snapshot = (store: ObjectStore, pointers: CanonicalPointer[], s = scope) =
     s,
   );
 
+async function restoreBaseOwner() {
+  await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1';
+    INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','sess:1','person')`);
+}
+
 test("turn-only discovery is per table and per org, and resolves the attributed source", async () => {
   const page = await legacyDiscoveryPage(db, "conversation_turns", "org_1", null);
   expect(page).toHaveLength(1);
@@ -161,7 +170,8 @@ test("erasure guard ignores a legacy-only group unless legacy recognition is swi
 test("gate 1: an unattributable turn is counted as unbound and never stops discovery of other orgs", async () => {
   try {
     await pg.exec(`INSERT INTO sessions.conversation_turns VALUES('44444444-4444-4444-8444-444444444444','org_a','ws','alice','lonely','alice',0,'user','hello','User','owner','{}','2026-11-01T10:00:00Z'),
- ('55555555-5555-4555-8555-555555555555','org_b','ws','claude','fine','bob',0,'user','hi','User','owner','{}','2026-11-01T10:00:00Z');`);
+ ('55555555-5555-4555-8555-555555555555','org_b','ws','claude','fine','bob',0,'user','hi','User','owner','{}','2026-11-01T10:00:00Z');
+ INSERT INTO sessions.session_outcomes VALUES('org_b','ws','claude','fine','bob-owner','bob',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     const checkpoint = new Checkpoint(join(root, "g1.sqlite"));
     const counters = newCounters();
     const store = createFsStore({ root: join(root, "g1") });
@@ -175,7 +185,7 @@ test("gate 1: an unattributable turn is counted as unbound and never stops disco
     expect(b).toMatchObject({ scopes: 1, exported: 1, failed: 0 });
     checkpoint.close();
   } finally {
-    await pg.exec("DELETE FROM sessions.conversation_turns WHERE org_id IN('org_a','org_b')");
+    await pg.exec("DELETE FROM sessions.conversation_turns WHERE org_id IN('org_a','org_b');DELETE FROM sessions.session_outcomes WHERE org_id='org_b'");
   }
 });
 
@@ -263,6 +273,8 @@ test("gate 4: legacy records are trusted only from the one exporter-owned legacy
 
 test("gate 8: a legacy-only manifest carries the scope's real user, never the placeholder machine", async () => {
   try {
+    await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
     await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     const store = createFsStore({ root: join(root, "g8") });
     const { result } = await exportScope(scope, store);
@@ -276,12 +288,14 @@ test("gate 8: a legacy-only manifest carries the scope's real user, never the pl
       "u_delivery",
     );
   } finally {
-    await pg.exec("DELETE FROM sessions.session_outcomes;DELETE FROM sessions.convergence_events");
+    await pg.exec("DELETE FROM sessions.convergence_events;DELETE FROM sessions.session_outcomes");
+    await restoreBaseOwner();
   }
 });
 
 test("nonempty links and outcomes preserve exact source IDs, timestamps and metadata through the snapshot", async () => {
   try {
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
     await pg.exec(`INSERT INTO sessions.session_links VALUES(9007199254740993,'org_1','ws_1','claude','sess:1','commit','','url','{"kept":true}',5000,'2026-11-01T10:00:00.123456Z','2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');
  INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     const store = createFsStore({ root: join(root, "links") });
@@ -296,6 +310,7 @@ test("nonempty links and outcomes preserve exact source IDs, timestamps and meta
     expect(snap.legacyCoverage).not.toBeNull();
   } finally {
     await pg.exec("DELETE FROM sessions.session_links;DELETE FROM sessions.session_outcomes");
+    await restoreBaseOwner();
   }
 });
 
@@ -322,13 +337,21 @@ test("frozen Neon delivery and conversation-turn fences both prevent export", as
   }
 });
 
-test("live session, turn-session and completed-user erase ledgers fence legacy export", async () => {
-  for (const erase of ["session", "turn", "user"] as const) {
+test("live session, upload deletion/reset, turn-session and completed-user erase ledgers fence legacy export", async () => {
+  for (const erase of ["session", "deletion", "reset", "turn", "user"] as const) {
     const checkpoint = new Checkpoint(join(root, `live-fence-${erase}.sqlite`));
     try {
       if (erase === "session")
         await pg.exec(
           `INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`,
+        );
+      else if (erase === "deletion")
+        await pg.exec(
+          `INSERT INTO sessions.upload_deletions VALUES('org_1','ws_1','person','origin','claude','sess:1')`,
+        );
+      else if (erase === "reset")
+        await pg.exec(
+          `INSERT INTO sessions.upload_resets VALUES('org_1','ws_1','person','reset-1')`,
         );
       else if (erase === "turn")
         await pg.exec(
@@ -360,25 +383,81 @@ test("live session, turn-session and completed-user erase ledgers fence legacy e
     } finally {
       checkpoint.close();
       await pg.exec(
-        "DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.turn_session_fences;DELETE FROM sessions.operator_user_erasures",
+        "DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.upload_deletions;DELETE FROM sessions.upload_resets;DELETE FROM sessions.turn_session_fences;DELETE FROM sessions.operator_user_erasures",
       );
     }
   }
 });
 
-test("a session erasure receipt won during the object write is caught by the race-loser recheck", async () => {
-  await expect(
-    withLegacyPrivacyFence(privacyDb, scope, "person", async () => {
-      await pg.exec(
-        `INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`,
-      );
-    }),
-  ).rejects.toMatchObject({ code: "legacy_privacy_race" });
-  await pg.exec("DELETE FROM sessions.session_erasure_receipts");
+test("session, upload deletion and reset races are caught after the object write", async () => {
+  for (const erase of ["session", "deletion", "reset"] as const) {
+    await expect(
+      withLegacyPrivacyFence(privacyDb, scope, "person", async () => {
+        if (erase === "session")
+          await pg.exec(`INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`);
+        else if (erase === "deletion")
+          await pg.exec(`INSERT INTO sessions.upload_deletions VALUES('org_1','ws_1','person','origin','claude','sess:1')`);
+        else
+          await pg.exec(`INSERT INTO sessions.upload_resets VALUES('org_1','ws_1','person','reset-race')`);
+        return { manifests: [{ manifestKey: `written/${erase}/manifest.json` }] };
+      }),
+    ).rejects.toMatchObject({
+      code: "legacy_privacy_race",
+      privacyValue: { manifests: [{ manifestKey: `written/${erase}/manifest.json` }] },
+    });
+    await pg.exec("DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.upload_deletions;DELETE FROM sessions.upload_resets");
+  }
+});
+
+test("a post-PUT privacy race records the written manifest and aborts the run", async () => {
+  const checkpoint = new Checkpoint(join(root, "privacy-race.sqlite"));
+  let fenceReads = 0;
+  const raceDb: Queryable = {
+    async query<T>(sql: string, params?: unknown[]) {
+      if (
+        /^(BEGIN|COMMIT|ROLLBACK|SET LOCAL)/u.test(sql) ||
+        sql.includes("pg_advisory_xact_lock_shared")
+      )
+        return { rows: [] as T[] };
+      if (sql.includes("AS fenced") && ++fenceReads === 2)
+        await pg.exec(`INSERT INTO sessions.upload_resets VALUES('org_1','ws_1','person','post-put')`);
+      return db.query<T>(sql, params);
+    },
+  };
+  try {
+    await expect(
+      runOrg(
+        {
+          db,
+          privacyDb: raceDb,
+          target: {
+            store: createFsStore({ root: join(root, "privacy-race") }),
+            keyRoot: "96bulls",
+            grantId: "g",
+          },
+          checkpoint,
+          hook: async () => {},
+          log: () => {},
+        },
+        "org_1",
+        { export: true },
+        newCounters(),
+      ),
+    ).rejects.toMatchObject({ code: "legacy_privacy_race" });
+    expect(checkpoint.scope(JSON.stringify(["org_1", "ws_1", "claude", "sess:1"]))).toMatchObject({
+      status: "failed:legacy_privacy_race",
+      user_id: "person",
+      manifest_key: expect.stringContaining("/manifest.json"),
+    });
+  } finally {
+    checkpoint.close();
+    await pg.exec("DELETE FROM sessions.upload_resets");
+  }
 });
 
 test("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {
   try {
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
     await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     await pg.query(`UPDATE sessions.conversation_turns SET content='key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end' WHERE id=$1`, [turnId]);
     const checkpoint = new Checkpoint(join(root, "verify.sqlite"));
@@ -411,6 +490,7 @@ test("verifier: equal on a fresh export, mismatched after Neon changes, includin
   } finally {
     await pg.query(`UPDATE sessions.conversation_turns SET content='preserved legacy transcript' WHERE id=$1`, [turnId]);
     await pg.exec("DELETE FROM sessions.session_outcomes");
+    await restoreBaseOwner();
   }
 });
 
@@ -440,6 +520,38 @@ test("secrets come only from stdin lines, and a writable Neon role is refused", 
   expect(() =>
     assertDirectUrl("postgresql://u@x-pooler.example:5432/db", "privacy"),
   ).toThrow("unpooled");
+  expect(() =>
+    assertDirectUrl("postgresql://u@abc.pooler.supabase.com:5432/db", "privacy"),
+  ).toThrow("unpooled");
+});
+
+test("privacy preflight rejects active RLS even for a SELECT-only role", async () => {
+  await pg.exec(`CREATE ROLE legacy_privacy_reader;
+    GRANT USAGE ON SCHEMA sessions TO legacy_privacy_reader;
+    GRANT SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures TO legacy_privacy_reader;
+    ALTER TABLE sessions.session_erasure_receipts ENABLE ROW LEVEL SECURITY;
+    SET ROLE legacy_privacy_reader`);
+  try {
+    await expect(assertPrivacySelectOnly(db)).rejects.toMatchObject({
+      code: "privacy_role_not_read_only",
+    });
+  } finally {
+    await pg.exec(`RESET ROLE;
+      ALTER TABLE sessions.session_erasure_receipts DISABLE ROW LEVEL SECURITY;
+      REVOKE ALL PRIVILEGES ON sessions.session_erasure_receipts,sessions.upload_deletions,sessions.upload_resets,sessions.turn_session_fences,sessions.operator_user_erasures FROM legacy_privacy_reader;
+      REVOKE USAGE ON SCHEMA sessions FROM legacy_privacy_reader;
+      DROP ROLE legacy_privacy_reader`);
+  }
+});
+
+test("session_owner is not accepted as an erasure user id", async () => {
+  await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
+  await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
+  try {
+    expect(await legacyScopeUser(db, scope)).toBeNull();
+  } finally {
+    await restoreBaseOwner();
+  }
 });
 
 test("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {
@@ -459,6 +571,7 @@ test("windowed cursors do not suppress a later full run, max-scopes progresses, 
       `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','claude','sess:2','person2',0,'user','second','U','owner','{}','2026-11-02T00:00:00Z')`,
       [second],
     );
+    await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:2','second-owner','person2',false,NULL,'2026-11-02T00:00:00Z','2026-11-02T00:00:00Z')`);
     const one = newCounters();
     await runOrg(
       deps,
@@ -485,6 +598,14 @@ test("windowed cursors do not suppress a later full run, max-scopes progresses, 
       null,
       null,
     );
+    checkpoint.setScope(
+      JSON.stringify(["org_1", "ws_1", "claude", "retained"]),
+      "org_1",
+      "fenced",
+      null,
+      "96bulls/org_1/retained/manifest.json",
+      "person",
+    );
     const report = await verifyExported(
       db,
       store,
@@ -495,11 +616,15 @@ test("windowed cursors do not suppress a later full run, max-scopes progresses, 
     );
     expect(report.ok).toBe(false);
     expect(report.unexplained).toContain("failed:test:1");
+    expect(report.unexplained).toContain(
+      'retained_manifest:fenced:["org_1","ws_1","claude","retained"]',
+    );
   } finally {
     checkpoint.close();
     await pg.query("DELETE FROM sessions.conversation_turns WHERE id=$1", [
       second,
     ]);
+    await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND session_id='sess:2'`);
   }
 });
 

@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS unbound(table_name TEXT,org TEXT,workspace TEXT,store
       )
       .all(...(org ? [org] : [])) as { key: string; manifest_key: string; user_id: string | null }[];
   }
+  retainedNonExported(org?: string): { key: string; status: string; manifest_key: string }[] {
+    return this.db
+      .prepare(
+        `SELECT key,status,manifest_key FROM scopes WHERE status<>'exported' AND manifest_key IS NOT NULL ${org ? "AND org=?" : ""} ORDER BY key`,
+      )
+      .all(...(org ? [org] : [])) as { key: string; status: string; manifest_key: string }[];
+  }
   statusCounts(org?: string): Record<string, number> {
     const rows = this.db
       .prepare(
@@ -213,10 +220,16 @@ export async function withLegacyPrivacyFence<T>(
   userId: string,
   action: () => Promise<T>,
 ): Promise<{ fenced: true } | { fenced: false; value: T }> {
-  await db.query("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY");
+  let phase: "privacy" | "action" = "privacy";
+  let actionValue: { set: false } | { set: true; value: T } = { set: false };
   try {
+    await db.query("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY");
     await db.query("SET LOCAL lock_timeout='30s'");
     await db.query("SET LOCAL statement_timeout='15min'");
+    // sessionReadOnly's session default is 30 s. A large scope intentionally
+    // idles this connection while Neon is streamed and S3 is written; keep the
+    // privacy transaction and its locks alive for this operator-controlled scope.
+    await db.query("SET LOCAL idle_in_transaction_session_timeout='0'");
     await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
     await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
     const privacyQuery = `SELECT (
@@ -224,6 +237,8 @@ export async function withLegacyPrivacyFence<T>(
           WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.upload_deletions
           WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
+        OR EXISTS(SELECT 1 FROM sessions.upload_resets
+          WHERE org_id=$1 AND workspace_id=$2 AND user_id=$5)
         OR EXISTS(SELECT 1 FROM sessions.turn_session_fences
           WHERE org_id=$1 AND workspace_id=$2 AND source=$3 AND session_id=$4)
         OR EXISTS(SELECT 1 FROM sessions.operator_user_erasures
@@ -244,7 +259,10 @@ export async function withLegacyPrivacyFence<T>(
       await db.query("COMMIT");
       return { fenced: true };
     }
+    phase = "action";
     const value = await action();
+    actionValue = { set: true, value };
+    phase = "privacy";
     // Ordinary deletion fences need not take the operator's exclusive lock.
     // Recheck before releasing; a race is a failed export, never an accepted
     // checkpoint. The user-scoped legacy machine is swept by user erasure.
@@ -252,11 +270,21 @@ export async function withLegacyPrivacyFence<T>(
     if (after.rows[0]?.fenced)
       throw Object.assign(new Error("privacy fence raced legacy export"), {
         code: "legacy_privacy_race",
+        privacyValue: value,
       });
     await db.query("COMMIT");
     return { fenced: false, value };
   } catch (error) {
-    await db.query("ROLLBACK").catch(() => {});
+    let rollbackOk = true;
+    await db.query("ROLLBACK").catch(() => { rollbackOk = false; });
+    if ((error as { code?: unknown })?.code === "legacy_privacy_race") throw error;
+    if (phase === "privacy" || !rollbackOk) {
+      throw Object.assign(new Error("privacy fence unavailable"), {
+        code: "privacy_fence_unavailable",
+        cause: error,
+        ...(actionValue.set ? { privacyValue: actionValue.value } : {}),
+      });
+    }
     throw error;
   }
 }
@@ -319,6 +347,7 @@ async function exportScope(
   counters: Counters,
 ) {
   const key = scopeKey(scope);
+  let boundUserId: string | null = null;
   try {
     const stats = await neonScopeStats(deps.db, scope);
     const fingerprint = sha(JSON.stringify(LEGACY_TABLES.map((s) => [s.table, stats[s.table]])));
@@ -337,7 +366,12 @@ async function exportScope(
       throw Object.assign(new Error("legacy scope owner changed"), {
         code: "legacy_user_changed",
       });
+    if (prior?.manifest_key && !prior.user_id)
+      throw Object.assign(new Error("pre-user-scoped checkpoint requires approved cleanup"), {
+        code: "legacy_checkpoint_upgrade_required",
+      });
     const userId = prior?.user_id ?? resolvedUserId;
+    boundUserId = userId;
     if (!opts.force && prior?.fingerprint === fingerprint && prior.status === "exported") {
       const privacy = await withLegacyPrivacyFence(deps.privacyDb, scope, userId, async () => undefined);
       if (privacy.fenced) {
@@ -390,16 +424,19 @@ async function exportScope(
     // Recorded failure (fingerprint null): the cursor moves on; `--refresh` retries it.
     if (opts.export) {
       const previous = deps.checkpoint.scope(key);
+      const written = (error as { privacyValue?: { manifests?: Array<{ manifestKey?: unknown }> } })
+        ?.privacyValue?.manifests?.[0]?.manifestKey;
       deps.checkpoint.setScope(
         key,
         scope.orgId,
         "failed:" + code,
         null,
-        previous?.manifest_key ?? null,
-        previous?.user_id ?? null,
+        typeof written === "string" ? written : previous?.manifest_key ?? null,
+        previous?.user_id ?? boundUserId,
       );
     }
     deps.log({ message: "scope failed", error_code: code });
+    if (["legacy_privacy_race", "privacy_fence_unavailable"].includes(code)) throw error;
   }
 }
 
@@ -531,6 +568,8 @@ export async function verifyExported(
   const unexplained = Object.entries(statuses)
     .filter(([status]) => status !== "exported" && status !== "fenced")
     .map(([status, n]) => `${status}:${n}`);
+  for (const row of checkpoint.retainedNonExported(org))
+    unexplained.push(`retained_manifest:${row.status}:${row.key}`);
   if (unboundTurns > 0) unexplained.push(`unbound_turns:${unboundTurns}`);
   let scopes = 0;
   const privacyFenced: LegacyScope[] = [];

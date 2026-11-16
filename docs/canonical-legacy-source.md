@@ -32,7 +32,9 @@ Live relay-session turns are separate records:
 
 They never contend with legacy records: the kinds differ, and the legacy fold keys include the kind.
 
-The read-side merge (`src/session-read-api/canonical-turns.ts`) works per Neon row key (workspace, stored source, turn_index):
+After migration `20261105062010_turns_forward_gates.sql` has landed and been
+applied, the read-side merge (`src/session-read-api/canonical-turns.ts`) works
+per Neon row key (workspace, stored source, turn_index):
 - a live record wins over a legacy row;
 - among live records, the highest revision wins.
 
@@ -55,6 +57,10 @@ This is exact only while the writer never goes back from dual/forward to Neon-on
 ### Still open (not code; operator or follow-up)
 
 - **Pointer proof.** Confirm on staging, or after the first canary org, that each legacy manifest got its `session_index` pointer (verification query in the runbook).
-- **Erasure after export.** User erasure always includes the synthetic legacy origin's user-scoped object and pointer prefixes. The per-session eraser discovers every machine and explicitly regression-tests deletion and fresh-list verification of the `legacy:tables:v1` manifest, raw object and pointer. The exporter also refuses frozen Neon delivery/turn fences and live session receipts, upload deletions, turn-session fences and user-erasure ledgers.
+- **Erasure after export.** User erasure always includes the synthetic legacy origin's user-scoped object and pointer prefixes. The per-session eraser discovers every machine and explicitly regression-tests deletion and fresh-list verification of the `legacy:tables:v1` manifest, raw object and pointer. The exporter also refuses frozen Neon delivery/turn fences and live session receipts, upload deletions/resets, turn-session fences and user-erasure ledgers.
 - **Turns written after the export.** Until relayhistory's turn writer is forward-only (PR 1), Neon keeps receiving turns. Re-run `--export --refresh` (cheap: unchanged scopes are skipped by fingerprint) after the writer flips, then `--verify`.
-- **Phantom directory rows.** A turn-only relay session becomes a `session_index` row. The turns-forward migration hides turn-only directory projections while leaving canonical pointers addressable.
+- **Phantom directory rows.** A turn-only relay session becomes a
+  `session_index` row. Before any legacy export, land and apply
+  `20261105062010_turns_forward_gates.sql`; it hides turn-only directory
+  projections while leaving canonical pointers addressable. This is an
+  activation precondition, not a claim about what is already on `main` or live.
