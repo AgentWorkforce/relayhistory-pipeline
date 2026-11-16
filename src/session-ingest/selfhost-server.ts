@@ -330,7 +330,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(logCommit
       ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}),
             budget: (records, receivedAt) => assertWithinBudget(deliver, records, receivedAt) }),
-          logMaterializer: new LogMaterializer({ store: parts.store, keyRoot: settings.keyRoot, ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+          logMaterializer: new LogMaterializer({ store: parts.store, keyRoot: settings.keyRoot, ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...uploadConsent,
             deliver: { ...withoutSlots(deliver), ledger: selfhostS3Ledger(settings.keyRoot, parts, undefined, { logModeGuard: false }) },
             log: (fields) => log.info("session ingest", fields) }) }
       : {}),

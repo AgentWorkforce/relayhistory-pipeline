@@ -50,7 +50,7 @@ import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
 import { appendBatches, LogFenced, logKeys, openStream, putPayload, settlePending, takeStream, type LogAdmitSnapshot, type LogState } from "./ledger-log.ts";
 import { admissionFenceView, batchPairs, fenceEpoch, hasPendingReset, judge, liveRecords, s3LedgerObjects, sessionKeyHash } from "./ledger-s3.ts";
 import { readLogSkip, registerLogStream } from "./ledger-log-materialize.ts";
-import { sessionKey } from "./upload-consent.ts";
+import { sessionKey, type OperatorSharingCap } from "./upload-consent.ts";
 import { assertTenantSegment } from "./writer.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 
@@ -72,6 +72,11 @@ export interface LogAdmitGates {
   journalSeq: number;
   /** Consent, as the legacy consentGate: throws UploadConsentRequired to hold the batch. */
   consent?: (dropped: ReadonlySet<string>, phase: "admit" | "commit") => Promise<void>;
+  /**
+   * The inbox's operator sharing cap (DecodedInbox.consentCap), carried in the payload so the materializer re-runs the
+   * consent gate at apply time with the same cap (docs/design/s3-ledger-log-commit.md, Remaining 1).
+   */
+  consentCap?: OperatorSharingCap;
 }
 
 /** As the legacy core answers: accepted_all_deleted when the fence dropped every session the batch writes. */
@@ -230,8 +235,10 @@ export class LogStreams {
       // appended this batch between the read-only open and the take.
       state = await this.#owned(tenant, prepared.originId, state);
       if (this.#fromWindow(state, prepared) === "replay") return "replay";
-      // 6. The payload: the kept records, exactly as prepared, plus this attempt's nonce (a fresh object per attempt).
-      const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, journalSeq: gates.journalSeq, attempt: attemptNonce(), receipt: prepared.receipt, records: kept })));
+      // 6. The payload: the kept records, exactly as prepared, plus this attempt's nonce (a fresh object per attempt) and
+      // the inbox's consent cap (the materializer re-runs consent at apply time with it).
+      const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, journalSeq: gates.journalSeq, attempt: attemptNonce(),
+        ...(gates.consentCap ? { consentCap: gates.consentCap } : {}), receipt: prepared.receipt, records: kept })));
       // 7. Consent again, just before the commit.
       if (gates.consent) await gates.consent(dropped, "commit");
       // 8. The commit.

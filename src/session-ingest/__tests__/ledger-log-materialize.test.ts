@@ -414,3 +414,84 @@ describe("slice 4: the admission snapshot, re-judged at apply", () => {
     expect([r.applied, r.refused]).toEqual([true, "legacy_raced_switch"]);
   });
 });
+
+describe("Remaining 1: consent re-checked at apply time", () => {
+  const prep = async (batchId: string, recordId: string) => {
+    const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
+    return prepareDelivery(TENANT, await batch([record({ record_id: recordId, session_id: `sess-${recordId}`, origin_id: ORIGIN })],
+      { batch_id: batchId, origin_id: ORIGIN, account_id: await deliveryAccount(TENANT) }));
+  };
+  async function materializer(store: ObjectStore, uploadConsent?: import("../upload-consent.ts").UploadConsentConfig) {
+    const { LogMaterializer } = await import("../ledger-log-materialize.ts");
+    const { selfhostS3Ledger } = await import("../selfhost-server.ts");
+    return new LogMaterializer({ store, keyRoot: ROOT, nowMs: () => T0, ...(uploadConsent ? { uploadConsent } : {}),
+      deliver: { ledger: selfhostS3Ledger(ROOT, { store, run: (async () => { throw new Error("sql"); }) as never }, undefined, { logModeGuard: false }),
+        acceptanceMode: "canonical", target: { store, keyRoot: ROOT } } });
+  }
+  async function admitted(store: ObjectStore, batchId: string, recordId: string, consentCap?: import("../upload-consent.ts").OperatorSharingCap) {
+    const { LogStreams } = await import("../ledger-log-admit.ts");
+    const streams = new LogStreams({ store, keyRoot: ROOT, writer: "w_test", nowMs: () => T0 });
+    // Consent passed at admit (the gate allowed it then); the cap rides in the payload.
+    expect(await streams.admit(TENANT, await prep(batchId, recordId), { journalSeq: 0, consent: async () => {}, ...(consentCap ? { consentCap } : {}) })).toBe("accepted");
+  }
+  const fresh = async () => {
+    const sc = scratchStore();
+    cleanups.push(sc.done);
+    await writeAuthority(sc.store);
+    await enable(sc.store);
+    return sc.store;
+  };
+
+  test("the payload carries the inbox's consent cap; the materializer re-runs the gate with it and skips a refused batch (payload deleted)", async () => {
+    const store = await fresh();
+    await admitted(store, "b1", "r1", { mode: "selected" });
+    const [b] = batchesIn(await entries(store));
+    expect((await json(store, b!.payloads[0]!.key)).consentCap).toEqual({ mode: "selected" });
+    // No consent store in this process: an operator cap with named sessions refuses (consent_store_required).
+    const r = await (await materializer(store)).materialize(TENANT, ORIGIN);
+    expect(r.outcomes).toEqual(["skipped:upload_consent_required"]);
+    expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
+    expect(await keysUnder(store, logKeys(ROOT, TENANT, ORIGIN).payloads)).toEqual([]);
+    expect(await exists(store, logKeys(ROOT, TENANT, ORIGIN).skipped("b1"))).toBe(true);
+  });
+
+  test("a consent revoked between the append and the apply skips the batch; one still allowed is written", async () => {
+    const { MemoryConsentStore } = await import("../upload-consent.ts");
+    const store = await fresh();
+    const consent = new MemoryConsentStore();
+    await consent.apply(TENANT, { mode: "all", confirmOrigins: [ORIGIN] }, { trusted: true, nowMs: T0 });
+    await admitted(store, "b1", "r1");
+    // Allowed now: written.
+    const m = await materializer(store, { enforcement: "enforce", store: consent, nowMs: () => T0 });
+    expect((await m.materialize(TENANT, ORIGIN)).outcomes).toEqual(["accepted"]);
+    // Held after the next append, before its apply: skipped, never written.
+    await admitted(store, "b2", "r2");
+    consent.hold(TENANT);
+    expect((await m.materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:upload_consent_required"]);
+    const side = [...(await readSide(store)).keys()];
+    expect(side.some((k) => k.includes("/s=sess-r1/manifest.json"))).toBe(true);
+    expect(side.some((k) => k.includes("/s=sess-r2/"))).toBe(false);
+    expect(await keysUnder(store, logKeys(ROOT, TENANT, ORIGIN).payloads)).toEqual([]);
+  });
+
+  test("a consent store fault at apply is a retry (the cursor stays), never a skip", async () => {
+    const { MemoryConsentStore } = await import("../upload-consent.ts");
+    const store = await fresh();
+    await admitted(store, "b1", "r1");
+    const consent = new MemoryConsentStore();
+    consent.snapshot = async () => { throw new Error("consent store down"); };
+    const m = await materializer(store, { enforcement: "enforce", store: consent, nowMs: () => T0 });
+    await expect(m.materialize(TENANT, ORIGIN)).rejects.toThrow();
+    expect(await exists(store, logKeys(ROOT, TENANT, ORIGIN).skipped("b1"))).toBe(false);
+    expect((await keysUnder(store, logKeys(ROOT, TENANT, ORIGIN).payloads)).length).toBe(1);
+  });
+
+  test("a malformed cap in the payload is refused as payload_invalid", async () => {
+    const store = await fresh();
+    await admitted(store, "b1", "r1");
+    const [b] = batchesIn(await entries(store));
+    const p = await json(store, b!.payloads[0]!.key);
+    await putJson(store, b!.payloads[0]!.key, { ...p, consentCap: { mode: "all" } });
+    expect((await (await materializer(store)).materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:payload_invalid"]);
+  });
+});

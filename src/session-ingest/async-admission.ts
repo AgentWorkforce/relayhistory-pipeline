@@ -197,8 +197,11 @@ function inboxRecord(id: unknown, line: unknown, originId: string): PreparedDeli
 
 export interface DecodedInbox { tenant: LedgerTenant; prepared: PreparedDelivery; receivedAtMs: number; journalSeq: number; consentCap?: OperatorSharingCap }
 
-/** A stored cap must be exactly the shape the request path writes; anything else is a malformed object. */
-function inboxConsentCap(v: unknown): OperatorSharingCap | undefined {
+/**
+ * A stored cap must be exactly the shape the request path writes; anything else is a malformed object (throws). Also
+ * validates the cap a log-mode payload carries (ledger-log-materialize.ts).
+ */
+export function inboxConsentCap(v: unknown): OperatorSharingCap | undefined {
   if (v === undefined) return undefined;
   if (!isObject(v) || (v.mode !== "selected" && v.mode !== "new") || Object.keys(v).some((k) => k !== "mode" && k !== "sinceMs")) return bad();
   if (v.sinceMs !== undefined && (!Number.isSafeInteger(v.sinceMs) || (v.sinceMs as number) < 0)) return bad();

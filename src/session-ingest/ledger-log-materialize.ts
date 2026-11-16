@@ -21,6 +21,11 @@
  *     (skipped:delivery_privacy_superseded); a session whose epoch moved since (deleted, maybe re-enabled) has its
  *     records dropped. So an upload admitted before a control is never written as one made after it. The legacy
  *     claim then registers the owner stubs under the current fence, as it always does;
+ *   - upload consent (Remaining 1 of the design): the payload carries the inbox's operator sharing cap, and the
+ *     consent gate runs again at apply time (admit phase, after the legacy claim and before any canonical write),
+ *     with that cap and this process's INGEST_UPLOAD_CONSENT config. A refusal skips the batch for good
+ *     (skipped:upload_consent_required) and its payload is deleted, as the journal re-check does: the materializer
+ *     never holds a stream behind one batch, so it cannot wait for a consent that may never come;
  *   - payloads under ledger/log/o=<origin>/p/ live only until their entry is applied: after its marker is written
  *     they are deleted. eraseLogPayloads deletes a user's unapplied payloads outright (a batch whose payload is gone
  *     is skipped as erased, never written).
@@ -33,11 +38,12 @@
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
-import { assertNoLaterPrivacyControl, outcomeKey, receiptDir, writeOutcome } from "./async-admission.ts";
+import { assertNoLaterPrivacyControl, inboxConsentCap, outcomeKey, receiptDir, writeOutcome } from "./async-admission.ts";
 import { deliverPrepared, type DeliverDeps } from "./deliver.ts";
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
 import { logKeys, readEntries, type LogEntry, type LogKeys } from "./ledger-log.ts";
 import { admissionFenceView, fenceEpoch, hasPendingReset, s3LedgerObjects, sessionKeyHash } from "./ledger-s3.ts";
+import { checkUploadConsent, UploadConsentRequired, type OperatorSharingCap, type UploadConsentConfig } from "./upload-consent.ts";
 import { DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 
@@ -136,7 +142,12 @@ export async function eraseLogPayloads(store: ObjectStore, keyRoot: string, tena
  * collection could take between a retry's PUT and its append. No admission time inside: received_at is the entry's
  * own atMs (the append). `receivedAtMs` is still read from a slice-3-era payload.
  */
-interface StoredPayload { v: 1; journalSeq?: number; receivedAtMs?: number; receipt: PreparedDelivery["receipt"]; records: PreparedDelivery["records"] }
+interface StoredPayload { v: 1; journalSeq?: number; receivedAtMs?: number; consentCap?: unknown; receipt: PreparedDelivery["receipt"]; records: PreparedDelivery["records"] }
+/** The payload's consent cap: absent (undefined), valid, or malformed (null: the payload is refused as invalid). */
+const payloadConsentCap = (p: StoredPayload): OperatorSharingCap | undefined | null => {
+  if (p.consentCap === undefined) return undefined;
+  try { return inboxConsentCap(p.consentCap) ?? null; } catch { return null; }
+};
 const isStrField = (v: unknown) => typeof v === "string";
 const validRecord = (r: unknown) => {
   const x = r as Record<string, unknown> | null;
@@ -170,6 +181,8 @@ export interface LogMaterializerDeps {
   keyRoot: string;
   /** The legacy admission deps, on a ledger WITHOUT logModeGuard (the materializer is the one legacy writer allowed). */
   deliver: DeliverDeps;
+  /** INGEST_UPLOAD_CONSENT, as the admission consumer has it: consent is re-checked at apply time (with the payload's cap). */
+  uploadConsent?: UploadConsentConfig;
   nowMs?: () => number;
   log?: (fields: Record<string, unknown>) => void;
 }
@@ -255,12 +268,18 @@ export class LogMaterializer {
     let receipt: PreparedDelivery["receipt"] | undefined;
     let journalSeq = 0;
     let receivedAtMs: number | undefined;
+    let consentCap: OperatorSharingCap | undefined;
     for (const ref of b.payloads) {
       let p: unknown;
       try { p = await readJson(store, ref.key); } catch (error) { if (error instanceof SyntaxError) return "skipped:payload_invalid"; throw error; }
       // Gone before its entry was applied: erased (eraseLogPayloads). Never written.
       if (p === undefined) return "skipped:payload_erased";
       if (!validPayload(p)) return "skipped:payload_invalid";
+      const cap = payloadConsentCap(p);
+      if (cap === null) return "skipped:payload_invalid";
+      // One batch, one inbox message, one cap: payloads of one batch that disagree are not something admission writes.
+      if (cap && consentCap && JSON.stringify(cap) !== JSON.stringify(consentCap)) return "skipped:payload_invalid";
+      consentCap ??= cap;
       receipt ??= p.receipt;
       receivedAtMs ??= p.receivedAtMs;
       // The snapshot's journal seq first; a payload without one (a slice-2-era payload) judges as seq 0, the
@@ -282,6 +301,16 @@ export class LogMaterializer {
       if (moved.size > 0) kept = records.filter((r) => typeof r.session_id !== "string" || r.session_id === "" || !moved.has(sessionKeyHash(r.source, r.session_id)));
     }
     const prepared: PreparedDelivery = { originId, batchId: b.batchId, batchDigest: b.digest, receipt, records: kept };
+    // Consent at apply time, with the admission's cap and this process's config (the consumer's consentGate, same
+    // inputs). Admit phase only: it runs after the legacy claim and BEFORE any canonical write, so a refusal leaves
+    // nothing written. The commit-phase re-check would run after the canonical writes, where a skip would strand them.
+    const uploadConsent = this.deps.uploadConsent;
+    const consentGate = (uploadConsent && uploadConsent.enforcement !== "off") || consentCap
+      ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => {
+          if (phase !== "admit") return;
+          await checkUploadConsent(uploadConsent, tenant, originId, kept, { dropped, phase, route: "log.materialize", ...(consentCap ? { operator: consentCap } : {}) }, this.deps.log);
+        }
+      : undefined;
     try {
       const r = await deliverPrepared({
         ...this.deps.deliver,
@@ -289,11 +318,16 @@ export class LogMaterializer {
         ...(receivedAtMs !== undefined ? { now: () => new Date(receivedAtMs), target: { ...this.deps.deliver.target, now: () => new Date(receivedAtMs) } } : {}),
         // The journal re-check at write time: a reset completed after the upload began refuses the batch.
         admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, now()),
+        ...(consentGate ? { consentGate } : {}),
       }, tenant, prepared);
       return r.outcome as MaterializedOutcome;
     } catch (error) {
       // A definitive refusal (403/409/413/422/400: batch-id or revision conflict, privacy superseded): the same answer
       // forever, so the batch is skipped and the stream moves on. Anything else is a retry: the cursor stays.
+      // Consent refused at apply (a 503 on the request path, where the inbox keeps the bytes for a redrive): here the
+      // batch is already admitted and its inbox retired, and holding the stream would block every later entry, so it
+      // is a final skip (its payload deleted). A consent STORE fault is not UploadConsentRequired: a retry.
+      if (error instanceof UploadConsentRequired) return "skipped:upload_consent_required";
       if (error instanceof DeliveryError && error.status !== 503 && error.status !== 429) return `skipped:${error.code}`;
       throw error;
     }
