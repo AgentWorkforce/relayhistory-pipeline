@@ -131,10 +131,11 @@ This takes manifest and index work off the admission critical path and batches i
 session per N entries. The reads stay as they are today; only the writer of those objects changes.
 
 Compaction: payloads stay content-addressed. Entry 0 is NEVER deleted: it is the mode marker, and its loss with
-other entries present reads as `log_open_missing`. Today `readEntries` replays from entry 0 and does not start from
-a checkpoint, so until it can (planned), compaction must not delete any entry a reader may still replay through.
-Once it can, entries below a materialized checkpoint can be deleted after a retention window, because the
-checkpoint holds the dedupe window, the owner and the cursor. Payloads live under `ledger/log/o=<origin>/p/` in the
+other entries present reads as `log_open_missing`. Since slice 6, `readEntries` and `openStream` start from a verified
+checkpoint, so entries strictly between entry 0 and a materialized checkpoint are no longer read by either. Deleting
+them (after a retention window) is what compaction would do; it is NOT implemented (Remaining 5), and a reader whose
+checkpoint fails verification still falls back to entry 0 and needs every entry, so compaction must also keep the
+checkpoint it relies on and stop deleting while a checkpoint fails to verify. Payloads live under `ledger/log/o=<origin>/p/` in the
 user's admission directory. The erase paths (operator erase, session-selection erase, reset) must find and delete
 them there, and that is part of the materializer slice.
 
@@ -364,6 +365,17 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
 
 ## Slice 6: the before-production items
 
+- **Start from a checkpoint (Remaining 2).** `readEntries(fromSeq)` always reads entry 0 (the mode marker, and the
+  `legacyCutover` a checkpoint must match), then tries the checkpoint boundary at or below `fromSeq` and the one before
+  it (deterministic keys, no listing of `c/`; a checkpoint PUT is best effort). The first that passes
+  `verifiedCheckpoint` (the `openStream` rules, now one function: hash, epoch and epoch writer cross-checked against
+  entry `seq`, the inbox cursor and window for a batches entry, the same `legacyCutover`, epoch at least 1, window
+  bounded) is the replay's start; none verifying, or a store error reading one, replays from entry 0, as before. A
+  materializer run therefore reads O(entries since its cursor), not O(stream length). What a checkpoint start does not
+  see: a gap or a bad hash strictly between entry 0 and the checkpoint (`openStream` already had this property).
+  - Tests (`ledger-log.test.ts`): no entry below the checkpoint is read; a missing boundary checkpoint falls back to
+    the previous; every forgery (hash, epoch writer, epoch, cursor, cutover, epoch 0, seq) and malformed JSON fall back
+    to entry 0 with the same entries; a store fault on the checkpoint falls back; a cursor read stays bounded.
 - **Consent at apply (Remaining 1).** `LogAdmitGates.consentCap` (the consumer passes the decoded inbox's cap) is
   written into the payload. The materializer validates it with the inbox's own validator (`inboxConsentCap`; a
   malformed cap is `payload_invalid`) and passes `deliverPrepared` a consent gate built exactly as the consumer's
@@ -385,8 +397,8 @@ Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream 
    time (admit phase, after the legacy claim and before any canonical write) with that cap and its own
    `INGEST_UPLOAD_CONSENT` config. A refusal is a final skip (`upload_consent_required`, payload deleted), as the
    journal re-check is; a consent store fault is a retry.
-2. Before production: `readEntries` still replays from entry 0 on every materializer run of a stream with new entries
-   (slice 4 only skips idle streams). It needs a start-from-checkpoint read before streams are long.
+2. Closed in slice 6: `readEntries(fromSeq)` reads entry 0 and then starts from the newest verified checkpoint at or
+   below `fromSeq` (the same trust rules as `openStream`), falling back to entry 0 on any mismatch.
 3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (the journal
    re-check and the snapshot) and then deletes them, so they live until the stream's next apply. Operator and session
    erase are refused under `INGEST_LEDGER=s3` today; when they are admitted, they must call `eraseLogPayloads`.

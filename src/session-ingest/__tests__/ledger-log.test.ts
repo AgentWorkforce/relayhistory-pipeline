@@ -506,3 +506,94 @@ describe("an unresolved entry past its age bound is only read back, never resent
     }
   });
 });
+
+describe("readEntries starts from the newest verified checkpoint (Remaining 2)", () => {
+  /** Wraps a store, recording the entry seqs read with getObject. */
+  function counting(inner: ObjectStore) {
+    const read: number[] = [];
+    const store: ObjectStore = {
+      backend: inner.backend,
+      head: (k) => inner.head(k), get: (k, r) => inner.get(k, r), list: (p, c) => inner.list(p, c), presignGet: (k, t) => inner.presignGet(k, t),
+      delete: (k) => inner.delete(k), put: inner.put.bind(inner),
+      getObject: (k, r) => { const m = /\/e\/\d{17}\/(\d{20})\.json$/.exec(String(k)); if (m) read.push(Number(m[1])); return inner.getObject(k, r); },
+    };
+    return { store, read };
+  }
+  async function from(store: ObjectStore, fromSeq: number) { const out: number[] = []; for await (const e of readEntries(store, keys, fromSeq)) out.push(e.seq); return out; }
+  const N = 2 * LOG_CHECKPOINT_EVERY + 5;
+  async function stream() {
+    const store = fresh();
+    const s = await enableLogMode(store, keys, "cut-1", W("w1"));
+    for (let i = 1; i <= N; i++) await appendBatches(store, s, [await batch(store, `b${i}`)], `cur-${i}`, W("w1"));
+    return store;
+  }
+  const cpOf = async (store: ObjectStore, seq: number) => JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(keys.checkpoint(seq)))).body)));
+  const expected = (fromSeq: number) => Array.from({ length: N - fromSeq }, (_, i) => fromSeq + 1 + i);
+
+  test("from a seq past a checkpoint: entry 0 and the checkpoint's own entry are read, nothing below it", async () => {
+    const inner = await stream();
+    const c = counting(inner);
+    const fromSeq = 2 * LOG_CHECKPOINT_EVERY + 2;
+    expect(await from(c.store, fromSeq)).toEqual(expected(fromSeq));
+    expect(c.read.filter((x) => x > 0 && x < 2 * LOG_CHECKPOINT_EVERY)).toEqual([]);
+    expect(c.read).toContain(0);
+    expect(c.read).toContain(2 * LOG_CHECKPOINT_EVERY);
+    // fromSeq 0 still yields every entry, entry 0 included.
+    expect(await from(inner, 0)).toEqual([0, ...expected(0)]);
+  });
+
+  test("a missing checkpoint at the boundary falls back to the one before it", async () => {
+    const inner = await stream();
+    await inner.delete(objectKey(keys.checkpoint(2 * LOG_CHECKPOINT_EVERY)));
+    const c = counting(inner);
+    const fromSeq = 2 * LOG_CHECKPOINT_EVERY + 1;
+    expect(await from(c.store, fromSeq)).toEqual(expected(fromSeq));
+    expect(c.read.filter((x) => x > 0 && x < LOG_CHECKPOINT_EVERY)).toEqual([]);
+  });
+
+  test("a checkpoint that fails any trust check is ignored and the read replays from entry 0, with the same entries", async () => {
+    const inner = await stream();
+    const top = 2 * LOG_CHECKPOINT_EVERY, prev = LOG_CHECKPOINT_EVERY;
+    const real = { top: await cpOf(inner, top), prev: await cpOf(inner, prev) };
+    const forgeries = (cp: Record<string, unknown>) => [
+      { ...cp, hash: "0".repeat(64) },
+      { ...cp, epochWriter: "evil" },
+      { ...cp, epoch: (cp.epoch as number) + 1 },
+      { ...cp, inboxCursor: "moved" },
+      { ...cp, legacyCutover: "cut-2" },
+      { ...cp, epoch: 0 },
+      { ...cp, seq: (cp.seq as number) + 1 },
+    ];
+    const fromSeq = top + 3;
+    for (let i = 0; i < forgeries(real.top).length; i++) {
+      await putRaw(inner, keys.checkpoint(top), enc(forgeries(real.top)[i]));
+      await putRaw(inner, keys.checkpoint(prev), enc(forgeries(real.prev)[i]));
+      const c = counting(inner);
+      expect(await from(c.store, fromSeq)).toEqual(expected(fromSeq));
+      // Fell back to entry 0: every entry from 1 was read.
+      expect(c.read).toContain(1);
+    }
+    // Malformed JSON at both boundaries: the same fallback.
+    await putRaw(inner, keys.checkpoint(top), new TextEncoder().encode("{"));
+    await putRaw(inner, keys.checkpoint(prev), new TextEncoder().encode("{"));
+    expect(await from(inner, fromSeq)).toEqual(expected(fromSeq));
+  });
+
+  test("a store fault reading a checkpoint falls back to entry 0 (never fails the read)", async () => {
+    const inner = await stream();
+    const store: ObjectStore = { ...inner, backend: inner.backend, head: (k) => inner.head(k), get: (k, r) => inner.get(k, r), list: (p, c) => inner.list(p, c),
+      presignGet: (k, t) => inner.presignGet(k, t), delete: (k) => inner.delete(k), put: inner.put.bind(inner),
+      getObject: (k, r) => { if (String(k).includes("/c/")) throw new ObjectStoreError("transient", "fs", "injected", { status: 503 }); return inner.getObject(k, r); } };
+    const fromSeq = 2 * LOG_CHECKPOINT_EVERY + 1;
+    expect(await from(store, fromSeq)).toEqual(expected(fromSeq));
+  });
+
+  test("the materializer's cursor reads stay bounded on a long stream (a run reads only entries since its cursor)", async () => {
+    const inner = await stream();
+    const c = counting(inner);
+    // A cursor just past the second checkpoint, as the materializer passes it.
+    const cursor = 2 * LOG_CHECKPOINT_EVERY + 4;
+    expect(await from(c.store, cursor)).toEqual([N]);
+    expect(c.read.length).toBeLessThanOrEqual(2 + (N - 2 * LOG_CHECKPOINT_EVERY) + 2);
+  });
+});
