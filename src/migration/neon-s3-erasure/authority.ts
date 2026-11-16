@@ -128,7 +128,17 @@ async function neonLegacyFencedPage(
       ? [after.org_id, after.workspace_id, after.source, after.session_id, after.legacy_user_id, Math.min(limit, LEGACY_FENCE_PAGE)]
       : [null, null, null, null, null, Math.min(limit, LEGACY_FENCE_PAGE)],
   );
-  return rows.map((r) => ({ ...r, legacy_machine_id: legacyMachineId(r.workspace_id, r.legacy_user_id) }));
+  // `default` and the historical empty workspace are one privacy scope, but
+  // old exports hashed the stored spelling. Queue both narrowly-derived
+  // candidates under a default fence; a missing candidate is an idempotent
+  // no-op and no arbitrary machine id is ever followed.
+  return rows.flatMap((r) => {
+    const workspaces = r.workspace_id === "default" ? ["", "default"] : [r.workspace_id];
+    return workspaces.map((workspace) => ({
+      ...r,
+      legacy_machine_id: legacyMachineId(workspace, r.legacy_user_id),
+    }));
+  });
 }
 
 async function neonStillLegacyFenced(db: Queryable, g: LegacyFencedGroup): Promise<boolean> {
