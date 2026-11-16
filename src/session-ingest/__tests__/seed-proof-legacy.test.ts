@@ -9,7 +9,7 @@ import { objectStoreManifestReader } from "../../../packages/pipeline/src/lib/pi
 import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { exportUnit } from "../../migration/neon-s3-sync/export-session.ts";
 import { buildSessionStream } from "../../migration/relayhistory-export.ts";
-import { RELAYHISTORY_LEGACY_MACHINE_ID } from "../../migration/neon-s3-sync/legacy-source.ts";
+import { legacyMachineId } from "../../migration/neon-s3-sync/legacy-source.ts";
 import { SeedProofIndex, type SeedPointer, type ProofDeps } from "../seed-proof.ts";
 import { TENANT, scratchStore } from "./support.ts";
 
@@ -21,7 +21,7 @@ test("gate 2: the seed proof acknowledges an exported legacy manifest's records 
   try {
     const unit = { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, source: "claude", sessionId: "sess-1", firstMs: 1761955200000, lastMs: 1761955200000, machineIds: [], totals: {} };
     const line = (kind: string, origin: string, id: string, payload: Record<string, unknown>) => ({
-      machine: RELAYHISTORY_LEGACY_MACHINE_ID,
+      machine: legacyMachineId(TENANT.workspaceId, TENANT.userId),
       userId: TENANT.userId,
       bytes: buildSessionStream([{ kind, origin_id: origin, record_id: id, revision: "1", operation: "upsert", received_at: "2025-11-01T00:00:00Z", payload }]).bytes,
     });
