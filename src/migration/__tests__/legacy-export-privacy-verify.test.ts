@@ -1554,10 +1554,30 @@ describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
         for await (const line of legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER).lines(u)) yield { ...line, machine: "srv_forged" };
       },
     });
-    const { streamed } = await streamOf(store, [genuine.manifests[0]!.manifestKey, forged.manifests[0]!.manifestKey]);
+    // A LIVE delivery part in the same scope: its rows are what the P1 suppressed (the user-visible harm).
+    const liveContent = "live_row_must_survive_7c1";
+    const at = "2026-11-01T10:00:00.000Z";
+    const live = await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, {
+      fenced: async () => false,
+      async *lines() {
+        const record = {
+          kind: "convergence_event", origin_id: "machine:srv_live", record_id: "live-1", revision: "1", operation: "upsert", received_at: at,
+          payload: {
+            source: S.source, session_id: S.sessionId, machine_id: "srv_live", user_id: OWNER, event_id: "live-1",
+            kind: "session_event", type: "assistant", ts: at, ingested_at: at, actor_name: "LiveAgent", actor_role: "owner",
+            content: liveContent, model: "fixture-model", provider: "fixture", input_tokens: 3, output_tokens: 5,
+            task_ref: {}, tags: [], files_touched: [], tool_calls: [],
+          },
+        };
+        yield { machine: "srv_live", userId: OWNER, bytes: new TextEncoder().encode(JSON.stringify(record) + "\n") };
+      },
+    });
+    const { streamed, rowsText } = await streamOf(store, [live.manifests[0]!.manifestKey, genuine.manifests[0]!.manifestKey, forged.manifests[0]!.manifestKey]);
     expect(streamed.reasons).not.toContain("relayhistory_revision_conflict");
     expect(streamed.reasons).toContain("legacy_provenance_invalid");
     expect(streamed.complete).toBe(true);
+    expect(rowsText).toContain(liveContent); // the live rows are served
+    expect([...streamed.kinds].filter((k) => /^legacy_/u.test(k))).toEqual([]); // all legacy evidence dropped (fail closed)
   });
 
   test("(i2) streamed read: a GENUINE exporter-owned legacy manifest streams without the provenance reason (positive control)", async () => {
