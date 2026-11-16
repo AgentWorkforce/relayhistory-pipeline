@@ -12,7 +12,8 @@ import { Histogram, Tally, type LatencySummary } from "./stats.ts";
 
 export const BATCH_KIB = 64;
 const SHARDS_PER_STREAM = 16;
-const SHARDS_PER_BATCH = 2;
+/** Revision shards one batch merges. A production batch touches about one per record; two keeps the chain's depth, not its width. */
+export const SHARDS_PER_BATCH = 2;
 const INBOX_POOL = 8;
 const CAS_RETRIES = 8;
 
@@ -82,12 +83,15 @@ export interface StreamWriter {
   /** The last sequence number this writer knows is committed. */
   tail: number;
   /** The payload PUT already in flight for the next group (pipelined behind the current commit). */
-  next?: { startedAt: number; done: Promise<string> };
+  next?: { done: Promise<{ key: string; ms: number }> };
   committed: number;
 }
 
 export interface CommitStats {
-  /** Payload start to commit acknowledgement, per group. */
+  /**
+   * Per group: the payload PUT's own duration plus the commit step's. Time a finished payload spends waiting
+   * for its writer's turn is the harness's scheduling (a worker serves several streams), so it is left out.
+   */
   commit: Histogram;
   groups: number;
 }
@@ -110,22 +114,30 @@ export async function logGroup(
 ): Promise<string> {
   const startPayload = (): NonNullable<StreamWriter["next"]> => {
     const k = key(root, `st${writer.stream}`, "payloads", crypto.randomUUID());
-    return { startedAt: performance.now(), done: store.put(k, randomBytes(group * BATCH_KIB * KIB)).then(() => k) };
+    const t0 = performance.now();
+    return { done: store.put(k, randomBytes(group * BATCH_KIB * KIB)).then(() => ({ key: k as string, ms: performance.now() - t0 })) };
   };
   const current = writer.next ?? startPayload();
   writer.next = undefined;
-  const payloadKey = await current.done;
+  const payload = await current.done;
+  const payloadKey = payload.key;
   // Pipelining: the next group's payload goes out while this group commits.
   writer.next = startPayload();
   writer.next.done.catch(() => {});
   const seq = writer.tail + 1;
   const batchIds = Array.from({ length: group }, (_, i) => `${writer.stream}-${seq}-${i}-${crypto.randomUUID().slice(0, 8)}`);
-  const outcome = await commit(seq, payloadKey, batchIds);
+  const commitStart = performance.now();
+  let outcome: CommitOutcome;
+  try {
+    outcome = await commit(seq, payloadKey, batchIds);
+  } catch (error) {
+    throw error;
+  }
   writer.tail = seq;
   if (outcome === "lost") return "lost_sequence";
   writer.committed++;
   stats.groups++;
-  stats.commit.record(performance.now() - current.startedAt);
+  stats.commit.record(payload.ms + (performance.now() - commitStart));
   return "ok";
 }
 
@@ -157,6 +169,9 @@ const HEAD_SK = "head";
 export function dynamoCommit(dynamo: Dynamo, pk: string, cancelled: Tally): (seq: number, payloadKey: string, batchIds: string[]) => Promise<CommitOutcome> {
   const TableName = dynamo.target.table;
   return async (seq, payloadKey, batchIds) => {
+    // Names this attempt, so a transaction whose answer was lost can be recognised by reading the entry back.
+    const attempt = crypto.randomUUID();
+    const entryKey = { pk: { S: pk }, sk: { S: `e#${seqName(seq)}` } };
     const items: Record<string, unknown>[] = [
       {
         Update: {
@@ -167,7 +182,7 @@ export function dynamoCommit(dynamo: Dynamo, pk: string, cancelled: Tally): (seq
           ExpressionAttributeValues: { ":next": { N: String(seq) }, ...(seq === 1 ? {} : { ":prev": { N: String(seq - 1) } }) },
         },
       },
-      { Put: { TableName, Item: { pk: { S: pk }, sk: { S: `e#${seqName(seq)}` }, payload: { S: payloadKey } }, ConditionExpression: "attribute_not_exists(pk)" } },
+      { Put: { TableName, Item: { ...entryKey, payload: { S: payloadKey }, attempt: { S: attempt } }, ConditionExpression: "attribute_not_exists(pk)" } },
       ...batchIds.map((id) => ({ Put: { TableName, Item: { pk: { S: pk }, sk: { S: `b#${id}` }, seq: { N: String(seq) } }, ConditionExpression: "attribute_not_exists(pk)" } })),
     ];
     try {
@@ -177,8 +192,14 @@ export function dynamoCommit(dynamo: Dynamo, pk: string, cancelled: Tally): (seq
       if (error instanceof DynamoError && error.exception === "TransactionCanceledException") {
         cancelled.add(error.errorClass);
         if (error.reasons.includes("ConditionalCheckFailed")) return "lost";
+        throw error;
       }
-      throw error;
+      // A reset, timeout or 5xx: the transaction may have applied. Never assume it failed; read the entry.
+      if (error instanceof DynamoError && error.status < 500) throw error;
+      const landed = await dynamo.get(entryKey);
+      if (landed === undefined) throw error;
+      const by = landed.attempt;
+      return by && "S" in by && by.S === attempt ? "committed" : "lost";
     }
   };
 }

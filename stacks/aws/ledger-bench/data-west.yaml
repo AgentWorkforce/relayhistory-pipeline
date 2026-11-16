@@ -74,6 +74,29 @@ Resources:
         - { Key: ttl, Value: !Ref Ttl }
         - { Key: owner, Value: !Ref Owner }
 
+  # A key no bucket uses: step 4 names it on a directory-bucket put to prove the bucket keeps its one key.
+  ProbeKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: ledger-bench probe key (throwaway; no bucket uses it)
+      EnableKeyRotation: false
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdministersThroughIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - { Key: purpose, Value: ledger-bench }
+        - { Key: ttl, Value: !Ref Ttl }
+        - { Key: owner, Value: !Ref Owner }
+
   # R2: the production encryption shape (SSE-KMS, Bucket Keys off), in the compute's Region.
   BucketR2:
     Type: AWS::S3::Bucket
@@ -221,7 +244,8 @@ Resources:
           - Effect: Allow
             Principal:
               AWS: !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:root"
-            Action: "sts:AssumeRole"
+            # EKS Pod Identity session tags are transitive, so the hop carries them: TagSession is required.
+            Action: ["sts:AssumeRole", "sts:TagSession"]
             Condition:
               ArnEquals:
                 "aws:PrincipalArn": !Sub "arn:${AWS::Partition}:iam::${ClusterAccountId}:role/${PodRoleName}"
@@ -295,6 +319,7 @@ Resources:
 
 Outputs:
   KeyArn: { Value: !GetAtt Key.Arn }
+  ProbeKeyArn: { Value: !GetAtt ProbeKey.Arn }
   BucketR2: { Value: !Ref BucketR2 }
   BucketR3: { Value: !Ref BucketR3 }
   BucketR4: { Value: !Ref BucketR4 }

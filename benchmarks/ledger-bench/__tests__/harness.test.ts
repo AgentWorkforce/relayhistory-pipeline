@@ -4,7 +4,7 @@ import type { ObjectStore } from "../../../packages/object-store/src/types.ts";
 import { assumeRole, BudgetExhausted, Dynamo, expressStore, expressZone, meteredFetch, RequestMeter } from "../aws.ts";
 import { LANES, parseConfig, SMOKE, STANDARD, type Profile } from "../config.ts";
 import { key, type Cell, type Ctx } from "../context.ts";
-import { costBound } from "../cost.ts";
+import { costBound, FIXED_USD, laneCostBound } from "../cost.ts";
 import { errorClass, runLoad } from "../load.ts";
 import { checkLog, dynamoCommit, dynamoHeadSeq, entryCommit, logGroup, P13_ROUND_TRIPS, p13Batch, racingWriters, seedP13, type CommitStats, type StreamWriter } from "../protocols.ts";
 import { Histogram, median, Tally } from "../stats.ts";
@@ -75,6 +75,13 @@ describe("load", () => {
     expect(Object.keys(result.errors)).toEqual(["thrown_Boom"]);
     expect(result.latency.p50_ms!).toBeGreaterThanOrEqual(1);
   });
+  test("the operation cap counts steady-state operations, so a fast cell still has samples after its warm-up", async () => {
+    // Far more than 20 operations fit in the warm-up; the cap must not be spent there.
+    const r = await runLoad({ concurrency: 4, warmupMs: 40, durationMs: 5_000, maxOps: 20, op: async () => {} });
+    expect(r.capped_at_ops).toBe(20);
+    expect(r.latency.n).toBe(20);
+    expect(r.ops_per_sec).toBeGreaterThan(0);
+  });
   test("stops at the operation cap and at the stop signal", async () => {
     const capped = await runLoad({ concurrency: 2, warmupMs: 0, durationMs: 5_000, maxOps: 20, op: async () => {} });
     expect(capped.capped_at_ops).toBe(20);
@@ -101,6 +108,13 @@ describe("config and cost", () => {
     expect(() => parseConfig(JSON.stringify({ ...base, targets: { R2: { bucket: "prod-sessions-ledger", region: "us-east-1" } } }), {})).toThrow(/not a ledger-bench resource/);
     expect(() => parseConfig(JSON.stringify({ ...base, targets: { R6: { table: "sessions", region: "us-west-2" } } }), {})).toThrow(/not a ledger-bench resource/);
   });
+  test("the single-key probe's key must be a key no bucket uses", () => {
+    const arn = (n: string) => `arn:aws:kms:us-west-2:111111111111:key/${n.repeat(8)}-${n.repeat(4)}-${n.repeat(4)}-${n.repeat(4)}-${n.repeat(12)}`;
+    const withKey = { ...base, targets: { ...base.targets, R2: { ...base.targets.R2, kmsKeyArn: arn("a") } } };
+    expect(parseConfig(JSON.stringify({ ...withKey, foreignKmsKeyArn: arn("b") }), {}).foreignKmsKeyArn).toBe(arn("b"));
+    expect(() => parseConfig(JSON.stringify({ ...withKey, foreignKmsKeyArn: arn("a") }), {})).toThrow(/must not be a bucket's own key/);
+    expect(() => parseConfig(JSON.stringify(base), { LEDGER_BENCH_PROFILE: "constructor" })).toThrow(/profile/);
+  });
   test("refuses a remote endpoint override, a bad lane, run id, profile or step", () => {
     expect(() => parseConfig(JSON.stringify({ ...base, targets: { R2: { bucket: "x-ledger-bench", region: "us-west-2", endpoint: "https://evil.example" } } }), {})).toThrow(/loopback/);
     expect(() => parseConfig(JSON.stringify({ ...base, lane: "prod" }), {})).toThrow(/lane/);
@@ -115,6 +129,10 @@ describe("config and cost", () => {
     expect(bound.total_usd).toBeLessThan(300);
     // The bound moves with the budget: doubling it must show.
     expect(costBound({ ...STANDARD, requestBudgetPerLane: STANDARD.requestBudgetPerLane * 2 }, 3).total_usd).toBeGreaterThan(300);
+    // The per-lane bounds the spend ledger adds up are the same money.
+    const lanes = LANES.reduce((a, lane) => a + laneCostBound(STANDARD, lane), 0);
+    expect(Math.abs(lanes * 3 + FIXED_USD - bound.total_usd)).toBeLessThan(0.25);
+    expect(laneCostBound(STANDARD, "dynamo")).toBeLessThan(laneCostBound(STANDARD, "r2"));
   });
 });
 
@@ -128,6 +146,11 @@ describe("request meter", () => {
     expect(meter.used).toBe(2);
     expect(meter.exhausted).toBe(true);
     expect(meter.statuses.toJSON()).toEqual({ "R2 GET 204": 1, "R2 PUT 204": 1 });
+    // A child's allowance is reserved whole, and refused whole when it does not fit.
+    const parent = new RequestMeter(10);
+    parent.take(6);
+    expect(() => parent.take(6)).toThrow(BudgetExhausted);
+    expect(parent.exhausted).toBe(true);
     expect(() => new RequestMeter(0)).toThrow();
   });
 });
@@ -200,6 +223,12 @@ describe("conditional-write checks", () => {
     expect(await probeIfMatch(store, "t/probe")).toEqual({ support: "supported", fresh: "ok", stale: "http_412" });
     expect((await raceDelete(store, "t/delete", 10)).violations).toBe(0);
   });
+  test("a round nobody wins is a liveness event, not a safety violation, and does not end the check", async () => {
+    const fake = new FakeS3();
+    const failing = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => (init?.method === "PUT" ? new Response("<Error><Code>SlowDown</Code></Error>", { status: 503 }) : fake.fetch(input, init))) as typeof fetch;
+    const r = await raceCreate(storeOn(fake, failing), "t/none", 4, 3);
+    expect(r).toMatchObject({ rounds: 3, clean: 0, violations: 0, no_winner: 3, winners: { "0": 3 }, refusals: { http_503: 12 } });
+  });
   test("a backend that ignores If-None-Match fails the create race", async () => {
     const { store } = fakeStore({ ignoreIfNoneMatch: true });
     const r = await raceCreate(store, "t/create", 4, 5);
@@ -224,7 +253,9 @@ describe("conditional-write checks", () => {
       await store.put(key(prefix, 3), ambiguousBody(tag, 3).subarray(0, 1000)); // in flight, torn
       return { started: [0, 1, 2, 3, 4], done: [0, 1] }; // 1 acknowledged but missing; 4 in flight, absent
     });
-    expect(totals).toEqual({ kills: 1, in_flight: 3, present_whole: 1, absent: 1, torn: 1, acknowledged_lost: 1 });
+    // A child that crashed before its first write proves nothing, and is counted as such.
+    expect(await ambiguousCommit(store, "t/amb-empty", 2, async () => ({ started: [], done: [] }))).toMatchObject({ kills: 2, empty_rounds: 2, in_flight: 0 });
+    expect(totals).toEqual({ kills: 1, empty_rounds: 0, in_flight: 3, present_whole: 1, absent: 1, torn: 1, acknowledged_lost: 1 });
   });
 });
 
@@ -325,6 +356,50 @@ describe("protocols", () => {
     expect(await dynamoHeadSeq(dynamo, "stream")).toBe(2);
     expect((await dynamo.queryPartition("stream", "b#")).length).toBe(3);
     expect(cancelled.toJSON()).toEqual({ ddb_TransactionCanceledException_ConditionalCheckFailed: 2 });
+  });
+
+  test("a DynamoDB transaction that applied but whose answer was lost is a commit, not a lost sequence", async () => {
+    const fake = new FakeDynamo();
+    let mode: "applied_then_500" | "500" | "reset_after_apply" | undefined;
+    const flaky = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const transact = new Headers(init?.headers).get("x-amz-target")?.endsWith("TransactWriteItems");
+      if (transact && mode) {
+        const m = mode;
+        mode = undefined;
+        if (m !== "500") await fake.fetch(input, init);
+        if (m === "reset_after_apply") throw Object.assign(new Error("socket"), { code: "ECONNRESET" });
+        return new Response(JSON.stringify({ __type: "com.amazonaws.dynamodb.v20120810#InternalServerError" }), { status: 500 });
+      }
+      return fake.fetch(input, init);
+    }) as typeof fetch;
+    const dynamo = new Dynamo({ table: "ledger_bench", region: "us-west-2" }, () => Promise.resolve(CREDS), flaky);
+    const commit = dynamoCommit(dynamo, "s", new Tally());
+    mode = "applied_then_500";
+    expect(await commit(1, "p", ["a"])).toBe("committed");
+    mode = "reset_after_apply";
+    expect(await commit(2, "p", ["b"])).toBe("committed");
+    // Nothing applied: the failure stands, and the head has not moved.
+    mode = "500";
+    await expect(commit(3, "p", ["c"])).rejects.toMatchObject({ exception: "InternalServerError" });
+    expect(await dynamoHeadSeq(dynamo, "s")).toBe(2);
+    // Another writer's entry at that number is a loss.
+    await dynamoCommit(dynamo, "s", new Tally())(3, "other", ["d"]);
+    mode = "500";
+    expect(await commit(3, "p", ["c"])).toBe("lost");
+  });
+
+  test("commit latency is the payload's and the commit's own time, not the wait for the writer's turn", async () => {
+    const { store } = fakeStore();
+    const stats: CommitStats = { commit: new Histogram(), groups: 0 };
+    const writer: StreamWriter = { stream: 0, tail: 0, committed: 0 };
+    const commit = entryCommit(store, "t/idle", 0, "w0");
+    await logGroup(store, "t/idle", writer, 1, stats, commit);
+    // The pipelined payload finishes long before its writer is served again.
+    await writer.next!.done;
+    await new Promise((r) => setTimeout(r, 150));
+    await logGroup(store, "t/idle", writer, 1, stats, commit);
+    await writer.next?.done;
+    expect(stats.commit.summary().max_ms!).toBeLessThan(100);
   });
 });
 

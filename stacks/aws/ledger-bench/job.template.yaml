@@ -9,9 +9,10 @@ metadata:
   namespace: ledger-bench
   labels: { app.kubernetes.io/name: ledger-bench, ledger-bench/run: "${RUN_ID}", ledger-bench/lane: "${LANE}", purpose: ledger-bench }
 spec:
-  # The hard deadline: the Job is killed 4 hours after it starts, and removed an hour after it ends.
+  # The hard deadline: the Job is killed 4 hours after it starts. The finished Job (its log is the results)
+  # is kept for 2 days, the stack's own ttl; teardown deletes the namespace before that.
   activeDeadlineSeconds: 14400
-  ttlSecondsAfterFinished: 3600
+  ttlSecondsAfterFinished: 172800
   backoffLimit: 0
   completions: 1
   parallelism: 1
@@ -41,6 +42,7 @@ spec:
             - { name: LEDGER_BENCH_RUN_ID, value: "${RUN_ID}" }
             - { name: LEDGER_BENCH_PROFILE, value: "${PROFILE}" }
             - { name: LEDGER_BENCH_STEPS, value: "${STEPS}" }
+            - { name: LEDGER_BENCH_BUNDLE_SHA256, value: "${BUNDLE_SHA256}" }
             - name: LEDGER_BENCH_CONFIG
               valueFrom: { configMapKeyRef: { name: ledger-bench-config, key: config.json } }
             - { name: TMPDIR, value: /tmp }

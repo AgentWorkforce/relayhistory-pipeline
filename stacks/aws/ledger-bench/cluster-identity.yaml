@@ -58,8 +58,9 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # TagSession because the Pod Identity session tags are transitive and travel with the hop.
               - Effect: Allow
-                Action: "sts:AssumeRole"
+                Action: ["sts:AssumeRole", "sts:TagSession"]
                 Resource: !Sub "arn:${AWS::Partition}:iam::${DataAccountId}:role/ledger-bench-client"
       Tags:
         - { Key: purpose, Value: ledger-bench }

@@ -68,8 +68,10 @@ interface RaceTotals {
   rounds: number;
   /** Rounds with exactly one winner and the winner's bytes stored. */
   clean: number;
-  /** Rounds with no winner, more than one winner, or stored bytes that are not the winner's. */
+  /** Safety: rounds with more than one winner, or stored bytes that are not the single winner's. */
   violations: number;
+  /** Liveness, not safety: rounds where every writer was refused or failed and nothing new was stored. */
+  no_winner: number;
   winners: Record<string, number>;
   refusals: Record<string, number>;
 }
@@ -82,12 +84,18 @@ async function settle<T>(work: Promise<T>): Promise<{ ok: true; value: T } | { o
   }
 }
 
+/** One round's verdict from who won and what is stored afterwards. */
+function judge(won: number, storedIsWinners: boolean, storedIsNew: boolean): "clean" | "no_winner" | "violation" {
+  if (won === 1) return storedIsWinners ? "clean" : "violation";
+  if (won === 0) return storedIsNew ? "violation" : "no_winner";
+  return "violation";
+}
+
 /** `writers` race one create-if-absent on a fresh key per round. Exactly one may win. */
 export async function raceCreate(store: ObjectStore, prefix: string, writers: number, rounds: number): Promise<RaceTotals> {
   const winners = new Tally();
   const refusals = new Tally();
-  let clean = 0;
-  let violations = 0;
+  const verdicts = { clean: 0, no_winner: 0, violation: 0 };
   for (let round = 0; round < rounds; round++) {
     const k = key(prefix, round);
     const bodies = Array.from({ length: writers }, (_, w) => jsonDoc({ round, writer: w, nonce: crypto.randomUUID() }, KIB));
@@ -95,21 +103,22 @@ export async function raceCreate(store: ObjectStore, prefix: string, writers: nu
     const won = results.flatMap((r, w) => (r.ok && r.value.created ? [w] : []));
     for (const r of results) if (!r.ok) refusals.add(errorClass(r.error));
     winners.add(String(won.length));
-    const stored = await sha256Hex(await readBody(store, k));
-    if (won.length === 1 && stored === (await sha256Hex(bodies[won[0]!]!))) clean++;
-    else violations++;
+    const after = await readOptional(store, k);
+    const stored = after === undefined ? undefined : await sha256Hex(after.body);
+    verdicts[judge(won.length, won.length === 1 && stored === (await sha256Hex(bodies[won[0]!]!)), stored !== undefined)]++;
   }
-  return { rounds, clean, violations, winners: winners.toJSON(), refusals: refusals.toJSON() };
+  return { rounds, clean: verdicts.clean, violations: verdicts.violation, no_winner: verdicts.no_winner, winners: winners.toJSON(), refusals: refusals.toJSON() };
 }
 
 /** `writers` race one `If-Match` CAS against the same version per round. Exactly one may win. */
 export async function raceCas(store: ObjectStore, prefix: string, writers: number, rounds: number): Promise<RaceTotals> {
   const winners = new Tally();
   const refusals = new Tally();
-  let clean = 0;
-  let violations = 0;
+  const verdicts = { clean: 0, no_winner: 0, violation: 0 };
   const k = key(prefix, "cas");
-  let version: ObjectVersion = (await store.put(k, jsonDoc({ round: -1 }, KIB))).version;
+  const first = jsonDoc({ round: -1 }, KIB);
+  let version: ObjectVersion = (await store.put(k, first)).version;
+  let before = await sha256Hex(first);
   for (let round = 0; round < rounds; round++) {
     const bodies = Array.from({ length: writers }, (_, w) => jsonDoc({ round, writer: w, nonce: crypto.randomUUID() }, KIB));
     const results = await Promise.all(bodies.map((b) => settle(store.put(k, b, { ifMatch: version }))));
@@ -118,11 +127,11 @@ export async function raceCas(store: ObjectStore, prefix: string, writers: numbe
     winners.add(String(won.length));
     const now = (await readOptional(store, k))!;
     const stored = await sha256Hex(now.body);
-    if (won.length === 1 && stored === (await sha256Hex(bodies[won[0]!]!))) clean++;
-    else violations++;
+    verdicts[judge(won.length, won.length === 1 && stored === (await sha256Hex(bodies[won[0]!]!)), stored !== before)]++;
     version = now.version;
+    before = stored;
   }
-  return { rounds, clean, violations, winners: winners.toJSON(), refusals: refusals.toJSON() };
+  return { rounds, clean: verdicts.clean, violations: verdicts.violation, no_winner: verdicts.no_winner, winners: winners.toJSON(), refusals: refusals.toJSON() };
 }
 
 export type IfMatchSupport = "supported" | "ignored" | "rejected";
@@ -188,6 +197,8 @@ export async function ambiguousChild(store: ObjectStore, prefix: string, runTag:
 
 export interface AmbiguousTotals {
   kills: number;
+  /** Rounds whose child never started a write (it crashed first): they prove nothing. */
+  empty_rounds: number;
   /** Writes that were in flight when the client died. */
   in_flight: number;
   present_whole: number;
@@ -208,12 +219,13 @@ export async function ambiguousCommit(
   kills: number,
   spawnChild: (roundPrefix: string, runTag: string) => Promise<{ started: number[]; done: number[] }>,
 ): Promise<AmbiguousTotals> {
-  const totals: AmbiguousTotals = { kills, in_flight: 0, present_whole: 0, absent: 0, torn: 0, acknowledged_lost: 0 };
+  const totals: AmbiguousTotals = { kills, empty_rounds: 0, in_flight: 0, present_whole: 0, absent: 0, torn: 0, acknowledged_lost: 0 };
   for (let round = 0; round < kills; round++) {
     const roundPrefix = `${prefix}/k${round}`;
     const runTag = crypto.randomUUID();
     const { started, done } = await spawnChild(roundPrefix, runTag);
     const acknowledged = new Set(done);
+    if (started.length === 0) totals.empty_rounds++;
     for (const i of started) {
       const got = await readOptional(store, key(roundPrefix, i));
       const whole = got !== undefined && (await sha256Hex(got.body)) === (await sha256Hex(ambiguousBody(runTag, i)));
