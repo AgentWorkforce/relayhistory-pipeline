@@ -91,6 +91,7 @@ import { sqlCanonicalPointers, type CanonicalRows } from "./session-timing-sourc
 import { sqlSessionHarnesses } from "./session-turns-source.ts";
 import type { TimingDeps, TurnsDeps } from "./app.ts";
 import type { CatalogDeps } from "./selfhost.ts";
+import { log } from "../shared/log.ts";
 
 export interface ServiceCanonicalDeps {
   /** Native brief-only JSONL. Public record-stream routes never invoke this. */
@@ -220,6 +221,10 @@ export async function serviceCanonicalDeps(
   }
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     const snapshot = await canonicalSnapshot(deps(signal), identity, scope);
+    if (snapshot.legacyDroppedReason)
+      log.warn("canonical legacy evidence dropped", {
+        reason: snapshot.legacyDroppedReason,
+      });
     return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, generation: snapshot.generation, exists: snapshot.exists };
   }
   return {

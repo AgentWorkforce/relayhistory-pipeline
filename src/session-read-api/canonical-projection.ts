@@ -15,7 +15,6 @@ import {
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
-import { legacyMachineId } from "../shared/legacy-export-machine.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
 import { labelledActorName, messageSubagent } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import {
@@ -48,6 +47,10 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
+import {
+  LEGACY_PROVENANCE_INVALID,
+  legacyProvenanceGate,
+} from "./legacy-provenance.ts";
 export interface SessionScope {
   orgId: string;
   workspaceId: string;
@@ -573,54 +576,16 @@ export async function readCanonicalScope(
     }
   }
 
-  // Legacy evidence provenance (activation gate 4). Legacy records skip delivery
-  // acceptance contention and owner binding, so they are trusted only from ONE
-  // manifest per scope that the legacy exporter wrote itself: the export marker,
-  // raw owner `migration:{grant}`, a single `initial` epoch (no adopted or client
-  // courier chunks), the dedicated legacy machine, and nothing but legacy records.
-  // Anything else drops only legacy evidence. Live canonical rows remain complete;
-  // a forged or stale legacy copy can neither replace content nor make the whole
-  // session unavailable.
-  {
-    const legacyParts = parts.filter((p) =>
-      p.records.some(isLegacyRelayhistoryRecord),
-    );
-    const owned = (m: ManifestV1) => {
-      const marker = m.extensions?.["client.relayhistory_export"] as
-        | { grant_id?: unknown }
-        | undefined;
-      return (
-        typeof marker?.grant_id === "string" &&
-        m.raw.owner === `migration:${marker.grant_id}` &&
-        m.raw.epochs.length === 1 &&
-        m.raw.epochs[0]!.reason === "initial" &&
-        canonicalManifestIdentity(m).machineId ===
-          legacyMachineId(m.session.workspace_id, manifestUserId(m))
-      );
-    };
-    const inScope = (r: RelayhistoryStreamRecord) => {
-      const p = r.payload;
-      return (
-        p?.org_id === scope.orgId &&
-        p.workspace_id === scope.workspaceId &&
-        p.source === scope.harness &&
-        p.session_id === scope.sessionId
-      );
-    };
-    if (
-      legacyParts.length > 1 ||
-      legacyParts.some(
-        (p) =>
-          !owned(p.manifest) ||
-          !p.records.every(
-            (r) => isLegacyRelayhistoryRecord(r) && inScope(r),
-          ),
-      )
-    ) {
-      reasons.push("legacy_provenance_invalid");
-      for (const p of legacyParts)
-        p.records = p.records.filter((r) => !isLegacyRelayhistoryRecord(r));
-    }
+  // Legacy evidence skips delivery acceptance and owner binding. The shared
+  // gate is also used by streamCanonicalScope, so whole and streamed reads
+  // drop the same untrusted records with the same bounded reason code.
+  const legacyGate = legacyProvenanceGate(scope, parts);
+  for (let part = 0; part < parts.length; part++)
+    for (const record of parts[part]!.records) legacyGate.observe(part, record);
+  if (legacyGate.invalid) {
+    reasons.push(LEGACY_PROVENANCE_INVALID);
+    for (const part of parts)
+      part.records = part.records.filter((record) => !isLegacyRelayhistoryRecord(record));
   }
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
