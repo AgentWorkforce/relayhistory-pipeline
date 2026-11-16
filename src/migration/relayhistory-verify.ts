@@ -15,6 +15,23 @@
  *   [--source-role=<Neon runtime role> --target-role=<Supabase runtime role>]
  * Schema mode does not pass without both roles: the target role must hold every
  * privilege the source role holds in `sessions`.
+ *
+ * Frozen full copies (a pg_dump/pg_restore of a frozen Neon branch, Neon exit):
+ *   --frozen-copy      also compare per-database state tables (__migrations,
+ *                      *_rollout), and require every sequence to equal the source
+ *                      exactly, since the target is a byte-for-byte copy.
+ *   --tables=a,b       verify only these source tables (data and schema rows), so
+ *                      disjoint groups can run in parallel with their own
+ *                      --checkpoint. Catalog and sequence checks always cover all.
+ *   --method=ctid --streams=N   full mode only: compare each table's whole-table
+ *                      fingerprint (count and both hash sums, which are
+ *                      order-independent) computed as the sum over N physical
+ *                      ctid ranges per side, read in parallel. Needs no key and
+ *                      no index, so it can run before post-data. Only valid when
+ *                      neither side takes writes (a frozen branch and a sealed
+ *                      copy). Not checkpointed: rerun a table group with --tables.
+ * Every session pins the settings row_to_json output depends on
+ * (FINGERPRINT_SESSION_SETTINGS), so both sides format values identically.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -56,6 +73,80 @@ interface VerifyCheckpoint {
 }
 
 const EMPTY_FINGERPRINT: Fingerprint = { count: "0", hash1: "0", hash2: "0" };
+
+/**
+ * Session settings that change the text row_to_json produces (timestamps,
+ * intervals, floats, bytea). Pinned identically on source and target so a
+ * fingerprint never differs only because the two servers have other defaults.
+ */
+export const FINGERPRINT_SESSION_SETTINGS: ReadonlyArray<readonly [string, string]> = [
+  ["TimeZone", "UTC"],
+  ["DateStyle", "ISO, MDY"],
+  ["IntervalStyle", "postgres"],
+  ["extra_float_digits", "1"],
+  ["bytea_output", "hex"],
+];
+
+export function fingerprintSettingsSql(): string {
+  return FINGERPRINT_SESSION_SETTINGS
+    .map(([name, value]) => `SET ${name} = '${value.replaceAll("'", "''")}'`)
+    .join("; ");
+}
+
+/** `--tables=a,b`: null when absent; refuses an empty or blank list. */
+export function parseTableFilter(argv: readonly string[]): Set<string> | null {
+  const raw = argv.find((value) => value.startsWith("--tables="))?.slice("--tables=".length);
+  if (raw === undefined) return null;
+  const names = raw.split(",").map((name) => name.trim());
+  if (names.length === 0 || names.some((name) => name.length === 0)) {
+    throw new Error("--tables must be a comma-separated list of table names");
+  }
+  return new Set(names);
+}
+
+/** Split [0, pages) into at most `streams` contiguous ranges; the last is open-ended. */
+export function ctidRanges(pages: number, streams: number): Array<[number, number | null]> {
+  if (!Number.isInteger(streams) || streams < 1) throw new Error("--streams must be a positive integer");
+  const count = Math.max(1, Math.min(streams, pages));
+  const size = Math.ceil(Math.max(pages, 1) / count);
+  const ranges: Array<[number, number | null]> = [];
+  for (let start = 0, index = 0; index < count; index += 1, start += size) {
+    ranges.push([start, index === count - 1 ? null : start + size]);
+  }
+  return ranges;
+}
+
+/** Fingerprint of one physical ctid range; $1 is the start page, $2 (if bounded) the end page. */
+export function ctidRangeFingerprintSql(schema: string, table: string, columns: string[], bounded: boolean): string {
+  const projection = columns.map(quoteIdent).join(", ");
+  const upper = bounded ? " AND ctid < format('(%s,0)', $2::bigint)::tid" : "";
+  return `SELECT count(*)::text AS count,
+    coalesce(sum(hashtextextended(row_to_json(row_value)::text, 0)::numeric), 0)::text AS hash1,
+    coalesce(sum(hashtextextended(row_to_json(row_value)::text, 961996)::numeric), 0)::text AS hash2
+  FROM (SELECT ${projection} FROM ${quoteIdent(schema)}.${quoteIdent(table)}
+    WHERE ctid >= format('(%s,0)', $1::bigint)::tid${upper}) AS row_value`;
+}
+
+async function ctidFingerprint(pool: pg.Pool, table: string, columns: string[], streams: number): Promise<Fingerprint> {
+  const size = await pool.query<{ pages: string }>(
+    `SELECT (pg_relation_size(c.oid) / current_setting('block_size')::bigint)::text AS pages
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'sessions' AND c.relname = $1`,
+    [table],
+  );
+  const ranges = ctidRanges(Number(size.rows[0]?.pages ?? 0), streams);
+  const prints = await Promise.all(ranges.map(([start, end]) =>
+    pool.query<Fingerprint>(
+      ctidRangeFingerprintSql("sessions", table, columns, end !== null),
+      end === null ? [start] : [start, end],
+    ).then((result) => result.rows[0]!)));
+  return prints.reduce(addFingerprint, { ...EMPTY_FINGERPRINT });
+}
+
+/** Sequence readiness: the T0 fence needs target >= source; a frozen copy needs equality. */
+export function sequenceReady(source: string | null, target: string | null, frozenCopy: boolean): boolean {
+  if (frozenCopy) return source === target;
+  return source === null || (target !== null && BigInt(target) >= BigInt(source));
+}
 
 export function quoteIdent(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
@@ -654,7 +745,9 @@ function sequenceFenceSql(source: SequenceValue[], gap = 1_000_000): string[] {
 }
 
 function schemaSignature(columns: Column[], keyColumns: string[]): string {
-  return createHash("sha256").update(JSON.stringify({ columns, keyColumns })).digest("hex");
+  return createHash("sha256")
+    .update(JSON.stringify({ columns, keyColumns, settings: FINGERPRINT_SESSION_SETTINGS }))
+    .digest("hex");
 }
 
 function endpointHash(sourceUrl: string, targetUrl: string): string {
@@ -763,11 +856,24 @@ export async function main() {
     ? await loadCheckpoint(checkpointPath, endpointHash(sourceUrl, targetUrl), size)
     : { version: 1 as const, endpointHash: endpointHash(sourceUrl, targetUrl), chunkSize: size, tables: {} };
   const resumedTables = Object.values(checkpoint.tables).filter((table) => table.chunks > 0).length;
-  const source = new pg.Pool({ connectionString: sourceUrl, max: 2, application_name: "96bulls-migration-verify-source", statement_timeout: 0 });
-  const target = new pg.Pool({ connectionString: targetUrl, max: 2, application_name: "96bulls-migration-verify-target", statement_timeout: 0 });
+  const frozenCopy = process.argv.includes("--frozen-copy");
+  const tableFilter = parseTableFilter(process.argv);
+  const method = argument("method") ?? "keyset";
+  if (method !== "keyset" && method !== "ctid") throw new Error("--method must be keyset or ctid");
+  if (method === "ctid" && mode !== "full") throw new Error("--method=ctid applies to --mode=full only");
+  const streams = Number(argument("streams") ?? 1);
+  if (!Number.isInteger(streams) || streams < 1) throw new Error("--streams must be a positive integer");
+  const poolSize = method === "ctid" ? Math.max(2, streams) : 2;
+  const source = new pg.Pool({ connectionString: sourceUrl, max: poolSize, application_name: "96bulls-migration-verify-source", statement_timeout: 0 });
+  const target = new pg.Pool({ connectionString: targetUrl, max: poolSize, application_name: "96bulls-migration-verify-target", statement_timeout: 0 });
+  // node-postgres runs queries on a client in order, so this SET precedes every query on it.
+  for (const pool of [source, target]) pool.on("connect", (client) => { void client.query(fingerprintSettingsSql()); });
   let passed = true;
   try {
-    const sourceTables = await tables(source);
+    const allSourceTables = await tables(source);
+    const unknownTables = tableFilter ? [...tableFilter].filter((name) => !allSourceTables.includes(name)).sort() : [];
+    if (unknownTables.length) throw new Error(`--tables names ${unknownTables.length} table(s) absent from the source`);
+    const sourceTables = tableFilter ? allSourceTables.filter((name) => tableFilter.has(name)) : allSourceTables;
     const targetTables = new Set(await tables(target));
     const results: Array<Record<string, unknown>> = [];
     for (const table of sourceTables) {
@@ -790,8 +896,23 @@ export async function main() {
         schema: incompatible.length ? "incompatible" : "compatible",
         ...(incompatible.length ? { incompatible } : {}),
       };
-      if (mode === "full" && incompatible.length === 0 && isPerDatabaseState(table)) {
+      if (mode === "full" && incompatible.length === 0 && isPerDatabaseState(table) && !frozenCopy) {
         Object.assign(result, { data: "skipped", reason: "per-database runner or rollout state" });
+      } else if (mode === "full" && incompatible.length === 0 && method === "ctid") {
+        const names = sourceColumns.map((column) => column.name);
+        const [sourcePrint, targetPrint] = await Promise.all([
+          ctidFingerprint(source, table, names, streams),
+          ctidFingerprint(target, table, names, streams),
+        ]);
+        const equal = equalFingerprint(sourcePrint, targetPrint);
+        if (!equal) passed = false;
+        Object.assign(result, {
+          data: equal ? "equal" : "different",
+          method: "whole-table fingerprint over parallel ctid ranges",
+          streams,
+          source: sourcePrint,
+          target: targetPrint,
+        });
       } else if (mode === "full" && incompatible.length === 0) {
         const [sourceKey, targetKey] = await Promise.all([primaryKey(source, table), primaryKey(target, table)]);
         const keyColumns = selectUsableKey(sourceKey, targetKey);
@@ -881,13 +1002,16 @@ export async function main() {
     const targetByName = new Map(targetSequences.map((item) => [item.name, item.lastValue]));
     const sequenceResults = sourceSequences.map((item) => {
       const targetValue = targetByName.get(item.name) ?? null;
-      const ready = item.lastValue === null || (targetValue !== null && BigInt(targetValue) >= BigInt(item.lastValue));
+      const ready = sequenceReady(item.lastValue, targetValue, frozenCopy);
       if (mode === "full" && !ready) passed = false;
       return { name: item.name, source: item.lastValue, target: targetValue, ready };
     });
     const output: Record<string, unknown> = {
       generatedAt: new Date().toISOString(),
       mode,
+      frozenCopy,
+      method,
+      tableFilter: tableFilter ? [...tableFilter].sort() : null,
       passed,
       checkpoint: {
         enabled: mode === "full" && Boolean(checkpointPath),
