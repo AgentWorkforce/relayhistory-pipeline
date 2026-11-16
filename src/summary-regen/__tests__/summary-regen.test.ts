@@ -128,6 +128,8 @@ test("reasonFromWorkKey reads only the regeneration suffixes", () => {
   expect(reasonFromWorkKey("summary-short:a:b:3:regen-retry")).toBe("retry_backoff");
   expect(reasonFromWorkKey("summary-short:a:b:3:regen-config")).toBe("config_changed");
   expect(reasonFromWorkKey("summary-short:a:b:3:regen-turns")).toBe("turns");
+  // A coverage stamp is not a regeneration: no reason, so the handler only stamps.
+  expect(reasonFromWorkKey("summary-short:a:b:3:regen-stamp")).toBeUndefined();
   expect(reasonFromWorkKey("summary-short:a:b:3")).toBeUndefined();
   expect(reasonFromWorkKey(undefined)).toBeUndefined();
 });

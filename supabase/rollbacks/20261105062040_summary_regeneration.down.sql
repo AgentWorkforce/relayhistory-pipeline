@@ -14,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062040_summary_regeneration.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='summary regeneration: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062040_summary_regeneration.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'69e8a924743f512540e44cf53852b5429cd41611f38228d236b6b693556eec3c'
+ IF NOT FOUND OR v_sha<>'a35af377d5ee5ed8fe605c0c75309f8642fe1168bd8f694bf419fdafe9f83329'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='summary regeneration: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP TRIGGER summary_regeneration_audit_forget_tombstoned_pointer ON sessions.session_index;

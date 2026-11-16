@@ -303,7 +303,11 @@ async function sweepRegen(db: HoopDb, regen: BriefRegen, options: Parameters<typ
   const { retry, audit } = regen.settings;
   const rows = await sweepUnbriefedRegen(db, 100, {
     ...options,
-    regen: { configHash: regen.configHash, configReset: retry.configReset, retry: retry.enabled, maxAttempts: maxDueAttempts(retry.backoffSeconds) },
+    regen: {
+      configHash: regen.configHash, configReset: retry.configReset, retry: retry.enabled, maxAttempts: maxDueAttempts(retry.backoffSeconds),
+      // The longest ladder step: a gone or refused row is re-armed and re-audited at most this often.
+      holdSeconds: Math.max(...retry.backoffSeconds, 300),
+    },
   });
   const entries: RegenAuditEntry[] = [];
   for (const row of rows) {
@@ -360,7 +364,11 @@ export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort
       const auditRetention = deps.regen?.settings.audit.enabled ? deps.regen.settings.audit.retentionDays : 0;
       if (auditRetention && now.getTime() - lastAuditPurge >= 3_600_000 && (await hasRelation(db, AUDIT_RELATION))) {
         lastAuditPurge = now.getTime();
-        const purged = await purgeRegenAudit(db, auditRetention);
+        // Best effort, like the audit write: a failing purge never aborts the rest of the tick.
+        const purged = await purgeRegenAudit(db, auditRetention).catch((error: unknown) => {
+          log.warn("summary regeneration audit purge failed", { stage: "session-brief", error_code: error instanceof Error ? error.name : "unknown" });
+          return 0;
+        });
         if (purged) log.info("summary regeneration audit purged", { stage: "session-brief", count: purged });
       }
       // Canonical mode only (no indexer arms wakeups there): recover wakeups parked until

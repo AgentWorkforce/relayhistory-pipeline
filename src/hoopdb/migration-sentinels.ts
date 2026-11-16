@@ -467,8 +467,14 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regclass('sessions.ingest_origin_claim_marks') IS NOT NULL AND to_regprocedure('sessions.ingest_origin_claim_buffered_batch(jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%ingest_origin_claim_marks%') AS applied",
   },
   "upstream:20261105062040_summary_regeneration.sql": {
-    evidence: "function sessions.summary_regeneration_audit_purge_v1 and table sessions.summary_regeneration_audit",
-    sql: "SELECT to_regprocedure('sessions.summary_regeneration_audit_purge_v1(integer)') IS NOT NULL AND to_regclass('sessions.summary_regeneration_audit') IS NOT NULL AS applied",
+    evidence:
+      "functions sessions.summary_regeneration_audit_purge_v1 and sessions.summary_regeneration_audit_append_v1, table sessions.summary_regeneration_audit, and the five session_briefs coverage/retry columns",
+    sql: `SELECT to_regprocedure('sessions.summary_regeneration_audit_purge_v1(integer)') IS NOT NULL
+         AND to_regprocedure('sessions.summary_regeneration_audit_append_v1(jsonb)') IS NOT NULL
+         AND to_regclass('sessions.summary_regeneration_audit') IS NOT NULL
+         AND (SELECT count(*) FROM pg_attribute
+               WHERE attrelid = to_regclass('sessions.session_briefs') AND NOT attisdropped
+                 AND attname IN ('covered_turns', 'retry_attempts', 'next_retry_at', 'config_hash', 'pipeline_version')) = 5 AS applied`,
   },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
