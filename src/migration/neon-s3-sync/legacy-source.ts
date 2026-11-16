@@ -153,17 +153,24 @@ export async function legacyUnit(
 }
 
 /**
- * Deletion fence for a legacy scope: Neon `deleted_upload_sessions` for the
- * scope (the turn key uses `default` for a token without a workspace, the
- * fence `""`, so both spellings are checked).
+ * Frozen-Neon deletion fences for a legacy scope. `deleted_upload_sessions`
+ * covers delivery erasure and `conversation_turn_fences` covers turns erased
+ * without a delivery row. The turn key uses `default` for a token without a
+ * workspace while both fence tables use `""`, so both spellings are checked.
  */
 export async function legacyScopeFenced(
   db: Queryable,
   s: LegacyScope,
 ): Promise<boolean> {
   const { rows } = await db.query(
-    `SELECT 1 FROM sessions.deleted_upload_sessions WHERE org_id=$1 AND source=$3 AND session_id=$4
-  AND (workspace_id=$2 OR ($2='default' AND workspace_id='')) LIMIT 1`,
+    `SELECT 1 WHERE
+ EXISTS(SELECT 1 FROM sessions.deleted_upload_sessions
+   WHERE org_id=$1 AND source=$3 AND session_id=$4
+    AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
+ OR EXISTS(SELECT 1 FROM sessions.conversation_turn_fences
+   WHERE org_id=$1 AND source=$3 AND session_id=$4
+    AND (workspace_id=$2 OR ($2='default' AND workspace_id='')))
+ LIMIT 1`,
     scopeParams(s),
   );
   return rows.length > 0;
