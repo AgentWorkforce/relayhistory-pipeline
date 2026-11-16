@@ -191,6 +191,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Legacy-export owner authority tables and narrowly granted exporter/eraser RPCs. They only read the
       // erasure ledgers and are never called by a G4 ingest path; the absence/body checks below review that impact.
       "20261105062030_legacy_export_scope_authority.sql",
+      // Summary regeneration: one append-only audit table (owner-only trigger and purge functions) and five nullable/defaulted
+      // session_briefs columns plus a partial index; no G4 function names them.
+      "20261105062040_summary_regeneration.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
