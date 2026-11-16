@@ -85,6 +85,7 @@ async function supabase() {
   await pg.exec(`CREATE SCHEMA sessions;
  CREATE TABLE sessions.session_erasure_receipts(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,request_id text NOT NULL DEFAULT 'r',status text NOT NULL DEFAULT 'in_progress');
  CREATE TABLE sessions.upload_deletions(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,deleted_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id));
+ CREATE TABLE sessions.ingest_frozen_source_deletions(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id));
  CREATE TABLE sessions.upload_resets(org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,request_id text NOT NULL,reset_at timestamptz NOT NULL DEFAULT now(),deleted bigint NOT NULL DEFAULT 0);
  CREATE TABLE sessions.operator_user_erasures(request_id text PRIMARY KEY,org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,state text NOT NULL,origins text[] NOT NULL DEFAULT '{}');
  CREATE TABLE sessions.turn_session_fences(org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL CHECK (fence_basis IN ('live','legacy_import')),PRIMARY KEY(org_id,workspace_id,source,session_id));`);
@@ -236,6 +237,16 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
       expect({ ledger, ...counters }).toMatchObject({ ledger, exported: 0, fenced: 1 });
       expect(await allKeys(store)).toEqual([]);
     }
+  });
+
+  test("Supabase ingest_frozen_source_deletions (a Neon-era deletion copied at freeze) fences the scope", async () => {
+    // Under the Supabase privacy authority the frozen copy is the record of Neon-era deletions.
+    const n = await neon(), p = await supabase();
+    await p.pg.query("INSERT INTO sessions.ingest_frozen_source_deletions VALUES($1,$2,$3,'relayhistory:delivery:v1',$4,$5)", [S.orgId, S.workspaceId, OTHER, S.source, S.sessionId]);
+    const store = createFsStore({ root: await tmp("a6") });
+    const { counters } = await run(n.db, p.db, store, "a6");
+    expect(counters).toMatchObject({ exported: 0, fenced: 1 });
+    expect(await allKeys(store)).toEqual([]);
   });
 
   test("an already-exported, unchanged scope fenced later is reported fenced on the rerun (checkpoint skip path)", async () => {
