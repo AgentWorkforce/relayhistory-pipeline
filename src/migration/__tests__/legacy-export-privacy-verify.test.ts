@@ -1510,12 +1510,14 @@ ${secret}
 // ---------------------------------------------------------------------------
 describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
   // ---- (i2) the STREAMED read (search-index source) enforces the same legacy provenance gate as the whole read ----
-  async function streamOf(store: ObjectStore, manifestKey: string, s: LegacyScope = S) {
+  async function streamOf(store: ObjectStore, manifestKey: string | string[], s: LegacyScope = S) {
     const { streamCanonicalScope } = (await import("../../session-read-api/canonical-stream-projection.ts")) as typeof import("../../session-read-api/canonical-stream-projection.ts");
-    const manifest = await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(manifestKey)))), manifestKey);
+    const keys = Array.isArray(manifestKey) ? manifestKey : [manifestKey];
+    const admitted = [];
+    for (const key of keys) admitted.push({ manifest: await parseManifest(new TextDecoder().decode(await readAll(await store.get(objectKey(key)))), key), key });
     const scope = { orgId: s.orgId, workspaceId: s.workspaceId, harness: s.source, sessionId: s.sessionId };
     const deps = { store, prefixFor: (org: string) => `96bulls/${org}`, decompress: (b: Uint8Array, max: number) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: max })) };
-    const streamed = await streamCanonicalScope(scope as never, [{ manifest, key: manifestKey }], deps as never, { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } as never, 7, 0);
+    const streamed = await streamCanonicalScope(scope as never, admitted as never, deps as never, { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 } as never, 7, 0);
     const rows: unknown[] = [];
     if (streamed.complete) await streamed.regenerate(new Set(streamed.wanted.keys()), 50, async (batch: unknown[]) => void rows.push(...batch));
     return { streamed, rowsText: JSON.stringify(rows) };
@@ -1536,6 +1538,26 @@ describe("(i) exported legacy content is scrubbed before it reaches S3", () => {
     expect(streamed.reasons).toContain("legacy_provenance_invalid");
     expect([...streamed.kinds].filter((k) => /^legacy_/u.test(k))).toEqual([]);
     expect(rowsText).not.toContain(canary);
+  });
+
+  test("(i2) streamed read: a FORGED copy that CONFLICTS with the genuine legacy record (same key and revision, different bytes) cannot stop the read; it stays complete and reports legacy_provenance_invalid", async () => {
+    // layered-sessions-pipeline's P1: the streamed pass-1 fold must not let a forged equal-revision copy throw
+    // relayhistory_revision_conflict and suppress the scope (the whole read gates first and stays complete).
+    const n = await neon();
+    const store = createFsStore({ root: await tmp("stream-conflict") });
+    const unit = (await legacyUnit(n.db, S))!;
+    const genuine = await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER));
+    await n.pg.query("UPDATE sessions.conversation_turns SET content='forged different bytes'"); // same id, same revision "1"
+    const forged = await exportUnit({ store, keyRoot: "96bulls", grantId: "g" }, unit, {
+      fenced: async () => false,
+      async *lines(u) {
+        for await (const line of legacyUnitSource(n.db, async () => {}, 500, undefined, OWNER).lines(u)) yield { ...line, machine: "srv_forged" };
+      },
+    });
+    const { streamed } = await streamOf(store, [genuine.manifests[0]!.manifestKey, forged.manifests[0]!.manifestKey]);
+    expect(streamed.reasons).not.toContain("relayhistory_revision_conflict");
+    expect(streamed.reasons).toContain("legacy_provenance_invalid");
+    expect(streamed.complete).toBe(true);
   });
 
   test("(i2) streamed read: a GENUINE exporter-owned legacy manifest streams without the provenance reason (positive control)", async () => {
