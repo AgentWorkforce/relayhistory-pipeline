@@ -324,7 +324,7 @@ export function createModelSummarizer(deps: ModelSummarizerDeps): Summarizer {
           tokens_out: tokensOut,
           ...extra,
         });
-        return fallback.summarize(kind, digest, ctx);
+        return { ...(await fallback.summarize(kind, digest, ctx)), fallbackReason: reason };
       };
 
       if (!transport) return fallBack("no_api_key");
