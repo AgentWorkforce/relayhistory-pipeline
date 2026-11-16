@@ -115,6 +115,7 @@
  */
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
+import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -361,6 +362,17 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 }
 
 /**
+ * INGEST_LEDGER_LOG_COMMIT (ledger-log.ts, docs/design/s3-ledger-log-commit.md): off (unset, the default) is today.
+ * `on` is refused until the admission path is wired to the log writer, so no deployment can half-enable it.
+ */
+export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" {
+  let mode;
+  try { mode = ledgerLogCommitMode(env[INGEST_LEDGER_LOG_COMMIT_VAR]); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR} must be off or on`); }
+  if (mode === "on") throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR}=on is not available yet (the admission path is not wired to the log commit)`);
+  return mode;
+}
+
+/**
  * INGEST_LEDGER (decision 0005): sql (unset, the default: unchanged) or s3. With s3 this process's ONE ledger is
  * ledger-s3.ts: the synchronous path, the async consumer, upload-inbox promotion and the selection / reset routes
  * all admit and fence through S3, and the database is never called for upload accounting. Refused with s3: the
@@ -369,6 +381,7 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 function selfhostLedger(env: NodeJS.ProcessEnv, s: { sessionSelection: boolean; sessionErase: { enabled: boolean }; uploadConsent: UploadConsentEnforcement; eraseRuntime: { eraseFenceEnforced?: true; eraseBytesEnabled?: true } }): "s3" | undefined {
   let mode;
   try { mode = ingestLedgerMode(env[INGEST_LEDGER_VAR]?.trim() === "" ? undefined : env[INGEST_LEDGER_VAR]?.trim()); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_VAR} must be sql or s3`); }
+  selfhostLedgerLogCommit(env);
   if (mode === "sql") return undefined;
   const refuse = (what: string) => { throw new Error(`96bulls: ${INGEST_LEDGER_VAR}=s3 refuses ${what} (its state is SQL-only)`); };
   if (s.sessionSelection) refuse("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
