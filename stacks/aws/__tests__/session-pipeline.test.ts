@@ -901,3 +901,86 @@ describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
     expect(() => validate(withPipeline({ SESSIONS_NEON_EXIT: "true" }))).toThrow(/sessionPipeline.SESSIONS_NEON_EXIT is not a known setting/);
   });
 });
+
+describe("session pipeline: summaryRegen (summaries regeneration push A, default off)", () => {
+  const withPipeline = (sessionPipeline: unknown) =>
+    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as AwsInputs & Record<string, unknown>;
+  const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
+  const env = (summaryRegen?: unknown) =>
+    sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: (summaryRegen === undefined ? {} : { summaryRegen }) as SessionPipelineInputs });
+  const regenKeys = (e: Record<string, string>) => Object.keys(e).filter((k) => k.startsWith("SUMMARY_")).sort();
+
+  it("absent renders no new key; each group renders only what is set, with the exact names", () => {
+    expect(regenKeys(env())).toEqual([]);
+    expect(regenKeys(env({}))).toEqual([]);
+    // The rest of the env is unchanged by an absent or empty summaryRegen.
+    expect(env({})).toEqual(env());
+    expect(regenKeys(env({ turns: { enabled: false } }))).toEqual(["SUMMARY_REGEN_TURNS_ENABLED"]);
+    expect(env({ turns: { enabled: false } }).SUMMARY_REGEN_TURNS_ENABLED).toBe("false");
+    const all = env({
+      turns: { enabled: true, threshold: 12, idleSeconds: 900 },
+      retry: { enabled: true, backoffSeconds: [300, 3600, 21600], configReset: true },
+      audit: { enabled: true, retentionDays: 30 },
+    });
+    expect(Object.fromEntries(regenKeys(all).map((k) => [k, all[k]]))).toEqual({
+      SUMMARY_REGEN_AUDIT_ENABLED: "true",
+      SUMMARY_REGEN_AUDIT_RETENTION_DAYS: "30",
+      SUMMARY_REGEN_IDLE_SECONDS: "900",
+      SUMMARY_REGEN_TURNS_ENABLED: "true",
+      SUMMARY_REGEN_TURN_THRESHOLD: "12",
+      SUMMARY_RETRY_BACKOFF_ENABLED: "true",
+      SUMMARY_RETRY_BACKOFF_SECONDS: "300,3600,21600",
+      SUMMARY_RETRY_CONFIG_RESET_ENABLED: "true",
+    });
+    expect(regenKeys(env({ retry: { enabled: true } }))).toEqual(["SUMMARY_RETRY_BACKOFF_ENABLED"]);
+    expect(regenKeys(env({ retry: { enabled: false, configReset: false } }))).toEqual(["SUMMARY_RETRY_BACKOFF_ENABLED", "SUMMARY_RETRY_CONFIG_RESET_ENABLED"]);
+    expect(regenKeys(env({ audit: { enabled: true } }))).toEqual(["SUMMARY_REGEN_AUDIT_ENABLED"]);
+  });
+
+  it("the rendered values are the ones the worker reads (src/summary-regen/settings.ts)", async () => {
+    const { regenSettings } = await import("../../../src/summary-regen/settings.ts");
+    const s = regenSettings(env({
+      turns: { enabled: true, threshold: 1, idleSeconds: 60 },
+      retry: { enabled: true, backoffSeconds: [604_800], configReset: false },
+      audit: { enabled: true, retentionDays: 3650 },
+    }));
+    expect(s).toEqual({
+      turns: { enabled: true, threshold: 1, idleSeconds: 60 },
+      retry: { enabled: true, backoffSeconds: [604_800], configReset: false },
+      audit: { enabled: true, retentionDays: 3650 },
+    });
+  });
+
+  it("validator: plain objects, known keys only, required boolean enabled, bounded integers", () => {
+    const ok = (v: unknown) => expect(() => validate(withPipeline({ summaryRegen: v }))).not.toThrow(/summaryRegen/);
+    const bad = (v: unknown, why: RegExp) => expect(() => validate(withPipeline({ summaryRegen: v }))).toThrow(why);
+    ok({});
+    ok({ turns: { enabled: true, threshold: 10, idleSeconds: 600 }, retry: { enabled: true, backoffSeconds: [300, 3600, 21600], configReset: true }, audit: { enabled: true, retentionDays: 90 } });
+    ok({ retry: { enabled: false, backoffSeconds: Array(10).fill(1) } });
+    bad(null, /summaryRegen must be a plain object/);
+    bad([], /summaryRegen must be a plain object/);
+    bad("true", /summaryRegen must be a plain object/);
+    bad({ requeue: { enabled: true } }, /summaryRegen.requeue is not a known setting/);
+    bad({ turns: true }, /summaryRegen.turns must be a plain object/);
+    bad({ turns: {} }, /summaryRegen.turns.enabled must be a boolean/);
+    bad({ turns: { enabled: "true" } }, /summaryRegen.turns.enabled must be a boolean/);
+    bad({ turns: { enabled: true, window: 5 } }, /summaryRegen.turns.window is not a known setting/);
+    bad({ turns: { enabled: true, threshold: 0 } }, /turns.threshold must be an integer from 1 to 10000/);
+    bad({ turns: { enabled: true, threshold: 10_001 } }, /turns.threshold/);
+    bad({ turns: { enabled: true, threshold: 2.5 } }, /turns.threshold/);
+    bad({ turns: { enabled: true, threshold: "10" } }, /turns.threshold/);
+    bad({ turns: { enabled: true, idleSeconds: 59 } }, /turns.idleSeconds must be an integer from 60 to 604800/);
+    bad({ turns: { enabled: true, idleSeconds: 604_801 } }, /turns.idleSeconds/);
+    bad({ retry: { enabled: true, backoffSeconds: [] } }, /retry.backoffSeconds must be 1 to 10 integers/);
+    bad({ retry: { enabled: true, backoffSeconds: Array(11).fill(1) } }, /retry.backoffSeconds/);
+    bad({ retry: { enabled: true, backoffSeconds: [0] } }, /retry.backoffSeconds/);
+    bad({ retry: { enabled: true, backoffSeconds: [604_801] } }, /retry.backoffSeconds/);
+    bad({ retry: { enabled: true, backoffSeconds: "300,3600" } }, /retry.backoffSeconds/);
+    bad({ retry: { enabled: true, backoffSeconds: [300, 1.5] } }, /retry.backoffSeconds/);
+    bad({ retry: { enabled: true, configReset: "true" } }, /retry.configReset must be a boolean/);
+    bad({ retry: { enabled: true, maxAttempts: 3 } }, /retry.maxAttempts is not a known setting/);
+    bad({ audit: { enabled: true, retentionDays: 0 } }, /audit.retentionDays must be an integer from 1 to 3650/);
+    bad({ audit: { enabled: true, retentionDays: 3651 } }, /audit.retentionDays/);
+    bad({ audit: { retentionDays: 90 } }, /audit.enabled must be a boolean/);
+  });
+});
