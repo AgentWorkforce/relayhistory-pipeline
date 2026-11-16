@@ -765,6 +765,15 @@ describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written dow
     expect(can("s3:GetObject", at(s3LedgerKeys(TENANT_KEY_BASE, tenant).batch("origin-1", "b1")))).toBe(true);
     for (const key of [k.entry(0), k.closed, `${k.root}/stream.json`, logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")]) expect(can("s3:PutObject", at(key))).toBe(true);
     expect(can("s3:PutObject", at(k.payload("f".repeat(64))))).toBe(false);
+    // Reads the control objects, never a payload (session records).
+    for (const x of [k.entry(0), k.checkpoint(64), k.head, k.closed, `${k.root}/stream.json`]) expect(can("s3:GetObject", at(x))).toBe(true);
+    expect(can("s3:GetObject", at(k.payload("f".repeat(64))))).toBe(false);
+    // Lists only under the admission inbox and the registry.
+    expect(can("s3:ListBucket", bucketArn) ).toBe(false);
+    const list = (prefix: string) => st.some((s) => s.Effect === "Allow" && matches(s, "s3:ListBucket", bucketArn, { ...octx, "s3:prefix": prefix }));
+    expect(list(`${k.root}/m/`)).toBe(true);
+    expect(list(`${TENANT_KEY_BASE}/.ledger/log-streams/`)).toBe(true);
+    expect(list(`${TENANT_KEY_BASE}/org-a/v1/`)).toBe(false);
     expect(can("s3:DeleteObject", at(logStreamRegistryKey(TENANT_KEY_BASE, tenant, "origin-1")))).toBe(true);
     expect(can("s3:DeleteObject", at(k.entry(0)))).toBe(false);
     const key = P.ledgerLogOperatorKeyStatement({ region, accountId, bucketName, operatorRoleArn });

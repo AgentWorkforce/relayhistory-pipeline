@@ -45,8 +45,9 @@ import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { assertNoLaterPrivacyControl, INBOX_NAMESPACE, inboxConsentCap, outcomeKey, receiptDir, writeOutcome } from "./async-admission.ts";
 import { deliverPrepared, type DeliverDeps } from "./deliver.ts";
+import { assertTenantSegment, IngestWriteError } from "./writer.ts";
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
-import { logKeys, readEntries, type LogEntry, type LogKeys } from "./ledger-log.ts";
+import { LogCorrupt, logKeys, logModeMarker, readEntries, type LogEntry, type LogKeys } from "./ledger-log.ts";
 import { admissionFenceView, fenceEpoch, hasPendingReset, s3LedgerObjects, sessionKeyHash } from "./ledger-s3.ts";
 import { checkUploadConsent, UploadConsentRequired, type OperatorSharingCap, type UploadConsentConfig } from "./upload-consent.ts";
 import { DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
@@ -134,27 +135,52 @@ export async function* listLogStreams(store: ObjectStore, keyRoot: string): Asyn
   }
 }
 
-export interface RegistryMigration { legacy: number; migrated: number }
+/**
+ * legacy: v1 docs found. migrated: rewritten as v2 and deleted. dropped: deleted WITHOUT re-registering, because the
+ * stream's entry 0 is gone (the user's directory was erased, or the stream never switched): re-registering would write
+ * the raw ids back into an erased directory. invalid: left in place and reported, never fatal (ids no key function
+ * accepts, or a stream whose log reads corrupt); an operator removes them by hand.
+ */
+export interface RegistryMigration { legacy: number; migrated: number; dropped: number; invalid: number }
 
 /**
  * Rewrite every v1 registry doc (raw ids, outside the user's directory) as the v2 layout: the identity doc and the
- * hash-keyed pointer (registerLogStream), then the v1 doc deleted. Dry run unless `apply`. Idempotent and resumable: a
- * crash between the steps leaves a v1 doc whose stream is also registered (listed once), and the next run finishes it.
+ * hash-keyed pointer (registerLogStream), then the v1 doc deleted. A v1 doc whose stream has no entry 0 any more is
+ * deleted without re-registering (dropped). Dry run unless `apply` (counts only). Idempotent and resumable: a crash
+ * between the steps leaves a v1 doc whose stream is also registered (listed once), and the next run finishes it.
  */
 export async function migrateLogStreamRegistry(store: ObjectStore, keyRoot: string, opts: { apply: boolean }): Promise<RegistryMigration> {
-  const legacy: { key: string; ref: LogStreamRef }[] = [];
+  const out: RegistryMigration = { legacy: 0, migrated: 0, dropped: 0, invalid: 0 };
+  const del = (key: string) => store.delete(objectKey(key)).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
   for await (const key of registryKeys(store, keyRoot)) {
     const ref = await resolveRegistryDoc(store, keyRoot, key);
-    if (ref?.v === 1) legacy.push({ key, ref });
+    if (ref?.v !== 1) continue;
+    out.legacy++;
+    // Ids admission would refuse (assertTenantSegment), keys the store refuses (invalid_key) and a log that reads
+    // corrupt are reported as invalid and left in place: one bad doc never aborts the run.
+    const invalid = (error: unknown) => error instanceof LogCorrupt || error instanceof IngestWriteError || (isObjectStoreError(error) && error.code === "invalid_key");
+    let keys: LogKeys;
+    let live: boolean;
+    try {
+      assertTenantSegment(keyRoot, ref.tenant.orgId);
+      keys = logKeys(keyRoot, ref.tenant, ref.originId);
+      live = await logModeMarker(store, keys);
+    } catch (error) {
+      if (invalid(error)) { out.invalid++; continue; }
+      throw error; // a store fault (LogUnavailable, transient): the run stops, and a rerun resumes
+    }
+    if (!live) {
+      if (opts.apply) await del(key);
+      out.dropped++;
+      continue;
+    }
+    if (!opts.apply) continue;
+    try { await registerLogStream(store, keyRoot, ref.tenant, ref.originId); }
+    catch (error) { if (invalid(error)) { out.invalid++; continue; } throw error; }
+    await del(key);
+    out.migrated++;
   }
-  if (!opts.apply) return { legacy: legacy.length, migrated: 0 };
-  let migrated = 0;
-  for (const { key, ref } of legacy) {
-    await registerLogStream(store, keyRoot, ref.tenant, ref.originId);
-    await store.delete(objectKey(key)).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
-    migrated++;
-  }
-  return { legacy: legacy.length, migrated };
+  return out;
 }
 
 /** Record a batch the materializer skipped for good (idempotent: the same code every time for a final refusal). */
@@ -324,13 +350,21 @@ export class LogMaterializer {
    * data that was not written.
    */
   async #applyBatch(tenant: LedgerTenant, originId: string, entry: Extract<LogEntry, { kind: "batches" }>, b: Extract<LogEntry, { kind: "batches" }>["batches"][number], now: () => number): Promise<MaterializedOutcome> {
-    const outcome = await this.#applyBatchOnce(tenant, originId, entry, b, now);
+    const keys = logKeys(this.deps.keyRoot, tenant, originId);
+    // A skip is STICKY: once a batch has a skip record (this materializer or another one refused it for good), it is
+    // never applied, whatever the gates answer now. Without this, a run that refused (say, consent) and wrote its skip
+    // record but crashed before the entry's marker would re-apply the entry later, and a consent confirmed in between
+    // would let the batch be written while its skip record and outcome say refused. The same holds for a second
+    // materializer replaying the entry after the first one skipped it. The finishing steps below are idempotent, so a
+    // sticky skip also completes a crashed run's refused outcome and retirement.
+    const prior = await readLogSkip(this.deps.store, keys, b.batchId);
+    const outcome: MaterializedOutcome = prior ? `skipped:${prior}` : await this.#applyBatchOnce(tenant, originId, entry, b, now);
     if (outcome.startsWith("skipped:")) {
       const code = outcome.slice("skipped:".length);
       this.deps.log?.({ route: "ingest.log_materialize", outcome: "skipped", error_code: code, stream: hid(entry.stream), seq: entry.seq, batch: hid(b.batchId) });
       // The skip record FIRST (the replay answer reads it: admission-consumer.ts re-checks it after writing admitted),
       // then the refused outcome, then the admitted one retired. Any interleaving with a replay ends refused.
-      await writeLogSkip(this.deps.store, logKeys(this.deps.keyRoot, tenant, originId), b.batchId, code, now());
+      if (!prior) await writeLogSkip(this.deps.store, keys, b.batchId, code, now());
       const dir = receiptDir(this.deps.keyRoot, tenant, originId, b.receiptId);
       await writeOutcome(this.deps.store, dir, { v: 1, state: "refused", code, atMs: now() });
       await this.deps.store.delete(objectKey(outcomeKey(dir, "admitted"))).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
@@ -345,6 +379,7 @@ export class LogMaterializer {
     let journalSeq = 0;
     let receivedAtMs: number | undefined;
     let consentCap: OperatorSharingCap | undefined;
+    let uncapped = false;
     for (const ref of b.payloads) {
       let p: unknown;
       try { p = await readJson(store, ref.key); } catch (error) { if (error instanceof SyntaxError) return "skipped:payload_invalid"; throw error; }
@@ -353,8 +388,11 @@ export class LogMaterializer {
       if (!validPayload(p)) return "skipped:payload_invalid";
       const cap = payloadConsentCap(p);
       if (cap === null) return "skipped:payload_invalid";
-      // One batch, one inbox message, one cap: payloads of one batch that disagree are not something admission writes.
+      // One batch, one inbox message, one cap: payloads of one batch that disagree (two caps, or a capped and an uncapped
+      // one) are not something admission writes, and taking either answer could drop the cap.
       if (cap && consentCap && JSON.stringify(cap) !== JSON.stringify(consentCap)) return "skipped:payload_invalid";
+      if ((cap && uncapped) || (!cap && consentCap)) return "skipped:payload_invalid";
+      if (!cap) uncapped = true;
       consentCap ??= cap;
       receipt ??= p.receipt;
       receivedAtMs ??= p.receivedAtMs;
@@ -381,12 +419,15 @@ export class LogMaterializer {
     // inputs). Admit phase only: it runs after the legacy claim and BEFORE any canonical write, so a refusal leaves
     // nothing written. The commit-phase re-check would run after the canonical writes, where a skip would strand them.
     const uploadConsent = this.deps.uploadConsent;
-    const consentGate = (uploadConsent && uploadConsent.enforcement !== "off") || consentCap
-      ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => {
-          if (phase !== "admit") return;
-          await checkUploadConsent(uploadConsent, tenant, originId, kept, { dropped, phase, route: "log.materialize", ...(consentCap ? { operator: consentCap } : {}) }, this.deps.log);
-        }
-      : undefined;
+    const consentOn = (uploadConsent && uploadConsent.enforcement !== "off") || consentCap;
+    // Always installed: at the admit phase (after the legacy claim, BEFORE any canonical write) it reads the skip record
+    // again, so a batch another materializer skipped after this run's first read is not written either (a retry: the
+    // next run finds the skip record and finishes the skip). Then consent, when it applies.
+    const consentGate = async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => {
+      if (phase !== "admit") return;
+      if (await readLogSkip(store, logKeys(keyRoot, tenant, originId), b.batchId)) throw new LedgerUnavailableError("log_batch_skipped");
+      if (consentOn) await checkUploadConsent(uploadConsent, tenant, originId, kept, { dropped, phase, route: "log.materialize", ...(consentCap ? { operator: consentCap } : {}) }, this.deps.log);
+    };
     try {
       const r = await deliverPrepared({
         ...this.deps.deliver,
@@ -394,7 +435,7 @@ export class LogMaterializer {
         ...(receivedAtMs !== undefined ? { now: () => new Date(receivedAtMs), target: { ...this.deps.deliver.target, now: () => new Date(receivedAtMs) } } : {}),
         // The journal re-check at write time: a reset completed after the upload began refuses the batch.
         admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, now()),
-        ...(consentGate ? { consentGate } : {}),
+        consentGate,
       }, tenant, prepared);
       return r.outcome as MaterializedOutcome;
     } catch (error) {
