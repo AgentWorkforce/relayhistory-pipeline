@@ -45,15 +45,19 @@ second per object name.
 ## Entries
 
 ```
-{ v: 1, seq, prev: sha256(previous entry bytes) | null, kind, epoch, writer, atMs, ... }
-kind "open"    seq 0 only: the MODE MARKER; carries legacyCutover
-kind "epoch"   takes ownership: epoch = previous + 1
+{ v: 1, stream: <the stream's key root>, seq, prev: sha256(previous entry bytes) | null, kind, epoch, writer, atMs, ... }
+kind "open"    seq 0 only, epoch 1: the MODE MARKER; carries legacyCutover
+kind "epoch"   takes ownership: epoch = previous + 1 exactly
 kind "batches" batches: [{ batchId, digest, receiptId, sessions: [[source, sessionId]], payloads: [{key, sha256, size}] }],
                inboxCursor
 ```
 
-The `prev` hash chain makes a gap, a reorder or a torn write detectable, and the reader fails closed
-(`LogCorrupt`). A batches entry must carry the current epoch; anything else is corrupt.
+The `prev` hash chain makes a reorder or a torn write detectable, and the reader fails closed (`LogCorrupt`). A
+deleted or lost entry is caught too: after following the chain to its head, the reader lists `e/` and refuses
+anything stored past the head (`log_entry_gap`). With no entry 0, any stored entry means entry 0 was lost, and the
+stream must not read as legacy (`log_open_missing`). A batches entry must carry the current epoch AND be written by
+the writer whose open or epoch entry set it. Its payload keys must be this stream's content addresses, and an entry
+whose `stream` names another stream is refused.
 
 ## Commit path
 
@@ -63,18 +67,25 @@ The `prev` hash chain makes a gap, a reorder or a torn write detectable, and the
    of itself.
 3. Create entry `head + 1` with the admitted batches and the inbox cursor. That one request is the commit.
 
-The window is `LOG_REMEMBERED_BATCHES` = 4096 batchIds per stream, carried in checkpoints and replayed from
-entries on open. A batchId older than the window is not remembered. That has the same bound as the legacy
-manifest's remembered-batches window, so the legacy batch docs and outcome markers stay the long-term replay
-answer during the transition.
+The window is `LOG_REMEMBERED_BATCHES` = 4096 batchIds PER STREAM, carried in full in every checkpoint and replayed
+from entries on open. A batchId older than the window is not remembered: an evicted id is admitted again (tested). This
+is NOT the legacy bound (the legacy manifest remembers 64 batches per session), so the legacy batch docs and outcome
+markers stay the long-term replay answer during the transition. An append dedupes against the window plus its own
+batches without copying the window.
 
 ## Single writer and fencing
 
-One writer per stream. A writer takes the stream by appending an `epoch` entry. A stale writer's next append
-targets a seq that is already taken: the create conflicts, the writer reads the entry back, finds different bytes,
-and stops (`LogFenced`). Fencing therefore falls out of create-if-absent sequencing. There is no fence object to
-CAS, and the fence changes only when ownership changes, never per batch. Two writers racing for one seq: exactly
-one lands (tested).
+One writer per stream. A writer takes the stream by appending an `epoch` entry. The state records which writer set
+the current epoch (`epochWriter`), and `appendBatches` refuses any other writer (`log_not_owner`) before writing.
+Two openers racing for entry 0 therefore get the same state, but only the one whose entry 0 landed may append. A
+stale writer's next append targets a seq that is already taken: the create conflicts, the writer reads the entry
+back, finds different bytes, and stops (`LogFenced`). There is no fence object to CAS, and the fence changes only
+when ownership changes, never per batch.
+
+`takeStream` first resolves any pending entry. It keeps its own epoch entry pending until that resolves, so an
+ambiguous take resends exactly that entry. A take that loses its race does NOT take again: it catches the state up
+and throws `log_take_lost`, so two takers back off (the caller's retry decides) instead of fencing each other in a
+loop. Linearity always held (the head + 1 create); this makes ownership explicit too.
 
 ## Ambiguous commits
 
@@ -99,8 +110,13 @@ index, search, the read API) until it is materialized from the log. Planned mate
 This takes manifest and index work off the admission critical path and batches it, one manifest update per
 session per N entries. The reads stay as they are today; only the writer of those objects changes.
 
-Compaction: payloads stay content-addressed. Old entries below a materialized checkpoint can be deleted after a
-retention window, because the checkpoint holds the dedupe window and the cursor.
+Compaction: payloads stay content-addressed. Entry 0 is NEVER deleted: it is the mode marker, and its loss with
+other entries present reads as `log_open_missing`. Today `readEntries` replays from entry 0 and does not start from
+a checkpoint, so until it can (planned), compaction must not delete any entry a reader may still replay through.
+Once it can, entries below a materialized checkpoint can be deleted after a retention window, because the
+checkpoint holds the dedupe window, the owner and the cursor. Payloads live under `ledger/log/o=<origin>/p/` in the
+user's admission directory. The erase paths (operator erase, session-selection erase, reset) must find and delete
+them there, and that is part of the materializer slice.
 
 ## Privacy gates (unchanged in meaning, rev 3)
 
@@ -131,18 +147,27 @@ today.
 - `src/session-ingest/ledger-log.ts`: the keys, entry and checkpoint schema, validation, `enableLogMode`,
   `takeStream`, `appendBatches` (dedupe, create-if-absent, read-back, pending resend), `openStream` (from a
   verified checkpoint or entry 0), `readEntries`, `putPayload`, and the `INGEST_LEDGER_LOG_COMMIT` parse.
-- `selfhost-config.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is refused at startup; `off` changes nothing.
+- `selfhost-config.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is refused at startup; `off` changes nothing. The hosted
+  Worker does not read the flag at all: it must refuse `on` too before any hosted wiring (planned).
 - Tests (`ledger-log.test.ts`, fs store):
   - flag parsing and the refusal;
-  - the mode marker is idempotent;
-  - append, replay and conflict;
-  - a reopen matches, with or without a valid checkpoint;
-  - an epoch entry fences the old writer;
-  - two concurrent writers at one seq, exactly one wins;
+  - the mode marker: idempotent; only the opener whose entry 0 landed owns it (two openers racing); a different
+    `legacyCutover` is refused;
+  - append, replay and conflict, including a different digest inside one call;
+  - the 4096 window: an evicted id is admitted again, a remembered one conflicts;
+  - a reopen matches, with or without a valid checkpoint (a missing checkpoint and a hash-mismatched one are
+    ignored);
+  - a foreign payload key is refused before any write;
+  - an epoch entry fences the old writer, and a reopened old writer is not the owner;
+  - two appends genuinely racing (a store that releases both creates together): exactly one lands;
+  - two takers racing: one owns, the loser gets `log_take_lost` and no second epoch entry is written;
+  - an ambiguous take keeps its epoch entry pending and resends it;
   - landed-but-503 counts as landed;
   - never-landed gives `LogUnavailable`, and the retry resends the same bytes first;
-  - crash after every PUT prefix leaves a valid chain;
-  - a forged or stale entry is `LogCorrupt`;
+  - crash at every PUT prefix, failing before or after the write, with the process state dropped and the work
+    finished by a new writer: a valid chain, and every batch exactly once;
+  - readers refuse a missing middle entry, a lost entry 0, a bad prev hash, a stale-epoch batches entry, malformed
+    JSON and an entry from another stream;
   - payloads are idempotent.
 
 ## Remaining
