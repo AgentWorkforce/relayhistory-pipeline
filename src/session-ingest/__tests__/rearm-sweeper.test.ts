@@ -741,6 +741,14 @@ describe("re-arm sweeper with a separate ledger bucket (INGEST_REARM_LEDGER_BUCK
     expect(rearmSweeperConfig(ENV).ledger).toEqual({ bucket: "ledger-b", region: "us-west-2" });
     expect(rearmSweeperConfig({ ...ENV, INGEST_REARM_LEDGER_REGION: "" }).ledger).toEqual({ bucket: "ledger-b", region: "us-east-1" });
     expect(rearmSweeperConfig(ENTRY_ENV).ledger).toBeUndefined();
+    // Endpoint: reused only in the same region; its own variable otherwise; never without the bucket.
+    const ep = { ...ENV, INGEST_REARM_ENDPOINT: "https://minio.internal.example" };
+    expect(() => rearmSweeperConfig(ep)).toThrow(RearmSweepRefused); // us-west-2 ledger, us-east-1 endpoint
+    expect(rearmSweeperConfig({ ...ep, INGEST_REARM_LEDGER_REGION: "" }).ledger).toEqual({ bucket: "ledger-b", region: "us-east-1", endpoint: "https://minio.internal.example" });
+    expect(rearmSweeperConfig({ ...ep, INGEST_REARM_LEDGER_ENDPOINT: "https://s3.us-west-2.amazonaws.com" }).ledger)
+      .toEqual({ bucket: "ledger-b", region: "us-west-2", endpoint: "https://s3.us-west-2.amazonaws.com" });
+    expect(rearmSweeperConfig(ENV).ledger?.endpoint).toBeUndefined();
+    expect(() => rearmSweeperConfig({ ...ENTRY_ENV, INGEST_REARM_LEDGER_ENDPOINT: "https://e.example" })).toThrow(RearmSweepRefused);
     for (const bad of [{ INGEST_REARM_LEDGER_BUCKET: "transcripts" }, { INGEST_REARM_LEDGER_BUCKET: "Bad_B" }, { INGEST_REARM_LEDGER_BUCKET: "", INGEST_REARM_LEDGER_REGION: "us-west-2" }])
       expect(() => rearmSweeperConfig({ ...ENV, ...bad })).toThrow(RearmSweepRefused);
   });

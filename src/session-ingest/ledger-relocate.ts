@@ -19,7 +19,8 @@
  *            the run, unless --replace-stale (for `back`, whose destination holds the pre-move copies) replaces it
  *            with a compare-and-swap on the version just read.
  *   verify   read-only: the destination's ledger objects are exactly the source's (same keys, same SHA-256), and
- *            reports the set's digest.
+ *            reports the set's digest. This readback IS the copy's integrity check: copy sends no contentSha256
+ *            (the store's own put check), so a copy is trusted only after a verify that reads every object back.
  *   switch   --confirm: verify again, then write the ledger-home marker naming the DESTINATION bucket, first into the
  *            source (from then on a process still configured for it refuses every claim: `ledger_home_moved`) and
  *            then into the destination (the process configured for it needs this one: `ledger_home_missing`).

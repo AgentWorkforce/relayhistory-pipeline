@@ -12,6 +12,9 @@
  *                                    records and ownership stubs are read there; the fences, the cursor and the canonical
  *                                    layout (and the erase) stay in INGEST_REARM_BUCKET. Same endpoint and credentials.
  *   INGEST_REARM_LEDGER_REGION       its signing region; default INGEST_REARM_REGION. Only with INGEST_REARM_LEDGER_BUCKET.
+ *   INGEST_REARM_LEDGER_ENDPOINT     its endpoint (bare origin); default INGEST_REARM_ENDPOINT, but only in the same region:
+ *                                    INGEST_REARM_ENDPOINT set with a different ledger region refuses (config_invalid).
+ *                                    Only with INGEST_REARM_LEDGER_BUCKET. Unset with no INGEST_REARM_ENDPOINT: AWS S3.
  *                                    With it, every pass first checks the ledger-home marker in that bucket (ledger-store.ts):
  *                                    missing (`ledger_home_missing`) or naming another bucket (`ledger_home_moved`) refuses
  *                                    (exit 2).
@@ -69,7 +72,7 @@ export interface RearmSweeperConfig {
   bucket: string;
   region: string;
   /** INGEST_REARM_LEDGER_BUCKET / _REGION: the S3 ledger's own bucket. Absent: the ledger is in `bucket`. */
-  ledger?: { bucket: string; region: string };
+  ledger?: { bucket: string; region: string; endpoint?: string };
   endpoint?: string;
   keyRoot: string;
   orgs?: string[];
@@ -93,6 +96,7 @@ export function rearmSweeperConfig(env: NodeJS.ProcessEnv, argv: readonly string
   const ledgerBucket = env.INGEST_REARM_LEDGER_BUCKET ?? "", ledgerRegion = env.INGEST_REARM_LEDGER_REGION || region;
   if (!ledgerBucket && env.INGEST_REARM_LEDGER_REGION) refuse("config_invalid");
   if (ledgerBucket && (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(ledgerBucket) || ledgerBucket === bucket || !/^[a-z0-9-]{1,63}$/.test(ledgerRegion))) refuse("config_invalid");
+  if (!ledgerBucket && env.INGEST_REARM_LEDGER_ENDPOINT) refuse("config_invalid");
   let endpoint: string | undefined;
   if (env.INGEST_REARM_ENDPOINT) {
     try { endpoint = assertDestinationUrl("INGEST_REARM_ENDPOINT", env.INGEST_REARM_ENDPOINT, destinationPolicy(env), { allowPath: false }).origin; }
@@ -111,8 +115,19 @@ export function rearmSweeperConfig(env: NodeJS.ProcessEnv, argv: readonly string
   if (at >= 0 && (!argv[at + 1] || argv[at + 1]!.startsWith("--"))) refuse("config_invalid");
   const credentials = env.INGEST_REARM_CREDENTIALS || "role";
   if (credentials !== "role" && credentials !== "keys" && credentials !== "podIdentity") refuse("config_invalid");
+  let ledgerEndpoint: string | undefined;
+  if (ledgerBucket) {
+    if (env.INGEST_REARM_LEDGER_ENDPOINT) {
+      try { ledgerEndpoint = assertDestinationUrl("INGEST_REARM_LEDGER_ENDPOINT", env.INGEST_REARM_LEDGER_ENDPOINT, destinationPolicy(env), { allowPath: false }).origin; }
+      catch { refuse("endpoint_invalid"); }
+    } else if (endpoint) {
+      // The transcripts bucket's endpoint is reused only in its own region: never send the ledger's requests to it.
+      if (ledgerRegion !== region) refuse("config_invalid");
+      ledgerEndpoint = endpoint;
+    }
+  }
   return {
-    bucket, region, ...(ledgerBucket ? { ledger: { bucket: ledgerBucket, region: ledgerRegion } } : {}), ...(endpoint ? { endpoint } : {}), keyRoot, ...(orgs ? { orgs } : {}),
+    bucket, region, ...(ledgerBucket ? { ledger: { bucket: ledgerBucket, region: ledgerRegion, ...(ledgerEndpoint ? { endpoint: ledgerEndpoint } : {}) } } : {}), ...(endpoint ? { endpoint } : {}), keyRoot, ...(orgs ? { orgs } : {}),
     dryRun: dry === "1" || argv.includes("--dry-run"),
     concurrency: int(env.INGEST_REARM_CONCURRENCY, 4, 1, REARM_MAX_CONCURRENCY),
     maxMarkers: int(env.INGEST_REARM_MAX_MARKERS, 500, 1, 10_000),
@@ -190,7 +205,7 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   const main = (overrides.store ?? createS3Store)({ ...s3, credentials: provider }) as unknown as ObjectStore;
   // INGEST_REARM_LEDGER_BUCKET: the ledger's keys (markers, completion records, fences, stubs) route to its bucket.
   const store = cfg.ledger
-    ? ledgerRoutedStore(main, (overrides.store ?? createS3Store)({ ...s3, bucket: cfg.ledger.bucket, region: cfg.ledger.region, credentials: provider }) as unknown as ObjectStore, cfg.keyRoot)
+    ? ledgerRoutedStore(main, (overrides.store ?? createS3Store)({ bucket: cfg.ledger.bucket, region: cfg.ledger.region, ...(cfg.ledger.endpoint ? { endpoint: cfg.ledger.endpoint } : {}), credentials: provider }) as unknown as ObjectStore, cfg.keyRoot)
     : main;
   // The fork guard: never sweep a ledger bucket the deployment has not moved to (or has moved away from again).
   let homeGuard = false;

@@ -40,9 +40,13 @@ marker, and the result is cached with it for 60 s per org:
   Locker bucket, an edge left on the old configuration (an old values file, a
   second release) cannot admit against the stale copy. The runbook therefore
   turns the guard on before step 1.
-- The hosted upload-admission Lambda (`upload-admission-hosted.ts`) only ever
-  runs on the Locker bucket. With `INGEST_LEDGER_HOME_GUARD=on` it does the
-  same check, and it refuses to start with `INGEST_LEDGER_BUCKET` set.
+- The hosted upload-admission Lambda (`upload-admission-hosted.ts`) is not
+  covered in this slice:
+  - Its code honours `INGEST_LEDGER_HOME_GUARD=on`, but its stack environment
+    (`stacks/aws/upload-inbox.ts` `uploadAdmissionFunctionEnv`) is fixed and
+    cannot set it. Setting it by hand would be drift.
+  - It refuses to start with `INGEST_LEDGER_BUCKET` set.
+  - So it is disabled for the window and stays disabled (steps 1 and 6).
 - The sweeper with `INGEST_REARM_LEDGER_BUCKET` checks the marker in the ledger
   bucket on every pass, and a missing or wrong marker exits 2. Without it, and
   with `INGEST_LEDGER_HOME_GUARD=on`, it checks the Locker bucket's marker and
@@ -50,8 +54,15 @@ marker, and the result is cached with it for 60 s per org:
   exits 2 (`access_denied`).
 - The single-bucket operator tools (`scripts/buffered-drain.ts`,
   `upload-fence-backfill.ts`, `ledger-reshard-revisions.ts`,
-  `ledger-log-stream.ts`) read their bucket's marker at start. They refuse
-  when it names another bucket or is unreadable.
+  `ledger-log-stream.ts`) read their bucket's marker at start only with
+  `INGEST_LEDGER_HOME_GUARD=on` in their shell. Off, they make no request.
+  - The backfill reads it only when an ownership or revision section runs;
+    the fences never move.
+  - The codes are exact:
+    - `ledger_home_moved`: a valid marker names another bucket.
+    - `ledger_home_invalid`: the marker body is bad.
+    - `access_denied`: a 403.
+    - `ledger_home_unavailable`: anything else. This one is retryable.
 
 ## Encryption
 
@@ -67,22 +78,26 @@ The tool is `src/session-ingest/ledger-relocate.ts`. It is in the services image
 and reads the edge's own environment. Run it as a Job with the edge's
 ServiceAccount, so no credential is ever on disk. It prints counts and codes only.
 
-0. **Before the window.** Deploy `INGEST_LEDGER_HOME_GUARD=on` to every writer
-   of this key root's ledger that runs on the Locker bucket:
-   - the ingest edge;
-   - the hosted upload-admission Lambda, if deployed;
-   - optionally the sweeper, if its role can read the marker.
+0. **Before the window.** Turn on `INGEST_LEDGER_HOME_GUARD=on`:
+   - Deploy it to the ingest edge (chart `ingestEdge.ledgerHomeGuard: true`).
+   - Optionally deploy it to the sweeper, if its role can read the marker.
+   - Export it in every shell that runs the operator tools above.
 
-   Confirm the writers still admit; with no marker present this changes
-   nothing.
+   Confirm the edge still admits; with no marker present this changes nothing.
+   The hosted upload-admission Lambda is not covered (see above), so steps 1
+   and 6 keep it disabled.
 1. **Stop admission.**
    - Write the deployment-wide stop marker
      `<root>/.ledger/fence-authority/.stop.json`
      (`{"v":1,"stop":"all","writtenAtMs":<now>}`).
-   - Scale the edge to 0, and disable or drain the hosted upload-admission
-     Lambda (reserved concurrency 0) if it is deployed. The stop alone does not
-     end a commit that was already claimed.
+   - Scale the edge to 0. The stop alone does not end a commit that was
+     already claimed.
+   - Disable the hosted upload-admission Lambda if it is deployed (reserved
+     concurrency 0).
    - Stop the re-arm sweeper (suspend its CronJob or scale its Deployment to 0).
+     The hosted re-arm sweeper Lambda (`rearm-sweeper-lambda.ts`) is
+     unsupported with a ledger bucket. Its code reads the same environment, but its stack environment cannot set `INGEST_REARM_LEDGER_BUCKET`, so it would sweep only the stale copies.
+     Disable it too, and leave it disabled.
    - Do not run any other single-bucket ledger tool against this key root:
      `scripts/buffered-drain.ts`, `upload-fence-backfill.ts`,
      `ledger-reshard-revisions.ts` or `ledger-log-stream.ts`. After step 5
@@ -94,7 +109,9 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
    the stop. It copies byte for byte and create-only, and a rerun copies nothing
    new. Any `diverged` fails the run.
 4. **`verify`.** The destination must hold exactly the source's keys with
-   identical SHA-256. Record the `digest`.
+   identical SHA-256. Record the `digest`. This readback is the copy's
+   integrity check, because `copy` sends no `contentSha256`. Never switch
+   without a passing verify; `switch` runs one itself.
 5. **Switch the home.** Write "moved" into the source, then the destination's marker:
    - With one principal that may write both buckets, run `switch --confirm`. It
      verifies again, then writes both markers in that order.
@@ -107,8 +124,10 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
    - Deploy the edge with `INGEST_LEDGER_BUCKET` / `INGEST_LEDGER_REGION`, and
      the sweeper with `INGEST_REARM_LEDGER_BUCKET` / `_REGION`. Startup proves
      conditional writes on the ledger bucket.
-   - Leave the hosted upload-admission Lambda disabled. It has no ledger
-     bucket, and with the guard on it refuses (`ledger_home_moved`).
+   - Leave the hosted upload-admission Lambda disabled: it refuses
+     `INGEST_LEDGER_BUCKET` and cannot carry the guard.
+   - Leave the hosted re-arm sweeper Lambda disabled too; it is unsupported
+     here. Use the EKS sweeper with `INGEST_REARM_LEDGER_BUCKET`.
    - Scale the edge back up, and restart the sweeper with its new setting.
    - Delete the stop marker. Claims resume within 60 s.
 7. **Watch.**

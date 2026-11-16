@@ -116,8 +116,12 @@
  *                                    bucket naming it (docs/ledger-relocation.md). Proven for conditional writes at startup.
  *   INGEST_LEDGER_REGION             the ledger bucket's signing region; default LOCKER_REGION. Only with INGEST_LEDGER_BUCKET.
  *   INGEST_LEDGER_ENDPOINT           the ledger bucket's endpoint origin; default LOCKER_ENDPOINT, but only when the regions
- *                                    match: a LOCKER_ENDPOINT with a different INGEST_LEDGER_REGION refuses startup (it would
- *                                    send the ledger bucket's requests to the Locker region's endpoint). Only with the bucket.
+ *                                    match. The cross-region refusal applies only when LOCKER_ENDPOINT is set: then a
+ *                                    different INGEST_LEDGER_REGION without INGEST_LEDGER_ENDPOINT refuses startup (it would
+ *                                    send the ledger bucket's requests to the Locker region's endpoint); with neither set the
+ *                                    store uses AWS S3 in INGEST_LEDGER_REGION. Accepts any http(s) bare origin, http:// to
+ *                                    any host included, exactly as LOCKER_ENDPOINT does (locker.ts). Set without
+ *                                    INGEST_LEDGER_BUCKET: refused.
  *   INGEST_LEDGER_HOME_GUARD         unset | "" | "off" (default: no marker read, byte-identical) | exactly "on": every
  *                                    claim's fence-authority read also reads the ledger-home marker
  *                                    (<keyRoot>/.ledger/fence-authority/.ledger-home.json) in LOCKER_BUCKET and refuses
@@ -226,6 +230,7 @@ export function selfhostLedgerStore(env: NodeJS.ProcessEnv, ledger: "s3" | undef
   const regionRaw = env[INGEST_LEDGER_REGION_VAR]?.trim() ?? "";
   if (!bucket) {
     if (regionRaw) throw new Error(`96bulls: ${INGEST_LEDGER_REGION_VAR} needs ${INGEST_LEDGER_BUCKET_VAR}`);
+    if (env.INGEST_LEDGER_ENDPOINT?.trim()) throw new Error(`96bulls: INGEST_LEDGER_ENDPOINT needs ${INGEST_LEDGER_BUCKET_VAR}`);
     return undefined;
   }
   if (ledger !== "s3") throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} needs ${INGEST_LEDGER_VAR}=s3`);
