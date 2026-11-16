@@ -480,6 +480,11 @@ async function exportScope(
   opts: { export: boolean; force?: boolean },
   counters: Counters,
 ) {
+  // Fresh per-scope activation gate: a healthy run-start heartbeat cannot
+  // authorize a later PUT after the eraser has gone stale or changed back to
+  // Neon. Keep this outside the scope failure catcher so readiness loss aborts
+  // the run instead of advancing its cursor as an ordinary bad scope.
+  if (opts.export) await assertLegacyErasureAuthorityReady(deps.privacyDb);
   const key = scopeKey(scope);
   let boundUserId: string | null = null;
   try {

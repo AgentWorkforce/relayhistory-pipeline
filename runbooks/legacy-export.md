@@ -77,6 +77,11 @@ them.
     This is how the hosted eraser finds the exact legacy copy after any member,
     session, frozen-source or turn-fence deletion without deriving an owner
     from the deleting member.
+  - The exporter refuses before discovery unless the Supabase eraser has
+    recorded a healthy successful sweep in the last 30 minutes. It repeats the
+    durable readiness RPC before every scope, so a stale heartbeat or rollback
+    to the Neon authority aborts the run before another legacy PUT. An
+    environment setting in the exporter is never accepted as readiness.
   - The shared global privacy lock is held for one scope's Neon read and S3
     write. A queued exclusive erase can in turn delay later ingest/export shared
     lock requests. Run only in the approved window, keep scopes bounded, and
