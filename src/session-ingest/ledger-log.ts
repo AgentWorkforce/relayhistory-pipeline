@@ -6,7 +6,7 @@
  *
  * One STREAM per (org, workspace, user, origin): ordering across a user's machines is not required
  * (Khaliq, 2026-11-16), so each machine's stream commits on its own. A stream is a dense sequence of immutable
- * entries `e/<seq>.json`, each written ONCE with create-if-absent. That is the only coordination primitive used,
+ * entries `e/<dir>/<seq>.json` (directories of LOG_ENTRIES_PER_DIR), each written ONCE with create-if-absent. That is the only coordination primitive used,
  * and it behaves the same on S3 (If-None-Match), GCS (ifGenerationMatch=0) and Azure (If-None-Match: *); the
  * object-store conformance cases `create_is_idempotent_for_same_content` and `create_conflicts_on_different_content`
  * pin it per backend. No object is ever compare-and-swapped on the commit path (GCS allows about one write per
@@ -171,6 +171,11 @@ async function readBytes(store: ObjectStore, key: string): Promise<Uint8Array | 
   try { return await readAll((await store.getObject(objectKey(key))).body); }
   catch (error) { if (isObjectStoreError(error) && error.code === "not_found") return undefined; throw error; }
 }
+/** readBytes for the replay/open path: a transient store fault is LogUnavailable; any other error stays raw. */
+async function readEntryBytes(store: ObjectStore, key: string): Promise<Uint8Array | undefined> {
+  try { return await readBytes(store, key); }
+  catch (error) { if (transient(error)) throw new LogUnavailable("log_entry_unavailable"); throw error; }
+}
 const parse = (bytes: Uint8Array): unknown => { try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; } };
 const equalBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 /** Retried: only the store's own `transient` (network, 408, 429, 5xx). Any other error is not a store fault: rethrown. */
@@ -211,7 +216,8 @@ async function createEntry(store: ObjectStore, keys: LogKeys, seq: number, bytes
   }
   // A timed-out or 5xx PUT may still have landed: read it back, never assume failure.
   let there: Uint8Array | undefined;
-  try { there = await readBytes(store, key); } catch { throw new LogUnavailable("log_entry_ambiguous"); }
+  try { there = await readBytes(store, key); }
+  catch (error) { if (transient(error)) throw new LogUnavailable("log_entry_ambiguous"); throw error; }
   if (there === undefined) throw new LogUnavailable("log_entry_ambiguous");
   return equalBytes(there, bytes) ? "landed" : "taken";
 }
@@ -261,10 +267,10 @@ async function anyEntry(store: ObjectStore, keys: LogKeys): Promise<boolean> {
  * and the list). Only a direct re-read still missing, with other entries present, is log_open_missing.
  */
 async function readZero(store: ObjectStore, keys: LogKeys): Promise<Uint8Array | undefined> {
-  const zero = await readBytes(store, keys.entry(0));
+  const zero = await readEntryBytes(store, keys.entry(0));
   if (zero !== undefined) return zero;
   if (!(await anyEntry(store, keys))) return undefined;
-  const again = await readBytes(store, keys.entry(0));
+  const again = await readEntryBytes(store, keys.entry(0));
   if (again !== undefined) return again;
   throw new LogCorrupt("log_open_missing");
 }
@@ -276,11 +282,11 @@ async function readZero(store: ObjectStore, keys: LogKeys): Promise<Uint8Array |
  */
 async function* replay(store: ObjectStore, state: LogState): AsyncGenerator<LogEntry> {
   for (;;) {
-    const bytes = await readBytes(store, state.keys.entry(state.head + 1));
+    const bytes = await readEntryBytes(store, state.keys.entry(state.head + 1));
     if (bytes !== undefined) { yield applyEntry(state, bytes); continue; }
     const past = await seqsPast(store, state.keys, state.head);
     if (past.length === 0) return;
-    const again = await readBytes(store, state.keys.entry(state.head + 1));
+    const again = await readEntryBytes(store, state.keys.entry(state.head + 1));
     if (again !== undefined) { yield applyEntry(state, again); continue; }
     throw new LogCorrupt("log_entry_gap");
   }
@@ -306,9 +312,11 @@ export async function openStream(store: ObjectStore, keys: LogKeys): Promise<Log
     if (hint && isNat(hint.seq) && hint.seq > 0) {
       const cp = parse((await readBytes(store, keys.checkpoint(hint.seq))) ?? new Uint8Array());
       const at = await readBytes(store, keys.entry(hint.seq));
-      // Bounded on read: a checkpoint is trusted only as far as its hash, and an oversized window is ignored.
+      // Bounded on read: a checkpoint is trusted only as far as its hash plus its fields cross-checked against entry
+      // `seq` (epoch, epoch writer; for a batches entry also the inbox cursor and every batch in the remembered
+      // window). An oversized window, or any mismatch, is ignored and the open replays from entry 0.
       if (validCheckpoint(cp) && cp.seq === hint.seq && cp.remembered.length <= LOG_REMEMBERED_BATCHES && cp.epoch >= 1 &&
-        at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover)
+        at !== undefined && sha256(at) === cp.hash && cp.legacyCutover === state.legacyCutover && checkpointMatchesEntry(cp, at))
         state = { keys, head: cp.seq, headHash: cp.hash, epoch: cp.epoch, epochWriter: cp.epochWriter, legacyCutover: cp.legacyCutover,
           inboxCursor: cp.inboxCursor, remembered: new Map(cp.remembered) };
     }
@@ -317,6 +325,16 @@ export async function openStream(store: ObjectStore, keys: LogKeys): Promise<Log
   }
   for await (const _ of replay(store, state)) { /* applied in order */ }
   return state;
+}
+
+/** A checkpoint's state fields agree with the entry it names (its hash already matched). */
+function checkpointMatchesEntry(cp: { epoch: number; epochWriter: string; inboxCursor: string | null; remembered: Array<[string, string]> }, at: Uint8Array): boolean {
+  const e = parse(at);
+  if (!validEntry(e) || e.epoch !== cp.epoch || e.writer !== cp.epochWriter) return false;
+  if (e.kind !== "batches") return true;
+  if (e.inboxCursor !== cp.inboxCursor) return false;
+  const window = new Map(cp.remembered);
+  return e.batches.every((b) => window.get(b.batchId) === b.digest);
 }
 
 /** Advance `state` over the next entry's exact bytes, or throw LogCorrupt. */

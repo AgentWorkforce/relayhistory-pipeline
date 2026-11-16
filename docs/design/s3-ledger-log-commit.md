@@ -60,8 +60,9 @@ If an entry is stored past head, it reads head + 1 AGAIN: a stream being appende
 append is replayed, not mistaken for a gap. Only a direct re-read still missing, with a later entry present, is
 `log_entry_gap`. With no entry 0, the first page of `e/` is listed; if any entry exists, entry 0 is read again
 (a concurrent `enableLogMode` may have just created it) and only a re-read still missing is `log_open_missing`, so
-the stream never reads as legacy. A store fault on any listing or on the conflict read-back is `LogUnavailable`
-(retryable), never a raw store error.
+the stream never reads as legacy. A transient store fault (network, 408, 429, 5xx) on any listing, entry read during open/replay, or
+read-back is `LogUnavailable` (retryable). Any other error (for example access denied, or a programming error) stays
+raw and is never reported as `LogCorrupt`.
 
 What is detectable: a lost entry 0, and a lost middle entry while one of its next 1000 successors still exists. What
 is NOT: a deleted TAIL (the newest entries, with nothing stored after them) reads as a shorter log; the next append
@@ -167,8 +168,11 @@ today.
 - `selfhost-config.ts`: `INGEST_LEDGER_LOG_COMMIT=on` is refused at startup; `off` changes nothing. The hosted
   upload-admission runtime (`upload-admission-hosted.ts`) refuses `on` too (`ledger_log_commit_unsupported`); the
   hosted Worker never runs the S3 ledger at all (it refuses `INGEST_LEDGER=s3`).
-- A checkpoint is trusted only as far as its hash: one with another `legacyCutover`, an epoch below 1 or a window
-  larger than `LOG_REMEMBERED_BATCHES` is ignored, and the open replays from entry 0.
+- A checkpoint is trusted only as far as its hash plus its fields cross-checked against entry `seq`: the entry's
+  epoch and writer must equal the checkpoint's epoch and epoch writer, and for a batches entry its inbox cursor must
+  equal the checkpoint's and every batch in it must be in the checkpoint's remembered window. One that fails any
+  check, or has another `legacyCutover`, an epoch below 1 or a window larger than `LOG_REMEMBERED_BATCHES`, is
+  ignored, and the open replays from entry 0.
 - Tests (`ledger-log.test.ts`, fs store):
   - flag parsing and the refusal;
   - the mode marker: idempotent; only the opener whose entry 0 landed owns it (two openers racing); a different
