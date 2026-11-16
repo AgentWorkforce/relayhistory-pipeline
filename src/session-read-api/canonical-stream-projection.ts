@@ -98,10 +98,32 @@ export interface StreamDeps {
    * rows exactly as before.
    */
   originLabels?: boolean;
+  /**
+   * A wall-clock deadline (epoch ms by `now`, default Date.now): checked before every chunk
+   * of every pass, so once crossed the read stops between chunks with StreamBudgetError
+   * (STREAM_DEADLINE), as a spent budget does: partial, nothing more read or written.
+   * Absent: no deadline, exactly as before.
+   */
+  deadline?: StreamDeadline;
+}
+
+/** A wall-clock bound on one streamed scope (SearchIndexDeps.streamDeadline). */
+export interface StreamDeadline {
+  /** Stop once `now()` reaches this instant (epoch ms). */
+  at: number;
+  /** Injectable clock; default Date.now. */
+  now?: () => number;
+}
+
+/** True once `deadline` is crossed (absent: never). */
+export function streamDeadlinePassed(deadline: StreamDeadline | undefined): boolean {
+  return deadline !== undefined && (deadline.now ?? Date.now)() >= deadline.at;
 }
 
 export const STREAM_READ_BYTES_BUDGET = "stream_read_bytes_budget";
 export const STREAM_READ_EVENTS_BUDGET = "stream_read_events_budget";
+/** The scope's wall-clock deadline passed (StreamDeps.deadline): partial like a spent budget. */
+export const STREAM_DEADLINE = "stream_deadline";
 export const STREAM_SOURCE_CHANGED = "stream_source_changed";
 /**
  * Two surviving events share an index key (other than an activity event
@@ -114,7 +136,7 @@ export const STREAM_PASSES = 4;
 
 /** A read budget ran out: the scope stays `scope_too_large`, `budget` says which. */
 export class StreamBudgetError extends PipelineError {
-  constructor(readonly budget: typeof STREAM_READ_BYTES_BUDGET | typeof STREAM_READ_EVENTS_BUDGET) {
+  constructor(readonly budget: typeof STREAM_READ_BYTES_BUDGET | typeof STREAM_READ_EVENTS_BUDGET | typeof STREAM_DEADLINE) {
     super("scope_too_large", `the streaming read budget ran out (${budget})`, false);
   }
 }
@@ -155,8 +177,10 @@ export class StreamReadMeter implements ChunkReadObserver {
    * size. After pass 1 this bounds what the same chunk checks need in a later pass.
    */
   peak = 0;
-  constructor(readonly limits: StreamReadLimits) {}
+  constructor(readonly limits: StreamReadLimits, readonly deadline?: StreamDeadline) {}
   chunk(entry: Readonly<{ bytes: number; stored_raw_bytes?: number }>): void {
+    // Between chunks, before this one is fetched: nothing of it is read or written.
+    if (streamDeadlinePassed(this.deadline)) throw new StreamBudgetError(STREAM_DEADLINE);
     const need = this.bytes + Math.max(entry.bytes, entry.stored_raw_bytes ?? 0);
     if (need > this.limits.maxReadBytes) throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
     if (need > this.peak) this.peak = need;
@@ -238,7 +262,7 @@ export async function streamCanonicalScope(
   version: number,
   fromMs: number,
 ): Promise<StreamedScope> {
-  const meter = new StreamReadMeter(limits);
+  const meter = new StreamReadMeter(limits, deps.deadline);
   const prefix = deps.prefixFor(scope.orgId);
   const userIds = admitted.map(({ manifest }) => manifestUserId(manifest));
   const identities = admitted.map(({ manifest }) => canonicalManifestIdentity(manifest));
