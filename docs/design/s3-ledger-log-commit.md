@@ -380,12 +380,23 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
   a refusal leaves nothing written. The commit-phase re-check runs after the canonical writes, where a skip would strand
   them; it is skipped at apply. `UploadConsentRequired` (a 503 on the request path, where the inbox keeps the bytes for
   a redrive) is a final skip here: the batch's inbox is already retired, and holding the stream would block every later
-  entry behind a consent that may never come. The person's upload reads refused (`upload_consent_required`); a
-  re-upload after they confirm is a fresh admission. Under `INGEST_LEDGER=s3` today `INGEST_UPLOAD_CONSENT` is refused
+  entry behind a consent that may never come. The person's upload reads refused (`upload_consent_required`). A
+  re-upload after they confirm is a fresh admission only under a NEW batch id: the same batch id answers refused (the
+  skip record), and the skip is sticky.
+  - **A skip is sticky** (review P2-1). Before applying a batch the materializer reads its skip record; one that exists
+    (this run or another materializer refused the batch for good) answers skipped whatever the gates say now, and the
+    idempotent finishing steps (refused outcome, admitted retired) run again. So a run that wrote the skip and crashed
+    before the entry's marker, or a second materializer replaying the entry, never writes the batch after a consent is
+    confirmed. The admit-phase gate (after the legacy claim, before any canonical write) reads the skip record once
+    more, so a skip written by another materializer after this run's first read is a retry, and the next run finishes
+    it as skipped. A batch whose payloads mix a capped and an uncapped one is `payload_invalid`. Under `INGEST_LEDGER=s3` today `INGEST_UPLOAD_CONSENT` is refused
   (SQL only), so in practice only the operator cap applies.
   - Tests (`ledger-log-materialize.test.ts`): the cap rides in the payload and refuses at apply with no consent store;
     a hold that lands between the append and the apply skips the batch while an earlier allowed batch is written; a
-    consent store fault is a retry (no skip record, payload kept); a malformed cap is `payload_invalid`.
+    consent store fault is a retry (no skip record, payload kept); a malformed cap, and capped and uncapped payloads
+    in one batch, are `payload_invalid`; a skip survives a crash before the marker and a later consent confirmation;
+    a second materializer whose consent allows the batch never writes it, whether the skip landed before its first
+    read or between that read and its admit gate.
 - **Start from a checkpoint (Remaining 2).** `readEntries(fromSeq)` always reads entry 0 (the mode marker, and the
   `legacyCutover` a checkpoint must match), then tries the checkpoint boundary at or below `fromSeq` and the one before
   it (deterministic keys, no listing of `c/`; a checkpoint PUT is best effort). The first that passes
@@ -408,8 +419,10 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
 - **IAM in the stack (Remaining 10).** `stacks/aws/ledger-log-commit-policy.ts` writes the grants down as statements:
   the consumer (admission and the materializer, one process) GET/PUT on every stream object and the receipt outcomes,
   GET/PUT on the registry, DELETE on payloads and the admitted outcome; the operator tool (a role outside the stack)
-  GET on the legacy batch docs, the log and the markers, PUT on entry 0, `closed.json`, the identity doc and the
-  registry, DELETE on registry docs (the migration), KMS via S3 for those keys. `uploadAdmissionBucketStatements`
+  GET on the legacy batch docs, the log's control objects (entries, checkpoints, head hint, `closed.json`, the identity
+  doc; never the payloads, which hold session records), the registry and the markers, LIST only under the admission
+  inbox and the registry (`s3:prefix`), PUT on entry 0, `closed.json`, the identity doc and the registry, DELETE on
+  registry docs (the migration), KMS via S3 for those keys. `uploadAdmissionBucketStatements`
   appends the consumer's statements only with `ledgerLogCommit` on, and `assertUploadAdmissionInputs` refuses `on`
   (the stack mirrors `ledger_log_commit_unsupported`): default off, the rendered policy is byte-for-byte unchanged.
   The bucket's `OnlyTheEraserDeletes` deny would still refuse the consumer's deletes; the carve-out it needs is named
@@ -429,12 +442,17 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
   - Migration: v1 docs (raw ids in the body, keyed by a hash of the ids) are still listed, once per stream even
     alongside a v2 doc. `migrateLogStreamRegistry` (CLI: `scripts/ledger-log-stream.ts migrate-registry --bucket <b>`,
     dry run unless `--apply`, which needs `--i-know-this-is-not-prod` and a non-production-like bucket name) registers
-    each v1 stream in the v2 layout and then deletes its v1 doc. It is idempotent and resumable. Only the operator tool
+    each v1 stream in the v2 layout and then deletes its v1 doc. A v1 doc whose stream has no entry 0 any more (the
+    user's directory was erased) is deleted WITHOUT re-registering (`dropped`), so the raw ids are never written back
+    into an erased directory; one with ids admission refuses (`assertTenantSegment`, an invalid key) or a log that
+    reads corrupt is left in place and counted `invalid`, never aborting the run. It is idempotent and resumable. Only the operator tool
     and non-production test runs ever wrote v1 docs (log mode never ran in production).
   - Tests (`ledger-log-materialize.test.ts`): the registry doc and key carry no user or origin id and the identity doc
     sits in the user's directory; after that directory is erased, nothing under `.ledger/` names the user or origin and
     the stream is no longer listed; a pointer to another root, outside the inbox, or copied under another key names
-    nothing; the migration's dry run, crash midway (listed once), apply and idempotent re-run. The CLI guard covers
+    nothing, including a copied pointer listed on its own and an identity doc that names another stream than its
+    root; the migration's dry run, crash midway (listed once), apply and idempotent re-run, an erased stream's v1 doc
+    dropped without writing into its directory, and an invalid v1 doc reported while the rest migrate. The CLI guard covers
     `migrate-registry` (`ledger-log-admit.test.ts`).
 
 ## Remaining
@@ -458,8 +476,8 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
    them at one GET each) until retention removes them.
 6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel), reads the legacy batch doc,
    the fence and the shards of its live records; each apply reads the fence once more. Since slice 6 each sweep reads
-   two objects per registered stream (the registry pointer and the identity doc), and an apply with a consent gate
-   reads the consent store once.
+   two objects per registered stream (the registry pointer and the identity doc), and each apply reads the batch's skip
+   record twice (before and at the admit gate) and, with a consent gate, the consent store once.
 7. Closed in slice 5 (the skip record, read before and after the consumer's admitted write). Kept as a number so the
    references stay stable.
 8. Closed in slice 6: a registry doc is a hash-keyed pointer to the stream root, and the ids live in the stream's

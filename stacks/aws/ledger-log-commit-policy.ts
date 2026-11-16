@@ -20,7 +20,9 @@
  *     Its existing UploadAdmissionPromotes grant (GET/PUT on the m=srv_* layout) already covers the GET/PUTs; they are
  *     listed again here so this grant stands on its own if that one narrows.
  *   - the operator tool (scripts/ledger-log-stream.ts, an operator role outside the stack):
- *       GET/LIST the legacy batch docs (`ledger/batches/`, the drain check) and every log object (status);
+ *       GET the legacy batch docs (`ledger/batches/`, the drain check) and the log's control objects (entries,
+ *       checkpoints, the head hint, closed.json, the identity doc; never the payloads p/, which hold session records);
+ *       LIST only under the admission inbox and the registry (an s3:prefix condition);
  *       PUT entry 0 (e/), closed.json, the identity doc, the registry; DELETE registry docs (the v1 registry migration);
  *       GET the deployment markers `.ledger/log-commit-on.json` and `.ledger/log-mode-nonprod.json`;
  *       KMS GenerateDataKey/Decrypt via S3 for those keys.
@@ -48,6 +50,10 @@ export const LEDGER_LOG_OUTCOMES = `${TENANT_KEY_BASE}/.admission-inbox/*/v1/ws=
 export const LEDGER_LOG_ADMITTED_OUTCOMES = `${TENANT_KEY_BASE}/.admission-inbox/*/v1/ws=*/m=srv_*/r=*/outcome-admitted.json`;
 /** The legacy batch docs the operator's drain check reads (ledger-s3.ts s3LedgerKeys.batch). */
 export const LEDGER_LOG_LEGACY_BATCHES = `${LEDGER_LOG_USER_DIR}/ledger/batches/*`;
+/** The log's control objects the operator tool reads (status, the switch, the close, the migration): never p/. */
+export const LEDGER_LOG_OPERATOR_READS = ["e/*", "c/*", "head.json", "closed.json", "stream.json"].map((x) => `${LEDGER_LOG_USER_DIR}/ledger/log/*/${x}`);
+/** The prefixes the operator tool lists (s3:prefix): the user directories (entries, markers, batch docs) and the registry. */
+export const LEDGER_LOG_OPERATOR_LIST_PREFIXES = [`${TENANT_KEY_BASE}/.admission-inbox/*`, `${TENANT_KEY_BASE}/.ledger/log-streams*`] as const;
 /** The operator-written deployment markers (ledger-log-stream-ops.ts logCommitProofKey, logModeNonProdKey). */
 export const LEDGER_LOG_MARKERS = [`${TENANT_KEY_BASE}/.ledger/log-commit-on.json`, `${TENANT_KEY_BASE}/.ledger/log-mode-nonprod.json`] as const;
 /** What OnlyTheEraserDeletes must exempt for log mode (see the header): payloads, the admitted outcome, the registry. */
@@ -72,23 +78,24 @@ export function ledgerLogOperatorStatements(i: { bucketArn: string; operatorRole
   const Principal = { AWS: i.operatorRoleArn };
   const o = (glob: string) => `${i.bucketArn}/${glob}`;
   return [
-    { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn },
+    { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn,
+      Condition: { StringLike: { "s3:prefix": [...LEDGER_LOG_OPERATOR_LIST_PREFIXES] } } },
     { Sid: "LedgerLogOperatorReads", Effect: "Allow" as const, Principal, Action: ["s3:GetObject"],
-      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), o(LEDGER_LOG_OBJECTS), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
+      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
     { Sid: "LedgerLogOperatorWrites", Effect: "Allow" as const, Principal, Action: ["s3:PutObject"],
       Resource: [o(LEDGER_LOG_ENTRIES), o(LEDGER_LOG_CLOSED), o(LEDGER_LOG_IDENTITY), o(LEDGER_LOG_REGISTRY)] },
     { Sid: "LedgerLogOperatorMigratesRegistry", Effect: "Allow" as const, Principal, Action: ["s3:DeleteObject"], Resource: [o(LEDGER_LOG_REGISTRY)] },
   ];
 }
 
-/** The operator's key statement: data keys and decrypt via S3, this bucket's log objects and markers only. */
+/** The operator's key statement: data keys and decrypt via S3, the objects it reads or writes only (never payloads). */
 export function ledgerLogOperatorKeyStatement(i: { region: string; accountId: string; bucketName: string; operatorRoleArn: string }) {
   const arn = (glob: string) => `arn:aws:s3:::${i.bucketName}/${glob}`;
   return {
     Sid: "LedgerLogOperatorViaS3", Effect: "Allow" as const, Principal: { AWS: i.operatorRoleArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*",
     Condition: {
       StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
-      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), arn(LEDGER_LOG_OBJECTS), arn(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(arn)] },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(arn), arn(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(arn)] },
     },
   };
 }

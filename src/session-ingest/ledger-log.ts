@@ -327,6 +327,14 @@ async function* replay(store: ObjectStore, state: LogState): AsyncGenerator<LogE
   }
 }
 
+/**
+ * Whether the stream is in log mode (entry 0 exists), concurrency-safe as readZero: false for a stream with no entries
+ * at all, LogCorrupt when entries exist without entry 0.
+ */
+export async function logModeMarker(store: ObjectStore, keys: LogKeys): Promise<boolean> {
+  return (await readZero(store, keys)) !== undefined;
+}
+
 // ---- open / replay ----
 
 function opened(keys: LogKeys, zero: Uint8Array): LogState {

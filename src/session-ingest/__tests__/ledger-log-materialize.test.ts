@@ -488,6 +488,81 @@ describe("Remaining 1: consent re-checked at apply time", () => {
     expect((await keysUnder(store, logKeys(ROOT, TENANT, ORIGIN).payloads)).length).toBe(1);
   });
 
+  test("a consent skip is sticky: a run that crashed before its marker never applies the batch after consent is confirmed", async () => {
+    const { MemoryConsentStore } = await import("../upload-consent.ts");
+    const store = await fresh();
+    const consent = new MemoryConsentStore();
+    await consent.apply(TENANT, { mode: "all", confirmOrigins: [ORIGIN] }, { trusted: true, nowMs: T0 });
+    consent.hold(TENANT);
+    await admitted(store, "b1", "r1");
+    // Run 1 refuses (held), writes the skip record and the refused outcome, then dies before the entry's marker.
+    const noMarks: ObjectStore = new Proxy(store, { get(t, prop, r) {
+      const v = Reflect.get(t, prop, r);
+      if (prop !== "put") return typeof v === "function" ? v.bind(t) : v;
+      return async (...args: unknown[]) => { const m = /\/m\/(\d{20})\.json$/.exec(String(args[0])); if (m && Number(m[1]) >= 2) throw new Error("process died before the marker"); return v.apply(t, args); };
+    } });
+    const config = { enforcement: "enforce" as const, store: consent, nowMs: () => T0 };
+    await expect((await materializer(noMarks, config)).materialize(TENANT, ORIGIN)).rejects.toThrow("process died before the marker");
+    expect(await exists(store, logKeys(ROOT, TENANT, ORIGIN).skipped("b1"))).toBe(true);
+    // Consent confirmed; run 2 replays the entry: still skipped, never written.
+    await consent.apply(TENANT, { releaseHold: true }, { trusted: true, nowMs: T0 });
+    expect((await (await materializer(store, config)).materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:upload_consent_required"]);
+    expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
+  });
+
+  test("two materializers: one skips; the other, whose consent allows it, never writes the batch (before its first read or after it)", async () => {
+    const { MemoryConsentStore } = await import("../upload-consent.ts");
+    const { writeLogSkip } = await import("../ledger-log-materialize.ts");
+    const { ObjectStoreError: OSE } = await import("../../shared/vendor.ts");
+    const allow = new MemoryConsentStore();
+    await allow.apply(TENANT, { mode: "all", confirmOrigins: [ORIGIN] }, { trusted: true, nowMs: T0 });
+    const config = { enforcement: "enforce" as const, store: allow, nowMs: () => T0 };
+    // (a) The other materializer skipped (and crashed before its marker) before this one read anything.
+    let store = await fresh();
+    await admitted(store, "b1", "r1");
+    await writeLogSkip(store, logKeys(ROOT, TENANT, ORIGIN), "b1", "upload_consent_required", T0);
+    expect((await (await materializer(store, config)).materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:upload_consent_required"]);
+    expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
+    // (b) The skip lands between this one's first read (absent) and its admit gate: a retry, nothing written, then skipped.
+    store = await fresh();
+    await admitted(store, "b1", "r1");
+    const skipKey = logKeys(ROOT, TENANT, ORIGIN).skipped("b1");
+    let reads = 0;
+    const racing: ObjectStore = new Proxy(store, { get(t, prop, r) {
+      const v = Reflect.get(t, prop, r);
+      if (prop !== "getObject") return typeof v === "function" ? v.bind(t) : v;
+      return async (...args: unknown[]) => {
+        if (String(args[0]) === skipKey && reads++ === 0) {
+          await writeLogSkip(store, logKeys(ROOT, TENANT, ORIGIN), "b1", "upload_consent_required", T0);
+          throw new OSE("not_found", "fs", "absent at the first read");
+        }
+        return v.apply(t, args);
+      };
+    } });
+    await expect((await materializer(racing, config)).materialize(TENANT, ORIGIN)).rejects.toThrow();
+    expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
+    expect((await (await materializer(racing, config)).materialize(TENANT, ORIGIN)).outcomes).toEqual(["skipped:upload_consent_required"]);
+    expect([...(await readSide(store)).keys()].some((k) => k.includes("/s=sess-r1/"))).toBe(false);
+  });
+
+  test("a batch mixing a capped and an uncapped payload is refused as payload_invalid", async () => {
+    const store = await fresh();
+    await admitted(store, "b1", "r1", { mode: "selected" });
+    const keys = logKeys(ROOT, TENANT, ORIGIN);
+    // Rewrite the entry's batch with a second, uncapped payload (a hand-built entry: admission never writes one).
+    const [b] = batchesIn(await entries(store));
+    const p = await json(store, b!.payloads[0]!.key);
+    const { consentCap: _cap, ...uncapped } = p;
+    void _cap;
+    const { putPayload, appendBatches, openStream } = await import("../ledger-log.ts");
+    const capped = await putPayload(store, keys, new TextEncoder().encode(JSON.stringify({ ...p, attempt: "second" })));
+    const ref = await putPayload(store, keys, new TextEncoder().encode(JSON.stringify(uncapped)));
+    const s = (await openStream(store, keys))!;
+    await appendBatches(store, s, [{ ...b!, batchId: "b2", payloads: [capped, ref] }], null, { writer: "w_test", now: () => T0 });
+    const r = await (await materializer(store)).materialize(TENANT, ORIGIN);
+    expect(r.outcomes).toEqual(["skipped:upload_consent_required", "skipped:payload_invalid"]);
+  });
+
   test("a malformed cap in the payload is refused as payload_invalid", async () => {
     const store = await fresh();
     await admitted(store, "b1", "r1");
@@ -555,6 +630,16 @@ describe("Remaining 8: the stream registry holds no raw user or origin id outsid
     await putJson(store, key, { v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
     await putJson(store, `${logStreamsRoot(ROOT)}${"e".repeat(40)}.json`, { v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
     expect(await streams(store)).toEqual([{ tenant: TENANT, originId: ORIGIN }]);
+    // A copied pointer listed ON ITS OWN (the original gone): the key binding refuses it.
+    await store.delete(objectKey(key));
+    expect(await streams(store)).toEqual([]);
+    // The original back, but the identity doc in its root names ANOTHER stream: the root binding refuses it.
+    await store.delete(objectKey(`${logStreamsRoot(ROOT)}${"e".repeat(40)}.json`));
+    await putJson(store, key, { v: 2, root: logKeys(ROOT, TENANT, ORIGIN).root });
+    await putJson(store, logKeys(ROOT, TENANT, ORIGIN).identity, { v: 1, ...TENANT, originId: "origin-other" });
+    expect(await streams(store)).toEqual([]);
+    await putJson(store, logKeys(ROOT, TENANT, ORIGIN).identity, { v: 1, ...TENANT, userId: "user-2", originId: ORIGIN });
+    expect(await streams(store)).toEqual([]);
   });
 
   test("migration: v1 docs are read until rewritten; dry run writes nothing; apply rewrites, deletes them and is idempotent", async () => {
@@ -562,23 +647,52 @@ describe("Remaining 8: the stream registry holds no raw user or origin id outsid
     const store = fresh();
     const O2 = "origin-2";
     const v1 = (originId: string) => ({ v: 1, orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, userId: TENANT.userId, originId });
+    for (const o of [ORIGIN, O2]) await enableLogMode(store, logKeys(ROOT, TENANT, o), null, { writer: "operator", now: () => T0 });
     await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, ORIGIN), v1(ORIGIN));
     await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, O2), v1(O2));
     const listed = async () => (await streams(store)).map((s) => s.originId).sort();
     expect(await listed()).toEqual([ORIGIN, O2]);
-    expect(await migrateLogStreamRegistry(store, ROOT, { apply: false })).toEqual({ legacy: 2, migrated: 0 });
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: false })).toEqual({ legacy: 2, migrated: 0, dropped: 0, invalid: 0 });
     expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(false);
     // A crash mid-migration (one stream registered in v2, its v1 doc not yet deleted) lists it once.
     const { registerLogStream } = await import("../ledger-log-materialize.ts");
     await registerLogStream(store, ROOT, TENANT, ORIGIN);
     expect(await listed()).toEqual([ORIGIN, O2]);
-    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 2, migrated: 2 });
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 2, migrated: 2, dropped: 0, invalid: 0 });
     for (const o of [ORIGIN, O2]) {
       expect(await exists(store, legacyLogStreamRegistryKey(ROOT, TENANT, o))).toBe(false);
       expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, o))).toBe(true);
       expect(await exists(store, logKeys(ROOT, TENANT, o).identity)).toBe(true);
     }
     expect(await listed()).toEqual([ORIGIN, O2]);
-    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 0, migrated: 0 });
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 0, migrated: 0, dropped: 0, invalid: 0 });
+  });
+
+  test("migration: a v1 doc for an erased stream (no entry 0) is deleted, never re-registered into the erased directory", async () => {
+    const { legacyLogStreamRegistryKey, logStreamRegistryKey, migrateLogStreamRegistry } = await import("../ledger-log-materialize.ts");
+    const { admissionUserDir } = await import("../async-admission.ts");
+    const store = fresh();
+    const key = legacyLogStreamRegistryKey(ROOT, TENANT, ORIGIN);
+    await putJson(store, key, { v: 1, ...TENANT, originId: ORIGIN });
+    // Dry run: reported, nothing deleted or written.
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: false })).toEqual({ legacy: 1, migrated: 0, dropped: 1, invalid: 0 });
+    expect(await exists(store, key)).toBe(true);
+    expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: 1, migrated: 0, dropped: 1, invalid: 0 });
+    expect(await exists(store, key)).toBe(false);
+    expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(false);
+    expect(await keysUnder(store, admissionUserDir(ROOT, TENANT) + "/")).toEqual([]);
+  });
+
+  test("migration: a v1 doc with ids admission refuses is reported and left in place; the run still migrates the rest", async () => {
+    const { legacyLogStreamRegistryKey, logStreamRegistryKey, logStreamsRoot, migrateLogStreamRegistry } = await import("../ledger-log-materialize.ts");
+    const store = fresh();
+    await enable(store);
+    await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, ORIGIN), { v: 1, ...TENANT, originId: ORIGIN });
+    const bad = `${logStreamsRoot(ROOT)}${"b".repeat(40)}.json`;
+    await putJson(store, bad, { v: 1, orgId: "../escape", workspaceId: TENANT.workspaceId, userId: TENANT.userId, originId: ORIGIN });
+    for (let i = 0; i < 2; i++)
+      expect(await migrateLogStreamRegistry(store, ROOT, { apply: true })).toEqual({ legacy: i === 0 ? 2 : 1, migrated: i === 0 ? 1 : 0, dropped: 0, invalid: 1 });
+    expect(await exists(store, bad)).toBe(true);
+    expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(true);
   });
 });
