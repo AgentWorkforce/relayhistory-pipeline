@@ -11,11 +11,11 @@ import {
 import {
   normalizeRelayhistoryRecords,
   isLegacyRelayhistoryRecord,
-  RELAYHISTORY_LEGACY_MACHINE_ID,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
+import { legacyMachineId } from "../shared/legacy-export-machine.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
 import {
   chunkKeys,
@@ -566,8 +566,9 @@ export async function readCanonicalScope(
   // manifest per scope that the legacy exporter wrote itself: the export marker,
   // raw owner `migration:{grant}`, a single `initial` epoch (no adopted or client
   // courier chunks), the dedicated legacy machine, and nothing but legacy records.
-  // Anything else refuses the read; a forged or stale copy can neither replace
-  // content nor silently empty the legacy rows.
+  // Anything else drops only legacy evidence. Live canonical rows remain complete;
+  // a forged or stale legacy copy can neither replace content nor make the whole
+  // session unavailable.
   {
     const legacyParts = parts.filter((p) =>
       p.records.some(isLegacyRelayhistoryRecord),
@@ -581,18 +582,29 @@ export async function readCanonicalScope(
         m.raw.owner === `migration:${marker.grant_id}` &&
         m.raw.epochs.length === 1 &&
         m.raw.epochs[0]!.reason === "initial" &&
-        canonicalManifestIdentity(m).machineId === RELAYHISTORY_LEGACY_MACHINE_ID
+        canonicalManifestIdentity(m).machineId ===
+          legacyMachineId(m.session.workspace_id, manifestUserId(m))
+      );
+    };
+    const inScope = (r: RelayhistoryStreamRecord) => {
+      const p = r.payload;
+      return (
+        p?.org_id === scope.orgId &&
+        p.workspace_id === scope.workspaceId &&
+        p.source === scope.harness &&
+        p.session_id === scope.sessionId
       );
     };
     if (
       legacyParts.length > 1 ||
       legacyParts.some(
         (p) =>
-          !owned(p.manifest) || !p.records.every(isLegacyRelayhistoryRecord),
+          !owned(p.manifest) ||
+          !p.records.every(
+            (r) => isLegacyRelayhistoryRecord(r) && inScope(r),
+          ),
       )
     ) {
-      complete = false;
-      reasons.push("legacy_provenance");
       for (const p of legacyParts)
         p.records = p.records.filter((r) => !isLegacyRelayhistoryRecord(r));
     }

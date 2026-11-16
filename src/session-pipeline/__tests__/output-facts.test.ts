@@ -100,6 +100,24 @@ describe("outputFactsFromScope", () => {
     expect(f.complete).toBe(false);
     expect(f.reasons).toContain("output_facts_legacy_invalid");
   });
+  test("a rejected legacy row or missing coverage marker makes facts incomplete", () => {
+    const rejected = outputFixture();
+    const turn = rejected.records.find(
+      (r) => r.kind === "legacy_conversation_turn",
+    )!;
+    turn.payload = { ...turn.payload!, actor_role: 7 };
+    let facts = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, rejected, 1);
+    expect(facts.complete).toBe(false);
+    expect(facts.reasons).toContain("output_facts_legacy_invalid");
+
+    const uncovered = outputFixture();
+    uncovered.records = uncovered.records.filter(
+      (r) => r.kind !== "legacy_scope",
+    );
+    facts = outputFactsFromScope(OUTPUT_FIXTURE_SCOPE, uncovered, 1);
+    expect(facts.complete).toBe(false);
+    expect(facts.reasons).toContain("output_facts_legacy_invalid");
+  });
   test("P1-c: a bad legacy or event timestamp marks the facts inexact and never throws", () => {
     const fx = outputFixture();
     const outcome = fx.records.find((r) => r.kind === "legacy_session_outcome")!;

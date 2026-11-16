@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { CONFIRMATION, parseUserEraseRequest, runUserErase, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
 import { exitCodeForError, exitCodeForResult, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
+import { LEGACY_EXPORT_ORIGIN_ID } from "../../shared/legacy-export-machine.ts";
 
 const code = (f: () => unknown) => { try { f(); return null; } catch (e) { return e instanceof UserEraseRefused ? e.code : String(e); } };
 const good = { request_id: "dsr-1", org_id: "org-a", workspace_id: "ws-a", user_id: "user-1", confirmation: CONFIRMATION };
@@ -36,13 +37,23 @@ describe("user-erase entry", () => {
   test("prefixes: the four layouts per origin, each under the user's own machine id", () => {
     const req = { requestId: "r", orgId: "org-a", workspaceId: "ws-a", userId: "user-1" };
     const m = liveMachineId("ws-a", "o1", "user-1");
+    const legacy = liveMachineId("ws-a", LEGACY_EXPORT_ORIGIN_ID, "user-1");
     expect(userErasePrefixes("96bulls", req, ["o1"])).toEqual([
       `96bulls/org-a/buffered-batches/v1/ws=ws-a/m=${m}/`,
       `96bulls/org-a/live-batches/v1/ws=ws-a/m=${m}/`,
       `96bulls/org-a/v1/ws=ws-a/m=${m}/`,
       `96bulls/org-a/live-sessions/v1/ws=ws-a/m=${m}/`,
+      `96bulls/org-a/buffered-batches/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/live-batches/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/live-sessions/v1/ws=ws-a/m=${legacy}/`,
     ]);
-    expect(userErasePrefixes("96bulls", req, [])).toEqual([]);
+    expect(userErasePrefixes("96bulls", req, [])).toEqual([
+      `96bulls/org-a/buffered-batches/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/live-batches/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/v1/ws=ws-a/m=${legacy}/`,
+      `96bulls/org-a/live-sessions/v1/ws=ws-a/m=${legacy}/`,
+    ]);
     expect(liveMachineId("ws-a", "o1", "user-2")).not.toBe(m);
   });
 
