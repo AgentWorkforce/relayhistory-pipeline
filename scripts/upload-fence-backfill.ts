@@ -28,7 +28,7 @@
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
-import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
+import { assertLedgerHomeGuardValid, assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
 import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
 
@@ -135,6 +135,8 @@ if (import.meta.main) {
   try {
     const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     if (!accessKeyId || !secretAccessKey) throw new Error("aws_credentials_required");
+    // A bad INGEST_LEDGER_HOME_GUARD refuses before the database or stdin is touched (ledger_home_guard_invalid).
+    assertLedgerHomeGuardValid();
     const line = readFileSync(0, "utf8").split("\n")[0] ?? "";
     if (line.length > 64 * 1024) throw new Error("stdin_too_large");
     let parsed: unknown;

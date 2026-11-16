@@ -786,6 +786,26 @@ describe("re-arm sweeper with a separate ledger bucket (INGEST_REARM_LEDGER_BUCK
     await expect(runRearmSweeperPass({ ...ENTRY_ENV, INGEST_LEDGER_HOME_GUARD: "x" }, [], overrides)).rejects.toMatchObject({ code: "config_invalid" });
   });
 
+  test("the ledger store is built with the ledger's own bucket, region and endpoint, never the transcripts store's", async () => {
+    const main = fresh(), ledger = fresh();
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), home("ledger-b"));
+    const configs: Record<string, unknown>[] = [];
+    const store = (c: { bucket: string; region: string; endpoint?: string }) => {
+      configs.push({ bucket: c.bucket, region: c.region, endpoint: c.endpoint });
+      return c.bucket === "ledger-b" ? ledger : main;
+    };
+    const env = { ...ENV, INGEST_REARM_ENDPOINT: "https://transcripts.s3.example", INGEST_REARM_LEDGER_ENDPOINT: "https://ledger.s3.example" };
+    await runRearmSweeperPass(env, [], { store, eraser: () => storeEraser(main), now: LATER } as never);
+    expect(configs).toEqual([
+      { bucket: "transcripts", region: "us-east-1", endpoint: "https://transcripts.s3.example" },
+      { bucket: "ledger-b", region: "us-west-2", endpoint: "https://ledger.s3.example" },
+    ]);
+    // No ledger endpoint and no transcripts endpoint: AWS S3 in the ledger's region (no endpoint carried over).
+    configs.length = 0;
+    await runRearmSweeperPass(ENV, [], { store, eraser: () => storeEraser(main), now: LATER } as never);
+    expect(configs[1]).toEqual({ bucket: "ledger-b", region: "us-west-2", endpoint: undefined });
+  });
+
   test("a position saved before the switch (a plain listing cursor) restarts its scope instead of failing every pass", async () => {
     const main = fresh(), ledger = fresh(), routed = ledgerRoutedStore(main, ledger, ROOT);
     await rearmed(routed, TENANT, "b1");

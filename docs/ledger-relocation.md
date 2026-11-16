@@ -62,7 +62,13 @@ marker, and the result is cached with it for 60 s per org:
     - `ledger_home_moved`: a valid marker names another bucket.
     - `ledger_home_invalid`: the marker body is bad.
     - `access_denied`: a 403.
-    - `ledger_home_unavailable`: anything else. This one is retryable.
+    - `ledger_home_unavailable`: a transient failure (5xx, 429, 408, or a
+      network, connection or timeout error). Run the tool again.
+    - `ledger_home_store_error`: any other store error, such as a
+      wrong-region 400, a 301, an invalid key or an unsupported operation.
+      Not retryable as-is: fix the bucket, region or endpoint.
+    - `ledger_home_guard_invalid`: the flag is neither `on` nor `off`. The
+      tool refuses before making any request.
 
 ## Encryption
 
@@ -80,6 +86,10 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
 
 0. **Before the window.** Turn on `INGEST_LEDGER_HOME_GUARD=on`:
    - Deploy it to the ingest edge (chart `ingestEdge.ledgerHomeGuard: true`).
+     That value and `ingestEdge.ledgerBucket` come from the infra chart change
+     on branch `feat/ingest-ledger-bucket` (sessions-pipeline chart 0.8.44,
+     agent-relay 0.7.41). They are not on any released chart yet; until that
+     lands, the edge cannot be configured for steps 0 and 6 through the chart.
    - Optionally deploy it to the sweeper, if its role can read the marker.
    - Export it in every shell that runs the operator tools above.
 
@@ -95,13 +105,17 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
    - Disable the hosted upload-admission Lambda if it is deployed (reserved
      concurrency 0).
    - Stop the re-arm sweeper (suspend its CronJob or scale its Deployment to 0).
-     The hosted re-arm sweeper Lambda (`rearm-sweeper-lambda.ts`) is
-     unsupported with a ledger bucket. Its code reads the same environment, but its stack environment cannot set `INGEST_REARM_LEDGER_BUCKET`, so it would sweep only the stale copies.
+     The hosted re-arm sweeper Lambda (`rearm-sweeper-lambda.ts`) is not
+     supported here; disable it.
      Disable it too, and leave it disabled.
    - Do not run any other single-bucket ledger tool against this key root:
      `scripts/buffered-drain.ts`, `upload-fence-backfill.ts`,
      `ledger-reshard-revisions.ts` or `ledger-log-stream.ts`. After step 5
-     they refuse on their own (`ledger_home_moved`).
+     they refuse on their own (`ledger_home_moved`), but only in a shell or
+     Job with `INGEST_LEDGER_HOME_GUARD=on`. Without the flag they read no
+     marker and would write the stale copies. The check stays flag-gated, so
+     the flag remains required in every tool shell and Job after the move,
+     not just during the window.
    - Desktop uploads keep landing in the upload inbox and wait there.
 2. **`plan`.** This is read-only. Check that the source counts match what you
    expect, that the destination is empty, and that the stop is present.
@@ -121,8 +135,11 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
      `switch --confirm --side destination`, which refuses unless the source
      already names the destination.
 6. **Reconfigure and resume.**
-   - Deploy the edge with `INGEST_LEDGER_BUCKET` / `INGEST_LEDGER_REGION`, and
-     the sweeper with `INGEST_REARM_LEDGER_BUCKET` / `_REGION`. Startup proves
+   - Deploy the edge with `INGEST_LEDGER_BUCKET` / `INGEST_LEDGER_REGION`
+     (chart `ingestEdge.ledgerBucket.{bucket,region}`, from the same
+     unreleased infra chart change as step 0), and the sweeper with
+     `INGEST_REARM_LEDGER_BUCKET` / `_REGION` (the same chart value renders
+     them). Startup proves
      conditional writes on the ledger bucket.
    - Leave the hosted upload-admission Lambda disabled: it refuses
      `INGEST_LEDGER_BUCKET` and cannot carry the guard.
@@ -140,7 +157,10 @@ Before step 6, roll back by deleting both home markers. The Locker bucket was
 never written, apart from its marker. After resuming on the new bucket, roll back
 by running the same steps with `--direction back`. Run `copy` with
 `--replace-stale`, because the Locker bucket still holds the pre-move copies.
-Then run `switch --direction back`, and deploy without the settings. If the Job cannot write the Locker bucket, use `switch --direction back --side source`, then write the Locker bucket's marker by hand, naming the Locker bucket.
+Then run `switch --direction back`, and deploy without the settings. If the
+Job cannot write the Locker bucket, use `switch --direction back --side
+source`, then write the Locker bucket's marker by hand, naming the Locker
+bucket.
 
 The pre-move copies in the Locker bucket are inert: the routed store never
 lists or reads them, and the moved marker refuses any edge that would. Delete
