@@ -2468,13 +2468,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
+    const TG = "upstream:20261105062020_turns_forward_gates.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2527,18 +2528,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     };
     // Turns gates is newest. Its rollback refuses while privacy state exists, then
     // removes only its own objects and exposes the per-origin claim fence as newest.
-    const TG = "upstream:20261105062010_turns_forward_gates.sql";
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','live')");
-    expect((await failure(rollback("20261105062010_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.turn_session_fences")).toBe("sessions.turn_session_fences");
     await db.query("DELETE FROM sessions.turn_session_fences WHERE org_id='rollback-org'");
-    await rollback("20261105062010_turns_forward_gates.down.sql");
+    await rollback("20261105062020_turns_forward_gates.down.sql");
     expect(await names()).not.toContain(TG);
     expect(await relation("sessions.turn_session_fences")).toBeNull();
     expect(await relation("sessions.turn_writers")).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_capability(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_register(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
-    expect((await failure(rollback("20261105062010_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");

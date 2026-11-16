@@ -1,4 +1,4 @@
--- Drops the 20261105062010 turns forward gates functions, triggers, tables and
+-- Drops the 20261105062020 turns forward gates functions, triggers, tables and
 -- ledger row. Guard, object removal and ledger removal are one transaction
 -- under the migrator lock. On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
@@ -7,10 +7,10 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: migration ledger required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062010_turns_forward_gates.sql')
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062020_turns_forward_gates.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_turns_forward_gates.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'bc2d66d469510bd37fe44b836227db644e054bf89a3c3acf038dbfdcc28a2947'
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_turns_forward_gates.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha<>'08ba3e772d0752494b041206f8c1bd273032e551064e04e7ed15fc962ca3d958'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.turn_session_fences) OR EXISTS(SELECT 1 FROM sessions.turn_writers)
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns forward gates: privacy state must be preserved';END IF;
@@ -26,5 +26,5 @@ DROP FUNCTION sessions.ingest_turn_capture_erasure();
 DROP FUNCTION sessions.ingest_turn_materialize_fence(text,text,text,text);
 DROP TABLE sessions.turn_writers;
 DROP TABLE sessions.turn_session_fences;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062010_turns_forward_gates.sql';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_turns_forward_gates.sql';
 COMMIT;

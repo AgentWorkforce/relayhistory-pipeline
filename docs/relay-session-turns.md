@@ -44,7 +44,7 @@ Khaliq's explicit approval. In order:
    live-revision rule. Cloud refuses a non-empty `forward` write before Neon or ingest unless
    `SESSION_READ_BACKEND=canonical`, so a misordered writer flip cannot acknowledge an invisible
    turn.
-2. **Erasure fence off Neon.** Migration `20261105062010_turns_forward_gates.sql` adds the permanent
+2. **Erasure fence off Neon.** Migration `20261105062020_turns_forward_gates.sql` adds the permanent
    logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
    under a per-logical-session transaction advisory lock shared with erasure capture, then attests
    the completed registration with `X-Relay-Turn-Fence: registered-v1`; relayhistory-cloud refuses

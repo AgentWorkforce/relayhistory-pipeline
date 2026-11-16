@@ -12,6 +12,11 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||
   CASE WHEN current_setting('server_version_num')::int>=170000 THEN ',MAINTAIN' ELSE '' END;
 BEGIN
+ -- Allowed only after 062010. The same verifier must pass before that migration
+ -- and again after its guarded rollback.
+ v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn
+  WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT IN(
+   'sessions.ingest_turn_capability(jsonb)','sessions.ingest_turn_register(jsonb)'));
  -- Allowed, not required: the verifier also passes before 20261105043910 is applied.
  v_allowed:=array_remove(v_allowed,CASE WHEN to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NULL THEN 'sessions.ingest_selfhost_set_session_uploads(jsonb)' END);
  -- Allowed, not required: the operator erase entry points (before 20261105050000 is applied).

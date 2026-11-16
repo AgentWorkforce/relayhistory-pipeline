@@ -1,11 +1,11 @@
-/** Lane: relay turn forward activation gates (slot 062010). */
+/** Lane: relay turn forward activation gates (slot 062020). */
 import type { LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105062010_turns_forward_gates.sql";
+const MIGRATION = "supabase/migrations/20261105062020_turns_forward_gates.sql";
 
 export const turnsForwardGates: LaneManifest = {
   lane: "turns-forward-gates",
-  owner: "relay turn cross-origin fence, capability and source discovery (slot 062010)",
+  owner: "relay turn cross-origin fence, capability and source discovery (slot 062020)",
   migration: MIGRATION,
   prefixes: [
     "sessions.ingest_turn_",

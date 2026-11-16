@@ -1,4 +1,4 @@
--- SLOT 062010. Relay turns forward activation gates. Code only: applying this migration,
+-- SLOT 062020. Relay turns forward activation gates. Code only: applying this migration,
 -- importing the legacy fence census, enabling publication, or changing any runtime flag each
 -- requires Khaliq's separate explicit approval.
 --
