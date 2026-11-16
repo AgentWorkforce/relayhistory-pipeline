@@ -22,17 +22,30 @@ without Khaliq's explicit words for that exact run. Design and gate status:
   - It refuses anything else, including `neondb_owner`.
 - **Privacy role.**
   - Use a SELECT-only direct connection that can read
-    `session_erasure_receipts`, `upload_deletions`, and
-    `turn_session_fences`, and `operator_user_erasures`. The turns-forward
-    migration that creates `turn_session_fences` must already be applied; a
-    missing relation is a hard refusal, never an empty fence set.
+    `session_erasure_receipts`, `upload_deletions`, `upload_resets`,
+    `turn_session_fences`, and `operator_user_erasures`. Migration
+    `20261105062010_turns_forward_gates.sql`, which creates
+    `turn_session_fences`, must already be landed and applied; a missing
+    relation is a hard refusal, never an empty fence set.
   - Poolers, including port 6543, and roles with ledger write privileges are
-    refused.
+    refused. The runner also refuses active row-level security on any privacy
+    table: a policy-less SELECT under RLS would hide every fence. Creating this
+    dedicated role, changing grants, or granting `BYPASSRLS` is an IAM change
+    and needs Khaliq's explicit approval; do not make it as part of a run.
   - The exporter holds the operator-erasure advisory locks shared across each
-    object write and rechecks session receipts, upload deletions, turn-session
-    fences and user erasures before checkpointing.
+    object write and rechecks session receipts, upload deletions/resets,
+    turn-session fences and user erasures before checkpointing. It overrides
+    the privacy connection's idle-in-transaction timeout for the bounded scope
+    and aborts the whole run if that connection or transaction is lost.
+  - The shared global privacy lock is held for one scope's Neon read and S3
+    write. A queued exclusive erase can in turn delay later ingest/export shared
+    lock requests. Run only in the approved window, keep scopes bounded, and
+    stop if an erase is queued rather than increasing lock timeouts.
 - **S3 key.** Use the transcript **writer/exporter** key (the same one as neon-s3-sync), never the eraser key. The store is wrapped write-only.
 - **Checkpoint.** It lives at `~/.agent-tmp/legacy-export/state.sqlite` (override with `--state=`). It holds cursors, scope keys, fingerprints and manifest keys; no secrets, no content. Keep it: it makes runs resumable and is the input to `--verify`.
+  A checkpoint created before user-scoped legacy machines were introduced is
+  refused if it retains a manifest without `user_id`; its exact old object and
+  pointer need separately approved cleanup before starting a fresh checkpoint.
 
 The secrets pipe used below: substitute the real 1Password item paths, and add `op read …/session-token` as line 5 if the key is temporary.
 
@@ -91,6 +104,10 @@ Each org prints one `org plan` line:
 
 Compare `rows` with the step 0 per-org counts. They are equal unless `--since`/`--until` are used.
 
+Do not proceed from plan to export until the turns-forward migration above is
+present in the live privacy database and the privacy preflight confirms all
+five tables are fully visible without active RLS.
+
 ## 2. Export the canary, then all orgs
 
 ```sh
@@ -123,7 +140,9 @@ For each exported scope the verifier:
 The report is one JSON line:
 `{ok, scopes, mismatched, statuses, unboundTurns, unexplained, privacyFenced}` (ids and
 digests, no content). Failed statuses and unbound turns make `ok:false`;
-privacy-fenced scopes are reported.
+privacy-fenced scopes are reported. Any failed or fenced checkpoint row that
+retains a manifest key also makes `ok:false`: it is an object-cleanup
+obligation, not an explained skip.
 
 The Neon side of (a) is `NEON_SCOPE_SQL` in `src/migration/legacy-export/runner.ts`. For each table it runs:
 
@@ -182,3 +201,11 @@ immediately, and canonical reads/output facts consume admitted legacy evidence.
 Rollback therefore requires a separately approved erase of the exact
 user-scoped `m=srv_…` prefixes plus pointer-tombstone verification. Never run
 that erase from this exporter.
+
+The same rule applies when a deletion/reset wins the final privacy recheck:
+the object PUT has already completed. The runner aborts, records
+`failed:legacy_privacy_race` plus the written manifest key, and verification
+stays red. With Khaliq's separate approval, use the production eraser to delete
+that exact manifest, its raw chunks, and its indexed pointer, verify fresh
+list/read absence, then resume with `--refresh`. The exporter deliberately has
+write-only transcript credentials and cannot perform this cleanup itself.

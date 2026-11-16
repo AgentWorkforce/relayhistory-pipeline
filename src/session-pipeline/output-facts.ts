@@ -235,7 +235,8 @@ function legacyAndTurns(records: RelayhistoryStreamRecord[], scope: OutputFactsS
     for (const [sessionId, list] of bySession) {
       const identity = { orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionId };
       const legacy = canonicalLegacy(list, identity);
-      if (legacy.rejected > 0 || legacy.coverage === null)
+      const hasLegacyEvidence = list.some((r) => r.kind.startsWith("legacy_"));
+      if (legacy.rejected > 0 || (hasLegacyEvidence && legacy.coverage === null))
         return { rows: [], ok: false };
       rows.push(...mergeTurnRows(legacy.rows, canonicalLiveTurns(list, identity)));
     }
