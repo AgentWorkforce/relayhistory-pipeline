@@ -295,7 +295,7 @@ describe('wiring inventory is complete (source scan)', () => {
   };
   // [kind, file, n-th match in that file] -> classification
   const WIRED_SITES = [
-    ['DeliverDeps', 'src/session-ingest/selfhost-server.ts', 1],
+    ['DeliverDeps', 'src/session-ingest/selfhost-server.ts', 2], // deliver: DeliverDeps = {...}; #1 is withoutSlots()
     ['write/export target', 'src/session-ingest/selfhost-server.ts', 1],
     // Decision 0005: the hosted upload-admission Lambda admits (and so seals) itself, inline, TS-only by config.
     ['DeliverDeps', 'src/session-ingest/upload-admission-hosted.ts', 1],
@@ -326,6 +326,12 @@ describe('wiring inventory is complete (source scan)', () => {
   // Matches the target shape but never seals a raw chunk.
   const NOT_SEAL_SITES = [
     ['write/export target', 'src/session-ingest/app.ts', 1], // enqueueAdmission: inbox object only
+    // INGEST_LEDGER_LOG_COMMIT (selfhost-server.ts): the log appender and the materializer hold {store, keyRoot}
+    // to read/write the stream log; raw chunks are sealed only when the materializer replays through
+    // `deliver.target`, which is site #1 above (wired). withoutSlots() passes those deps through unchanged.
+    ['DeliverDeps', 'src/session-ingest/selfhost-server.ts', 1], // withoutSlots(): pass-through, no target built
+    ['write/export target', 'src/session-ingest/selfhost-server.ts', 2], // new LogStreams({ store, keyRoot, writer })
+    ['write/export target', 'src/session-ingest/selfhost-server.ts', 3], // new LogMaterializer({ store, keyRoot, ... })
   ] as const;
 
   function sources(): string[] {
