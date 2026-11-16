@@ -96,6 +96,13 @@ import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, defaultAsyncMaxPerOrg, selfhostIngestConfig, selfhostLedgerLogCommit, type SelfhostIngestSettings } from "./selfhost-config.ts";
 import { LogStreams } from "./ledger-log-admit.ts";
+import { LogMaterializer } from "./ledger-log-materialize.ts";
+
+/** DeliverDeps without tenant slots (the log materializer is off the request path and serial per stream). */
+function withoutSlots(d: DeliverDeps): DeliverDeps {
+  const { slots: _slots, ...rest } = d;
+  return rest;
+}
 import { randomUUID } from "node:crypto";
 import { isSessionErasePath } from "./session-erase.ts";
 import type { SessionEraseService } from "./session-erase.ts";
@@ -211,14 +218,16 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
-export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">, limiter?: TenantLimiter): Ledger {
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean } = {}): Ledger {
+  // The log materializer's ledger passes logModeGuard false: it is the one legacy writer allowed on a log-mode stream.
+  const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
     // INGEST_S3_TENANT_LIMIT=on: the synchronous path's tenant limiter (one per process / replica). Off: no limiter, unchanged.
     // INGEST_LEDGER_LOG_COMMIT=on: legacy claims and commits refuse a stream in log mode (its log is the only writer).
     s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),
-      ...(selfhostLedgerLogCommit(process.env) === "on" ? { logModeGuard: true } : {}) }),
+      ...(guard ? { logModeGuard: true } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
@@ -242,12 +251,14 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
-    target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps() },
+    target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps(), ...(options.nowMs ? { now: () => new Date(options.nowMs!()) } : {}) },
     // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
     slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
     // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).
     // INGEST_CLAIM_LOCK_BUSY=on (default off): the same deps in every admission mode, as the Worker's deliverDepsFor.
     ...(settings.claimLockBusy ? { claimLockBusy: true as const } : {}),
+    // An injected clock (tests) also stamps received_at, so two runs of the same uploads write the same bytes.
+    ...(options.nowMs ? { now: () => new Date(options.nowMs!()) } : {}),
   };
   const identify = (request: Request) => {
     const identity = verified.get(request);
@@ -310,8 +321,13 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(asyncLimiter ? { deferTenantLimit: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
+    // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:
+    // it is off the request path and serial per stream).
     ...(s3 && selfhostLedgerLogCommit(process.env) === "on"
-      ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
+      ? { logStreams: new LogStreams({ store: parts.store, keyRoot: settings.keyRoot, writer: `w_${randomUUID()}`, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }),
+          logMaterializer: new LogMaterializer({ store: parts.store, keyRoot: settings.keyRoot, ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+            deliver: { ...withoutSlots(deliver), ledger: selfhostS3Ledger(settings.keyRoot, parts, undefined, { logModeGuard: false }) },
+            log: (fields) => log.info("session ingest", fields) }) }
       : {}),
   });
   options.onConsumer?.(consumer);

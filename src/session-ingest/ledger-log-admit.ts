@@ -19,10 +19,9 @@
  * reopens and takes the stream again; the queue retry gives the backoff. A LogUnavailable keeps the state, so the
  * retry resends exactly the pending entry first.
  *
- * NOT here yet (slice 3): the materializer that applies entries to the per-session manifests, the revision index
- * and the search feed. Until it ships, a log-mode stream's batches are durable and deduplicated but NOT visible to
- * readers, so no stream may be put into log mode outside tests (nothing in this repo writes entry 0 except
- * enableLogMode, which only tests and a future operator tool call).
+ * Visibility: ledger-log-materialize.ts applies the entries to the read-side state after the append (the consumer
+ * kicks it; its sweeper catches the rest), so a batch is durable at the append and readable after materialization.
+ * The first take registers the stream (registerLogStream) so the sweeper finds it.
  */
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { assertNoLaterPrivacyControl, PrivacyControlPending } from "./async-admission.ts";
@@ -30,6 +29,7 @@ import { batchIdConflict, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
 import { appendBatches, LogFenced, logKeys, openStream, putPayload, takeStream, type LogState } from "./ledger-log.ts";
 import { admissionFenceView, hasPendingReset, isDeletedForAdmission, s3LedgerObjects } from "./ledger-s3.ts";
+import { registerLogStream } from "./ledger-log-materialize.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 
 export interface LogAdmitDeps {
@@ -77,10 +77,15 @@ export class LogStreams {
   #w() { return { writer: this.deps.writer, ...(this.deps.nowMs ? { now: this.deps.nowMs } : {}), ...(this.deps.sleep ? { sleep: this.deps.sleep } : {}) }; }
   #id(tenant: LedgerTenant, originId: string) { return logKeys(this.deps.keyRoot, tenant, originId).root; }
 
-  /** Is this stream in log mode? Entry 0 is the durable marker; a cached open stream is in log mode for good. */
+  /**
+   * Is this stream in log mode? Entry 0 is the durable marker; the close marker (operator rollback) hands it back to
+   * legacy, and drops the cached state. Both are read every time (two HEADs in parallel).
+   */
   async isLogMode(tenant: LedgerTenant, originId: string): Promise<boolean> {
-    if (this.#states.has(this.#id(tenant, originId))) return true;
-    return (await this.deps.store.head(objectKey(logKeys(this.deps.keyRoot, tenant, originId).entry(0)))) !== undefined;
+    const keys = logKeys(this.deps.keyRoot, tenant, originId);
+    const [zero, closed] = await Promise.all([this.deps.store.head(objectKey(keys.entry(0))), this.deps.store.head(objectKey(keys.closed))]);
+    if (closed !== undefined) { this.#states.delete(this.#id(tenant, originId)); return false; }
+    return zero !== undefined;
   }
 
   async #owned(tenant: LedgerTenant, originId: string): Promise<LogState> {
@@ -90,6 +95,7 @@ export class LogStreams {
     const opened = await openStream(this.deps.store, logKeys(this.deps.keyRoot, tenant, originId));
     if (!opened) throw new LedgerUnavailableError("ledger_log_not_enabled");
     const state = await takeStream(this.deps.store, opened, this.#w());
+    await registerLogStream(this.deps.store, this.deps.keyRoot, tenant, originId);
     // Bounded: drop the oldest states with nothing pending. A dropped stream is reopened and taken again on its next
     // batch, which is safe (a new epoch entry), only slower. A state with a pending entry is kept until it resolves.
     if (this.#states.size >= LOG_STREAMS_MAX)
@@ -120,7 +126,14 @@ export class LogStreams {
     const kept = prepared.records.filter((r) => typeof r.session_id !== "string" || !deleted.has(pairKey(r.source, r.session_id)));
     // 4. The payload: the kept records, exactly as prepared.
     const state = await this.#owned(tenant, prepared.originId);
-    const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, receipt: prepared.receipt, records: kept })));
+    // A batch id the window already holds is answered without writing a payload (a replay, or the batch-id 409),
+    // so a retried or conflicting upload leaves no orphan payload behind. The append still decides any race.
+    const known = state.remembered.get(prepared.batchId);
+    if (known !== undefined) {
+      if (known !== prepared.batchDigest) throw batchIdConflict(prepared, known);
+      return "replay";
+    }
+    const ref = await putPayload(store, state.keys, new TextEncoder().encode(JSON.stringify({ v: 1, journalSeq: gates.journalSeq, receivedAtMs: now(), receipt: prepared.receipt, records: kept })));
     // 5. Consent again, just before the commit.
     if (gates.consent) await gates.consent(deleted, "commit");
     // 6. The commit.

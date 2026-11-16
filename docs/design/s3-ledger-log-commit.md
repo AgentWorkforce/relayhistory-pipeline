@@ -1,9 +1,9 @@
 # S3 ledger: numbered-log-entry commit
 
-Status: proposed. Slice 1 (writer and reader) and slice 2 (admission wiring, below) are implemented behind
-`INGEST_LEDGER_LOG_COMMIT` (default off). With `on`, only a stream whose entry 0 exists is admitted through its log,
-and nothing writes entry 0 outside tests yet. The materializer is not built, so no stream may be put into log mode in
-production: its batches would be durable but invisible to readers.
+Status: proposed. Slices 1 (writer and reader), 2 (admission wiring) and 3 (materializer, operator tool) are
+implemented behind `INGEST_LEDGER_LOG_COMMIT` (default off). With `on`, only a stream whose entry 0 exists is
+admitted through its log; entry 0 is written only by the operator tool (`scripts/ledger-log-stream.ts switch`). No
+stream should be switched in production before the items in Remaining marked "before production" are done.
 
 Builds on the group-commit design (`docs/design/s3-ledger-group-commit.md`, rev 3) and the hosted ledger
 decision record (0008, benchmark first). It replaces that design's per-session manifest CAS on the critical path
@@ -238,14 +238,63 @@ today.
   - fault injection on the entry PUT, before and after landing: exactly one entry and one admission;
   - equivalence: the same uploads reach the same per-upload outcome on a legacy edge and a log-mode edge.
 
+## Slice 3: materializer and operator tool
+
+- `ledger-log-materialize.ts` `LogMaterializer`: applies a stream's entries, in log order, to the read-side state by
+  replaying each logged batch through the UNCHANGED legacy core (`deliverPrepared`: claim, canonical writes, commit)
+  on a ledger without `logModeGuard`. It is the one legacy writer allowed on a log-mode stream. Because the legacy core
+  is the only writer of manifests, chunks, the revision index, owners and batch docs, log mode yields the same state
+  legacy admission yields, and the legacy properties carry over: a re-applied batch is a replay, a crash resumes the
+  pending claim, two materializers race on the same claim tokens and the loser retries into a replay.
+  - Progress: `m/<seq>.json`, written once after entry `seq` is applied; the highest is the cursor. A crash before
+    the marker re-applies the entry (idempotent).
+  - `received_at` is the admission time: the payload carries `receivedAtMs` (the append), and the replay writes with
+    that clock, so a record's `received_at` is when it was accepted, not when it was applied.
+  - Privacy at apply time (never resurrect erased data): the legacy claim re-reads the fence (sessions deleted after
+    the entry are dropped; a pending reset is a retry); the privacy journal is re-checked against the payload's
+    `journalSeq` (a reset completed after the upload began skips the batch); a batch whose payload is gone is skipped
+    as erased (`eraseLogPayloads` deletes a user's unapplied payloads). A definitive refusal (403/409/413/422/400)
+    skips the batch; anything else is a retry with the cursor unchanged. A read that sees a concurrent append as a gap
+    is a retry too.
+  - Payloads are deleted once their entry is applied; unreferenced payloads (a put whose append never happened)
+    are collected after `ORPHAN_GRACE_MS` (1 h, by the store's own lastModified), so an in-flight admission's payload
+    is never collected. Admission answers a batch id its window already holds without writing a payload.
+  - Running: the consumer kicks the stream after each append (never awaited); every scan kicks every stream named in
+    the registry `<keyRoot>/.ledger/log-streams/` (written when a writer first takes a stream and by the operator
+    tool), so a stream another process admitted is applied too.
+- `ledger-log-stream-ops.ts` + `scripts/ledger-log-stream.ts` (dry run unless `--apply`):
+  - `status`: legacy | log | closed, the head, the cursor, legacy batches pending and committed;
+  - `switch`: refused while a legacy batch of the stream is pending (drain first) or the stream is not legacy; writes
+    entry 0 with `legacyCutover = "committed=<n>"` and registers the stream;
+  - `close`: refused until every entry is applied; writes `closed.json`. The consumer and `logModeGuard` both read it,
+    so the stream is legacy again. One way: a closed stream is not reopened. A writer that had the stream cached may
+    still append one in-flight entry; the materializer keeps applying the log.
+- Tests:
+  - `ledger-log-materialize.test.ts` (self-host edge, fs store):
+    - equivalence: the same uploads on a legacy and a log-mode edge give byte-equal canonical objects and revision
+      index, owners and rearm markers, the same batch-doc meaning (state, digest, origin, batch id; claim tokens are
+      random) and the same per-upload outcomes; applied payloads are gone and every entry has its marker;
+    - fault injection on every read-side write, failing before or after it: the same bytes;
+    - two materializers racing on one stream: the same state, applied once;
+    - privacy at apply time: deleted-after-entry, reset-after-upload and erased payload;
+    - the sweeper applies a stream no kick reached;
+    - the operator steps (drain refusal, dry runs, switch, close refusal, close, legacy again).
+  - `ledger-log-emulators.test.ts`: the protocol on MinIO and Azurite (including the create-if-absent races) when
+    their endpoints are set. fake-gcs-server ignores generation preconditions, so GCS runs only the sequential
+    cases.
+
 ## Remaining
 
-1. The materializer (manifests, revision index, search feed), with its cursor and checkpoints, and the erase paths
-   for `ledger/log/.../p/` payloads. Until it ships, a log-mode stream's batches are invisible to readers. The
-   equivalence suite then extends to the canonical, read and search state, not just the per-upload outcomes.
-2. The ledger-log and log-admission suites against the MinIO, GCS and Azure emulators. The object-store
-   conformance cases cover the primitive; the protocol suites still run only on the fs store.
-3. An operator tool that drains a stream and writes entry 0 with its `legacyCutover`, plus the close marker for
-   rollback.
-4. The hosted Worker must refuse `on` before any hosted wiring. `readEntries` starting from a checkpoint.
-   Compaction and retention, and metrics.
+1. Before production: the materializer does not re-check upload consent at apply time (the inbox `consentCap` is not
+   in the payload). Carry it in the payload and re-run the consent gate in the replay.
+2. Before production: `readEntries` replays from entry 0 on every materializer run, and the sweeper lists the whole
+   registry every scan. Both need a start-from-checkpoint read and a dirty-stream set before streams are many or long.
+3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (journal
+   re-check) and then deletes them, so they live until the stream's next apply. Operator and session erase are refused
+   under `INGEST_LEDGER=s3` today; when they are admitted, they must call `eraseLogPayloads`.
+4. The GCS protocol run on a backend that honours generation preconditions (real GCS or a newer emulator). The local
+   fake-gcs-server 1.52.2 also answered the adapter's create with `400 invalid uploadType`, so the GCS case did not run
+   here.
+5. The hosted Worker must refuse `on` before any hosted wiring. Compaction and retention, and metrics.
+6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel) instead of using the cached
+   state, so a close is seen at once.

@@ -73,6 +73,12 @@ export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string)
     payload: (sha: string) => `${root}/p/${sha}.json.zst`,
     /** The whole entry prefix: listed (first page only) to tell "no entries at all" from "entry 0 lost". */
     entries: `${root}/e`,
+    payloads: `${root}/p/`,
+    /** Materializer progress (ledger-log-materialize.ts): entry `seq` is applied to the read-side state. Written once. */
+    marker: (seq: number) => `${root}/m/${pad(seq)}.json`,
+    markers: `${root}/m/`,
+    /** The close marker (rollback to legacy): with it, the stream reads as legacy again. Written once, by the operator tool. */
+    closed: `${root}/closed.json`,
   };
 }
 export type LogKeys = ReturnType<typeof logKeys>;

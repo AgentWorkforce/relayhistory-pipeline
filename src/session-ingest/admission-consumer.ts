@@ -15,6 +15,7 @@ import type { DeliverDeps } from "./deliver.ts";
 import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
 import type { LogStreams } from "./ledger-log-admit.ts";
+import type { LogMaterializer } from "./ledger-log-materialize.ts";
 import { DeliveryBusyError, DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import {
@@ -49,6 +50,8 @@ export interface AdmissionConsumerDeps {
    * admitted through the stream's log; every other stream keeps the legacy path, unchanged. Absent: legacy only.
    */
   logStreams?: LogStreams;
+  /** With logStreams: applies a stream's entries to the read-side state after each append. */
+  logMaterializer?: LogMaterializer;
 }
 
 export type AdmissionAction =
@@ -147,6 +150,8 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     // Log mode is decided per stream by its durable marker, never by this message: a legacy stream stays legacy.
     if (deps.logStreams && await deps.logStreams.isLogMode(tenant, prepared.originId)) {
       const outcome = await deps.logStreams.admit(tenant, prepared, { journalSeq, ...(consentGate ? { consent: consentGate } : {}) });
+      // Durable at the append; readable once applied. Never awaited: the materializer runs off this path.
+      deps.logMaterializer?.kick(tenant, prepared.originId);
       return finish("admitted", outcome);
     }
     const result = await deliverPrepared({
