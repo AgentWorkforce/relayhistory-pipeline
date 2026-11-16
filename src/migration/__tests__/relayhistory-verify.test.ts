@@ -380,6 +380,11 @@ describe("frozen full-copy verification", () => {
     expect(transactionPoolerReason("postgresql://u:p@aws-1-us-east-1.pooler.supabase.com:5432/db")).toBeNull();
     expect(transactionPoolerReason("postgresql://u:p@ep-x.c-7.us-east-1.aws.neon.tech/neondb")).toBeNull();
     expect(transactionPoolerReason("not a url")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@direct:5432/db?host=x-pooler.neon.tech&port=6543")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@direct:5432/db?PORT=6543")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@EP-X-POOLER.neon.tech/db")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@h:5432/db?PgBouncer=TRUE")).not.toBeNull();
+    expect(transactionPoolerReason("postgresql://u:p@h:6432/db")).not.toBeNull();
   });
 
   test("bounds --streams and ties it to --method=ctid", () => {
@@ -389,6 +394,9 @@ describe("frozen full-copy verification", () => {
     expect(() => parseStreams("4", "keyset")).toThrow();
     expect(() => parseStreams("0", "ctid")).toThrow();
     expect(() => parseStreams("2.5", "ctid")).toThrow();
+    expect(() => parseStreams(" 8 ", "ctid")).toThrow();
+    expect(() => parseStreams("0x10", "ctid")).toThrow();
+    expect(() => parseStreams("1e1", "ctid")).toThrow();
     expect(() => parseStreams(String(MAX_CTID_STREAMS + 1), "ctid")).toThrow();
   });
 });
