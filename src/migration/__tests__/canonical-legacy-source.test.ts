@@ -14,7 +14,7 @@ import {
   type ObjectStore,
 } from "../../../packages/object-store/src/index.ts";
 import {
-  RELAYHISTORY_LEGACY_MACHINE_ID,
+  legacyMachineId,
   legacyDiscoveryPage,
   legacyGroupScopes,
   legacyUnit,
@@ -24,7 +24,11 @@ import {
 import { exportUnit } from "../neon-s3-sync/export-session.ts";
 import { groupExistsInNeon } from "../neon-s3-sync/neon-reader.ts";
 import { Checkpoint, newCounters, runOrg, verifyExported, NEON_SCOPE_SQL } from "../legacy-export/runner.ts";
-import { assertSelectOnly, readSecrets } from "../legacy-export/main.ts";
+import {
+  assertDirectUrl,
+  assertSelectOnly,
+  readSecrets,
+} from "../legacy-export/main.ts";
 import {
   canonicalSnapshot,
   CanonicalReadError,
@@ -41,6 +45,16 @@ __modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
 __modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 const pg = new PGlite(),
   db = pg as unknown as Queryable;
+const privacyDb: Queryable = {
+  async query<T>(sql: string, params?: unknown[]) {
+    if (
+      /^(BEGIN|COMMIT|ROLLBACK|SET LOCAL)/u.test(sql) ||
+      sql.includes("pg_advisory_xact_lock_shared")
+    )
+      return { rows: [] as T[] };
+    return db.query<T>(sql, params);
+  },
+};
 const turnId = "11111111-1111-4111-8111-111111111111";
 let root: string;
 const decompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b));
@@ -53,11 +67,14 @@ beforeAll(async () => {
  CREATE TABLE sessions.session_catalog(org_id text,session_id text,workspace_id text,source text,first_activity_at timestamptz,last_activity_at timestamptz,received_at timestamptz);
  CREATE TABLE sessions.convergence_events(org_id text,workspace_id text,source text,session_id text,user_id text NOT NULL DEFAULT 'u_event');
  CREATE TABLE sessions.deleted_upload_sessions(org_id text,workspace_id text,source text,session_id text);
+ CREATE TABLE sessions.session_erasure_receipts(org_id text,workspace_id text,source text,session_id text);
+ CREATE TABLE sessions.upload_deletions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+ CREATE TABLE sessions.operator_user_erasures(request_id text,org_id text,workspace_id text,user_id text,state text);
  CREATE TABLE sessions.conversation_turns(id uuid PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,session_owner text,turn_index int,role text,content text,actor_name text,actor_role text,metadata jsonb,ts timestamptz,UNIQUE(org_id,workspace_id,source,session_id,turn_index));
  CREATE TABLE sessions.session_links(id bigint PRIMARY KEY,org_id text,workspace_id text,source text,session_id text,link_kind text,link_ref text,link_url text,metadata jsonb,confidence_basis_points int,link_ts timestamptz,updated_at timestamptz,created_at timestamptz);
  CREATE TABLE sessions.session_outcomes(org_id text,workspace_id text,source text,session_id text,commit_sha text,user_id text,reverted boolean,shipped_at timestamptz,ingested_at timestamptz,created_at timestamptz);`);
   await pg.query(
-    `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','owner',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
+    `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','owner','sess:1','person',3,'assistant','preserved legacy transcript','Agent','owner','{"nativeCli":"claude"}','2026-11-01T10:00:00.123456Z')`,
     [turnId],
   );
 });
@@ -117,7 +134,7 @@ test("exports the legacy row and explicit empty-table coverage into its own lega
   expect(result.lines).toBe(2);
   expect(result.manifests).toHaveLength(1);
   const key = result.manifests[0]!.manifestKey;
-  expect(parseSessionKey(key)?.machineId).toBe(RELAYHISTORY_LEGACY_MACHINE_ID);
+  expect(parseSessionKey(key)?.machineId).toBe(legacyMachineId("ws_1", "person"));
   const snap = await snapshot(store, [await pointerFor(store, key)]);
   expect(snap.legacyCoverage).toEqual({ version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] });
   expect(snap.rows.filter((r) => r.table === "conversation_turns")).toHaveLength(1);
@@ -146,7 +163,7 @@ test("gate 1: an unattributable turn is counted as unbound and never stops disco
     const checkpoint = new Checkpoint(join(root, "g1.sqlite"));
     const counters = newCounters();
     const store = createFsStore({ root: join(root, "g1") });
-    const deps = { db, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
+    const deps = { db, privacyDb, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
     await runOrg(deps, "org_a", { export: true }, counters);
     expect(counters.unboundTurns).toBe(1);
     expect(counters.scopes).toBe(0);
@@ -167,7 +184,7 @@ test("gate 2: an ordinary unit keeps its date and key; the legacy manifest uses 
     expect(new Date(unit.firstMs).toISOString()).toBe("2026-11-03T00:00:00.000Z");
     const { result } = await exportScope(scope, createFsStore({ root: join(root, "g2") }));
     const loc = parseSessionKey(result.manifests[0]!.manifestKey)!;
-    expect(loc.machineId).toBe(RELAYHISTORY_LEGACY_MACHINE_ID);
+    expect(loc.machineId).toBe(legacyMachineId("ws_1", "person"));
     expect(result.manifests[0]!.manifestKey).toContain("/d=2026/11/03/");
   } finally {
     await pg.exec("DELETE FROM sessions.session_rollups");
@@ -184,7 +201,7 @@ test("gate 3: a rerun skips unchanged scopes by fingerprint, and every discovery
   };
   const checkpoint = new Checkpoint(join(root, "g3.sqlite"));
   const store = createFsStore({ root: join(root, "g3") });
-  const deps = { db: spy, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
+  const deps = { db: spy, privacyDb, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
   const first = newCounters();
   await runOrg(deps, "org_1", { export: true }, first);
   expect(first).toMatchObject({ exported: 1, manifestsWritten: 1 });
@@ -217,7 +234,11 @@ test("gate 4: legacy records are trusted only from the one exporter-owned legacy
   const copy = await exportUnit({ store, keyRoot: "96bulls", grantId: "grant_1" }, shifted, legacyUnitSource(db, async () => {}));
   const dup = await pointerFor(store, copy.manifests[0]!.manifestKey);
   expect(dup.manifest_key).not.toBe(real.manifest_key);
-  await expect(snapshot(store, [real, dup])).rejects.toBeInstanceOf(CanonicalReadError);
+  const duplicate = await snapshot(store, [real, dup]);
+  expect(duplicate.legacyCoverage).toBeNull();
+  expect(
+    duplicate.rows.filter((r) => r.table === "conversation_turns"),
+  ).toEqual([]);
   // Legacy-kinded records inside a manifest on an ordinary machine are refused.
   const forged = await exportUnit(
     { store, keyRoot: "96bulls", grantId: "grant_1" },
@@ -229,9 +250,11 @@ test("gate 4: legacy records are trusted only from the one exporter-owned legacy
       },
     },
   );
-  await expect(snapshot(store, [await pointerFor(store, forged.manifests[0]!.manifestKey)])).rejects.toBeInstanceOf(
-    CanonicalReadError,
-  );
+  const forgedSnapshot = await snapshot(store, [
+    await pointerFor(store, forged.manifests[0]!.manifestKey),
+  ]);
+  expect(forgedSnapshot.legacyCoverage).toBeNull();
+  expect(forgedSnapshot.rows).toEqual([]);
   // The genuine one alone is accepted.
   expect((await snapshot(store, [real])).legacyCoverage).not.toBeNull();
 });
@@ -243,7 +266,7 @@ test("gate 8: a legacy-only manifest carries the scope's real user, never the pl
     const { result } = await exportScope(scope, store);
     const p = await pointerFor(store, result.manifests[0]!.manifestKey);
     expect(p.user_id).toBe("user_1");
-    expect(p.machine_id).toBe(RELAYHISTORY_LEGACY_MACHINE_ID);
+    expect(p.machine_id).toBe(legacyMachineId("ws_1", "user_1"));
     // The delivery user of the scope's own events wins over an outcome user.
     await pg.exec(`INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','sess:1','u_delivery')`);
     const again = await exportScope(scope, createFsStore({ root: join(root, "g8b") }));
@@ -280,7 +303,7 @@ test("a fenced scope is not exported", async () => {
     const checkpoint = new Checkpoint(join(root, "fence.sqlite"));
     const counters = newCounters();
     await runOrg(
-      { db, target: { store: createFsStore({ root: join(root, "fence") }), keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} },
+      { db, privacyDb, target: { store: createFsStore({ root: join(root, "fence") }), keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} },
       "org_1",
       { export: true },
       counters,
@@ -292,18 +315,72 @@ test("a fenced scope is not exported", async () => {
   }
 });
 
+test("live session and completed-user erase ledgers fence legacy export", async () => {
+  for (const erase of ["session", "user"] as const) {
+    const checkpoint = new Checkpoint(join(root, `live-fence-${erase}.sqlite`));
+    try {
+      if (erase === "session")
+        await pg.exec(
+          `INSERT INTO sessions.session_erasure_receipts VALUES('org_1','ws_1','claude','sess:1')`,
+        );
+      else
+        await pg.exec(
+          `INSERT INTO sessions.operator_user_erasures VALUES('erase-1','org_1','ws_1','person','bytes_verified')`,
+        );
+      const counters = newCounters();
+      await runOrg(
+        {
+          db,
+          privacyDb,
+          target: {
+            store: createFsStore({ root: join(root, `live-fence-${erase}`) }),
+            keyRoot: "96bulls",
+            grantId: "g",
+          },
+          checkpoint,
+          hook: async () => {},
+          log: () => {},
+        },
+        "org_1",
+        { export: true },
+        counters,
+      );
+      expect(counters).toMatchObject({ fenced: 1, exported: 0 });
+    } finally {
+      checkpoint.close();
+      await pg.exec(
+        "DELETE FROM sessions.session_erasure_receipts;DELETE FROM sessions.operator_user_erasures",
+      );
+    }
+  }
+});
+
 test("verifier: equal on a fresh export, mismatched after Neon changes, including scrubbed content", async () => {
   try {
     await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','abcdef','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
     await pg.query(`UPDATE sessions.conversation_turns SET content='key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA end' WHERE id=$1`, [turnId]);
     const checkpoint = new Checkpoint(join(root, "verify.sqlite"));
     const store = createFsStore({ root: join(root, "verify") });
-    await runOrg({ db, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} }, "org_1", { export: true }, newCounters());
-    const ok = await verifyExported(db, store, checkpoint, decompress);
+    await runOrg({ db, privacyDb, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} }, "org_1", { export: true }, newCounters());
+    const ok = await verifyExported(
+      db,
+      store,
+      checkpoint,
+      decompress,
+      undefined,
+      privacyDb,
+    );
     expect(ok).toMatchObject({ ok: true, scopes: 1 });
     await pg.query(`UPDATE sessions.conversation_turns SET content='drifted' WHERE id=$1`, [turnId]);
     await pg.exec(`INSERT INTO sessions.session_outcomes VALUES('org_1','ws_1','claude','sess:1','fedcba','user_1',false,NULL,'2026-11-01T10:00:00Z','2026-11-01T10:00:00Z');`);
-    const bad = await verifyExported(db, store, checkpoint, decompress);
+    const bad = await verifyExported(
+      db,
+      store,
+      checkpoint,
+      decompress,
+      undefined,
+      privacyDb,
+    );
     expect(bad.ok).toBe(false);
     expect(bad.mismatched[0]!.problems).toEqual(
       expect.arrayContaining(["session_outcomes:count neon=2 s3=1", "session_outcomes:keys", "conversation_turns:content"]),
@@ -321,23 +398,99 @@ test("the verifier's Neon SQL is read-only and parameterized", () => {
 });
 
 test("secrets come only from stdin lines, and a writable Neon role is refused", async () => {
-  const s = await readSecrets("postgresql://ro@host/db\nAKIA\nsecret\n");
-  expect(s).toEqual({ neonUrl: "postgresql://ro@host/db", s3: { accessKeyId: "AKIA", secretAccessKey: "secret" } });
+  const s = await readSecrets(
+    "postgresql://ro@host/db\npostgresql://privacy@host/db\nAKIA\nsecret\n",
+  );
+  expect(s).toEqual({
+    neonUrl: "postgresql://ro@host/db",
+    privacyUrl: "postgresql://privacy@host/db",
+    s3: { accessKeyId: "AKIA", secretAccessKey: "secret" },
+  });
   await expect(readSecrets("not-a-url\n")).rejects.toThrow("line 1");
   // PGlite's current user owns the tables: it can write, so it is refused.
   await expect(assertSelectOnly(db)).rejects.toThrow("SELECT-only");
+  expect(() =>
+    assertDirectUrl("postgresql://u@direct.example:5432/db", "Neon"),
+  ).not.toThrow();
+  expect(() =>
+    assertDirectUrl("postgresql://u@direct.example:6543/db", "Neon"),
+  ).toThrow("unpooled");
+  expect(() =>
+    assertDirectUrl("postgresql://u@x-pooler.example:5432/db", "privacy"),
+  ).toThrow("unpooled");
+});
+
+test("windowed cursors do not suppress a later full run, max-scopes progresses, and failed scopes fail verify", async () => {
+  const checkpoint = new Checkpoint(join(root, "progress.sqlite"));
+  const store = createFsStore({ root: join(root, "progress") });
+  const deps = {
+    db,
+    privacyDb,
+    target: { store, keyRoot: "96bulls", grantId: "g" },
+    checkpoint,
+    hook: async () => {},
+    log: () => {},
+  };
+  const second = "77777777-7777-4777-8777-777777777777";
+  try {
+    await pg.query(
+      `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','claude','sess:2','person2',0,'user','second','U','owner','{}','2026-11-02T00:00:00Z')`,
+      [second],
+    );
+    const one = newCounters();
+    await runOrg(
+      deps,
+      "org_1",
+      {
+        export: true,
+        maxScopes: 1,
+        window: {
+          sinceMs: Date.parse("2026-11-01T00:00:00Z"),
+          untilMs: Date.parse("2026-11-03T00:00:00Z"),
+        },
+      },
+      one,
+    );
+    expect(one.exported).toBe(1);
+    const two = newCounters();
+    await runOrg(deps, "org_1", { export: true, maxScopes: 1 }, two);
+    expect(two.exported).toBe(1);
+    expect(checkpoint.exported("org_1")).toHaveLength(2);
+    checkpoint.setScope(
+      JSON.stringify(["org_1", "ws_1", "claude", "failed"]),
+      "org_1",
+      "failed:test",
+      null,
+      null,
+    );
+    const report = await verifyExported(
+      db,
+      store,
+      checkpoint,
+      decompress,
+      "org_1",
+      privacyDb,
+    );
+    expect(report.ok).toBe(false);
+    expect(report.unexplained).toContain("failed:test:1");
+  } finally {
+    checkpoint.close();
+    await pg.query("DELETE FROM sessions.conversation_turns WHERE id=$1", [
+      second,
+    ]);
+  }
 });
 
 test("a re-export keeps the scope's first key even if its oldest row moves earlier, and an interrupt does not advance the cursor", async () => {
   const id = "66666666-6666-4666-8666-666666666666";
   const checkpoint = new Checkpoint(join(root, "pin.sqlite"));
   const store = createFsStore({ root: join(root, "pin") });
-  const deps = { db, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
+  const deps = { db, privacyDb, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} };
   try {
     await runOrg(deps, "org_1", { export: true }, newCounters());
     const first = checkpoint.exported("org_1")[0]!.manifest_key;
     await pg.query(
-      `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','claude','sess:1','owner',0,'user','older','U','owner','{}','2026-10-01T00:00:00Z')`,
+      `INSERT INTO sessions.conversation_turns VALUES($1,'org_1','ws_1','claude','sess:1','person',0,'user','older','U','owner','{}','2026-10-01T00:00:00Z')`,
       [id],
     );
     const again = newCounters();

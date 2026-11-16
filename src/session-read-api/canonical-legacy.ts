@@ -1,7 +1,7 @@
 import { comparePublicTurnRows } from "../shared/legacy-turn-source.ts";
 /** Legacy public evidence preserved explicitly in the canonical raw stream. */
 import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
-import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import type { CanonicalIdentity } from "./canonical.ts";
 export const LEGACY_SOURCE_TABLES = [
   "conversation_turns",
   "session_links",
@@ -15,7 +15,7 @@ const kinds = new Map<string, string>([
 /** A record outside the authenticated scope, or a malformed coverage marker:
  * the whole read is refused (a 503 the caller falls back on, never a 500). */
 function fail(): never {
-  throw new CanonicalReadError("legacy_evidence_invalid");
+  throw new Error("canonical legacy evidence invalid");
 }
 const clock = (v: unknown, nullable = false) =>
   (nullable && v === null) ||

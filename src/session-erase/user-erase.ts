@@ -28,6 +28,7 @@
 import { createHash } from "node:crypto";
 import type { EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { liveBufferedPrefix, liveObjectPrefix, livePointerPrefix, liveStagedPrefix } from "../migration/neon-s3-erasure/live.ts";
+import { LEGACY_EXPORT_ORIGIN_ID } from "../shared/legacy-export-machine.ts";
 
 export class UserEraseRefused extends Error {
   constructor(readonly code: string) {
@@ -140,7 +141,10 @@ export interface UserEraseResult {
 /** Every prefix a captured origin of this user can have written to. */
 export function userErasePrefixes(keyRoot: string, req: UserEraseRequest, origins: readonly string[]): string[] {
   const out: string[] = [];
-  for (const origin_id of origins) {
+  // The one-shot legacy exporter uses a user-scoped machine derived from this
+  // synthetic origin. Include it even when the ingest ledger never saw it so
+  // an erase racing S3 publication removes the late legacy copy too.
+  for (const origin_id of [...origins, LEGACY_EXPORT_ORIGIN_ID]) {
     const g = { org_id: req.orgId, workspace_id: req.workspaceId, origin_id, user_id: req.userId };
     out.push(liveBufferedPrefix(keyRoot, g), liveStagedPrefix(keyRoot, g), liveObjectPrefix(keyRoot, g), livePointerPrefix(keyRoot, g));
   }

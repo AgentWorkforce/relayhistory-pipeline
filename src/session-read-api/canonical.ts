@@ -238,6 +238,7 @@ async function snapshotWithLimits(
       generation: version,
       exists: false,
       legacyCoverage: null,
+      legacyRowsMerged: false,
       neonDerived: false,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
@@ -327,6 +328,7 @@ async function snapshotWithLimits(
     generation: version,
     exists: true,
     legacyCoverage: legacy.coverage,
+    legacyRowsMerged: legacy.rows.length > 0,
     rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
     // Always present: the never-in-Neon objects half fails closed on absence (evidence.ts).
     neonDerived,

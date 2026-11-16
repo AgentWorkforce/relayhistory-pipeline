@@ -81,7 +81,8 @@ test("gate 6: an invalid row is counted and makes coverage unknown, never failin
   expect(canonicalLegacy([marker], identity).coverage).not.toBeNull();
 });
 
-test("gate 6: a record outside the scope refuses with a CanonicalReadError (a fallback, not a 500)", async () => {
-  const { CanonicalReadError } = await import("../canonical.ts");
-  expect(() => canonicalLegacy([record({ org_id: "foreign" })], identity)).toThrow(CanonicalReadError);
+test("gate 6: a record outside the scope retains the established invalid-evidence error", () => {
+  expect(() =>
+    canonicalLegacy([record({ org_id: "foreign" })], identity),
+  ).toThrow("canonical legacy evidence invalid");
 });
