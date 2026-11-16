@@ -95,8 +95,11 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     expect([...g4, ...POST_G4_MIGRATIONS]).toEqual(files);
     // Registry order: the legacy authority reads the user-erasure ledger, so
     // 062030 must remain after 058010 even as later post-G4 slots are added.
-    expect(files.indexOf("20261105062030_legacy_export_scope_authority.sql"))
-      .toBeGreaterThan(files.indexOf("20261105058010_operator_user_erase.sql"));
+    const operatorErase = files.indexOf("20261105058010_operator_user_erase.sql");
+    const legacyAuthority = files.indexOf("20261105062030_legacy_export_scope_authority.sql");
+    expect(operatorErase).toBeGreaterThanOrEqual(0);
+    expect(legacyAuthority).toBeGreaterThanOrEqual(0);
+    expect(legacyAuthority).toBeGreaterThan(operatorErase);
     // Drift alarm: a migration landing on main after G4 fails here, so its G4 impact is reviewed (the
     // absence checks and the function-body scan below already include it through the derived list).
     expect([...POST_G4_MIGRATIONS]).toEqual([

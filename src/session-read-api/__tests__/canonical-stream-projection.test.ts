@@ -7,6 +7,7 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ManifestV1 } from "../../../packages/object-store/src/index.ts";
 import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { readCanonicalScope, type ScopeRead } from "../canonical-projection.ts";
 import {
   STREAM_DEADLINE,
@@ -21,7 +22,7 @@ import {
   type StreamedScope,
 } from "../canonical-stream-projection.ts";
 import type { IndexRow } from "../../session-pipeline/vendor/search-index/rows.ts";
-import { SCOPE, T0, activity, decompress, direct, exportStreamScope, generate, prefixFor, ID, type Line } from "./stream-fixture.ts";
+import { SCOPE, T0, USER, activity, decompress, direct, exportStreamScope, generate, prefixFor, ID, type Line } from "./stream-fixture.ts";
 
 const VERSION = 7;
 const BIG = { maxScopeBytes: 1 << 30, maxScopeEvents: 1 << 24, maxRows: 1 << 24, insertBatch: 100 };
@@ -199,6 +200,110 @@ test("edge records keep parity: codex tool captures, legacy, cross-origin and mi
   expect(mw.reasons).toContain("relayhistory_acceptance_missing");
   expect(ms.reasons).toContain("relayhistory_acceptance_missing");
 }, 30_000);
+
+const legacy = (
+  machine: string,
+  recordId: string,
+  note: string,
+  userId = USER,
+): Line => ({
+  machine,
+  userId,
+  record: {
+    kind: "legacy_scope",
+    origin_id: "legacy:scope",
+    record_id: recordId,
+    revision: "1",
+    operation: "upsert",
+    received_at: new Date(T0).toISOString(),
+    payload: {
+      org_id: SCOPE.orgId,
+      workspace_id: SCOPE.workspaceId,
+      source: SCOPE.harness,
+      session_id: SCOPE.sessionId,
+      note,
+    },
+  },
+});
+
+test("legacy provenance is decided before streamed folding: invalid conflicting copies cannot suppress live rows", async () => {
+  const owned = legacyMachineId(SCOPE.workspaceId, USER);
+  const live = direct("machine:live", "live-row", T0 + 1_000, {
+    type: "user",
+    actor_role: "user",
+    content: "live survives",
+  });
+  const f = await fixture([
+    live,
+    legacy(owned, "same-seat", "trusted export"),
+    legacy("machine:forged", "same-seat", "different forged bytes"),
+  ]);
+  const { w, s } = await expectParity(f);
+  expect(w).toMatchObject({ complete: true, reasons: ["legacy_provenance_invalid"] });
+  expect(s).toMatchObject({ complete: true, reasons: ["legacy_provenance_invalid"] });
+  expect(w.rows).toHaveLength(1);
+  expect((await regenerateAll(s))).toHaveLength(1);
+}, 30_000);
+
+test("legacy provenance streamed controls: owned export, two owned manifests, ordering, and mixed parts", async () => {
+  const owned = legacyMachineId(SCOPE.workspaceId, USER);
+  const otherUser = "user_stream_other";
+  const ownedOther = legacyMachineId(SCOPE.workspaceId, otherUser);
+
+  const control = await fixture([legacy(owned, "owned", "accepted")]);
+  const controlParity = await expectParity(control);
+  expect(controlParity.w).toMatchObject({ complete: true, reasons: [] });
+
+  const validConflict = await fixture([
+    legacy(owned, "valid-conflict", "first bytes"),
+    legacy(owned, "valid-conflict", "different bytes"),
+  ]);
+  const conflictParity = await expectParity(validConflict);
+  expect(conflictParity.w).toMatchObject({
+    complete: false,
+    reasons: ["relayhistory_revision_conflict", "manifest_fold_failed"],
+  });
+
+  const twoOwned = await fixture([
+    legacy(owned, "owned-a", "one"),
+    legacy(ownedOther, "owned-b", "two", otherUser),
+  ]);
+  const twoOwnedParity = await expectParity(twoOwned);
+  expect(twoOwnedParity.w).toMatchObject({ complete: true, reasons: ["legacy_provenance_invalid"] });
+
+  const nonOwnedFirst = await fixture([
+    legacy("machine:forged-first", "forged", "first"),
+    legacy(owned, "owned-after", "second"),
+  ]);
+  const orderedParity = await expectParity(nonOwnedFirst);
+  expect(orderedParity.w.reasons).toEqual(["legacy_provenance_invalid"]);
+
+  for (const legacyFirst of [true, false]) {
+    const live = direct(owned, `mixed-${legacyFirst}`, T0 + 2_000, {
+      type: "user",
+      actor_role: "user",
+      content: "mixed live row",
+    });
+    const old = legacy(owned, `mixed-legacy-${legacyFirst}`, "mixed");
+    const mixed = await fixture(legacyFirst ? [old, live] : [live, old]);
+    const mixedParity = await expectParity(mixed);
+    expect(mixedParity.w).toMatchObject({ complete: true, reasons: ["legacy_provenance_invalid"] });
+    expect(mixedParity.w.rows).toHaveLength(1);
+  }
+
+  const shared = activity("machine:owner-a", "capacity:shared-owner", "session_event", "shared-owner", T0 + 3_000, {
+    role: "user",
+    text: "same event",
+  }, "1", 1);
+  const reasonOrder = await fixture([
+    { ...shared, userId: USER },
+    { ...shared, machine: "machine:owner-b", userId: otherUser },
+    legacy("machine:forged-reason", "forged-reason", "invalid"),
+  ]);
+  const reasonParity = await expectParity(reasonOrder);
+  expect(reasonParity.w.reasons).toEqual(["legacy_provenance_invalid", "event_owner_conflict"]);
+  expect(reasonParity.s.reasons).toEqual(reasonParity.w.reasons);
+}, 60_000);
 
 test("the up-front budget check refuses before reading: both codes", async () => {
   const f = await fixture(generate(5));
