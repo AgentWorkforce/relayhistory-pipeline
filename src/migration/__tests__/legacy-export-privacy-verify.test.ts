@@ -166,6 +166,16 @@ describe("(a) turn-specific cross-member fences block a legacy-only export", () 
     expect((await allKeys(store)).length).toBeGreaterThan(0);
   });
 
+  test("coverage: a turns-only legacy scope (no events, no outcomes) is exported, not left behind as legacy_user_unbound", async () => {
+    // Pending a product decision: if turns-only scopes are intentionally not exported, replace this
+    // with a test that they are counted and documented as data left behind. Until then it gates.
+    const n = await neon(), p = await supabase();
+    await n.pg.query("DELETE FROM sessions.session_outcomes");
+    const store = createFsStore({ root: await tmp("a0t") });
+    const { counters } = await run(n.db, p.db, store, "a0t");
+    expect(counters).toMatchObject({ exported: 1, fenced: 0, failed: 0 });
+  });
+
   test("Supabase turn_session_fences (legacy_import, no user) fences the scope: nothing reaches S3", async () => {
     for (const basis of ["legacy_import", "live"]) {
       const n = await neon(), p = await supabase();
