@@ -34,6 +34,8 @@ export const OPERATOR_USER_ERASE_SQL = "supabase/migrations/20261105058010_opera
 export const ORIGIN_CLAIM_FENCE_SQL = "supabase/migrations/20261105062010_ingest_origin_claim_fence.sql";
 /** 062020 installs the user-erasure capture trigger and registration gate over 058010's operator ledger. */
 export const TURNS_FORWARD_GATES_SQL = "supabase/migrations/20261105062020_turns_forward_gates.sql";
+/** 062030 reads the privacy ledgers created by 041000/058010, so it is skipped with them on pending:false. */
+export const LEGACY_EXPORT_SQL = "supabase/migrations/20261105062030_legacy_export_scope_authority.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
@@ -50,10 +52,11 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // so it is skipped with it (and 043860, which requires 043700's parity table, 043870, which requires 041000, and 043890, which
   // replaces 043860's gate, and 045010, which replaces 043870's stage RPC, and 047030, whose receipts trigger executes
   // 041000's guard function, and 058010, which re-creates 041000's begins, 062010, which replaces 058010's lock,
-  // and 062020, whose user-erasure capture trigger reads 058010's operator ledger), while 042000/043000/043500 still apply.
+  // 062020, whose user-erasure capture trigger reads 058010's operator ledger, and 062030, which reads those ledgers),
+  // while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL || path === LEGACY_EXPORT_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }
