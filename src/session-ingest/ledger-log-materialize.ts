@@ -75,6 +75,21 @@ export async function* listLogStreams(store: ObjectStore, keyRoot: string): Asyn
   } while (cursor);
 }
 
+/** Record a batch the materializer skipped for good (idempotent: the same code every time for a final refusal). */
+export async function writeLogSkip(store: ObjectStore, keys: LogKeys, batchId: string, code: string, atMs: number): Promise<void> {
+  await store.put(objectKey(keys.skipped(batchId)), enc({ v: 1, code, atMs }), { contentType: "application/json" });
+}
+
+/** The refusal code a skipped batch was recorded with, or undefined. A malformed record reads as skipped (fail closed). */
+export async function readLogSkip(store: ObjectStore, keys: LogKeys, batchId: string): Promise<string | undefined> {
+  let doc: unknown;
+  try { doc = await readJson(store, keys.skipped(batchId)); }
+  catch (error) { if (error instanceof SyntaxError) return "log_skip_unreadable"; throw error; }
+  if (doc === undefined) return undefined;
+  const code = (doc as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "log_skip_unreadable";
+}
+
 async function readJson(store: ObjectStore, key: string): Promise<unknown | undefined> {
   try { return JSON.parse(new TextDecoder().decode(await readAll((await store.getObject(objectKey(key))).body))); }
   catch (error) { if (isObjectStoreError(error) && error.code === "not_found") return undefined; throw error; }
@@ -115,10 +130,11 @@ export async function eraseLogPayloads(store: ObjectStore, keyRoot: string, tena
 }
 
 /**
- * A logged batch's payload (ledger-log-admit.ts): the kept records, the receipt and the upload's journal seq. Its key
- * is its content hash, so a retried admission writes the SAME payload (no admission time inside: received_at is the
- * entry's own atMs, the append, so a record's received_at is when it was accepted, not when applied). `receivedAtMs`
- * is still read from a slice-3-era payload.
+ * A logged batch's payload (ledger-log-admit.ts): the kept records, the receipt, the upload's journal seq and a per-
+ * attempt nonce. Its key is its content hash, so one attempt's own retried PUTs are idempotent, while every admission
+ * attempt writes a FRESH object (a fresh lastModified): an identical re-put never leaves a stale payload that orphan
+ * collection could take between a retry's PUT and its append. No admission time inside: received_at is the entry's
+ * own atMs (the append). `receivedAtMs` is still read from a slice-3-era payload.
  */
 interface StoredPayload { v: 1; journalSeq?: number; receivedAtMs?: number; receipt: PreparedDelivery["receipt"]; records: PreparedDelivery["records"] }
 const isStrField = (v: unknown) => typeof v === "string";
@@ -223,6 +239,9 @@ export class LogMaterializer {
     if (outcome.startsWith("skipped:")) {
       const code = outcome.slice("skipped:".length);
       this.deps.log?.({ route: "ingest.log_materialize", outcome: "skipped", error_code: code, stream: hid(entry.stream), seq: entry.seq, batch: hid(b.batchId) });
+      // The skip record FIRST (the replay answer reads it: admission-consumer.ts re-checks it after writing admitted),
+      // then the refused outcome, then the admitted one retired. Any interleaving with a replay ends refused.
+      await writeLogSkip(this.deps.store, logKeys(this.deps.keyRoot, tenant, originId), b.batchId, code, now());
       const dir = receiptDir(this.deps.keyRoot, tenant, originId, b.receiptId);
       await writeOutcome(this.deps.store, dir, { v: 1, state: "refused", code, atMs: now() });
       await this.deps.store.delete(objectKey(outcomeKey(dir, "admitted"))).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
@@ -318,22 +337,30 @@ export class LogMaterializer {
    */
   async sweep(): Promise<void> {
     if (this.#sweeping) return;
-    const due: LogStreamRef[] = [];
-    for await (const s of listLogStreams(this.deps.store, this.deps.keyRoot)) {
-      const known = this.#through.get(this.#id(s.tenant, s.originId));
-      if (known !== undefined && (await this.deps.store.head(objectKey(logKeys(this.deps.keyRoot, s.tenant, s.originId).entry(known + 1)))) === undefined) continue;
-      due.push(s);
-    }
+    // Everything runs in the background (the caller, the admission scan loop, never waits on it): the registry
+    // listing, the idle checks (one HEAD per known stream, LOG_SWEEP_CONCURRENCY at a time) and the materializing.
+    this.#sweeping = this.#sweepOnce().then(() => {}, () => {}).finally(() => { this.#sweeping = undefined; });
+  }
+
+  async #sweepOnce(): Promise<void> {
+    const listed: LogStreamRef[] = [];
+    for await (const s of listLogStreams(this.deps.store, this.deps.keyRoot)) listed.push(s);
     let next = 0;
     const worker = async () => {
-      while (next < due.length) {
-        const s = due[next++]!;
+      while (next < listed.length) {
+        const s = listed[next++]!;
+        const known = this.#through.get(this.#id(s.tenant, s.originId));
+        if (known !== undefined) {
+          let idle = false;
+          try { idle = (await this.deps.store.head(objectKey(logKeys(this.deps.keyRoot, s.tenant, s.originId).entry(known + 1)))) === undefined; }
+          catch { idle = false; }
+          if (idle) continue;
+        }
         this.kick(s.tenant, s.originId);
         await this.#running.get(this.#id(s.tenant, s.originId));
       }
     };
-    this.#sweeping = Promise.all(Array.from({ length: Math.min(LOG_SWEEP_CONCURRENCY, due.length) }, worker)).then(() => {}, () => {})
-      .finally(() => { this.#sweeping = undefined; });
+    await Promise.all(Array.from({ length: Math.min(LOG_SWEEP_CONCURRENCY, listed.length) }, worker));
   }
 
   async settle(): Promise<void> {

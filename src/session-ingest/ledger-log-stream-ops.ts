@@ -3,7 +3,8 @@
  * Every mutating step is a dry run unless `apply` is set; the CLI is scripts/ledger-log-stream.ts.
  *
  *   status   legacy | log | closed, the log head, the materialized cursor, legacy batches still pending.
- *   switch   refuses unless the deployment-wide proof exists (LOG_COMMIT_PROOF_KEY: every replica runs with
+ *   switch   refuses unless the bucket is declared non-production (logModeNonProdKey, an allowlist checked here, not
+ *            only in the CLI) and the deployment-wide proof exists (LOG_COMMIT_PROOF_KEY: every replica runs with
  *            INGEST_LEDGER_LOG_COMMIT=on, so every legacy claim and commit honours the marker); refuses while any
  *            legacy batch of the stream is pending (drain it first) or the stream is already in log mode; writes
  *            entry 0 with legacyCutover = "committed=<n legacy batches committed>". Then it waits past the longest
@@ -69,6 +70,12 @@ export interface StepResult { applied: boolean; action: string; refused?: string
  * would claim and commit a log-mode stream behind its log.
  */
 export const logCommitProofKey = (keyRoot: string) => `${keyRoot}/.ledger/log-commit-on.json`;
+/**
+ * The allowlist the switch requires, inside the operation itself (not only in the CLI): an operator-written marker
+ * declaring THIS bucket and key root a non-production test target. Nothing in the service writes it. Log mode is not
+ * cleared for production (docs/design/s3-ledger-log-commit.md, Remaining), so a production bucket never carries it.
+ */
+export const logModeNonProdKey = (keyRoot: string) => `${keyRoot}/.ledger/log-mode-nonprod.json`;
 /** Longer than a legacy claim lives (claim -> commit, with its retries): the switch's settle wait. */
 export const SWITCH_SETTLE_MS = 5 * 60_000;
 
@@ -76,6 +83,7 @@ export async function switchToLogMode(store: ObjectStore, keyRoot: string, tenan
   opts: { apply: boolean; writer: string; settleMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<StepResult> {
   const status = await streamStatus(store, keyRoot, tenant, originId);
   if (status.mode !== "legacy") return { applied: false, action: "switch", refused: `stream_is_${status.mode}`, status };
+  if (!(await exists(store, logModeNonProdKey(keyRoot)))) return { applied: false, action: "switch", refused: "bucket_not_declared_nonprod", status };
   if (!(await exists(store, logCommitProofKey(keyRoot)))) return { applied: false, action: "switch", refused: "log_commit_not_proven_on", status };
   if (status.legacyPending > 0) return { applied: false, action: "switch", refused: "legacy_batches_pending", status };
   if (!opts.apply) return { applied: false, action: "switch (dry run)", status };

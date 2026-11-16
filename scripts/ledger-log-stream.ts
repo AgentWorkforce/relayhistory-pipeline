@@ -3,8 +3,10 @@
  * Operator tool for one ledger-log stream (src/session-ingest/ledger-log-stream-ops.ts). Dry run unless --apply.
  *
  *   bun scripts/ledger-log-stream.ts status --bucket <b> --org <o> --workspace <w> --user <u> --origin <origin>
- *   bun scripts/ledger-log-stream.ts switch  ... [--apply --kms-key-arn <arn>]   drain check, then entry 0
- *   bun scripts/ledger-log-stream.ts close   ... [--apply --kms-key-arn <arn>]   every entry applied, then the close marker
+ *   bun scripts/ledger-log-stream.ts switch  ... [--apply --kms-key-arn <arn> --i-know-this-is-not-prod]   drain check, then entry 0
+ *   bun scripts/ledger-log-stream.ts close   ... [--apply --kms-key-arn <arn> --i-know-this-is-not-prod]   every entry applied, then the close marker
+ *
+ * --apply on switch/close is refused without --i-know-this-is-not-prod, and for any production-like bucket name.
  *
  * Credentials: --credentials keys (default: AWS_* environment) | podIdentity, as scripts/ledger-reshard-revisions.ts.
  * Prints one JSON result; never a key, token or header value.
@@ -16,6 +18,19 @@ import { reshardCredentials, type ReshardCredentialMode } from "./ledger-reshard
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 
+/**
+ * The CLI's guard for a MUTATING step (switch or close with --apply): an allowlist, not a denylist. It needs the
+ * explicit --i-know-this-is-not-prod flag, and it still refuses any bucket whose name looks production-like (a
+ * belt on top: the operation itself also requires the bucket's non-production marker, ledger-log-stream-ops.ts).
+ * Returns the refusal code, or undefined when allowed. Read-only steps (status, dry runs) are always allowed.
+ */
+export function mutationRefusal(command: string | undefined, bucket: string, apply: boolean, declaredNonProd: boolean): string | undefined {
+  if (!apply || (command !== "switch" && command !== "close")) return undefined;
+  if (!declaredNonProd) return "not_declared_nonprod";
+  if (/prod|prd|live|hosted|customer/i.test(bucket)) return "bucket_name_production_like";
+  return undefined;
+}
+
 if (import.meta.main) {
   const [command, ...rest] = process.argv.slice(2);
   let values;
@@ -24,13 +39,16 @@ if (import.meta.main) {
       bucket: { type: "string" }, region: { type: "string", default: "us-east-1" }, "key-root": { type: "string", default: "96bulls" },
       org: { type: "string" }, workspace: { type: "string" }, user: { type: "string" }, origin: { type: "string" },
       apply: { type: "boolean", default: false }, "kms-key-arn": { type: "string" }, credentials: { type: "string", default: "keys" },
+      "i-know-this-is-not-prod": { type: "boolean", default: false },
     } }));
   } catch { values = undefined; }
   const ids = [values?.org, values?.workspace, values?.user, values?.origin];
-  // Log mode is not cleared for hosted or production buckets (docs/design/s3-ledger-log-commit.md, Remaining):
-  // switching one is refused here, whatever else is given. status stays read-only and allowed.
-  if (command === "switch" && /(^|[-_.])(prod|production|hosted)([-_.]|$)/i.test(values?.bucket ?? "")) {
-    console.error(JSON.stringify({ refused: "bucket_not_cleared_for_log_mode" }));
+  // Log mode is not cleared for production (docs/design/s3-ledger-log-commit.md, Remaining). A mutating step needs
+  // the explicit allowlist flag (and the operation itself needs the bucket's non-production marker). status and dry
+  // runs stay allowed.
+  const refusal = mutationRefusal(command, values?.bucket ?? "", values?.apply ?? false, values?.["i-know-this-is-not-prod"] ?? false);
+  if (refusal) {
+    console.error(JSON.stringify({ refused: refusal }));
     process.exit(2);
   }
   if (!values?.bucket || !["status", "switch", "close"].includes(command ?? "") || ids.some((v) => !v || !ID.test(v))

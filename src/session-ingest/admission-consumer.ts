@@ -11,6 +11,7 @@
  * then walks to the DLQ for an operator, never silently dropped).
  */
 import { checkUploadConsent, UploadConsentRequired, type UploadConsentConfig } from "./upload-consent.ts";
+import { isObjectStoreError, objectKey } from "../shared/vendor.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
@@ -23,6 +24,7 @@ import {
   PrivacyControlPending,
   assertNoLaterPrivacyControl,
   decodeInbox,
+  outcomeKey,
   readInbox,
   receiptDir,
   tombstoneInbox,
@@ -149,13 +151,38 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
       : undefined;
     // Log mode is decided per stream by its durable marker, never by this message: a legacy stream stays legacy.
     if (deps.logStreams && await deps.logStreams.isLogMode(tenant, prepared.originId)) {
-      const outcome = await deps.logStreams.admit(tenant, prepared, { journalSeq, ...(consentGate ? { consent: consentGate } : {}) });
-      // Durable at the append; readable once applied. The outcome is written BEFORE the materializer is kicked, so a
-      // refusal it records at apply time (it retires the admitted outcome) is never overwritten by this one.
-      const done = await finish("admitted", outcome);
+      const logStreams = deps.logStreams;
+      const outcome = await logStreams.admit(tenant, prepared, { journalSeq, ...(consentGate ? { consent: consentGate } : {}) });
+      // A batch the materializer already skipped for good (its skip record): a replay of it answers refused, never
+      // admitted (admissionStatus lets admitted win, so admitted must not be written over a final refusal).
+      // Durable at the append; readable once applied. The outcome is written BEFORE the materializer is kicked.
+      // A materializer (this process's sweep, or another replica) may skip the batch between the read below and our
+      // write: it writes the skip record BEFORE it retires the admitted outcome, so the re-read AFTER our write sees
+      // every skip whose retirement could have run before our write. The inbox is retired only after that re-read,
+      // so a failure anywhere here retries the message (admit answers replay, and both reads run again).
+      const t = Date.now();
+      let refusedAs: string | undefined;
+      try {
+        refusedAs = await logStreams.skipped(tenant, prepared.originId, prepared.batchId);
+        if (!refusedAs) {
+          await writeOutcome(store, dir, { v: 1, state: "admitted", code: outcome, atMs: now });
+          refusedAs = await logStreams.skipped(tenant, prepared.originId, prepared.batchId);
+        }
+        // Refused (before or after our write): the refused outcome, and any admitted one retired, ours or one left by
+        // a materializer that crashed between its skip record and its own retirement.
+        if (refusedAs) {
+          await writeOutcome(store, dir, { v: 1, state: "refused", code: refusedAs, atMs: now });
+          await store.delete(objectKey(outcomeKey(dir, "admitted"))).catch((error) => { if (!(isObjectStoreError(error) && error.code === "not_found")) throw error; });
+        }
+        await tombstoneInbox(store, key);
+      } catch (error) {
+        return { action: "retry", delaySeconds: backoffSeconds(attempts), code: "outcome_unavailable", error };
+      }
+      const timingMs = { read, finish: Date.now() - t };
+      if (refusedAs) return { action: "ack", outcome: "refused", code: refusedAs, lagMs, timingMs };
       // Never awaited: the materializer runs off this path.
       deps.logMaterializer?.kick(tenant, prepared.originId);
-      return done;
+      return { action: "ack", outcome: "admitted", code: outcome, lagMs, timingMs };
     }
     const result = await deliverPrepared({
       ...deps.deliver,

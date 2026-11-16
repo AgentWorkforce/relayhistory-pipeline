@@ -306,8 +306,8 @@ mode: no stream leaves tests before slice 4 lands. What slice 4 changes:
   is written and the snapshot refuses it.
 - **One admission per stream at a time** in a process (a promise chain per stream), so concurrent admits of one stream
   never race for head+1; a LogFenced drops the cached state only if it is still the state that failed.
-- **The payload is written only after every refusal point**, and carries no admission time, so a retried admission
-  writes the same content-addressed payload (received_at is the entry's own `atMs`).
+- **The payload is written only after every refusal point**, and carries no admission time (received_at is the entry's
+  own `atMs`). Slice 5 adds a per-attempt nonce, so each attempt writes its own object.
 - **Unresolved entries have an age bound** (`LOG_PENDING_MAX_AGE_MS`, 15 min). Past it an entry is never resent, only
   read back: landed applies, absent is dropped. The orphan collection (`ORPHAN_GRACE_MS`, 1 h) is longer, and it also
   skips any payload an entry names, so no entry can land naming a payload that was collected.
@@ -321,12 +321,46 @@ mode: no stream leaves tests before slice 4 lands. What slice 4 changes:
 - **The switch** requires the deployment-wide proof `<keyRoot>/.ledger/log-commit-on.json` (written by the operator
   once every replica runs with the flag on), waits past the longest legacy claim (`SWITCH_SETTLE_MS`) after entry 0 and
   re-checks: a legacy batch that committed or is pending in that window (the commit guard's HEAD race with entry 0)
-  reports `legacy_raced_switch`. The CLI refuses to switch a bucket named prod, production or hosted, catches failures
-  and prints a code only, and uses a per-run operator writer id.
+  reports `legacy_raced_switch`. The CLI catches failures and prints a code only, and uses a per-run operator writer id.
+  (Slice 5 replaces the CLI's bucket-name denylist with an allowlist and adds a guard inside the switch itself.)
 - **Precheck parity**: the tenant segment and the delivery budget run first, as the legacy core's precheck. The log
   path takes no tenant slot: its per-stream concurrency is one. The mode is carried in `SelfhostIngestSettings`
   (`ledgerLogCommit`), parsed at config; the env is read only for a direct caller that omits it. An unreadable mode
   HEAD on the admission side is a `ledger_log_mode_unreadable` retry, logged by the consumer's retry line.
+
+## Slice 5: a skipped batch stays refused, fresh payloads per attempt, take only to write
+
+Commit-4's review (lander, P2 1-2, P3 3-7). Both P2s gate log mode: **no stream leaves tests before slice 5 lands.**
+
+- **A replay of a skipped batch answers refused.** The materializer writes a skip record (`<stream>/s/<h(batchId)>.json`,
+  the refusal code) BEFORE its refused outcome and before it retires the admitted one. The admission consumer, on the
+  log path, reads the skip record before it writes anything (skipped: it finishes refused), and again AFTER it writes
+  its admitted outcome (skipped: it writes refused and retires its own admitted). Because the skip record precedes the
+  materializer's retirement, the re-read after our write sees every skip whose retirement could have run before our
+  write, so every interleaving of a replay with a final skip ends refused. The inbox is retired only after that
+  re-read; a failure anywhere in it retries the message. This also closes the cross-replica race that was Remaining 7.
+- **A fresh payload per attempt.** The payload carries a per-attempt nonce, so every admission attempt writes its own
+  object (a fresh `lastModified`): an identical re-put can no longer leave a stale object that the orphan collection
+  takes between a retry's PUT and its append. One attempt's own retried PUTs are still idempotent (the same bytes).
+- **Take only to write.** Admission opens the stream read-only (the cached owned state, or a fresh open that is not
+  cached) for the replay check, the legacy doc, the fence, the journal and consent at admit. It takes the stream (the
+  epoch entry, the registry doc) only after every refusal point, just before the payload, and looks at the window again
+  after the take (another writer may have appended the batch since the open). Refused or replayed traffic writes no
+  epoch entry and no registry doc.
+- **Eviction never drops an in-flight stream**: the bounded state cache skips states whose admission chain is running.
+- **The switch's allowlist**: `switchToLogMode` itself refuses unless the bucket carries the operator-written
+  non-production marker (`<keyRoot>/.ledger/log-mode-nonprod.json`, `bucket_not_declared_nonprod`). The CLI requires
+  `--i-know-this-is-not-prod` for `switch` and `close` with `--apply`, and still refuses production-like bucket names
+  (prod, prd, live, hosted, customer). Status and dry runs stay allowed.
+- **The sweep never blocks the scan loop**: the registry listing and the idle HEADs run in the background with the
+  materializing, `LOG_SWEEP_CONCURRENCY` at a time.
+- **Window eviction (documented, not changed).** A batch id evicted from the 4096-entry window and not yet committed by
+  the materializer through the legacy path is appended again: a second entry for the same batch. Nothing is lost or
+  doubled in the read-side state: the materializer applies both through the legacy core, and the second is a replay
+  of the first's legacy batch doc. Only the log carries the duplicate entry.
+- **Residual (P3 3, documented).** An entry this process left unresolved is settled (resent if young) before the
+  current batch's gates run. That entry passed its own gates when it was built; a consent revocation since then is not
+  re-checked for it, as the materializer does not re-check consent at apply (Remaining 1).
 
 ## Remaining
 
@@ -343,14 +377,13 @@ mode: no stream leaves tests before slice 4 lands. What slice 4 changes:
 5. Compaction and retention: entries, materializer markers (`m/`) and the stream registry grow forever. Metrics.
 6. Cost: with the flag on, each admission HEADs entry 0 and the close marker (in parallel), reads the legacy batch doc,
    the fence and the shards of its live records; each apply reads the fence once more.
-7. A refused outcome written by the materializer races an admitted outcome written by ANOTHER replica's consumer for
-   the same batch only if that replica's sweep applies the entry before the admitting consumer writes its outcome
-   (milliseconds); status could then read admitted. Close it with a refusal that outranks admitted in
-   `admissionStatus`.
+7. Closed in slice 5 (the skip record, read before and after the consumer's admitted write). Kept as a number so the
+   references stay stable.
 8. Stream registry docs hold the user id and raw origin id outside the user's directory: erasure must delete them (or
    key them by hash only).
 9. `registerLogStream` failing after `takeStream` makes the retry take the stream again (one more epoch entry per
    retry): register before taking, or make the take idempotent for the same writer.
-10. IAM: the materializer needs GET/PUT/DELETE/LIST on `ledger/log/` and `.ledger/log-streams/`, PUT/DELETE on the
-    receipt outcomes; the operator tool GET/LIST on `ledger/batches/` and PUT on `ledger/log/e/`, `closed.json` and the
+10. IAM: the materializer needs GET/PUT/DELETE/LIST on `ledger/log/` (including the skip records under `s/`) and
+    `.ledger/log-streams/`, PUT/DELETE on the receipt outcomes; the admission consumer GET on the skip records and
+    DELETE on its own admitted outcome; the operator tool GET/LIST on `ledger/batches/` and PUT on `ledger/log/e/`, `closed.json` and the
     registry. Document them in the stack before any deployment.
