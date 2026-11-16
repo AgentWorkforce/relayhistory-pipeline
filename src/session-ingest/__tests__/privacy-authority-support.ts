@@ -32,6 +32,8 @@ export const FROZEN_COPY_PROGRESS_SQL = "supabase/migrations/20261105047030_froz
 export const OPERATOR_USER_ERASE_SQL = "supabase/migrations/20261105058010_operator_user_erase.sql";
 /** 062010 replaces 058010's ingest_lock_fences (its body reads 058010's erase ledger), so it is skipped with 058010. */
 export const ORIGIN_CLAIM_FENCE_SQL = "supabase/migrations/20261105062010_ingest_origin_claim_fence.sql";
+/** 062020 installs the user-erasure capture trigger and registration gate over 058010's operator ledger. */
+export const TURNS_FORWARD_GATES_SQL = "supabase/migrations/20261105062020_turns_forward_gates.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
@@ -47,10 +49,11 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // pending:false reproduces the state without 041000; 043700's creator precondition requires 041000's ingest_privacy_authority,
   // so it is skipped with it (and 043860, which requires 043700's parity table, 043870, which requires 041000, and 043890, which
   // replaces 043860's gate, and 045010, which replaces 043870's stage RPC, and 047030, whose receipts trigger executes
-  // 041000's guard function, and 058010, which re-creates 041000's begins, and 062010, which replaces 058010's lock), while 042000/043000/043500 still apply.
+  // 041000's guard function, and 058010, which re-creates 041000's begins, 062010, which replaces 058010's lock,
+  // and 062020, whose user-erasure capture trigger reads 058010's operator ledger), while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL || path === FROZEN_COPY_PROGRESS_SQL || path === OPERATOR_USER_ERASE_SQL || path === ORIGIN_CLAIM_FENCE_SQL || path === TURNS_FORWARD_GATES_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }
