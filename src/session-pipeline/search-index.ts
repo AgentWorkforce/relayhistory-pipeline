@@ -124,8 +124,8 @@ export interface SearchIndexDeps {
    */
   outputFactsStore?: (tx: SqlExecutor) => OutputFactsStore;
   /**
-   * SEARCH_INDEX_STREAMING_ENABLED=true only (the self-host consumer, adapter binding, no
-   * output facts): a scope past the whole-read bound (`scope_too_large` alone) is reconciled
+   * SEARCH_INDEX_STREAMING_ENABLED on (the default) only, in the self-host consumer (adapter
+   * binding, no output facts): a scope past the whole-read bound (`scope_too_large` alone) is reconciled
    * by the streaming reader (canonical-stream-projection.ts) within these read budgets,
    * summed over its passes, instead of being marked partial. Absent: such a scope is marked
    * partial exactly as before, and every other scope never reaches the streaming reader.
@@ -672,42 +672,60 @@ async function streamedReconcile(
 }
 
 /**
+ * How SEARCH_INDEX_STREAMING_ENABLED resolved for the indexer SERVICE (searchIndexStreamStartup).
+ * Unset and "" are the same: the code default, which is on unless
+ * RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true (the facts are built from a whole read), where it is
+ * off without failing startup. "true" is an explicit on and, with output facts, still fails
+ * startup; "false" is an explicit off. Any other value fails startup (strict flag grammar:
+ * "1", "0", "TRUE" and padded values are refused, never guessed).
+ */
+export type SearchIndexStreamFlag = "explicit_on" | "explicit_off" | "default_on" | "default_off_output_facts";
+
+export function searchIndexStreamFlag(env: Record<string, string | undefined>, outputFacts: boolean): SearchIndexStreamFlag {
+  const flag = env.SEARCH_INDEX_STREAMING_ENABLED;
+  if (flag === undefined || flag === "") return outputFacts ? "default_off_output_facts" : "default_on";
+  if (flag === "false") return "explicit_off";
+  if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED must be true or false");
+  if (outputFacts)
+    throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
+  return "explicit_on";
+}
+
+/**
  * Streaming reconcile budgets for the indexer SERVICE (consumer-service.ts serve() only),
  * from the environment, given the effective whole-read `limits`:
  *
- *   SEARCH_INDEX_STREAMING_ENABLED      exactly "true" turns streaming on; unset, "" or "false"
- *                                       leave it off (returns undefined); anything else fails
+ *   SEARCH_INDEX_STREAMING_ENABLED      default on (unset or ""), except off when
+ *                                       RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true; "true" is an
+ *                                       explicit on (fails with output facts), "false" an
+ *                                       explicit off (returns undefined); anything else fails
  *   SEARCH_INDEX_STREAM_MAX_READ_BYTES  bytes read, summed over every pass of one scope (a whole
  *                                       number, optional MiB / GiB suffix)
  *   SEARCH_INDEX_STREAM_MAX_READ_EVENTS records read, summed over every pass of one scope
  *
- * Unset, each budget is four times the effective whole-read bound (one read per pass), capped
- * at the large-read profile (2 GiB / 2,000,000); set, it must lie between that default and
- * the cap. A scope whose declared size times four exceeds a budget is never streamed: with
- * both defaults that is every scope past the whole-read bound (searchIndexStreamDefaultsWarning
- * logs it at startup). A scope streams only when its size times four fits both budgets, so
- * an operator raises the budget(s) its size exceeds, usually both (at the caps: scopes up to
- * 512 MiB and 500,000 records), sizing the pod for one chunk plus about 1 KB of keys per
- * record. Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the facts are built from a
- * whole read. Errors name the variable and its range, never the value.
+ * Unset, each budget is the large-read profile's bound, STREAM_READ_CEILING (2 GiB /
+ * 2,000,000): a scope streams only when four times its size fits both budgets, so the
+ * default streams scopes up to 512 MiB and 500,000 records. Set, a budget must lie between
+ * its floor (searchIndexStreamFloor: four times the effective whole-read bound, capped at the
+ * ceiling, below which no scope past that bound could stream) and the ceiling; lower it to
+ * shrink the largest streamed scope and the pod memory it needs (one chunk plus about 1 KB
+ * of keys per record read). Off reads neither budget. Errors name the variable and its
+ * range, never the value.
  */
 export function searchIndexStreamFromEnv(
   env: Record<string, string | undefined>,
   limits: Partial<SearchIndexLimits>,
   outputFacts: boolean,
 ): StreamReadLimits | undefined {
-  const flag = env.SEARCH_INDEX_STREAMING_ENABLED;
-  if (flag === undefined || flag === "" || flag === "false") return undefined;
-  if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED must be true or false");
-  if (outputFacts)
-    throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
+  const flag = searchIndexStreamFlag(env, outputFacts);
+  if (flag !== "explicit_on" && flag !== "default_on") return undefined;
   const MiB = 1024 * 1024;
   const cap = STREAM_READ_CEILING;
-  const defaults = searchIndexStreamDefaults(limits);
+  const floor = searchIndexStreamFloor(limits);
   const fmt = (bytes: boolean, n: number) => (bytes ? `${n / MiB}MiB` : String(n));
   const read = (name: string, bytes: boolean, min: number, max: number): number => {
     const raw = env[name];
-    if (raw === undefined || raw === "") return min;
+    if (raw === undefined || raw === "") return max;
     const m = (bytes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
     const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
     if (!Number.isSafeInteger(value) || value < min || value > max)
@@ -715,13 +733,17 @@ export function searchIndexStreamFromEnv(
     return value;
   };
   return {
-    maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, defaults.maxReadBytes, cap.maxReadBytes),
-    maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, defaults.maxReadEvents, cap.maxReadEvents),
+    maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, floor.maxReadBytes, cap.maxReadBytes),
+    maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, floor.maxReadEvents, cap.maxReadEvents),
   };
 }
 
-/** The default (and smallest accepted) streaming budgets for the effective whole-read `limits`. */
-export function searchIndexStreamDefaults(limits: Partial<SearchIndexLimits>): StreamReadLimits {
+/**
+ * The smallest accepted streaming budgets for the effective whole-read `limits`: four whole
+ * reads, capped at STREAM_READ_CEILING. At the floor of both, no scope past the whole-read
+ * bound fits (searchIndexStreamBudgetWarning). The defaults are the ceiling itself.
+ */
+export function searchIndexStreamFloor(limits: Partial<SearchIndexLimits>): StreamReadLimits {
   const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
   return {
     maxReadBytes: Math.min(STREAM_PASSES * effective.maxScopeBytes, STREAM_READ_CEILING.maxReadBytes),
@@ -730,26 +752,66 @@ export function searchIndexStreamDefaults(limits: Partial<SearchIndexLimits>): S
 }
 
 /**
- * The startup warning for streaming on with both budgets at their defaults, or undefined.
- * Every scope the streaming reader takes is past the whole-read bound, and it needs four
- * times its size within each budget: at the defaults (four whole reads, or the cap once a
- * bound reaches 512 MiB / 500,000) no scope fits, so none streams; one whose chunks do not
- * declare their record counts is refused only after a full first pass under the scope's
- * locks. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES and/or _EVENTS (whichever the scopes'
- * sizes exceed, usually both) toward the cap.
+ * The startup warning for streaming on with budgets no scope can use, or undefined. Every
+ * scope the streaming reader takes is past the whole-read bound in bytes or in records, and
+ * it needs four times its size within each budget: when neither budget exceeds four times
+ * its bound, no scope fits and none streams (a scope whose chunks do not declare their
+ * record counts is refused only after a full first pass under the scope's locks). Never at
+ * the default budgets (the ceiling is above four times the largest accepted bound in bytes);
+ * only when an operator lowers both to their floor. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES
+ * and/or _EVENTS toward the ceiling, or set SEARCH_INDEX_STREAMING_ENABLED=false.
  */
-export function searchIndexStreamDefaultsWarning(
+export function searchIndexStreamBudgetWarning(
   stream: StreamReadLimits | undefined,
   limits: Partial<SearchIndexLimits>,
 ): Record<string, number> | undefined {
   if (!stream) return undefined;
-  const defaults = searchIndexStreamDefaults(limits);
-  if (stream.maxReadBytes !== defaults.maxReadBytes || stream.maxReadEvents !== defaults.maxReadEvents) return undefined;
+  const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
+  if (stream.maxReadBytes > STREAM_PASSES * effective.maxScopeBytes || stream.maxReadEvents > STREAM_PASSES * effective.maxScopeEvents)
+    return undefined;
   return {
     max_read_bytes: stream.maxReadBytes,
     max_read_events: stream.maxReadEvents,
     largest_streamed_scope_bytes: Math.floor(stream.maxReadBytes / STREAM_PASSES),
     largest_streamed_scope_events: Math.floor(stream.maxReadEvents / STREAM_PASSES),
+  };
+}
+
+/** One startup log line about the streaming reconcile, for serve() to emit. */
+export interface SearchIndexStreamNotice {
+  level: "info" | "warn";
+  message: string;
+  fields: Record<string, string | number>;
+}
+
+/**
+ * The streaming reconcile as the indexer SERVICE starts it: the budgets (undefined when off)
+ * and at most one log line. Off by default because RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true
+ * logs that reason (info) instead of failing; budgets no scope can use log a warning.
+ * Throws exactly as searchIndexStreamFlag / searchIndexStreamFromEnv do.
+ */
+export function searchIndexStreamStartup(
+  env: Record<string, string | undefined>,
+  limits: Partial<SearchIndexLimits>,
+  outputFacts: boolean,
+): { stream: StreamReadLimits | undefined; notice: SearchIndexStreamNotice | undefined } {
+  const flag = searchIndexStreamFlag(env, outputFacts);
+  const stream = searchIndexStreamFromEnv(env, limits, outputFacts);
+  if (flag === "default_off_output_facts")
+    return {
+      stream,
+      notice: {
+        level: "info",
+        message: "pipeline consumer streaming reconcile off: RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true builds facts from a whole read",
+        fields: { streaming: "off", reason: "output_facts" },
+      },
+    };
+  const budget = searchIndexStreamBudgetWarning(stream, limits);
+  return {
+    stream,
+    notice: budget
+      ? { level: "warn", message: "pipeline consumer streaming reconcile on with read budgets no scope past the whole-read bound fits", fields: budget }
+      : undefined,
   };
 }
 

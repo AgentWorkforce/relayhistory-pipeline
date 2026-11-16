@@ -144,9 +144,9 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_MAX_SCOPE_BYTES` | session-pipeline consumer (self-host SERVICE only, enabled) | Raw bytes of one search index scope; above it the session is marked partial (`scope_too_large`). Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 64 MiB; accepted 64 MiB to 256 MiB (the replay bound). The indexer holds the scope several times over in memory, so raise the pod limit with it. Needs no manual re-index: every reconcile tick (`CONSUMER_RECONCILE_EVERY_MINUTES`) the consumer re-sends each session the search state lists as partial, `scope_too_large` ones included, so after a restart with a higher limit those sessions are indexed again under it (a large backlog over several ticks; a key in retry backoff waits for it). Unset or empty is the default; malformed, below 64 MiB or above 256 MiB fails startup before any connection opens, naming the variable only. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_SCOPE_EVENTS` | session-pipeline consumer (self-host SERVICE only, enabled) | Records of one search index scope, a positive integer. Default 100000; accepted 100000 to 1000000. Same partial, re-index and startup rules as `SEARCH_INDEX_MAX_SCOPE_BYTES`. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_ROWS` | session-pipeline consumer (self-host SERVICE only, enabled) | Index rows compared for one scope, a positive integer. Default 500000; accepted 500000 to 1000000. Same startup rules. Never read by the hosted Lambda. |
-| `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Exactly `true` streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset, `""` or `false` is off (default) and neither budget is read; any other value, or `true` with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Never read by the hosted Lambda. |
-| `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES`, capped at 2 GiB; accepted from that default to 2 GiB. With both budgets at their defaults no scope streams (startup warns); a scope streams only when four times its size fits both budgets, so raise the one(s) its size exceeds, usually both. Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
-| `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS`, capped at 2000000; accepted from that default to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
+| `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
+| `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 0.5 GB of keys on top of its usual limit); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -302,11 +302,16 @@ disposable containers (`docs/session-search-proof.md`).
 ### Streaming reconcile (Phase 2)
 
 `SEARCH_INDEX_STREAMING_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only,
-default off) indexes a session that is too large for one search index pass instead of marking it partial. Exactly
-`true` turns it on; unset, `""` or `false` leaves it off and the consumer reads neither budget below; any other
-value fails startup, and so does `true` together with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (the facts are
-built from a whole read). It applies only to a scope whose whole read stopped on `scope_too_large` alone
-(above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before.
+**default on**) indexes a session that is too large for one search index pass instead of marking it partial.
+Unset or `""` is the code default: on, except off when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (the facts are
+built from a whole read), where startup does not fail and the consumer logs `pipeline consumer streaming reconcile
+off` with `reason=output_facts` (info, once per start). `false` turns it off, with or without output facts, and the
+consumer then reads neither budget below. `true` is an explicit on and still fails startup together with
+`RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. Any other value (`1`, `0`, `TRUE`, padded values included) fails startup.
+To turn streaming off, set `SEARCH_INDEX_STREAMING_ENABLED=false` explicitly: leaving the variable out of the
+environment no longer means off. It applies only to a scope whose whole read stopped on `scope_too_large` alone
+(above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before. The hosted
+pipeline Lambda and the large-read worker never read these settings, so the default changes nothing there.
 
 The streaming reader reads the scope's chunks again in several passes rather than holding them: roughly four object
 reads per chunk for flagged sessions, memory bounded by one chunk plus per-record keys. It produces the same index
@@ -320,17 +325,21 @@ timeout.
 
 Two budgets bound it, each summed over every pass of one scope: `SEARCH_INDEX_STREAM_MAX_READ_BYTES` (a whole
 number of bytes, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` (records). Unset, each
-is four times the effective whole-read bound, capped at 2 GiB / 2000000; set, it must lie between that default
-and the cap, or startup fails naming the variable and its range, never the value. A scope is refused before any
-chunk is read when its declared size times four exceeds a budget, again after the first pass from the sizes
-actually read and declared, and on any chunk or record past it. A scope whose chunks do not declare their record
-counts is refused only after a full first pass, read under the scope's lock. With both budgets at their defaults
-every scope past the whole-read bound is refused, because a streamed scope is by definition larger than the bound
-and the defaults allow four reads of the bound; the consumer logs a warning at startup when streaming is on with
-both defaults. From `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the default events budget is already the 2000000 cap,
-so no larger scope streams there either. A scope streams only when its size times four fits both budgets: raise
-the one its size exceeds, or both (usually both); at the caps, scopes up to 512 MiB and 500000 records stream. Size the consumer pod for one decompressed chunk plus about 1 KB
-of keys per record, about 0.5 GB at the 2000000-record cap, on top of its usual memory limit. A refused scope stays
+is the large-read profile's bound, 2 GiB / 2000000. A scope streams only when its size times four fits both
+budgets, so at the defaults scopes up to 512 MiB and 500000 records stream. Set, a budget must lie between its
+floor, four times the effective whole-read bound capped at 2 GiB / 2000000, and that cap, or startup fails naming
+the variable and its range, never the value; lower a budget to shrink the largest streamed scope and the memory it
+needs. A scope is refused before any chunk is read when its declared size times four exceeds a budget, again
+after the first pass from the sizes actually read and declared, and on any chunk or record past it. A scope whose
+chunks do not declare their record counts is refused only after a full first pass, read under the scope's lock.
+With both budgets lowered to their floors every scope past the whole-read bound is refused (a streamed scope is
+by definition larger than the bound, and the floors allow four reads of it), and the consumer logs a warning at
+startup; from `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the events floor is already the 2000000 cap, so a scope
+past the events bound never streams there, while one past only the bytes bound still can. Size the consumer pod
+for one decompressed chunk plus about 1 KB of keys per record, about 0.5 GB at the default 2000000-record budget,
+on top of its usual memory limit; an image upgrade turns this on for an install that never set the variable, so
+check the pod limit or set `false` before upgrading. On the first reconcile tick after the upgrade, every session
+already partial with `scope_too_large` alone is streamed (or refused by the budgets) in turn. A refused scope stays
 partial with `scope_too_large` first and then the budget's code, `stream_read_bytes_budget` or
 `stream_read_events_budget`, and is retried every reconcile tick like any partial session; the consumer's
 `search index partial` warning names those codes and, for a streamed scope, the passes, chunks, bytes and records

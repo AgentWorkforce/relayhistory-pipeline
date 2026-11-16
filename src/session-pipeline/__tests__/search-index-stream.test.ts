@@ -14,7 +14,10 @@ import { TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/pos
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
-import { indexSearchScope, searchIndexStreamDefaultsWarning, searchIndexStreamFromEnv, type SearchIndexDeps } from "../search-index.ts";
+import {
+  STREAM_READ_CEILING, indexSearchScope, searchIndexStreamBudgetWarning, searchIndexStreamFlag, searchIndexStreamFloor, searchIndexStreamFromEnv,
+  searchIndexStreamStartup, type SearchIndexDeps,
+} from "../search-index.ts";
 import { STREAM_READ_BYTES_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
 import {
   SCOPE, T0, activity, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line,
@@ -299,25 +302,43 @@ test("streaming on: a failed keepalive ends the pass with its error, not a read 
   expect(b.recorded).toEqual([]);
 }, 60_000);
 
-test("SEARCH_INDEX_STREAMING_ENABLED and the read budgets are validated", () => {
+test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts, and the read budgets are validated", () => {
   const MiB = 1024 * 1024;
   const limits = { maxScopeBytes: 64 * MiB, maxScopeEvents: 100_000 };
-  expect(searchIndexStreamFromEnv({}, limits, false)).toBeUndefined();
-  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "" }, limits, false)).toBeUndefined();
-  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, limits, false)).toBeUndefined();
-  // Off ignores the budgets entirely.
-  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }, limits, true)).toBeUndefined();
-  for (const flag of ["1", "TRUE", "yes", " true"])
+  const CEILING = { maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000 };
+  expect(STREAM_READ_CEILING).toEqual(CEILING);
+  // Unset or "": the code default, on, at the ceiling budgets.
+  expect(searchIndexStreamFlag({}, false)).toBe("default_on");
+  expect(searchIndexStreamFromEnv({}, limits, false)).toEqual(CEILING);
+  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "" }, limits, false)).toEqual(CEILING);
+  // Unset or "" with output facts: off, no failure, and the budgets are not read.
+  for (const env of [{}, { SEARCH_INDEX_STREAMING_ENABLED: "" }]) {
+    expect(searchIndexStreamFlag(env, true)).toBe("default_off_output_facts");
+    expect(searchIndexStreamFromEnv({ ...env, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }, limits, true)).toBeUndefined();
+  }
+  // Explicit "false": off, with or without output facts, and the budgets are not read.
+  for (const facts of [false, true]) {
+    expect(searchIndexStreamFlag({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, facts)).toBe("explicit_off");
+    expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }, limits, facts)).toBeUndefined();
+  }
+  // Strict grammar: anything but "true" / "false" / "" fails, "1" and "0" included.
+  for (const flag of ["1", "0", "TRUE", "False", "yes", " true", "false "])
     expect(() => searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: flag }, limits, false)).toThrow("SEARCH_INDEX_STREAMING_ENABLED must be true or false");
-  expect(() => searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, limits, true)).toThrow("RELAYHISTORY_SELFHOST_OUTPUT_FACTS");
+  // Explicit "true" with output facts still fails startup, exactly as before the default flip.
+  expect(() => searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, limits, true)).toThrow(
+    "pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
+  );
   const on = { SEARCH_INDEX_STREAMING_ENABLED: "true" };
-  expect(searchIndexStreamFromEnv(on, limits, false)).toEqual({ maxReadBytes: 256 * MiB, maxReadEvents: 400_000 });
-  // Defaults: four whole reads, capped at 2 GiB / 2,000,000.
-  expect(searchIndexStreamFromEnv(on, { maxScopeBytes: 1024 * MiB, maxScopeEvents: 1_000_000 }, false)).toEqual({ maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000 });
-  expect(searchIndexStreamFromEnv({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" }, limits, false)).toEqual({ maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000 });
-  expect(searchIndexStreamFromEnv({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "512MiB" }, limits, false)!.maxReadBytes).toBe(512 * MiB);
+  expect(searchIndexStreamFlag(on, false)).toBe("explicit_on");
+  expect(searchIndexStreamFromEnv(on, limits, false)).toEqual(CEILING);
+  // The floor (four whole reads, capped at the ceiling) is accepted; the default stays the ceiling.
+  expect(searchIndexStreamFloor(limits)).toEqual({ maxReadBytes: 256 * MiB, maxReadEvents: 400_000 });
+  expect(searchIndexStreamFloor({ maxScopeBytes: 1024 * MiB, maxScopeEvents: 1_000_000 })).toEqual(CEILING);
+  expect(searchIndexStreamFromEnv({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400000" }, limits, false)).toEqual({ maxReadBytes: 256 * MiB, maxReadEvents: 400_000 });
+  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAM_MAX_READ_BYTES: "512MiB" }, limits, false)).toEqual({ maxReadBytes: 512 * MiB, maxReadEvents: 2_000_000 });
+  expect(searchIndexStreamFromEnv({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" }, limits, false)).toEqual(CEILING);
   for (const [name, value] of [
-    ["SEARCH_INDEX_STREAM_MAX_READ_BYTES", "255MiB"], // below the default
+    ["SEARCH_INDEX_STREAM_MAX_READ_BYTES", "255MiB"], // below the floor
     ["SEARCH_INDEX_STREAM_MAX_READ_BYTES", "3GiB"], // above the cap
     ["SEARCH_INDEX_STREAM_MAX_READ_BYTES", "1.5GiB"],
     ["SEARCH_INDEX_STREAM_MAX_READ_BYTES", "-1"],
@@ -325,28 +346,58 @@ test("SEARCH_INDEX_STREAMING_ENABLED and the read budgets are validated", () => 
     ["SEARCH_INDEX_STREAM_MAX_READ_EVENTS", "2000001"],
     ["SEARCH_INDEX_STREAM_MAX_READ_EVENTS", "1MiB"],
   ] as const) {
-    let message = "";
-    try {
-      searchIndexStreamFromEnv({ ...on, [name]: value }, limits, false);
-    } catch (error) {
-      message = (error as Error).message;
+    for (const env of [on, {}]) {
+      let message = "";
+      try {
+        searchIndexStreamFromEnv({ ...env, [name]: value }, limits, false);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toStartWith(`pipeline consumer: ${name} must be`);
+      expect(message).not.toContain(value); // never echoes the value
     }
-    expect(message).toStartWith(`pipeline consumer: ${name} must be`);
-    expect(message).not.toContain(value); // never echoes the value
   }
 });
 
-test("streaming on with both budgets at their defaults warns at startup; a raised budget does not", () => {
+test("startup: unset with output facts logs why streaming is off; budgets at their floors warn; the defaults do not", () => {
   const MiB = 1024 * 1024;
   const limits = { maxScopeBytes: 64 * MiB, maxScopeEvents: 100_000 };
-  const on = { SEARCH_INDEX_STREAMING_ENABLED: "true" };
-  const warn = (env: Record<string, string>, l: typeof limits = limits) => searchIndexStreamDefaultsWarning(searchIndexStreamFromEnv(env, l, false), l);
-  expect(warn({})).toBeUndefined(); // off
-  expect(warn(on)).toEqual({ max_read_bytes: 256 * MiB, max_read_events: 400_000, largest_streamed_scope_bytes: 64 * MiB, largest_streamed_scope_events: 100_000 });
-  // Set to the default values is still the defaults.
-  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400000" })).toBeDefined();
-  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB" })).toBeUndefined();
-  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" })).toBeUndefined();
-  // At 500,000 records and more the default events budget is the 2,000,000 cap: still no scope fits.
-  expect(warn(on, { maxScopeBytes: 64 * MiB, maxScopeEvents: 500_000 })).toMatchObject({ max_read_events: 2_000_000, largest_streamed_scope_events: 500_000 });
+  const start = (env: Record<string, string>, facts = false, l: Partial<typeof limits> = limits) => searchIndexStreamStartup(env, l, facts);
+  expect(start({}, true)).toEqual({
+    stream: undefined,
+    notice: { level: "info", message: expect.stringContaining("RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true"), fields: { streaming: "off", reason: "output_facts" } },
+  });
+  expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, true)).toEqual({ stream: undefined, notice: undefined });
+  expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "false" })).toEqual({ stream: undefined, notice: undefined });
+  expect(() => start({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, true)).toThrow("RELAYHISTORY_SELFHOST_OUTPUT_FACTS");
+  // The defaults (the ceiling) stream scopes past the bound: no warning, at any accepted whole-read bound.
+  expect(start({})).toEqual({ stream: STREAM_READ_CEILING, notice: undefined });
+  expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "true" })).toEqual({ stream: STREAM_READ_CEILING, notice: undefined });
+  expect(start({}, false, { maxScopeBytes: 256 * MiB, maxScopeEvents: 1_000_000 }).notice).toBeUndefined();
+  // Both budgets lowered to their floors: no scope past the bound fits, so startup warns.
+  const floor = { SEARCH_INDEX_STREAM_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400000" };
+  expect(start(floor).notice).toEqual({
+    level: "warn",
+    message: expect.stringContaining("no scope past the whole-read bound fits"),
+    fields: { max_read_bytes: 256 * MiB, max_read_events: 400_000, largest_streamed_scope_bytes: 64 * MiB, largest_streamed_scope_events: 100_000 },
+  });
+  // One budget above its floor lets the scopes past that bound stream: no warning.
+  expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "257MiB" }).notice).toBeUndefined();
+  expect(start({ ...floor, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400001" }).notice).toBeUndefined();
+  expect(searchIndexStreamBudgetWarning(undefined, limits)).toBeUndefined();
 });
+
+test("streaming at the default budgets: a scope past the whole-read bound is streamed, not left partial", async () => {
+  const x = await scope(generate(31));
+  const stream = searchIndexStreamFromEnv({}, TINY, false);
+  expect(stream).toEqual(STREAM_READ_CEILING);
+  const b = await backend(x, { limits: TINY, stream });
+  const s = await indexSearchScope(SCOPE, b.deps);
+  expect(s).toMatchObject({ complete: true, reasons: [], deleted: 0 });
+  expect(s.stream).toMatchObject({ passes: 4 });
+  expect(s.rows).toBeGreaterThan(10);
+  // Off by default with output facts: the same scope stays partial (scope_too_large).
+  expect(searchIndexStreamFromEnv({}, TINY, true)).toBeUndefined();
+  const off = await backend(x, { limits: TINY });
+  expect(await indexSearchScope(SCOPE, off.deps)).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large"] });
+}, 60_000);

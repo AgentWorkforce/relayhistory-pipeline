@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
-import { searchIndexLimitsFromEnv, searchIndexStreamDefaultsWarning, searchIndexStreamFromEnv, type SearchIndexDeps } from "./search-index.ts";
+import { searchIndexLimitsFromEnv, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1134,15 +1134,13 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // a malformed or out-of-range SEARCH_INDEX_MAX_* fails startup. All unset is {}
   // and the search deps below carry no `limits`, exactly as before.
   const searchLimits = searchIndexLimitsFromEnv(env);
-  // SEARCH_INDEX_STREAMING_ENABLED=true only (default off): the streaming reconcile for a
-  // scope past the whole-read bound, within SEARCH_INDEX_STREAM_MAX_READ_* (search-index.ts
-  // searchIndexStreamFromEnv). Off returns undefined and the search deps carry no `stream`.
-  const searchStream = searchIndexStreamFromEnv(env, searchLimits, config.outputFacts);
-  const streamDefaults = searchIndexStreamDefaultsWarning(searchStream, searchLimits);
-  if (streamDefaults)
-    log.warn("pipeline consumer streaming reconcile on with default read budgets: no scope past the whole-read bound fits them", {
-      service: "session-pipeline-consumer", ...streamDefaults,
-    });
+  // SEARCH_INDEX_STREAMING_ENABLED, default on (off by default with
+  // RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, logged; an explicit "true" with it still fails
+  // startup): the streaming reconcile for a scope past the whole-read bound, within
+  // SEARCH_INDEX_STREAM_MAX_READ_* (search-index.ts searchIndexStreamStartup). Off returns
+  // undefined and the search deps carry no `stream`.
+  const { stream: searchStream, notice: streamNotice } = searchIndexStreamStartup(env, searchLimits, config.outputFacts);
+  if (streamNotice) log[streamNotice.level](streamNotice.message, { service: "session-pipeline-consumer", ...streamNotice.fields });
   // Dormant never opens a database, so smuggled startup options there are
   // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);
