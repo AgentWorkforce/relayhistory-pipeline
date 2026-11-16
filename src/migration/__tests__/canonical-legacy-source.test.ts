@@ -438,7 +438,9 @@ test("a post-PUT privacy race records the written manifest and aborts the run", 
         sql.includes("pg_advisory_xact_lock_shared")
       )
         return { rows: [] as T[] };
-      if (sql.includes("AS fenced") && ++fenceReads === 2)
+      // Registration is committed in its own transaction, then the write
+      // transaction has a precheck. Inject on that transaction's postcheck.
+      if (sql.includes("AS fenced") && ++fenceReads === 4)
         await pg.exec(`INSERT INTO sessions.upload_resets VALUES('org_1','ws_1','person','post-put')`);
       return db.query<T>(sql, params);
     },
@@ -565,11 +567,23 @@ test("privacy preflight rejects active RLS even for a SELECT-only role", async (
   }
 });
 
-test("turns-only scope uses the unambiguous attributed session_owner", async () => {
-  await pg.exec(`DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
+test("turns-only scope uses an unambiguous session_owner verified elsewhere in the tenant", async () => {
+  await pg.exec(`INSERT INTO sessions.convergence_events VALUES('org_1','ws_1','claude','verified-owner','person');
+    DELETE FROM sessions.convergence_events WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
   await pg.exec(`DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
   try {
     expect(await legacyScopeUser(db, scope)).toBe("person");
+  } finally {
+    await pg.exec("DELETE FROM sessions.convergence_events WHERE session_id='verified-owner'");
+    await restoreBaseOwner();
+  }
+});
+
+test("turns-only free text without authenticated tenant evidence is not an erasure owner", async () => {
+  await pg.exec(`DELETE FROM sessions.convergence_events;
+    DELETE FROM sessions.session_outcomes WHERE org_id='org_1' AND workspace_id='ws_1' AND source='claude' AND session_id='sess:1'`);
+  try {
+    expect(await legacyScopeUser(db, scope)).toBeNull();
   } finally {
     await restoreBaseOwner();
   }
