@@ -91,31 +91,27 @@ them.
     the evidence names every target org and the handoff owner confirms the
     reviewed S3-side fence path for each S3-path org; do not run the SQL eraser
     against such an org before that confirmation. For every
-    `INGEST_LEDGER=s3` org, the export plan has a second hard gate with these
-    two per-org predicates:
+    `INGEST_LEDGER=s3` org, the export plan has this second hard gate: The
+    receipt is the #613 mirror check: S3 fence-deleted pairs keyed (org,
+    workspace with '' and 'default' equal, source, session_id) must be a subset
+    of sessions.upload_deletions; sessions.upload_resets must be at or after
+    the S3 reset epoch per (org, workspace, user_id). Both halves are recorded:
+    SQL by the handoff owner, S3 via the ingest-edge read role.
 
-    1. the current S3 fence-deleted pairs, keyed by `(org, workspace, source,
-       session_id)`, are a subset of SQL `sessions.upload_deletions`; normalize
-       workspace so `''` and `default` are the same key; and
-    2. for each `(org, normalized workspace, user_id)`, the SQL
-       `sessions.upload_resets` epoch is greater than or equal to the current
-       S3 reset epoch.
+    Run the check per org immediately before that org's export run, not once
+    per activation window. The fail-closed mirror (a 503 when an erase cannot
+    be mirrored) must stay in force until that org's export finishes.
 
     **Stop syncing**, privacy reset, and ordered controls mirror fail-closed
     into those SQL ledgers (the request returns 503 when the mirror cannot be
     written), and there are no S3-only erase kinds. Still prove both predicates
     from current state; do not infer them from a successful historical request.
-    Run this check separately for each org immediately before that org's export,
-    not once per activation window or once before an all-org run. Keep the
-    fail-closed mirror path (503 when an erase cannot be mirrored) in force
-    until that org's export finishes. The receipt records both halves: the
-    pipeline handoff owner runs and signs the SQL half; the S3 half requires the
-    ingest-edge read role owned by `infra-environments`. Obtain its read-only
-    evidence through that owner, never pass its credential to this exporter or
-    grant that role to the exporter identity. If either half is unavailable or
-    either predicate fails, exclude the org from both canary and all-org export;
-    never interpret an absent SQL row as unfenced. Track the cross-path
-    reconciliation in relayhistory-pipeline#613. The exporter and
+    The ingest-edge read role is owned by `infra-environments`; obtain its
+    read-only evidence through that owner, never pass its credential to this
+    exporter or grant that role to the exporter identity. If either half is
+    unavailable or either predicate fails, exclude the org from both canary and
+    all-org export; never interpret an absent SQL row as unfenced. Track the
+    cross-path reconciliation in relayhistory-pipeline#613. The exporter and
     hosted eraser continue to enforce all six SQL ledgers listed under the
     privacy-role rule above. The set of S3-path orgs changes during the
     migration; never rely on a copied org list or an earlier window's receipt.
