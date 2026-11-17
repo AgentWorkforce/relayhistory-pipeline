@@ -52,7 +52,7 @@ For every release that moves readiness (the same condition as the overlap gate a
 3. **Post-apply check**: every listed deployment is back at its recorded Ready count on the new image, and the summary dead-letter count has not grown since step 1. Any shortfall is a release incident: page, do not wait for the next monitor summary.
 4. Record the list, the images and the readback in the release handoff.
 
-A NotReady-but-running worker is the failure mode this guards against. The standing alert (any schema-gated deployment below its desired Ready count for more than 5 minutes) is the backstop, not the plan.
+A NotReady-but-running worker is the failure mode this guards against. A standing alert (any schema-gated deployment below its desired Ready count for more than 5 minutes) is to be added in the infra repository, next to the manifests; until it exists, step 3 is the only check. Even then it is the backstop, not the plan.
 
 ### Failed apply without a window (`retry_marker_pending_no_window`)
 
