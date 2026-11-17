@@ -31,7 +31,7 @@ export function prng(seed: number) {
   };
 }
 
-export type Line = { machine: string; record: RelayhistoryStreamRecord };
+export type Line = { machine: string; record: RelayhistoryStreamRecord; userId?: string };
 export const iso = (ms: number) => new Date(ms).toISOString();
 
 /** A direct convergence line of `machine`'s manifest. */
@@ -138,8 +138,8 @@ export async function exportStreamScope(lines: Line[], maxChunkBytes = 1500, id:
   const exported = await exportUnit({ store, keyRoot: "96bulls", grantId: "stream_parity", maxChunkBytes }, unit, {
     fenced: async () => false,
     async *lines() {
-      for (const { machine, record } of lines)
-        yield { machine, userId: USER, bytes: encoder.encode(JSON.stringify(record) + "\n") };
+      for (const { machine, record, userId } of lines)
+        yield { machine, userId: userId ?? USER, bytes: encoder.encode(JSON.stringify(record) + "\n") };
     },
   });
   const keys = exported.manifests.map((m) => m.manifestKey);

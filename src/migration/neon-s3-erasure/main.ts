@@ -22,6 +22,7 @@
  *                          connected at all.
  *   S3X_STATE, S3X_BUCKET, S3X_EXPECT_BUCKET, S3X_REGION, S3X_ENDPOINT, S3X_KEY_ROOT,
  *   S3X_ERASER_RECOGNIZES_LEGACY ("true" keeps legacy-only groups; default false; neon only)
+ *   S3X_LEGACY_EXPORT_ERASURE_ENABLED (exactly "true" enables the 062030 legacy fence feed; default false)
  *
  * Phase: Babysitter evidence retention (./babysitter-phase.ts), BABYSITTER_RETENTION_SWEEP
  * off (default) | dry_run | on. It shares this process's eraser, --execute gate and stop
@@ -45,6 +46,14 @@ import { phaseSettings, poolConfig, startBabysitterPhase, type BabysitterPhase }
  */
 export function obligationsEnabled(e: (k: string) => string | undefined = (k) => process.env[k]): boolean {
   return obligationsFlag(e("S3X_OBLIGATIONS"));
+}
+
+export function legacyExportErasureEnabled(raw: string | undefined): boolean {
+  if (raw === undefined || raw.trim() === "") return false;
+  if (raw === "true") return true;
+  throw Object.assign(new Error("S3X_LEGACY_EXPORT_ERASURE_ENABLED must be exactly true or unset"), {
+    code: "config_flag_invalid",
+  });
 }
 
 const env = (k: string, d?: string) => process.env[k]?.trim() || d;
@@ -120,6 +129,7 @@ export async function main() {
       ...DEFAULT_ERASURE_CONFIG,
       keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
       recognizeLegacy: env("S3X_ERASER_RECOGNIZES_LEGACY", "false") === "true",
+      legacyExportErasure: legacyExportErasureEnabled(process.env.S3X_LEGACY_EXPORT_ERASURE_ENABLED),
     };
     // Supabase mode: least-privilege identity first (bulls96_privacy_eraser only; never owner/superuser/BYPASSRLS).
     if (kind === "supabase") await assertEraserIdentity(db);

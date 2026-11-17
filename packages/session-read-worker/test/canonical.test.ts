@@ -1,7 +1,10 @@
 import type { GetObject } from "../../object-store/src/types.ts";
 import { expect, it } from "vitest";
 import { decompress } from "fzstd";
-import { canonicalHandle } from "../src/canonical.ts";
+import {
+  canonicalHandle,
+  orderLegacySnapshotRows,
+} from "../src/canonical.ts";
 import {
   computeContentSha256,
   manifestKey,
@@ -25,6 +28,29 @@ interface Scenario {
   ceiling?: string | number;
   status: number;
 }
+
+it("preserves live-only turn order for asc and desc while sorting merged legacy rows", () => {
+  const rows = [
+    { row: { id: "b", turn_index: 2, workspace_id: "ws", source: "claude" } },
+    { row: { id: "a", turn_index: 1, workspace_id: "ws", source: "claude" } },
+  ];
+  expect(
+    orderLegacySnapshotRows("conversation_turns", [...rows], "asc", false),
+  ).toEqual(rows);
+  expect(
+    orderLegacySnapshotRows("conversation_turns", [...rows], "desc", false),
+  ).toEqual(rows);
+  expect(
+    orderLegacySnapshotRows("conversation_turns", [...rows], "asc", true).map(
+      (r) => r.row.id,
+    ),
+  ).toEqual(["a", "b"]);
+  expect(
+    orderLegacySnapshotRows("conversation_turns", [...rows], "desc", true).map(
+      (r) => r.row.id,
+    ),
+  ).toEqual(["b", "a"]);
+});
 const scenarios: Scenario[] = [
   { name: "main-writer chunk8 retains legacy default", manifestVersion: 1, chunkVersion: "8", status: 200 },
   { name: "main-writer chunk8 satisfies explicit8", manifestVersion: 1, chunkVersion: "8", ceiling: "8", status: 200 },
