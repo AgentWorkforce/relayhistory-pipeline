@@ -1097,6 +1097,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_set_session_uploads_internal(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_source_control_begin(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

@@ -71,8 +71,9 @@ function operatorTurnsRollbackSql(): string {
     "utf8",
   );
   return wrapper
-    .replace(/^\\set .*$/m, "")
-    .replace("\\ir 20261105062020_turns_forward_gates.down.sql", down);
+    .replace("\\ir 20261105062020_turns_forward_gates.down.sql", down)
+    .replace(/^\\.*$/gm, "")
+    .replaceAll(":'turns_intake_paused'", "'on'");
 }
 /** What supabase/bootstrap/hoopdb_function_default_revoke.sql does for the PGlite owner (postgres). */
 const OWNER_FN_DEFAULT_REVOKE =
@@ -1529,7 +1530,7 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
-    // 062060 replaces ingest_apply_selection after the turns gates. Restore it first so
+    // 062060 replaces the public and self-host selection boundaries after the turns gates. Restore it first so
     // this test exercises 062020's privacy refusals rather than its later-migration guard.
     await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql"), "utf8"));
     // A gated registration witness is intentionally not reversible even while its ordinary
@@ -2710,14 +2711,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'coordination\\_advisor\\_%' OR proname='coordination_advisories_recent_v1')")).rows[0]!.n).toBe(0);
     expect(await relation("sessions.coordination_advisories")).toBe("sessions.coordination_advisories");
     expect((await failure(rollback("20261105062070_coordination_advisor_readers.down.sql")))?.code).toBe("55000");
-    // 20261105062060 is then newest. Its down restores 030000's exact
-    // ingest_apply_selection body before the legacy and turns rollbacks are considered.
-    expect((await procSrc("sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)")).s).toContain("turns origin is reserved");
+    // 20261105062060 is then newest. Its down restores 055000's public
+    // selection body and 057030's self-host body before the legacy and turns rollbacks are considered.
+    expect((await procSrc("sessions.ingest_set_session_uploads(jsonb)")).s).toContain("turns origin is reserved");
+    expect((await procSrc("sessions.ingest_selfhost_set_session_uploads(jsonb)")).s).toContain("ingest_set_session_uploads_internal");
     await rollback("20261105062060_turns_selection_origin_guard.down.sql");
     expect(await names()).not.toContain(TSOG);
-    expect((await procSrc("sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)")).s).toBe(
-      bodyOf("20261104030000_ingest_fence_ownership.sql", "ingest_apply_selection", "$apply$"),
+    expect((await procSrc("sessions.ingest_set_session_uploads(jsonb)")).s).toBe(
+      bodyOf("20261104055000_lazy_current_custody.sql", "ingest_set_session_uploads", "$selection$"),
     );
+    expect((await procSrc("sessions.ingest_selfhost_set_session_uploads(jsonb)")).s).toBe(
+      bodyOf("20261105057030_selfhost_erase_directory_membership.sql", "ingest_selfhost_set_session_uploads", "$selfhost_selection$"),
+    );
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_set_session_uploads_internal(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     // 20261105062030 is then newest: the per-origin claim-fence down refuses until
     // the durable legacy-export authority and its grants/policies are removed.
     expect(await names()).toContain(LA);

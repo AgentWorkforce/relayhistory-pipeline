@@ -7,6 +7,17 @@
 -- retriable and fail-closed, but the wrapper must not be used while intake is live.
 -- The migration lock orders the ledger preflight against every schema apply. The
 -- frozen down takes the same lock re-entrantly after this wrapper sets both timeouts.
+-- Invoke with -v turns_intake_paused=on only after independently verifying that pause.
+\if :{?turns_intake_paused}
+\else
+\set turns_intake_paused false
+\endif
+DO $intake_guard$ BEGIN
+ IF NOT :'turns_intake_paused'::boolean THEN
+  RAISE EXCEPTION 'turns forward gates: erasure and selection intake must be paused'
+    USING ERRCODE='55000';
+ END IF;
+END $intake_guard$;
 BEGIN;
 SET LOCAL statement_timeout='120s';
 SET LOCAL lock_timeout='5s';

@@ -1,17 +1,26 @@
-/** Lane: relay-turn ordinary-selection origin guard (slot 062060). */
+/** Lane: relay-turn public-selection origin guard (slot 062060). */
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
 const MIGRATION = "supabase/migrations/20261105062060_turns_selection_origin_guard.sql";
-const ORIGINAL = "supabase/migrations/20261104030000_ingest_fence_ownership.sql";
+const SELECTION_ORIGINAL = "supabase/migrations/20261104055000_lazy_current_custody.sql";
+const SELFHOST_ORIGINAL = "supabase/migrations/20261105057030_selfhost_erase_directory_membership.sql";
 const ROLLBACK = "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql";
 const NAME = "upstream:20261105062060_turns_selection_origin_guard.sql";
 
-function originalBody(source: string): string {
+function originalSelection(source: string): string {
   const match = source.match(
-    /CREATE OR REPLACE FUNCTION sessions\.ingest_apply_selection\(p_org text, p_ws text, p_user text, p_origin text,[\s\S]*?\n\$apply\$;/,
+    /CREATE OR REPLACE FUNCTION sessions\.ingest_set_session_uploads\(p jsonb\)[\s\S]*?\nEND \$selection\$;/,
   );
-  if (!match) throw Error("turns selection origin guard rollback: exact prior body missing");
+  if (!match) throw Error("turns selection origin guard rollback: exact public selection body missing");
+  return match[0];
+}
+
+function originalSelfhost(source: string): string {
+  const match = source.match(
+    /CREATE OR REPLACE FUNCTION sessions\.ingest_selfhost_set_session_uploads\(p jsonb\)[\s\S]*?\nEND \$selfhost_selection\$;/,
+  );
+  if (!match) throw Error("turns selection origin guard rollback: exact self-host selection body missing");
   return match[0];
 }
 
@@ -19,7 +28,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
   const checksum = createHash("sha256").update(ctx.sql).digest("hex");
   return {
     [ROLLBACK]: [
-      "-- Generated turns selection origin-guard rollback. Restores 030000's exact ingest_apply_selection body.",
+      "-- Generated turns selection origin-guard rollback. Restores the exact public and self-host selection bodies.",
       "-- Code only: hosted execution needs Khaliq's separate explicit approval.",
       "BEGIN;",
       "SET LOCAL lock_timeout='5s';",
@@ -35,7 +44,9 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
       " IF NOT FOUND OR v_sha IS DISTINCT FROM '" + checksum + "'",
       " THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection origin guard: own applied checksum required';END IF;",
       "END $rollback_guard$;",
-      originalBody(await ctx.read(ORIGINAL)),
+      originalSelection(await ctx.read(SELECTION_ORIGINAL)),
+      originalSelfhost(await ctx.read(SELFHOST_ORIGINAL)),
+      "DROP FUNCTION sessions.ingest_set_session_uploads_internal(jsonb);",
       "DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "' AND sha256='" + checksum + "';",
       "COMMIT;",
     ].join("\n") + "\n",
@@ -46,13 +57,19 @@ export const turnsSelectionOriginGuard: LaneManifest = {
   lane: "turns-selection-origin-guard",
   owner: "turns-gates post-merge hardening (slot 062060)",
   migration: MIGRATION,
-  prefixes: [],
+  prefixes: ["sessions.ingest_set_session_uploads_internal("],
   grantSources: [],
-  functions: {},
+  functions: {
+    "sessions.ingest_set_session_uploads_internal(jsonb)": { secdef: true, grants: [] },
+  },
   replaces: {
-    "sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)": {
-      secdef: false,
-      original: ORIGINAL,
+    "sessions.ingest_set_session_uploads(jsonb)": {
+      secdef: true,
+      original: SELECTION_ORIGINAL,
+    },
+    "sessions.ingest_selfhost_set_session_uploads(jsonb)": {
+      secdef: true,
+      original: SELFHOST_ORIGINAL,
     },
   },
   extraOutputs: rollback,

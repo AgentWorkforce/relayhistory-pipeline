@@ -160,13 +160,20 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
 });
 
 test("SQL: ordinary selection rejects the reserved turns origin without writing a fence",async()=>{
- const f=await fixture(null);let refused:unknown;
+ const f=await fixture(null);let refused:unknown;let bypass:unknown;
+ await f.db.exec("SET ROLE bulls96_session_ingest");
  try {
-  await f.db.query("SELECT sessions.ingest_apply_selection($1,$2,$3,$4,$5::jsonb,false)",[
-   TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,JSON.stringify([["claude",SESSION]]),
+  await f.db.query("SELECT sessions.ingest_set_session_uploads($1::jsonb)",[
+   JSON.stringify({tenant:TENANT,originId:TURN_ORIGIN_ID,sessions:[["claude",SESSION]],enabled:false}),
   ]);
  } catch(error) { refused=error }
+ try {
+  await f.db.query("SELECT sessions.ingest_set_session_uploads_internal($1::jsonb)",[
+   JSON.stringify({tenant:TENANT,originId:TURN_ORIGIN_ID,sessions:[["claude",SESSION]],enabled:false}),
+  ]);
+ } catch(error) { bypass=error } finally { await f.db.exec("RESET ROLE") }
  expect((refused as {code?:string})?.code).toBe("22023");
+ expect((bypass as {code?:string})?.code).toBe("42501");
  expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[
   TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,
  ])).rows).toEqual([{n:0}]);
