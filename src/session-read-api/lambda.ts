@@ -1,4 +1,5 @@
 import { sqlBriefSummary } from "./brief-summary.ts";
+import { sqlMemoryDocuments } from "./memory-documents.ts";
 /**
  * AWS Lambda entry for the session read API (Function URL, payload v2;
  * stacks/aws/session-read-api.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-read-api.md).
@@ -50,6 +51,9 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true", ClickHouse backend only) serves GET
  * /v1/sessions/summaries/search over the owner-applied session_brief_documents table; otherwise 501
  * `summary_search_not_configured`.
+ * READ_API_MEMORY_DOCUMENTS_ENABLED (exactly "true", either entry) serves GET /v1/memory/documents
+ * and /v1/memory/documents/:topic (migration 20261105062080); otherwise both are 501
+ * `memory_documents_disabled`.
  * READ_API_SEARCH_PARTIAL_SESSIONS (self-host service only; unset/""/"refuse" here, "skip"
  * fails startup on this entry, see searchSkipsPartialSessions).
  *
@@ -82,7 +86,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_MEMORY_DOCUMENTS_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
@@ -706,6 +710,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),
     ...(briefSummaryWired ? { briefSummary: sqlBriefSummary(poolTenantRunner(pool as never)) } : {}),
+    ...(exactTrueFlag(env[READ_API_MEMORY_DOCUMENTS_ENABLED]) ? { memoryDocuments: sqlMemoryDocuments(poolTenantRunner(pool as never)) } : {}),
     ...(listShortSummary ? { listShortSummary: true } : {}),
     ...(summarySearch ? { summarySearch: true } : {}),
     ...(messageOrigin ? { messageOrigin: true } : {}),

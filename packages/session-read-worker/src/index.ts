@@ -42,6 +42,9 @@
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true": GET /v1/sessions/summaries/search over the
  * owner-applied ClickHouse session_brief_documents; every other value = 501
  * summary_search_not_configured; unset in wrangler.jsonc),
+ * READ_API_MEMORY_DOCUMENTS_ENABLED (exactly "true": GET /v1/memory/documents and
+ * /v1/memory/documents/:topic, migration 20261105062080; every other value = 501
+ * memory_documents_disabled),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -107,6 +110,7 @@ import { sqlBriefSummary } from "../../../src/session-read-api/brief-summary.ts"
 import { pointerSummaryFallback, type SummaryFallback } from "../../../src/session-read-api/summary-fallback.ts";
 import { masterKeyring, parseMasterKeys } from "../../../src/shared/keyring.ts";
 import type { WorkspaceKeyring } from "../../../src/bob-costas/summary-objects.ts";
+import { sqlMemoryDocuments } from "../../../src/session-read-api/memory-documents.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
@@ -179,6 +183,8 @@ export interface Env extends CanonicalEnv {
    * same value Bob Costas encrypts under. Read only by the summary fallback; never logged.
    */
   SUMMARY_MASTER_KEYS?: string;
+  /** Exactly "true": serve GET /v1/memory/documents[/:topic] (sqlMemoryDocuments); anything else = 501 memory_documents_disabled. */
+  READ_API_MEMORY_DOCUMENTS_ENABLED?: string;
   /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
   READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
   READ_API_SUMMARY_SEARCH_ENABLED?: string;
@@ -506,6 +512,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)
       ? { summaryFallback: summaryFallbackDeps(env, tenant.run, overrides.fetcher) }
       : {}),
+    ...(exactTrueFlag(env.READ_API_MEMORY_DOCUMENTS_ENABLED) ? { memoryDocuments: sqlMemoryDocuments(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
     ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),

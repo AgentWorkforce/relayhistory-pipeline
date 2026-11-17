@@ -49,6 +49,8 @@ export function coordinationOverlapsEnabled(raw: unknown): boolean {
 
 /** Hosted Lambda entry: wire the brief-summary read (GET /v1/sessions/:id/summary). The service always wires it. */
 export const READ_API_BRIEF_SUMMARY_ENABLED = "READ_API_BRIEF_SUMMARY_ENABLED";
+/** Every entry: serve the memory documents reads (GET /v1/memory/documents, /v1/memory/documents/:topic). */
+export const READ_API_MEMORY_DOCUMENTS_ENABLED = "READ_API_MEMORY_DOCUMENTS_ENABLED";
 /** GET /v1/sessions: serve the opt-in includeShortSummary=recorded list extension. */
 export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_ENABLED";
 /** GET /v1/sessions/summaries/search: ClickHouse summary search (clickhouse/summary-search-query.ts). Default off. */

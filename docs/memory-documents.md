@@ -107,7 +107,7 @@ Evidence rows carry session ids. The operator per-session erase does not reach t
 
 ## Surfacing
 
-The first slice is pull only: `GET /v1/memory/documents` lists topics with counts, and `GET /v1/memory/documents/{topic}` returns a markdown rendering. Each route requires the workspace attestation and the `memory` canary, rejects unsupported parameters, returns at most 200 records per page (oldest first) with a cursor, and renders only stored fields.
+The first slice is pull only: `GET /v1/memory/documents` lists topics with counts, and `GET /v1/memory/documents/{topic}` returns `{topic, records, nextCursor, markdown}`, where `markdown` renders one page of the topic's records. Each route requires the workspace attestation and the `memory` canary, rejects unsupported parameters, returns at most 200 records per page (oldest first) with a cursor, and renders only stored fields. Every line of stored text is escaped, so it cannot open a heading, list, link, HTML tag or code span, or add a line.
 
 Out of scope, as follow-ups:
 
@@ -144,4 +144,5 @@ Rollback: unset the flags, then run the rollback file if the tables must go.
 3. Extractor in the session-analysis path, behind `SUMMARY_DECISION_RECORDS_ENABLED`.
    Implemented: `src/session-analysis/decision-records.ts`, the `onCompleted` hook of `runAnalysisJob`, the `decisionRecords` sink of `analysisTick`, wired in `src/session-pipeline/lambda.ts`; tests in `src/session-analysis/__tests__/decision-records.test.ts` and `processor.test.ts`.
 4. Read API routes, behind `READ_API_MEMORY_DOCUMENTS_ENABLED`.
+   Implemented: `src/session-read-api/memory-documents.ts`, registered once in `app.ts` and wired by the Lambda and self-host entries (`lambda.ts`) and the Cloudflare worker; tests in `src/session-read-api/__tests__/memory-documents.test.ts`, `facts-backends-wiring.test.ts` and the worker suite.
 5. Self-host composition rows and the runbook.
