@@ -6,7 +6,10 @@ import type { Directory } from "../../session-read-api/directory.ts";
 import { advisorMain, type AdvisorIo } from "../main.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
 import { AdvisorLimits, type CandidateLane, type RecentAdvisory, type SessionRef } from "../rubric.ts";
-import { advisorTick, scanOnce, type AdvisorStore, type AdvisoryRowInput, type UpsertResult } from "../scan.ts";
+import {
+  ARTIFACT_MAX_CHARS, advisorTick, boundedArtifact, boundedEvidence, EVIDENCE_TEXT_MAX, scanOnce,
+  type AdvisorStore, type AdvisoryRowInput, type UpsertResult,
+} from "../scan.ts";
 
 const NOW = new Date(Date.UTC(2026, 10, 17, 12));
 const at = (min: number) => new Date(NOW.getTime() + min * 60_000).toISOString();
@@ -26,10 +29,18 @@ class FakeStore implements AdvisorStore {
   calls: string[] = [];
   constructor(private lanes: CandidateLane[]) {}
   key = (id: string, r: SessionRef) => `${id}|${r.harness}|${r.sessionId}`;
-  async candidates() { this.calls.push("candidates"); return this.lanes; }
+  candidateArgs: Array<string[] | null> = [];
+  upsertError: ((n: number) => unknown) | undefined;
+  async candidates(_since: Date, _limit: number, workspaces: string[] | null) {
+    this.calls.push("candidates");
+    this.candidateArgs.push(workspaces);
+    return this.lanes;
+  }
   directory(): Directory { return {} as Directory; }
   async upsert(_o: string, _w: string, row: AdvisoryRowInput): Promise<UpsertResult> {
     this.calls.push("upsert");
+    const err = this.upsertError?.(this.calls.filter((c) => c === "upsert").length);
+    if (err) throw err;
     const k = this.key(row.advisory_id, { harness: row.harness, sessionId: row.session_id });
     const cur = this.rows.get(k);
     if (!cur) { this.rows.set(k, { ...row, status: "pending" }); return { inserted: 1, upgraded: 0, skipped: 0 }; }
@@ -67,11 +78,12 @@ describe("scanOnce", () => {
   test("a HIGH pair writes one row per recipient, DMs both, marks delivered only after the send", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const sender = new InMemoryRelaySender();
-    const stats = await scanOnce({ store, backend: backend(shared), limits: limits(), sender }, NOW);
+    const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits(), sender }, NOW);
     expect(stats).toMatchObject({ findings: 1, written: 2, dmSent: 2, dmFailed: 0 });
     expect(store.calls.filter((c) => c === "mark")).toHaveLength(2);
     expect([...store.rows.values()].map((r) => r.status)).toEqual(["delivered", "delivered"]);
     expect(sender.sent.map((d) => d.to.sessionId).sort()).toEqual(["a", "b"]);
+    for (const d of sender.sent) expect([d.orgId, d.workspaceId]).toEqual(["org", "ws"]);
     for (const d of sender.sent) expect(d.text.length).toBeLessThanOrEqual(600);
   });
 
@@ -79,7 +91,7 @@ describe("scanOnce", () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const sender = new InMemoryRelaySender();
     sender.fail = true;
-    const stats = await scanOnce({ store, backend: backend(shared), limits: limits(), sender }, NOW);
+    const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits(), sender }, NOW);
     expect(stats).toMatchObject({ written: 2, dmSent: 0, dmFailed: 2 });
     expect(store.calls).not.toContain("mark");
     expect([...store.rows.values()].every((r) => r.status === "pending")).toBe(true);
@@ -88,10 +100,10 @@ describe("scanOnce", () => {
   test("acked is never resent: a skipped upsert sends no DM, even after the cooldown", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const sender = new InMemoryRelaySender();
-    await scanOnce({ store, backend: backend(shared), limits: limits({ pairCooldownMs: 0 }), sender }, NOW);
+    await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits({ pairCooldownMs: 0 }), sender }, NOW);
     for (const r of store.rows.values()) r.status = "acked";
     sender.sent.length = 0;
-    const stats = await scanOnce({ store, backend: backend(shared), limits: limits({ pairCooldownMs: 0 }), sender }, NOW);
+    const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits({ pairCooldownMs: 0 }), sender }, NOW);
     expect(stats).toMatchObject({ written: 0, existing: 2, dmSent: 0 });
     expect(sender.sent).toEqual([]);
   });
@@ -99,34 +111,34 @@ describe("scanOnce", () => {
   test("pair cooldown suppresses the next scan; the hourly cap stops a recipient", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const l = limits();
-    await scanOnce({ store, backend: backend(shared), limits: l }, NOW);
-    expect((await scanOnce({ store, backend: backend(shared), limits: l }, NOW)).cooldown).toBe(1);
-    const capped = await scanOnce({ store: new FakeStore([cand("a"), cand("b")]), backend: backend(shared), limits: limits({ sessionHourlyCap: 0 }) }, NOW);
+    await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: l }, NOW);
+    expect((await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: l }, NOW)).cooldown).toBe(1);
+    const capped = await scanOnce({ workspaces: "*", store: new FakeStore([cand("a"), cand("b")]), backend: backend(shared), limits: limits({ sessionHourlyCap: 0 }) }, NOW);
     expect(capped).toMatchObject({ written: 0, capped: 2 });
   });
 
   test("durable state seeds the limits before writing: a restart keeps the cooldown and the cap", async () => {
     const A = { harness: "claude", sessionId: "a" }, B = { harness: "claude", sessionId: "b" };
     const cooled = new FakeStore([cand("a"), cand("b")]);
-    cooled.recentRows = [{ kind: "pair", recipient: A, peer: B, latestAt: NOW.getTime() - 60_000 }];
-    expect(await scanOnce({ store: cooled, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ cooldown: 1, written: 0 });
+    cooled.recentRows = [{ kind: "pair", recipient: A, peer: B, urgency: "high", latestAt: NOW.getTime() - 60_000 }];
+    expect(await scanOnce({ workspaces: "*", store: cooled, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ cooldown: 1, written: 0 });
     expect(cooled.calls).toEqual(["candidates", "recent"]);
     const full = new FakeStore([cand("a"), cand("b")]);
     full.recentRows = [{ kind: "recipient", recipient: A, latestAt: NOW.getTime() - 60_000, sentLastHour: 3 }];
-    expect(await scanOnce({ store: full, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ capped: 1, written: 1 });
+    expect(await scanOnce({ workspaces: "*", store: full, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ capped: 1, written: 1 });
     // No findings: no durable read.
     const quiet = new FakeStore([cand("a"), cand("b")]);
-    await scanOnce({ store: quiet, backend: backend([]), limits: limits() }, NOW);
+    await scanOnce({ workspaces: "*", store: quiet, backend: backend([]), limits: limits() }, NOW);
     expect(quiet.calls).toEqual(["candidates"]);
   });
 
   test("durable state: 062070 not applied (42883) keeps in-memory limits; any other error fails the workspace unwritten", async () => {
     const missing = new FakeStore([cand("a"), cand("b")]);
     missing.recentError = Object.assign(new Error("function does not exist"), { code: "42883" });
-    expect(await scanOnce({ store: missing, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 2, failed: 0 });
+    expect(await scanOnce({ workspaces: "*", store: missing, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 2, failed: 0 });
     const broken = new FakeStore([cand("a"), cand("b")]);
     broken.recentError = Object.assign(new Error("permission denied"), { code: "42501" });
-    expect(await scanOnce({ store: broken, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 0, failed: 1 });
+    expect(await scanOnce({ workspaces: "*", store: broken, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 0, failed: 1 });
     expect(broken.calls).not.toContain("upsert");
   });
 
@@ -136,7 +148,7 @@ describe("scanOnce", () => {
       [cand("a"), cand("b", { projectId: "other" })],
     ]) {
       const store = new FakeStore(lanes);
-      const stats = await scanOnce({ store, backend: backend(shared), limits: limits() }, NOW);
+      const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits() }, NOW);
       expect(stats.written).toBe(0);
       expect(store.rows.size).toBe(0);
     }
@@ -144,23 +156,78 @@ describe("scanOnce", () => {
 
   test("a truncated write stream drops shared-file findings; a backend error fails only that workspace", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
-    const t = await scanOnce({ store, backend: backend(shared, { sessionsTruncated: true, notes: ["write evidence stream cap 1 reached"] }), limits: limits() }, NOW);
+    const t = await scanOnce({ workspaces: "*", store, backend: backend(shared, { sessionsTruncated: true, notes: ["write evidence stream cap 1 reached"] }), limits: limits() }, NOW);
     expect(t).toMatchObject({ truncated: 1, written: 0 });
     const bad = backend(shared);
     bad.readFacts = async () => { throw new Error("boom"); };
-    expect(await scanOnce({ store, backend: bad, limits: limits() }, NOW)).toMatchObject({ failed: 1, written: 0 });
+    expect(await scanOnce({ workspaces: "*", store, backend: bad, limits: limits() }, NOW)).toMatchObject({ failed: 1, written: 0 });
   });
 
   test("no DM without a sender: HIGH rows stay pending for the pull path", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
-    const stats = await scanOnce({ store, backend: backend(shared), limits: limits() }, NOW);
+    const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits() }, NOW);
     expect(stats).toMatchObject({ written: 2, dmSent: 0 });
     expect(store.calls).not.toContain("mark");
   });
 
+  test("a durable LOW cooldown never holds back a HIGH for the same pair", async () => {
+    const A = { harness: "claude", sessionId: "a" }, B = { harness: "claude", sessionId: "b" };
+    const store = new FakeStore([cand("a"), cand("b")]);
+    store.recentRows = [{ kind: "pair", recipient: A, peer: B, urgency: "low", latestAt: NOW.getTime() - 60_000 }];
+    expect(await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ cooldown: 0, written: 2 });
+  });
+
+  test("workspace allowlist: empty reads nothing; a list is passed to the query and enforced on its rows", async () => {
+    const none = new FakeStore([cand("a"), cand("b")]);
+    expect(await scanOnce({ workspaces: new Set(), store: none, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ workspaces: 0, written: 0 });
+    expect(none.calls).toEqual([]);
+    const listed = new FakeStore([cand("a"), cand("b"), cand("c", { workspaceId: "other" }), cand("d", { workspaceId: "other" })]);
+    const stats = await scanOnce({ workspaces: new Set(["ws2", "ws"]), store: listed, backend: backend(shared), limits: limits() }, NOW);
+    expect(listed.candidateArgs).toEqual([["ws", "ws2"]]);
+    expect(stats).toMatchObject({ workspaces: 1, written: 2 });
+    const all = new FakeStore([]);
+    await scanOnce({ workspaces: "*", store: all, backend: backend([]), limits: limits() }, NOW);
+    expect(all.candidateArgs).toEqual([null]);
+  });
+
+  test("bounds: artifact clipped by code point to 512; evidence trimmed until its jsonb text fits 4096", () => {
+    expect(boundedArtifact("x".repeat(600))).toHaveLength(ARTIFACT_MAX_CHARS);
+    const emoji = boundedArtifact("\u{1F600}".repeat(600));
+    expect(Array.from(emoji)).toHaveLength(ARTIFACT_MAX_CHARS);
+    expect(emoji.endsWith("\u{1F600}")).toBe(true);
+    expect(boundedArtifact("short")).toBe("short");
+    const big = Array.from({ length: 10 }, (_, i) => ({ sessionId: "s".repeat(200), eventId: `e${i}`.repeat(100), ts: at(i), kind: "tool" }));
+    const kept = boundedEvidence(big);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(10);
+    expect(kept).toEqual(big.slice(0, kept.length));
+    // jsonb's text form: ": " after each key and ", " between items and keys.
+    const jsonbText = JSON.stringify(kept).replace(/","/g, '", "').replace(/":/g, '": ').replace(/\},\{/g, "}, {");
+    expect(jsonbText.length).toBeLessThanOrEqual(EVIDENCE_TEXT_MAX);
+    const small = big.slice(0, 2).map((e) => ({ ...e, sessionId: "s", eventId: "e" }));
+    expect(boundedEvidence(small)).toEqual(small);
+  });
+
+  test("an oversized artifact is written clipped; a row the database refuses is skipped and the rest go on", async () => {
+    const long = `src/${"d".repeat(700)}.ts`;
+    const store = new FakeStore([cand("a"), cand("b")]);
+    const lanes = [lane("a", [[long, -40]]), lane("b", [[long, -20]])];
+    expect(await scanOnce({ workspaces: "*", store, backend: backend(lanes), limits: limits() }, NOW)).toMatchObject({ written: 2, rejected: 0 });
+    for (const r of store.rows.values()) expect(Array.from(r.artifact).length).toBeLessThanOrEqual(ARTIFACT_MAX_CHARS);
+    const refusing = new FakeStore([cand("a"), cand("b")]);
+    refusing.upsertError = (n) => (n === 1 ? Object.assign(new Error("check violation"), { code: "23514" }) : undefined);
+    const sender = new InMemoryRelaySender();
+    expect(await scanOnce({ workspaces: "*", store: refusing, backend: backend(shared), limits: limits(), sender }, NOW))
+      .toMatchObject({ rejected: 1, written: 1, dmSent: 1, failed: 0 });
+    // Not a row error (connection, permission): the workspace fails as before.
+    const down = new FakeStore([cand("a"), cand("b")]);
+    down.upsertError = () => Object.assign(new Error("connection reset"), { code: "08006" });
+    expect(await scanOnce({ workspaces: "*", store: down, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ failed: 1, rejected: 0, written: 0 });
+  });
+
   test("advisorTick throttles to the interval and sweeps hourly", async () => {
     const store = new FakeStore([]);
-    const tick = advisorTick(() => ({ store, backend: backend([]), limits: limits() }), { intervalMs: 120_000 });
+    const tick = advisorTick(() => ({ workspaces: "*", store, backend: backend([]), limits: limits() }), { intervalMs: 120_000 });
     const db = { query: async () => { throw new Error("tick must use the store"); } };
     await tick(db, NOW);
     await tick(db, new Date(NOW.getTime() + 60_000));

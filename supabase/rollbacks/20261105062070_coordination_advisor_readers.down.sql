@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062070_coordination_advisor_readers.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='coordination advisor readers: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062070_coordination_advisor_readers.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'5d17efbafc208baeb5810381279dcbc26b18f45eac2138deaace19d0ef291249'
+ IF NOT FOUND OR v_sha<>'9cb67556b416b956723e9ebbd8ca91eccb21e855caeddc811cdb848bad1061b0'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='coordination advisor readers: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer),

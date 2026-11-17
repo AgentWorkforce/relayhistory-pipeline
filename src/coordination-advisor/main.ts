@@ -45,12 +45,14 @@ export async function advisorMain(env: Record<string, string | undefined>, io: A
   const sender = io.sender(cfg);
   const backendFor = io.backend(cfg, env);
   const limits = new AdvisorLimits(cfg);
-  log.info("coordination advisor enabled", { service: ADVISOR_SERVICE, state: cfg.relayDm.enabled ? "dm_on" : "dm_off", kind: cfg.factsBackend });
+  // The allowlist size only, never its ids. Empty: the worker runs and scans nothing.
+  log.info(`coordination advisor enabled; workspaces=${cfg.workspaces === "*" ? "all" : cfg.workspaces.size}`,
+    { service: ADVISOR_SERVICE, state: cfg.relayDm.enabled ? "dm_on" : "dm_off", kind: cfg.factsBackend });
   await io.runWorker({
     service: ADVISOR_SERVICE,
     stages: [],
     handlers: () => ({}),
-    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db), backend: backendFor(db), limits, sender }), { intervalMs: cfg.intervalMs }),
+    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces }), { intervalMs: cfg.intervalMs }),
   });
   return "ran";
 }
