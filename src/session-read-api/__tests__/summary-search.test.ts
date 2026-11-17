@@ -53,7 +53,7 @@ function fakeDirectory(rows: DirectoryListRow[] | null) {
   return { directory, lists };
 }
 
-function api(over: { summarySearch?: boolean; ch?: ClickHouseClient; directory?: Directory; workspaces?: ReadonlySet<string> | "*"; ownerBuffered?: ReadApiDeps["ownerBuffered"] } = {}) {
+function api(over: { summarySearch?: boolean; ch?: ClickHouseClient; directory?: Directory; workspaces?: ReadonlySet<string> | "*"; ownerBuffered?: ReadApiDeps["ownerBuffered"]; operatorErased?: ReadApiDeps["operatorErased"] } = {}) {
   const app = createReadApi({
     verify: async (t) => {
       if (t !== "good") throw new AuthError(401, "invalid_token", "token is not valid");
@@ -67,6 +67,7 @@ function api(over: { summarySearch?: boolean; ch?: ClickHouseClient; directory?:
     directoryWorkspaces: over.workspaces ?? new Set(["ws-s"]),
     ...(over.ownerBuffered ? { ownerBuffered: over.ownerBuffered } : {}),
     ...(over.summarySearch !== undefined ? { summarySearch: over.summarySearch } : {}),
+    ...(over.operatorErased ? { operatorErased: over.operatorErased } : {}),
   });
   return (path: string) => app.request(path, { headers: { authorization: "Bearer good" } });
 }
@@ -98,7 +99,7 @@ describe("buildSummarySearchQuery", () => {
 
   test("each candidate branch is bounded (newest activity first), so the IN set never grows unbounded", () => {
     const { query } = buildSummarySearchQuery("relay_search", { orgId: "o", workspaceId: "w", q: "abc", limit: 5 });
-    expect(query.match(/> 0 ORDER BY last_activity_at DESC LIMIT \{cap:UInt32\}\)/g)).toHaveLength(2);
+    expect(query.match(/> 0 ORDER BY last_activity_at DESC, source DESC, session_id DESC LIMIT \{cap:UInt32\}\)/g)).toHaveLength(2);
     expect(SUMMARY_SEARCH_MAX_CANDIDATES).toBeGreaterThan(51);
   });
 
@@ -138,6 +139,19 @@ describe("flag off or unconfigured: 501, nothing read", () => {
         expect((await json(r)).error, p).toMatchObject({ code: "unsupported_by_backend", reason: "summary_search_not_configured" });
       }
     }
+    expect(selects).toHaveLength(0);
+  });
+
+  test("operator-erase fence wired (Lambda): the search path is not a session; flag-off 501 stays first, no fence lookup", async () => {
+    const { ch, selects } = fakeCh(async () => []);
+    let fenceCalls = 0;
+    const get = api({ ch, operatorErased: async () => { fenceCalls++; return true; } });
+    for (const p of ["/v1/sessions/summaries/search?workspace=ws-other&q=erasure", "/v1/sessions/summaries/search?q=erasure&source=claude"]) {
+      const r = await get(p);
+      expect(r.status, p).toBe(501);
+      expect((await json(r)).error, p).toMatchObject({ code: "unsupported_by_backend", reason: "summary_search_not_configured" });
+    }
+    expect(fenceCalls).toBe(0);
     expect(selects).toHaveLength(0);
   });
 

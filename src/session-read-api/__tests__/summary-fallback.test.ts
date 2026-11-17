@@ -148,6 +148,17 @@ describe("pointerSummaryFallback: decryption with a test keyring", () => {
     expect(await h.fallback.read(scope, "long")).toBeNull();
   });
 
+  test("wrong key bytes on an object with missing or partial summary-* metadata stay empty (pre-metadata objects)", async () => {
+    for (const keep of [[], ["summary-revision"], ["summary-revision", "summary-kind"]]) {
+      const f = await fixture();
+      const key = await f.write(record(), { ring: await masterKeyring(parseMasterKeys(`k1:${HEX_B}`)) });
+      const stored = await f.store.getObject(key as never);
+      const bytes = new Uint8Array(await new Response(stored.body).arrayBuffer());
+      await f.store.put(key as never, bytes, { metadata: Object.fromEntries(Object.entries(stored.meta.metadata).filter(([k]) => keep.includes(k))) });
+      expect(await f.fallback.read(scope, "long"), keep.join(",") || "none").toBeNull();
+    }
+  });
+
   test("no live pointer (erased/tombstoned/unknown) or several physical rows: nothing served, no object read", async () => {
     for (const rows of [[], [pointer(), pointer({ machine_id: "m2", manifest_key: String(manifestKey({ ...loc, machineId: "m2" })) })]]) {
       const f = await fixture({ rows });

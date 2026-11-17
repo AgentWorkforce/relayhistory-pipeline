@@ -397,6 +397,8 @@ const MAX_LIST_SOURCES = 16;
 const MAX_LIST_USERS = 20;
 const MAX_LIST_ID_LENGTH = 255;
 const MAX_AGENT_LENGTH = 200;
+/** Must equal the literal route below (stacks/aws/__tests__/session-read-api.test.ts reads route literals). */
+const SUMMARY_SEARCH_PATH = "/v1/sessions/summaries/search";
 const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
 /** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
@@ -730,6 +732,9 @@ export function createReadApi(deps: ReadApiDeps) {
   const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
 
   if (deps.operatorErased) app.use("/v1/sessions/:sessionId/*", async (c, next) => {
+    // The workspace-wide summary search is a literal sub-path, not a session: never treat "summaries" as a
+    // session id here (no fence lookup, and no attestation ahead of the route's own flag check).
+    if (c.req.path === SUMMARY_SEARCH_PATH) return next();
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);

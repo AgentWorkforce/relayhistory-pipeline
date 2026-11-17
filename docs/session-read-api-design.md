@@ -348,7 +348,12 @@ envelope's key id, and it still fails the AES-GCM tag, the cause is key material
 this Worker holds with other bytes than the writer's), tampering or an object written under
 another workspace's key, and the route answers 503 `summary_decrypt_failed`. (A wrong key
 cannot be told from staleness on an object whose metadata names an older revision: that stays
-empty until Bob Costas rewrites the object at the current revision, which then fails loudly.) No migration and no
+empty until Bob Costas rewrites the object at the current revision, which then fails loudly.)
+An object with no or partial `summary-*` metadata (written before it existed) keeps the old
+behaviour: a failed open is empty. **Key ids in `SUMMARY_MASTER_KEYS` are immutable**: new key
+bytes need a new id. Rebinding an id to other bytes makes every object written under it a lasting
+503 for its tenant until the next revision rewrites it (the writer keeps an object whose
+metadata matches). No migration and no
 grant: the read role never reads `sessions.session_summaries`.
 
 Errors with the flag on: a row outside the tenant 500 (`TenantMismatchError`); missing raw
