@@ -37,7 +37,9 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * `q` on GET /v1/sessions and /v1/sessions/activity from the directory's query functions,
  * migration 20261105046010; unset/""/"false" off = 501 `param_q` as before; anything else
  * fails startup, see sessionQueryEnabled). READ_API_COORDINATION_OVERLAPS_ENABLED (exactly
- * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_OVERLAPS_BACKEND selects
+ * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_ADVISORIES_ENABLED (exactly
+ * "true") exposes GET /v1/coordination/advisories and its POST ack (the ack only through the
+ * self-host service: the Function URL handler is GET-only); READ_API_COORDINATION_OVERLAPS_BACKEND selects
  * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
  * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
  * /v1/sessions/summaries/activity) on this entry too; unset/any other value = 501
@@ -79,7 +81,7 @@ import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
-  READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
+  READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
@@ -91,6 +93,7 @@ import { sqlNarrativeCache, type DigestNarrativeDeps } from "./digest-narrative.
 import { postgresOutputBackend } from "./postgres/output-query.ts";
 import { postgresDigestBackend } from "./postgres/digest-query.ts";
 import { postgresCoordinationBackend } from "./postgres/coordination-query.ts";
+import { poolTenantWriter, sqlCoordinationAdvisories } from "./coordination-advisories.ts";
 import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
@@ -587,6 +590,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
+  const advisoriesEnabled = exactTrueFlag(env[READ_API_COORDINATION_ADVISORIES_ENABLED]);
   // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
@@ -689,6 +693,11 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
         ...(facts.coordination === "postgres" ? { backend: postgresCoordinationBackend(factsDeps) } : {}),
       } }
     : {};
+  // Advisories on the read-role pool: the GET READ ONLY, the ack in its own READ WRITE transaction.
+  // The Function URL handler is GET-only, so on the hosted Lambda the ack is a 405; the self-host service serves it.
+  const advisoriesDeps = advisoriesEnabled
+    ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(poolTenantRunner(pool as never), poolTenantWriter(pool as never)) } }
+    : {};
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness,
@@ -710,6 +719,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...outputDeps,
     ...digestDeps,
     ...coordinationDeps,
+    ...advisoriesDeps,
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),

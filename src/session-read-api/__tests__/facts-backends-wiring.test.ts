@@ -168,3 +168,31 @@ describe("brief-summary and list short-summary flags (READ_API_BRIEF_SUMMARY_ENA
     }
   });
 });
+
+describe("coordination advisories wiring", () => {
+  test("only the exact \"true\" wires the advisories source; the ack opens READ WRITE on the read pool", async () => {
+    for (const flag of [undefined, "", "false", "1", "TRUE"]) {
+      const off = await build({ ...ENV, ...(flag === undefined ? {} : { READ_API_COORDINATION_ADVISORIES_ENABLED: flag }) });
+      try {
+        expect([flag, off.deps.coordinationAdvisories]).toEqual([flag, undefined]);
+      } finally {
+        await off.close();
+      }
+    }
+    const on = await build({ ...ENV, READ_API_COORDINATION_ADVISORIES_ENABLED: "true" });
+    try {
+      expect(on.deps.coordinationAdvisories?.enabled).toBe(true);
+      sql = [];
+      const recipient = { orgId: "org-a", workspaceId: "ws-a", source: "codex", sessionId: "s-1" };
+      expect(await on.deps.coordinationAdvisories!.source.pending(recipient)).toEqual([]);
+      expect(sql.map((s) => s.text.split("(")[0]!.trim())).toEqual([
+        "BEGIN READ ONLY", "SELECT set_config", expect.stringContaining("SELECT advisory_id"), "COMMIT"]);
+      sql = [];
+      expect(await on.deps.coordinationAdvisories!.source.ack(recipient, "9f3c2a71d04be6e5")).toBe(false);
+      expect(sql.map((s) => s.text.split("(")[0]!.trim())).toEqual([
+        "BEGIN READ WRITE", "SELECT set_config", "SELECT sessions.coordination_advisories_ack_v1", "COMMIT"]);
+    } finally {
+      await on.close();
+    }
+  });
+});
