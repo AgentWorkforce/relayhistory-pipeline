@@ -356,6 +356,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // SELFHOST_ADMISSION_AWAIT_AUTHORITY=on: an org still waiting for its fence-authority marker defers (never
     // dead-letters) while its uploads queue in the inbox (wave rollouts). Off: an ordinary retry, unchanged.
     ...(admission.awaitAuthority ? { awaitAuthority: true } : {}),
+    // SELFHOST_ADMISSION_SPREAD=on: replicas start on different machines' work (salted order) below the grace. Off: unchanged.
+    ...(admission.spread ? { spread: { graceMs: admission.spread.graceMs } } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:

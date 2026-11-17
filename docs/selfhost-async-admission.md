@@ -110,6 +110,31 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
     Both stay ordinary retries and dead-letter after `SELFHOST_ADMISSION_MAX_ATTEMPTS`. To pause one org
     without dead letters, remove its marker instead (with no valid deployment-wide marker), or raise the
     deployment-wide stop.
+- **Several replicas (`SELFHOST_ADMISSION_SPREAD=on`, default off).** Every replica lists the same inbox.
+  With strict oldest-first (off, unchanged) they all start on the same oldest entries, and the losers end as
+  `already_terminal` / tombstoned or `retry ledger_attempt_superseded`: measured with 2 replicas, about half of
+  each pod's claims were wasted, claim time tripled, and 2 replicas admitted no more than 1. With spread on,
+  each process draws a random salt at startup and orders its due work in two tiers:
+  1. entries older than `SELFHOST_ADMISSION_SPREAD_GRACE_MS` (default max(120000, 4 x
+     `SELFHOST_ADMISSION_SCAN_MS`)): oldest first, exactly as off;
+  2. the rest: by sha256(salt, machine directory), oldest first within it. The machine directory
+     (`…/m=srv_<hash of workspace, origin, user>`) holds all batches of one user's machine, so they stay
+     together on whichever replica reaches them first, and two replicas start on different machines. A hot
+     user with several machines spreads by machine (order across a user's machines is not required).
+  The promotion pass does the same with `SELFHOST_UPLOAD_SCAN_BATCH`: objects past the grace are chosen
+  fairly across origins, oldest first (as off); the rest fill the batch a whole `o=` origin at a time, in
+  salted order (round-robin across young origins would hand every replica the same first object of each).
+  No replica index, StatefulSet ordinal, lease or heartbeat, and no extra request: it works on a Deployment
+  with random pod names and any replica count, during a roll included. It is an efficiency hint only: every
+  replica still lists and may admit every entry, duplicates stay safe through the claim's idempotency and the
+  ledger CAS, and the grace bounds what spread can delay. An entry no replica reached within the grace (a dead
+  pod, a roll, a replica-count change, a hot machine with a long run) is then taken oldest-first by every
+  replica, as with spread off; nothing can be owned by nobody. Limits: within one hot machine directory the
+  order is still oldest first, so a single machine's backlog is admitted by one replica at a time only until
+  it passes the grace; when the whole backlog is older than the grace, every replica works tier 1 and they
+  contend as before (strictly no worse than off). Set the grace above the normal backlog age and below the
+  admission latency you can accept for the unluckiest machine. The tenant-cap hint, authority waits and
+  backoff apply unchanged on top of this order.
 - **Dead letters.** After `SELFHOST_ADMISSION_MAX_ATTEMPTS` failures (default 20, the hosted queue's
   max retries) in one process, the consumer writes a marker at
   `<keyRoot>/.admission-dlq/<the inbox path>.json` holding `{v, kind, code, attempts, atMs}`. It holds
@@ -241,6 +266,8 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_SCAN_MS` | 1000..600000 | 15000 |
 | `SELFHOST_ADMISSION_MAX_ATTEMPTS` | 1..100 | 20 |
 | `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`async`/`drain` with `INGEST_LEDGER=s3`; a silent no-op with `sql`, which never answers these codes) | `on`, `off`; anything else refuses startup | off |
+| `SELFHOST_ADMISSION_SPREAD` (`async`/`drain` only; set with `sync`: refused) | `on`, `off`; anything else refuses startup | off |
+| `SELFHOST_ADMISSION_SPREAD_GRACE_MS` (`SELFHOST_ADMISSION_SPREAD=on` only; set otherwise: refused) | 1000..86400000 | max(120000, 4 x `SELFHOST_ADMISSION_SCAN_MS`) |
 | `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |

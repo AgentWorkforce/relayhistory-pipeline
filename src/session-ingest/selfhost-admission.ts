@@ -32,11 +32,28 @@
  * admission-inbox object and notifies this consumer, which admits it like any other. Off: the prefix is
  * never listed.
  *
+ * Spread (SELFHOST_ADMISSION_SPREAD=on, `spread`; default off = strict oldest-first, unchanged): with N replicas every
+ * one lists the same inbox, and strict oldest-first makes them all start on the SAME oldest entries, so about half of
+ * each replica's claims lose a race (already_terminal / ledger_attempt_superseded) and N replicas admit no more than
+ * one. With spread, each process draws a random salt at startup and orders its due work in two tiers:
+ *   1. entries older than `graceMs` (receivedAtMs from the key; upload objects: LastModified): oldest first, as off.
+ *   2. the rest: by sha256(salt, group), then oldest first within the group. The group is the inbox machine directory
+ *      `<org>/v1/ws=<ws>/m=<srv_ hash of (ws, origin, user)>` (all batches of one user's machine stay together, so one
+ *      replica works one machine's run while another works a different one) or, for promotion, the upload's
+ *      `o=<origin>` under its user prefix (whole origins in salt order, each oldest first).
+ * No replica index, lease, heartbeat or extra request: replicas disagree on nothing because they agree on nothing.
+ * It is an efficiency hint only. Every replica still lists and may admit every entry, and tier 1 bounds what spread can
+ * delay: an entry no replica reached within `graceMs` (dead pod, roll, replica-count change, hot user) is then taken
+ * oldest-first by every replica, exactly as with spread off. Correctness is the claim's (idempotent resume / replay,
+ * CAS fences), unchanged. Within one hot machine directory the order is still oldest first; when the backlog is older
+ * than `graceMs` everything is tier 1 and replicas contend as before, so the grace must exceed the normal backlog age.
+ *
  * Logs: one `ingest.admission` line per attempt (the hosted fields), one `ingest.admission_consumer`
  * line per scan (backlog, oldest age, dead letters, in flight). Never a key, body, token or header value.
  */
 import type { UploadConsentConfig } from "./upload-consent.ts";
 import { zstdDecompressSync } from "node:zlib";
+import { createHash, randomBytes } from "node:crypto";
 import { ADMISSION_PHASE_FIELDS, log as sharedLog } from "../shared/log.ts";
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-consumer.ts";
@@ -121,6 +138,12 @@ export interface SelfhostAdmissionOptions {
   logStreams?: LogStreams;
   /** With logStreams: the log materializer (kicked after each append; every registered stream kicked each scan). */
   logMaterializer?: LogMaterializer;
+  /**
+   * SELFHOST_ADMISSION_SPREAD=on (header "Spread"): order work younger than `graceMs` by a per-process salted hash of
+   * its machine directory / upload origin instead of oldest first. `salt` is for tests (default: 16 random bytes).
+   * Absent: strict oldest-first, unchanged.
+   */
+  spread?: { graceMs: number; salt?: string };
 }
 
 export interface SelfhostAdmissionStatus {
@@ -160,7 +183,18 @@ export interface SelfhostAdmissionConsumer {
   userHints(): number;
 }
 
-interface Entry { attempts: number; notBefore: number; addedAt: number; receivedAtMs: number }
+interface Entry { attempts: number; notBefore: number; addedAt: number; receivedAtMs: number; spreadRank?: string }
+
+/** The spread group of an admission inbox key: its machine directory (`…/m=<id>`), or the key itself if none. */
+export function admissionSpreadGroup(key: string): string {
+  const r = key.indexOf("/r=");
+  return r > 0 ? key.slice(0, r) : key;
+}
+
+/** A salted, fixed-width rank (sha256 hex) for one group: compared as strings. */
+export function spreadRank(salt: string, group: string): string {
+  return createHash("sha256").update(salt).update("\u0000").update(group).digest("hex");
+}
 
 export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): SelfhostAdmissionConsumer {
   const { store, keyRoot } = opts.deliver.target as { store: ObjectStore; keyRoot: string };
@@ -240,6 +274,12 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const staleAfterMs = Math.max(3 * opts.scanIntervalMs, 60_000);
   /** Upload keys that returned `retry` (or `invalid`): attempts and the earliest next attempt. */
   const uploadBackoff = new Map<string, { attempts: number; notBefore: number }>();
+  const spread = opts.spread ? { graceMs: opts.spread.graceMs, salt: opts.spread.salt ?? randomBytes(16).toString("hex") } : undefined;
+  const newEntry = (key: string, addedAt: number): Entry => {
+    const e: Entry = { attempts: 0, notBefore: 0, addedAt, receivedAtMs: receivedAtOf(key) };
+    if (spread) e.spreadRank = spreadRank(spread.salt, admissionSpreadGroup(key));
+    return e;
+  };
 
   async function promoteUploads(at: number): Promise<void> {
     const upload = opts.uploadInbox;
@@ -268,7 +308,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         cursor = page.nextCursor;
       } while (cursor && !stopped);
       for (const key of uploadBackoff.keys()) if (!seen.has(key)) uploadBackoff.delete(key);
-      const chosen = selectUploadsFairly(due, upload.batchSize);
+      const chosen = spread ? selectUploadsSpread(due, upload.batchSize, spread.salt, spread.graceMs, now()) : selectUploadsFairly(due, upload.batchSize);
       const promoteOne = async (key: string): Promise<void> => {
         const back = uploadBackoff.get(key);
         const r = await upload.promote(key).catch((error: unknown): PromoteResult => ({ action: "retry", code: "promote_failed", error }));
@@ -323,7 +363,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       for await (const m of pendingAdmissions(store, keyRoot, { nowMs: scanAt, olderThanMs: Number.NEGATIVE_INFINITY, onPage: scanPage })) {
         if (dead.has(m.key)) { live++; marked.add(m.key); if (!inflight.has(m.key)) forget(m.key); continue; }
         seen.add(m.key);
-        if (!entries.has(m.key)) entries.set(m.key, { attempts: 0, notBefore: 0, addedAt: scanAt, receivedAtMs: receivedAtOf(m.key) });
+        if (!entries.has(m.key)) entries.set(m.key, newEntry(m.key, scanAt));
       }
       // Terminal (tombstoned) or gone: forget it, unless it is in flight or was notified during this scan.
       for (const [key, e] of entries) if (!seen.has(key) && !inflight.has(key) && e.addedAt < scanAt) forget(key);
@@ -434,7 +474,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     for (const [dir, until] of busyUntil) if (until <= at) busyUntil.delete(dir);
     // An expired window becomes a probe: the org's next start is its only one until that claim answers.
     for (const [org, until] of authorityUntil) if (until <= at) { authorityUntil.delete(org); authorityProbe.add(org); }
-    const waiting = [...entries].filter(([key]) => !inflight.has(key)).sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
+    const waiting = [...entries].filter(([key]) => !inflight.has(key));
+    if (spread) waiting.sort(spreadOrder(at, spread.graceMs));
+    else waiting.sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
     let next = Infinity;
     for (const [key, entry] of waiting) {
       if (entry.notBefore > at) { next = Math.min(next, entry.notBefore); continue; }
@@ -534,7 +576,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
           userOf.set(key, `${hint.orgId}\n${hint.userId}`);
         }
         if (entries.has(key)) return;
-        entries.set(key, { attempts: 0, notBefore: 0, addedAt: now(), receivedAtMs: receivedAtOf(key) });
+        entries.set(key, newEntry(key, now()));
         if (started) pump();
       } catch {
         // A hint only: the next scan finds the object anyway.
@@ -548,6 +590,25 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     },
     status,
     userHints: () => userOf.size,
+  };
+}
+
+/**
+ * Spread order of waiting entries at `at`: tier 1 (older than `graceMs`, or no parseable receivedAt) oldest first,
+ * then tier 2 by salted rank, oldest first within a rank, key order on a tie (deterministic).
+ */
+function spreadOrder(at: number, graceMs: number) {
+  const old = (e: Entry) => !Number.isFinite(e.receivedAtMs) || at - e.receivedAtMs >= graceMs;
+  return (a: [string, Entry], b: [string, Entry]): number => {
+    const oa = old(a[1]), ob = old(b[1]);
+    if (oa !== ob) return oa ? -1 : 1;
+    if (!oa) {
+      const ra = a[1].spreadRank ?? "", rb = b[1].spreadRank ?? "";
+      if (ra !== rb) return ra < rb ? -1 : 1;
+    }
+    const d = (Number.isFinite(a[1].receivedAtMs) ? a[1].receivedAtMs : -Infinity) - (Number.isFinite(b[1].receivedAtMs) ? b[1].receivedAtMs : -Infinity);
+    if (d !== 0 && !Number.isNaN(d)) return d;
+    return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
   };
 }
 
@@ -583,6 +644,36 @@ export function selectUploadsFairly(candidates: readonly UploadCandidate[], limi
     }
     if (!took) break;
   }
+  return out;
+}
+
+/** The spread group of an upload key: everything up to its `o=<origin>/` segment (one user's one machine). */
+export function uploadSpreadGroup(key: string): string {
+  const m = /\/o=[^/]+\//u.exec(key);
+  return m ? key.slice(0, m.index + m[0].length) : key;
+}
+
+/**
+ * Spread choice (SELFHOST_ADMISSION_SPREAD=on): first the candidates older than `graceMs` (by LastModified), chosen
+ * exactly as selectUploadsFairly; then, while room is left, the younger ones a whole origin group at a time (each
+ * oldest first), groups in salted-rank order. Fair round-robin across the younger groups would hand every replica the
+ * same first object of every origin, which is the race spread exists to avoid; the grace restores fairness.
+ */
+export function selectUploadsSpread(candidates: readonly UploadCandidate[], limit: number, salt: string, graceMs: number, nowMs: number): string[] {
+  const old: UploadCandidate[] = [], young: UploadCandidate[] = [];
+  for (const c of candidates) (nowMs - c.lastModifiedMs >= graceMs || !Number.isFinite(c.lastModifiedMs) ? old : young).push(c);
+  const out = selectUploadsFairly(old, limit);
+  if (out.length >= limit) return out;
+  const groups = new Map<string, UploadCandidate[]>();
+  for (const c of young) {
+    const g = uploadSpreadGroup(c.key);
+    const list = groups.get(g);
+    if (list) list.push(c); else groups.set(g, [c]);
+  }
+  const order = (a: UploadCandidate, b: UploadCandidate) => a.lastModifiedMs - b.lastModifiedMs || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  const ranked = [...groups].map(([g, list]) => ({ rank: spreadRank(salt, g), list: list.sort(order) }))
+    .sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : 0));
+  for (const { list } of ranked) for (const c of list) { if (out.length >= limit) return out; out.push(c.key); }
   return out;
 }
 
