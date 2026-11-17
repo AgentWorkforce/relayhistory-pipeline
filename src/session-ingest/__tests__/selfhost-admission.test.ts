@@ -40,6 +40,15 @@ describe("SELFHOST_INGEST_ADMISSION", () => {
     }
   });
 
+  test("SELFHOST_ADMISSION_ONE_PER_RECEIPT: absent unless on; off/empty/unset unchanged; anything else refuses; refused with sync", () => {
+    const base = { SELFHOST_INGEST_ADMISSION: "async" };
+    expect(selfhostAdmissionSettings(base)).not.toHaveProperty("onePerReceipt");
+    for (const v of ["", "off"]) expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_ONE_PER_RECEIPT: v })).toEqual(selfhostAdmissionSettings(base));
+    expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_ONE_PER_RECEIPT: "on" })).toMatchObject({ onePerReceipt: true });
+    for (const v of ["true", "1", "ON"]) expect(() => selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_ONE_PER_RECEIPT: v })).toThrow("SELFHOST_ADMISSION_ONE_PER_RECEIPT must be on or off");
+    expect(() => selfhostAdmissionSettings({ SELFHOST_ADMISSION_ONE_PER_RECEIPT: "on" })).toThrow("SELFHOST_ADMISSION_ONE_PER_RECEIPT needs SELFHOST_INGEST_ADMISSION=async or drain");
+  });
+
   test("SELFHOST_ADMISSION_LEARN_USERS: absent unless on; off/empty/unset unchanged; anything else refuses; refused with sync", () => {
     const base = { SELFHOST_INGEST_ADMISSION: "async" };
     expect(selfhostAdmissionSettings(base)).not.toHaveProperty("learnUsers");
@@ -385,15 +394,15 @@ describe("deferTenantLimit (INGEST_LEDGER=s3 only)", () => {
   test("absent (the SQL ledger): a slot refusal is an ordinary retry that counts toward maxAttempts, unchanged", async () => {
     const r = await run(undefined);
     expect(r.lines).toEqual([
-      { route: "ingest.admission", outcome: "retry", error_code: "delivery_busy", attempt: 1 },
-      { route: "ingest.admission", outcome: "dead_lettered", error_code: "delivery_busy", attempt: 1 },
+      { route: "ingest.admission", receipt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), attempt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), outcome: "retry", error_code: "delivery_busy", attempt: 1 },
+      { route: "ingest.admission", receipt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), attempt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), outcome: "dead_lettered", error_code: "delivery_busy", attempt: 1 },
     ]);
     expect(r.dead).toBeDefined();
   });
 
   test("true: a slot refusal defers the object (no attempt consumed, never dead-lettered)", async () => {
     const r = await run(true);
-    expect(r.lines).toEqual([{ route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", attempt: 1 }]);
+    expect(r.lines).toEqual([{ route: "ingest.admission", receipt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), attempt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), outcome: "deferred", error_code: "tenant_limit", attempt: 1 }]);
     expect(r.dead).toBeUndefined();
   });
 });

@@ -155,6 +155,14 @@ export interface SelfhostAdmissionOptions {
   learnUsers?: boolean;
   /** With learnUsers: how many machine directories' users are remembered (default USER_HINT_MAX), oldest out. */
   learnedUserMax?: number;
+  /**
+   * SELFHOST_ADMISSION_ONE_PER_RECEIPT=on: never start an inbox key while another key of the same receipt directory
+   * (`…/r=<receipt>/`, every attempt of one batch: the receipt is content-addressed by its digest) is in flight. Two
+   * attempts of one pending batch at once make the second claim resume it with a new token, so the first writes its
+   * objects and then loses its commit (`ledger_attempt_superseded`). The sibling waits and, after the first commits,
+   * is a cheap replay. Absent: no such check, unchanged.
+   */
+  onePerReceipt?: boolean;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -198,6 +206,16 @@ export interface SelfhostAdmissionConsumer {
 
 interface Entry { attempts: number; notBefore: number; addedAt: number; receivedAtMs: number; spreadRank?: string }
 
+/**
+ * Log tags for one admission (log.ts receipt_tag / attempt_tag): the first 8 hex of sha256 of its receipt directory
+ * (`…/r=<receipt>`, shared by every attempt of one batch) and of its inbox key. Correlation only, never the key.
+ */
+export function admissionLogTags(key: string): { receipt_tag: string; attempt_tag: string } {
+  const a = key.lastIndexOf("/a=");
+  const tag = (v: string) => createHash("sha256").update(v).digest("hex").slice(0, 8);
+  return { receipt_tag: tag(a > 0 ? key.slice(0, a) : key), attempt_tag: tag(key) };
+}
+
 /** The spread group of an admission inbox key: its machine directory (`…/m=<id>`), or the key itself if none. */
 export function admissionSpreadGroup(key: string): string {
   const r = key.indexOf("/r=");
@@ -216,6 +234,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const decompress = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
   const entries = new Map<string, Entry>();
   const inflight = new Set<string>();
+  /** onePerReceipt: receipt directories (`…/r=<hex>`) with a key in flight. */
+  const inflightReceipts = opts.onePerReceipt ? new Set<string>() : undefined;
+  const receiptOf = (key: string): string | undefined => { const a = key.lastIndexOf("/a="); return a > 0 && key.slice(0, a).includes("/r=") ? key.slice(0, a) : undefined; };
   const running = new Set<Promise<void>>();
   // Tenant-cap HINT (deferTenantLimit only): skip, without starting, an entry whose org or user is already at the
   // consumer's tenant cap, or whose user was just deferred by it. The authoritative guard is still deliver.ts's
@@ -448,6 +469,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   async function admitOne(key: string, entry: Entry): Promise<"deferred" | void> {
     entry.attempts += 1;
     const t0 = Date.now();
+    const tags = admissionLogTags(key);
     const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}),
       ...(opts.logStreams ? { logStreams: opts.logStreams } : {}), ...(opts.logMaterializer ? { logMaterializer: opts.logMaterializer } : {}),
       ...(learnUsers ? { onTenant: (tenant: { orgId: string; userId: string }) => learn(key, tenant) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
@@ -455,7 +477,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (r.action === "ack") {
       const timing: Record<string, number> = {};
       for (const [phase, ms] of Object.entries(r.timingMs ?? {})) { const field = ADMISSION_PHASE_FIELDS.get(phase); if (field) timing[field] = ms; }
-      logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts, ...timing });
+      logger.info("session ingest admission", { route: "ingest.admission", ...tags, outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts, ...timing });
       forget(key);
       if (marked.delete(key)) await store.delete(objectKey(deadLetterKey(keyRoot, key))).catch(() => {});
       return;
@@ -467,7 +489,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       // Its siblings in the same machine directory (the same user) wait as long, unless one of them ends first.
       const tenant = caps ? tenantOf(key) : undefined;
       if (tenant) busyUntil.set(tenant.group, Math.max(busyUntil.get(tenant.group) ?? 0, entry.notBefore));
-      logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
+      logger.info("session ingest admission", { route: "ingest.admission", ...tags, outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
       return "deferred";
     }
     // Matched on the retry's code: the claim's LedgerUnavailableError reaches here wrapped by the delivery layer,
@@ -479,12 +501,12 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       entry.notBefore = now() + AUTHORITY_WAIT_MS;
       const org = orgOf(key);
       if (org !== undefined) authorityUntil.set(org, Math.max(authorityUntil.get(org) ?? 0, entry.notBefore));
-      logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: r.code, duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
+      logger.info("session ingest admission", { route: "ingest.admission", ...tags, outcome: "deferred", error_code: r.code, duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
       return "deferred";
     }
     const storeStatus = (r.error as { storeStatus?: unknown } | undefined)?.storeStatus;
     const storeCause = (r.error as { storeCause?: unknown } | undefined)?.storeCause;
-    const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), ...(typeof storeCause === "string" ? { store_cause: storeCause } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
+    const fields: Record<string, unknown> = { route: "ingest.admission", ...tags, outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), ...(typeof storeCause === "string" ? { store_cause: storeCause } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
     const db = (r.error as { db?: { db_error_class: string; db_error_code: string; db_error_basis: string } } | undefined)?.db;
     if (db) Object.assign(fields, { db_error_class: db.db_error_class, db_error_code: db.db_error_code, db_error_basis: db.db_error_basis });
     logger.warn("session ingest admission", fields);
@@ -492,7 +514,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (lock) logger.warn("session ingest admission", { ...lock, route: "ingest.admission_lock_alert" });
     if (entry.attempts >= opts.maxAttempts) {
       if (await deadLetter(key, r.code, entry.attempts)) {
-        logger.error("session ingest admission", { route: "ingest.admission", outcome: "dead_lettered", error_code: r.code, attempt: entry.attempts });
+        logger.error("session ingest admission", { route: "ingest.admission", ...tags, outcome: "dead_lettered", error_code: r.code, attempt: entry.attempts });
         forget(key);
         return;
       }
@@ -524,6 +546,10 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       if (authorityWait !== undefined && authorityWait > at) { next = Math.min(next, authorityWait); continue; }
       // A probe of this org is already in flight: wait for its answer (it re-pumps on finish).
       if (waitOrg !== undefined && probing.has(waitOrg)) continue;
+      // onePerReceipt: another attempt of the same batch is in flight; it re-pumps when it ends. Checked before any
+      // tenant count is taken, so a skip leaves nothing to undo.
+      const receipt = inflightReceipts ? receiptOf(key) : undefined;
+      if (receipt !== undefined && inflightReceipts!.has(receipt)) continue;
       const tenant = caps ? tenantOf(key) : undefined;
       if (tenant && caps) {
         // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
@@ -543,12 +569,14 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const probe = waitOrg !== undefined && authorityProbe.has(waitOrg);
       if (probe) { authorityProbe.delete(waitOrg!); probing.add(waitOrg!); }
       inflight.add(key);
+      if (receipt !== undefined) inflightReceipts!.add(receipt);
       let deferred = false;
       const p: Promise<void> = admitOne(key, entry)
         .then((outcome) => { deferred = outcome === "deferred"; })
         .catch(() => { entry.notBefore = now() + 300_000; })
         .finally(() => {
           inflight.delete(key);
+          if (receipt !== undefined) inflightReceipts!.delete(receipt);
           if (probe) probing.delete(waitOrg!);
           if (tenant && !held) {
             bump(inflightOrg, tenant.org, -1); bump(inflightGroup, tenant.group, -1);

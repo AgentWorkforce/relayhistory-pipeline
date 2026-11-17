@@ -132,6 +132,20 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
     than the limiter alone would make it.
   - **Needs the tenant limit.** With `INGEST_S3_TENANT_LIMIT` off, startup refuses
     `SELFHOST_ADMISSION_LEARN_USERS=on` rather than start and do nothing.
+- **One attempt of a batch at a time (`SELFHOST_ADMISSION_ONE_PER_RECEIPT=on`, default off).** Every attempt
+  of one batch (the original upload and every desktop re-send) has its own key in the same receipt directory,
+  `…/r=<receipt>/a=<time>-<nonce>`; the receipt is content-addressed by the batch digest. With the S3 ledger, a
+  claim of a same-digest batch that is still pending resumes it with a new claim token. Two attempts of one
+  batch in flight at once therefore make the second take over: the first writes its canonical objects and then
+  loses its commit (`ledger_attempt_superseded`), with all of its work wasted. Measured on one replica at
+  concurrency 8: 249 of about 1,000 admissions in 16 minutes, with 47% of the work being re-sends. With the flag,
+  the pump never starts a key while another key of its receipt directory is in flight. The sibling waits,
+  without a deferral or a claim, and once the first commits it is a cheap replay. The check runs before any
+  tenant count or authority probe is taken, and the ending admission re-pumps. Across replicas, attempts can
+  still race, as before; `SELFHOST_ADMISSION_SPREAD` keeps one machine directory on one replica below its grace.
+  Every admission log line carries `receipt_tag` and `attempt_tag`, whatever the flag: the first 8 hex of a
+  sha256 of the receipt directory and of the inbox key. Attempts of one batch share a `receipt_tag`, so a
+  sample can show which supersedes came from a sibling attempt. Neither tag is the key.
 - **Several replicas (`SELFHOST_ADMISSION_SPREAD=on`, default off).** Every replica lists the same inbox.
   With strict oldest-first (off, unchanged) they all start on the same oldest entries, and the losers end as
   `already_terminal` / tombstoned or `retry ledger_attempt_superseded`: measured with 2 replicas, about half of
@@ -290,6 +304,7 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`async`/`drain` with `INGEST_LEDGER=s3`; a silent no-op with `sql`, which never answers these codes) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_ADMISSION_SPREAD` (`async`/`drain` only; set with `sync`: refused) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_ADMISSION_SPREAD_GRACE_MS` (`SELFHOST_ADMISSION_SPREAD=on` only; set otherwise: refused) | 1000..86400000 | max(120000, 4 x `SELFHOST_ADMISSION_SCAN_MS`) |
+| `SELFHOST_ADMISSION_ONE_PER_RECEIPT` (`async`/`drain` only; set with `sync`: refused) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_ADMISSION_LEARN_USERS` (`async`/`drain` only; set with `sync`: refused; acts only with the tenant limit) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |

@@ -13,13 +13,13 @@ import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { SYNC_SCOPE, type IngestIdentity } from "../app.ts";
-import { outcomeKey, receiptDir } from "../async-admission.ts";
+import { enqueueAdmission, outcomeKey, receiptDir } from "../async-admission.ts";
 import { fenceAuthorityKey, s3LedgerKeys } from "../ledger-s3.ts";
 import type { SelfhostAdmissionConsumer } from "../selfhost-admission.ts";
 import { selfhostIngestRuntime } from "../selfhost-server.ts";
 import { uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey } from "../upload-admission.ts";
 import { encodeUploadWitness, parseUploadKey, parseUploadWitnessKey, uploadKeyPrefix, uploadObjectKey, uploadObjectSha256Hex } from "../upload-inbox-contract.ts";
-import { deliveryAccount } from "../vendor/delivery/prepare.ts";
+import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { TENANT, batch, record, scratchStore } from "./support.ts";
 
 const V = JSON.parse(readFileSync(join(import.meta.dir, "../../../docs/contracts/relay-upload-inbox-v1.vectors.json"), "utf8"));
@@ -67,7 +67,7 @@ async function until(cond: () => boolean | Promise<boolean>, what: string): Prom
   throw new Error(`timed out waiting for ${what}`);
 }
 
-function edge(opts: { admission?: { mode: "async"; concurrency: number; scanIntervalMs: number; maxAttempts: number; learnUsers?: true }; direct?: boolean; ledger?: "s3";
+function edge(opts: { admission?: { mode: "async"; concurrency: number; scanIntervalMs: number; maxAttempts: number; learnUsers?: true; onePerReceipt?: true }; direct?: boolean; ledger?: "s3";
   /** INGEST_S3_TENANT_LIMIT: on ({}, or with asyncMaxPerOrg) by default here; null = off. */
   limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number;
   /** Share another edge's store (a second process: its consumer has none of the first one's notify hints). */
@@ -187,7 +187,7 @@ describe("INGEST_LEDGER=s3, the async consumer at the tenant cap (direct uploads
     e.open();
     await settling;
     const deferred = e.logged.filter((f) => f.route === "ingest.admission" && f.outcome === "deferred");
-    expect(deferred).toEqual([{ route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: expect.any(Number), attempt: 1 }]);
+    expect(deferred).toEqual([{ route: "ingest.admission", receipt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), attempt_tag: expect.stringMatching(/^[0-9a-f]{8}$/), outcome: "deferred", error_code: "tenant_limit", duration_ms: expect.any(Number), attempt: 1 }]);
     expect(e.logged.some((f) => f.outcome === "dead_lettered" || f.outcome === "refused")).toBe(false);
     expect(e.consumer().status()).toMatchObject({ backlog: 1, deadLetters: 0 });
     const status = async (k: string) => (await uploadAdmissionStatus({ store: e.base, keyRoot: ROOT }, uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on" }), TENANT, k)) as { body: { state: string } };
@@ -358,6 +358,40 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
   test("SELFHOST_ADMISSION_LEARN_USERS without the tenant limit is refused at startup (it would do nothing)", () => {
     expect(() => edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 20, learnUsers: true }, direct: true, limit: null }))
       .toThrow("SELFHOST_ADMISSION_LEARN_USERS=on needs INGEST_S3_TENANT_LIMIT=on");
+  });
+
+  for (const onePerReceipt of [true, false] as const)
+  test(`two attempts of one batch: ${onePerReceipt ? "SELFHOST_ADMISSION_ONE_PER_RECEIPT=on runs one at a time, nothing superseded" : "flag off (control): both run and the first loses its commit"}`, async () => {
+    const e = edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20, ...(onePerReceipt ? { onePerReceipt: true as const } : {}) },
+      limit: { asyncMaxPerOrg: 4 }, maxPerUser: 4 });
+    await writeAuthority(e.base);
+    // The same batch twice (an original and a desktop re-send): two inbox keys in one r=<receipt> directory.
+    const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "dup", session_id: "sess-dup" })], { batch_id: "batch-dup" }));
+    for (const nonce of ["0000000000000001", "0000000000000002"])
+      await enqueueAdmission({ store: e.base, keyRoot: ROOT, enqueue: async () => {}, nonce: () => nonce }, TENANT, prepared, T0, 0);
+    const inbox = (await e.base.list(objectKey(`${ROOT}/.admission-inbox`))).items.map((i) => String(i.key)).filter((k) => /\/a=\d{15}-[0-9a-f]{16}\.ndjson\.zst$/.test(k));
+    expect(inbox).toHaveLength(2);
+    expect(new Set(inbox.map((k) => k.slice(0, k.lastIndexOf("/a=")))).size).toBe(1);
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    await until(() => e.blocked() > 0, "the first attempt to reach its canonical writes");
+    await new Promise((r) => setTimeout(r, 80));
+    expect(e.consumer().status().inFlight).toBe(onePerReceipt ? 1 : 2);
+    e.open();
+    await settling;
+    for (let i = 0; i < 6 && e.consumer().status().backlog > 0; i++) { e.advance(301_000); await e.consumer().scan(); await e.consumer().settle(); }
+    const superseded = e.logged.filter((f) => f.route === "ingest.admission" && f.error_code === "ledger_attempt_superseded").length;
+    if (onePerReceipt) expect(superseded).toBe(0);
+    else expect(superseded).toBeGreaterThan(0);
+    expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-dup"))).toMatchObject({ state: "committed" });
+    // The log tags group the attempts: one receipt_tag, two attempt_tags, never the key itself.
+    const lines = e.logged.filter((f) => f.route === "ingest.admission");
+    expect(new Set(lines.map((f) => f.receipt_tag)).size).toBe(1);
+    expect(new Set(lines.map((f) => f.attempt_tag)).size).toBe(2);
+    expect(lines.every((f) => /^[0-9a-f]{8}$/.test(String(f.receipt_tag)) && /^[0-9a-f]{8}$/.test(String(f.attempt_tag)))).toBe(true);
+    expect(JSON.stringify(lines)).not.toContain(".admission-inbox");
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
   });
 
   test("the writer hint never holds back another user of the same org", async () => {

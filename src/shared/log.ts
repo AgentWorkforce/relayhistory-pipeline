@@ -75,6 +75,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "store_cause",
   // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
   ...ADMISSION_PHASE_FIELDS_LIST,
+  // ...and which batch and which attempt it was (selfhost-admission.ts admissionLogTags): the first 8 hex of a
+  // sha256 of the receipt directory and of the inbox key, so attempts of one batch group together. Never the key.
+  "receipt_tag", "attempt_tag",
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
   // (e.g. `http_429:bulk_items_812:bulk_bytes_4190000`), never backend text or a reason.
   "error_detail",
@@ -166,7 +169,8 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
  * ingest-refusal-log.test.ts): never a token, hostname or hex id. */
 export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Za-z.]{1,16})?$/;
-const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE]]);
+export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
+const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE]]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;

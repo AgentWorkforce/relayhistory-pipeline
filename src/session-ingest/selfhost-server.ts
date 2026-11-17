@@ -381,6 +381,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(admission.spread ? { spread: { graceMs: admission.spread.graceMs } } : {}),
     // SELFHOST_ADMISSION_LEARN_USERS=on: the tenant-cap hint groups scan-found keys by their learned user. Off: unchanged.
     ...(admission.learnUsers ? { learnUsers: true } : {}),
+    // SELFHOST_ADMISSION_ONE_PER_RECEIPT=on: one attempt of a batch in flight at a time (no self-supersede). Off: unchanged.
+    ...(admission.onePerReceipt ? { onePerReceipt: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     ...(options.learnedUserMax !== undefined ? { learnedUserMax: options.learnedUserMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.

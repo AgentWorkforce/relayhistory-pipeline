@@ -725,7 +725,9 @@ counting toward the dead letter, `INGEST_LEDGER=s3` only) and `SELFHOST_ADMISSIO
 `SELFHOST_ADMISSION_SPREAD_GRACE_MS` by a per-process salted hash of its machine directory so replicas
 stop racing on the same oldest entries) and `SELFHOST_ADMISSION_LEARN_USERS` (`on`/`off`,
 default off; with the tenant limit, scan-found inbox keys are counted per user, learned from each machine
-directory's first admission, instead of per machine directory) are read only in `async` and `drain`. The mode is never taken from a
+directory's first admission, instead of per machine directory) and `SELFHOST_ADMISSION_ONE_PER_RECEIPT`
+(`on`/`off`, default off; never two attempts of one batch in flight at once, so a re-send never supersedes the
+attempt already writing) are read only in `async` and `drain`. The mode is never taken from a
 request. Semantics: `docs/selfhost-async-admission.md`.
 
 Sizing with `INGEST_LEDGER=s3`: one admission of a 100-record batch holds a few MB (the batch, its

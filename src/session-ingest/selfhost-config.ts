@@ -81,6 +81,9 @@
  *                                    the tenant-cap hint learns each machine directory's user from its first admission,
  *                                    so inbox keys found by a scan (no notify hint) count, and wait, per user as the
  *                                    limiter counts them, not per machine directory (selfhost-admission.ts learnUsers)
+ *   SELFHOST_ADMISSION_ONE_PER_RECEIPT  on | off (default off: unchanged). on: never two attempts of one batch (one
+ *                                    `r=<receipt>` inbox directory) in flight at once, so a desktop re-send never
+ *                                    supersedes the attempt already writing (selfhost-admission.ts onePerReceipt)
  *
  *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
  *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
@@ -211,6 +214,8 @@ export interface SelfhostAdmissionSettings {
   spread?: { graceMs: number };
   /** SELFHOST_ADMISSION_LEARN_USERS=on only (selfhost-admission.ts learnUsers). Absent when off (unchanged). */
   learnUsers?: true;
+  /** SELFHOST_ADMISSION_ONE_PER_RECEIPT=on only (selfhost-admission.ts onePerReceipt). Absent when off (unchanged). */
+  onePerReceipt?: true;
 }
 
 export interface SelfhostIngestSettings {
@@ -429,7 +434,7 @@ export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmis
   const raw = env[SELFHOST_INGEST_ADMISSION_VAR];
   if (raw === undefined || raw === "" || raw === "sync") {
     // The spread orders the async consumer's work: without one it would silently do nothing.
-    for (const name of [SELFHOST_ADMISSION_SPREAD_VAR, SELFHOST_ADMISSION_SPREAD_GRACE_VAR, SELFHOST_ADMISSION_LEARN_USERS_VAR]) {
+    for (const name of [SELFHOST_ADMISSION_SPREAD_VAR, SELFHOST_ADMISSION_SPREAD_GRACE_VAR, SELFHOST_ADMISSION_LEARN_USERS_VAR, SELFHOST_ADMISSION_ONE_PER_RECEIPT_VAR]) {
       const v = env[name]?.trim();
       if (v && v !== "off") throw new Error(`96bulls: ${name} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
     }
@@ -445,7 +450,18 @@ export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmis
     ...(awaitAuthorityFlag(env) ? { awaitAuthority: true as const } : {}),
     ...spreadSettings(env, scanIntervalMs),
     ...(learnUsersFlag(env) ? { learnUsers: true as const } : {}),
+    ...(onOff(env, SELFHOST_ADMISSION_ONE_PER_RECEIPT_VAR) ? { onePerReceipt: true as const } : {}),
   };
+}
+
+export const SELFHOST_ADMISSION_ONE_PER_RECEIPT_VAR = "SELFHOST_ADMISSION_ONE_PER_RECEIPT";
+
+/** An on/off flag: on or off (unset / empty = off); anything else refuses startup. */
+function onOff(env: NodeJS.ProcessEnv, name: string): boolean {
+  const raw = env[name];
+  if (raw === undefined || raw === "" || raw === "off") return false;
+  if (raw === "on") return true;
+  throw new Error(`96bulls: ${name} must be on or off`);
 }
 
 export const SELFHOST_ADMISSION_LEARN_USERS_VAR = "SELFHOST_ADMISSION_LEARN_USERS";

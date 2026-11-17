@@ -143,3 +143,10 @@ describe("searchIndexErrorDetail", () => {
     expect(searchIndexErrorDetail(undefined)).toEqual({});
   });
 });
+
+test("receipt_tag / attempt_tag: 8 lowercase hex only, anything else dropped", () => {
+  for (const f of ["receipt_tag", "attempt_tag"]) {
+    expect(sanitizeLogField(f, "0a1b2c3d")).toBe("0a1b2c3d");
+    for (const bad of ["0A1B2C3D", "0a1b2c3", "0a1b2c3d4", "96bulls/.admission-inbox/org/v1", 12345678, null]) expect(sanitizeLogField(f, bad)).toBeUndefined();
+  }
+});
