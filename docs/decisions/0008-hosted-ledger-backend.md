@@ -6,10 +6,14 @@ chosen. Every cloud resource, IAM or KMS change, bucket move and deploy below
 needs his explicit OK in his own words, as AGENTS.md says, and all of it lands as code (stacks, charts,
 Terraform), never by hand.
 
+**As of 2026-11-17:** the benchmark harness and its stacks are on main, and the benchmark ran three times on
+2026-11-16 (results kept in the private ops docs). Option C is built on main behind `INGEST_LEDGER_LOG_COMMIT`
+(off by default; slices 1-6, `docs/design/s3-ledger-log-commit.md`, whose smoke-run table is at lines 18-26). It is
+not on in any hosted environment. No option has been chosen.
+
 **Builds on:** 0005 (upload accounting lives in S3) and 0007 (hosted sessions on the agentrelay EKS
 clusters, on durable actors). **Refines:** the group-commit design
-(`docs/design/s3-ledger-group-commit.md`, rev 3, on `review/claude-s3-ledger-group-commit`, not yet on
-main). **Measured by:** `docs/design/hosted-ledger-benchmark-plan.md`.
+(`docs/design/s3-ledger-group-commit.md`, on main as "Revision 2, design only", not implemented). **Measured by:** `docs/design/hosted-ledger-benchmark-plan.md`.
 
 ## Context
 
@@ -26,7 +30,7 @@ Measurements, taken read-only from the prod ingest-edge pod on 2026-11-16:
 | S3 in us-west-2 (same region) | 5 ms | 15 ms |
 | KMS in us-east-1 | 187 ms | 200 ms |
 
-Each batch admission is a chain of about 13 dependent S3 requests (the table in §1 of the group-commit
+Each batch admission is a chain of about 13 dependent S3 round trips (about 75 requests per batch in total) (the table in §1 of the group-commit
 design), several of them SSE-KMS. 13 × 66 ms ≈ 860 ms, and two or three KMS calls at 187 ms add about
 450 ms, so a batch costs about 1.3 s. 60 s / 1.3 s ≈ 46 per serial lane, which matches what we observed.
 This is arithmetic on our own measurements, not a measured breakdown per call. The ceiling is latency
@@ -75,7 +79,7 @@ Each option lists its benefit, cost, risk, portability impact and rollback. They
 | | A1 (ledger to us-west-2) | A2 (compute to us-east-1) |
 | --- | --- | --- |
 | Benefit | About 13× lower S3 latency per request (66 → 5 ms) and in-region KMS; the largest single lever | The same latency gain, with no data move |
-| Cost | A new bucket, a key and grants in code; a per-org migration of the ledger working set with a dual-read window | A new cluster or compute in us-east-1, which contradicts 0007's "one prod cluster" shape; new ops surface |
+| Cost | A new bucket, a key and grants in code; a per-org migration of the ledger working set with a dual-read window | A new cluster or compute in us-east-1, which contradicts 0007's single prod cluster shape; new ops surface |
 | Risk | Two ledgers live for one org during the move. A per-org cutover is required: stop, copy, verify, marker, switch, exactly like the 2026-11-15 marker flow | Splits the sessions deployment across regions; the read API and actors stay in us-west-2, so the cross-region trips move elsewhere instead of disappearing |
 | Portability | None: a deployment choice. The same chart values work for self-host | None |
 | Rollback | Per org: point it back at the old prefix; the old objects stay until the move is verified | Scale the us-east-1 deployment to zero |
@@ -105,7 +109,7 @@ needs anyway. The benchmark tests it.
 
 ### C. Reshape group commit into a payload PUT plus a create-if-absent numbered log entry
 
-The approved group commit (rev 3) groups up to 16 batches per machine directory. It keeps every
+The group-commit design (revision 2, design only) groups up to 16 batches per machine directory. It keeps every
 per-batch object (batch doc, outcome, status) and shares the fence, journal and shard reads and the
 manifest CAS per session. C goes further, following the Delta log, Turbopuffer and Husky:
 
@@ -163,7 +167,7 @@ per-batch fence CAS is no longer needed.
 - **Benefit:** a single-digit-ms conditional write, and `TransactWriteItems` (up to 100 actions or 4 MB,
   atomically, with a 10-minute idempotency token). That is the multi-key transaction S3 does not have.
   On-demand capacity scales to millions of users.
-- **Cost:** a new storage dependency and its IAM. It amends 0005 ("no database for upload accounting").
+- **Cost:** a new storage dependency and its IAM. It amends 0005, which keeps upload accounting in object storage rather than a database.
 - **Risk:**
   - A partition, or one hot item, caps at about 1,000 WCU.
   - No transaction spans DynamoDB and S3, so orphaned payloads need garbage collection.
@@ -225,17 +229,18 @@ options above are hypotheses for that benchmark to confirm or reject.
 The benchmark plan sets the exact thresholds and the matrix. **A migration plan follows only after the
 benchmark results are reviewed.**
 
-The one change this record expects to ship ahead of the benchmark is the per-machine stream key on
-today's consumer (the option D interim). It follows directly from Khaliq's ordering decision and needs
-no infra; it goes through normal review on its own branch.
+The one change this record expects ahead of the benchmark's review is the per-machine stream key on
+today's consumer (the option D interim). It follows from Khaliq's ordering decision and needs no infra.
+It lands through normal review on its own branch behind its own default-off flag; turning it on in any
+hosted environment needs Khaliq's explicit OK, like every other change here.
 
 ### What this amends
 
 - **0005:** nothing yet. Accounting stays in object storage. Adopting E would amend 0005 for the hosted
   backend only, and would need its own record.
-- **0007:** nothing. If A1 is later chosen it would bring forward phase 7's agentrelay-prod sessions
+- **0007:** nothing. If A1 is later chosen it would bring forward the agentrelay-prod sessions
   bucket for the ledger working set. The stream key (org, workspace, user, origin) is the natural shard
-  for phase 4's ledger actors. The transcript-region rule for stored content stays until phase 7.
+  for phase 4's ledger actors. The transcript-region rule for stored content stays until 0007 decides where the new bucket lives (0007 line 160 says phase 6, while its phase list puts the bucket in phase 7; 0007 looks off by one, and this record follows its phase list elsewhere).
 
 ### Needs Khaliq's explicit OK (each separately, all as code)
 
@@ -250,7 +255,7 @@ no infra; it goes through normal review on its own branch.
 - **Self-host guidance.** Compute and object store in the same region becomes a documented requirement.
   ingest-edge should also measure its store round-trip time at startup and warn, or report degraded,
   when it is high. That would have caught our own us-west-2 to us-east-1 split.
-- **Code defaults stay portable.** Hosted tuning (concurrency 8, ledger parallelism 16) lives in the
+- **Code defaults stay portable.** Hosted tuning (concurrency 8, ledger parallelism 8 as measured above; any later value such as 16 is a benchmark result, not this record's) lives in the
   hosted chart values, not in code defaults.
 - **Not measured yet:** the KMS latency per call with Bucket Keys, the Bucket Key cache lifetime,
   directory-bucket `If-Match`, and DynamoDB transaction latency from the cluster. The benchmark plan

@@ -1,5 +1,10 @@
 # Hosted ledger benchmark plan
 
+**As of 2026-11-17:** this plan has run. The harness and stacks are on main, and three repeats ran on 2026-11-16
+(results in the private ops docs). The cluster side is torn down; the data-side teardown waits for Khaliq's OK.
+Differences from this plan as built: four CloudFormation stacks instead of one; a finished Job is
+kept 2 days (`stacks/aws/ledger-bench/job.template.yaml`, `ttlSecondsAfterFinished`), not the 1 hour in "Teardown"; the budget alarm only notifies and does not stop the run.
+
 **Status:** proposed. It is the deliverable of decision 0008 ("benchmark first"). Nothing here runs until
 Khaliq gives his explicit OK to the resources in "Resources" below. All of them are created and destroyed
 by code, never by hand. The results decide between the 0008 options. A migration plan is written only
@@ -22,7 +27,7 @@ ledger needs. The answers have to be good enough to pick an option with numbers 
   assumes a sessions-dev role through a cross-account trust scoped to the Job's service account.
 - **Data:** synthetic only: random bytes and synthetic ids. No customer data and no production keys.
 
-## Resources (throwaway; one stack, one `apply`, one `destroy`)
+## Resources (throwaway; planned as one stack, built as four; see the status line)
 
 | Id | Resource | Region | Purpose |
 | --- | --- | --- | --- |
@@ -165,8 +170,8 @@ The total is bounded by request volume, not storage.
   very worst. It is likely tens.
 - **S3 Express and DynamoDB on-demand:** both are cheaper per request at these volumes.
 - **Hard caps:**
-  - a sessions-dev budget alarm at **$300** for the `purpose=ledger-bench` tag, which stops the run if
-    it fires;
+  - a sessions-dev budget alarm at **$300** for the `purpose=ledger-bench` tag (as built it only notifies;
+    the operator stops the run);
   - the Job's `activeDeadlineSeconds` limit;
   - DynamoDB on-demand with a table-level maximum throughput setting;
   - no data kept past teardown.
