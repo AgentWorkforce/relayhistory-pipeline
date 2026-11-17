@@ -397,9 +397,8 @@ export async function withLegacyPrivacyFence<T>(
     const value = await action();
     actionValue = { set: true, value };
     phase = "privacy";
-    // Recheck after the PUT. Heartbeat freshness is checked before each scope
-    // outside this transaction; doing that here could roll a concurrent
-    // heartbeat update back with the scope transaction.
+    // Recheck after the PUT. Readiness was already rechecked after both
+    // shared locks in begin(); the exporter never writes the eraser heartbeat.
     if (registration) await register();
     // Ordinary deletion fences need not take the operator's exclusive lock.
     // Recheck before releasing; a race is a failed export, never an accepted
