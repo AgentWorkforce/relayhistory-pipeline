@@ -6,7 +6,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
-import { backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
+import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { scratchStore } from "./support.ts";
@@ -312,6 +312,20 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(await entryOf(store, A, "origin-1", "w0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await fenceOf(store, C)).toBeNull();
     await expect(run(store, { orgs: ["org-a"], slotWindowBlocks: 0 })).rejects.toThrow("backfill_slot_window_invalid");
+  });
+
+  test("per-org cap boundary: exactly the cap is read by the cursor, cap + 1 falls back; the default cap is 4M", async () => {
+    expect(SLOTS_ORG_READ_MAX_ROWS).toBe(4_000_000);
+    const store = scratch();
+    for (let i = 0; i < 30; i++) await slot(A, "origin-1", `c${String(i).padStart(4, "0")}`, A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
+    const atCap: string[] = [];
+    const a = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1, slotsByOrg: true, slotOrgReadMaxRows: 30 }, atCap);
+    expect(a.revisions).toMatchObject({ slot_rows: 30, failed: 0 });
+    expect(atCap.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(0);
+    const overCap: string[] = [];
+    const b = await run(scratch(), { orgs: ["org-a"], slotWindowBlocks: 1, slotsByOrg: true, slotOrgReadMaxRows: 29 }, overCap);
+    expect(b.revisions).toMatchObject({ slot_rows: 30, failed: 0 });
+    expect(overCap.filter((l) => l.includes("ctid >= $2::tid")).length).toBeGreaterThan(0);
   });
 
   test("org scope over the per-org cap: that org falls back to heap block windows, same result", async () => {
