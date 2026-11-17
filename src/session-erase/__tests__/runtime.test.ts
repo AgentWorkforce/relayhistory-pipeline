@@ -91,7 +91,7 @@ test("failure recording cannot release an ambiguous writer or mask its original 
  expect(calls).toHaveLength(2);expect(calls.some(c=>c.includes("write_finish"))).toBe(false);
 });
 
-// Memory documents (20261105062090): the decision records erase step, wired only with the flag on.
+// Relayfacts (20261105062090): the decision records erase step, wired only with the flag on.
 function recordsFixture(records: "off" | "ok" | "fail") {
  const calls: string[] = [], codes: (string | undefined)[] = [], logs: Record<string, unknown>[] = [];
  const ledger = { next: async () => work, authorize: async () => true,
@@ -120,15 +120,15 @@ test("decision records on: a records failure is not swallowed; no purge, a retry
  const f = recordsFixture("fail"); await f.worker.scan();
  expect(f.calls).not.toContain("purge"); expect(f.calls).not.toContain("historyDerivedObjects:not_applicable");
  expect(f.calls).toContain("searchDocuments:failed_retryable");
- expect(f.codes.at(-1)).toBe("decision_records_erase_failed"); expect(f.calls.at(-1)).toBe("release");
- expect(f.logs).toEqual([{ event: "operator_session_erase_pass", outcome: "failed", step: "searchDocuments", code: "decision_records_erase_failed" }]);
+ expect(f.codes.at(-1)).toBe("relayfacts_erase_failed"); expect(f.calls.at(-1)).toBe("release");
+ expect(f.logs).toEqual([{ event: "operator_session_erase_pass", outcome: "failed", step: "searchDocuments", code: "relayfacts_erase_failed" }]);
  expect(JSON.stringify(f.logs)).not.toContain("private");
 });
 test("the SQL records port calls only the 062090 erase function with the erase key and lease, and refuses a malformed result", async () => {
  const seen: { text: string; values: unknown[] }[] = [];
  const lease = "00000000-0000-4000-8000-000000000001";
  await sqlDecisionRecordsErase(async (text, values) => { seen.push({ text, values: values ?? [] }); return { rows: [{ result: { evidenceRows: 1, recordsDeleted: 0, recordsRewritten: 1 } }] }; }).erase(work, lease);
- expect(seen).toEqual([{ text: "SELECT sessions.decision_evidence_erase_session_v1($1,$2,$3,$4,$5) AS result", values: ["o", "w", "claude", "s", lease] }]);
+ expect(seen).toEqual([{ text: "SELECT sessions.relayfacts_evidence_erase_session_v1($1,$2,$3,$4,$5) AS result", values: ["o", "w", "claude", "s", lease] }]);
  await expect(sqlDecisionRecordsErase(async () => ({ rows: [{ result: null }] })).erase(work, lease)).rejects.toBeInstanceOf(SessionEraseServiceError);
  await expect(sqlDecisionRecordsErase(async () => { throw Object.assign(Error("private"), { code: "RH014" }); }).erase(work, lease))
   .rejects.toBeInstanceOf(SessionEraseServiceError);

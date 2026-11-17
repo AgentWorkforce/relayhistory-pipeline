@@ -42,5 +42,5 @@ test("decision records erase is wired only when SUMMARY_DECISION_RECORDS_ENABLED
  };
  const off = await required({}), on = await required({ SUMMARY_DECISION_RECORDS_ENABLED: "true" });
  expect(off.some(fn => fn.includes("decision_evidence"))).toBe(false);
- expect(on).toEqual([...off, "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)"]);
+ expect(on).toEqual([...off, "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)"]);
 });

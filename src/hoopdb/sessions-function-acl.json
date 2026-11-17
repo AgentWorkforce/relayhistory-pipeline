@@ -237,29 +237,6 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
-    "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)": [
-      "<owner>:EXECUTE",
-      "bulls96_session_ingest:EXECUTE"
-    ],
-    "sessions.decision_evidence_fence_guard_v1()": [
-      "<owner>:EXECUTE"
-    ],
-    "sessions.decision_records_insert_v1(text,text,jsonb)": [
-      "<owner>:EXECUTE",
-      "service_role:EXECUTE"
-    ],
-    "sessions.decision_records_list_v1(text,text,text,timestamp with time zone,uuid,integer)": [
-      "<owner>:EXECUTE",
-      "bulls96_read_api:EXECUTE"
-    ],
-    "sessions.decision_records_supersede_v1(text,text,uuid,uuid)": [
-      "<owner>:EXECUTE",
-      "service_role:EXECUTE"
-    ],
-    "sessions.decision_records_topics_v1(text,text)": [
-      "<owner>:EXECUTE",
-      "bulls96_read_api:EXECUTE"
-    ],
     "sessions.digest_narrative_read(text,date,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -1344,6 +1321,29 @@
     "sessions.register_search_feature_source(text,text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.relayfacts_evidence_fence_guard_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.relayfacts_insert_v1(text,text,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.relayfacts_list_v1(text,text,text,timestamp with time zone,uuid,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.relayfacts_supersede_v1(text,text,uuid,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.relayfacts_topics_v1(text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
     ],
     "sessions.repo_backfill_report()": [
       "<owner>:EXECUTE",

@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|decision_records_|decision_evidence_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|relayfacts_|relayfacts_evidence_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -814,7 +814,7 @@ test("real tree: after the full tree including 062070, a dropped coordination ad
   expect((await marker(s.db)).some((m) => m.status === "pass")).toBe(false);
 });
 
-test("real tree: after the full tree including 062080, a dropped memory documents worker function refuses function_acl_drift on the next run", async () => {
+test("real tree: after the full tree including 062080, a dropped relayfacts worker function refuses function_acl_drift on the next run", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);
   const MD = "upstream:20261105062080_memory_documents.sql";
@@ -825,11 +825,11 @@ test("real tree: after the full tree including 062080, a dropped memory document
   await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
   expect(await ledger(s.db)).toContain(MD);
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
-  const fn = "sessions.decision_records_insert_v1(text,text,jsonb)";
+  const fn = "sessions.relayfacts_insert_v1(text,text,jsonb)";
   expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
   // The read-API functions are not runtime application functions.
-  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_records_")).sort()).toEqual([
-    "sessions.decision_records_insert_v1(text,text,jsonb)", "sessions.decision_records_supersede_v1(text,text,uuid,uuid)",
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_")).sort()).toEqual([
+    "sessions.relayfacts_insert_v1(text,text,jsonb)", "sessions.relayfacts_supersede_v1(text,text,uuid,uuid)",
   ]);
   await s.db.exec(`DROP FUNCTION ${fn}`);
   // Nothing is held now, so nothing excuses the absent function.
@@ -840,10 +840,10 @@ test("real tree: after the full tree including 062080, a dropped memory document
   expect((await marker(s.db)).some((m) => m.status === "pass")).toBe(false);
 });
 
-test("real tree: after the full tree including 062090, the memory documents erase function is ingest-only and an extra grant is ACL drift", async () => {
+test("real tree: after the full tree including 062090, the relayfacts erase function is ingest-only and an extra grant is ACL drift", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);
-  const MDE = "upstream:20261105062090_memory_documents_erase.sql";
+  const MDE = "upstream:20261105062090_relayfacts_erase.sql";
   expect(s.split.held).toContain(MDE);
   const last = s.split.held.at(-1)!;
   const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
@@ -851,9 +851,9 @@ test("real tree: after the full tree including 062090, the memory documents eras
   await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
   expect(await ledger(s.db)).toContain(MDE);
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
-  const fn = "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)";
+  const fn = "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)";
   // The erase runs as the ingest login inside the operator erase lease, never as the runtime role.
-  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_evidence_"))).toEqual([]);
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO service_role`);

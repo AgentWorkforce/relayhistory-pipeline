@@ -1,7 +1,7 @@
 /**
- * Memory documents, the extractor (docs/memory-documents.md): the decisions of one completed
+ * Relayfacts, the extractor (docs/relayfacts.md): the decisions of one completed
  * session analysis become decision records with evidence, written through
- * sessions.decision_records_insert_v1 (migration 20261105062080).
+ * sessions.relayfacts_insert_v1 (migration 20261105062080).
  *
  * Off unless SUMMARY_DECISION_RECORDS_ENABLED is exactly "true". Off, the analysis tick gets no
  * sink: no extractor call, no database call, no log line.
@@ -21,7 +21,7 @@ import type { AnalysisJob, AnalysisJobOutput } from "./processor.ts";
 export const DECISION_TITLE_MAX = 200;
 export const DECISION_STATEMENT_MAX = 1000;
 export const DECISION_CLAIM_MAX = 300;
-/** Per call of decision_records_insert_v1. */
+/** Per call of relayfacts_insert_v1. */
 export const DECISION_BATCH_MAX = 100;
 /** Evidence rows per record and call. */
 export const DECISION_EVIDENCE_MAX = 10;
@@ -113,9 +113,9 @@ function firstSentence(text: string): string {
  * with high or medium confidence and at least one cited reference; at most 100 records of at
  * most 10 evidence rows, and at most one evidence row per session per record. Two decisions with
  * the same topic and title key become one record. Dedupe is per batch here and on the exact
- * (source, session, range) in decision_records_insert_v1, so a re-analysis whose spans shift can
+ * (source, session, range) in relayfacts_insert_v1, so a re-analysis whose spans shift can
  * still add rows (up to the 50-row cap), and reworded titles give a new record
- * (docs/memory-documents.md, Deduplication limits).
+ * (docs/relayfacts.md, Deduplication limits).
  */
 export function extractDecisionRecords(snapshot: SessionAnalysisSnapshot): DecisionRecordInput[] {
   const references = snapshot.evidence?.references ?? [];
@@ -198,7 +198,7 @@ export function postgresDecisionRecordsSink(db: SqlExecutor): DecisionRecordsSin
   return async (scope, records) => {
     if (records.length === 0) return null;
     const { rows } = await db.query<DecisionRecordsWrite>(
-      "SELECT inserted, merged, evidence_added FROM sessions.decision_records_insert_v1($1, $2, $3::jsonb)",
+      "SELECT inserted, merged, evidence_added FROM sessions.relayfacts_insert_v1($1, $2, $3::jsonb)",
       [scope.orgId, scope.workspaceId, JSON.stringify(records)],
     );
     return rows[0] ?? null;
@@ -220,7 +220,7 @@ export async function recordDecisions(
 /**
  * The analysis tick's completion hook: records the decisions of a job that has just completed,
  * in that job's own workspace. Counts `decision_records` (records sent) and
- * `decision_records_failed`; never throws, never logs.
+ * `relayfacts_failed`; never throws, never logs.
  */
 export function decisionRecordsHook(
   sink: DecisionRecordsSink,
@@ -231,7 +231,7 @@ export function decisionRecordsHook(
       const sent = await recordDecisions(sink, { orgId: job.orgId, workspaceId: job.workspaceId }, output.result.analysis);
       counts.decision_records = (counts.decision_records ?? 0) + sent;
     } catch {
-      counts.decision_records_failed = (counts.decision_records_failed ?? 0) + 1;
+      counts.relayfacts_failed = (counts.relayfacts_failed ?? 0) + 1;
     }
   };
 }

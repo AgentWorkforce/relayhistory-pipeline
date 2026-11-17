@@ -129,7 +129,7 @@ export function analysisTick(deps: {
   /** The shared strict paged eraser (createS3Eraser); see sweepAnalysisTickets. Absent = no sweep. */
   eraser?: PagedEraser;
   /**
-   * Memory documents (SUMMARY_DECISION_RECORDS_ENABLED): each completed job's decisions become
+   * Relayfacts (SUMMARY_DECISION_RECORDS_ENABLED): each completed job's decisions become
    * decision records in that job's workspace. Absent = no extractor, no call, no count.
    */
   decisionRecords?: DecisionRecordsSink;
