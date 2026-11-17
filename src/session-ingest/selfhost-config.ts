@@ -155,6 +155,7 @@ import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
 import { LEDGER_HOME_GUARD_VAR, ledgerHomeGuard } from "./ledger-store.ts";
 import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
 import { S3_ERASE_FENCE_VAR, s3EraseFenceMode } from "./s3-erase-fence.ts";
+import { INGEST_LEDGER_LOG_ERASE_VAR, ledgerLogEraseMode } from "./ledger-log-erase.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -225,6 +226,8 @@ export interface SelfhostIngestSettings {
   ledger?: "s3";
   /** INGEST_LEDGER_LOG_COMMIT, parsed once here (selfhostLedgerLogCommit; on only with ledger s3). */
   ledgerLogCommit?: "off" | "on";
+  /** INGEST_LEDGER_LOG_ERASE=on (ledger s3 + log commit on only): a reset erases the log payloads it superseded. */
+  ledgerLogErase?: true;
   /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
   uploadDirect?: SelfhostUploadDirectSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
@@ -473,6 +476,21 @@ export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" | "on" {
 }
 
 /**
+ * INGEST_LEDGER_LOG_ERASE (ledger-log-erase.ts, docs/design/s3-ledger-log-commit.md Remaining 3): off (unset, the
+ * default) is today, byte for byte. `on` needs INGEST_LEDGER=s3 and INGEST_LEDGER_LOG_COMMIT=on (refused otherwise):
+ * every reset through the S3 ledger deletes the user's unapplied log payloads that reset superseded BEFORE it completes
+ * or answers, and a failure fails the reset (503, retryable). Costs one LIST of the user's log directory per reset,
+ * plus a read of each stream's unapplied entries.
+ */
+export function selfhostLedgerLogErase(env: NodeJS.ProcessEnv, ledger: "s3" | undefined, logCommit: "off" | "on"): true | undefined {
+  let mode;
+  try { mode = ledgerLogEraseMode(env[INGEST_LEDGER_LOG_ERASE_VAR]); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_LOG_ERASE_VAR} must be off or on`); }
+  if (mode === "off") return undefined;
+  if (ledger !== "s3" || logCommit !== "on") throw new Error(`96bulls: ${INGEST_LEDGER_LOG_ERASE_VAR}=on needs ${INGEST_LEDGER_VAR}=s3 and ${INGEST_LEDGER_LOG_COMMIT_VAR}=on`);
+  return true;
+}
+
+/**
  * INGEST_LEDGER (decision 0005): sql (unset, the default: unchanged) or s3. With s3 this process's ONE ledger is
  * ledger-s3.ts: the synchronous path, the async consumer, upload-inbox promotion and the selection / reset routes
  * all admit and fence through S3, and the database is never called for upload accounting. Refused with s3: the
@@ -530,6 +548,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   try { eraseFence = s3EraseFenceMode(env[S3_ERASE_FENCE_VAR]) === "on"; } catch { throw new Error(`96bulls: ${S3_ERASE_FENCE_VAR} must be off or on`); }
   const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime, eraseFence });
   const ledgerLogCommit = selfhostLedgerLogCommit(env);
+  const ledgerLogErase = selfhostLedgerLogErase(env, ledger, ledgerLogCommit);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
@@ -558,6 +577,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
     ...(ledger ? { ledger, ledgerLogCommit } : {}),
     ...(eraseFence ? { s3EraseFence: true as const } : {}),
+    ...(ledgerLogErase ? { ledgerLogErase } : {}),
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
     ...(ledgerStore ? { ledgerStore } : {}),
     ...(homeGuard ? { ledgerHomeGuard: true as const } : {}),

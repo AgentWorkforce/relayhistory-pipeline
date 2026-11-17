@@ -65,7 +65,17 @@ const pad = (seq: number) => {
 };
 
 export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string) {
-  const root = `${admissionUserDir(keyRoot, tenant)}/ledger/log/o=${h(originId)}`;
+  return logKeysAt(`${logUserRoot(keyRoot, tenant)}o=${h(originId)}`);
+}
+
+/** Every log stream of one (org, workspace, user) lives under this prefix (one `o=<hash>` directory per origin). */
+export const logUserRoot = (keyRoot: string, tenant: LedgerTenant) => `${admissionUserDir(keyRoot, tenant)}/ledger/log/`;
+
+/**
+ * The keys of the stream rooted at `root` (a `logKeys(...).root`). For a caller that found the root by listing the
+ * user's log directory (ledger-log-erase.ts) and so has only the origin's hash, never the origin id.
+ */
+export function logKeysAt(root: string) {
   return {
     root,
     entry: (seq: number) => { const p = pad(seq); return `${root}/e/${p.slice(0, BUCKET_DIGITS)}/${p}.json`; },
