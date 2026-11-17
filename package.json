@@ -34,6 +34,7 @@
     "migration:reverse": "bun run src/migration/relayhistory-reverse.ts",
     "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts",
+    "migration:neon-census": "bun run src/migration/neon-census.ts",
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
     "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
     "e2e:selfhost": "bun run e2e/selfhost/run.ts",
