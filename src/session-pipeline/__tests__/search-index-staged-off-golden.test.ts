@@ -82,6 +82,8 @@ const SCENARIOS: Scenario[] = [
     runs: [{ limits: TINY, stream: UNLIMITED }, { limits: { ...TINY, maxRows: 3 }, stream: UNLIMITED }],
   },
   { name: "streamed: four times the scope past the read budget is refused", seed: 45, runs: [{ limits: TINY, stream: { maxReadBytes: 1024, maxReadEvents: 1 << 24 } }] },
+  // One pass of this scope reads about 9 KB: the budget fits one pass but not four (summed, refused).
+  { name: "streamed: a budget one pass fits but four do not is refused", seed: 47, runs: [{ limits: TINY, stream: { maxReadBytes: 20_000, maxReadEvents: 1 << 24 } }] },
   { name: "streaming off: too large stays partial", seed: 46, runs: [{ limits: TINY }] },
 ];
 

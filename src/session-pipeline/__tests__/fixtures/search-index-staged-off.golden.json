@@ -3401,6 +3401,105 @@
    }
   }
  ],
+ "streamed: a budget one pass fits but four do not is refused": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "warn",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index partial",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "session_id": "stream_parity",
+    "manifests": 2,
+    "reason": "scope_too_large,stream_read_bytes_budget"
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 2,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "scope_too_large,stream_read_bytes_budget"
+   }
+  }
+ ],
  "streaming off: too large stays partial": [
   {
    "run": 0
