@@ -46,11 +46,17 @@ on:
         required: false
         default: ""
         type: string
+      observe_turns_lock_hold:
+        description: Record read-only 062020 relation-lock evidence beside a clean rehearsal
+        required: true
+        default: false
+        type: boolean
   pull_request:
     paths:
       - .github/workflows/rehearse-session-schema.yml
       - scripts/pg-proof/schema-rehearsal.ts
       - scripts/pg-proof/schema-rehearsal-core.ts
+      - scripts/pg-proof/lock-hold-observer.ts
       - src/hoopdb/**
       - supabase/migrations/**
       - supabase/bootstrap/**
@@ -102,6 +108,7 @@ jobs:
       REHEARSAL_EXPECT_REFUSAL: ${{ inputs.expect_refusal }}
       REHEARSAL_PG_MAJOR: ${{ matrix.pg }}
       REHEARSAL_DISPOSABLE_PG: "1"
+      OBSERVE_TURNS_LOCK_HOLD: ${{ inputs.observe_turns_lock_hold }}
     steps:
       - name: Validate release sha
         run: |
@@ -130,7 +137,59 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Rehearse
         timeout-minutes: 45
-        run: bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
+        run: |
+          if [[ "$OBSERVE_TURNS_LOCK_HOLD" != "true" ]]; then
+            bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
+            exit
+          fi
+          [[ "$REHEARSAL_INJECT" == "none" ]] || {
+            echo "turns lock observation is only valid for a clean rehearsal"
+            exit 1
+          }
+          mkdir -p rehearsal-out
+          observer_done="$RUNNER_TEMP/turns-lock-observer.done"
+          observer_log="rehearsal-out/turns-lock-hold.jsonl"
+          rm -f "$observer_done" "$observer_log"
+          # The URL reaches only this job's loopback trust-auth service and is scoped to
+          # the observer process, so schema-rehearsal.ts inherits no connection env.
+          OBSERVER_DATABASE_URL=postgres://supabase_admin@127.0.0.1:5432/postgres \
+            bun .rehearsal-tooling/scripts/pg-proof/lock-hold-observer.ts \
+            --tables sessions.upload_deletions,sessions.operator_user_erasures,sessions.session_directory \
+            --interval-ms 100 --max-seconds 900 --until-file "$observer_done" \
+            >"$observer_log" &
+          observer_pid=$!
+          cleanup_observer() {
+            touch "$observer_done"
+            if kill -0 "$observer_pid" 2>/dev/null; then
+              wait "$observer_pid" || true
+            fi
+          }
+          trap cleanup_observer EXIT
+          observer_connected=false
+          for _ in {1..100}; do
+            if grep -q '"type":"connected"' "$observer_log"; then
+              observer_connected=true
+              break
+            fi
+            kill -0 "$observer_pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if [[ "$observer_connected" != "true" ]]; then
+            echo "turns lock observer did not connect"
+            exit 1
+          fi
+          set +e
+          bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
+          rehearsal_status=$?
+          touch "$observer_done"
+          wait "$observer_pid"
+          observer_status=$?
+          set -e
+          trap - EXIT
+          if (( rehearsal_status != 0 || observer_status != 0 )); then
+            echo "rehearsal=$rehearsal_status turns_lock_observer=$observer_status"
+            exit 1
+          fi
       - name: Check summary
         if: always()
         run: jq -e '.passed == true' rehearsal-out/summary.json
