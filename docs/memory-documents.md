@@ -22,11 +22,11 @@ Mapping:
 
 | Record field | Derived from |
 |---|---|
-| `topic` | Slug of the first two path segments of the most-edited file in `metrics.filesChanged` (for example `src-session-read-api`), else `general`. Lowercase `[a-z0-9-]`, at most 64 characters. |
-| `title` | The first sentence of the decision text, scrubbed, at most 200 characters. |
-| `statement` | The decision text, scrubbed, at most 1000 characters. |
+| `topic` | Slug of the first two directory segments of the most-edited file in `metrics.filesChanged` (for example `src-session-read-api`), else `general`. A relative path starts at its first segment. An absolute path starts at its first known source root (`src`, `packages`, `apps`, `lib`, `docs` and similar), so no home directory or user name becomes a topic; an absolute path with no source root, or any path with `..`, gives `general`. Lowercase `[a-z0-9-]`, at most 64 characters. |
+| `title` | The first sentence of the decision text, at most 200 characters. |
+| `statement` | The decision text with whitespace collapsed to single spaces, at most 1000 characters. |
 | `status` | `decided`. |
-| evidence `claim` | The decision text, scrubbed, at most 300 characters. |
+| evidence `claim` | The decision text, at most 300 characters. |
 | evidence `turn_start`, `turn_end` | The lowest and highest 0-based position, among the snapshot's references for that session, of the references the decision cites. |
 | evidence `ref` | The first GitHub commit, pull request or issue URL in the decision text, if any. |
 
@@ -81,10 +81,14 @@ Both tables have row-level security enabled and no table privileges for any role
 
 Writes go to the worker role. The task asked for service_role only; the read API runs as `bulls96_read_api`, so the two read functions are granted to that role instead, following the coordination advisories template (`20261105062000`). Both read functions refuse with SQLSTATE `42501` unless `sessions.session_directory_read_api_scope(workspace)` equals the requested org, so a read-API caller cannot read another workspace even with a forged org.
 
+## Extractor runtime
+
+The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts`), as a hook that `runAnalysisJob` calls once after `store.complete` has succeeded. It never runs for a failed, lease-lost or refused job, and it writes to the completed job's own org and workspace. A failing write is contained: the job stays completed, the tick counts `decision_records_failed`, and nothing is logged. The tick counts the records it sent as `decision_records`. With the flag off the tick has no hook, so it makes the same store calls as before and adds no count.
+
 ## What is not stored
 
 - No transcript text and no message bodies. The reference `summary` and `detail` fields of the analysis evidence are never read by the extractor.
-- No secrets. Every stored string passes through `scrubText` (the relayscrubber engine via `src/shared/vendor.ts`), and a claim that scrubbing changed is dropped rather than stored redacted.
+- No secrets. The full decision text and each stored cut of it (title, statement, claim) pass through `scrubText` (the relayscrubber engine via `src/shared/vendor.ts`). A decision the scrubber would change in any way is not recorded at all, so no stored string holds a secret-like value or a redaction marker.
 - Evidence is limited to the source, session id, a turn range, a claim of at most 300 characters and an optional GitHub URL.
 - No people's names beyond what a decision statement itself says, no file contents and no tool output.
 
@@ -119,7 +123,7 @@ Out of scope, as follow-ups:
 | Cross-workspace leak | Every function takes `org_id` and `workspace_id` and filters on both. The read functions also require the read-API scope to match. The routes attest the workspace against the caller's identity. A pglite test proves a workspace A row is never returned for workspace B. |
 | Prompt injection through extracted text | Records are data, not instructions. The markdown renders stored fields only, escapes markdown control characters at line starts and collapses newlines, and labels the document as recorded decisions. Bounds keep any injected text short. The consumer still treats the document as untrusted evidence. |
 | Oversized documents | Column checks bound every field; each record holds at most 50 evidence rows; each page holds at most 200 records; the topic slug is at most 64 characters, and a longer one is answered with 400 before any database call. |
-| Secrets in claims | `scrubText` runs on every stored string; a claim scrubbing would change is dropped. |
+| Secrets in claims | `scrubText` runs on the full decision text and every stored cut; a decision the scrubber would change is not recorded at all. |
 | Unattended activation | Both flags default off and must be exactly `true`. The migration enables nothing. |
 
 ## Activation (gated on Khaliq)
@@ -136,6 +140,8 @@ Rollback: unset the flags, then run the rollback file if the tables must go.
 
 1. Design (this document).
 2. Migration, rollback, function boundary lane and sentinel, with pglite tests for up, down and workspace scope.
+   Implemented: `supabase/migrations/20261105062080_memory_documents.sql`, its rollback, the `memory-documents` lane, and `src/hoopdb/__tests__/memory-documents.pglite.test.ts`.
 3. Extractor in the session-analysis path, behind `SUMMARY_DECISION_RECORDS_ENABLED`.
+   Implemented: `src/session-analysis/decision-records.ts`, the `onCompleted` hook of `runAnalysisJob`, the `decisionRecords` sink of `analysisTick`, wired in `src/session-pipeline/lambda.ts`; tests in `src/session-analysis/__tests__/decision-records.test.ts` and `processor.test.ts`.
 4. Read API routes, behind `READ_API_MEMORY_DOCUMENTS_ENABLED`.
 5. Self-host composition rows and the runbook.

@@ -216,7 +216,16 @@ export function classifyAnalysisFailure(error: unknown): { code: string; retryab
 /** One bounded job; process death is recovered by the lease. relayhistory runSessionJob. */
 export async function runAnalysisJob(
   store: AnalysisJobStore,
-  deps: { evidence: AnalysisEvidenceDeps; transport: AnalysisModelTransport; assumeNoLegacyTurns?: boolean },
+  deps: {
+    evidence: AnalysisEvidenceDeps;
+    transport: AnalysisModelTransport;
+    assumeNoLegacyTurns?: boolean;
+    /**
+     * Runs once after the job has completed (never before, never on lease loss or failure).
+     * Its errors are contained: it never changes the job's outcome. Absent = nothing runs.
+     */
+    onCompleted?: (job: AnalysisJob, output: AnalysisJobOutput) => Promise<void>;
+  },
   options: { jobId?: string; leaseSeconds?: number } = {},
 ): Promise<"idle" | "completed" | "failed" | "lease-lost"> {
   const job = await store.claim({
@@ -225,6 +234,7 @@ export async function runAnalysisJob(
   });
   if (!job) return "idle";
   if (!job.leaseToken) throw new Error("Claimed analysis has no lease token");
+  let completed: AnalysisJobOutput;
   try {
     const output = await processSessionAnalysis(job, deps);
     const { bytes, sha256 } = encodeAnalysisResult(output.result);
@@ -233,13 +243,22 @@ export async function runAnalysisJob(
     if (!key) return "lease-lost";
     const put = await store.put(key, bytes, sha256, job);
     const versionId = put && put.versionId ? put.versionId : undefined;
-    return (await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length, ...(versionId ? { versionId } : {}) } }))
-      ? "completed"
-      : "lease-lost";
+    if (!(await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length, ...(versionId ? { versionId } : {}) } })))
+      return "lease-lost";
+    completed = output;
   } catch (error) {
     // Persist only controlled codes, never model content, credentials or exception text.
     const { code, retryable } = classifyAnalysisFailure(error);
     const saved = await store.fail({ jobId: job.id, leaseToken: job.leaseToken, error: code, retryable });
     return saved ? "failed" : "lease-lost";
   }
+  // Outside the try above: a completed job is never failed afterwards.
+  if (deps.onCompleted) {
+    try {
+      await deps.onCompleted(job, completed);
+    } catch {
+      // Contained: the hook keeps its own counts.
+    }
+  }
+  return "completed";
 }

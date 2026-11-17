@@ -240,6 +240,36 @@ describe("20261105062080 memory documents", () => {
       ["general", 1, 1, 0, 0], ["src-session-read-api", 5, 0, 4, 1],
     ]);
   });
+
+  test("the extractor's records, at their bounds, pass the insert function through the worker's sink", async () => {
+    await reset();
+    const { extractDecisionRecords, postgresDecisionRecordsSink, recordDecisions } = await import("../../session-analysis/decision-records.ts");
+    const long = `${"Keep the keyset cursor at microsecond precision ".repeat(10)}per https://github.com/o/r/pull/12 and ${"never round it ".repeat(60)}`;
+    const snapshot = {
+      evidence: { references: [{ id: "e0", source: "claude", sessionId: "sess-1" }, { id: "e1", source: "claude", sessionId: "sess-1" }, { id: "e2", source: "codex", sessionId: "sess-2" }] },
+      metrics: { filesChanged: [{ path: "/home/someone/work/src/session-read-api/app.ts", editCount: 3 }] },
+      understanding: { decisions: [
+        { text: long, evidenceIds: ["e0", "e1", "e2"], confidence: "high" },
+        { text: "Use one registration call.\nIt keeps app.ts small.", evidenceIds: ["e1"], confidence: "medium" },
+      ] },
+    } as never;
+    const records = extractDecisionRecords(snapshot);
+    expect(records.map((r) => [r.topic, r.title.length, r.statement.length, r.evidence[0]!.claim.length])).toEqual([
+      ["src-session-read-api", 200, 1000, 300], ["src-session-read-api", 26, 49, 49],
+    ]);
+    const sink = postgresDecisionRecordsSink({
+      query: <R,>(text: string, params?: unknown[]) => as("service_role", async (tx) => (await tx.query<R>(text, params)) as { rows: R[] }),
+    } as never);
+    expect(await sink({ orgId: "org-a", workspaceId: "ws-a" }, records)).toEqual({ inserted: 2, merged: 0, evidence_added: 3 });
+    // The same analysis again merges and adds nothing.
+    expect(await recordDecisions(sink, { orgId: "org-a", workspaceId: "ws-a" }, snapshot)).toBe(2);
+    const rows = await list("org-a", "ws-a", "src-session-read-api");
+    expect(rows.map((r) => [r.title.length, r.evidence.map((e) => [e.source, e.session_id, e.turn_start, e.turn_end, e.ref])])).toEqual([
+      [200, [["claude", "sess-1", 0, 1, "https://github.com/o/r/pull/12"], ["codex", "sess-2", 0, 0, "https://github.com/o/r/pull/12"]]],
+      [26, [["claude", "sess-1", 1, 1, null]]],
+    ]);
+    expect(await list("org-a", "ws-b", "src-session-read-api")).toEqual([]);
+  });
 });
 
 describe("20261105062080 rollback", () => {

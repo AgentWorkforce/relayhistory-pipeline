@@ -24,7 +24,9 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * default, so the pointer stage can go live first); PIPELINE_FANOUT=postgres
  * enqueues the index's summary/state fan-out on `sessions.pipeline_jobs`
  * (default off: no consumer runs in production yet, and Bob Costas's sweep
- * rebuilds missing summaries when it does). SESSION_BRIEF_ENABLED=true arms brief
+ * rebuilds missing summaries when it does). SUMMARY_DECISION_RECORDS_ENABLED=true (exactly
+ * "true"; default off) writes each completed session analysis's decisions as memory-document
+ * decision records (docs/memory-documents.md). SESSION_BRIEF_ENABLED=true arms brief
  * wakeups as sessions index and lets the brief schedule run; with no
  * `openai_api_key` a brief tick claims nothing (src/session-brief/config.ts).
  * SESSION_DESKTOP_CATALOG_ENABLED=1 (only the literal "1"; default off) switches the
@@ -91,6 +93,7 @@ import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.t
 import { briefTick } from "../session-brief/worker.ts";
 import { BriefDocumentError, publishBriefDocumentsTick } from "./brief-documents.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
+import { decisionRecordsEnabled, postgresDecisionRecordsSink } from "../session-analysis/decision-records.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
@@ -543,6 +546,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
+    ...(decisionRecordsEnabled() ? { decisionRecords: postgresDecisionRecordsSink(db) } : {}),
     transact: (work) => transaction(db, work),
     // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
     // pages, every version of a ticketed result key that no published job owns.
