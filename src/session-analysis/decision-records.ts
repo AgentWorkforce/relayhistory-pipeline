@@ -219,8 +219,10 @@ export async function recordDecisions(
 
 /**
  * The analysis tick's completion hook: records the decisions of a job that has just completed,
- * in that job's own workspace. Counts `decision_records` (records sent) and
- * `decision_records_failed`; never throws, never logs.
+ * in that job's own workspace. Counts `decision_records` (records sent), `decision_records_fenced`
+ * (the batch was refused with RH016: a reference to an erased, fenced session; the whole batch is
+ * lost, see docs/relayfacts.md, Retention) and `decision_records_failed` (any other failure);
+ * never throws, never logs.
  */
 export function decisionRecordsHook(
   sink: DecisionRecordsSink,
@@ -230,8 +232,9 @@ export function decisionRecordsHook(
     try {
       const sent = await recordDecisions(sink, { orgId: job.orgId, workspaceId: job.workspaceId }, output.result.analysis);
       counts.decision_records = (counts.decision_records ?? 0) + sent;
-    } catch {
-      counts.decision_records_failed = (counts.decision_records_failed ?? 0) + 1;
+    } catch (e) {
+      const key = (e as { code?: unknown } | null)?.code === "RH016" ? "decision_records_fenced" : "decision_records_failed";
+      counts[key] = (counts[key] ?? 0) + 1;
     }
   };
 }

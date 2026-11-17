@@ -93,7 +93,7 @@ Writes go to the worker role. The task asked for service_role only; the read API
 
 ## Extractor runtime
 
-The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts`), as a hook that `runAnalysisJob` calls once after `store.complete` has succeeded. It never runs for a failed, lease-lost or refused job, and it writes to the completed job's own org and workspace. A failing write is contained: the job stays completed, the tick counts `decision_records_failed`, and nothing is logged. The tick counts the records it sent as `decision_records`. With the flag off the tick has no hook, so it makes the same store calls as before and adds no count.
+The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts`), as a hook that `runAnalysisJob` calls once after `store.complete` has succeeded. It never runs for a failed, lease-lost or refused job, and it writes to the completed job's own org and workspace. A failing write is contained: the job stays completed, the tick counts `decision_records_fenced` when the write was refused with `RH016` (a reference to an erased, fenced session; see Retention) and `decision_records_failed` for any other failure, and nothing is logged. The tick counts the records it sent as `decision_records`. With the flag off the tick has no hook, so it makes the same store calls as before and adds no count.
 
 ## What is not stored
 
@@ -131,10 +131,15 @@ Hosted: the extractor runs in the hosted session-pipeline Lambda, and the operat
 - It then applies the per-session rules above to every pair: the evidence rows go, a record left with no evidence is deleted, and a kept record gets the oldest remaining claim as its statement.
 - A trigger refuses (`RH016`) any later evidence insert or update for a fenced pair, so a late extractor write fails as a whole.
 - Every insert or update statement on the two tables takes a shared advisory lock that the erase takes exclusively, so the erase waits for in-flight writes and blocks new ones until it commits.
-- A failure is not swallowed: the job logs `{"event":"user_erase_relayfacts","outcome":"failed"}`, never calls begin, and exits 4 (`22023`, a malformed id or a request id that belongs to another user, exits 2). A rerun after success adds no fence and deletes nothing.
-- The rollback drops the function, the triggers and the fence table; it does not restore erased evidence.
+- With the flag on, the job first checks that the function exists and refuses with `relayfacts_migration_missing` (exit 2) where `20261105062100` is not applied, before any other statement.
+- A failure is not swallowed: the job logs `{"event":"user_erase_relayfacts","outcome":"failed","sqlstate":"…"}` (the five-character code only), never calls begin, and exits 4 (`22023`, a malformed id or a request id that belongs to another user or already fences another workspace, exits 2). A rerun after success adds no fence and deletes nothing.
+- A user with no `session_index` row returns zeros without taking the exclusive lock, so the common buffered-only erase does not stop relayfacts writers.
+- Deadlock with the per-session erase: `relayfacts_evidence_erase_session_v1` (`20261105062090`) locks a record `FOR UPDATE` before its update takes the shared lock, while this erase holds the lock exclusively and then locks records `FOR UPDATE`. When both touch the same record at once, Postgres aborts one with `40P01`. Both sides are retried (this job exits 4; the per-session pass records `failed_retryable`), and the aborted transaction leaves nothing behind.
+- The rollback drops the function, the triggers and the fence table; it does not restore erased evidence. It refuses (`55000`) while any fence row exists, because dropping the fences lets the analysis tick rewrite relayfacts from an erased user's sessions. To drop them anyway, run `SET relayfacts.rollback_drop_fences = 'true'` in the same session before the rollback file (the file opens its own transaction).
 
-Per-user (data-subject) erase: the user erase job (`src/session-erase/user-erase.ts`) does not reach the relayfacts tables on any deployment yet. A hosted user-keyed erase is being added as migration `20261105062100` in a separate lane.
+Known limitation: the fence guards refuse a whole `relayfacts_insert_v1` batch when any of its evidence rows references a fenced session. An analysis of a live session that cites an erased session therefore writes no record at all, on every re-analysis; the tick counts it as `decision_records_fenced`, separate from `decision_records_failed`, so it does not mask other failures. Filtering fenced references out before the insert is a follow-up.
+
+Per-user (data-subject) erase: see Hosted above. `20261105062100` adds it, and it reaches the relayfacts tables only where that migration is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the user-erase job; self-host uses the per-session erase.
 
 ## Surfacing
 
@@ -167,7 +172,7 @@ Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
 2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where an erase reaches these tables (see Retention): on hosted, only after `20261105062100` is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the operator user-erase job.
 3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to `READ_API_DIRECTORY_WORKSPACES`, the shared canary allowlist that `requireCanary(identity, "relayfacts")` checks (see Surfacing). That also enables the other directory routes for that workspace, so add only a workspace that is cleared for them too.
 
-Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062100` first, then `20261105062090` (each rollback refuses while a later migration is applied).
+Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062100` first, then `20261105062090` (each rollback refuses while a later migration is applied). The `20261105062100` rollback also refuses while erasure fences exist, unless `relayfacts.rollback_drop_fences` is set to `true` in the same session (see Retention).
 
 ## Implementation plan
 

@@ -512,6 +512,14 @@ describe("20261105062100 relayfacts user erase", () => {
       rec({ title: "Shared decision", statement: "Late merge.", evidence: [e("claude", "u-1", "Late merge claim.")] }),
     ]))).toBe("RH016");
     expect(await records()).toEqual(before);
+    // The guard also refuses an UPDATE that would point an existing evidence row at a fenced pair (the row trigger
+    // fires for INSERT OR UPDATE). Rolled back either way, so a regression cannot leak into the later checks.
+    expect(await code(db.transaction(async (tx) => {
+      await tx.query(`UPDATE sessions.relayfacts_evidence_v1 AS e SET session_id = 'u-1' FROM sessions.relayfacts_v1 AS t
+                       WHERE t.id = e.decision_id AND t.org_id = 'org-u' AND t.workspace_id = 'ws-u' AND e.source = 'claude' AND e.session_id = 'v-1'`);
+      throw Object.assign(new Error("update not refused"), { code: "not-refused" });
+    }))).toBe("RH016");
+    expect(await records()).toEqual(before);
     expect(await insert("org-u", "ws-u", [rec({ title: "Shared decision", evidence: [e("claude", "v-2", "Another session.")] })]))
       .toEqual({ inserted: 0, merged: 1, evidence_added: 1 });
     expect(await insert("org-u", "ws-b", [rec({ title: "Other workspace", evidence: [e("claude", "u-1", "Workspace B again.")] })])).toMatchObject({ merged: 1 });
@@ -527,6 +535,11 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(await code(erase("req-v", "org-u", "ws-b", "user-v"))).toBe("22023");
     // The request id's own user is accepted.
     expect(await erase("req-v", "org-u", "ws-u", "user-v")).toMatchObject({ sessions: 1, fencesAdded: 1 });
+    // A request id that already fences sessions under another workspace or org is refused, though no ledger row
+    // names it (an erase that ended with RH040 at begin leaves only its fences).
+    expect((await db.query("SELECT 1 FROM sessions.operator_user_erasures WHERE request_id = 'req-u'")).rows).toEqual([]);
+    expect(await code(erase("req-u", "org-u", "ws-b", "user-u"))).toBe("22023");
+    expect(await code(erase("req-u", "org-x", "ws-u", "user-u"))).toBe("22023");
     for (const bad of [["", "org-u", "ws-u", "user-u"], ["r", "", "ws-u", "user-u"], ["r", "org-u", "ws-u", ""], ["r", "org-u", "ws-u", "user\u0001"],
       ["r", "org-u", "x".repeat(513), "user-u"]] as const)
       expect(await code(erase(...bad))).toBe("22023");
@@ -538,10 +551,44 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(await fences()).toBe(n + 1);
   });
 
-  test("rollback: 062090's down refuses while 062100 is applied; the down drops everything and its ledger row; a rerun refuses", async () => {
+  test("lock scope: a user without sessions returns zeros without the exclusive lock; a user with sessions takes it", async () => {
+    const advisory = (tx: { query: PGlite["query"] }) => tx.query<{ n: number }>(
+      "SELECT count(*)::int n FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND mode = 'ExclusiveLock'");
+    await db.transaction(async (tx) => {
+      expect((await tx.query<{ r: Counts }>(`SELECT ${USER_ERASE.replace(/\(.*$/, "")}('req-none','org-u','ws-u','user-none') AS r`)).rows[0]!.r).toEqual(ZERO);
+      expect((await advisory(tx)).rows[0]!.n).toBe(0);
+      expect((await tx.query<{ r: Counts }>(`SELECT ${USER_ERASE.replace(/\(.*$/, "")}('req-u','org-u','ws-u','user-u') AS r`)).rows[0]!.r).toEqual({ ...ZERO, sessions: 2 });
+      expect((await advisory(tx)).rows[0]!.n).toBe(1);
+    });
+  });
+
+  test("a session id with a control character (allowed in session_index) is fenced", async () => {
+    await pointer("ws-c", "c\t1", "user-c");
+    expect(await erase("req-c", "org-u", "ws-c", "user-c")).toEqual({ ...ZERO, sessions: 1, fencesAdded: 1 });
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences WHERE workspace_id = 'ws-c' AND session_id = 'c' || chr(9) || '1'")).rows[0]!.n).toBe(1);
+  });
+
+  test("rollback: 062090's down refuses while 062100 is applied; the down refuses while fences exist unless overridden, then drops everything and its ledger row; a rerun refuses", async () => {
     const refusal = async (sql: string) => { const c = await code(db.exec(sql)); await db.exec("ROLLBACK"); return c; };
+    const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     expect(await refusal(ERASE_DOWN)).toBe("55000");
+    // Fences exist (the tests above): refused, and nothing is dropped; any value but exactly 'true' still refuses.
+    const fenceCount = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences")).rows[0]!.n;
+    const fences = await fenceCount();
+    expect(fences).toBeGreaterThan(0);
+    expect(await message(USER_ERASE_DOWN)).toContain("erasure fences exist");
+    for (const v of ["on", "TRUE", "1"]) {
+      await db.exec(`SET relayfacts.rollback_drop_fences = '${v}'`);
+      expect(await refusal(USER_ERASE_DOWN)).toBe("55000");
+    }
+    await db.exec("RESET relayfacts.rollback_drop_fences");
+    expect(await refusal(USER_ERASE_DOWN)).toBe("55000");
+    expect(await fenceCount()).toBe(fences);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
+    // With the override set in the same session, the down proceeds.
+    await db.exec("SET relayfacts.rollback_drop_fences = 'true'");
     await db.exec(USER_ERASE_DOWN);
+    await db.exec("RESET relayfacts.rollback_drop_fences");
     const left = (await db.query<{ n: number }>(`SELECT
       (SELECT count(*) FROM pg_proc WHERE proname LIKE 'relayfacts_user_erase%')
       + (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'relayfacts_user_erase%')

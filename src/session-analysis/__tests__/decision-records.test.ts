@@ -227,4 +227,14 @@ describe("decisionRecordsHook", () => {
     await decisionRecordsHook(async () => { throw new Error("db down"); }, failing)(job, output([claim("Use a flag.", ["e0"])]));
     expect(failing).toEqual({ decision_records_failed: 1 });
   });
+
+  test("an RH016 refusal (a fenced, erased session) has its own counter; other SQLSTATEs stay failures", async () => {
+    const counts: Record<string, number> = {};
+    const throwing = (code: string) => decisionRecordsHook(async () => { throw Object.assign(new Error("refused"), { code }); }, counts);
+    await throwing("RH016")(job, output([claim("Use a flag.", ["e0"])]));
+    await throwing("RH016")(job, output([claim("Use a flag.", ["e0"])]));
+    await throwing("RH015")(job, output([claim("Use a flag.", ["e0"])]));
+    await throwing("23514")(job, output([claim("Use a flag.", ["e0"])]));
+    expect(counts).toEqual({ decision_records_fenced: 2, decision_records_failed: 2 });
+  });
 });

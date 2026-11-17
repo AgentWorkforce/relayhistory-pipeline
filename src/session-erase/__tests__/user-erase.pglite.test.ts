@@ -14,7 +14,7 @@ import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
+import { RelayfactsEraseFailed, relayfactsUserEraseApplied, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
 import { exitCodeForError } from "../user-erase-main.ts";
 
 setDefaultTimeout(300_000);
@@ -758,6 +758,8 @@ describe("operator per-user erase: relayfacts pre-begin step (062100)", () => {
     });
     expect(out).toMatchObject({ state: "bytes_verified", verified: true,
       relayfacts: { sessions: 0, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 } });
+    // The flag-on preflight finds the function by its exact signature on a migrated database.
+    expect(await relayfactsUserEraseApplied(db)).toBe(true);
   });
 
   test("a published user: the relayfacts erase commits and fences, then begin refuses RH040 (exit 2) and changes nothing else", async () => {

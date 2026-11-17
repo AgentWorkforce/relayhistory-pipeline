@@ -216,10 +216,16 @@ this step reads those rows to find the user's sessions.
   becomes its oldest remaining claim. `RH015` if any of the pairs' evidence remains.
 - Serialization: relayfacts writes take a shared advisory lock per statement; this step takes it exclusively, so it
   waits for in-flight writes and blocks new ones until it commits.
+- Preflight: before any other statement the job checks `to_regprocedure` for the function and refuses
+  `relayfacts_migration_missing` (exit 2) when `20261105062100` is not applied. Apply the migration or unset the flag.
+- Request ids: refused (`22023`) when the id belongs to another user in `operator_user_erasures`, or already fences
+  sessions under another org or workspace.
 - Result and log: the job result gains `"relayfacts": {sessions, fencesAdded, evidenceRows, recordsDeleted,
   recordsRewritten}` and logs `{"event":"user_erase_relayfacts", ...counts}`; a failure logs
-  `{"event":"user_erase_relayfacts","outcome":"failed"}` and stops before `begin`. A rerun adds no fence and deletes
-  nothing (zero counts except `sessions`). A workspace id of `''` returns zeros.
+  `{"event":"user_erase_relayfacts","outcome":"failed","sqlstate":"…"}` (the five-character code only) and stops
+  before `begin`. A rerun adds no fence and deletes nothing (zero counts except `sessions`). A user with no
+  `session_index` row and a workspace id of `''` return zeros. A `40P01` (deadlock with a concurrent per-session
+  erase, see `docs/relayfacts.md`) exits 4: rerun.
 - Flag off (unset or anything but `true`): no relayfacts SQL, no `relayfacts` result key and no relayfacts log line;
   the job is unchanged.
 
@@ -256,9 +262,11 @@ bun run src/session-erase/user-erase-main.ts --request /abs/path/request.json
   `2` refused or misconfigured (do not retry unchanged; `RH040` means hand the published sessions to the
   per-session erase first; `user_rows_remain_at_completion` means an upload root or a control head of the user
   landed after the purge, see "Ingest fence"; `user_seat_ambiguity` means a seat naming the user is still referenced
-  by another user's slot, see "Seat ambiguity"; a relayfacts step refused with `22023`, a malformed id or a request id
-  that belongs to another user), `4` other failure, including a `lock_timeout` (`55P03`) or `statement_timeout`
-  (`57014`), and `relayfacts_erase_failed` (any other relayfacts step failure, `RH015` included) (rerun).
+  by another user's slot, see "Seat ambiguity"; `relayfacts_migration_missing`, the relayfacts flag is on but
+  `20261105062100` is not applied; a relayfacts step refused with `22023`, a malformed id or a request id that
+  belongs to another user or workspace), `4` other failure, including a `lock_timeout` (`55P03`) or
+  `statement_timeout` (`57014`), and `relayfacts_erase_failed` (any other relayfacts step failure, `RH015` and
+  `40P01` included; the printed line carries its `sqlstate`) (rerun).
 - Output is one JSON line of counts; nothing logged carries an id or a key.
 
 Rerunning the same `request_id` is always safe: a finished erase answers from its ledger row.

@@ -19,8 +19,10 @@
  *                                              production bucket policy lets delete), as the per-session byte eraser
  *
  * Exit codes: 0 verified (or disabled); 3 not verified yet (rerun the same request: every phase resumes);
- * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun). A failed relayfacts
- * step prints relayfacts_erase_failed: 2 for 22023 (the request id belongs to another user, or a malformed id), else 4.
+ * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun). With the relayfacts flag
+ * on, the job first checks that sessions.relayfacts_user_erase_v1 exists and refuses relayfacts_migration_missing (2)
+ * when 20261105062100 is not applied. A failed relayfacts step prints relayfacts_erase_failed with its SQLSTATE:
+ * 2 for 22023 (the request id belongs to another user or workspace, or a malformed id), else 4.
  * Output: one JSON result line with counts only. Runbook: docs/operator-user-erase.md.
  */
 import { readFileSync, statSync } from "node:fs";
@@ -30,7 +32,7 @@ import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migrat
 import { ownerClientConfig, OwnerUrlError } from "../shared/owner-pg-config.ts";
 import { sessionEraseConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
 import { SessionEraseRefused } from "./selfhost-eraser.ts";
-import { parseUserEraseRequest, RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb, type UserEraseResult } from "./user-erase.ts";
+import { parseUserEraseRequest, RelayfactsEraseFailed, relayfactsUserEraseApplied, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb, type UserEraseResult } from "./user-erase.ts";
 
 export const ENABLE_FLAG = "OPERATOR_USER_ERASE_ENABLED";
 const APPLICATION_NAME = "96bulls-operator-user-erase";
@@ -116,9 +118,13 @@ export async function runUserEraseMain(
     db = client;
   }
   try {
+    const relayfacts = relayfactsUserEraseEnabled(env);
+    // Flag on but 20261105062100 not applied: refuse before any other statement, instead of failing 42883 on
+    // every rerun (exit 4) without ever reaching begin.
+    if (relayfacts && !(await relayfactsUserEraseApplied(db))) refuse("relayfacts_migration_missing");
     const result = await runUserErase(db, req, {
       keyRoot: s3cfg.keyRoot, eraser, settleMs: settle,
-      ...(relayfactsUserEraseEnabled(env) ? { relayfacts: sqlUserEraseRelayfacts(db) } : {}),
+      ...(relayfacts ? { relayfacts: sqlUserEraseRelayfacts(db) } : {}),
       ...(overrides.sleep ? { sleep: overrides.sleep } : {}),
       log: overrides.log ?? ((e) => console.error(JSON.stringify(e))),
     });
@@ -141,6 +147,15 @@ export function exitCodeForError(e: unknown): 2 | 4 {
   // RH040 (published sessions: use the per-session erase), 22023 (malformed, or the request id belongs to another
   // user), 55000 (another request is active for this user, or the purge found rows it could not remove).
   return code === "RH040" || code === "22023" || code === "55000" ? 2 : 4;
+}
+
+/** The one printed error line: a code, plus the SQLSTATE of a failed relayfacts step; never an id or database text. */
+export function errorEvent(e: unknown): { event: "user_erase"; error: string; sqlstate?: string } {
+  if (e instanceof RelayfactsEraseFailed) return { event: "user_erase", error: e.message, ...(e.sqlstate ? { sqlstate: e.sqlstate } : {}) };
+  const code = e instanceof UserEraseRefused || e instanceof SessionEraseRefused ? e.message
+    : e instanceof OwnerUrlError ? e.code
+    : typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "user_erase_failed";
+  return { event: "user_erase", error: code };
 }
 
 async function readStdin(): Promise<string> {
@@ -166,10 +181,7 @@ if (import.meta.main) {
       process.exit(exitCodeForResult(r));
     })
     .catch((e) => {
-      const code = e instanceof UserEraseRefused || e instanceof SessionEraseRefused || e instanceof RelayfactsEraseFailed ? e.message
-        : e instanceof OwnerUrlError ? e.code
-        : typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "user_erase_failed";
-      console.error(JSON.stringify({ event: "user_erase", error: code }));
+      console.error(JSON.stringify(errorEvent(e)));
       process.exit(exitCodeForError(e));
     });
 }

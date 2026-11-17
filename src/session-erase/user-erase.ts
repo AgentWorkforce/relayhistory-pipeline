@@ -87,12 +87,35 @@ export interface UserEraseRelayfactsPort {
   erase(req: UserEraseRequest): Promise<RelayfactsUserEraseCounts>;
 }
 
-/** The relayfacts step failed before begin; only the SQLSTATE is kept, never the message. */
+/** A five-character SQLSTATE, or undefined: never an identifier or message text. */
+export function sqlstateOf(e: unknown): string | undefined {
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code : undefined;
+}
+
+/**
+ * The relayfacts step failed before begin. The message and `sqlstate` carry no id or database text; the original
+ * error is kept as `cause` for an in-process debugger and is never logged or printed.
+ */
 export class RelayfactsEraseFailed extends Error {
-  constructor(readonly sqlstate?: string) {
-    super("relayfacts_erase_failed");
+  readonly sqlstate?: string;
+  constructor(sqlstate?: string, cause?: unknown) {
+    super("relayfacts_erase_failed", cause === undefined ? undefined : { cause });
     this.name = "RelayfactsEraseFailed";
+    if (sqlstate !== undefined) this.sqlstate = sqlstate;
   }
+}
+
+/** The exact signature of the 20261105062100 erase function, for the flag-on preflight. */
+export const RELAYFACTS_USER_ERASE_FUNCTION = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
+
+/**
+ * Flag-on preflight: is 20261105062100 applied? One read-only statement outside any transaction. Without it the step
+ * would fail with 42883 on every rerun (exit 4) and never reach begin.
+ */
+export async function relayfactsUserEraseApplied(db: UserEraseDb): Promise<boolean> {
+  const r = await db.query("SELECT to_regprocedure($1) IS NOT NULL AS r", [RELAYFACTS_USER_ERASE_FUNCTION]);
+  return r.rows[0]?.r === true;
 }
 
 /** One SQL call in its own read-committed transaction (a pg Client or a test double). */
@@ -122,14 +145,16 @@ interface LedgerView {
 export const USER_ERASE_LOCK_TIMEOUT_MS = 30_000;
 export const USER_ERASE_STATEMENT_TIMEOUT_MS = 15 * 60_000;
 
-async function call<T = LedgerView>(db: UserEraseDb, sql: string, params: unknown[]): Promise<T> {
+/** `check` runs on the result before COMMIT: when it throws, the transaction rolls back. */
+async function call<T = LedgerView>(db: UserEraseDb, sql: string, params: unknown[], check?: (r: unknown) => T): Promise<T> {
   await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
   try {
     await db.query(`SET LOCAL lock_timeout = ${USER_ERASE_LOCK_TIMEOUT_MS}`);
     await db.query(`SET LOCAL statement_timeout = ${USER_ERASE_STATEMENT_TIMEOUT_MS}`);
     const r = await db.query(sql, params);
+    const out = check ? check(r.rows[0]?.r) : (r.rows[0]!.r as T);
     await db.query("COMMIT");
-    return r.rows[0]!.r as T;
+    return out;
   } catch (e) {
     await db.query("ROLLBACK").catch(() => {});
     throw e;
@@ -138,18 +163,23 @@ async function call<T = LedgerView>(db: UserEraseDb, sql: string, params: unknow
 
 const RELAYFACTS_COUNT_KEYS = ["sessions", "fencesAdded", "evidenceRows", "recordsDeleted", "recordsRewritten"] as const;
 
-/** The relayfacts port over the owner connection: one call() transaction (read committed, same lock and statement bounds). */
+function relayfactsCounts(r: unknown): RelayfactsUserEraseCounts {
+  const o = r as Record<string, unknown> | null;
+  if (!o || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join() !== [...RELAYFACTS_COUNT_KEYS].sort().join()
+    || !RELAYFACTS_COUNT_KEYS.every((k) => Number.isSafeInteger(o[k]) && (o[k] as number) >= 0)) {
+    throw new Error("relayfacts user erase: malformed result");
+  }
+  return Object.fromEntries(RELAYFACTS_COUNT_KEYS.map((k) => [k, o[k]])) as unknown as RelayfactsUserEraseCounts;
+}
+
+/**
+ * The relayfacts port over the owner connection: one call() transaction (read committed, same lock and statement
+ * bounds). The result shape is checked before COMMIT, so a malformed result rolls the fences back.
+ */
 export function sqlUserEraseRelayfacts(db: UserEraseDb): UserEraseRelayfactsPort {
   return {
-    async erase(req) {
-      const r = await call<unknown>(db, "SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r", [req.requestId, req.orgId, req.workspaceId, req.userId]);
-      const o = r as Record<string, unknown> | null;
-      if (!o || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join() !== [...RELAYFACTS_COUNT_KEYS].sort().join()
-        || !RELAYFACTS_COUNT_KEYS.every((k) => Number.isSafeInteger(o[k]) && (o[k] as number) >= 0)) {
-        throw new Error("relayfacts user erase: malformed result");
-      }
-      return Object.fromEntries(RELAYFACTS_COUNT_KEYS.map((k) => [k, o[k]])) as unknown as RelayfactsUserEraseCounts;
-    },
+    erase: (req) => call(db, "SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r",
+      [req.requestId, req.orgId, req.workspaceId, req.userId], relayfactsCounts),
   };
 }
 
@@ -212,9 +242,9 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
     try {
       relayfacts = await opts.relayfacts.erase(req);
     } catch (e) {
-      log({ event: "user_erase_relayfacts", outcome: "failed" });
-      const code = (e as { code?: unknown })?.code;
-      throw new RelayfactsEraseFailed(typeof code === "string" ? code : undefined);
+      const sqlstate = sqlstateOf(e);
+      log({ event: "user_erase_relayfacts", outcome: "failed", ...(sqlstate ? { sqlstate } : {}) });
+      throw new RelayfactsEraseFailed(sqlstate, e);
     }
     log({ event: "user_erase_relayfacts", ...relayfacts });
   }

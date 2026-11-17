@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { CONFIRMATION, parseUserEraseRequest, RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
-import { exitCodeForError, exitCodeForResult, relayfactsUserEraseEnabled, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
+import { CONFIRMATION, parseUserEraseRequest, RELAYFACTS_USER_ERASE_FUNCTION, RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
+import { errorEvent, exitCodeForError, exitCodeForResult, relayfactsUserEraseEnabled, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { LEGACY_EXPORT_ORIGIN_ID } from "../../shared/legacy-export-machine.ts";
 
@@ -98,14 +98,17 @@ describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_E
   const COUNTS = { sessions: 2, fencesAdded: 3, evidenceRows: 4, recordsDeleted: 1, recordsRewritten: 1 };
   const VIEW = { state: "bytes_verified", origins: [], tokens_revoked: 0, deleted: {}, done: true };
   const eraser = () => ({ eraseStep: async () => { throw new Error("no bytes phase expected"); } }) as never;
-  /** A fake owner connection: records every statement; `fail` maps a SQL prefix to a thrown error. */
-  function fakeDb(opts: { relayfacts?: unknown; fail?: Record<string, unknown> } = {}) {
+  const PREFLIGHT = "SELECT to_regprocedure($1) IS NOT NULL AS r";
+  /** A fake owner connection: records every statement; `fail` maps a SQL prefix to a thrown error; `applied: false`
+   * answers the preflight as if 20261105062100 were not applied. */
+  function fakeDb(opts: { relayfacts?: unknown; fail?: Record<string, unknown>; applied?: boolean } = {}) {
     const seen: { text: string; params?: unknown[] }[] = [];
     return {
       seen,
       query: async (text: string, params?: unknown[]) => {
         seen.push({ text, ...(params ? { params } : {}) });
         for (const [prefix, err] of Object.entries(opts.fail ?? {})) if (text.startsWith(prefix)) throw err;
+        if (text === PREFLIGHT) return { rows: [{ r: opts.applied ?? true }] };
         if (text.startsWith("SELECT sessions.relayfacts_user_erase_v1")) return { rows: [{ r: "relayfacts" in opts ? opts.relayfacts : COUNTS }] };
         return { rows: text.startsWith("SELECT") ? [{ r: VIEW }] : [] };
       },
@@ -139,32 +142,69 @@ describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_E
     const db = fakeDb(), logs: Record<string, unknown>[] = [];
     const r = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs);
     expect(db.seen.map((q) => q.text)).toEqual([
+      PREFLIGHT,
       "BEGIN ISOLATION LEVEL READ COMMITTED", "SET LOCAL lock_timeout = 30000", "SET LOCAL statement_timeout = 900000",
       "SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r", "COMMIT",
       "BEGIN ISOLATION LEVEL READ COMMITTED", "SET LOCAL lock_timeout = 30000", "SET LOCAL statement_timeout = 900000",
       "SELECT sessions.operator_user_erase_begin($1,$2,$3,$4) AS r", "COMMIT",
     ]);
-    expect(db.seen[3]!.params).toEqual(["dsr-1", "org-a", "ws-a", "user-1"]);
+    expect(db.seen[0]!.params).toEqual(["sessions.relayfacts_user_erase_v1(text,text,text,text)"]);
+    expect(db.seen[4]!.params).toEqual(["dsr-1", "org-a", "ws-a", "user-1"]);
     expect(r).toMatchObject({ enabled: true, verified: true, relayfacts: COUNTS });
     expect(logs[0]).toEqual({ event: "user_erase_relayfacts", ...COUNTS });
     expect(logs[1]).toMatchObject({ event: "user_erase_begin" });
   });
 
+  test("flag on, 20261105062100 not applied: refused relayfacts_migration_missing (exit 2) after the preflight alone", async () => {
+    expect(RELAYFACTS_USER_ERASE_FUNCTION).toBe("sessions.relayfacts_user_erase_v1(text,text,text,text)");
+    let erased = 0;
+    const db = fakeDb({ applied: false }), logs: Record<string, unknown>[] = [];
+    const err = await runUserEraseMain({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, () => JSON.stringify(good), {
+      db, log: (e) => logs.push(e),
+      eraser: () => ({ eraseStep: async () => { erased += 1; throw new Error("no bytes phase expected"); } }) as never,
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(UserEraseRefused);
+    expect((err as UserEraseRefused).code).toBe("relayfacts_migration_missing");
+    expect(exitCodeForError(err)).toBe(2);
+    expect(errorEvent(err)).toEqual({ event: "user_erase", error: "relayfacts_migration_missing" });
+    expect(db.seen).toEqual([{ text: PREFLIGHT, params: [RELAYFACTS_USER_ERASE_FUNCTION] }]);
+    expect(logs).toEqual([]);
+    expect(erased).toBe(0);
+    // Flag off: no preflight at all, even where the function is absent.
+    const off = fakeDb({ applied: false });
+    await run(ENV, off);
+    expect(off.seen.some((q) => q.text === PREFLIGHT)).toBe(false);
+  });
+
   test("a failed relayfacts step: RelayfactsEraseFailed with the SQLSTATE only, rolled back, begin never called; 22023 exits 2, else 4", async () => {
-    for (const [sqlstate, exit] of [["RH015", 4], ["55P03", 4], ["22023", 2]] as const) {
-      const db = fakeDb({ fail: { "SELECT sessions.relayfacts_user_erase_v1": Object.assign(new Error("secret detail"), { code: sqlstate }) } });
+    for (const [sqlstate, exit] of [["RH015", 4], ["55P03", 4], ["40P01", 4], ["22023", 2]] as const) {
+      const cause = Object.assign(new Error("secret detail"), { code: sqlstate });
+      const db = fakeDb({ fail: { "SELECT sessions.relayfacts_user_erase_v1": cause } });
       const logs: Record<string, unknown>[] = [];
       const err = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs).then(() => null, (e: unknown) => e);
       expect(err).toBeInstanceOf(RelayfactsEraseFailed);
       expect((err as RelayfactsEraseFailed).sqlstate).toBe(sqlstate);
       expect((err as Error).message).toBe("relayfacts_erase_failed");
+      expect((err as Error).cause).toBe(cause);
       expect(db.seen.at(-1)!.text).toBe("ROLLBACK");
       expect(db.seen.some((q) => q.text.includes("operator_user_erase_begin"))).toBe(false);
-      expect(logs).toEqual([{ event: "user_erase_relayfacts", outcome: "failed" }]);
+      expect(logs).toEqual([{ event: "user_erase_relayfacts", outcome: "failed", sqlstate }]);
+      expect(errorEvent(err)).toEqual({ event: "user_erase", error: "relayfacts_erase_failed", sqlstate });
+      expect(JSON.stringify(errorEvent(err))).not.toContain("secret");
       expect(exitCodeForError(err)).toBe(exit);
     }
-    // A failure without a SQLSTATE (a dropped connection) is rerun.
+    // A failure without a SQLSTATE (a dropped connection) is rerun, and logs no sqlstate key.
     expect(exitCodeForError(new RelayfactsEraseFailed())).toBe(4);
+    expect(errorEvent(new RelayfactsEraseFailed())).toEqual({ event: "user_erase", error: "relayfacts_erase_failed" });
+    // Only a five-character code is ever kept: anything else (a driver code, a long or lowercase string) is dropped.
+    for (const code of ["ECONNRESET", "rh015", "RH0150", "user-1"]) {
+      const db = fakeDb({ fail: { "SELECT sessions.relayfacts_user_erase_v1": Object.assign(new Error("x"), { code }) } });
+      const logs: Record<string, unknown>[] = [];
+      const err = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs).then(() => null, (e: unknown) => e);
+      expect((err as RelayfactsEraseFailed).sqlstate).toBeUndefined();
+      expect(logs).toEqual([{ event: "user_erase_relayfacts", outcome: "failed" }]);
+      expect(exitCodeForError(err)).toBe(4);
+    }
   });
 
   test("RH040 from begin after a successful relayfacts step exits 2; the relayfacts counts were logged first", async () => {
@@ -184,6 +224,8 @@ describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_E
       { sessions: 0, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0 }, { ...COUNTS, recordsRewritten: "1" }]) {
       const db = fakeDb({ relayfacts: bad });
       await expect(sqlUserEraseRelayfacts(db).erase(req)).rejects.toThrow("malformed result");
+      // Checked before COMMIT: the transaction (and with it any fence) is rolled back, never committed.
+      expect(db.seen.map((q) => q.text).slice(3)).toEqual(["SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r", "ROLLBACK"]);
     }
     // Through runUserErase a malformed result is a failed relayfacts step: begin is never called.
     const db = fakeDb({ relayfacts: { ...COUNTS, sessions: -1 } });
