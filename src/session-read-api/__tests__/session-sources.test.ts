@@ -28,7 +28,7 @@ function reader(answer: SessionSourceRow[] | (() => Promise<SessionSourceRow[]>)
   return { read, calls };
 }
 
-const src = (harness: string, over: Partial<SessionSourceRow> = {}): SessionSourceRow => ({ org_id: "org-a", workspace_id: "ws-a", harness, ...over });
+const src = (harness: string, over: Partial<SessionSourceRow> = {}): SessionSourceRow => ({ org_id: "org-a", workspace_id: "ws-a", harness, session_ids: ["s-1"], canonical_ids: [], ...over });
 
 function api(over: { sessionSources?: ReadApiDeps["sessionSources"]; workspaces?: ReadonlySet<string> | "*"; operatorErased?: ReadApiDeps["operatorErased"] } = {}) {
   const logs: Array<Record<string, unknown>> = [];
@@ -152,13 +152,40 @@ describe("GET /v1/sessions/:sessionId/sources", () => {
     expect((await json(down)).error.code).toBe("backend_unavailable");
   });
 
-  test("with the operator erase fence configured, a fenced source is dropped; a fence failure is a 503", async () => {
+  test("with the operator erase fence configured, a source fenced under any form of its key is dropped; checks run one at a time", async () => {
     const r = reader([src("claude"), src("codex")]);
     const fenced = await api({ sessionSources: r.read, operatorErased: async (k) => k.source === "codex" }).get(path());
     expect(fenced.status).toBe(200);
     expect(await json(fenced)).toEqual({ sessionId: "s-1", sources: ["claude"] });
+    // The caller asks the source id X; the fence was written under the physical id P of claude's row.
+    const aliased = reader([src("claude", { session_ids: ["P"], canonical_ids: ["X"] }), src("codex", { session_ids: ["X"] })]);
+    const seen: string[] = [];
+    let inFlight = 0, maxInFlight = 0;
+    const fence: NonNullable<ReadApiDeps["operatorErased"]> = async (k) => {
+      inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+      seen.push(`${k.source}:${k.sessionId}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight--;
+      return k.source === "claude" && k.sessionId === "P";
+    };
+    const res = await api({ sessionSources: aliased.read, operatorErased: fence }).get(path("X"));
+    expect(res.status).toBe(200);
+    expect(await json(res)).toEqual({ sessionId: "X", sources: ["codex"] });
+    expect(seen).toEqual(["claude:X", "claude:P", "codex:X"]);
+    expect(maxInFlight).toBe(1);
     const broken = await api({ sessionSources: r.read, operatorErased: async () => { throw new Error("operator_fence_unavailable"); } }).get(path());
     expect(broken.status).toBe(503);
+  });
+
+  test("with the fence configured and the flag off: 501 before any fence statement, even for another workspace", async () => {
+    let calls = 0;
+    const a = api({ operatorErased: async () => { calls++; return false; } });
+    for (const p of [path(), "/v1/sessions/s-1/sources?workspace=ws-other", "/v1/sessions/s-1/sources?workspace=ws-a&source=claude"]) {
+      const res = await a.get(p);
+      expect(res.status, p).toBe(501);
+      expect((await json(res)).error.reason, p).toBe("sources_not_configured");
+    }
+    expect(calls).toBe(0);
   });
 
   test("the served log line carries a count only, never the id or a source", async () => {
