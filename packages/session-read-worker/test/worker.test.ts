@@ -830,6 +830,46 @@ describe("directory list and activity (P3b)", () => {
   });
 });
 
+describe("session sources (READ_API_SESSION_SOURCES_ENABLED)", () => {
+  test("off unless exactly \"true\"; on, the live harnesses of the id through the read role, tenant only", async () => {
+    const t = tenant();
+    const bearer = await token(t);
+    const call = async (path: string, over: Partial<Env> = {}, b = bearer) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${b}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const sources = (id: string, ws = t.ws) => `/v1/sessions/${id}/sources?workspace=${ws}`;
+    await pointer(t, { session: "one", harness: "claude" });
+    await pointer(t, { session: "one", harness: "claude", machine: "m-2", deleted: true });
+    await pointer(t, { session: "two", harness: "codex" });
+    await pointer(t, { session: "two", harness: "claude", machine: "m-2" });
+    await pointer(t, { session: "gone", harness: "codex", deleted: true });
+    for (const flag of [undefined, "", "1", "TRUE", " true", "on"]) {
+      const r = await call(sources("one"), { READ_API_SESSION_SOURCES_ENABLED: flag });
+      expect(r.status, String(flag)).toBe(501);
+      expect((await body(r)).error.reason, String(flag)).toBe("sources_not_configured");
+    }
+    const on = { READ_API_SESSION_SOURCES_ENABLED: "true" };
+    for (const [id, expected] of [["one", ["claude"]], ["two", ["claude", "codex"]], ["gone", []], ["absent", []]] as const) {
+      const r = await call(sources(id), on);
+      expect(r.status, id).toBe(200);
+      expect(await body(r), id).toEqual({ sessionId: id, sources: expected });
+    }
+    // Off the canary allowlist, and another workspace's attestation: refused before any read.
+    const canary = await call(sources("one"), { ...on, READ_API_DIRECTORY_WORKSPACES: "ws-someone-else" });
+    expect(canary.status).toBe(501);
+    expect((await body(canary)).error.reason).toBe("directory_workspace_not_enabled");
+    expect((await call(sources("one", "ws-someone-else"), on)).status).toBe(403);
+    // Another tenant's token never sees these rows.
+    const other = tenant();
+    const r = await call(sources("two", other.ws), { ...on, READ_API_DIRECTORY_WORKSPACES: "*" }, await token(other));
+    expect(r.status).toBe(200);
+    expect((await body(r)).sources).toEqual([]);
+  });
+});
+
 describe("bulls96_read_api through Hyperdrive", () => {
   async function asRole<T>(work: (c: pg.Client) => Promise<T>): Promise<T> {
     const c = await connectPg(E.SUPABASE.connectionString);

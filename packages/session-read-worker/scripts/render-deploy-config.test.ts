@@ -460,6 +460,14 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).toContain('${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"}');
     expect(TEMPLATE).not.toContain("READ_API_SUMMARY_SEARCH_ENABLED");
   });
+  test("session_sources: default off; on adds only the exact \"true\" --var, never the template", () => {
+    expect(WORKFLOW).toMatch(/session_sources:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("SESSION_SOURCES: ${{ inputs.session_sources }}");
+    expect(WORKFLOW).toContain(`case "$SESSION_SOURCES" in off|on) ;; *) fail 'session_sources must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain('session_sources=""; if [ "$SESSION_SOURCES" = "on" ]; then session_sources=true; fi');
+    expect(WORKFLOW).toContain('${session_sources:+--var "READ_API_SESSION_SOURCES_ENABLED:$session_sources"}');
+    expect(TEMPLATE).not.toContain("READ_API_SESSION_SOURCES_ENABLED");
+  });
 });
 
 

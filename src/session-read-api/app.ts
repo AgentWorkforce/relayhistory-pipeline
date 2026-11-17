@@ -92,6 +92,7 @@ import type { StoredAnalysisResult } from "../session-analysis/processor.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
+import { SESSION_SOURCES_MAX, type SessionSources } from "./session-sources.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, mergeTurnRows, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
@@ -261,6 +262,12 @@ export interface ReadApiDeps {
    * true = 501 `summary_search_not_configured`; nothing else changes.
    */
   summarySearch?: boolean;
+  /**
+   * READ_API_SESSION_SOURCES_ENABLED=true (exactly "true"): GET /v1/sessions/:sessionId/sources
+   * lists the harnesses holding a live pointer row for the session id (session-sources.ts).
+   * Absent = 501 `sources_not_configured`; nothing else changes.
+   */
+  sessionSources?: SessionSources;
   /**
    * MESSAGE_ORIGIN_LABELS_ENABLED=true (exactly "true"): GET /v1/events serves `origin=`
    * (who wrote the event, message-origin.ts). Not true = 501 `param_origin`. A served
@@ -1717,6 +1724,50 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({error:{code:"backend_unavailable",message:"read backend unavailable"},correlationId:c.get("correlationId")},503);
       }
       return fail(c,error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/:sessionId/sources?workspace=: READ_API_SESSION_SOURCES_ENABLED=true only
+   * (deps.sessionSources). The distinct harnesses (`source`) holding a live (`deleted_at IS NULL`)
+   * `sessions.session_index` row for this session id in the token's org and attested workspace,
+   * deduplicated and sorted by name, at most SESSION_SOURCES_MAX: `{"sessionId","sources":[...]}`.
+   * Zero = unknown here (never published, erased, or owner-buffered only: buffered sessions have
+   * no pointer row), still a 200, as the directory list answers an empty page; one = exactly one
+   * source; more = ambiguous. One indexed statement, no paging. Order: the flag (501
+   * `sources_not_configured`), the workspace attestation (403), the directory canary (501
+   * `directory_workspace_not_enabled`), parameters (501 `param_<name>`), the id (400), then the
+   * read; the bearer's 401 precedes all of them, so nothing about another workspace is revealed.
+   * With the self-host operator erase fence configured, a fenced source is dropped.
+   */
+  app.get("/v1/sessions/:sessionId/sources", async (c) => {
+    try {
+      const identity = c.get("identity");
+      // Flag first: off answers exactly the not-configured 501, whatever the request says.
+      const reader = deps.sessionSources;
+      if (!reader) throw unsupported("sources_not_configured");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "directory");
+      for (const name of Object.keys(c.req.query())) if (name !== "workspace") throw unsupported(`param_${name}`);
+      const sessionId = c.req.param("sessionId");
+      if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
+      const rows = await reader(identity.orgId, identity.workspaceId, sessionId);
+      if (rows.length > SESSION_SOURCES_MAX) throw new Error("session sources out of contract");
+      for (const row of rows) {
+        if (row.org_id !== identity.orgId || row.workspace_id !== identity.workspaceId) throw new TenantMismatchError();
+        if (typeof row.harness !== "string" || !HARNESS_NAME.test(row.harness)) throw new Error("session sources out of contract");
+      }
+      let sources = [...new Set(rows.map((row) => row.harness))].sort();
+      const erased = deps.operatorErased;
+      if (erased) {
+        const fenced = await Promise.all(sources.map((source) => erased({ orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId })));
+        sources = sources.filter((_, i) => !fenced[i]);
+      }
+      // Counts only, never the session id or a source name.
+      log({ route: c.req.routePath, reason: "session_sources_served", count: sources.length, status: 200, correlation_id: c.get("correlationId") });
+      return c.json({ sessionId, sources });
+    } catch (error) {
+      return fail(c, error);
     }
   });
 

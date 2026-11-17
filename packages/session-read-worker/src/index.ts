@@ -42,6 +42,9 @@
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true": GET /v1/sessions/summaries/search over the
  * owner-applied ClickHouse session_brief_documents; every other value = 501
  * summary_search_not_configured; unset in wrangler.jsonc),
+ * READ_API_SESSION_SOURCES_ENABLED (exactly "true": GET /v1/sessions/:sessionId/sources, the
+ * live harnesses of one session id from session_index through the read role; every other value =
+ * 501 sources_not_configured; unset in wrangler.jsonc),
  * READ_API_MEMORY_DOCUMENTS_ENABLED (exactly "true": GET /v1/memory/documents and
  * /v1/memory/documents/:topic, migration 20261105062080; every other value = 501
  * memory_documents_disabled),
@@ -97,6 +100,7 @@ import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
+import { sqlSessionSources } from "../../../src/session-read-api/session-sources.ts";
 import type { TimingDeps, TurnsDeps } from "../../../src/session-read-api/app.ts";
 import { sqlEvidenceDeps, type EvidenceDeps } from "../../../src/session-read-api/babysitter-evidence.ts";
 import { objectKey, readAll } from "../../../src/shared/vendor.ts";
@@ -188,6 +192,8 @@ export interface Env extends CanonicalEnv {
   /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
   READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
   READ_API_SUMMARY_SEARCH_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/sessions/:sessionId/sources (sqlSessionSources); anything else = 501 sources_not_configured. */
+  READ_API_SESSION_SOURCES_ENABLED?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
   MESSAGE_ORIGIN_LABELS_ENABLED?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
@@ -515,6 +521,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_MEMORY_DOCUMENTS_ENABLED) ? { memoryDocuments: sqlMemoryDocuments(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
     ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
+    ...(exactTrueFlag(env.READ_API_SESSION_SOURCES_ENABLED) ? { sessionSources: sqlSessionSources(tenant.run) } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
