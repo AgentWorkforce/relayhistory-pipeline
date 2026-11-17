@@ -156,6 +156,26 @@ describe("extractDecisionRecords", () => {
     expect(odd).toEqual([]);
   });
 
+  test("at most one evidence row per session per record: a repeated decision widens its session's span", () => {
+    // e0, e1, e2, e3 are sess-root positions 0-3; c0, c1 are sess-child positions 0-1.
+    const [r, ...rest] = extractDecisionRecords(snapshot([
+      claim("Use keyset paging.", ["e1"]),
+      claim("Use keyset paging.", ["e3", "c1"]),
+      claim("use keyset paging", ["e0", "c0"]),
+    ]));
+    expect(rest).toEqual([]);
+    expect(r!.evidence.map((e) => [e.session_id, e.turn_start, e.turn_end])).toEqual([["sess-root", 0, 3], ["sess-child", 0, 1]]);
+    // The cap still holds: a full record widens existing sessions and drops new ones.
+    const refs = Array.from({ length: 11 }, (_, i) => ref(`r${i}`, `sess-${i}`)).concat([ref("r0b", "sess-0")]);
+    const [full] = extractDecisionRecords(snapshot([
+      claim("Spread decision.", refs.slice(0, 10).map((x) => x.id)),
+      claim("Spread decision.", ["r0b", "r10"]),
+    ], { refs }));
+    expect(full!.evidence.length).toBe(10);
+    expect(full!.evidence.filter((e) => e.session_id === "sess-0").map((e) => [e.turn_start, e.turn_end])).toEqual([[0, 1]]);
+    expect(full!.evidence.some((e) => e.session_id === "sess-10")).toBe(false);
+  });
+
   test("at most 10 evidence rows per record and 100 records per snapshot", () => {
     const refs = Array.from({ length: 12 }, (_, i) => ref(`r${i}`, `sess-${i}`));
     const [r] = extractDecisionRecords(snapshot([claim("Spread decision.", refs.map((x) => x.id))], { refs }));

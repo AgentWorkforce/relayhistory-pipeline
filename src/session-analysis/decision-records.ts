@@ -111,7 +111,11 @@ function firstSentence(text: string): string {
 /**
  * The decision records of one analysis snapshot, for the job's own workspace. Only decisions
  * with high or medium confidence and at least one cited reference; at most 100 records of at
- * most 10 evidence rows. Two decisions with the same topic and title key become one record.
+ * most 10 evidence rows, and at most one evidence row per session per record. Two decisions with
+ * the same topic and title key become one record. Dedupe is per batch here and on the exact
+ * (source, session, range) in decision_records_insert_v1, so a re-analysis whose spans shift can
+ * still add rows (up to the 50-row cap), and reworded titles give a new record
+ * (docs/memory-documents.md, Deduplication limits).
  */
 export function extractDecisionRecords(snapshot: SessionAnalysisSnapshot): DecisionRecordInput[] {
   const references = snapshot.evidence?.references ?? [];
@@ -159,10 +163,16 @@ export function extractDecisionRecords(snapshot: SessionAnalysisSnapshot): Decis
     const dedupe = `${topic}\u0000${decisionTitleKey(title)}`;
     const existing = records.get(dedupe);
     if (existing) {
+      // At most one evidence row per session per record in a batch: a second decision with the
+      // same title widens that session's span instead of adding a row for a shifted range.
       for (const span of spans.values()) {
-        if (existing.evidence.length >= DECISION_EVIDENCE_MAX) break;
-        if (!existing.evidence.some((e) => e.source === span.source && e.session_id === span.session_id && e.turn_start === span.turn_start && e.turn_end === span.turn_end))
+        const same = existing.evidence.find((e) => e.source === span.source && e.session_id === span.session_id);
+        if (same) {
+          same.turn_start = Math.min(same.turn_start, span.turn_start);
+          same.turn_end = Math.max(same.turn_end, span.turn_end);
+        } else if (existing.evidence.length < DECISION_EVIDENCE_MAX) {
           existing.evidence.push(span);
+        }
       }
       continue;
     }

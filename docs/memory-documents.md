@@ -30,7 +30,13 @@ Mapping:
 | evidence `turn_start`, `turn_end` | The lowest and highest 0-based position, among the snapshot's references for that session, of the references the decision cites. These are reference positions, not transcript turn numbers, so they do not address `/v1/sessions/{id}/turns`; the markdown prints them as `refs a-b`. The column names are kept from the shipped migration. |
 | evidence `ref` | The first GitHub commit, pull request or issue URL in the decision text, if any. |
 
-Only decisions with `confidence` `high` or `medium` and at least one cited reference become records. Records are deduplicated by workspace, topic and normalized title (lowercase, whitespace collapsed, trailing punctuation removed). A repeated decision adds evidence to the existing record instead of creating a second one.
+Only decisions with `confidence` `high` or `medium` and at least one cited reference become records. Records are deduplicated by workspace, topic and normalized title (lowercase, whitespace collapsed, trailing punctuation removed). A repeated decision adds evidence to the existing record instead of creating a second one. Within one analysis snapshot a record gets at most one evidence row per session: a repeated decision widens that session's range instead of adding a row.
+
+Deduplication limits (best effort, accepted for this slice):
+
+- The title is the model's first sentence, so a re-analysis that words a decision differently creates a new record. Nothing merges near-duplicates.
+- Across snapshots, evidence is deduplicated only on the exact (`source`, `session_id`, `turn_start`, `turn_end`). A re-analysis of the same session whose reference positions shift adds another row for that session, up to the 50-row cap per record.
+- `sessions.decision_records_supersede_v1` has no caller in this repository. Every record stays `decided` until a follow-up (for example the coordination advisor) marks one superseded.
 
 ## Data model
 
@@ -68,14 +74,14 @@ A unique index on (`org_id`, `workspace_id`, `topic`, `title_key`) enforces dedu
 | `ref` | `text`, nullable | `https://github.com/` commit, pull or issue URL, at most 500 characters |
 | `created_at` | `timestamptz` | |
 
-Evidence is unique on (`decision_id`, `source`, `session_id`, `turn_start`, `turn_end`), so rerunning the extractor on the same snapshot adds nothing. A record holds at most 50 evidence rows; further evidence is dropped by the insert function.
+Evidence is unique on (`decision_id`, `source`, `session_id`, `turn_start`, `turn_end`), so rerunning the extractor on the same snapshot adds nothing. A record holds at most 50 evidence rows; further evidence is dropped by the insert function. The extractor sends at most one row per session per record in one call (see Deduplication limits).
 
 Both tables have row-level security enabled and no table privileges for any role. Access goes through SECURITY DEFINER functions with `search_path` pinned and PUBLIC EXECUTE revoked:
 
 | Function | Role | Purpose |
 |---|---|---|
 | `sessions.decision_records_insert_v1` | `service_role` | Insert or merge one record and its evidence for one workspace. |
-| `sessions.decision_records_supersede_v1` | `service_role` | Mark one record superseded by another record in the same workspace. |
+| `sessions.decision_records_supersede_v1` | `service_role` | Mark one record superseded by another record in the same workspace. No caller yet. |
 | `sessions.decision_records_topics_v1` | `bulls96_read_api` | List topics with record counts for one workspace. |
 | `sessions.decision_records_list_v1` | `bulls96_read_api` | List one topic's records with evidence for one workspace, oldest first, keyset paginated. |
 | `sessions.decision_evidence_erase_session_v1` | `bulls96_session_ingest` | Operator per-session erase (`20261105062090`, see Retention). |
