@@ -14,7 +14,7 @@
 --      stream index key, match_key equals it); side 'have' = the index scan, one row per index
 --      identity (key_hash identifies the identity, match_key is its stream index key, payload
 --      carries the identity a delete needs). 'fold' and 'directory_seen' are reserved for the
---      next slice. owner is workspace id U+001F session id on both sides.
+--      next slice. owner is the JSON array [workspace id, session id] on both sides.
 --   Logged tables, RLS on, no policy, no table grant: reachable only through the functions.
 --
 -- Writer functions (SECURITY DEFINER, search_path pinned, EXECUTE to search_consumer_runtime
@@ -31,8 +31,11 @@
 --   search_reconcile_abandon_v1      the stage rows go, the run restarts from 'want'
 --   search_reconcile_erase_scope_v1  erasure: every run (and stage row) of the scope goes,
 --                                    leased or not
--- Every function but claim and erase_scope checks the lease nonce and expiry and extends the
--- lease; a stale lease (expired, taken over, finished, abandoned or erased) is SQLSTATE RH062.
+-- Every function but claim and erase_scope checks the lease nonce under the run's row lock and
+-- extends the lease. Expiry only opens the run to a takeover: claim replaces the nonce once
+-- lease_expires_at has passed, so the holder keeps the run through a long source read unless
+-- someone took it over. A stale lease (taken over, finished, abandoned or erased) is SQLSTATE
+-- RH062. Cursors only move forward within a phase.
 --
 -- Roles: never created or altered here; search_consumer_runtime (session_consumer_roles.sql) is
 -- provisioned before migrate and checked here, fail closed (42704 absent, 55000 elevated).
@@ -120,8 +123,9 @@ BEGIN
 END
 $caller$;
 
--- The run under a live lease, locked for the rest of the transaction, its lease extended by
--- its lease_ms. Anything else (no such run, another nonce, expired) is RH062.
+-- The run held under this nonce, locked for the rest of the transaction, its lease extended by
+-- its lease_ms. Anything else (no such run, another nonce) is RH062. An expired lease nobody
+-- has taken over is still the holder's: claim, under the same row lock, is what ends it.
 CREATE FUNCTION sessions.search_reconcile_lease_v1(p_run_id bigint, p_nonce uuid)
 RETURNS sessions.search_reconcile_runs_v1
 LANGUAGE plpgsql VOLATILE
@@ -133,7 +137,7 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: run and lease nonce required';
   END IF;
   SELECT * INTO r FROM sessions.search_reconcile_runs_v1 AS t WHERE t.run_id = p_run_id FOR UPDATE;
-  IF NOT FOUND OR r.lease_nonce IS DISTINCT FROM p_nonce OR r.lease_expires_at <= clock_timestamp() THEN
+  IF NOT FOUND OR r.lease_nonce IS DISTINCT FROM p_nonce THEN
     RAISE EXCEPTION USING ERRCODE = 'RH062', MESSAGE = 'search reconcile: stale lease';
   END IF;
   UPDATE sessions.search_reconcile_runs_v1 AS t
@@ -158,6 +162,7 @@ SET search_path = pg_catalog, sessions, pg_temp AS $claim$
 DECLARE
   r sessions.search_reconcile_runs_v1%ROWTYPE;
   v_restarted boolean := false;
+  v_try integer;
 BEGIN
   PERFORM sessions.search_reconcile_caller_v1();
   IF coalesce(p_org_id, '') = '' OR coalesce(p_workspace_id, '') = '' OR coalesce(p_harness, '') = ''
@@ -166,14 +171,22 @@ BEGIN
      OR p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 3600000 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid claim';
   END IF;
-  INSERT INTO sessions.search_reconcile_runs_v1 AS t
-    (org_id, workspace_id, harness, session_id, canonical_id, pointer_epoch, manifest_fingerprint, lease_ms, lease_expires_at)
-  VALUES (p_org_id, p_workspace_id, p_harness, p_session_id, p_canonical_id, p_pointer_epoch, p_manifest_fingerprint,
-          p_lease_ms, '-infinity')
-  ON CONFLICT (org_id, workspace_id, harness, session_id) DO NOTHING;
-  SELECT * INTO STRICT r FROM sessions.search_reconcile_runs_v1 AS t
-   WHERE t.org_id = p_org_id AND t.workspace_id = p_workspace_id AND t.harness = p_harness AND t.session_id = p_session_id
-   FOR UPDATE;
+  -- A run finished or erased between the insert and the lock: insert again (bounded).
+  FOR v_try IN 1..3 LOOP
+    INSERT INTO sessions.search_reconcile_runs_v1 AS t
+      (org_id, workspace_id, harness, session_id, canonical_id, pointer_epoch, manifest_fingerprint, lease_ms, lease_expires_at)
+    VALUES (p_org_id, p_workspace_id, p_harness, p_session_id, p_canonical_id, p_pointer_epoch, p_manifest_fingerprint,
+            p_lease_ms, '-infinity')
+    ON CONFLICT (org_id, workspace_id, harness, session_id) DO NOTHING;
+    SELECT * INTO r FROM sessions.search_reconcile_runs_v1 AS t
+     WHERE t.org_id = p_org_id AND t.workspace_id = p_workspace_id AND t.harness = p_harness AND t.session_id = p_session_id
+     FOR UPDATE;
+    EXIT WHEN FOUND;
+  END LOOP;
+  -- Still gone after three tries: a concurrent finish or erase keeps winning; busy, no row.
+  IF r.run_id IS NULL THEN
+    RETURN;
+  END IF;
   -- Another live lease: busy, no row.
   IF r.lease_nonce IS NOT NULL AND r.lease_expires_at > clock_timestamp() THEN
     RETURN;
@@ -217,6 +230,9 @@ BEGIN
      OR jsonb_array_length(p_entries) > 10000 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid batch';
   END IF;
+  IF p_cursor IS NOT NULL AND r.chunk_cursor IS NOT NULL AND p_cursor < r.chunk_cursor COLLATE "C" THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search reconcile: cursor moved backwards';
+  END IF;
   IF EXISTS (SELECT 1 FROM jsonb_to_recordset(p_entries) AS e(k text, o text, t bigint, f text)
               WHERE e.k IS NULL OR e.o IS NULL OR e.t IS NULL OR e.f IS NULL) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: incomplete stage entry';
@@ -252,6 +268,9 @@ BEGIN
          OR array_position(p_regenerable_kinds, NULL) IS NOT NULL)) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid advance';
   END IF;
+  IF p_phase = r.phase AND p_cursor IS NOT NULL AND r.chunk_cursor IS NOT NULL AND p_cursor < r.chunk_cursor COLLATE "C" THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search reconcile: cursor moved backwards';
+  END IF;
   UPDATE sessions.search_reconcile_runs_v1 AS t
      SET phase = p_phase, chunk_cursor = p_cursor,
          regenerable_kinds = coalesce(p_regenerable_kinds, t.regenerable_kinds),
@@ -274,7 +293,7 @@ DECLARE r sessions.search_reconcile_runs_v1%ROWTYPE;
 BEGIN
   r := sessions.search_reconcile_lease_v1(p_run_id, p_nonce);
   IF p_mode IS NULL OR p_mode NOT IN ('insert', 'delete') OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 10000
-     OR p_keep_prefix IS NULL OR char_length(p_keep_prefix) > 16 THEN
+     OR p_keep_prefix IS NULL OR char_length(p_keep_prefix) NOT BETWEEN 1 AND 16 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid diff page';
   END IF;
   IF NOT (r.phase = 'final' OR (r.phase = 'write' AND p_mode = 'insert')) THEN
@@ -304,7 +323,7 @@ BEGIN
        WHERE h.run_id = p_run_id AND h.side = 'have'
          AND (p_after IS NULL OR h.key_hash > p_after COLLATE "C")
          AND (h.payload->>'kind') = ANY (r.regenerable_kinds)
-         AND NOT (w.key_hash IS NULL AND p_keep_prefix <> '' AND left(h.fingerprint, char_length(p_keep_prefix)) = p_keep_prefix)
+         AND NOT (w.key_hash IS NULL AND left(h.fingerprint, char_length(p_keep_prefix)) = p_keep_prefix)
          AND (w.key_hash IS NULL OR w.owner <> h.owner OR w.ts_ms <> h.ts_ms)
        ORDER BY h.key_hash COLLATE "C"
        LIMIT p_limit;
