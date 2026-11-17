@@ -161,11 +161,10 @@ const COMMON_PROFILE = {
  * moved the policy and all admission rows to H. This is lifecycle step (2) (step 6 of the required
  * order): deploy H-only at the same baseline phase while retaining the pair solely to authorize the
  * G+H -> H transition; step (3) sets it to null after the live Worker reads back exactly H.
+ * Done: the H-only deploy 43951438815 (2026-11-16 20:37Z) read back exactly H, so lifecycle step (3)
+ * returns the contract to dormant (null).
  */
-export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
-  from: "8a7cf72ad616f93a700f38c787dc65d4c3c05388555a367b16222f8c94c930e8",
-  to: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",
-};
+export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = null;
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
   generation: COMMON_PROFILE.expectedGeneration,
