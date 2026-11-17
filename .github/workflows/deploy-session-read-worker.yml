@@ -117,8 +117,14 @@ name: deploy session-read-worker
 # without it POST answers 501 analysis_admission_not_configured and GET still serves. An on dispatch
 # fails before `wrangler deploy` unless the PIPELINE_RAW_S3_* secrets exist (names only). off (the
 # default) renders no var: GET 501 analysis_not_configured and POST 405, as before this input.
-# Not preserved from live (the live-settings guard refuses a dispatch that would drop it, and one
-# that would drop a live ANALYSIS_ADMIT binding); dispatch is Khaliq's call.
+# The ANALYSIS_ADMIT binding is rendered whenever SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set, whatever
+# `analysis` says (a flag-off Worker ignores it); the render is byte-identical to before only with
+# that variable unset. Not preserved from live: in EVERY mode (profile, preserve, and explicit
+# owner_buffered=on/off) the guard (resolve-deploy-profile.ts unchangedAnalysisSettings) refuses a
+# dispatch that would drop a live READ_API_ANALYSIS_ENABLED or change/drop a live ANALYSIS_ADMIT
+# binding; analysis=disable is the explicit removal (no var, and the binding may go when the
+# variable is unset). The other summary inputs keep their profile/preserve-only guard. Dispatch is
+# Khaliq's call.
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
@@ -208,9 +214,9 @@ on:
         options: ["off", "on"]
         default: "off"
       analysis:
-        description: GET/POST /v1/sessions/:id/analysis (READ_API_ANALYSIS_ENABLED=true; POST needs SESSION_READ_ANALYSIS_HYPERDRIVE_ID); off = no var, GET 501 analysis_not_configured, POST 405. Not preserved from live; repeat it on later dispatches
+        description: GET/POST /v1/sessions/:id/analysis (READ_API_ANALYSIS_ENABLED=true; POST needs SESSION_READ_ANALYSIS_HYPERDRIVE_ID); off = no var, refused if live has it on; disable = remove it. Not preserved from live; repeat on later dispatches
         type: choice
-        options: ["off", "on"]
+        options: ["off", "on", "disable"]
         default: "off"
 permissions:
   contents: read
@@ -312,7 +318,7 @@ jobs:
           case "$SUMMARY_SEARCH" in off|on) ;; *) fail 'summary_search must be "off" or "on"' ;; esac
           case "$RELAYFACTS" in off|on) ;; *) fail 'relayfacts must be "off" or "on"' ;; esac
           case "$SESSION_SOURCES" in off|on) ;; *) fail 'session_sources must be "off" or "on"' ;; esac
-          case "$ANALYSIS" in off|on) ;; *) fail 'analysis must be "off" or "on"' ;; esac
+          case "$ANALYSIS" in off|on|disable) ;; *) fail 'analysis must be "off", "on" or "disable"' ;; esac
           if [ -n "$ANALYSIS_HYPERDRIVE_ID" ]; then
             [[ "$ANALYSIS_HYPERDRIVE_ID" =~ ^[0-9a-f]{32}$ ]] && [ "$ANALYSIS_HYPERDRIVE_ID" != "00000000000000000000000000000000" ] || fail "SESSION_READ_ANALYSIS_HYPERDRIVE_ID must be the admission role's Hyperdrive config id (32 hex)"
             [ "$ANALYSIS_HYPERDRIVE_ID" != "$HYPERDRIVE_ID" ] || fail "SESSION_READ_ANALYSIS_HYPERDRIVE_ID must not be the read role's Hyperdrive config"

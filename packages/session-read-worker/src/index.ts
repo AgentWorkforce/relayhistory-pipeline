@@ -106,7 +106,8 @@ import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
-import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
+import { rawStoreFromEnv, type RawStore } from "../../pipeline/src/lib/pipeline/adapter.ts";
+import { AnalysisResultError } from "../../../src/session-analysis/results.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
@@ -634,6 +635,43 @@ export function summaryFallbackDeps(env: Env, run: TenantRunner, fetcher: typeof
 
 /** One analysis result object read's deadline per store call (results are at most 8 MiB, results.ts). */
 const ANALYSIS_RESULT_DEADLINE_MS = 10_000;
+/**
+ * The most result bytes one GET reads in total (the read returns up to 50 analyses, each at most
+ * 8 MiB): past it the request is a 503 (analysis_result_budget), never a partial page.
+ */
+export const ANALYSIS_RESULT_REQUEST_BUDGET_BYTES = 32 * 1024 * 1024;
+
+type Store = RawStore["store"];
+
+/**
+ * The raw store as the analysis result reader sees it: read only, and get() refuses an object
+ * whose response size (content-length) exceeds the size the job row recorded for that key,
+ * before reading its body (the body is cancelled). readAnalysisResult still verifies the exact
+ * size and SHA-256 of what it read.
+ */
+function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>): Store {
+  const refuse = () => Promise.reject(new Error("session read worker: the analysis result reader does not write"));
+  return {
+    backend: store.backend,
+    head: (key) => store.head(key),
+    list: (prefix, cursor) => store.list(prefix, cursor),
+    presignGet: () => Promise.reject(new Error("session read worker: no presigned analysis reads")),
+    put: refuse,
+    delete: refuse,
+    async getObject(key, range) {
+      const got = await store.getObject(key, range);
+      const want = recorded.get(String(key));
+      if (want === undefined || (Number.isFinite(got.meta.size) && got.meta.size > want)) {
+        await got.body.cancel().catch(() => {});
+        throw new AnalysisResultError(want === undefined ? "analysis_result_ref_invalid" : "analysis_result_mismatch");
+      }
+      return got;
+    },
+    async get(key, range) {
+      return (await this.getObject(key, range)).body;
+    },
+  };
+}
 
 /**
  * Session analysis (lane F1, READ_API_ANALYSIS_ENABLED=true), the Lambda's sqlAnalysisSource:
@@ -642,6 +680,8 @@ const ANALYSIS_RESULT_DEADLINE_MS = 10_000;
  *   result          the result object from the pipeline raw bucket (PIPELINE_RAW_S3_*, the
  *                   canonical store the analysis worker publishes to), at the key, SHA-256 and
  *                   size the job row recorded (never derived from the request), bounded per call;
+ *                   an object larger than recorded is refused by content-length before its body
+ *                   is read, and one request reads at most ANALYSIS_RESULT_REQUEST_BUDGET_BYTES;
  *   admit           the admission principal's pool (ANALYSIS_ADMIT); absent = POST 501
  *                   analysis_admission_not_configured, GET unchanged.
  * Without the raw store: undefined, so GET and POST answer 501 analysis_not_configured.
@@ -653,7 +693,20 @@ export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | und
   };
   const raw = rawStoreFromEnv(env, bounded);
   if (!raw) return undefined;
-  return sqlAnalysisSource(run, raw.store, admit);
+  // Per request (analysisDeps is built per request): the recorded size of each key being read,
+  // and what is left of the request's byte budget.
+  const recorded = new Map<string, number>();
+  let remaining = ANALYSIS_RESULT_REQUEST_BUDGET_BYTES;
+  const source = sqlAnalysisSource(run, recordedSizeStore(raw.store, recorded), admit);
+  return {
+    ...source,
+    async result(ref) {
+      if (!Number.isSafeInteger(ref.bytes) || ref.bytes < 0 || ref.bytes > remaining) throw new AnalysisResultError("analysis_result_budget");
+      remaining -= ref.bytes;
+      recorded.set(ref.key, ref.bytes);
+      return source.result(ref);
+    },
+  };
 }
 
 /**

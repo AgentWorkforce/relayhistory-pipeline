@@ -10,7 +10,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ANALYSIS_ADMIT_BINDING, CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown; id?: unknown };
 type Version = { id?: unknown; resources?: { bindings?: Binding[] } };
@@ -46,6 +46,32 @@ export const SUMMARY_FLAGS = {
   SESSION_SOURCES: "READ_API_SESSION_SOURCES_ENABLED",
   ANALYSIS: "READ_API_ANALYSIS_ENABLED",
 } as const;
+/**
+ * The analysis input's values: off (the default; never drops a live analysis flag or ANALYSIS_ADMIT
+ * binding, in every mode), on (renders READ_API_ANALYSIS_ENABLED=true), disable (the explicit
+ * removal: renders no flag and lets the dispatch drop the live flag and, with
+ * SESSION_READ_ANALYSIS_HYPERDRIVE_ID unset, the live binding).
+ */
+const ANALYSIS_VALUES = ["", "off", "on", "disable"];
+
+/**
+ * The analysis guard, in every mode (profile, preserve, and explicit owner_buffered=on/off, which
+ * otherwise renders its inputs without comparing live): unless analysis=disable, a live
+ * READ_API_ANALYSIS_ENABLED=true needs analysis=on, and a live ANALYSIS_ADMIT binding needs
+ * SESSION_READ_ANALYSIS_HYPERDRIVE_ID to name the same config.
+ */
+export function unchangedAnalysisSettings(version: Version, env: Environment): void {
+  if (env.ANALYSIS === "disable") return;
+  for (const b of version.resources?.bindings ?? []) {
+    if (b.name === SUMMARY_FLAGS.ANALYSIS) {
+      need(b.type === "plain_text" && typeof b.text === "string", `Live ${SUMMARY_FLAGS.ANALYSIS} is not plain text; explicit deployment review required`);
+      need(b.text !== "true" || env.ANALYSIS === "on", `This dispatch would change or drop live setting ${SUMMARY_FLAGS.ANALYSIS}; repeat analysis=on, or choose analysis=disable to remove it`);
+    } else if (b.name === ANALYSIS_ADMIT_BINDING) {
+      need(b.type === "hyperdrive" && typeof b.id === "string" && (env.ANALYSIS_HYPERDRIVE_ID ?? "").trim() === b.id, `This dispatch would change or drop live Hyperdrive binding ${ANALYSIS_ADMIT_BINDING}; keep SESSION_READ_ANALYSIS_HYPERDRIVE_ID, or choose analysis=disable to remove it`);
+    }
+  }
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function activeVersion(d: unknown): string {
@@ -141,6 +167,8 @@ export function unchangedOtherSettings(version: Version, template: string, env: 
     if (env[key] === "on") vars[name] = "true";
   }
   const managed = new Set<string>([...Object.values(VARIABLES), ...Object.values(FLAGS).map(([name]) => name)]);
+  // analysis=disable is the explicit removal of the flag and the binding (unchangedAnalysisSettings).
+  if (env.ANALYSIS === "disable") for (const name of [SUMMARY_FLAGS.ANALYSIS, ANALYSIS_ADMIT_BINDING]) managed.add(name);
   for (const b of version.resources?.bindings ?? []) {
     need(typeof b.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name), "Invalid live binding name");
     const name = b.name;
@@ -204,7 +232,10 @@ export function profileInputs(env: Environment): RenderInputs {
 export async function resolveProfile(env: Environment, template: string, get: (path: string) => Promise<unknown>, committed?: CommittedProfile): Promise<Record<string, string>> {
   const requested = env.OWNER_BUFFERED?.trim() || "profile";
   need(["profile", "preserve", "on", "off"].includes(requested), "owner_buffered must be profile, preserve, on or off");
-  for (const key of Object.keys(SUMMARY_FLAGS)) need(["", "off", "on"].includes(env[key] ?? ""), `${key.toLowerCase()} must be off or on`);
+  for (const key of Object.keys(SUMMARY_FLAGS)) {
+    if (key === "ANALYSIS") need(ANALYSIS_VALUES.includes(env[key] ?? ""), "analysis must be off, on or disable");
+    else need(["", "off", "on"].includes(env[key] ?? ""), `${key.toLowerCase()} must be off or on`);
+  }
   // An empty or "profile" child input defers to the committed profile; below it is simply unset.
   const explicit: Environment = { ...env };
   for (const key of PROFILE_CHILDREN) if (!env[key]?.trim() || env[key]!.trim() === "profile") explicit[key] = "";
@@ -226,13 +257,18 @@ export async function resolveProfile(env: Environment, template: string, get: (p
     const directory = requestedDirectory(env);
     need(directory === undefined || directory === resolved.DIRECTORY_WORKSPACES, "Directory input/environment differs from live; choose explicit owner_buffered=on/off to change the directory list");
     unchangedOtherSettings(version, template, { ...env, ...resolved });
+    unchangedAnalysisSettings(version, env);
   } else {
     // Explicit mode renders the inputs; on production an unset child falls back to the committed profile.
     const children: Record<string, string> = {};
     for (const key of PROFILE_CHILDREN) children[key] = explicit[key] || (mode === "on" && profile ? profile[key] : key === "OWNER_BUFFERED_WORKSPACES" ? "" : "off");
     const directory = requestedDirectory(env);
+    // Explicit mode renders its inputs without the profile/preserve comparison, but still reads
+    // live for the analysis guard, so an owner_buffered=on/off dispatch never silently drops a
+    // live analysis flag or ANALYSIS_ADMIT binding.
+    const { id, version } = await readLive(get);
+    unchangedAnalysisSettings(version, env);
     if (directory === undefined) {
-      const { id, version } = await readLive(get);
       resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
     } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
   }

@@ -2290,10 +2290,13 @@ export function createReadApi(deps: ReadApiDeps) {
   app.post("/v1/sessions/:sessionId/analysis", async (c) => {
     try {
       const identity = c.get("identity");
-      const { analysis, sessionId } = await analysisSession(c, identity);
-      // relayhistory routes/session-analysis.ts:174-177: POST needs rth:read and rth:sync.
+      // relayhistory routes/session-analysis.ts:174-177: POST needs rth:read and rth:sync. Checked
+      // (after the workspace attestation, which runs no SQL) before analysisSession's read-role
+      // harness query, so an unscoped or cross-workspace POST touches no database.
+      attestWorkspace(c, identity);
       if (!identity.scopes.includes("rth:sync"))
         return c.json({ error: { code: "forbidden", message: "missing required scope: rth:sync" }, correlationId: c.get("correlationId") }, 403);
+      const { analysis, sessionId } = await analysisSession(c, identity);
       if (!analysis.admit) throw unsupported("analysis_admission_not_configured");
       const out = admitResponse(await analysis.admit(identity, sessionId));
       if (out.retryAfter) c.header("Retry-After", out.retryAfter);

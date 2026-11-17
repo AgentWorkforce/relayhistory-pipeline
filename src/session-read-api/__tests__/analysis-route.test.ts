@@ -117,6 +117,24 @@ describe("POST /v1/sessions/:id/analysis", () => {
     expect([r.status, (await json(r)).error.reason]).toEqual([501, "analysis_admission_not_configured"]);
   });
 
+  test("rth:sync and the workspace are checked before any read-role query (no harness or analysis SQL)", async () => {
+    for (const [scopes, path] of [[["rth:read"], undefined], [["rth:read", "rth:sync"], "/v1/sessions/s-1/analysis?workspace=ws-b"]] as const) {
+      const calls: string[] = [];
+      const { call } = api({
+        scopes: [...scopes],
+        analysis: {
+          harnesses: async () => (calls.push("harnesses"), ["claude"]),
+          read: async () => (calls.push("read"), { outcome: "not_found" }),
+          admit: async () => (calls.push("admit"), { outcome: "accepted", request: REQ }),
+        },
+      });
+      const r = await call("POST", path);
+      expect(r.status).toBe(403);
+      expect((await json(r)).error.code).toBe("forbidden");
+      expect(calls).toEqual([]);
+    }
+  });
+
   test("relayhistory's outcome map", async () => {
     const at = (outcome: any) =>
       api({ scopes: ["rth:read", "rth:sync"], analysis: { admit: async () => outcome } }).call("POST");

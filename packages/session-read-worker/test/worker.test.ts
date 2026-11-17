@@ -11,10 +11,10 @@ import type pg from "pg";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
-import { boundedClickHouse, connectPg, handle, methodAllowed, ownerBufferedDeps, type Env } from "../src/index.ts";
+import { analysisDeps, ANALYSIS_RESULT_REQUEST_BUDGET_BYTES, boundedClickHouse, connectPg, handle, methodAllowed, ownerBufferedDeps, type Env } from "../src/index.ts";
 import { BufferedFenced, BufferedIndexVerifier } from "../../../src/session-read-api/owner-buffered.ts";
 import { BRIEF_SUMMARY_SIGNATURE } from "../../../src/session-read-api/brief-summary.ts";
-import { ANALYSIS_ADMIT_SQL, ANALYSIS_READ_SQL } from "../../../src/session-read-api/analysis-source.ts";
+import { ANALYSIS_ADMIT_BOUNDS_SQL, ANALYSIS_ADMIT_SQL, ANALYSIS_READ_SQL } from "../../../src/session-read-api/analysis-source.ts";
 import { SESSION_HARNESSES_SQL } from "../../../src/session-read-api/session-turns-source.ts";
 import { TENANT_SETTINGS_SQL } from "../../../src/session-read-api/liveness.ts";
 
@@ -1057,6 +1057,37 @@ describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
     expect(JSON.stringify(await body(r))).not.toContain("other text");
   });
 
+  test("result reads: an object larger than recorded is refused by content-length before its body is read; one request reads at most the byte budget", async () => {
+    const t = tenant();
+    const { key } = await setup(t);
+    const sha = key.slice(-69, -5);
+    const run = (async () => { throw new Error("no database in this test"); }) as never;
+    let pulled = 0;
+    let fetches = 0;
+    const big = (async () => {
+      fetches++;
+      const stream = new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024)); } });
+      return new Response(stream, { status: 200, headers: { "content-length": String(resultBytes.length + 1) } });
+    }) as typeof fetch;
+    const deps = analysisDeps({ ...E, ...RAW } as Env, run, undefined, big)!;
+    await expect(deps.result({ key, sha256: sha, bytes: resultBytes.length })).rejects.toMatchObject({ name: "AnalysisResultError", message: "analysis_result_mismatch" });
+    expect(fetches).toBe(1);
+    expect(pulled).toBeLessThanOrEqual(1);
+    // The budget: refs whose recorded sizes sum past it are refused before any fetch of the overflow.
+    const counted = (async () => { fetches++; return new Response(resultBytes, { status: 200, headers: { "content-length": String(resultBytes.length) } }); }) as typeof fetch;
+    fetches = 0;
+    const budget = analysisDeps({ ...E, ...RAW } as Env, run, undefined, counted)!;
+    const chunk = 8 * 1024 * 1024;
+    const n = Math.floor(ANALYSIS_RESULT_REQUEST_BUDGET_BYTES / chunk);
+    // Each fits the per-object bound but mismatches the tiny object: still spends budget, one fetch each.
+    for (let i = 0; i < n; i++) await expect(budget.result({ key, sha256: sha, bytes: chunk })).rejects.toMatchObject({ name: "AnalysisResultError" });
+    expect(fetches).toBe(n);
+    await expect(budget.result({ key, sha256: sha, bytes: 1 })).rejects.toMatchObject({ message: "analysis_result_budget" });
+    expect(fetches).toBe(n);
+    // A fresh request (deps are per request) has its own budget and serves the real object.
+    expect(await analysisDeps({ ...E, ...RAW } as Env, run, undefined, counted)!.result({ key, sha256: sha, bytes: resultBytes.length })).toEqual(result);
+  });
+
   test("flag on without ANALYSIS_ADMIT: POST 501 analysis_admission_not_configured; GET still serves", async () => {
     const t = tenant();
     const { read, fetcher } = await setup(t);
@@ -1076,21 +1107,39 @@ describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
     const r = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
     expect(r.status).toBe(202);
     expect((await body(r)).request).toEqual(request);
-    expect(admit.f.seen.map((x) => x.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
-    expect(admit.f.seen[1]!.params).toEqual([t.org, t.ws]);
-    expect(admit.f.seen[2]!.params).toEqual([t.org, t.ws, t.user, "s-1"]);
+    expect(admit.f.seen.map((x) => x.text)).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
+    expect(admit.f.seen[2]!.params).toEqual([t.org, t.ws]);
+    expect(admit.f.seen[3]!.params).toEqual([t.org, t.ws, t.user, "s-1"]);
     expect(admit.f.connects).toBe(1);
     expect(admit.f.ended).toBe(1);
     // The read role's client never runs the admission; the admission's never runs a read.
     expect(read.f.seen.some((x) => x.text === ANALYSIS_ADMIT_SQL)).toBe(false);
     expect(admit.f.seen.some((x) => x.text === ANALYSIS_READ_SQL || x.text === SESSION_HARNESSES_SQL)).toBe(false);
-    // Rate limited and not found keep relayhistory's statuses.
-    for (const [outcome, status] of [["rate_limited", 429], ["not_found", 404]] as const) {
+  });
+
+  test("flag on: POST keeps relayhistory's outcome map through the Worker (404, 429 with Retry-After: 86400, 400 invalid_request)", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    for (const [outcome, status, code] of [["not_found", 404, "not_found"], ["rate_limited", 429, "rate_limited"], ["invalid_request", 400, "invalid_request"]] as const) {
       const a = fakePg((text) => (text === ANALYSIS_ADMIT_SQL ? [{ r: { outcome } }] : []));
       const x = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: a.connect, fetcher });
       expect(x.status, outcome).toBe(status);
+      expect(x.headers.get("retry-after"), outcome).toBe(outcome === "rate_limited" ? "86400" : null);
+      expect((await body(x)).error?.code, outcome).toBe(code);
+      expect(a.f.seen.map((q) => q.text), outcome).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
       expect(a.f.ended, outcome).toBe(1);
     }
+  });
+
+  test("flag on: a cross-workspace POST is exactly 403 and runs no SQL on either principal", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const admit = fakePg(() => []);
+    const r = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=ws-not-mine`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+    expect(r.status).toBe(403);
+    expect((await body(r)).error.code).toBe("forbidden");
+    expect(read.f.seen).toEqual([]);
+    expect(admit.f.connects).toBe(0);
   });
 
   test("flag on: a failing admission rolls back and is a 5xx; POST without rth:sync is 403 and opens no admission connection", async () => {
@@ -1100,12 +1149,15 @@ describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
     const r = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: failing.connect, fetcher });
     expect(r.status).toBeGreaterThanOrEqual(500);
     expect(JSON.stringify(await body(r))).not.toContain("tenant binding");
-    expect(failing.f.seen.map((x) => x.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "ROLLBACK"]);
+    expect(failing.f.seen.map((x) => x.text)).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "ROLLBACK"]);
     expect(failing.f.ended).toBe(1);
     const unscoped = fakePg(() => []);
-    const f = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: unscoped.connect, fetcher }, ["rth:read"]);
+    const fresh = await setup(t);
+    const f = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: fresh.read.connect, connectAnalysisAdmit: unscoped.connect, fetcher }, ["rth:read"]);
     expect(f.status).toBe(403);
     expect(unscoped.f.connects).toBe(0);
+    // rth:sync is checked before the read role's harness query: no SQL at all.
+    expect(fresh.read.f.seen).toEqual([]);
   });
 
   test("flag on: the canary allowlist and the token's workspace still gate both methods", async () => {
