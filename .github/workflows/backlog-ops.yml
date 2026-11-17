@@ -80,6 +80,8 @@ on:
       - src/session-ingest/ledger-tool-store.ts
       - src/session-ingest/__tests__/ledger-tool-store*
       - src/session-ingest/ledger-store.ts
+      - src/session-ingest/buffered-drain.ts
+      - src/session-ingest/upload-fence-backfill.ts
       - src/session-ingest/__tests__/buffered-drain.test.ts
       - src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts
   push:
@@ -97,6 +99,8 @@ on:
       - src/session-ingest/ledger-tool-store.ts
       - src/session-ingest/__tests__/ledger-tool-store*
       - src/session-ingest/ledger-store.ts
+      - src/session-ingest/buffered-drain.ts
+      - src/session-ingest/upload-fence-backfill.ts
       - src/session-ingest/__tests__/buffered-drain.test.ts
       - src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts
 

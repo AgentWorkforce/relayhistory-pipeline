@@ -61,7 +61,7 @@ import { assertToolLedgerHome, homeGuardedToolStore, toolLedgerBucket, toolStore
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
-import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, SUPERSEDED_SUFFIX, drainBufferedBatches, parseDrainCheckpoint, parseStagedKey, type DrainCheckpoint, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
+import { ACCEPTED_SUFFIX, DRAIN_LEASE_RELEASE_FAILED, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, SUPERSEDED_SUFFIX, drainBufferedBatches, parseDrainCheckpoint, parseStagedKey, type DrainCheckpoint, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
 
 export const KEY_ROOT = "96bulls";
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
@@ -253,6 +253,19 @@ export async function runDrainTool(args: DrainArgs, deps: {
   return runDrain(args, { store, orgs: deps.orgs, halt: () => store.homeRefusal(), ...(deps.stderr ? { stderr: deps.stderr } : {}) });
 }
 
+/**
+ * The CLI's one stdout line for a failed run: the closed reason, and `lease_release` when the lease could not be
+ * released either (also logged on stderr, one line, so the step log shows why the next run waits out the TTL).
+ */
+export function drainRefusal(error: unknown, stderr: (line: string) => void = (l) => process.stderr.write(l)): { refused: string; lease_release?: string } {
+  const m = (error as Error)?.message;
+  const refused = typeof m === "string" && /^[a-z0-9_]{1,64}$/.test(m) ? m : "internal_error";
+  const lease = (error as { leaseRelease?: unknown } | null)?.leaseRelease;
+  if (lease !== DRAIN_LEASE_RELEASE_FAILED) return { refused };
+  stderr(DRAIN_LEASE_RELEASE_FAILED + "\n");
+  return { refused, lease_release: DRAIN_LEASE_RELEASE_FAILED };
+}
+
 if (import.meta.main) {
   let args: DrainArgs;
   try {
@@ -270,11 +283,11 @@ if (import.meta.main) {
   try {
     assertLedgerHomeGuardValid();
     const summary = await runDrainTool(args, { env: process.env, credentials, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
+    if (summary.lease_release !== undefined) process.stderr.write(summary.lease_release + "\n");
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {
     // A closed reason only: an S3 error message can carry a key.
-    const m = (error as Error)?.message;
-    process.stdout.write(JSON.stringify({ refused: typeof m === "string" && /^[a-z0-9_]{1,64}$/.test(m) ? m : "internal_error" }) + "\n");
+    process.stdout.write(JSON.stringify(drainRefusal(error)) + "\n");
     process.exitCode = 1;
   }
 }

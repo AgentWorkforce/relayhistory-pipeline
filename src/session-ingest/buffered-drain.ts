@@ -420,6 +420,8 @@ export interface DrainSummary {
   /** Write failures by closed code (IngestWriteError code, or `storage`). */
   write_failures: Record<string, number>;
   stopped: "complete" | "max_objects";
+  /** Present only when the run's lease release failed (DRAIN_LEASE_RELEASE_FAILED): it runs out its TTL. */
+  lease_release?: typeof DRAIN_LEASE_RELEASE_FAILED;
   /**
    * How a `resume` checkpoint was used: `none` (none given), `resumed`, or `reset_export_changed`. In that last case an
    * org at or before the checkpoint has a different accepted-stage export generation now (a re-export can flip a stage's
@@ -644,6 +646,9 @@ export const drainLockKey = (keyRoot: string) => `${keyRoot}/.drain/lock.json`;
 export const exportLockKey = (keyRoot: string) => `${keyRoot}/.drain/export-lock.json`;
 interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number; token?: number }
 
+/** The closed code a run reports when its lease release failed (the lease then runs out its TTL). */
+export const DRAIN_LEASE_RELEASE_FAILED = "drain_lease_release_failed";
+
 export class DrainLockError extends Error {
   constructor(readonly code: "drain_locked" | "drain_peer_locked" | "drain_lock_invalid" | "drain_lock_lost") {
     super(code);
@@ -705,7 +710,11 @@ export interface DrainLease {
    * every mutation and before every canonical put.
    */
   alive(): boolean;
-  release(): Promise<void>;
+  /**
+   * Expire the lease in place. Never throws: false when the write failed (the lease then runs out its TTL), true
+   * otherwise (released, or lost to another holder, which is theirs to keep).
+   */
+  release(): Promise<boolean>;
 }
 
 /** Take the lease: create-only, or CAS over an expired one. A live lease (anyone's) refuses. */
@@ -746,8 +755,8 @@ export async function acquireDrainLock(store: ObjectStore, keyRoot: string, opts
     },
     async release() {
       // Expire it in place (the drain never deletes). A lost lease is someone else's now: leave it.
-      if (lost) return;
-      await store.put(objectKey(key), body(0), { ifMatch: version, contentType: "application/json" }).catch(() => {});
+      if (lost) return true;
+      return store.put(objectKey(key), body(0), { ifMatch: version, contentType: "application/json" }).then(() => true, () => false);
     },
   };
 }
@@ -841,6 +850,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   const nowMs = () => (opts.now ?? (() => new Date()))().getTime();
   let lease: DrainLease | undefined;
   let lockLost: unknown;
+  let leaseReleaseFailed = false;
   let renewTimer: ReturnType<typeof setInterval> | undefined;
   if (opts.dryRun) {
     await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
@@ -1088,14 +1098,21 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   await checkpointChain;
   } finally {
     if (renewTimer) clearInterval(renewTimer);
-    if (lockLost === undefined) await lease?.release();
+    if (lockLost === undefined && lease && !(await lease.release())) leaseReleaseFailed = true;
   }
+  // A failed run says so when its lease could not be released either (it then runs out its TTL): the error carries
+  // `leaseRelease: "drain_lease_release_failed"`, which the CLI prints beside the refusal.
+  const failWith = (error: unknown): never => {
+    if (leaseReleaseFailed && error !== null && typeof error === "object") (error as { leaseRelease?: string }).leaseRelease = DRAIN_LEASE_RELEASE_FAILED;
+    throw error;
+  };
   // A caller's stop outranks what it caused (refused writes, a listing that failed after it).
   const halted = opts.halt?.();
-  if (halted !== undefined) throw halted;
-  if (fatal) throw fatal.error;
-  if (checkpointError !== undefined) throw checkpointError;
-  if (lockLost !== undefined) throw lockLost;
+  if (halted !== undefined) failWith(halted);
+  if (fatal) failWith(fatal.error);
+  if (checkpointError !== undefined) failWith(checkpointError);
+  if (lockLost !== undefined) failWith(lockLost);
+  if (leaseReleaseFailed) summary.lease_release = DRAIN_LEASE_RELEASE_FAILED;
   return summary;
 
   /** Drain one batch group. True when every object of it reached a terminal outcome (the checkpoint may pass it). */

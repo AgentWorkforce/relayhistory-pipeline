@@ -8,7 +8,7 @@ import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAd
 import type { OrderedControlInput } from "../ledger.ts";
 import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason, runBackfill } from "../../../scripts/upload-fence-backfill.ts";
-import { toolLedgerBucket } from "../ledger-tool-store.ts";
+import { TOOL_HOME_RECHECK_MS, toolLedgerBucket } from "../ledger-tool-store.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { isLedgerKey, ledgerHomeKey, ledgerRoutedStore } from "../ledger-store.ts";
 import { scratchStore } from "./support.ts";
@@ -1404,6 +1404,52 @@ describe("a relocated ledger (INGEST_LEDGER_BUCKET, docs/ledger-relocation.md): 
     expect(await ownerOf(ledger, A, "origin-1", "claude", "kept")).toMatchObject({ sessionId: "kept" });
     expect(await entryOf(ledger, A, "origin-1", "rec-1")).toEqual([1, "rec-1:r1", hex("a"), sessionKeyHash("claude", "kept"), expect.any(Number), expect.any(Number)]);
     for (const k of stale) expect(dec.decode(await readAll(await locker.get(objectKey(k))))).toBe("stale pre-relocation copy");
+  });
+
+  test("the CLI entry: the Locker marker flips mid-run: the ownership section stops at its next page with the code, no ledger write after", async () => {
+    await reset(A, "req-1", "2030-01-02T00:00:00.000Z");
+    for (let i = 0; i < 5; i++) await own(A, "origin-1", "claude", `sess-${i}`);
+    const locker = scratch(), ledger = scratch();
+    const LOCKER = "example-locker-bucket", LEDGER = "example-ledger-bucket";
+    const marker = (bucket: string) => enc.encode(JSON.stringify({ v: 1, home: bucket, writtenAtMs: 1 }));
+    await locker.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    const log: string[] = [];
+    let t = 0, flippedAt = -1;
+    const ledgerWritesAfterFlip: string[] = [];
+    // The ledger bucket: after the first owner stub lands, a relocation elsewhere rewrites the Locker marker, and a
+    // minute passes on the re-check's clock.
+    const ledgerSeen: ObjectStore = { ...ledger, backend: ledger.backend,
+      head: (k) => ledger.head(k), get: (k, r) => ledger.get(k, r), getObject: (k, r) => ledger.getObject(k, r), list: (p, c) => ledger.list(p, c),
+      presignGet: (k, x) => ledger.presignGet(k, x), delete: (k) => ledger.delete(k),
+      put: async (k, b, o) => {
+        if (flippedAt >= 0) ledgerWritesAfterFlip.push(String(k));
+        const ack = await ledger.put(k, b, o);
+        if (flippedAt < 0 && String(k).includes("/ledger/")) {
+          await locker.put(objectKey(ledgerHomeKey(ROOT)), marker("example-other-env-ledger"));
+          flippedAt = log.length;
+          t += TOOL_HOME_RECHECK_MS;
+        }
+        return ack;
+      } };
+    const env = { INGEST_LEDGER_BUCKET: LEDGER, INGEST_LEDGER_REGION: "eu-west-1", INGEST_LEDGER_HOME_GUARD: "on" };
+    const args = parseBackfillArgs(["--execute", "--bucket", LOCKER, "--kms-key-arn", "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-4000-8000-000000000000",
+      "--row-page-size", "1", "--concurrency", "1"]);
+    const run = runBackfill(args, {
+      sql: recordingSql(log), env, credentials: { accessKeyId: "AKIAEXAMPLE", secretAccessKey: "secret" }, ledgerBucket: toolLedgerBucket(env, args),
+      create: (c) => (c.bucket === LOCKER ? locker : c.bucket === LEDGER ? ledgerSeen : (() => { throw new Error("unexpected_bucket"); })()),
+      recheck: { now: () => t },
+    });
+    await expect(run).rejects.toThrow(/^ledger_home_mismatch$/);
+    expect(flippedAt).toBeGreaterThan(0);
+    const ownershipPages = (from: number, to = log.length) => log.slice(from, to).filter((q) => q.startsWith("SELECT DISTINCT org_id, workspace_id, user_id, origin_id, source, session_id FROM (")).length;
+    // One page per owner row: one read before the flip; after it exactly one more (whose write found the refusal), then
+    // none of the three left, and nothing of the revision section.
+    expect(ownershipPages(0, flippedAt)).toBe(1);
+    expect(ownershipPages(flippedAt)).toBe(1);
+    expect(log.slice(flippedAt).some((q) => q.includes("ingest_lazy_native_slots"))).toBe(false);
+    expect(ledgerWritesAfterFlip).toEqual([]);
+    expect(await ownerOf(ledger, A, "origin-1", "claude", "sess-1")).toBeUndefined();
   });
 
   test("a fences-only run writes the Locker store alone", async () => {

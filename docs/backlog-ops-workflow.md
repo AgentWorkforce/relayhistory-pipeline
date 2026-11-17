@@ -286,7 +286,9 @@ markers, the layout and the lease in `BACKLOG_OPS_BUCKET`. Before the first writ
 `BACKLOG_OPS_BUCKET`'s marker names exactly that ledger bucket (`ledger_home_mismatch`: a variable pointing at another
 environment's ledger refuses here) and the ledger bucket's own marker names it (`ledger_home_missing`,
 `ledger_home_moved`), and they check again before a ledger write once a minute has passed since the last good check
-(a refusal then stops the run at its next boundary with that code, a failed receipt; the drain still releases its lease). The
+(a refusal then stops the run at its next boundary with that code, a failed receipt: the drain before its next batch
+group, after releasing its lease, logging `drain_lease_release_failed` if that release fails; the backfill before its
+next SQL page, slot window or org read, or after its current merge pass). The
 export touches no ledger key and does not take them.
 
 **Set them as environment variables only.** `vars.*` falls back to a repository or organisation variable of the same
@@ -453,9 +455,11 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      `s3:GetObject`, and the write role `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption`
      condition, since the tools send no encryption header there. Both need `s3:GetObject` on
      `<root>/.ledger/fence-authority/.ledger-home.json`, and `s3:ListBucket` on the bucket with `StringLike`
-     `s3:prefix` = `<root>/.admission-inbox/*` and `<root>/.ledger/fence-authority/.ledger-home.json` (without it
-     a missing shard or stub reads as a 403, not a 404, and the run fails; a missing marker would read as
-     `access_denied` rather than `ledger_home_missing`, a refusal either way). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     `s3:prefix` = `<root>/.admission-inbox/*`, required (without it a missing shard or stub reads as a 403, not a
+     404, and the run fails; the stack refuses a condition without it), and optionally also
+     `<root>/.ledger/fence-authority/.ledger-home.json`, so a missing marker reads as `ledger_home_missing` rather
+     than `access_denied` (a refusal either way). Whether S3 applies the `s3:prefix` condition to its 404-vs-403
+     decision on a `GetObject` is to be confirmed on the first real run against the ledger bucket. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses

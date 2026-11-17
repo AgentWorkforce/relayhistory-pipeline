@@ -222,6 +222,8 @@ export async function runBackfill(args: BackfillArgs, deps: {
   const guarded = backfillWritesNoLedger(args.sections) ? null : homeGuardedToolStore(stores, BACKFILL_KEY_ROOT, args.bucket, deps.env, deps.recheck);
   const summary = await backfillUploadFences({
     sql: deps.sql, store: guarded ?? stores.store, keyRoot: BACKFILL_KEY_ROOT, dryRun: args.mode === "dry_run",
+    // A sticky refusal stops the ownership and revision sections at their next page, window, org or merge pass.
+    ...(guarded ? { halt: () => guarded.homeRefusal() } : {}),
     ...(args.orgs.length ? { orgs: args.orgs } : {}),
     sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
     ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
@@ -229,7 +231,7 @@ export async function runBackfill(args: BackfillArgs, deps: {
     ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
     ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
   });
-  // A refusal mid-run left the remaining ledger writes failed: the run fails with the closed code, not a summary.
+  // Belt and braces (the library throws it at its next boundary): never a summary after a refusal.
   const refused = guarded?.homeRefusal();
   if (refused !== undefined) throw refused;
   return summary;
