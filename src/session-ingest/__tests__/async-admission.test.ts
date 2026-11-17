@@ -425,6 +425,20 @@ describe("consumer", () => {
     expect(await admitMessage(deps(q.s, ledger), q.message, 2)).toMatchObject({ action: "ack", outcome: "already_terminal" });
   });
 
+  test("onTenant sees the decoded tenant before the claim, and a throw from it never changes the outcome", async () => {
+    const plain = await queued(), hooked = await queued();
+    const seen: unknown[] = [];
+    const order: string[] = [];
+    const ledgerA = new MemoryLedger(), ledgerB = new MemoryLedger();
+    const claim = ledgerB.claim.bind(ledgerB);
+    ledgerB.claim = async (...args: Parameters<typeof claim>) => { order.push("claim"); return claim(...args); };
+    const a = await admitMessage(deps(plain.s, ledgerA), plain.message, 1);
+    const b = await admitMessage({ ...deps(hooked.s, ledgerB), onTenant: (t) => { seen.push(t); order.push("tenant"); throw new Error("hint failed"); } }, hooked.message, 1);
+    expect(b).toEqual(a);
+    expect(seen).toEqual([TENANT]);
+    expect(order).toEqual(["tenant", "claim"]);
+  });
+
   test("a lock timeout is retried with backoff, never refused, and writes no outcome", async () => {
     const q = await queued();
     const ledger = new MemoryLedger();

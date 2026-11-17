@@ -149,7 +149,7 @@ export interface SelfhostAdmissionOptions {
    * first admission decodes (a machine directory, `m=<hash of ws, origin, user>`, belongs to exactly one user), so a
    * key found only by a scan counts, and waits after a deferral, in its user's group `u:<org>\n<user>` (the group
    * notify's hint gives and the limiter counts) rather than its directory's. In-flight starts of a directory move to
-   * its user's group when it is learned. Bounded by `learnedUserMax`, oldest out.
+   * its user's group when it is learned. Bounded by `learnedUserMax`, first learned first out (FIFO).
    * Absent: scan-found keys use the per-directory group, unchanged.
    */
   learnUsers?: boolean;
@@ -192,6 +192,8 @@ export interface SelfhostAdmissionConsumer {
   status(): SelfhostAdmissionStatus;
   /** How many inbox keys currently carry a writer-user hint (bounded by userHintMax). Tests. */
   userHints(): number;
+  /** learnUsers: machine directories with a learned user, and the tenant counters still held. Tests. */
+  learnedUsers(): { directories: number; held: number; groups: number; orgs: number };
 }
 
 interface Entry { attempts: number; notBefore: number; addedAt: number; receivedAtMs: number; spreadRank?: string }
@@ -237,16 +239,18 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     if (r < 0 || slash < 0 || slash > r) return undefined;
     const org = key.slice(inboxPrefix.length, slash);
     const dir = key.slice(0, r);
-    const user = userOf.get(key) ?? (learnUsers ? userOfDir.get(dir) : undefined);
+    const user = userOf.get(key) ?? userOfDir?.get(dir);
     return { org, group: user !== undefined ? `u:${user}` : `d:${dir}` };
   };
-  /** learnUsers: machine directory (`…/m=<hash>`) -> `<org>\n<userId>`, from a decoded admission. Bounded, oldest out. */
+  // learnUsers only (absent otherwise, so flag off creates nothing and counts exactly as before):
   const learnUsers = caps !== undefined && opts.learnUsers === true;
   const learnedUserMax = Math.max(1, Math.floor(opts.learnedUserMax ?? USER_HINT_MAX));
-  const userOfDir = new Map<string, string>();
+  /** Machine directory (`…/m=<hash>`) -> `<org>\n<userId>`, from a decoded admission. FIFO-bounded (oldest learned out). */
+  const userOfDir = learnUsers ? new Map<string, string>() : undefined;
   /** In-flight key -> the groups its start was counted in (learn() moves a directory's count to its user's group). */
-  const held = new Map<string, { org: string; group: string }>();
+  const held = learnUsers ? new Map<string, { org: string; group: string }>() : undefined;
   const learn = (key: string, tenant: { orgId: string; userId: string }) => {
+    if (!userOfDir || !held) return;
     if (!key.startsWith(`${inboxPrefix}${tenant.orgId}/`) || typeof tenant.userId !== "string" || tenant.userId === "") return;
     const r = key.indexOf("/r=", inboxPrefix.length);
     if (r < 0) return;
@@ -533,7 +537,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         if ((caps.maxPerOrg >= 1 && (inflightOrg.get(tenant.org) ?? 0) >= caps.maxPerOrg)
           || (caps.maxPerUser >= 1 && (inflightGroup.get(tenant.group) ?? 0) >= caps.maxPerUser)) continue;
         bump(inflightOrg, tenant.org, 1); bump(inflightGroup, tenant.group, 1);
-        held.set(key, { org: tenant.org, group: tenant.group });
+        held?.set(key, { org: tenant.org, group: tenant.group });
       }
       // Past every skip: if its org's window just ended, this start is the org's one probe claim.
       const probe = waitOrg !== undefined && authorityProbe.has(waitOrg);
@@ -546,11 +550,16 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         .finally(() => {
           inflight.delete(key);
           if (probe) probing.delete(waitOrg!);
-          const h = held.get(key);
-          if (h) {
-            held.delete(key);
-            bump(inflightOrg, h.org, -1); bump(inflightGroup, h.group, -1);
+          if (tenant && !held) {
+            bump(inflightOrg, tenant.org, -1); bump(inflightGroup, tenant.group, -1);
             // A finished (non-deferred) admission freed this user's slot: its siblings may try again now.
+            if (!deferred) busyUntil.delete(tenant.group);
+          }
+          // learnUsers: the counts may have moved to the user's group since the start (learn()).
+          const h = held?.get(key);
+          if (h) {
+            held!.delete(key);
+            bump(inflightOrg, h.org, -1); bump(inflightGroup, h.group, -1);
             if (!deferred) { busyUntil.delete(h.group); if (tenant && tenant.group !== h.group) busyUntil.delete(tenant.group); }
           }
           running.delete(p); pump();
@@ -626,6 +635,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     },
     status,
     userHints: () => userOf.size,
+    learnedUsers: () => ({ directories: userOfDir?.size ?? 0, held: held?.size ?? 0, groups: inflightGroup.size, orgs: inflightOrg.size }),
   };
 }
 

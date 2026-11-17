@@ -124,9 +124,14 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
     so the mapping is exact. From then on, every key of that directory counts, and waits after a deferral, in
     the user's group, which is the group the writer hint uses and the limiter counts. Admissions of the
     directory already in flight move to the user's group when it is learned.
-  - **Limits.** The map is in-process and bounded (oldest out). The first admission of each directory can
-    still be deferred, as before. The limiter after the claim stays the authoritative guard, so the hint can
-    only skip a start the limiter would refuse.
+  - **Limits.** The map is in-process and holds at most 100,000 directories, first learned first out (FIFO,
+    not LRU; no setting). An evicted directory falls back to its directory group until it is learned again.
+    The first admission of each directory can still be deferred, as before.
+  - **Guarantees.** The limiter after the claim stays the authoritative guard. The hint never starts more than
+    the limiter allows. Because it counts this process's in-flight starts, an entry may wait slightly longer
+    than the limiter alone would make it.
+  - **Needs the tenant limit.** With `INGEST_S3_TENANT_LIMIT` off, startup refuses
+    `SELFHOST_ADMISSION_LEARN_USERS=on` rather than start and do nothing.
 - **Several replicas (`SELFHOST_ADMISSION_SPREAD=on`, default off).** Every replica lists the same inbox.
   With strict oldest-first (off, unchanged) they all start on the same oldest entries, and the losers end as
   `already_terminal` / tombstoned or `retry ledger_attempt_superseded`: measured with 2 replicas, about half of

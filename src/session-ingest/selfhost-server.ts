@@ -219,6 +219,8 @@ export interface SelfhostRuntimeOptions {
   log?: SelfhostAdmissionOptions["log"];
   /** Tests: the consumer's per-user hint bound (SelfhostAdmissionOptions.userHintMax). */
   userHintMax?: number;
+  /** Tests: the consumer's learned-directory bound (SelfhostAdmissionOptions.learnedUserMax). */
+  learnedUserMax?: number;
 }
 
 /**
@@ -358,6 +360,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   // INGEST_ASYNC_MAX_PER_ORG (default half the consumer) per org, so one org's backlog never holds every consumer slot.
   // Only the slot calls differ: every other ledger method is the same S3 ledger.
   const asyncLimiter = tenantLimit ? tenantLimiter() : undefined;
+  // SELFHOST_ADMISSION_LEARN_USERS feeds the tenant-cap hint, which exists only with the tenant limit: refused
+  // without it, rather than start and silently do nothing.
+  if (admission.learnUsers && !asyncLimiter) throw new Error("96bulls: SELFHOST_ADMISSION_LEARN_USERS=on needs INGEST_S3_TENANT_LIMIT=on");
   const consumerDeliver: DeliverDeps = asyncLimiter ? {
     ...deliver,
     ledger: { ...ledger, acquireSlot: async (request) => asyncLimiter.acquire(request), releaseSlot: async (tenant, holder) => asyncLimiter.release(tenant, holder) },
@@ -377,6 +382,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // SELFHOST_ADMISSION_LEARN_USERS=on: the tenant-cap hint groups scan-found keys by their learned user. Off: unchanged.
     ...(admission.learnUsers ? { learnUsers: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
+    ...(options.learnedUserMax !== undefined ? { learnedUserMax: options.learnedUserMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:
     // it is off the request path and serial per stream).

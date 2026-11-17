@@ -71,7 +71,7 @@ function edge(opts: { admission?: { mode: "async"; concurrency: number; scanInte
   /** INGEST_S3_TENANT_LIMIT: on ({}, or with asyncMaxPerOrg) by default here; null = off. */
   limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number;
   /** Share another edge's store (a second process: its consumer has none of the first one's notify hints). */
-  base?: ObjectStore; userHintMax?: number }) {
+  base?: ObjectStore; userHintMax?: number; learnedUserMax?: number }) {
   const s = opts.base ? { store: opts.base, done: () => {} } : scratchStore();
   cleanups.push(s.done);
   const g = gatedStore(s.store);
@@ -87,6 +87,7 @@ function edge(opts: { admission?: { mode: "async"; concurrency: number; scanInte
   }, { run: (async (text: string) => { sql.push(text); throw new Error("SQL runner called on the S3 ledger path"); }) as never, store: g.store,
     verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} },
   { startConsumer: false, nowMs: () => clock, onConsumer: (c) => { consumer = c; }, ...(opts.userHintMax !== undefined ? { userHintMax: opts.userHintMax } : {}),
+    ...(opts.learnedUserMax !== undefined ? { learnedUserMax: opts.learnedUserMax } : {}),
     log: { info: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), warn: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), error: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}) } as never });
   cleanups.push(() => runtime.close());
   const identity = { ...TENANT, scopes: [SYNC_SCOPE] } as unknown as IngestIdentity;
@@ -332,7 +333,31 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     for (let i = 0; i < 10 && (await Promise.all(keys.map(statusOf(e)))).some((s) => s !== "admitted"); i++) { e.advance(11_000); await e.consumer().scan(); await e.consumer().settle(); }
     expect(await Promise.all(keys.map(statusOf(e)))).toEqual(keys.map(() => "admitted"));
     expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    // Every counter drained: nothing held, no group or org count left behind (moved counts included).
+    expect(e.consumer().learnedUsers()).toMatchObject({ held: 0, groups: 0, orgs: 0 });
+    if (learnUsers) expect(e.consumer().learnedUsers().directories).toBe(2);
+    else expect(e.consumer().learnedUsers().directories).toBe(0);
     expect(e.sql).toEqual([]);
+  });
+
+  test("learnUsers, learnedUserMax 1: a second directory evicts the first, which falls back to its directory group; everything drains to zero", async () => {
+    const e = edge({ admission: { mode: "async", concurrency: 8, scanIntervalMs: 15_000, maxAttempts: 20, learnUsers: true },
+      direct: true, limit: { asyncMaxPerOrg: 8 }, maxPerUser: 2, userHintMax: 0, learnedUserMax: 1 });
+    await writeAuthority(e.base);
+    const keys: string[] = [];
+    for (const origin of ["origin-1", "origin-2"]) for (let i = 1; i <= 3; i++) keys.push(await upload(e.base, `batch-ev-${origin}-${i}`, `ev-${origin}-${i}`, TENANT, origin));
+    await e.consumer().scan();
+    for (let i = 0; i < 12 && (await Promise.all(keys.map(statusOf(e)))).some((s) => s !== "admitted"); i++) { await e.consumer().settle(); e.advance(11_000); await e.consumer().scan(); }
+    expect(await Promise.all(keys.map(statusOf(e)))).toEqual(keys.map(() => "admitted"));
+    // Bounded: never more than one learned directory, and no counter left behind by an eviction mid-flight.
+    expect(e.consumer().learnedUsers()).toEqual({ directories: 1, held: 0, groups: 0, orgs: 0 });
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
+  });
+
+  test("SELFHOST_ADMISSION_LEARN_USERS without the tenant limit is refused at startup (it would do nothing)", () => {
+    expect(() => edge({ admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 20, learnUsers: true }, direct: true, limit: null }))
+      .toThrow("SELFHOST_ADMISSION_LEARN_USERS=on needs INGEST_S3_TENANT_LIMIT=on");
   });
 
   test("the writer hint never holds back another user of the same org", async () => {
