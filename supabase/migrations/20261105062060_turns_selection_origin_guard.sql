@@ -1,15 +1,6 @@
--- SLOT 062015. Defense in depth before 062020 installs the relay-turn privacy tables.
--- Code only: applying this migration or changing any runtime flag requires Khaliq's
--- separate explicit approval.
---
--- Every ordinary selection takes the shared side of the global privacy lock before
--- its per-user fence lock or upload_deletions write. The reviewed 062020 rollback
--- wrapper takes the exclusive side first, so it can never hold turn_session_fences
--- while an ordinary erasure holds upload_deletions and waits for that turn fence.
---
--- The reserved turns origin is owned only by /v1/turns/batches. Rejecting it here is
--- the SQL boundary behind the matching HTTP validation and protects every current
--- or future caller of ingest_apply_selection.
+-- SLOT 062060. Reserve the relay-turn origin at the ordinary-selection SQL
+-- boundary. Code only: applying this migration or changing any runtime flag
+-- requires Khaliq's separate explicit approval.
 
 SET LOCAL lock_timeout='5s';
 SET LOCAL statement_timeout='120s';
@@ -23,7 +14,6 @@ BEGIN
  IF p_origin='relayhistory:conversation_turns:v1' THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='session ingest: turns origin is reserved';
  END IF;
- PERFORM pg_advisory_xact_lock_shared(961996,50000);
  PERFORM sessions.ingest_lock_fences(p_org,p_ws,p_user);
  IF p_enabled THEN
   DELETE FROM sessions.upload_deletions AS d

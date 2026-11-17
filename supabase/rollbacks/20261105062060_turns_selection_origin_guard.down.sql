@@ -1,18 +1,18 @@
--- Generated turns selection hardening rollback. Restores 030000's exact ingest_apply_selection body.
--- Run only after rolling back 062020 through its operator wrapper. Code only: hosted execution needs Khaliq's OK.
+-- Generated turns selection origin-guard rollback. Restores 030000's exact ingest_apply_selection body.
+-- Code only: hosted execution needs Khaliq's separate explicit approval.
 BEGIN;
 SET LOCAL lock_timeout='5s';
 SET LOCAL statement_timeout='120s';
 SELECT pg_advisory_xact_lock(961996,1);
 DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
- THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection hardening: migration ledger required';END IF;
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection origin guard: migration ledger required';END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
- IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062015_turns_selection_hardening.sql')
- THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection hardening: a later migration is applied; roll it back first';END IF;
- SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062015_turns_selection_hardening.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM '1980db416eda063a2610259f9191d706d9751d4424015f6a3dee6e9177fc8865'
- THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection hardening: own applied checksum required';END IF;
+ IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062060_turns_selection_origin_guard.sql')
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection origin guard: a later migration is applied; roll it back first';END IF;
+ SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062060_turns_selection_origin_guard.sql' FOR UPDATE;
+ IF NOT FOUND OR v_sha IS DISTINCT FROM 'd8457cc296da41b0dc8e5c796acbc62e72f81d21be345550fe2f261db6bba48f'
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='turns selection origin guard: own applied checksum required';END IF;
 END $rollback_guard$;
 CREATE OR REPLACE FUNCTION sessions.ingest_apply_selection(p_org text, p_ws text, p_user text, p_origin text,
                                                 p_sessions jsonb, p_enabled boolean)
@@ -53,5 +53,5 @@ BEGIN
   RETURN v_n;
 END
 $apply$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062015_turns_selection_hardening.sql' AND sha256='1980db416eda063a2610259f9191d706d9751d4424015f6a3dee6e9177fc8865';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062060_turns_selection_origin_guard.sql' AND sha256='d8457cc296da41b0dc8e5c796acbc62e72f81d21be345550fe2f261db6bba48f';
 COMMIT;

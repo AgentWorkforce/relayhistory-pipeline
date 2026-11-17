@@ -44,10 +44,8 @@ Khaliq's explicit approval. In order:
    live-revision rule. Cloud refuses a non-empty `forward` write before Neon or ingest unless
    `SESSION_READ_BACKEND=canonical`, so a misordered writer flip cannot acknowledge an invisible
    turn.
-2. **Erasure fence off Neon.** Apply `20261105062015_turns_selection_hardening.sql` first; it
-   orders ordinary selection/erasure behind the shared global privacy lock and reserves the turns
-   origin at the SQL boundary. Migration `20261105062020_turns_forward_gates.sql` then adds the
-   permanent logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
+2. **Erasure fence off Neon.** Migration `20261105062020_turns_forward_gates.sql` adds the permanent
+   logical turn-fence census and `ingest_turn_register`. The turns route registers its exact writers
    under a per-logical-session transaction advisory lock shared with erasure capture, then attests
    the completed registration with `X-Relay-Turn-Fence: registered-v1`; relayhistory-cloud refuses
    before posting any batch unless the independently default-off `INGEST_TURN_FENCE_REGISTER=on`
@@ -63,6 +61,10 @@ Khaliq's explicit approval. In order:
    registration shares its global privacy lock, and the erase-ledger insert removes that user's
    auxiliary writer rows. Its separate erase path removes the user's bytes and index rows; it does
    not claim a per-session directory witness.
+   The append-only `20261105062060_turns_selection_origin_guard.sql` migration separately reserves
+   the synthetic turns origin at the ordinary selection SQL boundary. The public delivery,
+   selection, and archive-recovery HTTP boundaries reject the same origin before it can reach an
+   ordinary ingest path.
 3. **Custody.** Cloud forward is Neon-free only in `frozen-supabase`. `supabase-authority` continues
    to refuse all non-empty turn writes and must not be used for this migration. Flip custody first,
    under its own runbook and approval.
@@ -86,7 +88,8 @@ Khaliq's explicit approval. In order:
    `(workspace, source, session, turn_index)`. Run `--verify` successfully after the final export;
    once forward begins, never return to `neon` without re-exporting the affected scopes.
 
-Activation is allowed only after both migrations are applied, the legacy fence import and legacy export
+Activation is allowed only after the required migrations are applied (including the append-only
+selection-origin guard), the legacy fence import and legacy export
 both verify equal, `frozen-supabase` is already healthy, owner-buffered exact-session reads and
 canonical reads are healthy for the canary, and publication/GC have no backlog. `TURNS_WRITE_PATH`
 stays unset/`neon` while these code changes are reviewed.
@@ -104,11 +107,12 @@ canonical. Neon is complete only for a preceding `dual` interval; after any dire
 interval, returning to Neon would split authority and is forbidden until the affected scopes are
 re-exported and verified.
 
-Before the first registration only, a separately approved schema rollback must run
+Before the first registration only, a separately approved schema rollback must first roll back
+`20261105062060_turns_selection_origin_guard.sql`, then run
 `supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql` with psql
-`ON_ERROR_STOP`. The wrapper sets the statement and lock timeouts, takes the migration/global
-privacy locks, and pre-locks the live ledgers before the turn tables; it then invokes the frozen down
-file in the same transaction. Schedule this only in a quiet window with selection and erasure
-writers stopped, and treat any timeout as a failed rollback. Never run the bare
-`20261105062020_turns_forward_gates.down.sql` directly. Roll back 062020 before 062015 so the
-shared selection lock remains installed for the entire operation.
+`ON_ERROR_STOP`. The wrapper sets the statement and lock timeouts, validates the exact migration
+ledger entry, and then invokes the frozen down file in the same transaction. The frozen down can
+abort a concurrent erasure because their table-lock orders differ; the abort is retriable and fails
+closed, but the operator must first pause every selection and erasure intake path and use a quiet
+window. Treat any timeout as a failed rollback. Never run the bare
+`20261105062020_turns_forward_gates.down.sql` directly.

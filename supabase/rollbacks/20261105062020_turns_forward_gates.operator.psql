@@ -2,10 +2,11 @@
 -- Canonical operator wrapper for the frozen 062020 down migration. Do not run
 -- 20261105062020_turns_forward_gates.down.sql directly.
 --
--- The migration lock orders this rollback against every schema apply. The global
--- privacy lock orders it against 062015's ordinary selection/erasure path. Pre-lock
--- the live ledgers before the turn tables so the frozen down file's later repeated
--- LOCK statements are re-entrant instead of participating in the old cycle.
+-- PRECONDITION: pause every erasure/selection intake path before invoking this file.
+-- The frozen down's table-lock order can abort a concurrent erasure; that failure is
+-- retriable and fail-closed, but the wrapper must not be used while intake is live.
+-- The migration lock orders the ledger preflight against every schema apply. The
+-- frozen down takes the same lock re-entrantly after this wrapper sets both timeouts.
 BEGIN;
 SET LOCAL statement_timeout='120s';
 SET LOCAL lock_timeout='5s';
@@ -26,9 +27,4 @@ BEGIN
   END IF;
 END
 $operator_guard$;
-SELECT pg_advisory_xact_lock(961996,50000);
-LOCK TABLE sessions.upload_deletions,sessions.operator_user_erasures
- IN SHARE ROW EXCLUSIVE MODE;
-LOCK TABLE sessions.turn_session_fences,sessions.turn_writers
- IN SHARE ROW EXCLUSIVE MODE;
 \ir 20261105062020_turns_forward_gates.down.sql

@@ -3,7 +3,6 @@ import { describe, expect, test } from "bun:test";
 import pg from "pg";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -27,20 +26,6 @@ const read = (path: string) =>
     .split("\n")
     .filter((line) => !line.startsWith("\\"))
     .join("\n");
-const operatorTurnsDown = () => {
-  const down = readFileSync(
-    join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"),
-    "utf8",
-  );
-  return readFileSync(
-    join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql"),
-    "utf8",
-  )
-    .replace("\\ir 20261105062020_turns_forward_gates.down.sql", down)
-    .split("\n")
-    .filter((line) => !line.startsWith("\\"))
-    .join("\n");
-};
 const tenant = { orgId: "turn-race-org", workspaceId: "turn-race-ws", userId: "turn-race-user" };
 const registerInput = (sessionId: string) =>
   JSON.stringify({ tenant, sessions: [["claude", sessionId]] });
@@ -59,8 +44,7 @@ describe.skipIf(!url)("turn fence registration on real PostgreSQL", () => {
       await pool.query(read("supabase/tests/supabase_shim.sql"));
       await pool.query("CREATE EXTENSION btree_gin;CREATE EXTENSION pg_trgm");
       for (const file of SESSION_BOOTSTRAP_FILES) await pool.query(read(file));
-      for (const file of readdirSync(join(root, "supabase/migrations")).sort()
-        .filter((file) => file <= "20261105062020_turns_forward_gates.sql"))
+      for (const file of readdirSync(join(root, "supabase/migrations")).sort())
         await pool.query(read(`supabase/migrations/${file}`));
 
       const connection = async (role = false) => {
@@ -184,50 +168,6 @@ describe.skipIf(!url)("turn fence registration on real PostgreSQL", () => {
         "SELECT session_id FROM sessions.turn_session_fences WHERE org_id=$1 AND workspace_id=$2 AND session_id=ANY($3::text[]) ORDER BY session_id",
         [tenant.orgId, tenant.workspaceId, [ea, eb]],
       )).rows.map((row) => row.session_id)).toEqual([ea, eb]);
-
-      const selectionSource = (await pool.query<{ source: string }>(
-        "SELECT prosrc source FROM pg_proc WHERE oid='sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)'::regprocedure",
-      )).rows[0]!.source;
-      expect(selectionSource.indexOf("pg_advisory_xact_lock_shared(961996,50000)"))
-        .toBeLessThan(selectionSource.indexOf("ingest_lock_fences"));
-
-      // Pause an ordinary selection inside the upload_deletions trigger. The documented
-      // operator wrapper takes the exclusive global privacy lock before any table lock, so
-      // it waits for the selection instead of forming the former table-lock cycle.
-      const rollbackSession = "rollback-selection-race";
-      await pool.query(
-        "CREATE TABLE sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL)",
-      );
-      const turnsSql = readFileSync(
-        join(root, "supabase/migrations/20261105062020_turns_forward_gates.sql"),
-      );
-      const turnsSha = createHash("sha256").update(turnsSql).digest("hex");
-      await pool.query(
-        "INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES('upstream:20261105062020_turns_forward_gates.sql',$1)",
-        [turnsSha],
-      );
-      await writer.query("BEGIN;SET LOCAL statement_timeout='10s'");
-      await eraser.query("BEGIN;SET LOCAL statement_timeout='10s'");
-      await writer.query(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1||chr(31)||$2||chr(31)||'claude'||chr(31)||$3,0))",
-        [tenant.orgId, tenant.workspaceId, rollbackSession],
-      );
-      const pendingSelection = eraser.query(
-        "SELECT sessions.ingest_apply_selection($1,$2,$3,'desktop-origin',$4::jsonb,false)",
-        [tenant.orgId, tenant.workspaceId, tenant.userId, JSON.stringify([["claude", rollbackSession]])],
-      );
-      await waitForLock(eraserPid, writerPid);
-      const operator = await pool.connect();
-      held.push(operator);
-      const operatorPid = await pid(operator);
-      const pendingDown = operator.query(operatorTurnsDown());
-      await waitForLock(operatorPid, eraserPid);
-      await writer.query("COMMIT");
-      await pendingSelection;
-      await eraser.query("COMMIT");
-      const downError = await pendingDown.then(() => null, (error: { code?: string }) => error);
-      expect(downError?.code).toBe("55000");
-      await operator.query("ROLLBACK");
     } finally {
       for (const client of held) {
         await client.query("ROLLBACK").catch(() => {});
