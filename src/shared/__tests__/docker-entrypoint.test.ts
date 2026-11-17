@@ -32,6 +32,7 @@ const EXPECTED: Record<string, string[]> = {
   "session-erase-bytes": ["run", "/app/src/session-erase/selfhost-eraser-main.ts"],
   "user-erase": ["run", "/app/src/session-erase/user-erase-main.ts"],
   "s3-ledger-rearm-sweeper": ["run", "/app/src/session-ingest/rearm-sweeper-main.ts", "--loop"],
+  "selfhost-control": ["run", "/app/src/selfhost-control/server.ts"],
 };
 
 let bin = "";
