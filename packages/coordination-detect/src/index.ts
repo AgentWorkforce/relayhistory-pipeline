@@ -198,7 +198,7 @@ function migrationKey(path: string): string {
 }
 
 const outcomePair = (a: LaneFacts, b: LaneFacts) => [laneKey(a), laneKey(b)].sort(textCompare).join("\u0001");
-const findingId = (workspaceId: string, kind: FindingKind, a: LaneFacts, b: LaneFacts, artifact: string) =>
+export const findingId = (workspaceId: string, kind: FindingKind, a: LaneFacts, b: LaneFacts, artifact: string) =>
   stableHex([workspaceId, kind, [laneKey(a), laneKey(b)].sort(textCompare), artifact]);
 const outcomeScore = (tier: OutcomeTier, suppressed: boolean) => suppressed
   ? ({ T1: 0.29, T2: 0.19, T3: 0.09 })[tier]

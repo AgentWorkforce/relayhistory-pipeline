@@ -21,6 +21,7 @@ const EXPECTED: Record<string, string[]> = {
   "hoopdb-indexer": ["run", "/app/src/hoopdb/indexer.ts"],
   referee: ["run", "/app/src/referee/main.ts"],
   "bob-costas": ["run", "/app/src/bob-costas/main.ts"],
+  "coordination-advisor": ["run", "/app/src/coordination-advisor/main.ts"],
   "session-brief": ["run", "/app/src/session-brief/main.ts"],
   "session-read-api": ["run", "/app/src/session-read-api/server.ts"],
   "session-ingest": ["run", "/app/src/session-ingest/selfhost-server.ts"],
