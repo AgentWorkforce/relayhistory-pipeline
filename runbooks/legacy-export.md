@@ -81,6 +81,19 @@ them.
     callers must use at most 30 seconds, treat SQLSTATE `55P03` as retryable,
     and must never disable the timeout. This prevents an erase waiting behind
     an exporter from queueing later shared-lock ingest transactions indefinitely.
+  - **S3 admission/fence precondition.** Before activation, and before any
+    operator session or user erase while this lane is active, get the current
+    per-org ingest-ledger status from the pipeline handoff owner
+    (`pipeline-handoff-sfmini` at the time of writing) and record it in the
+    window evidence. An org admitted through `ingest-edge` with
+    `INGEST_LEDGER=s3` does not consult the SQL erase fences at admission, so a
+    SQL-only erase can be undone by a later S3 re-upload. Do not activate until
+    the evidence names every target org and the handoff owner confirms the
+    reviewed S3-side fence path for each S3-path org; do not run the SQL eraser
+    against such an org before that confirmation. Desktop **Stop syncing** and
+    privacy reset are the safe coordinated paths because they fence in S3 and
+    mirror the result into SQL. The set of S3-path orgs changes during the
+    migration; never rely on a copied org list or an earlier window's receipt.
   - Before the first S3 PUT for a scope, the exporter immutably registers
     `(org, normalized workspace, source, session, legacy user, legacy machine)`.
     A replay must return the same tuple; an owner or machine change refuses.
