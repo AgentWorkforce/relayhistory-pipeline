@@ -20,6 +20,11 @@ import { authorityKind, authorityUrl, eraserFor, legacyExportErasureEnabled } fr
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
+import {
+  LEGACY_EXPORT_ACTIVATION_GENERATION,
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+} from "../../shared/legacy-export-generation.ts";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
 import { authorityFixture, epoch } from "../../session-ingest/__tests__/privacy-authority-support.ts";
@@ -360,7 +365,10 @@ async function world() {
   // The job's read-only connection: the same database (an owner session, as the operator's login would be).
   const authority = supabaseAuthority(f.queryable);
   const logs: Record<string, unknown>[] = [];
-  const job = (a: ErasureAuthority = authority) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), DEFAULT_ERASURE_CONFIG, later, async () => {});
+  const job = (
+    a: ErasureAuthority = authority,
+    cfg = DEFAULT_ERASURE_CONFIG,
+  ) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), cfg, later, async () => {});
   const keys = async () => {
     const out: string[] = [];
     let c: string | undefined;
@@ -401,6 +409,104 @@ describe("supabase privacy authority as the eraser's source", () => {
     expect(
       (await w.f.db.query("SELECT 1 FROM sessions.legacy_export_scope_authority WHERE session_id=$1", [registration.session_id])).rows,
     ).toEqual([]);
+  });
+
+  test("legacy export readiness requires a fresh heartbeat from a healthy real Supabase sweep", async () => {
+    const w = await world();
+    // 062020 is separately owned and absent from this standalone fixture; a
+    // release stack always has it before 062030.
+    await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+      first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
+      PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+    await w.activate();
+    const readyAs = async (generation: string) => {
+      await w.f.db.query("SELECT set_config($1,$2,false)", [
+        LEGACY_EXPORT_GENERATION_SETTING,
+        generation,
+      ]);
+      return w.f.db.query("SELECT sessions.legacy_export_privacy_authority_ready() AS ready");
+    };
+    const ready = () => readyAs(LEGACY_EXPORT_GENERATION);
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
+    // A dry run proves nothing about the deployed deleter and must not arm export.
+    const cfg = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true };
+    await w.job(undefined, cfg).sweep({ dryRun: true });
+    expect((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ n: 0 });
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
+    // The real healthy sweep reaches the eraser-only heartbeat and records
+    // durable evidence for this exact authority activation. Production
+    // keeps this connection read-only by default; only the fixed RPC's explicit
+    // transaction is read-write.
+    await w.f.db.query("SET default_transaction_read_only=on");
+    try {
+      await w.job(undefined, cfg).sweep();
+    } finally {
+      await w.f.db.query("SET default_transaction_read_only=off");
+    }
+    expect((await w.f.db.query("SELECT authority,generation FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({
+      authority: "supabase",
+      generation: LEGACY_EXPORT_GENERATION,
+    });
+    await expect(readyAs(LEGACY_EXPORT_ACTIVATION_GENERATION)).rejects.toMatchObject({ code: "55000" });
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+
+    await w.f.db.query("UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()-interval '31 minutes'");
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+  });
+
+  test("authority transitions clear readiness in one transaction while unrelated updates preserve it", async () => {
+    const w = await world();
+    await w.f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
+      first_fenced_at timestamptz NOT NULL DEFAULT clock_timestamp(),fence_basis text NOT NULL,
+      PRIMARY KEY(org_id,workspace_id,source,session_id))`);
+    await w.activate();
+    const cfg = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true };
+    await w.job(undefined, cfg).sweep();
+    const readinessCount = async () =>
+      (await w.f.db.query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness",
+      )).rows[0]?.n;
+    const activatedAt = async () =>
+      (await w.f.db.query<{ activated_at: string }>(
+        "SELECT activated_at::text FROM sessions.ingest_privacy_authority WHERE singleton",
+      )).rows[0]?.activated_at;
+    const ready = async () => {
+      await w.f.db.query("SELECT set_config($1,$2,false)", [
+        LEGACY_EXPORT_GENERATION_SETTING,
+        LEGACY_EXPORT_GENERATION,
+      ]);
+      return w.f.db.query("SELECT sessions.legacy_export_privacy_authority_ready() AS ready");
+    };
+    expect(await readinessCount()).toBe(1);
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+
+    // fenced_at is not authority identity. Its maintenance must not flap a
+    // healthy readiness row or export would never remain armed.
+    await w.f.db.exec(
+      "UPDATE sessions.ingest_privacy_authority SET fenced_at=fenced_at+interval '1 microsecond' WHERE singleton",
+    );
+    expect(await readinessCount()).toBe(1);
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+
+    const before = await activatedAt();
+    await w.f.db.exec("BEGIN");
+    try {
+      await w.f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch });
+      expect(await readinessCount()).toBe(0);
+      await w.activate();
+      expect(await readinessCount()).toBe(0);
+      await w.f.db.exec("COMMIT");
+    } catch (error) {
+      await w.f.db.exec("ROLLBACK");
+      throw error;
+    }
+    expect(await activatedAt()).not.toBe(before);
+    expect(await readinessCount()).toBe(0);
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
   });
 
   test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {
@@ -652,9 +758,12 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     await a.ready();
     expect(Array.isArray(await a.fencedGroups())).toBe(true);
     expect(Array.isArray(await a.fencedLivePage(null))).toBe(true);
+    await a.recordSuccessfulSweep!();
+    expect((await w.f.db.query("SELECT authority FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ authority: "supabase" });
     // A superuser session that SET ROLE to the eraser role is refused: the login keeps its credential.
     expect(await assertEraserIdentity(w.asEraser).then(() => "ok", (e) => e.code)).toMatch(/^eraser_identity_(not_authenticated_as_privacy_eraser|superuser)$/);
-    for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records"])
+    for (const t of ["sessions.ingest_frozen_source_deletions", "sessions.upload_deletions", "sessions.ingest_privacy_authority", "sessions.ingest_frozen_source_records",
+      "sessions.legacy_export_scope_authority", "sessions.legacy_export_privacy_eraser_readiness"])
       expect(await w.asEraser.query(`SELECT 1 FROM ${t} LIMIT 1`).then(() => "read", (e) => String(e.message))).toContain("permission denied");
     for (const fn of ["sessions.ingest_privacy_authority_state()", "sessions.ingest_privacy_authority_owned_digest()"])
       expect(await w.asEraser.query(`SELECT ${fn}`).then(() => "ran", (e) => String(e.message))).toContain("permission denied");

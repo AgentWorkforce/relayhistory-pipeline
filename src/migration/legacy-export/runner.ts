@@ -35,6 +35,11 @@ import {
 } from "../neon-s3-sync/legacy-source.ts";
 import { selectedPublicTurnPredicateSql } from "../../shared/legacy-turn-source.ts";
 import {
+  LEGACY_EXPORT_ACTIVATION_GENERATION,
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+} from "../../shared/legacy-export-generation.ts";
+import {
   objectKey,
   parseManifest,
   readAll,
@@ -218,12 +223,23 @@ export interface RunDeps {
 
 /**
  * A mapped legacy copy may exist only after Supabase is the active erasure
- * authority. A missing probe is not compatibility: it means the durable
- * authority contract is absent, so exporting must fail closed.
+ * authority and its production eraser has completed a recent healthy sweep
+ * for the current authority activation. A missing probe is not compatibility: it means the
+ * durable authority contract is absent, so exporting must fail closed.
  */
 export async function assertLegacyErasureAuthorityReady(
   db: Queryable,
 ): Promise<void> {
+  // The landing branch deliberately ships the activation-final schema and
+  // eraser writer while keeping every library caller unable to export. This
+  // check is compiled from a constant; flags, environment and a forged DB row
+  // cannot bypass it.
+  const generation: string = LEGACY_EXPORT_GENERATION;
+  if (generation !== LEGACY_EXPORT_ACTIVATION_GENERATION)
+    throw Object.assign(
+      new Error("legacy export requires the activation heartbeat follow-up"),
+      { code: "legacy_export_requires_activation_heartbeat" },
+    );
   const installed = await db.query<{ installed: boolean }>(
     "SELECT to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AS installed",
   );
@@ -233,6 +249,10 @@ export async function assertLegacyErasureAuthorityReady(
       { code: "legacy_export_authority_not_active" },
     );
   try {
+    await db.query("SELECT set_config($1,$2,false)", [
+      LEGACY_EXPORT_GENERATION_SETTING,
+      LEGACY_EXPORT_GENERATION,
+    ]);
     const { rows } = await db.query<{ ready: boolean }>(
       "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
     );
@@ -274,6 +294,11 @@ export async function withLegacyPrivacyFence<T>(
       await db.query("SET LOCAL idle_in_transaction_session_timeout='15min'");
       await db.query("SELECT pg_advisory_xact_lock_shared(961996,50000)");
       await db.query("SELECT pg_advisory_xact_lock_shared(1919249529,96)");
+      // The run-start and per-scope checks happen before this transaction.
+      // Recheck only after the authority-transition lock is held so a
+      // release/re-activation committed in that gap cannot authorize a PUT
+      // with the prior activation's heartbeat.
+      if (registration) await assertLegacyErasureAuthorityReady(db);
     };
     const commit = async () => {
       await db.query("COMMIT");
@@ -323,6 +348,10 @@ export async function withLegacyPrivacyFence<T>(
       // Recheck the authority in every transaction, including after the PUT,
       // so a mid-run fallback to Neon refuses the export.
       if (registration) {
+        await db.query("SELECT set_config($1,$2,false)", [
+          LEGACY_EXPORT_GENERATION_SETTING,
+          LEGACY_EXPORT_GENERATION,
+        ]);
         const { rows: readiness } = await db.query<{ ready: boolean }>(
           "SELECT sessions.legacy_export_privacy_authority_ready() AS ready",
         );

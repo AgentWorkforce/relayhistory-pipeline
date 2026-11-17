@@ -1473,6 +1473,24 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
 });
 
 describe("the ordered migration lanes: contiguous prefixes, no unledgered footprint", () => {
+  test("legacy authority rollback bounds every lock acquisition", () => {
+    const down = readFileSync(
+      join(
+        root,
+        "supabase/rollbacks/20261105062030_legacy_export_scope_authority.down.sql",
+      ),
+      "utf8",
+    );
+    const begin = down.indexOf("BEGIN;");
+    const timeout = down.indexOf("SET LOCAL lock_timeout='5s'");
+    const migratorLock = down.indexOf("SELECT pg_advisory_xact_lock(961996,1)");
+    const tableLock = down.indexOf(
+      "LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE",
+    );
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(begin < timeout && timeout < migratorLock && migratorLock < tableLock).toBe(true);
+  });
+
   test("turn-gates historical deletion backfill is derived and does not make rollback one-way", async () => {
     const db = await fresh();
     const tg = "upstream:20261105062020_turns_forward_gates.sql";
@@ -1483,12 +1501,17 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect(privacyGuard).toBeGreaterThan(privacyLock);
     expect(down).toContain("sessions.upload_deletions,sessions.operator_user_erasures IN SHARE ROW EXCLUSIVE MODE");
     const steps = await plan(LOCAL);
-    const prefix = steps.filter((step) => !step.name.startsWith("upstream:") || step.name < tg);
+    const turnsIndex = steps.findIndex((step) => step.name === tg);
+    expect(turnsIndex).toBeGreaterThan(0);
+    const prefix = steps.slice(0, turnsIndex);
+    const throughTurns = steps.slice(0, turnsIndex + 1);
     await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps: prefix });
     await db.query(
       "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
     );
-    await runMigrations(client(db), { profile: LOCAL, steps });
+    // Exercise 062020's own rollback without installing a later migration whose
+    // identity guard must correctly make that rollback refuse.
+    await runMigrations(client(db), { profile: LOCAL, steps: throughTurns });
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
@@ -1907,7 +1930,11 @@ describe("per-step catalog sentinels", () => {
     const steps = (await plan(LOCAL)).filter(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
-    const db = await prefix(steps.length - 1, steps.length);
+    const legacyIndex = steps.findIndex(
+      (st) => st.name === "upstream:20261105062030_legacy_export_scope_authority.sql",
+    );
+    expect(legacyIndex).toBeGreaterThan(0);
+    const db = await prefix(legacyIndex, legacyIndex + 1);
     const error = await failure(
       db.exec(
         readFileSync(
@@ -2620,6 +2647,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105062030_legacy_export_scope_authority.down.sql");
     expect(await names()).not.toContain(LA);
     expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();
+    expect(await relation("sessions.legacy_export_privacy_eraser_readiness")).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'legacy_export_privacy_%' OR proname='ingest_legacy_export_scope_authority_register')")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live

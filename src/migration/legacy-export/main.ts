@@ -148,9 +148,9 @@ export function assertDirectUrl(raw: string, label: string): URL {
 export async function main() {
   const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
   if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
-  // Landing safety: this branch ships the schema and eraser plumbing, but not
-  // the activation heartbeat contract. The activation follow-up replaces this
-  // unconditional refusal with its fresh eraser-written heartbeat gate.
+  // Landing safety: this branch ships the activation-final schema and eraser
+  // plumbing, but not an enabled exporter. The activation follow-up replaces
+  // this unconditional refusal with its fresh eraser-written heartbeat gate.
   if (mode[0] === "export")
     throw Object.assign(new Error("legacy export requires the activation heartbeat follow-up"), {
       code: "legacy_export_requires_activation_heartbeat",
