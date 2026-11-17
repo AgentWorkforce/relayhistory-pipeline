@@ -7,13 +7,14 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { selfhostIngestConfig } from "../../session-ingest/selfhost-config.ts";
 import { readApiServiceConfig } from "../../session-read-api/service-config.ts";
 import { readApiAuthConfig } from "../../session-read-api/lambda.ts";
 import { assertLockerSelection } from "../locker-selection.ts";
+import { consumerServiceConfig } from "../../session-pipeline/consumer-config.ts";
 import { loadSelfhostControlConfig, parseSelfhostControlUser } from "../../selfhost-control/server.ts";
 import { TOKEN_ENV, tokensDocument, writeTokensFile } from "../../../deploy/selfhost-local/control-tokens.ts";
 import { smokeBatch } from "../../../deploy/selfhost-local/smoke.ts";
@@ -27,11 +28,115 @@ const envExample = readFileSync(join(DIR, ".env.example"), "utf8");
 type Service = {
   image?: string; environment?: Record<string, string>; volumes?: string[]; ports?: string[];
   entrypoint?: string[]; tmpfs?: string[]; deploy?: { replicas?: number }; depends_on?: Record<string, unknown>;
+  network_mode?: string;
 };
 const compose = (Bun as unknown as { YAML: { parse(text: string): unknown } }).YAML.parse(composeText) as {
   name: string; services: Record<string, Service>; volumes: Record<string, unknown>;
 };
 const services = compose.services;
+/** A deep copy of the services to seed a fault into; the checks below must then report it. */
+const mutated = (seed: (copy: Record<string, Service>) => void): Record<string, Service> => {
+  const copy = structuredClone(services);
+  seed(copy);
+  return copy;
+};
+
+/**
+ * Every environment variable name the shipped code reads: a quoted literal or an `env.NAME` access in
+ * TS/JS, or a `$NAME` / `${NAME` in a shell script, under src/, packages/ and docker/ (tests excluded).
+ */
+const SOURCE_NAMES: Set<string> = (() => {
+  const names = new Set<string>();
+  const walk = (path: string) => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const full = join(path, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules" && entry.name !== "__tests__" && entry.name !== "dist") walk(full);
+        continue;
+      }
+      if (/\.test\.[cm]?[jt]sx?$/.test(entry.name)) continue;
+      const text = () => readFileSync(full, "utf8");
+      if (/\.[cm]?[jt]sx?$/.test(entry.name)) {
+        for (const m of text().matchAll(/["'`]([A-Z][A-Z0-9_]+)["'`]|\benv\??\.([A-Z][A-Z0-9_]+)\b/g)) names.add(m[1] ?? m[2]!);
+      } else if (entry.name.endsWith(".sh")) {
+        for (const m of text().matchAll(/\$\{?([A-Z][A-Z0-9_]+)/g)) names.add(m[1]!);
+      }
+    }
+  };
+  for (const top of ["src", "packages", "docker"]) walk(join(ROOT, top));
+  return names;
+})();
+/** Keys no src/packages/docker code reads: each names the deploy script (or image) that reads it, and the only service that may set it. */
+const DEPLOY_SCRIPT_KEYS: Record<string, { file: string; service: string }> = {
+  RH_USER_SUB: { file: "control-tokens.ts", service: "selfhost-control" },
+  RH_USER_ORG: { file: "control-tokens.ts", service: "selfhost-control" },
+  RH_WORKSPACE: { file: "control-tokens.ts", service: "selfhost-control" },
+  RH_CONTROL_TOKEN: { file: "control-tokens.ts", service: "selfhost-control" },
+  RH_READ_PASSWORD: { file: "roles.sh", service: "roles" },
+  RH_INGEST_PASSWORD: { file: "roles.sh", service: "roles" },
+  RH_CONSUMER_PASSWORD: { file: "roles.sh", service: "roles" },
+};
+/** libpq's own environment (the psql that roles.sh runs reads them); only the `roles` service sets them. */
+const LIBPQ_KEYS = new Set(["PGHOST", "PGUSER", "PGDATABASE", "PGPASSWORD", "PGSSLMODE", "PGSSLROOTCERT"]);
+/** Read by a third-party image's own entrypoint: the postgres image initialises the superuser from it. */
+const IMAGE_KEYS: Record<string, string> = { POSTGRES_PASSWORD: "db" };
+/**
+ * Compose interpolation variables that never reach a container environment, with what they feed.
+ * Every other ${VAR} in compose.yaml must appear inside some service's environment.
+ */
+const INTERPOLATION_ONLY: Record<string, string> = {
+  RH_HTTPS_PORT: "the proxy's published loopback port",
+  RH_SERVICES_IMAGE: "the services image tag",
+  RH_PG_TLS_DIR: "bind-mount source of the Postgres certificates",
+  RH_EDGE_TLS_DIR: "bind-mount source of the edge certificate",
+};
+function envKeyProblems(svcs: Record<string, Service>): string[] {
+  const problems: string[] = [];
+  for (const [name, svc] of Object.entries(svcs)) for (const key of Object.keys(svc.environment ?? {})) {
+    const script = DEPLOY_SCRIPT_KEYS[key];
+    if (script) {
+      if (name !== script.service) problems.push(`${name}.${key}: only ${script.service} may set it`);
+      if (!readFileSync(join(DIR, script.file), "utf8").includes(key)) problems.push(`${name}.${key}: not read by ${script.file}`);
+    } else if (LIBPQ_KEYS.has(key)) {
+      if (name !== "roles" || !(svc.entrypoint ?? []).includes("/deploy/roles.sh")) problems.push(`${name}.${key}: libpq key outside roles.sh`);
+    } else if (IMAGE_KEYS[key] !== undefined) {
+      if (IMAGE_KEYS[key] !== name) problems.push(`${name}.${key}: image key on the wrong service`);
+    } else if (!SOURCE_NAMES.has(key)) problems.push(`${name}.${key}: no code reads it`);
+  }
+  return problems;
+}
+function interpolationProblems(svcs: Record<string, Service>, text: string): string[] {
+  const inEnv = JSON.stringify(Object.values(svcs).map(s => s.environment ?? {}));
+  const code = text.split("\n").filter(line => !/^\s*#/.test(line)).join("\n");
+  const referenced = new Set([...code.matchAll(/\$\{([A-Z0-9_]+)/g)].map(m => m[1]!));
+  const problems: string[] = [];
+  for (const name of referenced) {
+    const used = inEnv.includes(`\${${name}`);
+    if (INTERPOLATION_ONLY[name] !== undefined && used) problems.push(`${name}: listed interpolation-only but reaches an environment`);
+    if (INTERPOLATION_ONLY[name] === undefined && !used) problems.push(`${name}: referenced but not in any environment nor INTERPOLATION_ONLY`);
+  }
+  for (const name of Object.keys(INTERPOLATION_ONLY)) if (!referenced.has(name)) problems.push(`${name}: in INTERPOLATION_ONLY, never referenced`);
+  return problems;
+}
+/** The fs Locker mounts: exactly one writer (ingest), the two readers read-only, nobody else. */
+const LOCKER_MOUNTS: Record<string, string[]> = {
+  "session-ingest": ["locker:/locker"],
+  "session-read-api": ["locker:/locker:ro"],
+  "session-pipeline-consumer": ["locker:/locker:ro"],
+  "local-init": ["locker:/locker"],
+};
+const lockerMounts = (svcs: Record<string, Service>) =>
+  Object.fromEntries(Object.entries(svcs).map(([n, s]) => [n, (s.volumes ?? []).filter(v => v.startsWith("locker:"))]).filter(([, v]) => v!.length > 0));
+/** Host exposure: no service shares a host or container network namespace; one loopback port, the proxy's. */
+function exposureProblems(svcs: Record<string, Service>): string[] {
+  const problems: string[] = [];
+  for (const [name, svc] of Object.entries(svcs)) {
+    if (svc.network_mode !== undefined) problems.push(`${name}: network_mode ${svc.network_mode}`);
+    for (const port of svc.ports ?? []) if (name !== "proxy" || port !== "127.0.0.1:${RH_HTTPS_PORT:-8443}:8443") problems.push(`${name}: port ${port}`);
+  }
+  if (JSON.stringify(svcs.proxy?.ports) !== JSON.stringify(["127.0.0.1:${RH_HTTPS_PORT:-8443}:8443"])) problems.push("proxy: published ports");
+  return problems;
+}
 
 const SECRET_VARS = ["RH_PG_PASSWORD", "RH_INGEST_PASSWORD", "RH_READ_PASSWORD", "RH_CONSUMER_PASSWORD", "RH_INTROSPECT_SECRET", "RH_CONTROL_TOKEN"];
 const fixture: Record<string, string> = {
@@ -113,10 +218,46 @@ describe("selfhost-local compose: layout", () => {
     for (const name of ["db", "roles"]) expect(services[name]!.image).toBe("postgres:17");
   });
 
-  test("the only published port is the proxy's 8443 on loopback", () => {
+  test("the only published port is the proxy's 8443 on loopback, and no service sets network_mode", () => {
     for (const [name, svc] of Object.entries(services)) if (name !== "proxy") expect(svc.ports).toBeUndefined();
     expect(services.proxy!.ports).toEqual(["127.0.0.1:${RH_HTTPS_PORT:-8443}:8443"]);
+    expect(exposureProblems(services)).toEqual([]);
+    // Text-level too, so a key the typed parse would miss still counts.
+    expect(composeText).not.toMatch(/network_mode/);
+    expect(composeText.match(/^\s*ports:/gm)!.length).toBe(1);
     expect(nginx).toMatch(/listen 8443 ssl;/);
+    // Seeded faults.
+    expect(exposureProblems(mutated(c => { c.db!.network_mode = "host"; }))).toEqual(["db: network_mode host"]);
+    expect(exposureProblems(mutated(c => { c["session-read-api"]!.ports = ["8080:8080"]; }))).toEqual(["session-read-api: port 8080:8080"]);
+    expect(exposureProblems(mutated(c => { c.proxy!.ports = ["${RH_HTTPS_PORT:-8443}:8443"]; })).length).toBeGreaterThan(0);
+    expect(exposureProblems(mutated(c => { c.proxy!.ports!.push("127.0.0.1:9000:9000"); })).length).toBeGreaterThan(0);
+  });
+
+  test("every environment key the compose sets is read by the code (or an allowlisted script/image), so a typo fails", () => {
+    expect(SOURCE_NAMES.size).toBeGreaterThan(100);
+    expect(envKeyProblems(services)).toEqual([]);
+    expect(interpolationProblems(services, composeText)).toEqual([]);
+    for (const [key, { file }] of Object.entries(DEPLOY_SCRIPT_KEYS)) {
+      expect(readFileSync(join(DIR, file), "utf8")).toContain(key);
+      expect(SOURCE_NAMES.has(key)).toBe(false); // otherwise it belongs in no allowlist
+    }
+    expect(readFileSync(join(DIR, "roles.sh"), "utf8")).toMatch(/command psql /);
+    // Seeded faults: a misspelled key, a script key moved to another service, a libpq key outside roles.
+    const rename = (svc: string, from: string, to: string) => mutated(c => {
+      const env = c[svc]!.environment!;
+      env[to] = env[from]!;
+      delete env[from];
+    });
+    expect(envKeyProblems(rename("session-read-api", "READ_API_TURNS_ASSUME_NO_LEGACY", "READ_API_TURNS_ASUME_NO_LEGACY")))
+      .toEqual(["session-read-api.READ_API_TURNS_ASUME_NO_LEGACY: no code reads it"]);
+    expect(envKeyProblems(rename("session-ingest", "RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT", "RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPTS"))).toHaveLength(1);
+    expect(envKeyProblems(rename("session-pipeline-consumer", "CONSUMER_RECONCILE_EVERY_MINUTES", "CONSUMER_RECONCILE_EVERY_MINUTE"))).toHaveLength(1);
+    expect(envKeyProblems(mutated(c => { c["session-ingest"]!.environment!.RH_CONTROL_TOKEN = "x"; })))
+      .toEqual(["session-ingest.RH_CONTROL_TOKEN: only selfhost-control may set it"]);
+    expect(envKeyProblems(mutated(c => { c["session-read-api"]!.environment!.PGPASSWORD = "x"; }))).toHaveLength(1);
+    expect(envKeyProblems(mutated(c => { c.roles!.environment!.POSTGRES_PASSWORD = "x"; }))).toHaveLength(1);
+    expect(interpolationProblems(services, composeText.replace("${RH_HTTPS_PORT:-8443}", "${RH_HTTPS_PROT:-8443}")))
+      .toEqual(["RH_HTTPS_PROT: referenced but not in any environment nor INTERPOLATION_ONLY", "RH_HTTPS_PORT: in INTERPOLATION_ONLY, never referenced"]);
   });
 
   test("listen ports line up with nginx upstreams and the control URL", () => {
@@ -136,8 +277,13 @@ describe("selfhost-local compose: layout", () => {
       expect(env.LOCKER_FS_ROOT).toBe("/locker");
     }
     expect(services["session-ingest"]!.deploy).toEqual({ replicas: 1 });
-    expect(services["session-ingest"]!.volumes).toContain("locker:/locker");
-    for (const name of ["session-read-api", "session-pipeline-consumer"]) expect(services[name]!.volumes).toContain("locker:/locker:ro");
+    expect(services["session-ingest"]!.volumes!.filter(v => v.startsWith("locker:"))).toEqual(["locker:/locker"]);
+    for (const name of ["session-read-api", "session-pipeline-consumer"]) expect(services[name]!.volumes!.filter(v => v.startsWith("locker:"))).toEqual(["locker:/locker:ro"]);
+    expect(lockerMounts(services)).toEqual(LOCKER_MOUNTS);
+    // Seeded faults: a reader that can write, a second writer mount, a new service on the Locker.
+    expect(lockerMounts(mutated(c => { c["session-read-api"]!.volumes = c["session-read-api"]!.volumes!.map(v => v.replace("locker:/locker:ro", "locker:/locker")); }))).not.toEqual(LOCKER_MOUNTS);
+    expect(lockerMounts(mutated(c => { c["session-pipeline-consumer"]!.volumes!.push("locker:/locker2"); }))).not.toEqual(LOCKER_MOUNTS);
+    expect(lockerMounts(mutated(c => { c["consumer-bootstrap"]!.volumes!.push("locker:/locker:ro"); }))).not.toEqual(LOCKER_MOUNTS);
     expect(services["local-init"]!.entrypoint!.join(" ")).toContain("chown 1000:1000 /locker && chmod 0700 /locker");
   });
 
@@ -182,6 +328,23 @@ describe("selfhost-local compose: the services' own config parsers accept it", (
     expect(auth.mode).toBe("relaycontrol_only");
     expect(auth.origin).toBe("https://localhost:8443");
     expect(auth.relaycontrol?.url).toBe("http://control.local.svc:8090");
+  });
+
+  test("pipeline consumer: its own config parser (consumer-config.ts) accepts the env", () => {
+    const env = containerEnv("session-pipeline-consumer");
+    const config = consumerServiceConfig(env);
+    if (!config.enabled) throw new Error("consumer dormant");
+    expect(config.searchBackend).toBe("postgres");
+    expect(config.backendId).toBe("local-postgres");
+    expect(config.keyPrefix).toBe("96bulls");
+    expect(config.everyMinutes).toBe(1);
+    expect(config.lookbackMinutes).toBe(30);
+    expect(config.floorMs).toBe(0);
+    expect(config.secret.hoopdb_url).toStartWith("postgresql://search_consumer_runtime:");
+    // Seeded faults the parser must refuse.
+    expect(() => consumerServiceConfig({ ...env, CONSUMER_RECONCILE_EVERY_MINUTES: "30" })).toThrow("LOOKBACK_MINUTES must be greater");
+    expect(() => consumerServiceConfig({ ...env, SEARCH_INDEX_BACKEND: "pgvector" })).toThrow("SEARCH_INDEX_BACKEND");
+    expect(() => consumerServiceConfig({ ...env, PIPELINE_KEY_PREFIX: "" })).toThrow("PIPELINE_KEY_PREFIX");
   });
 
   test("pipeline consumer and bootstrap: fs selection accepted", () => {

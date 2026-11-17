@@ -93,6 +93,10 @@ alias rhc='op run --env-file deploy/selfhost-local/.env -- docker compose -f dep
 Changing it later needs an `ALTER ROLE postgres PASSWORD` first. The three
 service passwords are re-applied by `roles` on every `up`.
 
+Never run plain `docker compose` while `.env` holds `op://` references:
+without `op run` the reference strings themselves become the passwords and
+tokens. Always go through `op run` (the alias above).
+
 Without `op`, use `alias rhc='docker compose -f deploy/selfhost-local/compose.yaml'`
 and export the secrets in your shell instead of writing them into `.env`.
 Compose refuses to start while any required value is empty and names the
@@ -105,12 +109,23 @@ rhc up -d
 rhc ps
 ```
 
-Start order: `db` becomes healthy, then `migrate`, `consumer-bootstrap` and
-`roles` run once and exit 0, and `local-init` exits 0. Then `selfhost-control`
-starts, then the ingest, consumer and read API, and finally the proxy. A
+Start order: `db`, `local-init` and `selfhost-control` start at once
+(`selfhost-control` has no `depends_on`). Once `db` is healthy, `migrate`,
+`consumer-bootstrap` and `roles` run in turn and each exits 0. The ingest,
+consumer and read API then start; the ingest and read API also wait for
+`selfhost-control` to answer its `GET /healthz`. The proxy starts last. A
 one-shot that exits non-zero stops everything after it. Check it with
 `rhc logs migrate` (or `roles`, `local-init`). Every service logs the name of a
 bad variable, never its value.
+
+## Flags this install turns on
+
+Each is off by default in code; `compose.yaml` sets it for this install.
+
+- `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true` (ingest): the Desktop's onboarding heartbeat `POST /v1/onboarding/heartbeat` is answered 204 and discarded.
+- `READ_API_TIMING_ASSUME_NO_TURNS=true` (read API): a session with no legacy turn evidence is timed as having no turns instead of 501 `timing_turns_unknown`.
+- `READ_API_TURNS_ASSUME_NO_LEGACY=true` (read API): this install never had a Neon source, so `/turns` and `/metadata` serve canonical turns without a legacy coverage marker instead of 501 `turns_unknown`.
+- `READ_API_CANONICAL_PIN_LAGGING_POINTER=true` (read API): while the session pointer lags an async-admitted append, canonical reads serve the indexed generation instead of 501 `*_manifest_mismatch` (`docs/local-stack.md`).
 
 ## 5. The control token
 
@@ -175,22 +190,34 @@ Back up Postgres and the Locker together, with writes stopped, so neither
 refers to something the other lacks. A backup holds your transcripts, so keep
 it outside the repository.
 
+The backup is created private to you (`umask 077`, a 0700 directory). The
+`alpine` image is the same digest-pinned one `local-init` uses.
+
 ```sh
-mkdir -p ~/relayhistory-backup
+umask 077
+mkdir -m 700 -p ~/relayhistory-backup
 rhc stop proxy session-ingest session-pipeline-consumer session-read-api
 rhc exec -T db pg_dump -U postgres -Fc postgres > ~/relayhistory-backup/pg.dump
 docker run --rm -v relayhistory-local_locker:/locker:ro -v ~/relayhistory-backup:/out \
-  alpine:3.20 tar -C /locker -czf /out/locker.tgz .
+  alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
+  tar -C /locker -czf /out/locker.tgz .
 rhc start session-ingest session-pipeline-consumer session-read-api proxy
 ```
 
 To restore into a fresh install:
 
-1. Run `rhc up -d` once, so the roles and schema exist.
-2. Stop the same four services.
+**Warning:** `pg_restore --clean --if-exists` drops every object in the dump
+that already exists in the database before recreating it. Run it only against
+the install you mean to overwrite.
+
+1. Run `rhc up -d roles local-init`. That starts `db` and runs `migrate`,
+   `consumer-bootstrap`, `roles` and `local-init`, so the roles and schema
+   exist, but never starts the proxy, ingest, consumer or read API, so nothing
+   writes while you restore.
+2. Wait until `rhc ps -a roles local-init` shows both `Exited (0)`.
 3. Run `rhc exec -T db pg_restore -U postgres -d postgres --clean --if-exists < ~/relayhistory-backup/pg.dump`.
 4. Unpack the Locker:
-   `docker run --rm -v relayhistory-local_locker:/locker -v ~/relayhistory-backup:/in:ro alpine:3.20 tar -C /locker -xzf /in/locker.tgz`.
+   `docker run --rm -v relayhistory-local_locker:/locker -v ~/relayhistory-backup:/in:ro alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc tar -C /locker -xzf /in/locker.tgz`.
 5. Run `rhc up -d`.
 
 ## 9. Upgrade
