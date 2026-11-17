@@ -29,6 +29,7 @@ whole table.
 | `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)) |
 | `user-erase` | Job (one-shot, operator-run, default off; `OPERATOR_USER_ERASE_ENABLED=1`) | `src/session-erase/user-erase-main.ts` | none | exit code (0 verified / disabled, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)); see `docs/operator-user-erase.md` |
 | `s3-ledger-rearm-sweeper` | Deployment (long-running `--loop`, default off; `INGEST_REARM_SWEEPER_ENABLED=true`) | `src/session-ingest/rearm-sweeper-main.ts` | none | one JSON line per pass (counts and codes only); exits 2 on a refused config |
+| `selfhost-control` | Deployment (HTTP, local single-user only, default off; `RELAYHISTORY_SELFHOST_CONTROL=true`) | `src/selfhost-control/server.ts` | `SELFHOST_CONTROL_LISTEN`, default `0.0.0.0:8090` | `GET /healthz` (200 `{"ok":true}`); exits 2 on a refused config (below) |
 
 The worker port serves probes only. It must never be reachable from outside
 the cluster.
@@ -104,6 +105,59 @@ marker of that session's transcript directories, live pointer and supplied
 staged objects in the versioned S3-compatible store, lists again, and prints
 one count-only result line. It is internal: no port, no route, and it never
 runs on a schedule. The operator orchestrator decides when to run it.
+
+### Local single-user control (selfhost-control)
+
+For one developer running the pipeline locally with no relaycontrol.
+`SERVICE=selfhost-control` (`src/selfhost-control/server.ts`) answers only
+relaycontrol's introspection contract (`POST /internal/v1/auth/introspect`,
+`packages/pipeline/src/auth/relaycontrol.ts`) for exactly one user, plus
+`GET /healthz` (200 `{"ok":true}`). It never starts unless `SERVICE=selfhost-control`
+AND `RELAYHISTORY_SELFHOST_CONTROL` is exactly `true`; otherwise, or on any bad
+setting, it prints one stderr line naming the variable (never a value) and exits 2.
+
+- `SELFHOST_CONTROL_INTROSPECT_SECRET`: the bearer the read API presents (its
+  `RELAYCONTROL_INTROSPECT_SECRET`); at least 32 printable ASCII characters, no spaces.
+- `SELFHOST_CONTROL_TOKENS_FILE`: absolute path to a JSON file, read once at startup:
+  `{"sub": "...", "org": "...", "workspace": "...", "tokens": [{"token": "sh_at_...", "token_id": "...", "scopes": ["rth:read", "rth:sync"]}]}`.
+  Each token is at least 32 characters and starts with `sh_at_` (the only
+  bearers the read API and session-ingest introspect); unknown fields refuse.
+  At most 64 KiB, owned by the uid the container runs as (the services image
+  runs as uid 1000, `stacks/local/topology.ts`), mode `0600`: any group or other
+  permission refuses startup. On Kubernetes a Secret volume defaults to `0644`
+  (group-readable too with `fsGroup`), so mount it with `defaultMode: 0400` or
+  `0600`, or copy it into place in an init step.
+- `SELFHOST_CONTROL_LISTEN`: `host:port`, default `0.0.0.0:8090` (it runs in a
+  container; publish it to the read API's network only, never publicly).
+
+Replies. Active token: the stub's fields (`principal_type` `desktop-user`,
+`email` and `machine_id` null, `aud` echoed, `iat` = now - 10 s, `exp` = now + 1 h
+computed per request, because the client refuses an expired `exp`). `aud` is
+echoed unchecked, so on this single-user install a token is valid for any
+audience. The tokens never expire here: remove one from the file and restart to
+revoke it. Unknown token: 200 `{"active":false,"reason":"unknown"}`; a
+`workspace` other than the user's: 200
+`{"active":false,"reason":"workspace_mismatch"}`; wrong or missing bearer: 401
+`{}`; body over 16 KiB or not the contract shape: 400.
+
+What works. Read API reads and session-ingest sync/upload work. AlleyOop's
+mutating routes (POST/PUT/PATCH/DELETE under `/v1/*`, for example
+`/v1/pipeline/chunks`, `/v1/pipeline/manifests`, `/v1/pipeline/events`) are
+refused with 403 `machine_claim_refused` (the gate at `src/alleyoop/routes.ts:43`),
+because `machine_id` is always null and no machine claim is ever set.
+
+Wiring. The URL is `http://<name>.<ns>.svc:8090` (a network alias such as the
+e2e's `control.e2e.svc`, with `ALLOW_IN_CLUSTER_HTTP=true`; plain http otherwise
+only to loopback), and the secret is `SELFHOST_CONTROL_INTROSPECT_SECRET`.
+
+- Read API: `READ_API_AUTH_MODE=relaycontrol_only`,
+  `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`, `RELAYCONTROL_INTROSPECT_URL`,
+  `RELAYCONTROL_INTROSPECT_SECRET` and `READ_API_ORIGIN` (sent as `aud`; in
+  `relaycontrol_only` startup refuses without it, and in the default mode every
+  relaycontrol token is refused 401 `not_configured`).
+- Session-ingest (`RELAYHISTORY_SELFHOST_INGEST=true`): `RELAYCONTROL_INTROSPECT_URL`,
+  `RELAYCONTROL_INTROSPECT_SECRET` and `RELAYHISTORY_INGEST_ORIGIN` (sent as
+  `aud`), all required at startup (`src/session-ingest/selfhost-config.ts`).
 
 ## 2. One public origin
 

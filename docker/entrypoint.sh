@@ -21,5 +21,6 @@ case "${SERVICE:-}" in
   session-erase-bytes) exec bun run /app/src/session-erase/selfhost-eraser-main.ts ;;
   user-erase) exec bun run /app/src/session-erase/user-erase-main.ts ;;
   s3-ledger-rearm-sweeper) exec bun run /app/src/session-ingest/rearm-sweeper-main.ts --loop ;;
+  selfhost-control) exec bun run /app/src/selfhost-control/server.ts ;;
   *) echo "96bulls: unknown SERVICE='${SERVICE:-}'" >&2; exit 2 ;;
 esac
