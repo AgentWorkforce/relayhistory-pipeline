@@ -32,7 +32,8 @@
  * DELETE revision and ownership rows (ingest_apply_selection / ingest_apply_reset), so a control between FULL and the
  * refresh changes the fingerprint and the drain refuses stale: a new full run is then needed (fail-safe). The input fingerprint (upload-fence-backfill.ts
  * BackfillFingerprint: counts, the revisions' latest updated_at, the revision sum and content hashes of the ownership
- * and owned-slot rows, read at each run's start in one snapshot) proves that assumption: FULL's and the refresh's must
+ * and owned-slot rows, read at each run's start in one snapshot; with slots_read=org the owned-slot values are summed from
+ * each org's slot cursor in that read's own snapshot instead) proves that assumption: FULL's and the refresh's must
  * be equal, field by field, or the drain refuses with backlog_ops_backfill_stale before any credential is read (also
  * when either receipt has no fingerprint, e.g. one from before this field). FULL must be under
  * BACKLOG_OPS_BINDING_MAX_AGE_MS old and created before the refresh; the refresh under BACKLOG_OPS_FRESH_BACKFILL_MS
