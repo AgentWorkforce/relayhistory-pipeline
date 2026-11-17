@@ -9,6 +9,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { poolTenantRunner, sqlLiveness } from "../liveness.ts";
+import { SESSION_SOURCES_MAX, sqlSessionSources } from "../session-sources.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
@@ -154,5 +155,65 @@ describe("sqlLiveness as the role", () => {
     expect(await liveness.sessionStart("org-a", "ws-a", "s")).toEqual({ pointers: 3, live: 2, createdAtMs: Date.parse("2026-10-01T00:00:00Z") });
     expect(await liveness.sessionStart("org-a", "ws-a", "s", "claude")).toEqual({ pointers: 1, live: 0, createdAtMs: null });
     expect(await liveness.sessionStart("org-a", "ws-b", "s")).toEqual({ pointers: 0, live: 0, createdAtMs: null });
+  }, 60_000);
+});
+
+describe("sqlSessionSources as the role (GET /v1/sessions/:sessionId/sources)", () => {
+  test("distinct live harnesses for the id in the bound tenant: 0, 1, 2; tombstones, other tenants and other ids never count", async () => {
+    const db = await database();
+    // One harness on two machines (one tombstoned): one source.
+    await pointer(db, { session: "one", machine: "m-1" });
+    await pointer(db, { session: "one", machine: "m-2", deleted: true });
+    // Two harnesses live: ambiguous.
+    await pointer(db, { session: "two", harness: "codex" });
+    await pointer(db, { session: "two", harness: "claude", machine: "m-2" });
+    await pointer(db, { session: "two", harness: "claude", machine: "m-3" });
+    // A third harness only tombstoned: not a source.
+    await pointer(db, { session: "two", harness: "opencode", machine: "m-4", deleted: true });
+    // Erased (every pointer tombstoned).
+    await pointer(db, { session: "gone", deleted: true });
+    // The same id live elsewhere only.
+    await pointer(db, { ws: "ws-b", session: "elsewhere", harness: "claude" });
+    await pointer(db, { org: "org-b", session: "elsewhere", harness: "codex" });
+    const sources = sqlSessionSources(poolTenantRunner(asRole(db)));
+    const harnesses = async (org: string, ws: string, id: string) => (await sources(org, ws, id)).map((r) => r.harness);
+    expect(await sources("org-a", "ws-a", "one")).toEqual([{ org_id: "org-a", workspace_id: "ws-a", harness: "codex" }]);
+    expect(await harnesses("org-a", "ws-a", "two")).toEqual(["claude", "codex"]);
+    expect(await harnesses("org-a", "ws-a", "gone")).toEqual([]);
+    expect(await harnesses("org-a", "ws-a", "absent")).toEqual([]);
+    expect(await harnesses("org-a", "ws-a", "elsewhere")).toEqual([]);
+    expect(await harnesses("org-a", "ws-b", "elsewhere")).toEqual(["claude"]);
+    expect(await harnesses("org-b", "ws-a", "elsewhere")).toEqual(["codex"]);
+    // Ids are exact: no prefix or case folding.
+    expect(await harnesses("org-a", "ws-a", "on")).toEqual([]);
+    expect(await harnesses("org-a", "ws-a", "ONE")).toEqual([]);
+  }, 60_000);
+
+  test("the source RelayHistory id (canonical_session_id) and the physical id both match", async () => {
+    const db = await database();
+    await pointer(db, { session: "phys-1", harness: "claude" });
+    await db.query("UPDATE sessions.session_index SET canonical_session_id = 'source-id' WHERE session_id = 'phys-1'");
+    await pointer(db, { session: "source-id", harness: "codex" });
+    const sources = sqlSessionSources(poolTenantRunner(asRole(db)));
+    expect((await sources("org-a", "ws-a", "source-id")).map((r) => r.harness)).toEqual(["claude", "codex"]);
+    expect((await sources("org-a", "ws-a", "phys-1")).map((r) => r.harness)).toEqual(["claude"]);
+  }, 60_000);
+
+  test("RLS still holds if the statement's own tenant binding were wrong: another bound tenant sees nothing", async () => {
+    const db = await database();
+    await pointer(db, { session: "s", harness: "claude" });
+    // Bound to ws-b, asking for ws-a's rows: the policy admits none.
+    const run = poolTenantRunner(asRole(db));
+    const rows = await run("org-a", "ws-b", (q) => q.query("SELECT DISTINCT harness FROM sessions.session_index WHERE org_id = 'org-a' AND workspace_id = 'ws-a' AND session_id = 's' AND deleted_at IS NULL"));
+    expect(rows.rows).toEqual([]);
+  }, 60_000);
+
+  test("bounded to SESSION_SOURCES_MAX, sorted by name", async () => {
+    const db = await database();
+    for (let i = 0; i < SESSION_SOURCES_MAX + 2; i++) await pointer(db, { session: "many", harness: `h${String(i).padStart(2, "0")}` });
+    const got = (await sqlSessionSources(poolTenantRunner(asRole(db)))("org-a", "ws-a", "many")).map((r) => r.harness);
+    expect(got).toHaveLength(SESSION_SOURCES_MAX);
+    expect(got).toEqual([...got].sort());
+    expect(got[0]).toBe("h00");
   }, 60_000);
 });
