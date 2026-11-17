@@ -55,6 +55,9 @@ export interface ObserverSummary {
   max_migration_wait_ms: number;
   max_waiters: number;
   blocked_writer_count: number;
+  target_lock_observed: boolean;
+  representative: boolean;
+  error_code: string | null;
   abort_evidence: string[];
 }
 
@@ -95,11 +98,15 @@ export function observerConfig(
     const loopback = ["127.0.0.1", "::1", "localhost"].includes(
       parsed.hostname,
     );
+    const secureSsl = ["require", "verify-ca", "verify-full"].includes(
+      parsed.searchParams.get("sslmode") ?? "",
+    );
     if (
       !["postgres:", "postgresql:"].includes(parsed.protocol) ||
       !parsed.hostname ||
       !parsed.username ||
       (!loopback && !parsed.password) ||
+      (!loopback && !secureSsl) ||
       parsed.pathname.length < 2
     )
       throw new Error("shape");
@@ -136,7 +143,7 @@ export function observerConfig(
       untilFile = argument(args, i, flag);
       i += 1;
     } else {
-      throw new Error(`turns lock observer: unknown argument ${flag}`);
+      throw new Error(`turns lock observer: argument ${i + 1} is unknown`);
     }
   }
   if (
@@ -189,6 +196,10 @@ export class LockHoldEvidence {
   private maxWaiters = 0;
   private ledgerSha256: string | null = null;
   private migrationSeen = false;
+  private ledgerAbsenceSeen = false;
+  private migrationSeenBeforeLedger = false;
+  private targetLockObserved = false;
+  private errorCode: string | null = null;
 
   constructor(
     private readonly config: Pick<
@@ -205,7 +216,20 @@ export class LockHoldEvidence {
     this.abort.add(code);
   }
 
+  addError(error: unknown): void {
+    const code = (error as { code?: unknown })?.code;
+    this.errorCode =
+      typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code)
+        ? code
+        : "observer_error";
+    this.abort.add("observer_query_failed");
+  }
+
   observe(sample: ObserverSample): void {
+    if (sample.ledgerSha256 === null) this.ledgerAbsenceSeen = true;
+    else if (this.ledgerSha256 === null)
+      this.migrationSeenBeforeLedger =
+        this.ledgerAbsenceSeen && this.migrationSeen;
     for (const pid of sample.migrationPids) {
       this.knownMigrationPids.add(pid);
       this.migrationSeen = true;
@@ -226,6 +250,7 @@ export class LockHoldEvidence {
       );
       const key = lockKey(lock);
       if (lock.granted && migration) {
+        this.targetLockObserved = true;
         presentHolds.add(key);
         const seen = this.activeHolds.get(key) ?? {
           first: sample.atMs,
@@ -280,6 +305,10 @@ export class LockHoldEvidence {
   ): ObserverSummary {
     const ledgerSeen = this.ledgerSha256 !== null;
     if (!this.migrationSeen) this.abort.add("migration_not_observed");
+    if (ledgerSeen && !this.ledgerAbsenceSeen)
+      this.abort.add("ledger_absence_not_observed");
+    if (ledgerSeen && !this.migrationSeenBeforeLedger)
+      this.abort.add("migration_not_observed_before_ledger");
     if (!ledgerSeen) {
       this.abort.add("ledger_not_observed");
       if (this.migrationSeen) this.abort.add("migration_disappeared_before_ledger");
@@ -288,7 +317,8 @@ export class LockHoldEvidence {
       this.abort.add("completion_signal_before_ledger");
     if (stopReason === "max_seconds" && !ledgerSeen)
       this.abort.add("observer_deadline_exceeded");
-    if (stopReason === "error") this.abort.add("observer_query_failed");
+    if (stopReason === "error" && this.errorCode === null)
+      this.addError({ code: "observer_error" });
     const abortEvidence = [...this.abort].sort();
     return {
       type: "summary",
@@ -301,6 +331,9 @@ export class LockHoldEvidence {
       max_migration_wait_ms: this.maxMigrationWaitMs,
       max_waiters: this.maxWaiters,
       blocked_writer_count: this.blockedWriters.size,
+      target_lock_observed: this.targetLockObserved,
+      representative: this.targetLockObserved,
+      error_code: this.errorCode,
       abort_evidence: abortEvidence,
     };
   }
@@ -326,7 +359,7 @@ const delay = (ms: number) =>
 const emit = (value: unknown) =>
   process.stdout.write(`${JSON.stringify(value)}\n`);
 
-async function relationOids(
+export async function observerRelationOids(
   client: pg.Client,
   tables: string[],
 ): Promise<{ oids: number[]; missing: string[] }> {
@@ -344,7 +377,7 @@ async function relationOids(
   };
 }
 
-async function collect(
+export async function collectObserverSample(
   client: pg.Client,
   relationOids: number[],
 ): Promise<Omit<ObserverSample, "atMs">> {
@@ -352,6 +385,8 @@ async function collect(
     SELECT pid
     FROM pg_catalog.pg_stat_activity
     WHERE pid <> pg_catalog.pg_backend_pid()
+      AND datname = pg_catalog.current_database()
+      AND state <> 'idle'
       AND application_name <> 'turns-062020-lock-observer'
       AND (
         position('SLOT 062020' in query) > 0
@@ -362,11 +397,18 @@ async function collect(
   const locks = await client.query<DatabaseLockRow>(`
     SELECT l.pid,
       pg_catalog.format('%I.%I', n.nspname, c.relname) AS relation,
-      l.mode,l.granted,pg_catalog.pg_blocking_pids(l.pid) AS blocking_pids
+      l.mode,l.granted,
+      CASE WHEN l.granted THEN ARRAY[]::integer[]
+           ELSE pg_catalog.pg_blocking_pids(l.pid) END AS blocking_pids
     FROM pg_catalog.pg_locks l
     JOIN pg_catalog.pg_class c ON c.oid=l.relation
     JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-    WHERE l.locktype='relation' AND l.relation=ANY($1::oid[])
+    WHERE l.locktype='relation'
+      AND l.database = (
+        SELECT oid FROM pg_catalog.pg_database
+        WHERE datname = pg_catalog.current_database()
+      )
+      AND l.relation=ANY($1::oid[])
     ORDER BY l.pid,relation,l.mode`, [relationOids]);
   let ledgerSha256: string | null = null;
   try {
@@ -394,14 +436,16 @@ async function collect(
 export async function runObserver(
   config: ObserverConfig,
 ): Promise<ObserverSummary> {
+  const evidence = new LockHoldEvidence(config);
   const client = new pg.Client({
     connectionString: config.databaseUrl,
     application_name: "turns-062020-lock-observer",
     options:
       "-c default_transaction_read_only=on -c statement_timeout=1000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=5000",
     connectionTimeoutMillis: 10_000,
+    query_timeout: 2_000,
   });
-  const evidence = new LockHoldEvidence(config);
+  client.on("error", (error) => evidence.addError(error));
   let stopReason: "ledger" | "until_file" | "max_seconds" | "error" =
     "max_seconds";
   try {
@@ -409,26 +453,28 @@ export async function runObserver(
     const settings = await client.query<{
       read_only: string;
       statement_timeout: string;
+      lock_timeout: string;
     }>(
-      "SELECT current_setting('default_transaction_read_only') AS read_only,current_setting('statement_timeout') AS statement_timeout",
+      "SELECT current_setting('default_transaction_read_only') AS read_only,current_setting('statement_timeout') AS statement_timeout,current_setting('lock_timeout') AS lock_timeout",
     );
     if (
       settings.rows[0]?.read_only !== "on" ||
-      settings.rows[0]?.statement_timeout !== "1s"
+      settings.rows[0]?.statement_timeout !== "1s" ||
+      settings.rows[0]?.lock_timeout !== "1s"
     )
       throw new Error("observer_read_only_settings");
     emit({ type: "connected", tables: config.tables });
-    const started = Date.now();
-    let resolved: Awaited<ReturnType<typeof relationOids>>;
+    const started = performance.now();
+    let resolved: Awaited<ReturnType<typeof observerRelationOids>>;
     for (;;) {
-      resolved = await relationOids(client, config.tables);
+      resolved = await observerRelationOids(client, config.tables);
       if (resolved.missing.length === 0) break;
       if (config.untilFile && existsSync(config.untilFile)) {
         evidence.addAbort("target_relation_missing");
         stopReason = "until_file";
         return evidence.summary(stopReason);
       }
-      if (Date.now() - started >= config.maxSeconds * 1_000) {
+      if (performance.now() - started >= config.maxSeconds * 1_000) {
         evidence.addAbort("target_relation_missing");
         stopReason = "max_seconds";
         return evidence.summary(stopReason);
@@ -446,12 +492,16 @@ export async function runObserver(
       max_hold_ms: config.maxHoldMs,
     });
     for (;;) {
-      const atMs = Date.now();
+      const atMs = performance.now();
+      const observedAt = new Date().toISOString();
       if (config.untilFile && existsSync(config.untilFile)) {
         stopReason = "until_file";
         break;
       }
-      const sample = { atMs, ...(await collect(client, resolved.oids)) };
+      const sample = {
+        atMs,
+        ...(await collectObserverSample(client, resolved.oids)),
+      };
       evidence.observe(sample);
       if (
         sample.migrationPids.length > 0 ||
@@ -460,7 +510,7 @@ export async function runObserver(
       )
         emit({
           type: "sample",
-          at: new Date(atMs).toISOString(),
+          at: observedAt,
           migration_pids: sample.migrationPids,
           ledger_sha256: sample.ledgerSha256,
           locks: sample.locks.map((lock) => ({
@@ -475,13 +525,14 @@ export async function runObserver(
         stopReason = "ledger";
         break;
       }
-      if (Date.now() - started >= config.maxSeconds * 1_000) {
+      if (performance.now() - started >= config.maxSeconds * 1_000) {
         stopReason = "max_seconds";
         break;
       }
       await delay(config.intervalMs);
     }
-  } catch {
+  } catch (error) {
+    evidence.addError(error);
     stopReason = "error";
   } finally {
     await client.end().catch(() => {});

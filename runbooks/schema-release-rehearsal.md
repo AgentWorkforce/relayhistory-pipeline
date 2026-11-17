@@ -44,7 +44,8 @@ contents or the URL.
 
 For the disposable workflow, set `observe_turns_lock_hold=true`. The observer connects
 first, waits read-only while R0 creates the target relations, and then samples every
-100 ms while the rehearsal runs in the same workflow step. Success requires the exact
+25 ms while the rehearsal runs in the same workflow step. The row is valid only when
+`baseline` is earlier than 062020 and `target` includes 062020. Success requires the exact
 ledger row and frozen checksum for 062020. The uploaded evidence reports maximum hold
 per table, maximum migration and writer waits, maximum concurrent waiters and distinct
 blocked writers for:
@@ -57,6 +58,10 @@ For a separately approved dev rehearsal, start the observer before the chart mig
 Job from a host or one-off pod with database network access. The supplied role must be
 read-only, able to read the migration ledger and able to observe the migrator in
 `pg_stat_activity` (for example through an operator-reviewed monitoring role). Use
+the database's direct PostgreSQL endpoint, not a transaction/session pooled endpoint.
+Every non-loopback URL must include a password and `sslmode=require`, `verify-ca` or
+`verify-full`. Confirm the target ledger starts below 062020 and the approved
+migrations Job target includes 062020 before starting the observer. Use
 `--until-file` for the orchestrator's completion signal and keep stdout as the JSONL
 artifact. The observer identifies 062020 by its SQL slot/file marker; it also accepts a
 future `hoopdb-migrate-062020%` application name. It performs no apply and authorizes no
@@ -69,7 +74,8 @@ exceeds 120 seconds. Durations are first-seen/last-seen measurements and therefo
 up to one polling interval of sampling uncertainty. `blocked_writer_count` includes
 only backends requesting a relation-level writer lock; read waiters still contribute to
 `max_waiters`. This evidence gates the rehearsal row. It does not cancel the migrations
-Job itself.
+Job itself. Numbers from the empty disposable database prove the observer and ordering,
+but are not representative of a populated dev or production-sized database.
 
 ## Stages
 
