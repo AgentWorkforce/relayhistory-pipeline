@@ -237,7 +237,10 @@ export function backlogOpsScope(env: Record<string, string | undefined>): Backlo
 // --concurrency 16 (the tool's MAX_BACKFILL_CONCURRENCY): the scoped execute at the default 4 took over 3 h writing ~10.8M
 // revision entries, and the drain needs its bound backfill-execute under 3 h old (BACKLOG_OPS_FRESH_BACKFILL_MS). S3
 // writes are per-key CAS with no shared hot key; SQL reads stay one transaction at a time on the connection.
-export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000", "--concurrency", "16"] as const;
+// Lower load (2026-11-16, production owner's request): the export's candidate statement and the backfill's native-slot
+// scans were the top statements by total time on the shared database, so pages are smaller and concurrency is the
+// tools' default 4. A full run takes longer; it binds a drain only through the refresh path (FULL may be up to 24 h old).
+export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "1000", "--row-page-size", "5000", "--statement-timeout-ms", "600000", "--concurrency", "4"] as const;
 /**
  * The export's per-statement timeout (its reads over the buffer are as heavy as the backfill's), a 250-key page and the
  * tool's MAX_EXPORT_CONCURRENCY. VERDICT_PAGE's per-stage work (the judged/kept CTEs filter materialized CTEs by
@@ -245,7 +248,9 @@ export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-s
  * ran a scoped export-dry past the 355-min job limit, where 500 keys measured ~5 s a page on production. 250 keys
  * keeps each page short and the total near an hour; 16 overlaps the per-stage marker GETs.
  */
-export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "--page-size", "250", "--concurrency", "16"] as const;
+// Lower load (2026-11-16): 100-key pages (per-page work grows with the page squared) and concurrency 4. The export must
+// still be created after the refresh and the drain must start within 3 h of the refresh, so run it right after.
+export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "--page-size", "100", "--concurrency", "4"] as const;
 
 /**
  * The presence tool's per-statement timeout and total transaction budget. Its statements (the counts, the distinct-org
