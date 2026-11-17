@@ -96,10 +96,10 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   // The optional kit files (headless supervisor, delegation, workers, relay
   // sessions, issue watch) are not in user data; they reach the host over SSM
   // in the hot update after first boot (kit 0.1.10; headless.py and
-  // delegation.md since 0.1.12; issue-watch.sh since 0.1.20). The kit's
+  // delegation.md since 0.1.12; orchestration.md since 0.1.24; issue-watch.sh since 0.1.20). The kit's
   // OPTIONAL_KIT_FILES, which its own test/host.test.ts and
   // test/fresh-host.test.ts use, is not exported, so those two are listed here.
-  const optional: readonly string[] = ["headless.py", "delegation.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES, ...ISSUE_WATCH_KIT_FILES];
+  const optional: readonly string[] = ["headless.py", "delegation.md", "orchestration.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES, ...ISSUE_WATCH_KIT_FILES];
   // The generated card (module 0.1.17) and issue-watch (0.1.20) files travel by hot update, never in user data.
   for (const f of agent.files) if (f.source !== "generated" && !optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
   for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
