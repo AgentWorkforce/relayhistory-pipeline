@@ -366,7 +366,10 @@ async function world() {
   // The job's read-only connection: the same database (an owner session, as the operator's login would be).
   const authority = supabaseAuthority(f.queryable);
   const logs: Record<string, unknown>[] = [];
-  const job = (a: ErasureAuthority = authority) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true }, later, async () => {});
+  const job = (
+    a: ErasureAuthority = authority,
+    cfg = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true },
+  ) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), cfg, later, async () => {});
   const keys = async () => {
     const out: string[] = [];
     let c: string | undefined;
@@ -486,7 +489,7 @@ describe("supabase privacy authority as the eraser's source", () => {
       "UPDATE sessions.legacy_export_privacy_eraser_readiness SET authority_activated_at=authority_activated_at-interval '1 microsecond'",
     );
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
-    await w.job(undefined, cfg).sweep();
+    await w.job().sweep();
     expect((await ready()).rows[0]).toEqual({ ready: true });
 
     await w.f.db.query("UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()-interval '31 minutes'");
