@@ -237,6 +237,69 @@ describe("#405 INGEST_CLAIM_LOCK_BUSY through the self-host consumer", () => {
   });
 });
 
+describe("awaiting fence authority (an org whose marker is not written yet)", () => {
+  async function setup(code: string, maxAttempts = 1) {
+    const fs = scratchStore();
+    cleanups.push(fs.done);
+    const ledger = new MemoryLedger();
+    const realClaim = ledger.claim.bind(ledger);
+    let claims = 0, missing = true;
+    ledger.claim = (async (...args: Parameters<typeof realClaim>) => {
+      claims++;
+      if (missing) throw new LedgerUnavailableError(code);
+      return realClaim(...args);
+    }) as typeof ledger.claim;
+    let clock = Date.now();
+    const keys: string[] = [];
+    for (const id of ["auth-1", "auth-2"]) {
+      const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: id })]));
+      keys.push(await enqueueAdmission({ store: fs.store, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, clock, 0));
+    }
+    const lines: Record<string, unknown>[] = [];
+    const sink = (_m: string, f: Record<string, unknown> = {}) => void lines.push(f);
+    const consumer = selfhostAdmissionConsumer({
+      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts, nowMs: () => clock, log: { info: sink, warn: sink, error: sink },
+      deliver: { ledger, acceptanceMode: "canonical", target: { store: fs.store, keyRoot: "96bulls" }, random: () => 0 },
+    });
+    const tick = async (ms: number) => { clock += ms; await consumer.scan(); await consumer.settle(); };
+    return { fs, keys, lines, consumer, tick, claims: () => claims, grant: () => { missing = false; } };
+  }
+
+  for (const code of ["ledger_fence_authority_missing", "ledger_fence_authority_stopped"]) {
+    test(`${code}: a deferral, never dead-lettered, one claim per org per window, admitted once the marker exists`, async () => {
+      const t = await setup(code, 1);
+      await t.tick(0);
+      // One claim for the org; its sibling is skipped without starting. maxAttempts 1 would dead-letter a retry.
+      expect(t.claims()).toBe(1);
+      expect(t.lines.find((l) => l.route === "ingest.admission")).toMatchObject({ outcome: "deferred", error_code: code, attempt: 1 });
+      for (const key of t.keys) expect(await t.fs.store.head(deadLetterKey("96bulls", key) as never)).toBeUndefined();
+      // Inside the window nothing starts, even across scans; after it, the org is tried again (still one claim).
+      await t.tick(30_000);
+      expect(t.claims()).toBe(1);
+      await t.tick(31_000);
+      expect(t.claims()).toBe(2);
+      // Many windows later: still no dead letter and the backlog is intact.
+      for (let i = 0; i < 25; i++) await t.tick(61_000);
+      for (const key of t.keys) expect(await t.fs.store.head(deadLetterKey("96bulls", key) as never)).toBeUndefined();
+      expect(t.consumer.status()).toMatchObject({ backlog: 2, deadLetters: 0 });
+      // The marker lands: both objects are admitted.
+      t.grant();
+      await t.tick(61_000);
+      await t.tick(61_000);
+      expect(t.consumer.status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+      await t.consumer.stop();
+    });
+  }
+
+  test("an invalid marker is NOT a deferral: an ordinary retry that counts and dead-letters at maxAttempts", async () => {
+    const t = await setup("ledger_fence_authority_invalid", 1);
+    await t.tick(0);
+    expect(t.lines.find((l) => l.route === "ingest.admission")).toMatchObject({ outcome: "retry", error_code: "ledger_fence_authority_invalid" });
+    expect(await t.fs.store.head(deadLetterKey("96bulls", t.keys[0]!) as never)).toBeDefined();
+    await t.consumer.stop();
+  });
+});
+
 describe("deferTenantLimit (INGEST_LEDGER=s3 only)", () => {
   async function run(deferTenantLimit: boolean | undefined) {
     const fs = scratchStore();
