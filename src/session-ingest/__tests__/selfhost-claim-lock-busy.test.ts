@@ -105,7 +105,10 @@ describe("INGEST_CLAIM_LOCK_BUSY over the self-host edge", () => {
       await r.consumer().scan();
       await r.consumer().settle();
       expect(r.sql.length).toBe(1);
-      lines.push(r.logged.filter((f) => f.route === "ingest.admission").map(({ duration_ms: _d, ...rest }) => rest));
+      const admission = r.logged.filter((f) => f.route === "ingest.admission");
+      // The correlation tags (selfhost-admission.ts admissionLogTags) differ per run: shape-checked, then compared without.
+      for (const f of admission) { expect(String(f.receipt_tag)).toMatch(/^[0-9a-f]{8}$/); expect(String(f.attempt_tag)).toMatch(/^[0-9a-f]{8}$/); }
+      lines.push(admission.map(({ duration_ms: _d, receipt_tag: _r, attempt_tag: _a, ...rest }) => rest));
     }
     expect(lines[0]).toEqual(lines[1]!);
     expect(lines[0]).toEqual([{ route: "ingest.admission", outcome: "retry", error_code: "ledger_lock_timeout", stage: "claim", attempt: 1, db_error_class: expect.any(String), db_error_code: "55P03", db_error_basis: expect.any(String) }]);

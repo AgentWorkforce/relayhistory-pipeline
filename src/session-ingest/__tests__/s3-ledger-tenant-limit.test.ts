@@ -71,7 +71,7 @@ function edge(opts: { admission?: { mode: "async"; concurrency: number; scanInte
   /** INGEST_S3_TENANT_LIMIT: on ({}, or with asyncMaxPerOrg) by default here; null = off. */
   limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number;
   /** Share another edge's store (a second process: its consumer has none of the first one's notify hints). */
-  base?: ObjectStore; userHintMax?: number; learnedUserMax?: number }) {
+  base?: ObjectStore; userHintMax?: number; learnedUserMax?: number; onePerReceiptMaxWaitMs?: number }) {
   const s = opts.base ? { store: opts.base, done: () => {} } : scratchStore();
   cleanups.push(s.done);
   const g = gatedStore(s.store);
@@ -88,6 +88,7 @@ function edge(opts: { admission?: { mode: "async"; concurrency: number; scanInte
     verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} },
   { startConsumer: false, nowMs: () => clock, onConsumer: (c) => { consumer = c; }, ...(opts.userHintMax !== undefined ? { userHintMax: opts.userHintMax } : {}),
     ...(opts.learnedUserMax !== undefined ? { learnedUserMax: opts.learnedUserMax } : {}),
+    ...(opts.onePerReceiptMaxWaitMs !== undefined ? { onePerReceiptMaxWaitMs: opts.onePerReceiptMaxWaitMs } : {}),
     log: { info: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), warn: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}), error: (_m: string, f?: Record<string, unknown>) => void logged.push(f ?? {}) } as never });
   cleanups.push(() => runtime.close());
   const identity = { ...TENANT, scopes: [SYNC_SCOPE] } as unknown as IngestIdentity;
@@ -374,9 +375,16 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     expect(new Set(inbox.map((k) => k.slice(0, k.lastIndexOf("/a=")))).size).toBe(1);
     e.hold();
     const settling = e.consumer().scan().then(() => e.consumer().settle());
-    await until(() => e.blocked() > 0, "the first attempt to reach its canonical writes");
-    await new Promise((r) => setTimeout(r, 80));
-    expect(e.consumer().status().inFlight).toBe(onePerReceipt ? 1 : 2);
+    if (onePerReceipt) {
+      await until(() => e.blocked() > 0, "the first attempt to reach its canonical writes");
+      await new Promise((r) => setTimeout(r, 80));
+      expect(e.consumer().status().inFlight).toBe(1);
+      expect(e.blocked()).toBe(1);
+    } else {
+      // Both attempts past their claims and in their canonical writes: the second claim took the batch over.
+      await until(() => e.blocked() >= 2, "both attempts to reach their canonical writes");
+      expect(e.consumer().status().inFlight).toBe(2);
+    }
     e.open();
     await settling;
     for (let i = 0; i < 6 && e.consumer().status().backlog > 0; i++) { e.advance(301_000); await e.consumer().scan(); await e.consumer().settle(); }
@@ -384,6 +392,13 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     if (onePerReceipt) expect(superseded).toBe(0);
     else expect(superseded).toBeGreaterThan(0);
     expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-dup"))).toMatchObject({ state: "committed" });
+    if (onePerReceipt) {
+      // The first attempt is accepted; the sibling, started after it committed, is a replay (never a second write).
+      const codes = e.logged.filter((f) => f.route === "ingest.admission" && f.outcome === "admitted").map((f) => String(f.error_code)).sort();
+      expect(codes[0]).toBe("accepted");
+      expect(codes[1]).toMatch(/^replay(_fast)?$/);
+      expect(codes).toHaveLength(2);
+    }
     // The log tags group the attempts: one receipt_tag, two attempt_tags, never the key itself.
     const lines = e.logged.filter((f) => f.route === "ingest.admission");
     expect(new Set(lines.map((f) => f.receipt_tag)).size).toBe(1);
@@ -392,6 +407,68 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     expect(JSON.stringify(lines)).not.toContain(".admission-inbox");
     expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
     expect(e.sql).toEqual([]);
+  });
+
+  /** Two inbox attempts (nonces) of one batch, or one attempt each of several batches, all of one machine directory. */
+  async function attempts(e: ReturnType<typeof edge>, batches: string[], nonces: string[]) {
+    for (const b of batches) {
+      const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: `${b}-r`, session_id: `sess-${b}` })], { batch_id: b }));
+      for (const nonce of nonces) await enqueueAdmission({ store: e.base, keyRoot: ROOT, enqueue: async () => {}, nonce: () => nonce }, TENANT, prepared, T0, 0);
+    }
+  }
+  const perReceipt = (extra: Partial<Parameters<typeof edge>[0]> = {}) => edge({ admission: { mode: "async", concurrency: 4, scanIntervalMs: 15_000, maxAttempts: 20, onePerReceipt: true },
+    limit: { asyncMaxPerOrg: 4 }, maxPerUser: 4, ...extra });
+
+  test("ONE_PER_RECEIPT: two different batches of one machine directory still run together", async () => {
+    const e = perReceipt();
+    await writeAuthority(e.base);
+    await attempts(e, ["batch-p", "batch-q"], ["0000000000000001"]);
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    await until(() => e.blocked() >= 2, "both batches in their canonical writes");
+    expect(e.consumer().status().inFlight).toBe(2);
+    e.open();
+    await settling;
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+  });
+
+  test("ONE_PER_RECEIPT: when the first attempt ends in a retry, the sibling starts at once, with no scan (the ending admission re-pumps)", async () => {
+    const e = perReceipt();
+    await writeAuthority(e.base);
+    await attempts(e, ["batch-r"], ["0000000000000001", "0000000000000002"]);
+    let fail = true;
+    const original = e.base.put.bind(e.base);
+    (e.base as { put: ObjectStore["put"] }).put = (async (key: Parameters<ObjectStore["put"]>[0], ...rest: unknown[]) => {
+      if (fail && String(key).startsWith(CANONICAL)) { fail = false; throw Object.assign(new Error("store down"), { code: "unavailable" }); }
+      return (original as (...a: unknown[]) => unknown)(key, ...rest);
+    }) as ObjectStore["put"];
+    await e.consumer().scan(); // one pump: starts the first attempt only
+    const lines = () => e.logged.filter((f) => f.route === "ingest.admission");
+    await until(() => lines().length >= 2, "the retry and then the sibling's admission, with no further scan or settle");
+    expect(lines()[0]).toMatchObject({ outcome: "retry" });
+    expect(lines()[1]).toMatchObject({ outcome: "admitted", error_code: "accepted" });
+    expect(lines()[0]!.receipt_tag).toBe(lines()[1]!.receipt_tag);
+    expect(lines()[0]!.attempt_tag).not.toBe(lines()[1]!.attempt_tag);
+  });
+
+  test("ONE_PER_RECEIPT: a sibling waits at most onePerReceiptMaxWaitMs, then starts as without the flag (a hung attempt never holds its batch forever)", async () => {
+    const e = perReceipt({ onePerReceiptMaxWaitMs: 60_000 });
+    await writeAuthority(e.base);
+    await attempts(e, ["batch-h"], ["0000000000000001", "0000000000000002"]);
+    e.hold();
+    const settling = e.consumer().scan().then(() => e.consumer().settle());
+    await until(() => e.blocked() > 0, "the first attempt held in its writes");
+    await e.consumer().scan();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(e.consumer().status().inFlight).toBe(1);
+    e.advance(61_000);
+    await e.consumer().scan();
+    await until(() => e.consumer().status().inFlight === 2, "the sibling to start past the bound");
+    e.open();
+    await settling;
+    for (let i = 0; i < 6 && e.consumer().status().backlog > 0; i++) { e.advance(301_000); await e.consumer().scan(); await e.consumer().settle(); }
+    expect(await json(e.base, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-h"))).toMatchObject({ state: "committed" });
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
   });
 
   test("the writer hint never holds back another user of the same org", async () => {

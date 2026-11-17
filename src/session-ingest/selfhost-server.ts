@@ -221,6 +221,8 @@ export interface SelfhostRuntimeOptions {
   userHintMax?: number;
   /** Tests: the consumer's learned-directory bound (SelfhostAdmissionOptions.learnedUserMax). */
   learnedUserMax?: number;
+  /** Tests: SelfhostAdmissionOptions.onePerReceiptMaxWaitMs. */
+  onePerReceiptMaxWaitMs?: number;
 }
 
 /**
@@ -385,6 +387,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(admission.onePerReceipt ? { onePerReceipt: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     ...(options.learnedUserMax !== undefined ? { learnedUserMax: options.learnedUserMax } : {}),
+    ...(options.onePerReceiptMaxWaitMs !== undefined ? { onePerReceiptMaxWaitMs: options.onePerReceiptMaxWaitMs } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:
     // it is off the request path and serial per stream).

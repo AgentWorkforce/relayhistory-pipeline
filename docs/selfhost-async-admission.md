@@ -142,7 +142,14 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
   the pump never starts a key while another key of its receipt directory is in flight. The sibling waits,
   without a deferral or a claim, and once the first commits it is a cheap replay. The check runs before any
   tenant count or authority probe is taken, and the ending admission re-pumps. Across replicas, attempts can
-  still race, as before; `SELFHOST_ADMISSION_SPREAD` keeps one machine directory on one replica below its grace.
+  still race, as before. `SELFHOST_ADMISSION_SPREAD` only orders each replica's work differently, so replicas
+  usually start on different machine directories; it is a preference, not exclusive ownership.
+  - **Known limit, bounded.** No timeout wraps an admission, so an attempt that hangs would hold its batch's
+    siblings. A sibling therefore waits at most 10 minutes after the in-flight attempt started
+    (`ONE_PER_RECEIPT_MAX_WAIT_MS`). Past that it starts as it would without the flag, and supersedes the hung
+    attempt as today. The operator sees the batch's backlog entry age past 10 minutes, then a
+    `ledger_attempt_superseded` retry for the hung attempt if it ever ends, with the same `receipt_tag` as
+    the sibling that committed.
   Every admission log line carries `receipt_tag` and `attempt_tag`, whatever the flag: the first 8 hex of a
   sha256 of the receipt directory and of the inbox key. Attempts of one batch share a `receipt_tag`, so a
   sample can show which supersedes came from a sibling attempt. Neither tag is the key.
@@ -261,7 +268,9 @@ cannot delete, one small probe object per pod start remains.
     `offset` = lag ms, `attempt`, `db_error_*`), plus `outcome: dead_lettered`; an admitted or refused
     one also carries its wall time per phase: `admission_read_ms`, `admission_claim_ms`,
     `admission_gate_ms`, `admission_objects_ms`, `admission_commit_ms`, `admission_finish_ms` (bounded
-    integers, `ADMISSION_PHASE_FIELDS` in `shared/log.ts`);
+    integers, `ADMISSION_PHASE_FIELDS` in `shared/log.ts`); every one carries `receipt_tag` and
+    `attempt_tag` (8 hex of sha256 of the receipt directory and of the inbox key; correlation only, never the
+    key; see "One attempt of a batch at a time");
   - `ingest.admission_lock_alert` for 55P03 / 57014;
   - one `ingest.admission_consumer` line per scan: `admission_backlog`, `admission_oldest_age_ms`,
     `admission_dead_letters`, `admission_in_flight` (bounded integers in `shared/log.ts`), or

@@ -82,6 +82,8 @@ const INBOX_SUFFIX = ".ndjson.zst";
 const ATTEMPT = /\/a=(\d{15})-[0-9a-f]{16}\.ndjson\.zst$/;
 /** Most inbox keys whose writer's user this process remembers for the tenant-cap hint (oldest dropped first). */
 export const USER_HINT_MAX = 100_000;
+/** onePerReceipt: the longest a sibling attempt waits for the in-flight attempt of its batch (10 min). */
+export const ONE_PER_RECEIPT_MAX_WAIT_MS = 600_000;
 
 /** The dead-letter marker for one inbox object: the same path under the DLQ namespace. */
 export function deadLetterKey(keyRoot: string, inboxKey: string): string {
@@ -160,9 +162,13 @@ export interface SelfhostAdmissionOptions {
    * (`…/r=<receipt>/`, every attempt of one batch: the receipt is content-addressed by its digest) is in flight. Two
    * attempts of one pending batch at once make the second claim resume it with a new token, so the first writes its
    * objects and then loses its commit (`ledger_attempt_superseded`). The sibling waits and, after the first commits,
-   * is a cheap replay. Absent: no such check, unchanged.
+   * is a cheap replay. A sibling waits at most `onePerReceiptMaxWaitMs` (default ONE_PER_RECEIPT_MAX_WAIT_MS) after the
+   * in-flight attempt started; past that it starts as it would without the flag, so a hung attempt can still be
+   * superseded instead of holding its batch until a restart. Absent: no such check, unchanged.
    */
   onePerReceipt?: boolean;
+  /** With onePerReceipt: how long a sibling waits for the in-flight attempt of its batch (ms). Tests. */
+  onePerReceiptMaxWaitMs?: number;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -234,8 +240,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const decompress = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
   const entries = new Map<string, Entry>();
   const inflight = new Set<string>();
-  /** onePerReceipt: receipt directories (`…/r=<hex>`) with a key in flight. */
-  const inflightReceipts = opts.onePerReceipt ? new Set<string>() : undefined;
+  /** onePerReceipt: receipt directory (`…/r=<hex>`) -> keys of it in flight and when the latest started. */
+  const inflightReceipts = opts.onePerReceipt ? new Map<string, { n: number; startedAt: number }>() : undefined;
+  const receiptWaitMs = Math.max(0, Math.floor(opts.onePerReceiptMaxWaitMs ?? ONE_PER_RECEIPT_MAX_WAIT_MS));
   const receiptOf = (key: string): string | undefined => { const a = key.lastIndexOf("/a="); return a > 0 && key.slice(0, a).includes("/r=") ? key.slice(0, a) : undefined; };
   const running = new Set<Promise<void>>();
   // Tenant-cap HINT (deferTenantLimit only): skip, without starting, an entry whose org or user is already at the
@@ -549,7 +556,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       // onePerReceipt: another attempt of the same batch is in flight; it re-pumps when it ends. Checked before any
       // tenant count is taken, so a skip leaves nothing to undo.
       const receipt = inflightReceipts ? receiptOf(key) : undefined;
-      if (receipt !== undefined && inflightReceipts!.has(receipt)) continue;
+      const sibling = receipt !== undefined ? inflightReceipts!.get(receipt) : undefined;
+      // Past the bound, start anyway (as without the flag): a hung attempt is superseded, never waited on forever.
+      if (sibling && at - sibling.startedAt < receiptWaitMs) { next = Math.min(next, sibling.startedAt + receiptWaitMs); continue; }
       const tenant = caps ? tenantOf(key) : undefined;
       if (tenant && caps) {
         // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
@@ -569,14 +578,14 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const probe = waitOrg !== undefined && authorityProbe.has(waitOrg);
       if (probe) { authorityProbe.delete(waitOrg!); probing.add(waitOrg!); }
       inflight.add(key);
-      if (receipt !== undefined) inflightReceipts!.add(receipt);
+      if (receipt !== undefined) inflightReceipts!.set(receipt, { n: (inflightReceipts!.get(receipt)?.n ?? 0) + 1, startedAt: at });
       let deferred = false;
       const p: Promise<void> = admitOne(key, entry)
         .then((outcome) => { deferred = outcome === "deferred"; })
         .catch(() => { entry.notBefore = now() + 300_000; })
         .finally(() => {
           inflight.delete(key);
-          if (receipt !== undefined) inflightReceipts!.delete(receipt);
+          if (receipt !== undefined) { const r = inflightReceipts!.get(receipt); if (r && --r.n > 0) inflightReceipts!.set(receipt, r); else inflightReceipts!.delete(receipt); }
           if (probe) probing.delete(waitOrg!);
           if (tenant && !held) {
             bump(inflightOrg, tenant.org, -1); bump(inflightGroup, tenant.group, -1);
