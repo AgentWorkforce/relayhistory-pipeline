@@ -92,12 +92,13 @@ import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type Selfhos
 import { sqlLedger } from "./ledger-sql.ts";
 import { s3Ledger, serverLedgerParallel, withSqlControlMirror } from "./ledger-s3.ts";
 import { tenantLimiter, type TenantLimiter } from "./tenant-limiter.ts";
-import type { Ledger } from "./ledger.ts";
+import type { Ledger, LedgerTenant } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, defaultAsyncMaxPerOrg, selfhostIngestConfig, selfhostLedgerLogCommit, type SelfhostIngestSettings } from "./selfhost-config.ts";
 import { LogStreams } from "./ledger-log-admit.ts";
 import { LogMaterializer } from "./ledger-log-materialize.ts";
+import { eraseSupersededLogPayloads } from "./ledger-log-erase.ts";
 
 /** DeliverDeps without tenant slots (the log materializer is off the request path and serial per stream). */
 function withoutSlots(d: DeliverDeps): DeliverDeps {
@@ -226,7 +227,7 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
-export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean } = {}): Ledger {
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean; logErase?: boolean } = {}): Ledger {
   // The log materializer's ledger passes logModeGuard false: it is the one legacy writer allowed on a log-mode stream.
   // Callers pass the parsed mode (selfhostIngestRuntime); the env read is only for a direct caller that does not.
   const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";
@@ -236,13 +237,16 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
     // INGEST_S3_TENANT_LIMIT=on: the synchronous path's tenant limiter (one per process / replica). Off: no limiter, unchanged.
     // INGEST_LEDGER_LOG_COMMIT=on: legacy claims and commits refuse a stream in log mode (its log is the only writer).
     s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}),
-      ...(guard ? { logModeGuard: true } : {}), ...(parts.ledgerHome ? { ledgerHome: parts.ledgerHome } : {}) }),
+      ...(guard ? { logModeGuard: true } : {}), ...(parts.ledgerHome ? { ledgerHome: parts.ledgerHome } : {}),
+      // INGEST_LEDGER_LOG_ERASE=on: a reset deletes the log payloads it superseded before it completes or answers
+      // (ledger-log-erase.ts). The log lives in this ledger's (routed) store, as LogStreams writes it.
+      ...(opts.logErase ? { resetLogErase: (tenant: LedgerTenant, resets: number) => eraseSupersededLogPayloads(parts.store, keyRoot, tenant, resets) } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "s3TenantLimit" | "s3EraseFence">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "ledgerLogErase" | "s3TenantLimit" | "s3EraseFence">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
@@ -269,7 +273,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const logCommit = s3 && (settings.ledgerLogCommit ?? selfhostLedgerLogCommit(process.env)) === "on";
   // A log append admits without deliver's session guard: refused with the erase fence (selfhost-config.ts too).
   if (eraseFence && logCommit) throw new Error("96bulls: INGEST_S3_ERASE_FENCE=on refuses INGEST_LEDGER_LOG_COMMIT=on");
-  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  // INGEST_LEDGER_LOG_ERASE=on (parsed at config, refused there without s3 + log commit): refused again here.
+  if (settings.ledgerLogErase && !logCommit) throw new Error("96bulls: INGEST_LEDGER_LOG_ERASE=on needs INGEST_LEDGER=s3 and INGEST_LEDGER_LOG_COMMIT=on");
+  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit, logErase: settings.ledgerLogErase === true }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
     ...(withSessionWrites ? { withSessionWrites } : {}),

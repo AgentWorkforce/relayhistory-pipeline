@@ -676,6 +676,14 @@ export interface S3LedgerOptions {
    */
   resetBeginOnly?: boolean;
   /**
+   * INGEST_LEDGER_LOG_ERASE=on (self-host, with INGEST_LEDGER_LOG_COMMIT=on; ledger-log-erase.ts): run by every reset
+   * once its begin CAS is decided (applied, a replay, or an ordered stale) and BEFORE the reset completes or answers,
+   * with the fence's `resets` as that CAS saw it, to delete the user's unapplied log payloads that reset superseded.
+   * A throw fails the reset (retryable; a begun reset stays in flight, so log admission keeps refusing the user) and
+   * the reset's retry runs it again. Unset: nothing extra, byte-identical to before.
+   */
+  resetLogErase?: (tenant: LedgerTenant, resets: number) => Promise<unknown>;
+  /**
    * The per-tenant upload limit (tenant-limiter.ts): `acquireSlot` / `releaseSlot` count this process's in-flight
    * admissions per org and per (org, user), with no store or database call. Self-host (selfhostS3Ledger) always
    * sets one per replica. Absent: no limit (the hosted Lambda: reserved concurrency and SQS batch size 1 bound it,
@@ -1046,7 +1054,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     if (!mapKey(requestId)) throw new LedgerUnavailableError("ledger_input_refused");
     const keys = keysFor(tenant);
     const atMs = nowMs();
+    let resetsSeen = 0;
     const begun = await editFence<Decision>(keys.fence, (f) => {
+      // After applyFenceChange below this includes this reset; the last call is the fence the CAS decided on.
+      resetsSeen = f.resets;
       const d = mark?.(f);
       if (d && d !== "apply") return { next: null, result: d };
       const prior = own(f.resetRequests, requestId);
@@ -1055,8 +1066,11 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // Begun by an earlier attempt that stopped part way: finish it (the ordered mark, if any, is kept).
       if (prior === null) return { next: control ? f : null, result: "apply" as const };
       applyFenceChange(f, { reset: { requestId, atMs, result: null } });
+      resetsSeen = f.resets;
       return { next: f, result: "apply" as const };
     });
+    // Before the reset completes or answers, on every answer: a retry of a reset whose erase failed erases again.
+    if (opts.resetLogErase) await opts.resetLogErase(tenant, resetsSeen);
     if (begun !== "apply") return { outcome: begun.outcome, deleted: begun.result };
     if (opts.resetBeginOnly) return { outcome: "applied", deleted: 0 };
     const n = await finishResets(keys, requestId, control);

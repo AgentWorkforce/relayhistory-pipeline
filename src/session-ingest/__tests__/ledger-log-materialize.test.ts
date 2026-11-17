@@ -241,7 +241,7 @@ describe("the materializer", () => {
   });
 
   test("privacy at materialization: a session deleted after its entry is not written; a later reset skips the batch; an erased payload is skipped", async () => {
-    const { eraseLogPayloads } = await import("../ledger-log-materialize.ts");
+    const { eraseLogPayloads } = await import("../ledger-log-erase.ts");
     const e = edge("on");
     await writeAuthority(e.base);
     await enable(e.base);
@@ -276,17 +276,45 @@ describe("the materializer", () => {
     // a fresh upload with witness seq 0 would be refused at admit: write the journal back first.)
     await putJson(e.base, journalKey(ROOT, TENANT), { v: 3, seq: 0, pending: [], ambiguous: [] });
     hold(true);
-    await upload(e.base, "b3", ["erased"], () => "sess-erased");
+    const k3 = await upload(e.base, "b3", ["erased"], () => "sess-erased");
     await rounds(e, 2);
     expect(await eraseLogPayloads(e.base, ROOT, TENANT)).toBe(1);
     hold(false);
     await rounds(e, 2);
     side = [...(await readSide(e.base)).keys()];
     expect(side.some((k) => k.includes("/s=sess-erased/"))).toBe(false);
+    // No reset superseded it (the fence's resets did not move): a refused erasure (payload_erased, answered as admission_failed).
+    expect(await status(e.base, k3)).toMatchObject({ state: "refused", code: "admission_failed" });
     // Every entry applied, no payload left.
     const keys = logKeys(ROOT, TENANT, ORIGIN);
     expect((await keysUnder(e.base, keys.markers)).length).toBe((await entries(e.base)).length);
     expect(await keysUnder(e.base, keys.payloads)).toEqual([]);
+  });
+
+  test("a reset with the log erase on (INGEST_LEDGER_LOG_ERASE): the admitted, unapplied payload is gone before the reset answers, never written, refused as superseded", async () => {
+    const { eraseSupersededLogPayloads } = await import("../ledger-log-erase.ts");
+    const { s3Ledger } = await import("../ledger-s3.ts");
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    e.setFault((key) => (key.includes("/ledger/batches/") ? "before" : "ok"));
+    const k1 = await upload(e.base, "b1", ["secret"], () => "sess-secret");
+    await rounds(e, 2);
+    expect((await status(e.base, k1)).state).toBe("admitted");
+    const keys = logKeys(ROOT, TENANT, ORIGIN);
+    expect((await keysUnder(e.base, keys.payloads)).length).toBe(1);
+    // The reset (the self-host route's S3 ledger, its SQL mirror left out): the payload goes before it answers.
+    const ledger = s3Ledger(e.base, ROOT, { sleep: async () => {}, nowMs: () => T0, claimCompletesResets: false,
+      resetLogErase: (t, r) => eraseSupersededLogPayloads(e.base, ROOT, t, r) });
+    // (Its count is the owner stubs the held apply's legacy claim registered; not what this test is about.)
+    await ledger.resetUploadedSessions(TENANT, "req-1");
+    expect(await keysUnder(e.base, keys.payloads)).toEqual([]);
+    e.setFault(undefined);
+    await rounds(e, 2);
+    expect([...(await readSide(e.base)).keys()].some((k) => k.includes("/s=sess-secret/"))).toBe(false);
+    // The client-visible answer is the reset's (as the snapshot rule gives without the erase), not a bare erasure.
+    expect(await status(e.base, k1)).toMatchObject({ state: "refused", code: "delivery_privacy_superseded" });
+    expect((await keysUnder(e.base, keys.markers)).length).toBe((await entries(e.base)).length);
   });
 
   test("the sweeper applies a stream no kick reached (another process admitted it)", async () => {

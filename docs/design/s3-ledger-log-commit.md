@@ -1,7 +1,8 @@
 # S3 ledger: numbered-log-entry commit
 
 Status: proposed. Slices 1 (writer and reader), 2 (admission wiring), 3 (materializer, operator tool), 4 and 5 (review
-fixes) and 6 (the before-production items of Remaining) are implemented behind `INGEST_LEDGER_LOG_COMMIT` (default
+fixes), 6 (the before-production items of Remaining) and 7 (a reset erases the payloads it superseded, behind its own
+default-off `INGEST_LEDGER_LOG_ERASE`) are implemented behind `INGEST_LEDGER_LOG_COMMIT` (default
 off). With `on`, only a stream whose entry 0 exists is admitted through its log; entry 0 is written only by the
 operator tool (`scripts/ledger-log-stream.ts switch`). Production still needs: the review of slice 6, the
 `OnlyTheEraserDeletes` carve-out and the operator role's grants (Remaining 10), lifting the hosted and stack refusals
@@ -258,7 +259,8 @@ today.
   - Privacy at apply time (never resurrect erased data): the legacy claim re-reads the fence (sessions deleted after
     the entry are dropped; a pending reset is a retry); the privacy journal is re-checked against the payload's
     `journalSeq` (a reset completed after the upload began skips the batch); a batch whose payload is gone is skipped
-    as erased (`eraseLogPayloads` deletes a user's unapplied payloads). A definitive refusal (403/409/413/422/400)
+    as erased (`eraseLogPayloads`, now in `ledger-log-erase.ts`, deletes a user's unapplied payloads; slice 7 answers
+    a batch a reset superseded as `delivery_privacy_superseded`). A definitive refusal (403/409/413/422/400)
     skips the batch; anything else is a retry with the cursor unchanged. A read that sees a concurrent append as a gap
     is a retry too.
   - Payloads are deleted once their entry is applied; unreferenced payloads (a put whose append never happened)
@@ -469,6 +471,47 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
     dropped without writing into its directory, and an invalid v1 doc reported while the rest migrate. The CLI guard covers
     `migrate-registry` (`ledger-log-admit.test.ts`).
 
+## Slice 7: a reset erases the payloads it superseded (Remaining 3)
+
+Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` refused at startup without
+`INGEST_LEDGER=s3` and `INGEST_LEDGER_LOG_COMMIT=on`, and again in `selfhostIngestRuntime` for a direct caller).
+
+- `ledger-log-erase.ts`:
+  - Both erasures find a user's streams by listing that user's own log directory (`logUserRoot`, the hashed admission
+    directory), never the deployment-wide registry: a stream with no registry pointer or a corrupt identity doc is still
+    found, and no other user's stream is read. `logKeysAt(root)` gives the keys of a stream known only by its root.
+  - `eraseLogPayloads(store, keyRoot, tenant)` (moved here from the materializer): every payload of the user, then a
+    fresh listing; a payload still listed (a write that raced the erase) fails it with `ledger_log_erase_unverified`.
+  - `eraseSupersededLogPayloads(store, keyRoot, tenant, resets)`: the payloads of every UNAPPLIED batch (entries after the
+    materializer's cursor) whose admission snapshot has `resets` below the given count, which is exactly the
+    materializer's own skip rule (`fence.resets > b.admitted.resets`). Never a batch admitted after the reset, an
+    unreferenced (in-flight) payload, a payload a live batch also names, or a batch without a snapshot (admission always
+    writes one). Each delete is verified by a HEAD.
+  - Fail closed: a store fault, an unreadable stream (`LogCorrupt`, `LogUnavailable`) or a payload still present is a
+    `LedgerUnavailableError` (`ledger_log_erase_failed` / `ledger_log_erase_unverified`), a retry, never success.
+- `ledger-s3.ts` `resetLogErase`: with it set, every reset runs it once its begin CAS is decided (applied, replay, or an
+  ordered stale) and BEFORE `finishResets` and before it answers, with the fence's `resets` as that CAS saw it (this
+  reset included). A failure fails the reset: the begun reset stays in flight, so log admission keeps refusing the user
+  (`ledger_reset_in_flight`) and the materializer keeps retrying, and the retry (a replay included) erases again. The
+  self-host route answers 503. In self-host the SQL control mirror runs after S3, so a failed erase never reaches SQL.
+- The materializer answers a batch whose payload is gone as `delivery_privacy_superseded` when the fence's resets have
+  passed its snapshot (the reset's own erase took it), and `payload_erased` otherwise, so the client-visible outcome of
+  a reset does not change with the erase.
+- Ordering it relies on: log admission refuses a user while a reset is begun and not completed, and the erase runs
+  after the begin. A batch appended by an admission that read the fence after the begin carries the new `resets` and is
+  not touched. An admission that read the fence BEFORE the begin and appends AFTER the erase listed its stream carries
+  the old `resets`: the reset does not delete its payload, but the materializer never writes it (the same snapshot rule)
+  and deletes it when it reaches the entry (orphan collection takes it after `ORPHAN_GRACE_MS` if the append never
+  happens). That window is one admission's fence read to append.
+- Tests (`ledger-log-erase.test.ts`, fs store): the erased user's payloads are gone in every stream, other users' and the
+  same user id in another workspace untouched; a payload PUT racing `eraseLogPayloads` fails it and the retry erases it;
+  list, delete and HEAD faults, a lying delete and a corrupt entry all fail closed; only superseded unapplied batches
+  are taken; the S3 ledger's reset erases before it answers, a replay erases again but never a later batch, an erase
+  failure leaves the reset in flight and its retry completes it, unset touches nothing in the log; self-host wiring
+  runs the erase before the SQL mirror; the switch's parsing and refusals. `ledger-log-materialize.test.ts`: on the
+  self-host edge, an admitted, unapplied upload's payload is gone after a reset with the erase, never written, and
+  answered `delivery_privacy_superseded`.
+
 ## Remaining
 
 1. Closed in slice 6: the payload carries the inbox `consentCap`, and the materializer re-runs the consent gate at apply
@@ -477,9 +520,28 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
    journal re-check is; a consent store fault is a retry.
 2. Closed in slice 6: `readEntries(fromSeq)` reads entry 0 and then starts from the newest verified checkpoint at or
    below `fromSeq` (the same trust rules as `openStream`), falling back to entry 0 on any mismatch.
-3. A privacy reset does not delete unapplied payloads by itself: the materializer skips them at apply time (the journal
-   re-check and the snapshot) and then deletes them, so they live until the stream's next apply. Operator and session
-   erase are refused under `INGEST_LEDGER=s3` today; when they are admitted, they must call `eraseLogPayloads`.
+3. Partly closed in slice 7. A privacy reset through the S3 ledger (`resetUploadedSessions` and an ordered reset) now
+   deletes the unapplied payloads it superseded before it completes or answers, behind `INGEST_LEDGER_LOG_ERASE=on`
+   (default off; it needs `INGEST_LEDGER_LOG_COMMIT=on`, so it is self-host only while the hosted runtime refuses log
+   commit). What remains:
+   - The operator erase (`SESSION_ERASE_*`, the per-session erase route and runtime), the session-selection erase
+     (`RELAYHISTORY_SELFHOST_SESSION_SELECTION`) and upload consent stay REFUSED under `INGEST_LEDGER=s3`: their state
+     (erase receipts, session fences, tombstones, consent) is SQL-only, and the S3 ledger's admission never reads it, so
+     lifting the refusal is a port of that state to S3, not a call to add. The operator per-user erase
+     (`OPERATOR_USER_ERASE_*`) fences uploads only in SQL (RH041) for the same reason.
+   - When the per-user erase is admitted under the S3 ledger, it must first hold the user's S3 admissions (as a begun
+     reset does), then call `eraseLogPayloads` (which fails while a racing write keeps landing), together with the
+     ledger journal and fence objects, outcome markers and registry pointers that `OnlyTheEraserDeletes` must let it
+     delete (Remaining 10).
+   - A session-scoped erase or a selection disable cannot use either function: a payload holds a whole batch, often of
+     several sessions, so deleting it drops the other sessions' admitted records. Until payloads are rewritten without
+     the erased sessions (or split per session), those records stay in the payload until apply, where the fence drops
+     them (the epoch snapshot) and the payload is deleted.
+   - The window in slice 7's "Ordering": a payload written by an admission that read the fence before the reset began
+     and appended after the erase listed the stream lives until the materializer reaches it (never written).
+   - Deletes remove the current version only, as the materializer's own payload drop does; a versioned ledger bucket
+     keeps noncurrent versions until its lifecycle expires them.
+   - A stream that reads corrupt fails every reset of its user (fail closed) until an operator repairs or erases it.
 4. The GCS protocol run on a backend that honours generation preconditions (real GCS or a newer emulator). The local
    fake-gcs-server 1.52.2 also answered the adapter's create with `400 invalid uploadType`, so the GCS case did not run
    here.

@@ -27,8 +27,9 @@
  *     (skipped:upload_consent_required) and its payload is deleted, as the journal re-check does: the materializer
  *     never holds a stream behind one batch, so it cannot wait for a consent that may never come;
  *   - payloads under ledger/log/o=<origin>/p/ live only until their entry is applied: after its marker is written
- *     they are deleted. eraseLogPayloads deletes a user's unapplied payloads outright (a batch whose payload is gone
- *     is skipped as erased, never written).
+ *     they are deleted. ledger-log-erase.ts deletes a user's unapplied payloads ahead of that (eraseLogPayloads: all
+ *     of them; eraseSupersededLogPayloads: those a reset superseded, run by the reset itself under
+ *     INGEST_LEDGER_LOG_ERASE=on). A batch whose payload is gone is skipped, never written.
  *
  * Progress: `m/<seq>.json`, written once (create-if-absent) after entry `seq` and every entry before it are
  * applied. The highest marker is the cursor. A crash before the marker re-applies the entry (idempotent).
@@ -225,19 +226,6 @@ export async function materializedThrough(store: ObjectStore, keys: LogKeys): Pr
 }
 
 /**
- * Delete every payload of a user's log streams (erasure). A batch whose payload is gone is skipped as erased by the
- * materializer, never written. Returns how many were deleted.
- */
-export async function eraseLogPayloads(store: ObjectStore, keyRoot: string, tenant: LedgerTenant): Promise<number> {
-  let n = 0;
-  for await (const s of listLogStreams(store, keyRoot)) {
-    if (s.tenant.orgId !== tenant.orgId || s.tenant.workspaceId !== tenant.workspaceId || s.tenant.userId !== tenant.userId) continue;
-    for (const k of await listKeys(store, logKeys(keyRoot, s.tenant, s.originId).payloads)) { await store.delete(objectKey(k)); n++; }
-  }
-  return n;
-}
-
-/**
  * A logged batch's payload (ledger-log-admit.ts): the kept records, the receipt, the upload's journal seq and a per-
  * attempt nonce. Its key is its content hash, so one attempt's own retried PUTs are idempotent, while every admission
  * attempt writes a FRESH object (a fresh lastModified): an identical re-put never leaves a stale payload that orphan
@@ -372,6 +360,12 @@ export class LogMaterializer {
     return outcome;
   }
 
+  /** The snapshot rule alone (no pending / in-flight retry): a reset begun after the batch's admission dooms it. */
+  async #superseded(tenant: LedgerTenant, b: Extract<LogEntry, { kind: "batches" }>["batches"][number]): Promise<boolean> {
+    if (!b.admitted) return false;
+    return admissionFenceView(await this.#io.readFence(this.#io.keysFor(tenant).fence)).resets > b.admitted.resets;
+  }
+
   async #applyBatchOnce(tenant: LedgerTenant, originId: string, entry: Extract<LogEntry, { kind: "batches" }>, b: Extract<LogEntry, { kind: "batches" }>["batches"][number], now: () => number): Promise<MaterializedOutcome> {
     const { store, keyRoot } = this.deps;
     const records: PreparedDelivery["records"] = [];
@@ -383,8 +377,9 @@ export class LogMaterializer {
     for (const ref of b.payloads) {
       let p: unknown;
       try { p = await readJson(store, ref.key); } catch (error) { if (error instanceof SyntaxError) return "skipped:payload_invalid"; throw error; }
-      // Gone before its entry was applied: erased (eraseLogPayloads). Never written.
-      if (p === undefined) return "skipped:payload_erased";
+      // Gone before its entry was applied: erased (ledger-log-erase.ts). Never written. A batch a reset superseded (the
+      // reset's own erase took its payload) answers as the snapshot rule below would: privacy superseded.
+      if (p === undefined) return (await this.#superseded(tenant, b)) ? "skipped:delivery_privacy_superseded" : "skipped:payload_erased";
       if (!validPayload(p)) return "skipped:payload_invalid";
       const cap = payloadConsentCap(p);
       if (cap === null) return "skipped:payload_invalid";
