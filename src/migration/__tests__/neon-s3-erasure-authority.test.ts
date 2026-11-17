@@ -17,6 +17,10 @@ import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
 import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { supabaseAuthority, type ErasureAuthority } from "../neon-s3-erasure/authority.ts";
 import { authorityKind, authorityUrl, eraserFor, legacyExportErasureEnabled } from "../neon-s3-erasure/main.ts";
+import {
+  assertLegacyErasureAuthorityReady,
+  withLegacyPrivacyFence,
+} from "../legacy-export/runner.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
 import { postgresTlsOptions } from "../../shared/postgres-tls.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
@@ -568,6 +572,51 @@ describe("supabase privacy authority as the eraser's source", () => {
     expect(
       (await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0],
     ).toEqual({ n: 0 });
+  });
+
+  test("a real re-activation before the first fence transaction refuses before the scope action", async () => {
+    const w = await world();
+    await w.activate();
+    await w.job().sweep();
+
+    // The run-level/per-scope check observes activation A as ready. Inject a
+    // real same-epoch release + activation B in the gap before the first
+    // privacy transaction begins; begin() must re-read the real SQL gate only
+    // after taking both shared locks and must never call the action.
+    await assertLegacyErasureAuthorityReady(w.f.queryable);
+    let begins = 0;
+    let actionCalled = false;
+    const reactivated: Queryable = {
+      async query<T>(sql: string, params?: unknown[]) {
+        if (sql.startsWith("BEGIN")) {
+          begins += 1;
+          if (begins === 1) {
+            await w.f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch });
+            await w.activate();
+          }
+        }
+        return w.f.queryable.query<T>(sql, params);
+      },
+    };
+    const scope = {
+      orgId: "org-1",
+      workspaceId: "ws/1",
+      source: "claude",
+      sessionId: "reactivated-before-fence-transaction",
+    };
+    await expect(
+      withLegacyPrivacyFence(
+        reactivated,
+        scope,
+        "user-1",
+        async () => {
+          actionCalled = true;
+        },
+        { machineId: legacyMachineId(scope.workspaceId, "user-1"), existing: false },
+      ),
+    ).rejects.toMatchObject({ code: "legacy_export_authority_not_active" });
+    expect(begins).toBe(1);
+    expect(actionCalled).toBe(false);
   });
 
   test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {
