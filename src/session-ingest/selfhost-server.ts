@@ -108,6 +108,7 @@ import { randomUUID } from "node:crypto";
 import { isSessionErasePath } from "./session-erase.ts";
 import type { SessionEraseService } from "./session-erase.ts";
 import { buildSelfhostEraseRuntime } from "../session-erase/selfhost-runtime.ts";
+import { composeSessionWriteGuards, s3EraseFenceGuard, withS3EraseTombstones } from "./s3-erase-fence.ts";
 import type { SessionWriteGuard } from "../session-erase/runtime.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
@@ -241,25 +242,35 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "s3TenantLimit">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "s3TenantLimit" | "s3EraseFence">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
   // consumer, upload promotion and the selection / reset fences, so no admission or fence decision reads SQL.
   // The combinations whose state is SQL-only are refused at config; refused again here for direct callers.
   const s3 = settings.ledger === "s3";
-  if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || parts.withSessionWrites || parts.sessionEraseService))
+  // INGEST_S3_ERASE_FENCE=on (s3-erase-fence.ts) lifts the operator per-session erase refusal only: its erase is then
+  // tombstoned in S3 and every admission path checks the tombstones. Selection and consent stay refused.
+  const eraseFence = settings.s3EraseFence === true;
+  if (eraseFence && !s3) throw new Error("96bulls: INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3");
+  if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || !eraseFence && (parts.withSessionWrites || parts.sessionEraseService)))
     throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
+  // Flag off: exactly the parts as given (no guard, no tombstone write).
+  const withSessionWrites = eraseFence ? composeSessionWriteGuards(s3EraseFenceGuard(parts.store, settings.keyRoot), parts.withSessionWrites) : parts.withSessionWrites;
+  const sessionEraseService = eraseFence && parts.sessionEraseService
+    ? withS3EraseTombstones(parts.sessionEraseService, parts.store, settings.keyRoot, options.nowMs) : parts.sessionEraseService;
   // INGEST_S3_TENANT_LIMIT=on (selfhost-config.ts): needs the S3 ledger; refused again here for direct callers.
   const tenantLimit = settings.s3TenantLimit;
   if (tenantLimit && !s3) throw new Error("96bulls: INGEST_S3_TENANT_LIMIT=on needs INGEST_LEDGER=s3");
   // INGEST_LEDGER_LOG_COMMIT: the mode parsed at config (settings.ledgerLogCommit); a direct caller that omits it
   // falls back to the process env, validated the same way.
   const logCommit = s3 && (settings.ledgerLogCommit ?? selfhostLedgerLogCommit(process.env)) === "on";
+  // A log append admits without deliver's session guard: refused with the erase fence (selfhost-config.ts too).
+  if (eraseFence && logCommit) throw new Error("96bulls: INGEST_S3_ERASE_FENCE=on refuses INGEST_LEDGER_LOG_COMMIT=on");
   const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
-    ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
+    ...(withSessionWrites ? { withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
     target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps(), ...(options.nowMs ? { now: () => new Date(options.nowMs!()) } : {}) },
@@ -279,7 +290,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   };
   // SESSION_ERASE_API_ENABLED (session-erase.ts): the same operator route in every admission mode.
   const sessionErase = { ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
-    ...(parts.sessionEraseService ? { sessionEraseService: parts.sessionEraseService } : {}) };
+    ...(sessionEraseService ? { sessionEraseService } : {}) };
   // ANALYTICS_SINK=collector: the same port in every admission mode.
   const analytics = parts.analytics ? { analytics: parts.analytics } : {};
   // RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): the same check in every admission mode.
