@@ -1115,6 +1115,14 @@
       "<owner>:EXECUTE",
       "bulls96_legacy_export_privacy:EXECUTE"
     ],
+    "sessions.legacy_export_privacy_eraser_activation()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_eraser_heartbeat()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
     "sessions.legacy_export_privacy_eraser_page(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_privacy_eraser:EXECUTE"
@@ -1122,6 +1130,9 @@
     "sessions.legacy_export_privacy_eraser_still_fenced(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_readiness_clear()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.legacy_remote(text)": [
       "<owner>:EXECUTE",

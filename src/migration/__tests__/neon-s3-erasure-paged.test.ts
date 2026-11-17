@@ -30,7 +30,11 @@ __modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OB
  * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
-const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const SETTLED_CFG = {
+  ...DEFAULT_ERASURE_CONFIG,
+  legacyExportErasure: true,
+  obligationsSettled: () => true,
+};
 const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 
 setDefaultTimeout(120_000);
@@ -68,6 +72,36 @@ const job = (s: FakeS3Versions, st: SyncState, a: ErasureAuthority, now = () => 
   new ErasureJob(a, st, s.eraser(), () => {}, SETTLED_CFG, now, async () => {});
 
 describe("E3 job on the shared paged eraser", () => {
+  test("only a healthy non-dry-run Supabase sweep records exporter readiness", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    let heartbeats = 0;
+    const base = {
+      fencedLivePage: async () => [],
+      recordSuccessfulSweep: async () => void (heartbeats += 1),
+      legacyFencedPage: async () => [] as LegacyFencedGroup[],
+      stillLegacyFenced: async () => true,
+    };
+    await job(s, st, authority(base)).sweep({ dryRun: true });
+    expect(heartbeats).toBe(0);
+    await job(s, st, authority(base)).sweep();
+    expect(heartbeats).toBe(1);
+    const broken = authority({
+      ...base,
+      legacyFencedPage: async () => { throw Object.assign(new Error("broken"), { code: "legacy_rpc_broken" }); },
+    });
+    const logs: Record<string, unknown>[] = [];
+    const j = new ErasureJob(broken, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
+    await j.sweep();
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs).toContainEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+    }));
+    expect(heartbeats).toBe(1);
+    st.close();
+  });
+
   test("a machine over 10k versions resumes across sweeps (and a fresh process) instead of failing closed; pointer last", async () => {
     const s = new FakeS3Versions();
     fill(s, 12_500);
@@ -217,6 +251,39 @@ describe("hosted legacy-export scope erasure", () => {
     await j.sweep();
     expect(reads).toBe(0);
     expect(j.counters.legacyFenceFailed).toBe(0);
+    st.close();
+  });
+
+  test("a caught per-scope legacy failure is a partial sweep: no readiness heartbeat, per-sweep and cumulative alarm counts differ", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    s.rewrite = () => "<malformed>";
+    const st = await state();
+    let heartbeats = 0;
+    const logs: Record<string, unknown>[] = [];
+    const a = legacyAuthority() as ErasureAuthority;
+    a.recordSuccessfulSweep = async () => void (heartbeats += 1);
+    const j = new ErasureJob(a, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
+    await j.sweep();
+    expect(heartbeats).toBe(0);
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+      legacyFenceFailed: 1,
+    }));
+
+    // A later healthy sweep can arm the exporter. Its delta is zero while the
+    // process-lifetime counter still records the earlier privacy failure.
+    s.rewrite = undefined;
+    await j.sweep();
+    expect(heartbeats).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 0,
+      legacyFenceFailed: 1,
+    }));
     st.close();
   });
 
