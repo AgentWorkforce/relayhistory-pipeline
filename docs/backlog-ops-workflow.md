@@ -181,6 +181,27 @@ the sorted list).
   the primary key, which fetched every slot at random. With `slots_read=org` (opt-in, default off) a scoped one reads each
   org once through the `org_id` index (`SLOTS_ORG_CURSOR`); an org above `SLOTS_ORG_READ_MAX_ROWS` (2M slots, bounded memory) falls back to the windows. A slot rewritten during the pass can be
   missed, so run a scoped backfill-execute after the scope's HTTP admission stop (decision 0005's cutover order).
+- **Pacing and the slots fingerprint (`slots_read=org`).** A scoped `slots_read=org` run reads each org's owned slots
+  once: the run-start fingerprint transaction then reads only the revision and ownership values, and the three slots
+  values (`slots_owned_count`, `slots_revision_sum`, `slots_hash`) are summed from the per-org cursor rows (the server
+  computes each row's `hashtext`; the tool sums and normalises exactly as `FINGERPRINT_SLOTS`, so the values equal
+  what that query gives over the same rows). **Snapshot caveat:** those three values come from each org's own cursor
+  snapshot, taken later than (and per org apart from) the one run-start snapshot of the revision and ownership values;
+  they describe exactly the slots the run processed. The drain's FULL-versus-refresh equality keeps its meaning (an
+  owned slot changed between the two runs' reads still moves a value), and a FULL and a refresh may differ in
+  `slots_read`: over unchanged rows both methods give equal values. An org above
+  `SLOTS_ORG_READ_MAX_ROWS` still has its cursor read to the end for its fingerprint (rows dropped, not buffered)
+  before its rows are processed through the windows. A fences-only CLI run (no slot pass) keeps `FINGERPRINT_SLOTS`.
+  The optional `slot_pace_ms` input (backfill modes with `slots_read=org` only; digits, 0 to 5000; empty or 0 is
+  unpaced and the argv unchanged) passes `--slot-pace-ms`: the tool sleeps that long between the cursor's fetches,
+  which shrink from 5000 to 2000 rows when paced (`--slot-fetch-rows`, 100 to 50000, CLI only), so a multi-million
+  slot org is read as a stream of small index bursts instead of one IO-saturating sweep. Rows are still buffered to
+  the end and processed after the transaction closes (S3 work inside it would stretch the snapshot further). A paced
+  read holds its read-only transaction open longer by design, so it is bounded: an org whose paced read would pass
+  30 minutes (`SLOTS_ORG_PACED_READ_MAX_MS`) is rolled back and fails closed (`failed_codes.slot_read_too_long`,
+  ownership and revisions incomplete, so the receipt binds nothing; it is never retried through the heap windows).
+  Choose the pace so the largest org fits: about 2.9M slots at 2000 rows a fetch is ~1450 fetches, so 500 ms is
+  ~12 min of pauses plus the reads. Unpaced reads are not bounded by it.
 - An unscoped backfill run while orgs still admit (a pre-warm) certifies no org that was not stopped before it
   began. Each org's cutover takes its own scoped backfill-execute after its stop.
 - A scoped drain-execute WITHOUT `full_backfill_run` binds its backfill with the 3 h freshness check only: no
