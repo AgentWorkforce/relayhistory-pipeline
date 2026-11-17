@@ -476,6 +476,17 @@ export function sameNameOid(a: ReadonlyMap<string, string>, b: ReadonlyMap<strin
   return true;
 }
 
+/**
+ * seedCommit's candidate test: two name -> blob oid trees (both schema lanes) are equal
+ * except for `step`'s own blob: the same step names, `step` present in both, and the same
+ * blob for every other step.
+ */
+export function sameLanesExceptStep(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>, step: string): boolean {
+  if (!a.has(step) || !b.has(step) || a.size !== b.size) return false;
+  for (const [k, v] of a) if (!b.has(k) || (k !== step && b.get(k) !== v)) return false;
+  return true;
+}
+
 /** Flip the last hex digit: a well-formed generation that is not the approved one. */
 export function flipHex(hex: string): string {
   const last = hex.at(-1)!;
@@ -680,7 +691,19 @@ export function bootstrapChainGrowth(x: { landing: readonly string[]; release: r
  * still refuses rehearsal_bootstrap_unexpected_role. Sorted, each once.
  */
 export function bootstrapExpectedRoles(added: readonly string[], roleMap: Readonly<Record<string, Readonly<Record<string, unknown>>>> | undefined): string[] {
-  const out = new Set<string>(BOOTSTRAP_NEW_ROLES);
+  const out = new Set<string>([...BOOTSTRAP_NEW_ROLES, ...bootstrapAddedRoles(added, roleMap)]);
+  return [...out].sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
+}
+
+/**
+ * The roles that must exist after R2-bootstrap: those the release's role contract map
+ * assigns to a chain file the landing list does not have. Every chain file creates each of
+ * its roles whenever it is absent, or raises (none skips creation by mode or version
+ * without an error), so a refresh that applied every file without an error leaves each of
+ * them present; one absent refuses rehearsal_bootstrap_role_missing. Sorted, each once.
+ */
+export function bootstrapAddedRoles(added: readonly string[], roleMap: Readonly<Record<string, Readonly<Record<string, unknown>>>> | undefined): string[] {
+  const out = new Set<string>();
   for (const f of added) for (const r of Object.keys(roleMap?.[f] ?? {})) out.add(r);
   return [...out].sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
 }
@@ -694,9 +717,11 @@ const byName = (rows: readonly RoleRow[]) => new Map(rows.map((r) => [r.rolname,
  * `rehearsal_bootstrap_unexpected_role` (a new role not in `expected`, or any new role
  * while every chain file is unchanged from landing), `rehearsal_bootstrap_side_effect`
  * (a role removed, a pre-existing role's attributes changed, or the row count not
- * before + created), `rehearsal_bootstrap_role_contract` (an expected role present after
- * that is not bare NOLOGIN, or has any inbound or outbound membership). Evidence: role
- * names, attribute flags and edges only.
+ * before + created), `rehearsal_bootstrap_role_missing` (a `required` role, one an added
+ * chain file creates (bootstrapAddedRoles), absent after the refresh),
+ * `rehearsal_bootstrap_role_contract` (an expected role present after that is not bare
+ * NOLOGIN, or has any inbound or outbound membership). Evidence: role names, attribute
+ * flags and edges only.
  */
 export function bootstrapRefreshEvidence(x: {
   files: readonly BootstrapFileEvidence[];
@@ -705,6 +730,7 @@ export function bootstrapRefreshEvidence(x: {
   edges: readonly RoleEdge[];
   applied: number;
   expected?: readonly string[];
+  required?: readonly string[];
 }) {
   const expected = x.expected ?? BOOTSTRAP_NEW_ROLES;
   const before = byName(x.before);
@@ -726,6 +752,8 @@ export function bootstrapRefreshEvidence(x: {
       count_before: x.before.length,
       count_after: x.after.length,
     });
+  const missing = sort((x.required ?? []).filter((n) => !after.has(n)));
+  if (missing.length) rehearsalRefuse("rehearsal_bootstrap_role_missing", { missing, roles_created: created });
   const roles = expected.map((name) => {
     const r = after.get(name);
     if (!r) return { name, present: false };

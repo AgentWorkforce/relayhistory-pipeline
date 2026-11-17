@@ -2,9 +2,11 @@
  * The bootstrap role contract map: for each chain file (SESSION_BOOTSTRAP_FILES in
  * session-bootstrap-chain.ts), the roles it provisions and their contracts. Kept out of
  * session-bootstrap-chain.ts on purpose: the PR schema rehearsal
- * (scripts/pg-proof/schema-rehearsal.ts) pins that module's whole text at the release
- * sha to the landing commit's bytes, so the chain module must change only when the chain
- * file list does. The guarded release's bootstrap stage reads this module at the anchor
+ * (scripts/pg-proof/schema-rehearsal.ts) parses that module's text as data at the seed
+ * commit and at the release sha (one literal SESSION_BOOTSTRAP_FILES list; never
+ * executed) and accepts only append or insert growth of the list, the roles of an added
+ * file being the ones this map declares for it; the chain module stays the list alone.
+ * The guarded release's bootstrap stage reads this module at the anchor
  * (target_sha) as data, never evaluated (schema-release-bootstrap.ts rolesModuleContract).
  */
 import type { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";

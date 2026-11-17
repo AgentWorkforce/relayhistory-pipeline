@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BOOTSTRAP_NEW_ROLES,
+  bootstrapAddedRoles,
   bootstrapChainGrowth,
   bootstrapChainList,
   bootstrapExpectedRoles,
@@ -41,6 +42,7 @@ import {
   rehearsalPassed,
   resultRecord,
   runLandingMigrator,
+  sameLanesExceptStep,
   sameNameOid,
   seedSet,
   seedStepBytes,
@@ -433,6 +435,137 @@ describe("R0 landing migrator (offline: fixture repo and injected runner)", () =
     }
   });
 
+  // R0 seeds the seed commit's whole two-lane tree: any change to another step, in either
+  // lane, between the add and an amend of the baseline stops the walk (no false green).
+  const STEP_W = "upstream:20261105045010_w.sql";
+  const OTHER = "96bulls:0001_other.sql";
+  const otherPath = `src/hoopdb/migrations/${OTHER.slice("96bulls:".length)}`;
+  test("seedCommit: an earlier step edited before the baseline's amend keeps the add (drift refuses)", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["edit-a", { [pathOf(STEP_A)]: "select 1; -- edited after it landed" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- final" }],
+    ]);
+    try {
+      const head = h.at["amend-b"]!;
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["add-b"]!);
+      // The add's A (what production applied) is not the release's: refused, not seeded as applied.
+      expect(bytesCheck(h.repo, h.at["add-b"]!, head)).toBe("rehearsal_seed_bytes_drift");
+      // Seeding from the amend is the false green this guards against.
+      expect(bytesCheck(h.repo, h.at["amend-b"]!, head)).toBeNull();
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: a step inserted below the baseline before its amend keeps the add (noncontiguous)", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["insert-w", { [pathOf(STEP_W)]: "select 9;" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- final" }],
+    ]);
+    try {
+      const head = h.at["amend-b"]!;
+      // The lane tail is still B at insert-w; the walk stops there anyway.
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["add-b"]!);
+      expect(code(() => seedSet({ landing: [STEP_A, STEP_B], tree: [STEP_A, STEP_W, STEP_B, STEP_C], baseline: STEP_B, target: STEP_C }))).toBe(
+        "rehearsal_seed_noncontiguous",
+      );
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: a step added to the other lane before the baseline's amend keeps the add", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["add-other", { [otherPath]: "select 4;" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- final" }],
+    ]);
+    try {
+      const head = h.at["amend-b"]!;
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["add-b"]!);
+      // The other lane's step is not in the seed; it stays pending.
+      expect(gitText(h.at["add-b"]!, otherPath, h.repo)).toBeUndefined();
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: an other-lane step added and removed again before the baseline's amend still stops the walk", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["add-other", { [otherPath]: "select 4;" }],
+    ]);
+    try {
+      const g = (...args: string[]) => {
+        const r = spawnSync("git", args, {
+          cwd: h.repo,
+          encoding: "utf8",
+          env: { ...BASE_ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+        });
+        if (r.status !== 0) throw new Error(r.stderr);
+        return r.stdout.trim();
+      };
+      g("rm", "-q", otherPath);
+      g("commit", "-q", "-m", "remove-other");
+      writeFileSync(join(h.repo, pathOf(STEP_B)), "select 2; -- final");
+      g("commit", "-q", "-am", "amend-b");
+      // The amend's tree equals the add's but for B; the walk saw the other lane move first
+      // (both lane directories are walked), as with a later step that was reverted.
+      expect(seedCommit(g("rev-parse", "HEAD"), STEP_B, h.repo)).toBe(h.at["add-b"]!);
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: an amend made before a foreign edit still seeds", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- final" }],
+      ["edit-a", { [pathOf(STEP_A)]: "select 1; -- edited after it landed" }],
+    ]);
+    try {
+      const head = h.at["edit-a"]!;
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["amend-b"]!);
+      // A's edit is still caught against the release tree.
+      expect(bytesCheck(h.repo, h.at["amend-b"]!, head)).toBe("rehearsal_seed_bytes_drift");
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: a later step present at the add, then deleted, then the baseline edited keeps the add", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b-c", { [pathOf(STEP_B)]: "select 2;", [pathOf(STEP_C)]: "select 3;" }],
+    ]);
+    try {
+      const g = (...args: string[]) => {
+        const r = spawnSync("git", args, {
+          cwd: h.repo,
+          encoding: "utf8",
+          env: { ...BASE_ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+        });
+        if (r.status !== 0) throw new Error(r.stderr);
+        return r.stdout.trim();
+      };
+      g("rm", "-q", pathOf(STEP_C));
+      g("commit", "-q", "-m", "delete-c");
+      writeFileSync(join(h.repo, pathOf(STEP_B)), "select 2; -- edited");
+      g("commit", "-q", "-am", "edit-b");
+      // The lane ends at B again after delete-c, but delete-c changed the add's tree.
+      expect(seedCommit(g("rev-parse", "HEAD"), STEP_B, h.repo)).toBe(h.at["add-b-c"]!);
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
   test("landingTreeAtBaseline: a landing tree with a later step in the baseline lane refuses", () => {
     expect(code(() => landingTreeAtBaseline([u("5000"), u("5030"), o("0001")], u("5030")))).toBeNull();
     expect(code(() => landingTreeAtBaseline([u("5000"), u("5030"), u("6000"), o("0001")], u("5030")))).toBe(
@@ -614,6 +747,16 @@ describe("small helpers", () => {
     expect(sameNameOid(a, new Map([["x", "1"]]))).toBe(false);
     expect(sameNameOid(a, new Map([["x", "1"], ["y", "3"]]))).toBe(false);
   });
+  test("sameLanesExceptStep: same names, the step in both, every other blob equal", () => {
+    const a = new Map([["x", "1"], ["s", "2"], ["y", "3"]]);
+    expect(sameLanesExceptStep(a, new Map([["x", "1"], ["s", "9"], ["y", "3"]]), "s")).toBe(true);
+    expect(sameLanesExceptStep(a, a, "s")).toBe(true);
+    expect(sameLanesExceptStep(a, new Map([["x", "8"], ["s", "2"], ["y", "3"]]), "s")).toBe(false);
+    expect(sameLanesExceptStep(a, new Map([["x", "1"], ["s", "2"]]), "s")).toBe(false);
+    expect(sameLanesExceptStep(a, new Map([["x", "1"], ["s", "2"], ["y", "3"], ["z", "4"]]), "s")).toBe(false);
+    expect(sameLanesExceptStep(a, new Map([["x", "1"], ["t", "2"], ["y", "3"]]), "s")).toBe(false);
+    expect(sameLanesExceptStep(a, a, "absent")).toBe(false);
+  });
   test("flipHex changes exactly the last digit and stays hex64", () => {
     const g = flipHex(GEN);
     expect(g).toMatch(/^[0-9a-f]{64}$/);
@@ -679,6 +822,10 @@ describe("bootstrap chain list (landing list seeds; the release may only add fil
     expect(bootstrapExpectedRoles([F("new"), F("tail")], roles)).toEqual([...BOOTSTRAP_NEW_ROLES, "zeta_role"].sort());
     expect(bootstrapExpectedRoles([], roles)).toEqual([...BOOTSTRAP_NEW_ROLES]);
     expect(bootstrapExpectedRoles([F("new")], undefined)).toEqual([...BOOTSTRAP_NEW_ROLES]);
+    // The roles that must exist after the refresh: only an added file's.
+    expect(bootstrapAddedRoles([F("tail"), F("new")], { ...roles, [F("tail")]: { b_role: {}, zeta_role: {} } })).toEqual(["b_role", "zeta_role"]);
+    expect(bootstrapAddedRoles([], roles)).toEqual([]);
+    expect(bootstrapAddedRoles([F("new")], undefined)).toEqual([]);
   });
 
   test("a removed, reordered or duplicated entry refuses rehearsal_seed_bootstrap_chain", () => {
@@ -774,6 +921,27 @@ describe("R2-bootstrap (the release tree's bootstrap chain before the apply)", (
     expect(e.roles[0]).toMatchObject({ name: ADMIT, present: true, preexisting: true });
     const none = bootstrapRefreshEvidence({ files: same, before: BEFORE, after: BEFORE, edges: [], applied: 1 });
     expect(none.roles).toEqual([{ name: ADMIT, present: false }]);
+  });
+  test("an added file's role absent after the refresh refuses rehearsal_bootstrap_role_missing", () => {
+    const added = bootstrapFiles([
+      { file: "b/a.sql", release: "a", landing: "a" },
+      { file: "b/n.sql", release: "n", landing: undefined },
+    ]).files;
+    const expected = [ADMIT, "added_role"].sort();
+    const x = { files: added, before: BEFORE, edges: [] as RoleEdge[], applied: 2, expected, required: ["added_role"] };
+    expect(code(() => bootstrapRefreshEvidence({ ...x, after: [...BEFORE, bare(ADMIT)] }))).toBe("rehearsal_bootstrap_role_missing");
+    expect(code(() => bootstrapRefreshEvidence({ ...x, after: BEFORE }))).toBe("rehearsal_bootstrap_role_missing");
+    // Created by the refresh, or already there: present.
+    const made = bootstrapRefreshEvidence({ ...x, after: [...BEFORE, bare("added_role")] });
+    // expected is sorted: added_role, then the admission role.
+    expect(made.roles).toEqual([expect.objectContaining({ name: "added_role", present: true, preexisting: false }), { name: ADMIT, present: false }]);
+    const kept = bootstrapRefreshEvidence({ ...x, before: [...BEFORE, bare("added_role")], after: [...BEFORE, bare("added_role")] });
+    expect(kept.roles[0]).toMatchObject({ name: "added_role", present: true, preexisting: true });
+    // Without `required` an absent expected role is still only reported.
+    expect(bootstrapRefreshEvidence({ ...x, required: undefined, after: BEFORE }).roles).toEqual([
+      { name: "added_role", present: false },
+      { name: ADMIT, present: false },
+    ]);
   });
   test("unexpected role: any other new role, or any new role from an unchanged chain", () => {
     expect(code(() => bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT), bare("other")], edges: [], applied: 2 }))).toBe(

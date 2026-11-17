@@ -10,8 +10,9 @@
  * release checkout's own modules, imported from the working directory (the release sha):
  *   R0 seed      the database the release starts from: the seed commit of the baseline
  *                (seedCommit: on the first-parent history, from the commit that added the
- *                baseline, the newest commit that changed it before its lane first went
- *                past it, i.e. the baseline's final bytes as its pull request landed) is
+ *                baseline, the newest commit that changed it before any other step of
+ *                either lane changed, i.e. the baseline's final bytes as its pull request
+ *                landed, with every other step as it was at the add) is
  *                materialized from the Git object database (git archive, frozen bun
  *                install, read-only)
  *                and ITS OWN migrator (src/hoopdb/migrate.ts) runs as a subprocess with the
@@ -47,7 +48,8 @@
  *                them). Evidence: per-file release/landing sha256 and changed flag, the added
  *                files, the sorted names of the roles created (only BOOTSTRAP_NEW_ROLES and
  *                the roles the release's SESSION_BOOTSTRAP_ROLES assigns to an added file
- *                may appear, bare, no memberships),
+ *                may appear, bare, no memberships; a role an added file creates that is
+ *                absent after the refresh refuses rehearsal_bootstrap_role_missing),
  *                their flags and edges; no other role appears, disappears or changes
  *   R4 apply     the production apply order (anchor, inspection, ledger, boundary, window,
  *                generation, manifest, runMigrations with beforeWrite, read-backs)
@@ -101,6 +103,7 @@ import {
   PLAN_ANCHOR_INJECTIONS,
   removeAnchorRefs,
   type AnchorGit,
+  bootstrapAddedRoles,
   bootstrapChainGrowth,
   bootstrapChainList,
   bootstrapExpectedRoles,
@@ -125,6 +128,7 @@ import {
   rehearsalRefuse,
   resultRecord,
   runLandingMigrator,
+  sameLanesExceptStep,
   sameNameOid,
   seedSet,
   seedStepBytes,
@@ -273,29 +277,37 @@ export function landingCommit(sha: string, name: string, repo = ROOT): string {
 }
 /**
  * The commit the database at a step was seeded from: on the release sha's first-parent
- * history, walking forward from landingCommit (the add) through the commits that touch the
- * step's lane, the newest one that changed the step's file before the lane first ends
- * anywhere but AT the step. A step amended by a later first-parent commit before the next
- * step of its lane landed (a review round on the same pull request) is seeded with its
- * final bytes, from the commit that wrote them. A change made once a later step had landed
- * (even if that step was later reverted) is not a candidate, so the seed keeps the earlier
- * bytes and seedStepBytes refuses rehearsal_seed_bytes_drift against the release tree.
- * An add whose lane already ends above the step is returned as is, which
- * landingTreeAtBaseline refuses. Refuses only as landingCommit does (rehearsal_landing_missing).
+ * history, walking forward from landingCommit (the add) through the commits that touch
+ * EITHER lane directory, the newest one that changed the step's file before the first
+ * commit whose two lanes differ from the add's in anything but the step's own blob (a step
+ * added, removed or edited in either lane, the next step of the step's lane included). A
+ * step amended by a later first-parent commit while every other lane step was unchanged (a
+ * review round on the same pull request) is seeded with its final bytes, from the commit
+ * that wrote them. R0 seeds the seed commit's WHOLE two-lane tree, so a change to any
+ * other step stops the walk: a change made once anything else in the lanes had moved (even
+ * if that was later reverted) is not a candidate, so the seed keeps the earlier bytes and
+ * seedStepBytes / seedSet refuse (rehearsal_seed_bytes_drift, rehearsal_seed_noncontiguous)
+ * against the release tree. The walk lists commits touching both lane directories (not only
+ * the step's lane), so a foreign change is seen at the commit that made it. An add whose
+ * lane already ends above the step is returned as is, which landingTreeAtBaseline refuses.
+ * Refuses only as landingCommit does (rehearsal_landing_missing).
  */
 export function seedCommit(sha: string, name: string, repo = ROOT): string {
   const added = landingCommit(sha, name, repo);
   const lane = laneOf(name);
-  const log = (path: string) =>
-    git(["log", "--first-parent", "--diff-merges=first-parent", "--no-patch", "--reverse", "--format=%H", `${added}..${sha}`, "--", path], repo)
+  const log = (...paths: string[]) =>
+    git(["log", "--first-parent", "--diff-merges=first-parent", "--no-patch", "--reverse", "--format=%H", `${added}..${sha}`, "--", ...paths], repo)
       .split("\n")
       .filter((l) => /^[0-9a-f]{40}$/.test(l));
   const touched = new Set(log(stepPath(name)));
-  const tailAt = (c: string) => [...laneTree(c, repo).keys()].filter((n) => laneOf(n) === lane).at(-1);
+  const addedTree = laneTree(added, repo);
+  const tailAt = (t: ReadonlyMap<string, string>) => [...t.keys()].filter((n) => laneOf(n) === lane).at(-1);
   let seed = added;
-  if (tailAt(added) !== name) return seed;
-  for (const c of log(`${LANE_DIRS[lane]}/`)) {
-    if (tailAt(c) !== name) break;
+  for (const c of log(...Object.values(LANE_DIRS).map((d) => `${d}/`))) {
+    const tree = laneTree(c, repo);
+    // A candidate keeps the add's step names, so its lane ends where the add's does: an
+    // add already past the step (tree-above) has no candidate at all.
+    if (!sameLanesExceptStep(addedTree, tree, name) || tailAt(tree) !== name) break;
     if (touched.has(c)) seed = c;
   }
   return seed;
@@ -596,11 +608,13 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   let chainAdded: string[] = [];
   await stage("R0", async () => {
     // Everything is checked before anything is written: the seed commit (seedCommit: the
-    // baseline's final bytes before its lane went past it), its tree (ending the
+    // baseline's final bytes while every other step of both lanes was as at its add;
+    // addedSha in the evidence is the add itself), its tree (ending the
     // baseline lane at the baseline), its seed bytes against the release tree, its
     // generation A by the release code, then its own migrator materialized and installed,
     // and that migrator's `--generation` equal to A.
     landing = seedCommit(sha, baseline);
+    const added = landingCommit(sha, baseline);
     const landingSteps = RT.treeSchemaSteps(ROOT, landing) as [string, string][];
     landingTreeAtBaseline(landingSteps.map(([n]) => n), baseline);
     seed = seedSet({ landing: landingSteps.map(([n]) => n), tree, baseline, target });
@@ -690,6 +704,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     await owner.query(wrapper.sql.replace(delimiter, "\n-- fixture stale source\n" + delimiter));
     return {
       landingSha: landing,
+      addedSha: added,
+      seedDiffersFromAdd: landing !== added,
       seedGeneration: A,
       landingMigrator: "landing_tree",
       landingMigratorEnv: Object.keys(landingMigratorEnv(base, P.runtime, ownerUrl)).sort(),
@@ -1046,6 +1062,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   // R0's seed commit and list: a file R0 did not apply (absent from the landing list) has
   // no landing bytes, so it is reported changed and its roles may be created.
   const newRoles = bootstrapExpectedRoles(chainAdded, bootstrapRoleMap);
+  // The roles an added file creates must exist after the refresh (rehearsal_bootstrap_role_missing).
+  const requiredRoles = bootstrapAddedRoles(chainAdded, bootstrapRoleMap);
   const releaseBootstrap = () =>
     bootstrapFiles(
       (SESSION_BOOTSTRAP_FILES as readonly string[]).map((file) => ({
@@ -1070,7 +1088,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       await admin.query(`RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER`);
     }
     const after = await roleSnapshot();
-    return { ...bootstrapRefreshEvidence({ files, before, after, edges: await roleEdges(newRoles), applied, expected: newRoles }), added: chainAdded };
+    return { ...bootstrapRefreshEvidence({ files, before, after, edges: await roleEdges(newRoles), applied, expected: newRoles, required: requiredRoles }), added: chainAdded };
   };
   if (inject === "missing-bootstrap") await emit("R2-bootstrap", "SKIP", { reason: "injection_missing_bootstrap" });
   else await stage("R2-bootstrap", refreshBootstrap);

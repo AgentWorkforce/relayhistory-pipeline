@@ -63,11 +63,13 @@ test("contracts: only non-bare roles declare login, inbound members or settings"
   expect(all.search_consumer_runtime).toEqual({ login: "claimed-60s", inbound: "consumer", settings: "consumer" });
 });
 
-// The PR schema rehearsal (scripts/pg-proof/schema-rehearsal.ts) pins the WHOLE text of
-// the chain module at the release sha to the landing commit's bytes (refusing
-// rehearsal_seed_bootstrap_chain otherwise). So the role contract map lives in
-// session-bootstrap-roles.ts, and the chain module must change only when the chain file
-// list does. If the driver's pinned path ever moves, this test must move with it.
+// The PR schema rehearsal (scripts/pg-proof/schema-rehearsal.ts) parses the chain module's
+// text as data at the seed commit and at the release sha (one literal
+// SESSION_BOOTSTRAP_FILES list; anything else refuses rehearsal_seed_bootstrap_chain) and
+// accepts only append or insert growth, an added file's roles being those
+// session-bootstrap-roles.ts declares. So the role contract map lives in
+// session-bootstrap-roles.ts and the chain module holds the list alone. If the driver's
+// chain module path ever moves, this test must move with it.
 test("the rehearsal-pinned chain module carries no role contract map", () => {
   const chainModule = "src/hoopdb/session-bootstrap-chain.ts";
   expect(readFileSync(new URL(chainModule, root), "utf8")).not.toMatch(/\bSESSION_BOOTSTRAP_ROLES\b/);

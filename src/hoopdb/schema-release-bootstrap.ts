@@ -252,7 +252,9 @@ export function bootstrapContractDigest(map?: ContractMap, consumers?: ContractP
  * The anchor's (target_sha) contract modules as read from the Git object database:
  * src/hoopdb/session-bootstrap-roles.ts and src/hoopdb/session-bootstrap-consumers.ts
  * (each undefined: absent). The map is never read from session-bootstrap-chain.ts,
- * whose whole text the PR schema rehearsal pins to the landing commit's bytes.
+ * which holds the chain list alone (the PR schema rehearsal parses that list as data at
+ * the seed commit and at the release, accepting only append/insert growth with roles
+ * declared in session-bootstrap-roles.ts).
  */
 export interface BootstrapAnchorContract {
   rolesModule: Buffer | string | undefined;
