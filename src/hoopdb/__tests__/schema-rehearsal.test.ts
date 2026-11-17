@@ -637,6 +637,7 @@ describe("drift against production and the rehearsal files", () => {
     ".github/workflows/rehearse-session-schema.yml",
     "scripts/pg-proof/schema-rehearsal.ts",
     "scripts/pg-proof/schema-rehearsal-core.ts",
+    "scripts/pg-proof/lock-hold-observer.ts",
     "runbooks/schema-release-rehearsal.md",
     "src/hoopdb/__tests__/schema-rehearsal.test.ts",
   ];
@@ -658,7 +659,9 @@ describe("drift against production and the rehearsal files", () => {
       expect(HOSTED.test(text)).toBe(false);
       expect(CREDENTIAL.test(text)).toBe(false);
       for (const m of text.matchAll(/postgres(?:ql)?:\/\/[^\s"'`]+/g))
-        expect(m[0]).toMatch(/^postgres:\/\/postgres@127\.0\.0\.1:5432\//);
+        expect(m[0]).toMatch(
+          /^postgres:\/\/(?:postgres|supabase_admin)@127\.0\.0\.1:5432\//,
+        );
     }
   });
   test("the workflow is read-only, secretless, environment-free, bounded and dispatch/PR only", () => {

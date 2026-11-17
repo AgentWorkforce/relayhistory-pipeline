@@ -16,8 +16,8 @@ setting), `DATABASE_URL` or `SUPABASE_*URL*` is set (`rehearsal_connection_env_s
 the checkout is the exact clean full-history release sha; and the database is fresh:
 no `sessions` schema, no owner role, and `pg_postmaster_start_time()` within the last
 60 minutes (`rehearsal_database_not_fresh`). Both jobs therefore run on GitHub-hosted
-`ubuntu-latest`, not the `vars.CI_LINUX_RUNNER` expression of `pg-proof.yml`. It connects only to `postgres://postgres@127.0.0.1:5432/postgres` and the
-service superuser on the same loopback socket. It is DESTRUCTIVE to the database it
+`ubuntu-latest`, not the `vars.CI_LINUX_RUNNER` expression of `pg-proof.yml`. It connects only to a passwordless role on
+`127.0.0.1:5432` and the service superuser on the same loopback socket. It is DESTRUCTIVE to the database it
 runs against; never point it anywhere else.
 
 ## Inputs
@@ -30,6 +30,46 @@ runs against; never point it anywhere else.
 | `generation` | The 64-hex target generation the apply must mark PASS. The target commit is found on the release sha's first-parent history at this generation. |
 | `inject_failure` | `none` for a clean apply, or one refusal to prove (below). |
 | `expect_refusal` | Empty (default): the run passes only if no stage FAILs. `<stage>:<code>` (for example `R1:rehearsal_target_anchor_missing`) marks a known-negative row: the run passes only if that stage FAILs with exactly that code and no later stage ran; any other outcome, including a clean pass, fails the job. It does not change `inject_failure`. |
+| `observe_turns_lock_hold` | Default false. On a clean row only, start the read-only 062020 relation-lock observer before R0 and require its exact ledger receipt and threshold result. Its JSONL is uploaded as `turns-lock-hold.jsonl`. |
+
+## Turns-forward lock-hold evidence
+
+`scripts/pg-proof/lock-hold-observer.ts` is a read-only observer for
+`20261105062020_turns_forward_gates.sql`. It runs in a separate session with
+`default_transaction_read_only=on`, a one-second statement timeout and a one-second
+lock timeout. The database URL is read only from `OBSERVER_DATABASE_URL`; never put it
+in argv or logs. Non-loopback URLs require a password. The observer emits relation
+names, backend PIDs, modes and durations, but never query text, usernames, database row
+contents or the URL.
+
+For the disposable workflow, set `observe_turns_lock_hold=true`. The observer connects
+first, waits read-only while R0 creates the target relations, and then samples every
+100 ms while the rehearsal runs in the same workflow step. Success requires the exact
+ledger row and frozen checksum for 062020. The uploaded evidence reports maximum hold
+per table, maximum migration and writer waits, maximum concurrent waiters and distinct
+blocked writers for:
+
+- `sessions.upload_deletions`
+- `sessions.operator_user_erasures`
+- `sessions.session_directory`
+
+For a separately approved dev rehearsal, start the observer before the chart migrations
+Job from a host or one-off pod with database network access. The supplied role must be
+read-only, able to read the migration ledger and able to observe the migrator in
+`pg_stat_activity` (for example through an operator-reviewed monitoring role). Use
+`--until-file` for the orchestrator's completion signal and keep stdout as the JSONL
+artifact. The observer identifies 062020 by its SQL slot/file marker; it also accepts a
+future `hoopdb-migrate-062020%` application name. It performs no apply and authorizes no
+database action.
+
+The result fails closed when the ledger is absent or has another checksum, the migrator
+is not observed, the orchestrator signals completion before the ledger, any migration
+lock wait or blocked writer exceeds 5 seconds, or a migration-held target relation lock
+exceeds 120 seconds. Durations are first-seen/last-seen measurements and therefore have
+up to one polling interval of sampling uncertainty. `blocked_writer_count` includes
+only backends requesting a relation-level writer lock; read waiters still contribute to
+`max_waiters`. This evidence gates the rehearsal row. It does not cancel the migrations
+Job itself.
 
 ## Stages
 
