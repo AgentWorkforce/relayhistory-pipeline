@@ -1,0 +1,3503 @@
+{
+ "whole read: complete, then up to date": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "relayhistory_event_identity"
+   }
+  },
+  {
+   "run": 1
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "relayhistory_event_identity"
+   }
+  }
+ ],
+ "whole read: index rows past SEARCH_INDEX_MAX_ROWS are search_index_truncated": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "adapter": "scanFingerprints",
+   "args": [
+    {
+     "orgId": "org_stream",
+     "workspaceId": "ws_stream",
+     "source": "claude",
+     "sessionIds": [
+      "stream_parity",
+      "stream:parity"
+     ]
+    },
+    {
+     "fromMs": 0,
+     "limit": 500000
+    }
+   ]
+  },
+  {
+   "adapter": "upsert",
+   "args": [
+    [
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-33",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 33 r1",
+      "fingerprint": "s336ee8d6be62c5f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-7",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 7 r1",
+      "fingerprint": "s3c13133d83a3bd1",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-16",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 16 r1",
+      "fingerprint": "s316ab9ff12060c4",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527201000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-21",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 21 r1",
+      "fingerprint": "s3c1d8807b690e9d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-18",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 18 r1",
+      "fingerprint": "s31bc9edec5edde9",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-25",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "prompt 25 r1",
+      "fingerprint": "s3577686ddbfd5f3",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-1",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 1 r1",
+      "fingerprint": "s30d2114b004c07e",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527205000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-0",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "prompt 0 r1",
+      "fingerprint": "s3c602e2baf226be",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-28",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 28 r1",
+      "fingerprint": "s30fcff29a997a3f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-14",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-14",
+      "content": "",
+      "fingerprint": "s3a71d7572600cde",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-5",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-5",
+      "content": "Read",
+      "fingerprint": "s30c909682726fb2",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-9",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-9",
+      "content": "hello 9 r1",
+      "fingerprint": "s35ed8376d8ed9b5",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-3",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-3",
+      "content": "hello 3 r2",
+      "fingerprint": "s389bc8d6ce9f098",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-24",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-24",
+      "content": "hello 24 r1",
+      "fingerprint": "s30f3dd3eedc998b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-6",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-6",
+      "content": "",
+      "fingerprint": "s37b3de80d7f5b7a",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-20",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-20",
+      "content": "hello 20 r1",
+      "fingerprint": "s36ffa03d00494a7",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-15",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-15",
+      "content": "src/a.ts",
+      "fingerprint": "s3072de87cd3b068",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-22",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-22",
+      "content": "",
+      "fingerprint": "s3c3b8672aa3eca4",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-23",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-23",
+      "content": "Read",
+      "fingerprint": "s33b2e97b09e995b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "history",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-34",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-34",
+      "content": "",
+      "fingerprint": "s3740efacfa06425",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-12",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-12",
+      "content": "hello 12 r1",
+      "fingerprint": "s37f59e31bc29a24",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-2",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-2",
+      "content": "",
+      "fingerprint": "s31f1a054a8b9c1f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-27",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-27",
+      "content": "src/a.ts",
+      "fingerprint": "s3ba68ed5d0554ec",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-31",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-31",
+      "content": "hello 31 r1",
+      "fingerprint": "s3e731dbe7f871df",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-29",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-29",
+      "content": "src/a.ts",
+      "fingerprint": "s351769bcbec9ca8",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-4",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-4",
+      "content": "reply 4 r1",
+      "fingerprint": "s33a4f4e07abab51",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-35",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-35",
+      "content": "src/a.ts",
+      "fingerprint": "s325344b820d4cdc",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-11",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-11",
+      "content": "Read",
+      "fingerprint": "s33597191947a256",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-32",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-32",
+      "content": "",
+      "fingerprint": "s39fb0afdf111038",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-17",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-17",
+      "content": "hello 17 r1",
+      "fingerprint": "s343055021df6297",
+      "version": 1793534400000
+     }
+    ]
+   ]
+  },
+  {
+   "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity",
+    "stream_parity",
+    "{\"96bulls/org_stream/v1/ws=ws_stream/m=machine_0/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_1/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\"}",
+    "30",
+    "2026-11-01T10:00:00.000000Z",
+    "2026-11-01T10:00:07.000000Z",
+    [
+     "file_edit",
+     "history",
+     "session_event",
+     "tool_call"
+    ],
+    "[]",
+    null,
+    "27",
+    "45",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    null,
+    "active",
+    "2026-11-01T10:00:07.000000Z",
+    2,
+    "1",
+    [
+     "2026-11-01T10:00:00.000000Z",
+     "2026-11-01T10:00:01.000000Z",
+     "2026-11-01T10:00:02.000000Z",
+     "2026-11-01T10:00:03.000000Z",
+     "2026-11-01T10:00:04.000000Z",
+     "2026-11-01T10:00:05.000000Z",
+     "2026-11-01T10:00:06.000000Z",
+     "2026-11-01T10:00:07.000000Z"
+    ],
+    [
+     "user_stream"
+    ],
+    [
+     "delivery:ab9fe22998944278e610d2a73dabdfe3",
+     "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+     "machine:0",
+     "machine:1"
+    ],
+    [
+     "fixture-model"
+    ],
+    null,
+    "{\"session_id\":\"stream:parity\",\"event_id\":\"delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-9\",\"machine_id\":\"delivery:ab9fe22998944278e610d2a73dabdfe3\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:00.000000Z\",\"fingerprint\":\"s35ed8376d8ed9b5\"}",
+    null,
+    false
+   ]
+  },
+  {
+   "sql": "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+   "params": []
+  },
+  {
+   "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET recorded_catalog_title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN $18::text ELSE d.recorded_catalog_title END, title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity",
+    [],
+    [],
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    [],
+    [],
+    [],
+    null,
+    "1",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 30,
+    "complete": true,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 2,
+    "count": 30,
+    "inserted": 30,
+    "deleted": 0,
+    "ok": true
+   }
+  },
+  {
+   "run": 1
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "adapter": "scanFingerprints",
+   "args": [
+    {
+     "orgId": "org_stream",
+     "workspaceId": "ws_stream",
+     "source": "claude",
+     "sessionIds": [
+      "stream_parity",
+      "stream:parity"
+     ]
+    },
+    {
+     "fromMs": 0,
+     "limit": 3
+    }
+   ]
+  },
+  {
+   "adapter": "upsert",
+   "args": [
+    [
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-33",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 33 r1",
+      "fingerprint": "s336ee8d6be62c5f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-7",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 7 r1",
+      "fingerprint": "s3c13133d83a3bd1",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:0",
+      "kind": "session_event",
+      "eventId": "direct-42-16",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 16 r1",
+      "fingerprint": "s316ab9ff12060c4",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527201000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-21",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 21 r1",
+      "fingerprint": "s3c1d8807b690e9d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-18",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 18 r1",
+      "fingerprint": "s31bc9edec5edde9",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-25",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "prompt 25 r1",
+      "fingerprint": "s3577686ddbfd5f3",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-1",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 1 r1",
+      "fingerprint": "s30d2114b004c07e",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527205000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-0",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "prompt 0 r1",
+      "fingerprint": "s3c602e2baf226be",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-42-28",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 28 r1",
+      "fingerprint": "s30fcff29a997a3f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-3",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-3",
+      "content": "hello 3 r2",
+      "fingerprint": "s389bc8d6ce9f098",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-24",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-24",
+      "content": "hello 24 r1",
+      "fingerprint": "s30f3dd3eedc998b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-6",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-6",
+      "content": "",
+      "fingerprint": "s37b3de80d7f5b7a",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527202000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-20",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-20",
+      "content": "hello 20 r1",
+      "fingerprint": "s36ffa03d00494a7",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-15",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-15",
+      "content": "src/a.ts",
+      "fingerprint": "s3072de87cd3b068",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-22",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-22",
+      "content": "",
+      "fingerprint": "s3c3b8672aa3eca4",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-23",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-23",
+      "content": "Read",
+      "fingerprint": "s33b2e97b09e995b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "history",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-34",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-34",
+      "content": "",
+      "fingerprint": "s3740efacfa06425",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-12",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-12",
+      "content": "hello 12 r1",
+      "fingerprint": "s37f59e31bc29a24",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-2",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-2",
+      "content": "",
+      "fingerprint": "s31f1a054a8b9c1f",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-27",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-27",
+      "content": "src/a.ts",
+      "fingerprint": "s3ba68ed5d0554ec",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-31",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-31",
+      "content": "hello 31 r1",
+      "fingerprint": "s3e731dbe7f871df",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-29",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-29",
+      "content": "src/a.ts",
+      "fingerprint": "s351769bcbec9ca8",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-4",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-4",
+      "content": "reply 4 r1",
+      "fingerprint": "s33a4f4e07abab51",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-35",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-35",
+      "content": "src/a.ts",
+      "fingerprint": "s325344b820d4cdc",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-11",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-11",
+      "content": "Read",
+      "fingerprint": "s33597191947a256",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-42-32",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-32",
+      "content": "",
+      "fingerprint": "s39fb0afdf111038",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-42-17",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-42-17",
+      "content": "hello 17 r1",
+      "fingerprint": "s343055021df6297",
+      "version": 1793534400000
+     }
+    ]
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 30,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 2,
+    "count": 30,
+    "inserted": 27,
+    "deleted": 0,
+    "ok": false,
+    "reason": "search_index_truncated"
+   }
+  }
+ ],
+ "streamed: complete, then up to date": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "relayhistory_event_identity"
+   }
+  },
+  {
+   "run": 1
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "relayhistory_event_identity"
+   }
+  }
+ ],
+ "streamed: index rows past SEARCH_INDEX_MAX_ROWS are search_index_truncated": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "adapter": "scanFingerprints",
+   "args": [
+    {
+     "orgId": "org_stream",
+     "workspaceId": "ws_stream",
+     "source": "claude",
+     "sessionIds": [
+      "stream_parity",
+      "stream:parity"
+     ]
+    },
+    {
+     "fromMs": 0,
+     "limit": 500000
+    }
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "adapter": "upsert",
+   "args": [
+    [
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-0",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-0",
+      "content": "",
+      "fingerprint": "s32a336c21944f08",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527205000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-11",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-11",
+      "content": "Read",
+      "fingerprint": "s3367930a1bc0e2d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-14",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-14",
+      "content": "src/a.ts",
+      "fingerprint": "s3fc8e7c22a52259",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-18",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-18",
+      "content": "reply 18 r2",
+      "fingerprint": "s3e0cc49229c4e0d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-1",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-1",
+      "content": "hello 1 r2",
+      "fingerprint": "s3c5f738016cdf0a",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "tool_call",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-2",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-2",
+      "content": "Read",
+      "fingerprint": "s304df2996a7163b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-4",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-4",
+      "content": "hello 4 r2",
+      "fingerprint": "s36fcfd6ee5127e0",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527203000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+      "kind": "tool_call",
+      "eventId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-5",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-5",
+      "content": "Read",
+      "fingerprint": "s3ff3e9138d9fa84",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-12",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-12",
+      "content": "src/a.ts",
+      "fingerprint": "s3421ae2607eb72c",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-15",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-15",
+      "content": "src/a.ts",
+      "fingerprint": "s35eb1bb5d7715f7",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-44-17",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 17 r1",
+      "fingerprint": "s37ebe7c8140d82b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527200000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+      "kind": "session_event",
+      "eventId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-3",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-3",
+      "content": "hello 3 r1",
+      "fingerprint": "s3c3316746f5e674",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+      "kind": "session_event",
+      "eventId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-6",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-6",
+      "content": "reply 6 r1",
+      "fingerprint": "s3fbeceff9cc71ae",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:2",
+      "kind": "session_event",
+      "eventId": "direct-44-9",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 9 r1",
+      "fingerprint": "s39530c907623483",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+      "kind": "file_edit",
+      "eventId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-16",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-16",
+      "content": "src/a.ts",
+      "fingerprint": "s306dd0b54b52471",
+      "version": 1793534400000
+     }
+    ]
+   ]
+  },
+  {
+   "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity",
+    "stream_parity",
+    "{\"96bulls/org_stream/v1/ws=ws_stream/m=machine_0/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_1/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\",\"96bulls/org_stream/v1/ws=ws_stream/m=machine_2/h=claude/d=2026/11/01/s=stream_parity/manifest.json\":\"1\"}",
+    "15",
+    "2026-11-01T10:00:00.000000Z",
+    "2026-11-01T10:00:07.000000Z",
+    [
+     "file_edit",
+     "history",
+     "session_event",
+     "tool_call"
+    ],
+    "[]",
+    null,
+    "6",
+    "10",
+    "0",
+    "0",
+    "0",
+    "0",
+    "0",
+    null,
+    "active",
+    "2026-11-01T10:00:07.000000Z",
+    3,
+    "2",
+    [
+     "2026-11-01T10:00:00.000000Z",
+     "2026-11-01T10:00:03.000000Z",
+     "2026-11-01T10:00:04.000000Z",
+     "2026-11-01T10:00:05.000000Z",
+     "2026-11-01T10:00:06.000000Z",
+     "2026-11-01T10:00:07.000000Z"
+    ],
+    [
+     "user_stream"
+    ],
+    [
+     "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+     "delivery:ab9fe22998944278e610d2a73dabdfe3",
+     "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+     "machine:1",
+     "machine:2"
+    ],
+    [
+     "fixture-model"
+    ],
+    null,
+    "{\"session_id\":\"stream:parity\",\"event_id\":\"delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-3\",\"machine_id\":\"delivery:44b37ce55ba08dbbc4f66c90bbfaa676\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:00.000000Z\",\"fingerprint\":\"s3c3316746f5e674\"}",
+    null,
+    false
+   ]
+  },
+  {
+   "sql": "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+   "params": []
+  },
+  {
+   "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET recorded_catalog_title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN $18::text ELSE d.recorded_catalog_title END, title = CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( CASE WHEN d.event_projection_ready AND d.event_projection_epoch=$19::bigint AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id AND p.deleted_at IS NULL) THEN coalesce((SELECT b.title FROM sessions.session_briefs b WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness AND b.session_id=$20::text AND b.title IS NOT NULL AND b.engine_version NOT LIKE 'neon-backfill:%'), (SELECT p.title FROM sessions.session_index p WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness AND p.session_id=$20::text AND p.deleted_at IS NULL ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1), $18::text) ELSE d.title END, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity",
+    [],
+    [],
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    [],
+    [],
+    [],
+    null,
+    "2",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 15,
+    "complete": true,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 15,
+    "inserted": 15,
+    "deleted": 0,
+    "ok": true
+   }
+  },
+  {
+   "run": 1
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "adapter": "scanFingerprints",
+   "args": [
+    {
+     "orgId": "org_stream",
+     "workspaceId": "ws_stream",
+     "source": "claude",
+     "sessionIds": [
+      "stream_parity",
+      "stream:parity"
+     ]
+    },
+    {
+     "fromMs": 0,
+     "limit": 3
+    }
+   ]
+  },
+  {
+   "sql": "SELECT 1 AS stream_keepalive",
+   "params": []
+  },
+  {
+   "adapter": "upsert",
+   "args": [
+    [
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "history",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-0",
+      "type": "history",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-0",
+      "content": "",
+      "fingerprint": "s32a336c21944f08",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527205000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "tool_call",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-11",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-11",
+      "content": "Read",
+      "fingerprint": "s3367930a1bc0e2d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "file_edit",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-14",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-14",
+      "content": "src/a.ts",
+      "fingerprint": "s3fc8e7c22a52259",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:ab9fe22998944278e610d2a73dabdfe3",
+      "kind": "session_event",
+      "eventId": "delivery:ab9fe22998944278e610d2a73dabdfe3:event-44-18",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-18",
+      "content": "reply 18 r2",
+      "fingerprint": "s3e0cc49229c4e0d",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-1",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-1",
+      "content": "hello 1 r2",
+      "fingerprint": "s3c5f738016cdf0a",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "tool_call",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-2",
+      "type": "tool_call",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "Read",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-2",
+      "content": "Read",
+      "fingerprint": "s304df2996a7163b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "session_event",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-4",
+      "type": "user",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "user",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-4",
+      "content": "hello 4 r2",
+      "fingerprint": "s36fcfd6ee5127e0",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-12",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-12",
+      "content": "src/a.ts",
+      "fingerprint": "s3421ae2607eb72c",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527206000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:d4ce1e3374276bd9babaccfe9f65c827",
+      "kind": "file_edit",
+      "eventId": "delivery:d4ce1e3374276bd9babaccfe9f65c827:event-44-15",
+      "type": "file_edit",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [
+       "src/a.ts"
+      ],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-15",
+      "content": "src/a.ts",
+      "fingerprint": "s35eb1bb5d7715f7",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527204000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:1",
+      "kind": "session_event",
+      "eventId": "direct-44-17",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 17 r1",
+      "fingerprint": "s37ebe7c8140d82b",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676",
+      "kind": "session_event",
+      "eventId": "delivery:44b37ce55ba08dbbc4f66c90bbfaa676:event-44-6",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "",
+      "actorRole": "assistant",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "event-44-6",
+      "content": "reply 6 r1",
+      "fingerprint": "s3fbeceff9cc71ae",
+      "version": 1793534400000
+     },
+     {
+      "orgId": "org_stream",
+      "workspaceId": "ws_stream",
+      "tsMs": 1793527207000,
+      "sessionId": "stream:parity",
+      "source": "claude",
+      "machineId": "machine:2",
+      "kind": "session_event",
+      "eventId": "direct-44-9",
+      "type": "assistant",
+      "userId": "user_stream",
+      "actorName": "StreamAgent",
+      "actorRole": "owner",
+      "subagentId": "",
+      "projectId": "",
+      "taskTitle": "",
+      "taskRef": "{}",
+      "taskRefId": "",
+      "tags": [
+       "stream"
+      ],
+      "filesTouched": [],
+      "toolName": "",
+      "toolStatus": "",
+      "deliveryRecordId": "",
+      "content": "answer 9 r1",
+      "fingerprint": "s39530c907623483",
+      "version": 1793534400000
+     }
+    ]
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 15,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 3,
+    "count": 15,
+    "inserted": 12,
+    "deleted": 0,
+    "ok": false,
+    "reason": "search_index_truncated"
+   }
+  }
+ ],
+ "streamed: four times the scope past the read budget is refused": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "warn",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index partial",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "session_id": "stream_parity",
+    "manifests": 1,
+    "reason": "scope_too_large,stream_read_bytes_budget"
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 1,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "scope_too_large,stream_read_bytes_budget"
+   }
+  }
+ ],
+ "streaming off: too large stays partial": [
+  {
+   "run": 0
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+   "params": [
+    "96bulls:search\u001forg_stream\u001fws_stream\u001fclaude\u001fstream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+   "params": [
+    "96bulls:directory-events\u001forg_stream\u001fws_stream\u001fclaude\u001fstream:parity"
+   ]
+  },
+  {
+   "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream:parity"
+   ]
+  },
+  {
+   "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+   "params": [
+    "org_stream",
+    "ws_stream",
+    "claude",
+    "stream_parity"
+   ]
+  },
+  {
+   "state": "record",
+   "scope": {
+    "orgId": "org_stream",
+    "workspaceId": "ws_stream",
+    "harness": "claude",
+    "sessionId": "stream_parity"
+   },
+   "value": {
+    "revision": 1,
+    "rows": 0,
+    "complete": false,
+    "at": "2026-11-01T12:00:00.000Z",
+    "canonicalSessionId": "stream:parity"
+   }
+  },
+  {
+   "result": {
+    "batchItemFailures": []
+   }
+  },
+  {
+   "log": {
+    "level": "warn",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index partial",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "session_id": "stream_parity",
+    "manifests": 1,
+    "reason": "scope_too_large"
+   }
+  },
+  {
+   "log": {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "search index reconciled",
+    "stage": "search-index",
+    "org_id": "org_stream",
+    "workspace_id": "ws_stream",
+    "harness": "claude",
+    "session_id": "stream_parity",
+    "manifests": 1,
+    "count": 0,
+    "inserted": 0,
+    "deleted": 0,
+    "ok": false,
+    "reason": "scope_too_large"
+   }
+  }
+ ]
+}
