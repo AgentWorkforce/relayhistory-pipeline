@@ -48,6 +48,17 @@ import type { DeliverDeps } from "./deliver.ts";
 import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
 import { DeliveryBusyError } from "./vendor/delivery/delivery-contracts.ts";
 
+/**
+ * Ledger codes that mean "this org may not be admitted YET" (ledger-s3.ts requireFenceAuthority): no per-org or
+ * deployment-wide fence-authority marker, or the deployment-wide stop. They are operator states, not failures of
+ * the object: an org whose desktops already upload direct waits here for its marker (decision 0005 rollout step 4).
+ * Such an attempt is a DEFERRAL: it does not count toward `maxAttempts` (so the object is never dead-lettered for
+ * it) and the whole org waits AUTHORITY_WAIT_MS before its next start, so a large waiting backlog costs one claim
+ * per org per window, not one per object. An invalid or mismatched marker is NOT here: it stays an ordinary retry.
+ */
+export const AWAIT_AUTHORITY_CODES: ReadonlySet<string> = new Set(["ledger_fence_authority_missing", "ledger_fence_authority_stopped"]);
+export const AUTHORITY_WAIT_MS = 60_000;
+
 export const DEAD_LETTER_NAMESPACE = ".admission-dlq";
 export const DEAD_LETTER_RETENTION_MS = 14 * 24 * 3600 * 1000;
 const INBOX_SUFFIX = ".ndjson.zst";
@@ -181,6 +192,13 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const inflightOrg = new Map<string, number>(), inflightGroup = new Map<string, number>();
   /** User group -> no start before (ms): set by a tenant-limit deferral, cleared when one of its admissions ends. */
   const busyUntil = new Map<string, number>();
+  /** Org -> no start before (ms): set when a claim answered an AWAIT_AUTHORITY_CODES code (no marker yet). */
+  const authorityUntil = new Map<string, number>();
+  const orgOf = (key: string): string | undefined => {
+    if (!key.startsWith(inboxPrefix)) return undefined;
+    const slash = key.indexOf("/", inboxPrefix.length);
+    return slash > inboxPrefix.length ? key.slice(inboxPrefix.length, slash) : undefined;
+  };
   const bump = (m: Map<string, number>, k: string, d: number) => { const n = (m.get(k) ?? 0) + d; if (n > 0) m.set(k, n); else m.delete(k); };
   /** Inbox keys with a dead-letter marker seen by this process (to clear it after a later terminal outcome). */
   const marked = new Set<string>();
@@ -365,6 +383,18 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
       return "deferred";
     }
+    // Matched on the retry's code: the claim's LedgerUnavailableError reaches here wrapped by the delivery layer,
+    // which keeps its code (the same field the retry log line reports).
+    if (AWAIT_AUTHORITY_CODES.has(r.code)) {
+      // The org has no fence-authority marker yet (or the deployment-wide stop is up): wait for the operator, never
+      // dead-letter. The bytes stay in the inbox; the org's other entries wait the same window (pump skips them).
+      entry.attempts -= 1;
+      entry.notBefore = now() + AUTHORITY_WAIT_MS;
+      const org = orgOf(key);
+      if (org !== undefined) authorityUntil.set(org, Math.max(authorityUntil.get(org) ?? 0, entry.notBefore));
+      logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: r.code, duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
+      return "deferred";
+    }
     const storeStatus = (r.error as { storeStatus?: unknown } | undefined)?.storeStatus;
     const storeCause = (r.error as { storeCause?: unknown } | undefined)?.storeCause;
     const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), ...(typeof storeStatus === "number" ? { store_status: storeStatus } : {}), ...(typeof storeCause === "string" ? { store_cause: storeCause } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
@@ -392,11 +422,16 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const at = now();
     // Sweep expired deferral memos (a directory whose deferred entry left another way would otherwise linger).
     for (const [dir, until] of busyUntil) if (until <= at) busyUntil.delete(dir);
+    for (const [org, until] of authorityUntil) if (until <= at) authorityUntil.delete(org);
     const waiting = [...entries].filter(([key]) => !inflight.has(key)).sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
     let next = Infinity;
     for (const [key, entry] of waiting) {
       if (entry.notBefore > at) { next = Math.min(next, entry.notBefore); continue; }
       if (inflight.size >= opts.concurrency) break;
+      // Its org is waiting for a fence-authority marker: skip without starting until the window ends.
+      const waitOrg = authorityUntil.size ? orgOf(key) : undefined;
+      const authorityWait = waitOrg !== undefined ? authorityUntil.get(waitOrg) : undefined;
+      if (authorityWait !== undefined && authorityWait > at) { next = Math.min(next, authorityWait); continue; }
       const tenant = caps ? tenantOf(key) : undefined;
       if (tenant && caps) {
         // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
