@@ -331,7 +331,9 @@ const slotsOrgFetch = (rows: number) => `FETCH FORWARD ${rows} FROM backfill_slo
  * Above this many slots in one org the org-scoped read stops buffering rows (bounded memory) and the org's rows are
  * processed through the block walk; the cursor is still read to the end for the org's fingerprint.
  */
-export const SLOTS_ORG_READ_MAX_ROWS = 2_000_000;
+// A memory guard for the runner, not a correctness bound: the org's rows are buffered (roughly rows x ~350 B), so 4M is
+// about 1.4 GB, inside a GitHub-hosted runner; the largest production org has ~2.9M owned slots.
+export const SLOTS_ORG_READ_MAX_ROWS = 4_000_000;
 /** slotPaceMs bounds (ms): 0 is unpaced. */
 export const SLOT_PACE_MAX_MS = 5_000;
 /** slotFetchRows bounds, and the defaults: unpaced (the original 5000) and paced. */
