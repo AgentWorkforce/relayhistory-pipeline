@@ -96,7 +96,7 @@ describe("preserve the deployed Reader profile", () => {
     await expect(resolveProfile(env, template, get(withBinding({ name: "CLICKHOUSE_DATABASE", type: "secret_text" })))).rejects.toThrow(/replacing secret binding CLICKHOUSE_DATABASE/);
   });
   test("brief_summary / list_short_summary: off renders no var, on is the exact \"true\" --var, and a dispatch never silently drops a live one", async () => {
-    for (const [key, name] of [["BRIEF_SUMMARY", "READ_API_BRIEF_SUMMARY_ENABLED"], ["LIST_SHORT_SUMMARY", "READ_API_LIST_SHORT_SUMMARY_ENABLED"], ["SUMMARY_FALLBACK", "READ_API_SUMMARY_FALLBACK_ENABLED"], ["SUMMARY_SEARCH", "READ_API_SUMMARY_SEARCH_ENABLED"], ["RELAYFACTS", "READ_API_RELAYFACTS_ENABLED"], ["SESSION_SOURCES", "READ_API_SESSION_SOURCES_ENABLED"]] as const) {
+    for (const [key, name] of [["BRIEF_SUMMARY", "READ_API_BRIEF_SUMMARY_ENABLED"], ["LIST_SHORT_SUMMARY", "READ_API_LIST_SHORT_SUMMARY_ENABLED"], ["SUMMARY_FALLBACK", "READ_API_SUMMARY_FALLBACK_ENABLED"], ["SUMMARY_SEARCH", "READ_API_SUMMARY_SEARCH_ENABLED"], ["RELAYFACTS", "READ_API_RELAYFACTS_ENABLED"], ["SESSION_SOURCES", "READ_API_SESSION_SOURCES_ENABLED"], ["ANALYSIS", "READ_API_ANALYSIS_ENABLED"]] as const) {
       // Not live and off (the default dispatch, or no input): unchanged.
       for (const flag of [undefined, "", "off"]) await expect(resolveProfile({ ...env, [key]: flag }, template, get()), `${key}=${flag}`).resolves.toHaveProperty("OWNER_BUFFERED", "on");
       // Not live and on: a new variable, not a collateral change.
@@ -108,6 +108,21 @@ describe("preserve the deployed Reader profile", () => {
       // Only off/on are inputs; nothing else is passed through as a value.
       for (const bad of ["true", "1", "ON", " on", "yes"]) await expect(resolveProfile({ ...env, [key]: bad }, template, get()), `${key}=${bad}`).rejects.toThrow(/must be off or on/);
     }
+  });
+  test("the ANALYSIS_ADMIT Hyperdrive binding: added with SESSION_READ_ANALYSIS_HYPERDRIVE_ID, kept when repeated, never silently dropped or changed", async () => {
+    const AD = "fedcba9876543210fedcba9876543210";
+    const withBinding = (extra: Record<string, string>) => { const v = version(); (v.resources.bindings as Array<Record<string, string>>).push(extra); return v; };
+    const live = get(withBinding({ name: "ANALYSIS_ADMIT", type: "hyperdrive", id: AD }));
+    // Not live: adding it is a new binding, not a collateral change; without the variable nothing changes.
+    await expect(resolveProfile({ ...env, ANALYSIS_HYPERDRIVE_ID: AD }, template, get())).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile(env, template, get())).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    // Live: the same id keeps it; unset would drop it and another id would change it, so both refuse.
+    await expect(resolveProfile({ ...env, ANALYSIS_HYPERDRIVE_ID: AD }, template, live)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile(env, template, live)).rejects.toThrow(/change or drop live Hyperdrive binding ANALYSIS_ADMIT/);
+    await expect(resolveProfile({ ...env, ANALYSIS_HYPERDRIVE_ID: "abcdefabcdefabcdefabcdefabcdefab" }, template, live)).rejects.toThrow(/change or drop live Hyperdrive binding ANALYSIS_ADMIT/);
+    // The render's own validation applies: the read role's config is refused.
+    await expect(resolveProfile({ ...env, ANALYSIS_HYPERDRIVE_ID: env.HYPERDRIVE_ID }, template, get())).rejects.toThrow(/read role's Hyperdrive config/);
+    expect(profileInputs({ ...env, ANALYSIS_HYPERDRIVE_ID: AD }).analysisHyperdriveId).toBe(AD);
   });
   test("default deploy accepts unchanged unrelated variables and checks the real CLI overrides", async () => {
     const base = ts.parseConfigFileTextToJson("base.jsonc", template).config;

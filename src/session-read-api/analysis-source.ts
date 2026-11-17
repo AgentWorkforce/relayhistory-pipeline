@@ -48,6 +48,57 @@ export function sqlAnalysisAdmit(pool: AdmitPool): NonNullable<AnalysisDeps["adm
   };
 }
 
+/** A connected client of the admission principal as a runtime without a pool opens it (pg.Client). */
+export interface AdmitConnection {
+  query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }>;
+}
+
+/**
+ * AdmitPool over one connection per admission, for runtimes that cannot hold a pool across
+ * requests (the Cloudflare Worker: Hyperdrive pools the origin connections, the Worker opens a
+ * client per request). connect() opens a fresh client of the admission principal; release()
+ * closes it (the close runs in the background; close() awaits every one, and also closes a
+ * client that was opened and never released). Never shared with the read role's client, so the
+ * admission's READ WRITE transaction cannot run on a READ ONLY read connection or vice versa.
+ */
+export function perRequestAdmitPool<C extends AdmitConnection>(
+  open: () => Promise<C>,
+  end: (client: C) => Promise<void>,
+): { pool: AdmitPool; close(): Promise<void> } {
+  const pending = new Set<Promise<void>>();
+  const live = new Set<C>();
+  const finish = (client: C) => {
+    if (!live.delete(client)) return;
+    const p = end(client).catch(() => {});
+    pending.add(p);
+  };
+  return {
+    pool: {
+      async connect() {
+        const client = await open();
+        live.add(client);
+        let released = false;
+        return {
+          async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
+            if (released) throw new Error("analysis admit: client used after release");
+            const r = await client.query(text, params);
+            return { rows: r.rows as R[] };
+          },
+          release() {
+            if (released) return;
+            released = true;
+            finish(client);
+          },
+        };
+      },
+    },
+    async close() {
+      for (const client of [...live]) finish(client);
+      await Promise.all([...pending]);
+    },
+  };
+}
+
 export function sqlAnalysisSource(run: TenantRunner, store: ObjectStore, admit?: AdmitPool): AnalysisDeps {
   const harnesses = sqlSessionHarnesses(run);
   return {

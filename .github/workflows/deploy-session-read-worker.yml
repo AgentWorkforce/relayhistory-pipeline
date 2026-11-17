@@ -10,6 +10,8 @@ name: deploy session-read-worker
 #   SESSION_READ_ORIGIN          https://sessions-read.agentrelay.com (also Cloud's SESSIONS_READ_96BULLS_URL)
 #   SESSION_READ_COMPLETE_SINCE  ISO UTC timestamp ClickHouse is complete from, or "epoch"
 #   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
+#   SESSION_READ_ANALYSIS_HYPERDRIVE_ID  optional: the Hyperdrive config for bulls96_analysis_admit
+#                                (32 hex, caching disabled); unset = no ANALYSIS_ADMIT binding
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
 # Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts): a default dispatch
@@ -105,6 +107,19 @@ name: deploy session-read-worker
 # profile or preserve): with an explicit owner_buffered=on|off, an off summary/sources input drops a
 # live var without a refusal (true of every input above).
 #
+# Session analysis (lane F1, src/session-read-api/analysis-source.ts), default off.
+# analysis=on adds --var READ_API_ANALYSIS_ENABLED:true: GET /v1/sessions/:id/analysis
+# (sessions.analysis_read_v1 as bulls96_read_api, result objects normalized/session-analysis-v2/*
+# from the PIPELINE_RAW_S3_* raw store) and POST /v1/sessions/:id/analysis (the one non-GET route,
+# sessions.analysis_request_v1 as bulls96_analysis_admit). POST needs the ANALYSIS_ADMIT Hyperdrive
+# binding, rendered only when the environment variable SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set
+# (its live config is checked first: caching disabled, verify-full, the admission role's user);
+# without it POST answers 501 analysis_admission_not_configured and GET still serves. An on dispatch
+# fails before `wrangler deploy` unless the PIPELINE_RAW_S3_* secrets exist (names only). off (the
+# default) renders no var: GET 501 analysis_not_configured and POST 405, as before this input.
+# Not preserved from live (the live-settings guard refuses a dispatch that would drop it, and one
+# that would drop a live ANALYSIS_ADMIT binding); dispatch is Khaliq's call.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
@@ -192,6 +207,11 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      analysis:
+        description: GET/POST /v1/sessions/:id/analysis (READ_API_ANALYSIS_ENABLED=true; POST needs SESSION_READ_ANALYSIS_HYPERDRIVE_ID); off = no var, GET 501 analysis_not_configured, POST 405. Not preserved from live; repeat it on later dispatches
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -248,6 +268,10 @@ jobs:
       SUMMARY_SEARCH: ${{ inputs.summary_search }}
       RELAYFACTS: ${{ inputs.relayfacts }}
       SESSION_SOURCES: ${{ inputs.session_sources }}
+      # Session analysis (default off); on adds the exact "true" var on the deploy command only.
+      ANALYSIS: ${{ inputs.analysis }}
+      # The admission principal's Hyperdrive (optional); set = the ANALYSIS_ADMIT binding is rendered.
+      ANALYSIS_HYPERDRIVE_ID: ${{ vars.SESSION_READ_ANALYSIS_HYPERDRIVE_ID }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -288,6 +312,13 @@ jobs:
           case "$SUMMARY_SEARCH" in off|on) ;; *) fail 'summary_search must be "off" or "on"' ;; esac
           case "$RELAYFACTS" in off|on) ;; *) fail 'relayfacts must be "off" or "on"' ;; esac
           case "$SESSION_SOURCES" in off|on) ;; *) fail 'session_sources must be "off" or "on"' ;; esac
+          case "$ANALYSIS" in off|on) ;; *) fail 'analysis must be "off" or "on"' ;; esac
+          if [ -n "$ANALYSIS_HYPERDRIVE_ID" ]; then
+            [[ "$ANALYSIS_HYPERDRIVE_ID" =~ ^[0-9a-f]{32}$ ]] && [ "$ANALYSIS_HYPERDRIVE_ID" != "00000000000000000000000000000000" ] || fail "SESSION_READ_ANALYSIS_HYPERDRIVE_ID must be the admission role's Hyperdrive config id (32 hex)"
+            [ "$ANALYSIS_HYPERDRIVE_ID" != "$HYPERDRIVE_ID" ] || fail "SESSION_READ_ANALYSIS_HYPERDRIVE_ID must not be the read role's Hyperdrive config"
+          elif [ "$ANALYSIS" = "on" ]; then
+            echo "::warning::analysis=on without SESSION_READ_ANALYSIS_HYPERDRIVE_ID: GET serves, POST answers 501 analysis_admission_not_configured"
+          fi
           if [ "$SUMMARY_FALLBACK" = "on" ] && [ "$BRIEF_SUMMARY" != "on" ]; then fail 'summary_fallback=on needs brief_summary=on'; fi
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
@@ -301,11 +332,26 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             | bun run scripts/check-hyperdrive-config.ts
+      - name: Check the live admission Hyperdrive safety contract (only when SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set)
+        if: env.ANALYSIS_HYPERDRIVE_ID != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -o pipefail
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$ANALYSIS_HYPERDRIVE_ID" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | HYPERDRIVE_ID="$ANALYSIS_HYPERDRIVE_ID" HYPERDRIVE_ROLE=analysis_admit bun run scripts/check-hyperdrive-config.ts
       - name: Render the deploy config (Hyperdrive id; control-head binding and flags only when owner_buffered or buffered_search_gate is on)
         run: |
           grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc
           bun run scripts/render-deploy-config.ts
           grep -q "\"id\": \"$HYPERDRIVE_ID\"" wrangler.deploy.jsonc
+          if [ -n "$ANALYSIS_HYPERDRIVE_ID" ]; then
+            grep -q "\"id\": \"$ANALYSIS_HYPERDRIVE_ID\"" wrangler.deploy.jsonc
+          elif grep -q '"ANALYSIS_ADMIT"' wrangler.deploy.jsonc; then
+            echo "::error::ANALYSIS_ADMIT rendered without SESSION_READ_ANALYSIS_HYPERDRIVE_ID"; exit 1
+          fi
       - name: Check the owner-buffered Worker secrets exist (names only; on only)
         if: steps.resolve-profile.outputs.owner_buffered == 'on'
         env:
@@ -324,6 +370,15 @@ jobs:
           for n in SUMMARY_MASTER_KEYS PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do
             case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; summary fallback reads would answer 501 summary_fallback_not_configured. Refusing to deploy summary_fallback=on"; exit 1 ;; esac
           done
+      - name: Check the analysis Worker secrets exist before deploying (names only; analysis=on only)
+        if: env.ANALYSIS == 'on'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          names="$(bunx wrangler secret list --config wrangler.deploy.jsonc --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).map(x=>x.name).sort().join(" ")))')"
+          for n in PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do
+            case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; analysis reads would answer 501 analysis_not_configured. Refusing to deploy analysis=on"; exit 1 ;; esac
+          done
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -335,6 +390,7 @@ jobs:
           summary_search=""; if [ "$SUMMARY_SEARCH" = "on" ]; then summary_search=true; fi
           relayfacts=""; if [ "$RELAYFACTS" = "on" ]; then relayfacts=true; fi
           session_sources=""; if [ "$SESSION_SOURCES" = "on" ]; then session_sources=true; fi
+          analysis=""; if [ "$ANALYSIS" = "on" ]; then analysis=true; fi
           bunx wrangler deploy --config wrangler.deploy.jsonc \
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
@@ -347,6 +403,7 @@ jobs:
             ${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"} \
             ${relayfacts:+--var "READ_API_RELAYFACTS_ENABLED:$relayfacts"} \
             ${session_sources:+--var "READ_API_SESSION_SOURCES_ENABLED:$session_sources"} \
+            ${analysis:+--var "READ_API_ANALYSIS_ENABLED:$analysis"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)
         env:

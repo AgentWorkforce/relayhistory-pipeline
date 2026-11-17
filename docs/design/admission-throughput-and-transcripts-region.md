@@ -99,7 +99,7 @@ Its writers and readers:
 | session read API | Lambda us-east-1 | read (analysis results) | `normalized/session-analysis-v2/*` | `READ_API_ANALYSIS_BUCKET` |
 | read-api pod, search indexer, native consumer, operator erase | EKS (chart) | read; erase deletes versions | canonical layout | `LOCKER_*`, `SESSION_ERASE_S3_*` (off in prod today) |
 | hosted ingest Worker (+ S3 fence mirror) | Cloudflare | read, write, list | srv-writer canonical layout, live sessions and batches, upload inbox, fences | `INGEST_S3_*` |
-| hosted read Worker | Cloudflare | read | raw and canonical objects, `summary/*` | `PIPELINE_RAW_S3_*` |
+| hosted read Worker | Cloudflare | read | raw and canonical objects, `summary/*`; `normalized/session-analysis-v2/*` with `READ_API_ANALYSIS_ENABLED=true` | `PIPELINE_RAW_S3_*` |
 | relayhistory-cloud writer, inbox bridge | Cloudflare | read, write | `raw/*`, manifests, `summary/*`; the bridge writes the upload inbox | that repo's config |
 | history indexer (reader user) | external | list, read | canonical layout | n/a |
 | eraser, buffered GC | purge job; Lambda us-east-1 (dormant) | delete versions | everything; buffered stages | template parameter, fixed region |

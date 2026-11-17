@@ -57,6 +57,19 @@
  * before this input existed. Refused: any value other than off/on, on with owner_buffered off,
  * and a template that already declares the var (in every mode).
  *
+ * analysisHyperdriveId (ANALYSIS_HYPERDRIVE_ID, from the SESSION_READ_ANALYSIS_HYPERDRIVE_ID
+ * environment variable; session analysis admission, src/session-read-api/analysis-source.ts):
+ * when set, adds a second Hyperdrive binding ANALYSIS_ADMIT -> that config (the
+ * bulls96_analysis_admit role, caching disabled; the workflow checks the live config with
+ * check-hyperdrive-config.ts HYPERDRIVE_ROLE=analysis_admit before rendering). It composes with
+ * every mode above. Unset or empty (the default) changes nothing: every render is byte-identical to
+ * the render before this input existed. Refused: anything but 32 hex, all zeros, the read role's
+ * own SESSION_READ_HYPERDRIVE_ID (the admission principal never shares the read role's config),
+ * and a template that already declares an ANALYSIS_ADMIT binding (in every mode). The flag that
+ * uses it, READ_API_ANALYSIS_ENABLED, is a deploy-command --var (the workflow's `analysis` input),
+ * not this render; without the binding the Worker answers POST 501
+ * analysis_admission_not_configured and still serves GET.
+ *
  * The binding is production-scoped by living only in this production deploy's on-render, not in
  * wrangler.jsonc: a wrangler `env` block would rename the script (legacy_env appends -<env>) and
  * does not inherit hyperdrive/vars/services, so it would either deploy a second Worker or
@@ -68,7 +81,8 @@
  *   BUFFERED_SEARCH_GATE (off|on; empty = off), OWNER_BUFFERED_EVENTS (off|on; empty = off),
  *   OWNER_BUFFERED_STAGE_CONCURRENCY (off|2..32; empty = off), OWNER_BUFFERED_PHASE_LOG (off|on; empty = off),
  *   OWNER_BUFFERED_INDEX_VERIFY (off|on; empty = off),
- *   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (off|2000..6000; empty = off).
+ *   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (off|2000..6000; empty = off),
+ *   ANALYSIS_HYPERDRIVE_ID (32 hex; empty = no ANALYSIS_ADMIT binding).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -82,6 +96,9 @@ export const CONTROL_HEAD_BINDING = Object.freeze({
   service: "relayhistory-api",
   entrypoint: "SessionReadPrivacyControls",
 });
+
+/** The analysis admission principal's Hyperdrive binding (index.ts Env.ANALYSIS_ADMIT). */
+export const ANALYSIS_ADMIT_BINDING = "ANALYSIS_ADMIT";
 
 /** The buffered search gate flag (#338 index.ts Env; parseBufferedSearchGate accepts only "on"). */
 export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
@@ -127,6 +144,8 @@ export interface RenderInputs {
   ownerBufferedIndexVerify?: string;
   /** "off"/unset keeps the runtime default; otherwise its accepted 2000..6000 ms bound. */
   ownerBufferedStatementTimeoutMs?: string;
+  /** SESSION_READ_ANALYSIS_HYPERDRIVE_ID: the admission principal's Hyperdrive config; "" (unset) = no ANALYSIS_ADMIT binding. */
+  analysisHyperdriveId?: string;
 }
 
 export class RenderError extends Error {
@@ -186,7 +205,33 @@ function refusePredeclaredEvents(template: string, hyperdriveId: string): void {
   for (const k of RENDER_ONLY_VARS) if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
 }
 
+const HYPERDRIVE_ID = /^[0-9a-f]{32}$/;
+
+/** True when any hyperdrive entry of a parsed (rendered) template names the binding. */
+function declaresBinding(config: JsoncConfig | undefined, binding: string): boolean {
+  const list = (config as { hyperdrive?: unknown } | undefined)?.hyperdrive;
+  return Array.isArray(list) && list.some((h) => (h as { binding?: unknown } | null)?.binding === binding);
+}
+
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
+  const analysisId = (inputs.analysisHyperdriveId ?? "").trim();
+  if (analysisId) {
+    if (!HYPERDRIVE_ID.test(analysisId) || /^0+$/.test(analysisId)) throw new RenderError("SESSION_READ_ANALYSIS_HYPERDRIVE_ID must be the admission role's Hyperdrive config id (32 hex)");
+    if (analysisId === inputs.hyperdriveId) throw new RenderError("SESSION_READ_ANALYSIS_HYPERDRIVE_ID must not be the read role's Hyperdrive config; the admission principal has its own");
+  }
+  // Every mode: a template binding ANALYSIS_ADMIT itself is refused (the binding is added here only).
+  const parsedTemplate = ts.parseConfigFileTextToJson("wrangler.jsonc", template);
+  if (!parsedTemplate.error && declaresBinding(parsedTemplate.config as JsoncConfig, ANALYSIS_ADMIT_BINDING)) throw new RenderError(`wrangler.jsonc must not declare the ${ANALYSIS_ADMIT_BINDING} Hyperdrive binding; it is added here only`);
+  const base = renderBase(template, inputs);
+  if (!analysisId) return base;
+  const parsed = ts.parseConfigFileTextToJson("wrangler.deploy.jsonc", base);
+  if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
+  const config = parsed.config as JsoncConfig & { hyperdrive?: unknown };
+  if (!Array.isArray(config.hyperdrive)) throw new RenderError("wrangler.jsonc has no hyperdrive list");
+  return `${JSON.stringify({ ...config, hyperdrive: [...config.hyperdrive, { binding: ANALYSIS_ADMIT_BINDING, id: analysisId }] }, null, 2)}\n`;
+}
+
+function renderBase(template: string, inputs: RenderInputs): string {
   if (!/^[0-9a-f]{32}$/.test(inputs.hyperdriveId) || /^0+$/.test(inputs.hyperdriveId)) throw new RenderError("SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)");
   if (!template.includes(HYPERDRIVE_PLACEHOLDER)) throw new RenderError("wrangler.jsonc has no Hyperdrive placeholder");
   const gateMode = (inputs.bufferedSearchGate ?? "").trim() || "off";
@@ -298,6 +343,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       ownerBufferedPhaseLog: process.env.OWNER_BUFFERED_PHASE_LOG,
       ownerBufferedIndexVerify: process.env.OWNER_BUFFERED_INDEX_VERIFY,
       ownerBufferedStatementTimeoutMs: process.env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
+      analysisHyperdriveId: process.env.ANALYSIS_HYPERDRIVE_ID,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
@@ -311,6 +357,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     if (((process.env.OWNER_BUFFERED_PHASE_LOG ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered events phase log ON, ${OWNER_BUFFERED_PHASE_LOG_VAR}=1`);
     if (((process.env.OWNER_BUFFERED_STAGES_PAGED ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered paged exact-session stages ON, ${OWNER_BUFFERED_STAGES_PAGED_VAR}=on`);
     if (((process.env.OWNER_BUFFERED_INDEX_VERIFY ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered index verify ON, ${OWNER_BUFFERED_INDEX_VERIFY_VAR}=on`);
+    if ((process.env.ANALYSIS_HYPERDRIVE_ID ?? "").trim()) console.log(`deploy config: analysis admission binding ${ANALYSIS_ADMIT_BINDING} (Hyperdrive id from SESSION_READ_ANALYSIS_HYPERDRIVE_ID)`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);
