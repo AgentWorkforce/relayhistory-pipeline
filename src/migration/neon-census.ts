@@ -1,42 +1,56 @@
 /**
  * Neon session census for sessions.session_analysis_neon_free() (migration 20261105046000).
  *
- * The census is every (org_id, workspace_id, session_id) that Neon holds ANY row for, in ANY
- * `sessions` table with those three key columns (over-inclusion only makes neon_free false more
- * often, which fails closed). Migration 20261105046000 requires it to be taken AFTER Neon refuses
- * legacy turn writes: a census from an earlier cut misses later sessions and makes neon_free fail
- * OPEN for them. So `produce` must read a frozen source cut at or after that point (a read-only Neon
- * branch at the post-fence LSN, or a copy sealed at that LSN), never a live or earlier copy.
+ * The census is every (org_id, workspace_id, session_id) Neon holds ANY row for, in ANY `sessions`
+ * base table with org_id and session_id columns (over-inclusion only makes neon_free false more often,
+ * which fails closed). Migration 20261105046000 requires it to be taken AFTER Neon refuses legacy turn
+ * writes: a census from an earlier cut misses later sessions and makes neon_free fail OPEN for them.
  *
- *   produce  read-only. Reads the source (CENSUS_SOURCE_URL) in one REPEATABLE READ READ ONLY
- *            snapshot and writes FILE (one "org\tworkspace\tsession\n" line per row, sorted
- *            COLLATE "C") and FILE.manifest.json (census_rows, census_sha256, per-table counts,
- *            the source identity from --source-lsn/--source-ref/--source-seal).
- *   load     writes only with --execute and the target guard. Reads FILE and its manifest (never a
- *            database source), verifies the digest, then in ONE transaction on BULLS_TARGET_URL
- *            (the sessions schema owner): refuses if a seal or any census row exists, COPYs the
- *            rows, recomputes the digest in SQL, and inserts the singleton seal. Then it reads it back.
- *            Without --execute it is a dry run: it verifies the file, and nothing else.
+ *   produce  read-only. One REPEATABLE READ READ ONLY snapshot on CENSUS_SOURCE_URL. Before reading it
+ *            proves the source is the frozen cut it claims to be, and refuses otherwise:
+ *            - a Supabase source is refused unless it is named with --source-supabase-ref=<ref> (the frozen
+ *              legacy copy) AND carries a legacy_copy.seal whose cut LSN is >= --source-lsn; otherwise the
+ *              source must be a Neon (non-Supabase) server whose replay/current WAL LSN is >= --source-lsn;
+ *            - no non-owner, non-superuser role may hold INSERT/UPDATE/DELETE/TRUNCATE on any census table
+ *              (the source must be frozen);
+ *            - a `sessions` foreign table with org_id and session_id is refused (its rows live elsewhere).
+ *            It writes FILE ("org\tworkspace\tsession\n" lines, strictly sorted COLLATE "C") and
+ *            FILE.manifest.json (census_rows, census_sha256, neon_snapshot with the claimed and the
+ *            verified LSN, per-table counts, unkeyed rows, ignored relations).
+ *   load     reads only FILE and its manifest (never a database source), verifies them, and without
+ *            --execute stops there WITHOUT connecting. With --execute and the target guard
+ *            (--expect-supabase-ref) it runs ONE transaction on BULLS_TARGET_URL as the sessions schema
+ *            owner: lock_timeout 5 s; LOCK both census tables IN EXCLUSIVE MODE (blocks other loaders and
+ *            writers, not readers: MVCC hides the uncommitted rows and seal from session_analysis_neon_free
+ *            readers); refuse an existing seal or rows; batched INSERT ... SELECT unnest; recompute the digest
+ *            in SQL; insert the singleton seal; COMMIT; read back.
  *
- * NULL keys (measured on the frozen copy: ~128k rows with NULL workspace_id in session_revision_events and
- * session_timing_cache, 235 delivery_records with NULL session_id). session_analysis_neon_free() matches the
- * census on org_id and session_id only, so a NULL workspace must NOT drop the session (that would fail open):
- * it is kept with workspace_id = NULL_WORKSPACE. A row with a NULL org_id or session_id cannot be keyed to any
- * session; it is excluded and counted per table in neon_snapshot.unkeyed_rows so reviewers see it.
+ * NULL keys. neon_free matches the census on org_id and session_id only, so a NULL workspace_id (and a
+ * table with no workspace_id column at all) must NOT drop the session: it is kept with workspace_id =
+ * NULL_WORKSPACE. A row with a NULL org_id or session_id cannot be keyed to any session; it is excluded and
+ * counted per table in neon_snapshot.unkeyed_rows. Partitions are read through their parent only; views
+ * and materialized views are derived and are listed in neon_snapshot.ignored_relations, not read.
  *
- * Canonical digest: sha256 over the concatenation, in (org_id, workspace_id, session_id) order
- * COLLATE "C", of `org_id \t workspace_id \t session_id \n` encoded UTF-8. Any key holding a tab
- * or newline is refused (it would make the encoding ambiguous).
+ * Canonical digest: sha256 over the concatenation, in (org_id, workspace_id, session_id) order COLLATE "C"
+ * (UTF-8 byte order), of `org_id \t workspace_id \t session_id \n` encoded UTF-8. Any key holding a tab,
+ * CR or newline is refused (it would make the encoding ambiguous). The manifest digest detects accidental
+ * damage only: an edited file with a recomputed manifest still verifies, so the files must be produced and
+ * loaded by the operator, from a protected location, with the produce receipt kept.
+ *
+ * Size ceiling: produce and load hold the census in memory, and the SQL digest builds it as one text value
+ * (PostgreSQL's 1 GB limit), so about 9-10 million rows at most. That fails closed (an error, no seal). The
+ * frozen copy has far fewer sessions.
  *
  * Usage:
- *   CENSUS_SOURCE_URL=... bun run migration:neon-census produce --out=FILE --source-lsn=L --source-ref=R [--source-seal=S]
+ *   CENSUS_SOURCE_URL=... bun run migration:neon-census produce --out=FILE --source-lsn=L --source-ref=R
+ *       [--source-supabase-ref=<frozen copy ref>] [--source-seal=S]
  *   BULLS_TARGET_URL=... bun run migration:neon-census load --in=FILE [--execute --expect-supabase-ref=<ref>]
  * No URL, row value or credential is printed; output is counts and digests only.
  */
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import pg from "pg";
-import { guardFromArgv } from "./target-guard.js";
+import { guardFromArgv, supabaseProjectRef } from "./target-guard.js";
 
 export interface Queryable {
   query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
@@ -54,33 +68,63 @@ export interface CensusManifest {
   census_sha256: string;
   neon_snapshot: {
     source_lsn: string;
+    verified_lsn: string;
+    lsn_evidence: "neon-server" | "legacy-copy-seal";
     source_ref: string;
     source_seal: string | null;
     snapshot_at: string;
     tables: Record<string, number>;
     /** Per table: rows excluded because org_id or session_id is NULL (they cannot be keyed to a session). */
     unkeyed_rows: Record<string, number>;
+    /** sessions relations with org_id + session_id that were not read (views, materialized views), by kind. */
+    ignored_relations: Record<string, string>;
     null_workspace: string;
   };
 }
 
 const quoteIdent = (value: string) => `"${value.replaceAll('"', '""')}"`;
 
-/** Stand-in for a NULL workspace_id. neon_free() ignores workspace_id, so only org + session must be exact. */
+/** Stand-in for a NULL or absent workspace_id. neon_free() ignores workspace_id; only org + session must be exact. */
 export const NULL_WORKSPACE = "~neon-census:null-workspace~";
 
-/** Tables in `sessions` that carry all three key columns, as text. Sorted for a stable plan. */
-export async function censusTables(db: Queryable): Promise<string[]> {
-  const { rows } = await db.query<{ relname: string }>(
-    `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = 'sessions' AND c.relkind IN ('r','p')
+export interface CensusRelation {
+  name: string;
+  hasWorkspace: boolean;
+}
+
+/**
+ * Base tables (non-partition tables and partitioned parents) in `sessions` with org_id and session_id.
+ * Views/matviews are reported, not read; a foreign table with those columns is refused.
+ */
+export async function censusRelations(db: Queryable): Promise<{ tables: CensusRelation[]; ignored: Record<string, string> }> {
+  const { rows } = await db.query<{ relname: string; relkind: string; relispartition: boolean; ws: boolean }>(
+    `SELECT c.relname, c.relkind::text AS relkind, c.relispartition,
+            EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND NOT a.attisdropped AND a.attname = 'workspace_id') AS ws
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'sessions' AND c.relkind IN ('r','p','v','m','f')
         AND c.relname NOT IN ('session_neon_census')
         AND (SELECT count(*) FROM pg_attribute a
               WHERE a.attrelid = c.oid AND NOT a.attisdropped AND a.attnum > 0
-                AND a.attname IN ('org_id','workspace_id','session_id')) = 3
+                AND a.attname IN ('org_id','session_id')) = 2
       ORDER BY c.relname COLLATE "C"`,
   );
-  return rows.map((row) => row.relname);
+  const tables: CensusRelation[] = [];
+  const ignored: Record<string, string> = {};
+  for (const row of rows) {
+    if (row.relkind === "f") throw new Error(`sessions foreign table ${row.relname} has census keys: refusing (rows live elsewhere)`);
+    if (row.relkind === "v" || row.relkind === "m") {
+      ignored[row.relname] = row.relkind === "v" ? "view" : "materialized view";
+      continue;
+    }
+    if (row.relispartition) continue; // read through its partitioned parent
+    tables.push({ name: row.relname, hasWorkspace: row.ws });
+  }
+  return { tables, ignored };
+}
+
+/** Back-compat helper: the census table names. */
+export async function censusTables(db: Queryable): Promise<string[]> {
+  return (await censusRelations(db)).tables.map((table) => table.name);
 }
 
 export function censusLine(row: CensusRow): string {
@@ -91,12 +135,10 @@ export function censusLine(row: CensusRow): string {
   return `${row.org_id}\t${row.workspace_id}\t${row.session_id}\n`;
 }
 
-/** Byte-wise ("C") ordering, matching ORDER BY ... COLLATE "C". */
+/** Byte-wise ("C", UTF-8) ordering, matching ORDER BY ... COLLATE "C" (not JS UTF-16 order). */
 export function compareC(a: CensusRow, b: CensusRow): number {
   for (const key of ["org_id", "workspace_id", "session_id"] as const) {
-    const x = Buffer.from(a[key], "utf8");
-    const y = Buffer.from(b[key], "utf8");
-    const c = Buffer.compare(x, y);
+    const c = Buffer.compare(Buffer.from(a[key], "utf8"), Buffer.from(b[key], "utf8"));
     if (c !== 0) return c;
   }
   return 0;
@@ -114,29 +156,104 @@ export const DIGEST_SQL = `SELECT count(*)::bigint AS n,
     ORDER BY org_id COLLATE "C", workspace_id COLLATE "C", session_id COLLATE "C"), ''), 'UTF8')), 'hex') AS sha
   FROM sessions.session_neon_census`;
 
-/** Read the distinct census from a frozen source, in one read-only snapshot. */
+const LSN = /^[0-9A-F]{1,8}\/[0-9A-F]{1,8}$/i;
+
+/** Compare two pg_lsn text values (hi/lo hex). */
+export function lsnCompare(a: string, b: string): number {
+  if (!LSN.test(a) || !LSN.test(b)) throw new Error("not an LSN");
+  const v = (x: string) => {
+    const [hi, lo] = x.split("/");
+    return (BigInt(`0x${hi}`) << 32n) + BigInt(`0x${lo}`);
+  };
+  const d = v(a) - v(b);
+  return d === 0n ? 0 : d > 0n ? 1 : -1;
+}
+
+export interface SourceClaim {
+  lsn: string;
+  ref: string;
+  seal: string | null;
+  /** The source URL's Supabase project ref if it is one (from target-guard's parser), else null. */
+  urlSupabaseRef: string | null;
+  /** Required to accept a Supabase source: must equal urlSupabaseRef. */
+  allowSupabaseRef?: string | undefined;
+}
+
+/** Inside the snapshot: prove the source is the claimed frozen cut. Returns the verified LSN and its evidence. */
+export async function verifySource(
+  db: Queryable,
+  claim: SourceClaim,
+  tables: CensusRelation[],
+): Promise<{ verified: string; evidence: "neon-server" | "legacy-copy-seal" }> {
+  if (!LSN.test(claim.lsn)) throw new Error("--source-lsn is not an LSN");
+  let verified: string;
+  let evidence: "neon-server" | "legacy-copy-seal";
+  if (claim.urlSupabaseRef !== null) {
+    if (claim.allowSupabaseRef === undefined || claim.allowSupabaseRef !== claim.urlSupabaseRef) {
+      throw new Error("the source is a Supabase URL: refusing unless named with --source-supabase-ref (swapped URLs?)");
+    }
+    const { rows: has } = await db.query<{ ok: boolean }>("SELECT to_regclass('legacy_copy.seal') IS NOT NULL AS ok");
+    if (!has[0]!.ok) throw new Error("the Supabase source has no legacy_copy.seal: it is not a sealed frozen copy");
+    const { rows } = await db.query<{ lsn: string | null }>(
+      `SELECT coalesce(manifest->'source'->>'l2_lsn', manifest->'source'->>'cut_lsn') AS lsn
+         FROM legacy_copy.seal ORDER BY sealed_at DESC LIMIT 1`,
+    );
+    const sealed = rows[0]?.lsn ?? null;
+    if (sealed === null || !LSN.test(sealed)) throw new Error("legacy_copy.seal has no cut LSN");
+    verified = sealed;
+    evidence = "legacy-copy-seal";
+  } else {
+    const { rows } = await db.query<{ lsn: string }>(
+      "SELECT coalesce(pg_last_wal_replay_lsn(), pg_current_wal_lsn())::text AS lsn",
+    );
+    verified = rows[0]!.lsn;
+    evidence = "neon-server";
+  }
+  if (lsnCompare(verified, claim.lsn) < 0) {
+    throw new Error("the source is cut BEFORE --source-lsn: refusing (a census from an earlier cut fails open)");
+  }
+  for (const table of tables) {
+    const { rows } = await db.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM pg_roles r, pg_class c
+        WHERE c.oid = $1::regclass AND NOT r.rolsuper AND r.oid <> c.relowner
+          AND r.rolname !~ '^pg_' -- predefined roles (pg_write_all_data, ...); their real members are still checked
+          AND NOT pg_has_role(r.oid, c.relowner, 'MEMBER')
+          AND (has_table_privilege(r.oid, c.oid, 'INSERT') OR has_table_privilege(r.oid, c.oid, 'UPDATE')
+               OR has_table_privilege(r.oid, c.oid, 'DELETE') OR has_table_privilege(r.oid, c.oid, 'TRUNCATE'))`,
+      [`sessions.${quoteIdent(table.name)}`],
+    );
+    if (rows[0]!.n !== "0") throw new Error(`sessions.${table.name} is still writable by a non-owner role: the source is not frozen`);
+  }
+  return { verified, evidence };
+}
+
+/** Read the distinct census from a verified frozen source, in one read-only snapshot. */
 export async function produceCensus(
   db: Queryable,
-  source: { lsn: string; ref: string; seal: string | null },
+  claim: SourceClaim,
 ): Promise<{ rows: CensusRow[]; manifest: CensusManifest }> {
   await db.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
   try {
-    const tables = await censusTables(db);
-    if (tables.length === 0) throw new Error("no sessions table carries org_id/workspace_id/session_id");
+    const { tables, ignored } = await censusRelations(db);
+    if (tables.length === 0) throw new Error("no sessions table carries org_id/session_id");
+    const { verified, evidence } = await verifySource(db, claim, tables);
     const counts: Record<string, number> = {};
     const unkeyed: Record<string, number> = {};
     for (const table of tables) {
       const { rows } = await db.query<{ n: string; u: string }>(
         `SELECT count(*)::text AS n, count(*) FILTER (WHERE org_id IS NULL OR session_id IS NULL)::text AS u
-           FROM sessions.${quoteIdent(table)}`,
+           FROM sessions.${quoteIdent(table.name)}`,
       );
-      counts[table] = Number(rows[0]!.n);
-      if (rows[0]!.u !== "0") unkeyed[table] = Number(rows[0]!.u);
+      counts[table.name] = Number(rows[0]!.n);
+      if (rows[0]!.u !== "0") unkeyed[table.name] = Number(rows[0]!.u);
     }
     const nullWorkspace = NULL_WORKSPACE.replaceAll("'", "''");
     const union = tables
-      .map((table) => `SELECT org_id::text AS org_id, coalesce(workspace_id::text, '${nullWorkspace}') AS workspace_id, session_id::text AS session_id
-         FROM sessions.${quoteIdent(table)} WHERE org_id IS NOT NULL AND session_id IS NOT NULL`)
+      .map((table) => {
+        const ws = table.hasWorkspace ? `coalesce(workspace_id::text, '${nullWorkspace}')` : `'${nullWorkspace}'::text`;
+        return `SELECT org_id::text AS org_id, ${ws} AS workspace_id, session_id::text AS session_id
+                  FROM sessions.${quoteIdent(table.name)} WHERE org_id IS NOT NULL AND session_id IS NOT NULL`;
+      })
       .join(" UNION ");
     const { rows } = await db.query<CensusRow>(
       `SELECT org_id, workspace_id, session_id FROM (${union}) u
@@ -152,8 +269,9 @@ export async function produceCensus(
         census_rows: sorted.length,
         census_sha256: censusDigest(sorted),
         neon_snapshot: {
-          source_lsn: source.lsn, source_ref: source.ref, source_seal: source.seal, snapshot_at: at[0]!.t,
-          tables: counts, unkeyed_rows: unkeyed, null_workspace: NULL_WORKSPACE,
+          source_lsn: claim.lsn, verified_lsn: verified, lsn_evidence: evidence, source_ref: claim.ref,
+          source_seal: claim.seal, snapshot_at: at[0]!.t, tables: counts, unkeyed_rows: unkeyed,
+          ignored_relations: ignored, null_workspace: NULL_WORKSPACE,
         },
       },
     };
@@ -172,16 +290,22 @@ export function parseCensusFile(text: string): CensusRow[] {
   });
 }
 
-/** Verify a file against its manifest: sorted, unique, digest and row count equal. */
+/** Verify a file against its manifest: sorted, unique, digest and row count equal. Detects accidental damage only. */
 export function verifyCensus(rows: CensusRow[], manifest: CensusManifest): void {
   if (manifest.version !== 1) throw new Error("unknown manifest version");
+  if (!/^[0-9a-f]{64}$/.test(manifest.census_sha256)) throw new Error("manifest digest is malformed");
   for (let i = 1; i < rows.length; i += 1) {
     if (compareC(rows[i - 1]!, rows[i]!) >= 0) throw new Error("census file is not strictly sorted and unique");
   }
   if (rows.length !== manifest.census_rows) throw new Error("census row count differs from the manifest");
   if (censusDigest(rows) !== manifest.census_sha256) throw new Error("census digest differs from the manifest");
-  if (!/^[0-9a-f]{64}$/.test(manifest.census_sha256)) throw new Error("manifest digest is malformed");
 }
+
+/** The lock statements a load issues, exported for tests. */
+export const LOAD_LOCK_SQL = [
+  "SET LOCAL lock_timeout = '5s'",
+  "LOCK TABLE sessions.session_neon_census, sessions.session_neon_census_seal IN EXCLUSIVE MODE",
+];
 
 /** Load into the target in one transaction; refuses an existing seal or rows. Returns the readback. */
 export async function loadCensus(
@@ -193,7 +317,7 @@ export async function loadCensus(
   verifyCensus(rows, manifest);
   await db.query("BEGIN");
   try {
-    await db.query("LOCK TABLE sessions.session_neon_census, sessions.session_neon_census_seal IN ACCESS EXCLUSIVE MODE");
+    for (const sql of LOAD_LOCK_SQL) await db.query(sql);
     const { rows: existing } = await db.query<{ seals: string; census: string }>(
       `SELECT (SELECT count(*) FROM sessions.session_neon_census_seal)::text AS seals,
               (SELECT count(*) FROM sessions.session_neon_census)::text AS census`,
@@ -226,8 +350,9 @@ export async function loadCensus(
   );
   const { rows: digest } = await db.query<{ n: string; sha: string }>(DIGEST_SQL);
   const s = seal[0];
-  if (!s || s.census_sha256 !== manifest.census_sha256 || digest[0]!.sha !== manifest.census_sha256) {
-    throw new Error("readback after COMMIT does not match the manifest");
+  if (!s || Number(s.census_rows) !== manifest.census_rows || s.census_sha256 !== manifest.census_sha256
+      || Number(digest[0]!.n) !== manifest.census_rows || digest[0]!.sha !== manifest.census_sha256) {
+    throw new Error("COMMITTED; readback mismatch: the seal is in place but does not match the manifest. Do not retry; investigate");
   }
   return { census_rows: Number(s.census_rows), census_sha256: s.census_sha256, sealed_at: s.sealed_at };
 }
@@ -240,14 +365,18 @@ export async function main() {
     const url = process.env.CENSUS_SOURCE_URL;
     const out = arg("out"), lsn = arg("source-lsn"), ref = arg("source-ref");
     if (!url || !out || !lsn || !ref) throw new Error("produce needs CENSUS_SOURCE_URL, --out, --source-lsn and --source-ref");
-    if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(lsn)) throw new Error("--source-lsn is not an LSN");
+    const claim: SourceClaim = {
+      lsn, ref, seal: arg("source-seal") ?? null,
+      urlSupabaseRef: supabaseProjectRef(url), allowSupabaseRef: arg("source-supabase-ref"),
+    };
     const client = new pg.Client({ connectionString: url, application_name: "96bulls-neon-census-produce" });
     await client.connect();
     try {
-      const { rows, manifest } = await produceCensus(client, { lsn, ref, seal: arg("source-seal") ?? null });
+      const { rows, manifest } = await produceCensus(client, claim);
       await writeFile(out, rows.map(censusLine).join(""), { encoding: "utf8", mode: 0o600, flag: "wx" });
       await writeFile(`${out}.manifest.json`, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      process.stdout.write(`${JSON.stringify({ mode, census_rows: manifest.census_rows, census_sha256: manifest.census_sha256, tables: Object.keys(manifest.neon_snapshot.tables).length, unkeyed_rows: manifest.neon_snapshot.unkeyed_rows })}\n`);
+      const s = manifest.neon_snapshot;
+      process.stdout.write(`${JSON.stringify({ mode, census_rows: manifest.census_rows, census_sha256: manifest.census_sha256, verified_lsn: s.verified_lsn, lsn_evidence: s.lsn_evidence, tables: Object.keys(s.tables).length, unkeyed_rows: s.unkeyed_rows, ignored_relations: s.ignored_relations })}\n`);
     } finally {
       await client.end();
     }
