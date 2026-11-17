@@ -171,7 +171,7 @@ import {
   type SelfhostDeps,
 } from "./selfhost.ts";
 import { registerSelfIssuedRoutes, type SelfIssuedDeps } from "./self-issued.ts";
-import { registerMemoryDocumentsRoutes, type MemoryDocuments } from "./memory-documents.ts";
+import { registerRelayfactsRoutes, type Relayfacts } from "./relayfacts.ts";
 
 /**
  * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
@@ -242,11 +242,11 @@ export interface ReadApiDeps {
    */
   summaryFallback?: SummaryFallback;
   /**
-   * READ_API_MEMORY_DOCUMENTS_ENABLED=true (exactly "true"), on every entry: GET /v1/memory/documents
-   * and /v1/memory/documents/:topic (memory-documents.ts). Absent, both answer 501
-   * `memory_documents_disabled`. Uses directory workspace admission (the `memory` canary).
+   * READ_API_RELAYFACTS_ENABLED=true (exactly "true"), on every entry: GET /v1/relayfacts
+   * and /v1/relayfacts/:topic (relayfacts.ts). Absent, both answer 501
+   * `relayfacts_disabled`. Uses directory workspace admission (the `relayfacts` canary).
    */
-  memoryDocuments?: MemoryDocuments;
+  relayfacts?: Relayfacts;
   /**
    * READ_API_LIST_SHORT_SUMMARY_ENABLED=true (exactly "true"): GET /v1/sessions serves the opt-in
    * includeShortSummary=recorded (shortSummary, shortSummaryGeneratedAt). Not true = the param is a
@@ -1131,7 +1131,7 @@ export function createReadApi(deps: ReadApiDeps) {
   }
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary" | "memory"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary" | "relayfacts"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -1807,11 +1807,11 @@ export function createReadApi(deps: ReadApiDeps) {
       clearTimeout(timer);
     }
   };
-  registerMemoryDocumentsRoutes(app as never, deps.memoryDocuments, {
+  registerRelayfactsRoutes(app as never, deps.relayfacts, {
     guard: (c) => {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
-      requireCanary(identity, "memory");
+      requireCanary(identity, "relayfacts");
       rejectUnsupported(c);
       return identity;
     },

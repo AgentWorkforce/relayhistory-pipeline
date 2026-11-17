@@ -1,4 +1,4 @@
-/** Memory documents extractor: pure mapping from session-analysis decisions to decision records, with fakes. */
+/** Relayfacts extractor: pure mapping from session-analysis decisions to decision records, with fakes. */
 import { describe, expect, test } from "bun:test";
 import { scrubText } from "../../shared/vendor.ts";
 import type { AnalysisClaim, SessionAnalysisSnapshot } from "../engine/session-analysis-result.ts";
@@ -46,7 +46,7 @@ describe("decisionTopic", () => {
     expect(t("src/session-read-api/app.ts")).toBe("src-session-read-api");
     expect(t("./packages/session-read-worker/src/index.ts")).toBe("packages-session-read-worker");
     expect(t("README.md")).toBe("general");
-    expect(t("docs/memory-documents.md")).toBe("docs");
+    expect(t("docs/relayfacts.md")).toBe("docs");
     expect(decisionTopic([{ path: "docs/a.md", editCount: 1 }, { path: "src/hoopdb/migrate.ts", editCount: 3 }])).toBe("src-hoopdb");
     expect(decisionTopic([])).toBe("general");
   });
@@ -186,7 +186,7 @@ describe("extractDecisionRecords", () => {
 });
 
 describe("postgresDecisionRecordsSink", () => {
-  test("one call to decision_records_insert_v1 with the job's workspace; none for an empty list", async () => {
+  test("one call to relayfacts_insert_v1 with the job's workspace; none for an empty list", async () => {
     const calls: Array<[string, unknown[] | undefined]> = [];
     const db = { async query<R>(text: string, params?: unknown[]) {
       calls.push([text, params]);
@@ -199,7 +199,7 @@ describe("postgresDecisionRecordsSink", () => {
       evidence: [{ source: "claude", session_id: "s", turn_start: 0, turn_end: 0, claim: "T.", ref: null }] }];
     expect(await sink({ orgId: "org-a", workspaceId: "ws-a" }, records)).toEqual({ inserted: 1, merged: 0, evidence_added: 1 });
     expect(calls.length).toBe(1);
-    expect(calls[0]![0]).toContain("sessions.decision_records_insert_v1($1, $2, $3::jsonb)");
+    expect(calls[0]![0]).toContain("sessions.relayfacts_insert_v1($1, $2, $3::jsonb)");
     expect(calls[0]![1]).toEqual(["org-a", "ws-a", JSON.stringify(records)]);
   });
 });
@@ -225,6 +225,6 @@ describe("decisionRecordsHook", () => {
     expect(counts).toEqual({ decision_records: 0 });
     const failing: Record<string, number> = {};
     await decisionRecordsHook(async () => { throw new Error("db down"); }, failing)(job, output([claim("Use a flag.", ["e0"])]));
-    expect(failing).toEqual({ decision_records_failed: 1 });
+    expect(failing).toEqual({ relayfacts_failed: 1 });
   });
 });

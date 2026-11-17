@@ -28,7 +28,7 @@ BEGIN
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.ingest\_origin\_%');
  -- Allowed, not required: the decision-records erase entry point (before 20261105062090 is applied, and after
  -- its guarded rollback).
- v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.decision\_evidence\_%');
+ v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.relayfacts\_evidence\_%');
  -- Runtime RPCs are required once their table is installed, and absent on a validated prefix release.
  IF to_regclass('sessions.session_erasure_writes') IS NULL THEN
   v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.ingest\_operator\_runtime\_%');

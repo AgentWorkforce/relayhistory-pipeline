@@ -486,10 +486,10 @@ describe("entry and configuration", () => {
     }
   });
 
-  test("memory documents: default off (501 memory_documents_disabled, no SQL), on only with the exact string \"true\"", async () => {
+  test("relayfacts: default off (501 relayfacts_disabled, no SQL), on only with the exact string \"true\"", async () => {
     const t = tenant();
     const seen: Array<{ text: string; params?: unknown[] }> = [];
-    // A fake pg client: records every statement; the memory documents functions read as not installed.
+    // A fake pg client: records every statement; the relayfacts functions read as not installed.
     const connect = async () => ({
       async query(text: string, params?: unknown[]) {
         seen.push({ text, params });
@@ -503,24 +503,24 @@ describe("entry and configuration", () => {
       await waitOnExecutionContext(ctx);
       return r;
     };
-    const paths = [`/v1/memory/documents?workspace=${t.ws}`, `/v1/memory/documents/src-session-read-api?workspace=${t.ws}`];
-    const memorySql = () => seen.filter((q) => q.params?.some((p) => typeof p === "string" && p.startsWith("sessions.decision_records_")));
+    const paths = [`/v1/relayfacts?workspace=${t.ws}`, `/v1/relayfacts/src-session-read-api?workspace=${t.ws}`];
+    const relayfactsSql = () => seen.filter((q) => q.params?.some((p) => typeof p === "string" && p.startsWith("sessions.relayfacts_")));
     for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
       for (const path of paths) {
         seen.length = 0;
-        const r = await call(path, { READ_API_MEMORY_DOCUMENTS_ENABLED: flag });
+        const r = await call(path, { READ_API_RELAYFACTS_ENABLED: flag });
         expect(r.status, `${path} ${String(flag)}`).toBe(501);
-        expect(await r.json(), `${path} ${String(flag)}`).toEqual({ error: "memory_documents_disabled" });
-        expect(memorySql(), `${path} ${String(flag)}`).toHaveLength(0);
+        expect(await r.json(), `${path} ${String(flag)}`).toEqual({ error: "relayfacts_disabled" });
+        expect(relayfactsSql(), `${path} ${String(flag)}`).toHaveLength(0);
       }
     }
     // Exactly "true": each route reaches its function check through the request's tenant runner.
     for (const path of paths) {
       seen.length = 0;
-      const on = await call(path, { READ_API_MEMORY_DOCUMENTS_ENABLED: "true" });
-      expect(memorySql(), path).toHaveLength(1);
+      const on = await call(path, { READ_API_RELAYFACTS_ENABLED: "true" });
+      expect(relayfactsSql(), path).toHaveLength(1);
       expect(on.status, path).toBe(501);
-      expect((await body(on)).error, path).toMatchObject({ code: "unsupported_by_backend", reason: "memory_documents_not_migrated" });
+      expect((await body(on)).error, path).toMatchObject({ code: "unsupported_by_backend", reason: "relayfacts_not_migrated" });
     }
   });
 
