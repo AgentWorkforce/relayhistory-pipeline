@@ -22,3 +22,23 @@ export const memoryDocuments: LaneManifest = {
   },
   replaces: {},
 };
+
+const ERASE_MIGRATION = "supabase/migrations/20261105062090_memory_documents_erase.sql";
+
+/**
+ * Lane: memory-documents-erase (slot 062090).
+ * The operator per-session erase of decision evidence, run by the self-host ingest login
+ * (bulls96_session_ingest) inside its erase lease, and the trigger that refuses evidence for a fenced session.
+ */
+export const memoryDocumentsErase: LaneManifest = {
+  lane: "memory-documents-erase",
+  owner: "memory documents operator erase of decision evidence (slot 062090)",
+  migration: ERASE_MIGRATION,
+  prefixes: ["sessions.decision_evidence_"],
+  grantSources: [{ path: ERASE_MIGRATION, roles: ["bulls96_session_ingest"] }],
+  functions: {
+    "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)": { secdef: true, grants: ["bulls96_session_ingest"] },
+    "sessions.decision_evidence_fence_guard_v1()": { secdef: true, grants: [] },
+  },
+  replaces: {},
+};

@@ -200,6 +200,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Memory documents: two new owner-only tables and four SECURITY DEFINER entry points (worker insert/supersede,
       // read-API topics/list). No G4 function names them, and no G4 ingest path calls them.
       "20261105062080_memory_documents.sql",
+      // Memory documents erase: one SECURITY DEFINER erase entry point for the operator erase (bulls96_session_ingest)
+      // and a guard trigger on the 062080 evidence table. No G4 function names them, and no G4 ingest path calls them.
+      "20261105062090_memory_documents_erase.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

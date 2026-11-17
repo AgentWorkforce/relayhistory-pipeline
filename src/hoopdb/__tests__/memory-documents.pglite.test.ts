@@ -1,4 +1,4 @@
-/** 062080 memory documents: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback. */
+/** 062080 memory documents: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback; 062090 operator erase. */
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -298,5 +298,113 @@ describe("20261105062080 rollback", () => {
       await db.exec(SQL);
       expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.decision_records_v1')::text r")).rows[0]!.r).toBe("sessions.decision_records_v1");
     } finally { await db.close(); }
+  });
+});
+
+const ERASE_FILE = "20261105062090_memory_documents_erase.sql";
+const ERASE_STEP = `upstream:${ERASE_FILE}`;
+const ERASE_SQL = read(`supabase/migrations/${ERASE_FILE}`);
+const ERASE_DOWN = read("supabase/rollbacks/20261105062090_memory_documents_erase.down.sql");
+const ERASE = "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)";
+const GUARD = "sessions.decision_evidence_fence_guard_v1()";
+
+describe("20261105062090 memory documents operator erase", () => {
+  let db: PGlite;
+  const KEY = ["org-a", "ws-a", "claude", "s-1"] as const;
+  const as = async <R,>(role: string, run: (tx: Transaction) => Promise<R>) =>
+    db.transaction(async (tx) => { await tx.exec(`SET LOCAL ROLE ${role}`); return run(tx); });
+  const ingest = async <R,>(fn: string, params: unknown[]) => as("bulls96_session_ingest", async (tx) =>
+    (await tx.query<{ r: R }>(`SELECT sessions.${fn}(${params.map((_, i) => `$${i + 1}`).join(",")}) AS r`, params)).rows[0]!.r);
+  const insert = (org: string, ws: string, list: unknown) =>
+    as("service_role", async (tx) => (await tx.query<{ inserted: number; merged: number; evidence_added: number }>(
+      "SELECT * FROM sessions.decision_records_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!);
+  const records = async () => (await db.query<{ ws: string; title: string; statement: string; evidence: string[] }>(
+    `SELECT t.workspace_id ws, t.title, t.statement,
+            coalesce((SELECT array_agg(e.source || '/' || e.session_id ORDER BY e.source, e.session_id) FROM sessions.decision_evidence_v1 e WHERE e.decision_id = t.id), '{}') evidence
+       FROM sessions.decision_records_v1 t ORDER BY t.workspace_id, t.title`)).rows;
+  const e = (source: string, session_id: string, claim: string): Ev => ({ source, session_id, turn_start: 0, turn_end: 1, claim });
+
+  beforeAll(async () => {
+    db = await migrated();
+    // The pointer the operator erase begins from (its manifest layout names the bucket, workspace and source).
+    await db.query(`INSERT INTO sessions.session_index(
+      org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id)
+      VALUES($1,$2,$3,$4,'machine','user',now(),now(),'s3','bucket','96bulls/org-a/v1/ws=ws-a/m=machine/h=claude/d=2026/11/11/s=s-1/manifest.json',decode(repeat('ab',32),'hex'),'jsonl',
+      '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18')`, [...KEY]);
+  });
+  afterAll(async () => { await db?.close(); });
+
+  test("inventory, sentinel and grants: two owner-pinned functions and one trigger, erase for the ingest login only, not a runtime application function", async () => {
+    expect(inventoryOf(ERASE_SQL).map((i) => `${i.kind}:${i.name}`).sort()).toEqual([
+      "function:sessions.decision_evidence_erase_session_v1", "function:sessions.decision_evidence_fence_guard_v1",
+      "trigger:decision_evidence_fence_guard",
+    ]);
+    expect(ERASE_SQL).not.toMatch(/CONCURRENTLY/i);
+    expect(ERASE_DOWN).toContain(createHash("sha256").update(ERASE_SQL).digest("hex"));
+    expect(ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:")).sort().at(-1)).toBe(ERASE_STEP);
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_evidence_"))).toEqual([]);
+    for (const fn of [ERASE, GUARD]) {
+      const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
+        "SELECT p.prosecdef secdef, p.proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec FROM pg_proc p WHERE p.oid=$1::regprocedure", [fn])).rows[0]!;
+      expect(r.secdef).toBe(true);
+      expect(r.cfg).toEqual(["search_path=pg_catalog, sessions, pg_temp"]);
+      expect(r.public_exec).toBe(false);
+      for (const role of ["anon", "authenticated", "service_role", "search_consumer_runtime", "bulls96_read_api"])
+        expect((await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok).toBe(false);
+      expect((await db.query<{ ok: boolean }>("SELECT has_function_privilege('bulls96_session_ingest', $1, 'EXECUTE') ok", [fn])).rows[0]!.ok).toBe(fn === ERASE);
+    }
+  });
+
+  test("an erase removes only the erased session's evidence in its workspace and source; empty records go, shared records lose its text", async () => {
+    // Only the erased session: deleted with its evidence.
+    await insert("org-a", "ws-a", [rec({ title: "Only the erased session", statement: "Erased statement one.", evidence: [e("claude", "s-1", "Erased claim one.")] })]);
+    // First written from the erased session, then merged from s-2: kept, statement replaced by s-2's claim.
+    await insert("org-a", "ws-a", [rec({ title: "Shared decision", statement: "Erased statement two.", evidence: [e("claude", "s-1", "Erased claim two.")] })]);
+    await insert("org-a", "ws-a", [rec({ title: "shared decision.", statement: "Kept statement.", evidence: [e("claude", "s-2", "Kept claim from s-2.")] })]);
+    // Same session id under another history source, and in another workspace: untouched.
+    await insert("org-a", "ws-a", [rec({ title: "Other source", statement: "Codex statement.", evidence: [e("codex", "s-1", "Codex claim.")] })]);
+    await insert("org-a", "ws-b", [rec({ title: "Other workspace", statement: "Workspace B statement.", evidence: [e("claude", "s-1", "Workspace B claim.")] })]);
+    await insert("org-b", "ws-a", [rec({ title: "Other org", statement: "Org B statement.", evidence: [e("claude", "s-1", "Org B claim.")] })]);
+
+    // The erase function is not callable without the ingest login, nor without an authorized lease.
+    expect(await code(as("service_role", (tx) => tx.query(`SELECT ${ERASE.replace(/\(.*$/, "")}('org-a','ws-a','claude','s-1',gen_random_uuid())`)))).toBe("42501");
+    expect(await code(ingest("decision_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
+    expect(await ingest("ingest_operator_runtime_begin", [...KEY, crypto.randomUUID(), "user", "operator", "bucket", "96bulls", "a".repeat(64)]))
+      .toMatchObject({ status: "in_progress", uploadsFenced: true });
+    const lease = crypto.randomUUID();
+    expect(await ingest("ingest_operator_runtime_next", [lease])).toMatchObject({ sessionIds: ["s-1"] });
+    expect(await code(ingest("decision_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
+
+    expect(await ingest("decision_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 2, recordsDeleted: 1, recordsRewritten: 1 });
+    expect(await records()).toEqual([
+      { ws: "ws-a", title: "Other org", statement: "Org B statement.", evidence: ["claude/s-1"] },
+      { ws: "ws-a", title: "Other source", statement: "Codex statement.", evidence: ["codex/s-1"] },
+      { ws: "ws-a", title: "Shared decision", statement: "Kept claim from s-2.", evidence: ["claude/s-2"] },
+      { ws: "ws-b", title: "Other workspace", statement: "Workspace B statement.", evidence: ["claude/s-1"] },
+    ]);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.decision_records_v1 WHERE statement LIKE 'Erased%'")).rows[0]!.n).toBe(0);
+    // Idempotent: a retry within the lease finds nothing more.
+    expect(await ingest("decision_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 });
+
+    // A late analysis write for the fenced session is refused as a whole batch: no record without evidence.
+    const before = await records();
+    expect(await code(insert("org-a", "ws-a", [
+      rec({ title: "Late fresh record", statement: "Late statement.", evidence: [e("claude", "s-1", "Late claim.")] }),
+    ]))).toBe("RH016");
+    expect(await code(insert("org-a", "ws-a", [
+      rec({ title: "Shared decision", statement: "Late merge.", evidence: [e("claude", "s-1", "Late merge claim.")] }),
+    ]))).toBe("RH016");
+    expect(await records()).toEqual(before);
+    // The fence is per workspace and source: other sessions, sources and workspaces still write.
+    expect(await insert("org-a", "ws-a", [rec({ title: "Shared decision", evidence: [e("claude", "s-3", "Another session.")] })]))
+      .toEqual({ inserted: 0, merged: 1, evidence_added: 1 });
+    expect(await insert("org-a", "ws-b", [rec({ title: "Other workspace", evidence: [e("claude", "s-1", "Workspace B again.")], })]))
+      .toMatchObject({ merged: 1 });
+
+    // The metadata purge still runs in the same lease afterwards.
+    await ingest("ingest_operator_runtime_purge", [...KEY, lease]);
+    expect((await db.query("SELECT 1 FROM sessions.session_index WHERE org_id='org-a' AND workspace_id='ws-a'")).rows).toEqual([]);
   });
 });
