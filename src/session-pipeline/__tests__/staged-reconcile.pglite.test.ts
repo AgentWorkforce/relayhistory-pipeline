@@ -14,6 +14,18 @@ import { plan, runMigrations, type MigrationClient, type MigrationProfile } from
 import { streamIndexKey } from "../../session-read-api/canonical-stream-projection.ts";
 import { S3_ACTIVITY_KINDS } from "../search-index.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { PGlite as SearchPGlite } from "@electric-sql/pglite";
+import { pg_trgm as searchTrgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
+import { TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/postgres.ts";
+import { composeSearchService } from "../../shared/search-composition.ts";
+import { adapterProjectionIo, type SearchProjectionState } from "../search-adapter.ts";
+import { SEARCH_INDEX_DEFAULT_LIMITS, indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
+import { readCanonicalScope } from "../../session-read-api/canonical-projection.ts";
+import { streamCanonicalScope, type StreamedScope } from "../../session-read-api/canonical-stream-projection.ts";
+import {
+  SCOPE as FX, decompress, exportStreamScope, generate, prefixFor, type ExportedScope,
+} from "../../session-read-api/__tests__/stream-fixture.ts";
 import {
   STAGED_RECONCILE_STALE_LEASE,
   admittedManifestFingerprint,
@@ -161,7 +173,7 @@ describe("20261105062110 search reconcile staging", () => {
     (await db.query<{ r: string }>(
       "SELECT concat_ws('|', machine_id, source, kind, event_id, session_id, workspace_id, ts_ms::text, fingerprint) r FROM fake.idx")).rows.map((r) => r.r).sort();
   const runs = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n;
-  const staged = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1")).rows[0]!.n;
+  const staged_ = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1")).rows[0]!.n;
   const commits = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM fake.commits")).rows[0]!.n;
   const stampOf = (f: Fixture, epoch: string): SourceStamp => ({
     canonicalId: "sess-1", epoch,
@@ -302,8 +314,11 @@ describe("20261105062110 search reconcile staging", () => {
     expect(await claim()).toEqual([]);
     expect(await code(stage(first))).toBeNull();
     expect(await claim()).toEqual([]);
+    // Expired but not taken over: still the holder's; its next call renews the lease.
     await expire();
-    expect(await code(stage(first))).toBe(STAGED_RECONCILE_STALE_LEASE);
+    expect(await code(stage(first))).toBeNull();
+    expect(await claim()).toEqual([]);
+    await expire();
     const second = (await claim())[0]!;
     expect([second.run_id, second.attempts, second.restarted]).toEqual([first.run_id, 2, false]);
     expect(second.lease_nonce).not.toBe(first.lease_nonce);
@@ -313,9 +328,17 @@ describe("20261105062110 search reconcile staging", () => {
     expect(await code(transact((tx) => tx.query("SELECT * FROM sessions.search_reconcile_diff_page_v1($1::bigint,$2::uuid,'insert',NULL,10,'bf')", [first.run_id, first.lease_nonce])))).toBe("RH062");
     // The new holder continues where the old one committed; phase order is enforced.
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1")).rows[0]!.n).toBe(1);
+    // Cursors only move forward; the keep prefix is 1 to 16 characters.
+    const stageAt = (c: Claim, at: string) => transact((tx) => tx.query(
+      "SELECT sessions.search_reconcile_stage_batch_v1($1::bigint,$2::uuid,'want',3::smallint,'[]'::jsonb,$3)", [c.run_id, c.lease_nonce, at]));
+    expect(await code(stageAt(second, "b"))).toBeNull();
+    expect(await code(stageAt(second, "b"))).toBeNull();
+    expect(await code(stageAt(second, "a"))).toBe("55000");
+    expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want','a',NULL,0,0,false)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'write',NULL,NULL,0,0,false)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_finish_v1($1::bigint,$2::uuid)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT * FROM sessions.search_reconcile_diff_page_v1($1::bigint,$2::uuid,'insert',NULL,10,'bf')", [second.run_id, second.lease_nonce])))).toBe("55000");
+    expect(await code(transact((tx) => tx.query("SELECT * FROM sessions.search_reconcile_diff_page_v1($1::bigint,$2::uuid,'insert',NULL,10,'')", [second.run_id, second.lease_nonce])))).toBe("22023");
     // A release frees the scope at once.
     await transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want',NULL,NULL,0,0,true)", [second.run_id, second.lease_nonce]));
     expect((await claim())[0]!.attempts).toBe(3);
@@ -328,7 +351,7 @@ describe("20261105062110 search reconcile staging", () => {
     const out = await runStagedReconcile(SCOPE, stamp, ops(), deps());
     expect(out).toEqual({ status: "done", complete: true, inserted: EXPECT.inserted, wanted: EXPECT.inserted, deleted: EXPECT.deleted, reasons: [], attempts: 1, resumedFrom: null });
     expect(await indexRows()).toEqual(expected);
-    expect([await runs(), await staged(), await commits()]).toEqual([0, 0, 1]);
+    expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, 1]);
     // A second run finds nothing to do.
     const again = await runStagedReconcile(SCOPE, stamp, ops(), deps());
     expect(again).toMatchObject({ status: "done", inserted: 0, deleted: 0 });
@@ -360,7 +383,7 @@ describe("20261105062110 search reconcile staging", () => {
       const before = await indexRows();
       expect(await runStagedReconcile(SCOPE, stamp, ops(), deps(killAt(point, nth))).then(() => "ran", (e) => (e instanceof Kill ? e.message : e))).toBe(point);
       if (point === "finished") {
-        expect([await runs(), await staged(), await commits()]).toEqual([0, 0, 1]);
+        expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, 1]);
         expect(await indexRows()).toEqual(expected);
       } else {
         // The lease still lives: nobody else runs the scope until it expires.
@@ -373,7 +396,7 @@ describe("20261105062110 search reconcile staging", () => {
       calls.scanAfter = [];
       const out = await runStagedReconcile(SCOPE, stamp, ops(), deps());
       expect(await indexRows()).toEqual(expected);
-      expect([await runs(), await staged(), await commits()]).toEqual([0, 0, point === "finished" ? 2 : 1]);
+      expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, point === "finished" ? 2 : 1]);
       if (point === "finished") {
         expect(out).toMatchObject({ status: "done", inserted: 0, deleted: 0, attempts: 1, resumedFrom: null });
         return;
@@ -385,6 +408,62 @@ describe("20261105062110 search reconcile staging", () => {
       if (resumed?.phase === "have") expect(calls.scanAfter[0] !== null).toBe(resumed.cursor);
       if (resumed && resumed.phase !== "want" && resumed.phase !== "have") expect(calls.scanAfter).toEqual([]);
     });
+
+  test("a lease that expires during the source read or inside the final step, with no takeover, still completes", async () => {
+    const f = fixture();
+    const expected = memoryReconcile(f);
+    await reset(f);
+    const base = ops();
+    let removes = 0;
+    const out = await runStagedReconcile(SCOPE, stamp, {
+      ...base,
+      async readSource() {
+        await expire(); // the read outlived the lease
+        return base.readSource();
+      },
+      async remove(tx, ids) {
+        // Inside the final transaction: the lease passes its expiry while the run row is locked.
+        if (removes++ === 0) {
+          await tx.query("RESET ROLE");
+          await tx.query("UPDATE sessions.search_reconcile_runs_v1 SET lease_expires_at = clock_timestamp() - interval '1 second'");
+          await tx.query(`SET LOCAL ROLE ${RUNTIME}`);
+        }
+        return base.remove(tx, ids);
+      },
+    }, deps());
+    expect(out).toMatchObject({ status: "done", complete: true, inserted: EXPECT.inserted, deleted: EXPECT.deleted, attempts: 1 });
+    expect(removes).toBeGreaterThan(0);
+    expect(await indexRows()).toEqual(expected);
+    expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, 1]);
+  });
+
+  test("a takeover during the source read: the old holder stops with RH062, the taker's run converges", async () => {
+    const f = fixture();
+    const expected = memoryReconcile(f);
+    await reset(f);
+    const base = ops();
+    const err = await runStagedReconcile(SCOPE, stamp, {
+      ...base,
+      async readSource() {
+        await expire();
+        const taken = await transact((tx) => tx.query("SELECT run_id FROM sessions.search_reconcile_claim_v1($1,$2,$3,$4,$5,$6::bigint,$7,60000)",
+          [SCOPE.orgId, SCOPE.workspaceId, SCOPE.harness, SCOPE.sessionId, stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint]));
+        expect(taken.rows.length).toBe(1);
+        return base.readSource();
+      },
+    }, deps()).then(() => null, (e: { code?: string }) => e.code);
+    expect(err).toBe(STAGED_RECONCILE_STALE_LEASE);
+    expect(await commits()).toBe(0);
+    await expire();
+    expect(await runStagedReconcile(SCOPE, stamp, base, deps())).toMatchObject({ status: "done", complete: true, attempts: 3 });
+    expect(await indexRows()).toEqual(expected);
+  });
+
+  test("an index scan whose cursor does not advance stops instead of paging forever", async () => {
+    await reset(fixture());
+    const stuck = { ...ops(), scanPage: async (_tx: SqlExecutor, after: string | null) => ({ rows: [], next: after ?? "x" }) };
+    await expect(runStagedReconcile(SCOPE, stamp, stuck, deps())).rejects.toThrow("index scan cursor did not advance");
+  });
 
   test("a source change mid-run abandons the run at the final check; the next tick restarts and converges on the new source", async () => {
     const f = fixture();
@@ -400,13 +479,13 @@ describe("20261105062110 search reconcile staging", () => {
     const run = (await db.query<{ phase: string; last_error: string; lease_nonce: string | null }>(
       "SELECT phase, last_error, lease_nonce::text FROM sessions.search_reconcile_runs_v1")).rows;
     expect(run).toEqual([{ phase: "want", last_error: "source_changed", lease_nonce: null }]);
-    expect([await staged(), await commits()]).toEqual([0, 0]);
+    expect([await staged_(), await commits()]).toEqual([0, 0]);
     // The next tick claims with the new stamp, restarts from nothing, and converges.
     stamp = current;
     const next = await runStagedReconcile(SCOPE, stamp, ops(), deps());
     expect(next).toMatchObject({ status: "done", complete: true, resumedFrom: null });
     expect(await indexRows()).toEqual(expectedFor(changed, f));
-    expect([await runs(), await staged(), await commits()]).toEqual([0, 0, 1]);
+    expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, 1]);
   });
 
   test("a source change while a killed run waits: the takeover claim resets the run and restarts it", async () => {
@@ -429,18 +508,18 @@ describe("20261105062110 search reconcile staging", () => {
     let erased = -1;
     const err = await runStagedReconcile(SCOPE, stamp, ops(), deps(async (p) => {
       if (p === "have:batch" && erased < 0) {
-        expect(await staged()).toBeGreaterThan(0);
+        expect(await staged_()).toBeGreaterThan(0);
         erased = await transact((tx) => eraseStagedReconcileRuns(tx, SCOPE, ["sess-1"]));
       }
     })).then(() => null, (e: { code?: string }) => e.code);
     expect(erased).toBe(1);
     expect(err).toBe(STAGED_RECONCILE_STALE_LEASE);
-    expect([await runs(), await staged(), await commits()]).toEqual([0, 0, 0]);
+    expect([await runs(), await staged_(), await commits()]).toEqual([0, 0, 0]);
     // Erasure by the canonical id reaches an alias scope's run too.
     expect(await code(runStagedReconcile({ ...SCOPE, sessionId: "sess-1-alias" }, stamp, ops(), deps(killAt("want:done"))))).toBeNull();
     expect(await runs()).toBe(1);
     expect(await transact((tx) => eraseStagedReconcileRuns(tx, SCOPE, ["sess-1"]))).toBe(1);
-    expect([await runs(), await staged()]).toEqual([0, 0]);
+    expect([await runs(), await staged_()]).toEqual([0, 0]);
     expect(await runStagedReconcile(SCOPE, stamp, ops(), deps())).toMatchObject({ status: "done", complete: true });
     expect(await indexRows()).toEqual(expected);
   });
@@ -456,7 +535,7 @@ describe("20261105062110 search reconcile staging", () => {
     const truncating = { ...ops(), scanPage: async () => ({ rows: [], next: null, truncated: true }) };
     expect(await runStagedReconcile(SCOPE, stamp, truncating, deps())).toEqual({ status: "incomplete", reasons: ["search_index_truncated"] });
     expect((await db.query<{ last_error: string }>("SELECT last_error FROM sessions.search_reconcile_runs_v1")).rows).toEqual([{ last_error: "search_index_truncated" }]);
-    expect(await staged()).toBe(0);
+    expect(await staged_()).toBe(0);
   });
 
   test("a held scope lock at the final step releases the lease: busy now, resumed at final on the next tick", async () => {
@@ -476,6 +555,147 @@ describe("20261105062110 search reconcile staging", () => {
     expect(next).toMatchObject({ status: "done", complete: true, attempts: 2, resumedFrom: { phase: "final", cursor: null } });
     expect(await indexRows()).toEqual(expected);
   });
+
+  // The real base path: indexSearchScope's streamedReconcile on one Postgres search backend, the
+  // staged run on another, over the same exported manifests. The search index is a separate
+  // database, so its writes and deletes commit outside the staging transactions.
+  describe("parity with the real streamedReconcile", () => {
+    const NOW = new Date("2026-11-01T12:00:00.000Z");
+    const TINY = { maxScopeBytes: 1, maxScopeEvents: 1 };
+    const UNLIMITED = { maxReadBytes: 1 << 30, maxReadEvents: 1 << 24 };
+    const closers: Array<() => Promise<unknown>> = [];
+    afterAll(async () => {
+      for (const c of closers.splice(0)) await c();
+    });
+    const fakeSupabase = (x: ExportedScope) => {
+      const tx: SqlExecutor = {
+        async query<R>(text: string) {
+          if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title")) return { rows: [{ supported: false }] as R[] };
+          if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: true }] as R[] };
+          if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
+            return { rows: x.keys.map((manifest_key) => ({ manifest_key, canonical_id: x.canonicalId })) as R[] };
+          if (text.includes("AS canonical_id FROM sessions.session_index")) return { rows: [{ canonical_id: x.canonicalId }] as R[] };
+          return { rows: [] as R[] };
+        },
+      };
+      return { tx, transact: async <T,>(work: (tx: SqlExecutor) => Promise<T>) => work(tx) };
+    };
+    async function backend() {
+      const sdb = new SearchPGlite({ extensions: { pg_trgm: searchTrgm } });
+      closers.push(() => sdb.close());
+      await sdb.exec("CREATE EXTENSION pg_trgm");
+      const tenants: TenantSqlRunner = (orgId, workspaceId, work) =>
+        sdb.transaction(async (tx) => {
+          await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+          return work(tx);
+        });
+      const state: SearchProjectionState = {
+        async fromMs() { return 0; },
+        async record() {},
+        async partials() { return { sessions: [], overflow: false }; },
+      };
+      const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: sdb }, "writer", tenants);
+      await adapter.index.ensureSchema();
+      const directory: unknown[] = [];
+      const catalog: unknown[] = [];
+      const deps = (x: ExportedScope): SearchIndexDeps => ({
+        transact: fakeSupabase(x).transact, reader: x.reader, store: x.store, adapter, prefixFor, decompress, now: () => NOW,
+        limits: TINY, stream: UNLIMITED,
+        writeEvents: async (_tx, _key, input) => { directory.push(input); return { written: true } as never; },
+        writeCatalog: (async (_tx: unknown, _key: unknown, value: unknown) => { catalog.push(value); }) as never,
+      });
+      const scan = async (canonicalId: string) =>
+        (await adapter.index.scanFingerprints({ orgId: FX.orgId, workspaceId: FX.workspaceId, source: FX.harness, sessionIds: [FX.sessionId, canonicalId] }, { fromMs: 0, limit: 100_000 })).rows
+          .map((r) => JSON.stringify([r.sessionId, r.machineId, r.kind, r.eventId, r.tsMs, r.fingerprint])).sort();
+      return { adapter, deps, scan, directory, catalog };
+    }
+    type Backend = Awaited<ReturnType<typeof backend>>;
+
+    /** The staged run of `x` on backend `b`, its ops built from the real reader and adapter. */
+    async function staged(b: Backend, x: ExportedScope, boundary?: StagedReconcileDeps["boundary"]) {
+      const d = b.deps(x);
+      const s3 = await readCanonicalScope(FX, x.keys, { ...d, decompress }, { ...SEARCH_INDEX_DEFAULT_LIMITS, ...TINY }, NOW.getTime(), x.canonicalId);
+      expect(s3.partial && s3.reasons).toEqual(["scope_too_large"]);
+      const admitted = s3.admitted!;
+      const io = adapterProjectionIo(b.adapter, fakeSupabase(x).tx);
+      const sourceStamp: SourceStamp = {
+        canonicalId: x.canonicalId, epoch: "0",
+        manifestFingerprint: admittedManifestFingerprint(admitted.map((a) => ({ manifestKey: a.key, revision: String(a.manifest.revision) }))),
+      };
+      const realOps: StagedReconcileOps<StreamedScope> = {
+        async readSource() {
+          const r = await streamCanonicalScope(FX, admitted, { store: x.store, prefixFor, decompress }, UNLIMITED, NOW.getTime(), 0);
+          return r.complete && r.directorySessionId === x.canonicalId && r.events !== null ? r : null;
+        },
+        wanted: (r) => [...r.wanted].map(([key, w]) => ({ key, ...r.owners[w.owner]!, tsMs: w.tsMs, fingerprint: w.fingerprint })),
+        regenerableKinds: (r) => [...S3_ACTIVITY_KINDS, ...r.kinds],
+        async scanPage(_tx, after, limit) {
+          const all = (await io.scan(FX, x.canonicalId, 0, 1_000_000)).rows
+            .map((i) => ({ ...i, key: streamIndexKey(i) }))
+            .sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+          const start = after === null ? 0 : Number(after);
+          const rows = all.slice(start, start + limit);
+          return { rows, next: start + rows.length >= all.length ? null : String(start + rows.length).padStart(12, "0") };
+        },
+        async regenerate(_tx, r, keys) {
+          let n = 0;
+          await r.regenerate(keys, 5000, async (rows) => { n += await io.upsert(rows, FX, x.canonicalId); });
+          return n;
+        },
+        currentSource: async () => sourceStamp,
+        remove: async (_tx, ids) => io.remove(FX, ids),
+        async commit(_tx, r, pass) {
+          if (pass.complete) {
+            b.directory.push({ sourceSessionId: FX.sessionId, expectedEpoch: "0", sources: r.sources, events: r.events });
+            b.catalog.push(r.catalog);
+          }
+          return { complete: pass.complete, reasons: [] };
+        },
+      };
+      return runStagedReconcile(FX, sourceStamp, realOps, { transact, stageBatch: 7, scanPage: 9, writeKeys: 8, deletePage: 5, ...(boundary ? { boundary } : {}) });
+    }
+
+    let x1: ExportedScope;
+    let x2: ExportedScope;
+    let base: Backend;
+    let baseResult: Awaited<ReturnType<typeof indexSearchScope>>;
+    beforeAll(async () => {
+      x1 = await exportStreamScope(generate(31), 1200);
+      x2 = await exportStreamScope(generate(33), 1200);
+      closers.push(x1.dispose, x2.dispose);
+      base = await backend();
+      expect(await indexSearchScope(FX, base.deps(x1))).toMatchObject({ complete: true });
+      baseResult = await indexSearchScope(FX, base.deps(x2));
+    });
+
+    for (const point of [null, "want:batch", "have:batch", "write:page", "final:removed", "final:committed"] as const)
+      test(`staged ${point ? `killed at ${point}, resumed` : "uninterrupted"}: the same index rows, directory events and catalog as streamedReconcile`, async () => {
+        // The base pass streamed, inserted and deleted: the comparison covers both.
+        expect(baseResult).toMatchObject({ complete: true, reasons: [] });
+        expect(baseResult.stream?.passes).toBe(4);
+        expect(baseResult.inserted).toBeGreaterThan(0);
+        expect(baseResult.deleted).toBeGreaterThan(0);
+        await db.exec("DELETE FROM sessions.search_reconcile_runs_v1");
+        const b = await backend();
+        expect(await indexSearchScope(FX, b.deps(x1))).toMatchObject({ complete: true });
+        b.directory.length = 0;
+        b.catalog.length = 0;
+        if (point) {
+          expect(await staged(b, x2, killAt(point)).then(() => "ran", (e) => (e instanceof Kill ? e.message : e))).toBe(point);
+          await expire();
+        }
+        const out = await staged(b, x2);
+        expect(out).toMatchObject({ status: "done", complete: true, reasons: [] });
+        if (!point) expect(out).toMatchObject({ inserted: baseResult.inserted, deleted: baseResult.deleted });
+        expect(await b.scan(x2.canonicalId)).toEqual(await base.scan(x2.canonicalId));
+        // The arrays stand in for writes the real commit makes on the final transaction: a kill
+        // after the commit callback leaves its rolled-back entry here, so compare the last one.
+        expect(b.directory.length).toBe(point === "final:committed" ? 2 : 1);
+        expect(b.directory.slice(-1)).toEqual(base.directory.slice(-1));
+        expect(b.catalog.slice(-1)).toEqual(base.catalog.slice(-1));
+        expect([await runs(), await staged_()]).toEqual([0, 0]);
+      });
+  });
 });
 
 describe("20261105062110 rollback", () => {
@@ -489,6 +709,11 @@ describe("20261105062110 rollback", () => {
         await db.exec("ROLLBACK");
       }
       for (const step of later) await db.exec(read(`supabase/rollbacks/${step.name.slice("upstream:".length).replace(/\.sql$/, ".down.sql")}`));
+      // A run under a live lease refuses the down; an expired one does not.
+      await db.exec("INSERT INTO sessions.search_reconcile_runs_v1 (org_id, workspace_id, harness, session_id, canonical_id, pointer_epoch, manifest_fingerprint, lease_nonce, lease_ms, lease_expires_at) VALUES ('o','w','h','s','s',1,'f',gen_random_uuid(),60000,clock_timestamp() + interval '1 minute')");
+      expect(await code(db.exec(DOWN))).toBe("55000");
+      await db.exec("ROLLBACK");
+      await db.exec("UPDATE sessions.search_reconcile_runs_v1 SET lease_expires_at = clock_timestamp() - interval '1 second'");
       await db.exec(DOWN);
       for (const t of TABLES) expect((await db.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [t])).rows[0]!.r).toBeNull();
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'search\\_reconcile\\_%'")).rows[0]!.n).toBe(0);
