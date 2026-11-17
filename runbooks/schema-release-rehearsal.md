@@ -89,12 +89,12 @@ migrator lock, so it is listed in execution order below.
 
 | Stage | Proves |
 | --- | --- |
-| R0 seed | Owner, runtime and Supabase shim roles, bootstrap chain, function boundary (all from the baseline landing commit's bytes); then the landing commit's own migrator applies the baseline (see "R0 seeds with the landing migrator" below); the release code checks the ledger is exactly the landing tree's steps and digests (`rehearsal_seed_ledger`, `rehearsal_seed_ledger_digest`), those digests equal the release tree's (`rehearsal_seed_bytes_drift`), the marker is PASS at A (`rehearsal_seed_marker`) and A equals the landing `--generation` (`rehearsal_landing_generation_mismatch`); then the previous release's event-trigger body is installed (stale wrapper). R1 onward use the release sha's checkout. |
+| R0 seed | Owner, runtime and Supabase shim roles, bootstrap chain (the landing commit's own `SESSION_BOOTSTRAP_FILES` list, read from its module text as data; the release list may only add files, `rehearsal_seed_bootstrap_chain` otherwise), function boundary (all from the baseline landing commit's bytes; that commit is the seed commit described in "R0 seeds with the landing migrator"); then the landing commit's own migrator applies the baseline (see "R0 seeds with the landing migrator" below); the release code checks the ledger is exactly the landing tree's steps and digests (`rehearsal_seed_ledger`, `rehearsal_seed_ledger_digest`), those digests equal the release tree's (`rehearsal_seed_bytes_drift`), the marker is PASS at A (`rehearsal_seed_marker`) and A equals the landing `--generation` (`rehearsal_landing_generation_mismatch`); then the previous release's event-trigger body is installed (stale wrapper). R1 onward use the release sha's checkout. |
 | R7-pre | (clean runs where the baseline already has the 044030 overlap) synthetic lazy policy, seat and completeness at A; old and `{B,A}` Workers admit; the owner opens the A to B overlap (B is the target generation, so production's overlap gate passes; TTL 3600 s covers R1 through the R7 rebind). In the `ingest-overlap-missing` row the window is withheld. Otherwise SKIP. |
 | R1-prebuild | The operator's out-of-band index prebuild before the plan: every `ADOPTABLE_INDEXES` index (src/hoopdb/migration-sentinels.ts) of a pending, not-held window step that is absent while its table is populated (for example 058000's after R7-pre's rows) is built as the owner with `CREATE INDEX CONCURRENTLY` from the release checkout's own declaration, one autocommit statement each, and must read back adoptable (`index_prebuild_unproven` otherwise). Evidence: the steps and the built index names. Production does the same before its plan (docs/out-of-band-index-prebuild.md; 058000 through index-prebuild-058000.yml). SKIP when no such step is pending. |
 | R1 plan | `inspectRelease` (READ ONLY; refuses `function_acl_drift`, `ledger_gap`, ...), `migrationTargetSplit` equal to an independently computed window, the target commit (the release anchor on an anchor-aware release sha, see below) bound by production's `targetAnchor` at `generation`, production's buffered-ingest overlap gate (`inspectIngestOverlap`; a no-op without R7-pre's lazy policy; the reviewed Worker pair is the fixture `{from: A, to: B}` that R6 deploys, not the release sha's `PRIVATE_INGEST_OVERLAP`), `validateReleasePlan` on the plan built exactly as production builds it. |
 | R2 boundary | The planned boundary is safe and is still the previous body (prosrc not exact). |
-| R2-bootstrap | The release tree's bootstrap chain (`SESSION_BOOTSTRAP_FILES`, the release sha's bytes) applied before the apply; only `bulls96_analysis_admit` may appear, bare, with no memberships; no other role changes (see "R2-bootstrap" below). SKIP in the `missing-bootstrap` row. |
+| R2-bootstrap | The release tree's bootstrap chain (`SESSION_BOOTSTRAP_FILES`, the release sha's bytes) applied before the apply, including files the release list added after the landing commit; only `bulls96_analysis_admit` and the roles `SESSION_BOOTSTRAP_ROLES` assigns to an added file may appear, bare, with no memberships; no other role changes (see "R2-bootstrap" below). SKIP in the `missing-bootstrap` row. |
 | R4 apply | Production apply order (anchor helpers `targetAnchor`/`sameAnchor` imported from `scripts/schema-release-database.ts`): manifest anchor, inspection, ledger digest, boundary digest, pending window, generation, manifest, then the overlap gate, then `runMigrations` with `beforeWrite` re-anchoring, rechecking the overlap gate and refreshing the boundary under the migrator lock, then the production read-backs and `verifyReleaseBoundary`. |
 | R3 boundary | The refreshed event-trigger body is the pinned body (`SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256`). |
 | R5 read-back | Ledger = seed plus the approved window exactly; target ledgered; no later same-lane or held step ledgered; marker PASS at `generation`. |
@@ -110,6 +110,11 @@ chain creates: 046000 grants `sessions.analysis_request_v1` to `bulls96_analysis
 which `supabase/bootstrap/session_read_api_roles.sql` provisions (bare NOLOGIN) only since
 05008dc6. The migrator never creates roles, so without the refresh the apply fails at
 046000 with SQLSTATE `42704` (undefined_object) after the earlier pending steps commit.
+The same holds for a whole chain file the release list added after the landing commit:
+`supabase/bootstrap/legacy_export_privacy_roles.sql` (role
+`bulls96_legacy_export_privacy`) is in the release list but not in the list of the commit
+that seeds 062010, and 062030 verifies that role. R0 seeds with the landing list only; the
+added files are reported in R0's evidence (`bootstrapChain.added`) and applied here.
 
 In production that refresh is a gated, idempotent CI stage of the guarded release
 workflow with its own typed authorization (it reads back first, skips when the role
@@ -117,25 +122,32 @@ already exists exactly, and the plan shows it). That stage is a separate change;
 exists such an apply fails closed with `42704`
 (`runbooks/guarded-session-schema-release.md`). R2-bootstrap models that CI stage.
 
-It runs after R2 and before R4. For each `SESSION_BOOTSTRAP_FILES` file it reads the
+It runs after R2 and before R4. For each release `SESSION_BOOTSTRAP_FILES` file (the
+landing files and the added ones, in release order) it reads the
 release sha's bytes from the Git object database (never the working tree;
 `rehearsal_bootstrap_bytes_missing` when absent), snapshots `pg_roles` (names and
 attribute flags only), applies every file as the owner exactly as R0 does (owner
 SUPERUSER only for the chain, `hoopdb.db_mode` unset), snapshots again and reads the
-`pg_auth_members` edges of the new role. It refuses:
+`pg_auth_members` edges of the expected new roles. The expected new roles are
+`bulls96_analysis_admit` plus, for each added file, the roles the release tree's
+`SESSION_BOOTSTRAP_ROLES` (src/hoopdb/session-bootstrap-roles.ts, unit tested equal to each
+file's CREATE ROLE literals) lists for it; an added file without a map entry adds none.
+It refuses:
 
-- `rehearsal_bootstrap_unexpected_role`: a new role other than `bulls96_analysis_admit`,
-  or any new role while every file is byte-identical to the landing chain;
+- `rehearsal_bootstrap_unexpected_role`: a new role other than the expected ones,
+  or any new role while every file is byte-identical to the landing chain and none was
+  added;
 - `rehearsal_bootstrap_side_effect`: a role removed, a pre-existing role's flags
   changed, or the `pg_roles` row count not before plus created;
-- `rehearsal_bootstrap_role_contract`: `bulls96_analysis_admit` (new or pre-existing) not
+- `rehearsal_bootstrap_role_contract`: an expected role (new or pre-existing) not
   exactly NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION,
   or with any inbound member or outbound membership.
 
 Evidence: `files` (`file`, `release_sha256`, `landing_sha256`, `changed`),
-`roles_created` (sorted names), `applied`, `roles` (for `bulls96_analysis_admit`:
-`present`, `preexisting`, its attribute flags, `members_in`, `member_of`) and
-`role_count`. Never a password, setting or URL.
+`roles_created` (sorted names), `applied`, `roles` (for each expected role:
+`present`, `preexisting`, its attribute flags, `members_in`, `member_of`), `role_count`
+and `added` (the chain files the release list added after the landing commit). Never a
+password, setting or URL.
 
 ### R0 seeds with the landing migrator
 
@@ -146,9 +158,18 @@ every relation in the release's `runtimeApplicationAclCatalog`, including relati
 created by steps after the baseline (for 045030, the `session_analysis_*` tables of
 046000), and fails with `42P01`.
 
-R0 finds the commit that added the baseline on the release sha's first-parent history
-(`rehearsal_landing_missing`), refuses when that commit's tree already has a later step
-in the baseline's lane (`rehearsal_landing_tree_above_baseline`), extracts it with
+R0 finds the seed commit on the release sha's first-parent history: walking forward from
+the commit that added the baseline, the newest commit that changed the baseline file
+before the baseline's lane first ended at any other step (`rehearsal_landing_missing`
+when no first-parent commit added it). A baseline amended after its add but before the
+next step in its lane landed is therefore seeded with its final bytes, which is what
+production applied. An edit made once a later step had landed (even one later reverted)
+is never a seed candidate, so such a
+seed's bytes differ from the release tree's and R0 refuses `rehearsal_seed_bytes_drift`
+(landed migrations are frozen). With no candidate the seed is the add, and R0 refuses
+when that commit's tree already has a later step in the baseline's lane
+(`rehearsal_landing_tree_above_baseline`). The release-anchor discovery is unchanged: it
+still bounds its search at the commit that added the step. R0 extracts the seed commit with
 `git archive` into a temporary directory (`rehearsal_landing_materialize`), runs
 `bun install --frozen-lockfile` there (`rehearsal_landing_install`), and makes the
 sources read-only. It then runs `bun <dir>/src/hoopdb/migrate.ts --generation` (must equal
@@ -245,8 +266,9 @@ rehearsal of any of these rows is prerequisite proof only and authorizes nothing
   real event-trigger body) is not covered.
 - The production GitHub release gate (approval re-check in `beforeWrite`) is not
   exercised; there is no approval to re-check.
-- The seed uses the baseline landing commit's migrator, verifiers and steps; its
-  generation is that commit's canonical generation (A).
+- The seed uses the baseline seed commit's migrator, verifiers, steps and bootstrap
+  chain list; its generation is that commit's canonical generation (A). Chain files the
+  release list added later are applied only by R2-bootstrap, at the release bytes.
 - Plan items not covered (out of scope here, not implemented):
   - the boundary `42501` negative;
   - the 047010 rollback `.down.sql`;

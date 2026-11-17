@@ -605,6 +605,86 @@ export function bootstrapFiles(files: readonly { file: string; release: string |
   return { files: out, texts };
 }
 
+/**
+ * The SESSION_BOOTSTRAP_FILES list of a session-bootstrap-chain.ts text, read as data
+ * (never evaluated, so a landing commit's module is not executed): comments are skipped,
+ * and the array literal must be exactly `export const SESSION_BOOTSTRAP_FILES = [ ... ]
+ * as const;` holding only string literals naming supabase/bootstrap/*.sql files, each
+ * once, and the name used nowhere else except as `typeof SESSION_BOOTSTRAP_FILES` (a
+ * type). Anything else refuses `rehearsal_seed_bootstrap_chain` (reason "unparsable").
+ */
+export function bootstrapChainList(text: string): string[] {
+  const bad = (detail: string): never => rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "unparsable", detail });
+  // Code with comments blanked (a string or template literal is kept as written).
+  let code = "";
+  for (let i = 0; i < text.length; ) {
+    const c = text[i]!;
+    const n = text[i + 1];
+    if (c === "/" && n === "/") {
+      const end = text.indexOf("\n", i);
+      i = end < 0 ? text.length : end;
+      code += " ";
+    } else if (c === "/" && n === "*") {
+      const end = text.indexOf("*/", i + 2);
+      if (end < 0) bad("comment");
+      i = end + 2;
+      code += " ";
+    } else if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) {
+        if (text[j] === "\\" || text[j] === "\n") bad("string");
+        j++;
+      }
+      if (j >= text.length) bad("string");
+      code += text.slice(i, j + 1);
+      i = j + 1;
+    } else {
+      code += c;
+      i++;
+    }
+  }
+  const decl = /export\s+const\s+SESSION_BOOTSTRAP_FILES\s*=\s*\[([^\]]*)\]\s*as\s+const\s*;/g;
+  const found = [...code.matchAll(decl)];
+  // Any other use of the name (a later push, splice or reassignment could change the list
+  // the module exports) refuses; a type-only `typeof SESSION_BOOTSTRAP_FILES` cannot.
+  const uses = code.replace(/\btypeof\s+SESSION_BOOTSTRAP_FILES\b/g, " ");
+  if (found.length !== 1 || (uses.match(/\bSESSION_BOOTSTRAP_FILES\b/g) ?? []).length !== 1) bad("declaration");
+  const items = found[0]![1]!.split(",").map((s) => s.trim());
+  if (items.at(-1) === "") items.pop();
+  const files = items.map((s) => /^"(supabase\/bootstrap\/[A-Za-z0-9_.-]+\.sql)"$/.exec(s)?.[1] ?? bad("entry"));
+  if (!files.length || new Set(files).size !== files.length) bad(files.length ? "duplicate" : "empty");
+  return files;
+}
+
+/**
+ * The release chain list against the landing commit's: the release may only append or
+ * insert new files. Every landing entry must still be listed (else reason "removed") and
+ * in the same relative order (else reason "reordered"); the release list must hold each
+ * file once ("duplicate"). R0 seeds with the landing list (and bytes); the added files
+ * are the ones only R2-bootstrap applies. Refuses `rehearsal_seed_bootstrap_chain`.
+ */
+export function bootstrapChainGrowth(x: { landing: readonly string[]; release: readonly string[] }): { added: string[] } {
+  if (new Set(x.release).size !== x.release.length) rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "duplicate" });
+  const removed = x.landing.filter((f) => !x.release.includes(f));
+  if (removed.length) rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "removed", files: removed });
+  const kept = x.release.filter((f) => x.landing.includes(f));
+  if (kept.some((f, i) => f !== x.landing[i])) rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "reordered", landing: [...x.landing], release: kept });
+  return { added: x.release.filter((f) => !x.landing.includes(f)) };
+}
+
+/**
+ * The roles R2-bootstrap may newly create: BOOTSTRAP_NEW_ROLES, plus the roles the release
+ * tree's own role contract map (session-bootstrap-roles.ts SESSION_BOOTSTRAP_ROLES, unit
+ * tested equal to each file's CREATE ROLE literals) assigns to a chain file the landing
+ * list does not have. A new file without a map entry adds nothing, so a role it creates
+ * still refuses rehearsal_bootstrap_unexpected_role. Sorted, each once.
+ */
+export function bootstrapExpectedRoles(added: readonly string[], roleMap: Readonly<Record<string, Readonly<Record<string, unknown>>>> | undefined): string[] {
+  const out = new Set<string>(BOOTSTRAP_NEW_ROLES);
+  for (const f of added) for (const r of Object.keys(roleMap?.[f] ?? {})) out.add(r);
+  return [...out].sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
+}
+
 const attrs = (r: RoleRow) => Object.fromEntries(ROLE_COLUMNS.filter((c) => c !== "rolname").map((c) => [c, r[c]]));
 const byName = (rows: readonly RoleRow[]) => new Map(rows.map((r) => [r.rolname, r]));
 

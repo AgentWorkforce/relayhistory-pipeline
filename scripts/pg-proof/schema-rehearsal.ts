@@ -8,15 +8,20 @@
  *
  * It replays the production release (scripts/schema-release-database.ts) with the
  * release checkout's own modules, imported from the working directory (the release sha):
- *   R0 seed      the database the release starts from: the commit that landed the
- *                baseline (first-parent, its tree ending at the baseline) is materialized
- *                from the Git object database (git archive, frozen bun install, read-only)
+ *   R0 seed      the database the release starts from: the seed commit of the baseline
+ *                (seedCommit: on the first-parent history, from the commit that added the
+ *                baseline, the newest commit that changed it before its lane first went
+ *                past it, i.e. the baseline's final bytes as its pull request landed) is
+ *                materialized from the Git object database (git archive, frozen bun
+ *                install, read-only)
  *                and ITS OWN migrator (src/hoopdb/migrate.ts) runs as a subprocess with the
  *                production supabase profile and the owner URL, exactly as production ran
  *                it then. The release migrator cannot seed it: its hardenAndCheck grants on
  *                relations created by steps after the baseline (42P01). Operator setup
- *                (roles, shim, bootstrap chain, boundary) uses the landing bytes too. The
- *                release code then checks the ledger is exactly the landing steps and
+ *                (roles, shim, bootstrap chain, boundary) uses the landing bytes too, and
+ *                the landing commit's own chain list (read as data); the release list may
+ *                only add files (none removed or reordered: rehearsal_seed_bootstrap_chain).
+ *                The release code then checks the ledger is exactly the landing steps and
  *                digests (equal to the release tree's), the marker is PASS at A, and A
  *                equals the landing --generation; then installs the previous release's
  *                event-trigger body (a stale reviewed wrapper). R1 onward use the release
@@ -37,9 +42,12 @@
  *   R2-bootstrap the operator's pre-apply chain refresh: every SESSION_BOOTSTRAP_FILES file
  *                at the RELEASE sha's bytes (git objects) applied as the owner exactly as
  *                R0 applies the landing bytes (idempotent; creates bare NOLOGIN roles a
- *                release step grants to, e.g. bulls96_analysis_admit for 046000). Evidence:
- *                per-file release/landing sha256 and changed flag, the sorted names of the
- *                roles created (only BOOTSTRAP_NEW_ROLES may appear, bare, no memberships),
+ *                release step grants to, e.g. bulls96_analysis_admit for 046000), including
+ *                the files the release list added over the landing list (R0 did not apply
+ *                them). Evidence: per-file release/landing sha256 and changed flag, the added
+ *                files, the sorted names of the roles created (only BOOTSTRAP_NEW_ROLES and
+ *                the roles the release's SESSION_BOOTSTRAP_ROLES assigns to an added file
+ *                may appear, bare, no memberships),
  *                their flags and edges; no other role appears, disappears or changes
  *   R4 apply     the production apply order (anchor, inspection, ledger, boundary, window,
  *                generation, manifest, runMigrations with beforeWrite, read-backs)
@@ -93,7 +101,9 @@ import {
   PLAN_ANCHOR_INJECTIONS,
   removeAnchorRefs,
   type AnchorGit,
-  BOOTSTRAP_NEW_ROLES,
+  bootstrapChainGrowth,
+  bootstrapChainList,
+  bootstrapExpectedRoles,
   bootstrapFiles,
   bootstrapRefreshEvidence,
   disposableEnvRefusal,
@@ -207,11 +217,11 @@ const runCommand: Runner = (cmd, args, opts) => {
   return { status: r.error ? null : r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 };
 /** name -> blob oid of both lanes' *.sql at a commit, lane order, each lane sorted. */
-function laneTree(sha: string): Map<string, string> {
+function laneTree(sha: string, repo = ROOT): Map<string, string> {
   const m = new Map<string, string>();
   for (const [prefix, dir] of Object.entries(LANE_DIRS)) {
     const rows: [string, string][] = [];
-    for (const ent of git(["ls-tree", "-z", sha, dir + "/"]).split("\0")) {
+    for (const ent of git(["ls-tree", "-z", sha, dir + "/"], repo).split("\0")) {
       if (!ent) continue;
       const tab = ent.indexOf("\t");
       const path = ent.slice(tab + 1);
@@ -225,9 +235,9 @@ function laneTree(sha: string): Map<string, string> {
  * A path's utf8 text at a commit, from the Git object database (never the working tree);
  * undefined unless the path is a regular file there.
  */
-export function gitText(sha: string, rel: string): string | undefined {
+export function gitText(sha: string, rel: string, repo = ROOT): string | undefined {
   const run = (args: string[]) =>
-    spawnSync("git", args, { cwd: ROOT, maxBuffer: 256 * 1024 * 1024, env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } });
+    spawnSync("git", args, { cwd: repo, maxBuffer: 256 * 1024 * 1024, env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } });
   const ls = run(["ls-tree", "-z", "--full-tree", sha, "--", rel]);
   if (ls.status !== 0) rehearsalRefuse("rehearsal_git", { command: "ls-tree" });
   const ents = ls.stdout.toString("utf8").split("\0").filter(Boolean);
@@ -260,6 +270,35 @@ export function landingCommit(sha: string, name: string, repo = ROOT): string {
     .at(-1);
   if (!c) rehearsalRefuse("rehearsal_landing_missing", { step: name });
   return c;
+}
+/**
+ * The commit the database at a step was seeded from: on the release sha's first-parent
+ * history, walking forward from landingCommit (the add) through the commits that touch the
+ * step's lane, the newest one that changed the step's file before the lane first ends
+ * anywhere but AT the step. A step amended by a later first-parent commit before the next
+ * step of its lane landed (a review round on the same pull request) is seeded with its
+ * final bytes, from the commit that wrote them. A change made once a later step had landed
+ * (even if that step was later reverted) is not a candidate, so the seed keeps the earlier
+ * bytes and seedStepBytes refuses rehearsal_seed_bytes_drift against the release tree.
+ * An add whose lane already ends above the step is returned as is, which
+ * landingTreeAtBaseline refuses. Refuses only as landingCommit does (rehearsal_landing_missing).
+ */
+export function seedCommit(sha: string, name: string, repo = ROOT): string {
+  const added = landingCommit(sha, name, repo);
+  const lane = laneOf(name);
+  const log = (path: string) =>
+    git(["log", "--first-parent", "--diff-merges=first-parent", "--no-patch", "--reverse", "--format=%H", `${added}..${sha}`, "--", path], repo)
+      .split("\n")
+      .filter((l) => /^[0-9a-f]{40}$/.test(l));
+  const touched = new Set(log(stepPath(name)));
+  const tailAt = (c: string) => [...laneTree(c, repo).keys()].filter((n) => laneOf(n) === lane).at(-1);
+  let seed = added;
+  if (tailAt(added) !== name) return seed;
+  for (const c of log(`${LANE_DIRS[lane]}/`)) {
+    if (tailAt(c) !== name) break;
+    if (touched.has(c)) seed = c;
+  }
+  return seed;
 }
 /**
  * The target commit: on the release sha's first-parent history (newest first, down to the
@@ -466,7 +505,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   if (!hasApi) {
     // A pre-#534 tree (no release-target API) can only run a legacy full apply: report exactly what it would apply.
     const tree = [...laneTree(sha).keys()];
-    const landed = new Set(laneTree(landingCommit(sha, baseline)).keys());
+    const landed = new Set(laneTree(seedCommit(sha, baseline)).keys());
     const f = legacyForecast(tree, landed, target);
     rehearsalRefuse("rehearsal_release_api_missing", {
       fullApplyPending: f.fullApplyPending,
@@ -485,6 +524,10 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   const G = await mod("src/hoopdb/migrate-guards.ts");
   const DB = await mod("src/shared/db.ts");
   const { SESSION_BOOTSTRAP_FILES } = await mod("src/hoopdb/session-bootstrap-chain.ts");
+  // The release tree's chain role contract map, when it has one (R2-bootstrap's new roles).
+  const bootstrapRoleMap = existsSync(join(ROOT, "src/hoopdb/session-bootstrap-roles.ts"))
+    ? ((await mod("src/hoopdb/session-bootstrap-roles.ts")).SESSION_BOOTSTRAP_ROLES as Record<string, Record<string, unknown>> | undefined)
+    : undefined;
   // The anchor helpers are production's own (exported with this rehearsal); a release
   // sha without them cannot be rehearsed against production's anchor code.
   if (
@@ -547,12 +590,17 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   const ownerOps = ownerClient();
   let seed!: ReturnType<typeof seedSet>;
   let A = "";
+  /** R0's seed commit and the bootstrap chain list it applied (R2-bootstrap's landing side). */
+  let landing = "";
+  let landingChain: string[] = [];
+  let chainAdded: string[] = [];
   await stage("R0", async () => {
-    // Everything is checked before anything is written: the landing commit, its tree
-    // (ending the baseline lane at the baseline), its seed bytes against the release tree,
-    // its generation A by the release code, then its own migrator materialized and
-    // installed, and that migrator's `--generation` equal to A.
-    const landing = landingCommit(sha, baseline);
+    // Everything is checked before anything is written: the seed commit (seedCommit: the
+    // baseline's final bytes before its lane went past it), its tree (ending the
+    // baseline lane at the baseline), its seed bytes against the release tree, its
+    // generation A by the release code, then its own migrator materialized and installed,
+    // and that migrator's `--generation` equal to A.
+    landing = seedCommit(sha, baseline);
     const landingSteps = RT.treeSchemaSteps(ROOT, landing) as [string, string][];
     landingTreeAtBaseline(landingSteps.map(([n]) => n), baseline);
     seed = seedSet({ landing: landingSteps.map(([n]) => n), tree, baseline, target });
@@ -564,13 +612,20 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       landingDigests: landingSteps,
     });
     // The operator's setup (roles, shim, bootstrap chain, boundary) uses the landing
-    // commit's bytes; the bootstrap list is the release's module and must be the landing
-    // commit's list.
+    // commit's bytes and the landing commit's own chain list, read from its module text as
+    // data (never executed). The release list may only add files (bootstrapChainGrowth);
+    // those are applied by R2-bootstrap at the release bytes. The release module's text
+    // must parse to exactly the list the release checkout exports.
     const chain = gitText(landing, BOOTSTRAP_CHAIN);
-    if (chain === undefined || chain !== gitText(sha, BOOTSTRAP_CHAIN)) rehearsalRefuse("rehearsal_seed_bootstrap_chain");
+    if (chain === undefined) rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "landing_missing" });
+    landingChain = bootstrapChainList(chain);
+    const releaseChain = bootstrapChainList(gitText(sha, BOOTSTRAP_CHAIN) ?? rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "release_missing" }));
+    if (!sameNames(releaseChain, SESSION_BOOTSTRAP_FILES as readonly string[]))
+      rehearsalRefuse("rehearsal_seed_bootstrap_chain", { reason: "release_module_mismatch" });
+    chainAdded = bootstrapChainGrowth({ landing: landingChain, release: releaseChain }).added;
     const landingFile = (rel: string) => gitText(landing, rel) ?? rehearsalRefuse("rehearsal_seed_bytes_missing", { file: rel });
     const shimSql = landingFile(SHIM_SQL);
-    const bootstrapSql = (SESSION_BOOTSTRAP_FILES as readonly string[]).map(landingFile);
+    const bootstrapSql = landingChain.map(landingFile);
     const boundarySql = landingFile(BOUNDARY_SQL);
     // Generation A by the release code: the landing steps and the landing verifiers.
     const anchor = RT.releaseTargetBinding({
@@ -641,6 +696,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       seeded: seed.seed.length,
       unseeded: seed.unseeded.length,
       lastSeed: seed.lastSeed,
+      bootstrapChain: { landing: landingChain.length, added: chainAdded },
     };
   });
 
@@ -987,12 +1043,17 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
         [[...names]],
       )
     ).rows as RoleEdge[];
-  const releaseBootstrap = () => {
-    const landing = landingCommit(sha, baseline);
-    return bootstrapFiles(
-      (SESSION_BOOTSTRAP_FILES as readonly string[]).map((file) => ({ file, release: gitText(sha, file), landing: gitText(landing, file) })),
+  // R0's seed commit and list: a file R0 did not apply (absent from the landing list) has
+  // no landing bytes, so it is reported changed and its roles may be created.
+  const newRoles = bootstrapExpectedRoles(chainAdded, bootstrapRoleMap);
+  const releaseBootstrap = () =>
+    bootstrapFiles(
+      (SESSION_BOOTSTRAP_FILES as readonly string[]).map((file) => ({
+        file,
+        release: gitText(sha, file),
+        landing: landingChain.includes(file) ? gitText(landing, file) : undefined,
+      })),
     );
-  };
   const refreshBootstrap = async () => {
     const { files, texts } = releaseBootstrap();
     const before = await roleSnapshot();
@@ -1009,7 +1070,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       await admin.query(`RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER`);
     }
     const after = await roleSnapshot();
-    return bootstrapRefreshEvidence({ files, before, after, edges: await roleEdges(BOOTSTRAP_NEW_ROLES), applied });
+    return { ...bootstrapRefreshEvidence({ files, before, after, edges: await roleEdges(newRoles), applied, expected: newRoles }), added: chainAdded };
   };
   if (inject === "missing-bootstrap") await emit("R2-bootstrap", "SKIP", { reason: "injection_missing_bootstrap" });
   else await stage("R2-bootstrap", refreshBootstrap);
@@ -1164,7 +1225,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       // it would create is absent; otherwise there is nothing to prove.
       const { files } = releaseBootstrap();
       const names = new Set((await roleSnapshot()).map((r) => r.rolname));
-      if (!files.some((f) => f.changed) || BOOTSTRAP_NEW_ROLES.every((n) => names.has(n)))
+      if (!files.some((f) => f.changed) || newRoles.every((n) => names.has(n)))
         rehearsalRefuse("rehearsal_injection_unavailable", { inject });
       const r = await expectRefusal(INJECTION_REFUSAL["missing-bootstrap"], () => apply(planned, owner));
       const ledger = await schemaLedger();

@@ -14,6 +14,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BOOTSTRAP_NEW_ROLES,
+  bootstrapChainGrowth,
+  bootstrapChainList,
+  bootstrapExpectedRoles,
   bootstrapFiles,
   bootstrapRefreshEvidence,
   checkLandingSeed,
@@ -53,7 +56,7 @@ import {
   type RoleRow,
   type Runner,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
-import { landingCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
+import { gitText, landingCommit, seedCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
 import { manifestGeneration, migrationProfile, RELEASE_TREE } from "../migrate.ts";
 import { releaseAnchorBinding, requireReleaseAnchor, treeSchemaSteps, treeVerifiers } from "../release-target.ts";
 import { releaseAnchorBranch, SCHEMA_RELEASE } from "../schema-release-contract.ts";
@@ -193,6 +196,8 @@ describe("seedStepBytes (the seed's bytes are the baseline landing commit's)", (
   };
   test.skipIf(!haveLanding)("baseline 045030: 55511978's tree ends at it, its bytes are the release's, generation 7db65adb", () => {
     expect(landingCommit("HEAD", BASE, ROOT)).toBe(LANDING);
+    // Never amended on first-parent after its add: the seed is the landing commit.
+    expect(seedCommit("HEAD", BASE, ROOT)).toBe(LANDING);
     const landingSteps = treeSchemaSteps(ROOT, LANDING);
     const seed = landingSteps.map(([n]) => n);
     expect(seed.filter((n) => n.startsWith("upstream:")).at(-1)).toBe(BASE);
@@ -216,6 +221,26 @@ describe("seedStepBytes (the seed's bytes are the baseline landing commit's)", (
       verifiers: verifiers.map((v) => [v.name, v.sha256]),
     });
     expect(gen.slice(0, 8)).toBe("7db65adb");
+  });
+
+  // Baseline 062010: added by 27792843, its final bytes landed by the later first-parent
+  // commit 9858c43f while the upstream lane still ended at it. Seeding from the add was the
+  // rehearsal_seed_bytes_drift refusal; the seed is 9858c43f. Skipped without that history.
+  const B062010 = "upstream:20261105062010_ingest_origin_claim_fence.sql";
+  const ADDED_062010 = "277928434479735b5cec1cfeb63decf73b429a5b";
+  const SEED_062010 = "9858c43fdb0b7da46a21c7b288168f77f6a4b88a";
+  const have062010 = git(["merge-base", "--is-ancestor", SEED_062010, "HEAD"]).status === 0;
+  test.skipIf(!have062010)("baseline 062010: amended after its add, seeded from the amend, bytes equal the release's", () => {
+    expect(landingCommit("HEAD", B062010, ROOT)).toBe(ADDED_062010);
+    expect(seedCommit("HEAD", B062010, ROOT)).toBe(SEED_062010);
+    const landingSteps = treeSchemaSteps(ROOT, SEED_062010);
+    const seed = landingSteps.map(([n]) => n);
+    expect(code(() => landingTreeAtBaseline(seed, B062010))).toBeNull();
+    const lanes = new Map(RELEASE_TREE.lanes.map((l) => [l.prefix, l.dir]));
+    const stepRel = (n: string) => `${lanes.get(n.slice(0, n.indexOf(":") + 1))}/${n.slice(n.indexOf(":") + 1)}`;
+    const step = stepRel(B062010);
+    expect(at(SEED_062010)(step)).toBe(at("HEAD")(step));
+    expect(at(ADDED_062010)(step)).not.toBe(at("HEAD")(step));
   });
 });
 
@@ -270,8 +295,141 @@ describe("R0 landing migrator (offline: fixture repo and injected runner)", () =
       expect(landingCommit(f.second, "upstream:20261105045000_a.sql", f.repo)).toBe(f.first);
       expect(code(() => landingCommit(f.second, "upstream:20261105046000_never.sql", f.repo))).toBe("rehearsal_landing_missing");
       expect(code(() => landingCommit(f.first, "upstream:20261105045030_b.sql", f.repo))).toBe("rehearsal_landing_missing");
+      // seedCommit: with no later change to the step, the seed is the commit that added it.
+      expect(seedCommit(f.second, "upstream:20261105045030_b.sql", f.repo)).toBe(f.second);
+      expect(code(() => seedCommit(f.first, "upstream:20261105045030_b.sql", f.repo))).toBe("rehearsal_landing_missing");
     } finally {
       cleanup(f.repo);
+    }
+  });
+
+  /** A repo whose commits are applied in order; returns each commit's sha by label. */
+  const history = (steps: [label: string, files: Record<string, string>][]) => {
+    const repo = scratch();
+    const g = (...args: string[]) => {
+      const r = spawnSync("git", args, {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...BASE_ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+      });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return r.stdout.trim();
+    };
+    g("init", "-q", "-b", "main");
+    const at: Record<string, string> = {};
+    for (const [label, files] of steps) {
+      for (const [p, text] of Object.entries(files)) {
+        mkdirSync(join(repo, p, ".."), { recursive: true });
+        writeFileSync(join(repo, p), text);
+      }
+      g("add", "-A");
+      g("commit", "-q", "-m", label);
+      at[label] = g("rev-parse", "HEAD");
+    }
+    return { repo, at };
+  };
+  const STEP_A = "upstream:20261105045000_a.sql";
+  const STEP_B = "upstream:20261105045030_b.sql";
+  const STEP_C = "upstream:20261105046000_c.sql";
+  const pathOf = (n: string) => `supabase/migrations/${n.slice("upstream:".length)}`;
+  /** seedStepBytes for [A, B] seeded from `seedAt`, against the release `releaseAt`. */
+  const bytesCheck = (repo: string, seedAt: string, releaseAt: string) => {
+    const digest = (c: string, n: string) => createHash("sha256").update(gitText(c, pathOf(n), repo)!).digest("hex");
+    return code(() =>
+      seedStepBytes({
+        seed: [STEP_A, STEP_B],
+        stepRel: pathOf,
+        landing: (p) => gitText(seedAt, p, repo),
+        release: (p) => gitText(releaseAt, p, repo),
+        landingDigests: [STEP_A, STEP_B].map((n) => [n, digest(seedAt, n)] as [string, string]),
+      }),
+    );
+  };
+
+  test("seedCommit: the baseline amended on first-parent before the next step lands seeds from the amend", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- final" }],
+      ["unrelated", { "README.md": "x" }],
+      ["add-c", { [pathOf(STEP_C)]: "select 3;" }],
+    ]);
+    try {
+      const head = h.at["add-c"]!;
+      // The add stays the landing commit; the seed is the newer commit with the final bytes
+      // whose tree still ends at the baseline.
+      expect(landingCommit(head, STEP_B, h.repo)).toBe(h.at["add-b"]!);
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["amend-b"]!);
+      expect(bytesCheck(h.repo, h.at["amend-b"]!, head)).toBeNull();
+      // The add's bytes are not the release's: the refusal seeding from the add produced.
+      expect(bytesCheck(h.repo, h.at["add-b"]!, head)).toBe("rehearsal_seed_bytes_drift");
+      // A step never amended keeps its add as the seed.
+      expect(seedCommit(head, STEP_A, h.repo)).toBe(h.at["add-a"]!);
+      expect(seedCommit(head, STEP_C, h.repo)).toBe(head);
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: the baseline changed after a later step landed still refuses (real drift)", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["add-c", { [pathOf(STEP_C)]: "select 3;" }],
+      ["edit-b", { [pathOf(STEP_B)]: "select 2; -- edited after c" }],
+    ]);
+    try {
+      const head = h.at["edit-b"]!;
+      // The edit's tree ends at C, so it is no seed candidate: the seed stays the add.
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["add-b"]!);
+      expect(bytesCheck(h.repo, h.at["add-b"]!, head)).toBe("rehearsal_seed_bytes_drift");
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: an edit after a later step landed and was reverted is still no seed (drift refuses)", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b", { [pathOf(STEP_B)]: "select 2;" }],
+      ["amend-b", { [pathOf(STEP_B)]: "select 2; -- review" }],
+      ["add-c", { [pathOf(STEP_C)]: "select 3;" }],
+    ]);
+    try {
+      const g = (...args: string[]) => {
+        const r = spawnSync("git", args, {
+          cwd: h.repo,
+          encoding: "utf8",
+          env: { ...BASE_ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+        });
+        if (r.status !== 0) throw new Error(r.stderr);
+        return r.stdout.trim();
+      };
+      g("rm", "-q", pathOf(STEP_C));
+      g("commit", "-q", "-m", "revert-c");
+      writeFileSync(join(h.repo, pathOf(STEP_B)), "select 2; -- edited after the revert");
+      g("commit", "-q", "-am", "edit-b");
+      const head = g("rev-parse", "HEAD");
+      // The lane ends at B again, but it went past B first: the seed is the review amend.
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["amend-b"]!);
+      expect(bytesCheck(h.repo, h.at["amend-b"]!, head)).toBe("rehearsal_seed_bytes_drift");
+    } finally {
+      cleanup(h.repo);
+    }
+  });
+
+  test("seedCommit: a step that landed together with a later step seeds from its add (the tree-above refusal)", () => {
+    const h = history([
+      ["add-a", { [pathOf(STEP_A)]: "select 1;" }],
+      ["add-b-c", { [pathOf(STEP_B)]: "select 2;", [pathOf(STEP_C)]: "select 3;" }],
+      ["edit-b", { [pathOf(STEP_B)]: "select 2; -- edited" }],
+    ]);
+    try {
+      const head = h.at["edit-b"]!;
+      expect(seedCommit(head, STEP_B, h.repo)).toBe(h.at["add-b-c"]!);
+      expect(code(() => landingTreeAtBaseline([STEP_A, STEP_B, STEP_C], STEP_B))).toBe("rehearsal_landing_tree_above_baseline");
+    } finally {
+      cleanup(h.repo);
     }
   });
 
@@ -487,6 +645,70 @@ describe("small helpers", () => {
     expect(resultRecord("R5", "PASS", { h: "ab123456789012cd" }).status).toBe("PASS");
     expect(errorCode(Object.assign(new Error("x"), { code: "ledger_gap" }))).toBe("ledger_gap");
     expect(errorCode(new Error("secret value"))).toBe("rehearsal_failed");
+  });
+});
+
+describe("bootstrap chain list (landing list seeds; the release may only add files)", () => {
+  const F = (n: string) => `supabase/bootstrap/${n}.sql`;
+  const mod = (files: string[], extra = "") =>
+    `/** doc "quoted" [x] */\n${extra}export const SESSION_BOOTSTRAP_FILES = [\n${files
+      .map((f) => `  // why it's here: [a, b]\n  "${f}",`)
+      .join("\n")}\n] as const;\n`;
+  const reason = (f: () => unknown) => {
+    try {
+      f();
+      return null;
+    } catch (e) {
+      const x = e as { code?: string; detail?: { reason?: string; detail?: string } };
+      return `${x.code}:${x.detail?.reason ?? ""}${x.detail?.detail ? `/${x.detail.detail}` : ""}`;
+    }
+  };
+
+  test("parses the module text as data: the tree's chain module equals its export", () => {
+    expect(bootstrapChainList(read("src/hoopdb/session-bootstrap-chain.ts"))).toEqual([...SESSION_BOOTSTRAP_FILES]);
+    expect(bootstrapChainList(mod([F("a"), F("b")]))).toEqual([F("a"), F("b")]);
+  });
+
+  test("grown list: accepted, the landing list seeds, the new file and its roles go to R2-bootstrap", () => {
+    const landing = bootstrapChainList(mod([F("a"), F("b"), F("c")]));
+    const release = bootstrapChainList(mod([F("a"), F("new"), F("b"), F("c"), F("tail")]));
+    expect(landing).toEqual([F("a"), F("b"), F("c")]);
+    expect(bootstrapChainGrowth({ landing, release }).added).toEqual([F("new"), F("tail")]);
+    expect(bootstrapChainGrowth({ landing, release: landing }).added).toEqual([]);
+    const roles = { [F("new")]: { zeta_role: {} }, [F("a")]: { not_new: {} } };
+    expect(bootstrapExpectedRoles([F("new"), F("tail")], roles)).toEqual([...BOOTSTRAP_NEW_ROLES, "zeta_role"].sort());
+    expect(bootstrapExpectedRoles([], roles)).toEqual([...BOOTSTRAP_NEW_ROLES]);
+    expect(bootstrapExpectedRoles([F("new")], undefined)).toEqual([...BOOTSTRAP_NEW_ROLES]);
+  });
+
+  test("a removed, reordered or duplicated entry refuses rehearsal_seed_bootstrap_chain", () => {
+    const landing = [F("a"), F("b"), F("c")];
+    const g = (release: string[]) => reason(() => bootstrapChainGrowth({ landing, release }));
+    expect(g([F("a"), F("c")])).toBe("rehearsal_seed_bootstrap_chain:removed");
+    expect(g([F("a"), F("new"), F("c")])).toBe("rehearsal_seed_bootstrap_chain:removed");
+    expect(g([F("b"), F("a"), F("c")])).toBe("rehearsal_seed_bootstrap_chain:reordered");
+    expect(g([F("a"), F("c"), F("new"), F("b")])).toBe("rehearsal_seed_bootstrap_chain:reordered");
+    expect(g([F("a"), F("b"), F("b"), F("c")])).toBe("rehearsal_seed_bootstrap_chain:duplicate");
+  });
+
+  test("module text it cannot read as one literal list refuses (never evaluated)", () => {
+    const p = (t: string) => reason(() => bootstrapChainList(t));
+    const u = "rehearsal_seed_bootstrap_chain:unparsable";
+    expect(p(mod([F("a")], "const X = [1];\n"))).toBeNull();
+    expect(p(mod([F("a")]).replace("as const", ""))).toBe(`${u}/declaration`);
+    expect(p(mod([F("a")]) + mod([F("b")]))).toBe(`${u}/declaration`);
+    expect(p(mod([F("a")], "const Y = SESSION_BOOTSTRAP_FILES;\n"))).toBe(`${u}/declaration`);
+    expect(p(mod([F("a")]) + `(SESSION_BOOTSTRAP_FILES as unknown as string[]).push("${F("b")}");\n`)).toBe(`${u}/declaration`);
+    // A type-only reference (an older chain module held its role map's type) is data-neutral.
+    expect(p(mod([F("a")]) + "type K = (typeof SESSION_BOOTSTRAP_FILES)[number];\n")).toBeNull();
+    expect(p(mod([F("a")]).replace(`"${F("a")}"`, `"${F("a")}", ...MORE`))).toBe(`${u}/entry`);
+    expect(p(mod([F("a")]).replace(`"${F("a")}"`, "`supabase/bootstrap/${x}.sql`"))).toBe(`${u}/entry`);
+    expect(p(mod(["supabase/migrations/x.sql"]))).toBe(`${u}/entry`);
+    expect(p(mod([F("../x")]))).toBe(`${u}/entry`);
+    expect(p(mod([F("a"), F("a")]))).toBe(`${u}/duplicate`);
+    expect(p(mod([]))).toBe(`${u}/empty`);
+    expect(p(mod([F("a")]) + "/* open")).toBe(`${u}/comment`);
+    expect(p(mod([F("a")]).replace(`"${F("a")}"`, `"supabase/bootstrap/a\\x.sql"`))).toBe(`${u}/string`);
   });
 });
 
