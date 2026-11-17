@@ -19,6 +19,8 @@ See [decision 0005](decisions/0005-s3-native-upload-ledger.md), "The buffered ba
 | `backfill-execute` | fences, owner stubs, revision shards | `DRY <backfill-dry run>` |
 | `backfill-refresh-dry` | nothing (fences and ownership sections only) | none |
 | `backfill-refresh-execute` | fences, owner stubs (no revisions section) | `DRY <backfill-refresh-dry run>` |
+| `backfill-catchup-dry` | nothing (all three sections, revisions since t) | `full_backfill_run` (no confirmation) |
+| `backfill-catchup-execute` | fences, owner stubs, the revision shards of rows updated since t | `DRY <backfill-catchup-dry run> FULL <backfill-execute run>` |
 | `export-dry` | nothing | none |
 | `export-execute` | accepted sidecars, per-org completion | `DRY <export-dry run> BACKFILL <backfill-execute run>` |
 | `drain-dry` | nothing | none |
@@ -26,8 +28,9 @@ See [decision 0005](decisions/0005-s3-native-upload-ledger.md), "The buffered ba
 | `presence-dry` | nothing (dry only; there is no `presence-execute`) | none |
 
 The confirmation is exactly `<MODE uppercase> <sha> DRY <id> [BACKFILL <id>] [FULL <id>] [EXPORT <id>]`, for example
-`DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 FULL 444 EXPORT 333` or `BACKFILL-REFRESH-EXECUTE <sha> DRY 555`. `FULL` is
-the `full_backfill_run` input, accepted on `drain-execute` only.
+`DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 FULL 444 EXPORT 333`, `BACKFILL-REFRESH-EXECUTE <sha> DRY 555` or
+`BACKFILL-CATCHUP-EXECUTE <sha> DRY 666 FULL 444`. `FULL` is the `full_backfill_run` input: optional on
+`drain-execute`, required on both catch-up modes, refused on every other mode.
 
 `presence-dry` is outside the sequence: a diagnostic for one session, described in
 [Session presence (presence-dry)](#session-presence-presence-dry).
@@ -48,6 +51,63 @@ A full `backfill-execute` now takes longer than the drain's 3 hour window (its r
 compare-and-swaps millions of shards; even a no-op rerun reads them all), so the drain binds a fresh refresh beside
 the full run it refreshes. Without `FULL`, the drain's rule is unchanged: its `BACKFILL` must be a full
 `backfill-execute` under 3 hours old with every section complete.
+
+### The two-phase cutover: FULL while live, then a catch-up
+
+The refresh order above needs the scope stopped for the whole FULL run (hours). The catch-up keeps the stop window
+short: the FULL run happens while the org still uploads through SQL, and only a short catch-up runs after the stop.
+Per org (scope `BACKLOG_OPS_ORGS` to it), at one `main` commit:
+
+1. **Phase A, while the org is live:** `backfill-dry`, then `backfill-execute` (the FULL run, hours).
+2. **Stop:** stop the org's Worker HTTP admission (`INGEST_HTTP_ADMISSION_STOPPED_ORGS`), verify it took effect
+   (`http_admission_stopped` log lines, no new SQL admission for the org) and wait until the Worker's admission queue
+   has drained. All within 24 hours of the FULL run's dispatch.
+3. **Phase B, the catch-up:** `backfill-catchup-dry` and `backfill-catchup-execute`, both with `full_backfill_run` the
+   phase A run. They run all three sections: fences and ownership in full (as a refresh), the owned lazy slots in full,
+   and the `ingest_record_revisions` rows updated at or after t only.
+4. `export-dry`, `drain-dry`, `export-execute` (binding the FULL run as `BACKFILL`; created after the catch-up), then
+   `drain-execute` with `BACKFILL` the catch-up, `FULL` the phase A run, `EXPORT` the export.
+5. The fence-authority marker (decision 0005, rollout step 4), as before.
+
+**t** is the FULL run's `created_at` minus `BACKLOG_OPS_CATCHUP_MARGIN_MS` (15 minutes), computed by the gate from
+the GitHub API, never an input. The gate writes it as the recheck step's output `revisions_since_ms`, which the
+workflow hands only to the credential step (`BACKLOG_OPS_REVISIONS_SINCE_MS`), and the tool gets it as
+`--revisions-since-ms`. The FULL run's tool starts after its `created_at` (gate, approval), so t is before its first
+read; the margin also covers clock skew between GitHub and the database.
+
+**Why it converges.** Every revision upsert stamps `updated_at` (the insert default `now()`; every `ON CONFLICT DO
+UPDATE` sets `now()` or `clock_timestamp()`). A revision row updated at or after t is re-applied by the catch-up; a
+row last updated before t existed when the FULL run began, so the FULL run read it as it still is. Fences, ownership
+and the owned lazy slots (which have no custody timestamp: `initialized_at` is the insert time, and a custody move
+rewrites `current_*` in place) are re-read in full after the stop, which also covers slots the FULL run's block
+windows missed while the org was live. Every write is monotone (fence changes are idempotent, owner stubs keep their
+oldest generation of the current epoch, revision merges never lower and drop what a fence has forgotten), so FULL plus
+the catch-up leave the same ledger, as readers see it, as one full run after the stop
+(`upload-fence-backfill.pglite.test.ts`, "catch-up").
+
+**Cost.** No index serves `updated_at` (the primary key and the session index both lead with the org), so the catch-up
+still walks the scope's `ingest_record_revisions` primary key in keyset windows of `--row-page-size` rows (each page
+returns its matching rows and its last key, so a window with no match still advances); only the S3 work (fence reads
+and shard compare-and-swaps) shrinks to the changed rows. The owned-slot pass is a full heap read as in every run,
+and its merges of what is already stored read each shard once and write nothing. Expect the SQL reads of a FULL run
+and the S3 writes of the changes only.
+
+**Receipts and bindings.** The catch-up's receipt must show all three sections `complete`, `failed` 0 in each, and
+`revisions_since_ms` (a number) equal to the gate's t; a catch-up execute's DRY must have recorded the same t, so
+both followed the same FULL. FULL must be a successful `backfill-execute` at the same commit, under 24 hours old,
+with exactly the catch-up's scope (never an unscoped run), created before the catch-up's DRY. A backfill receipt that
+is not a catch-up must not carry `revisions_since_ms`, so a since-filtered run never stands in for a full one.
+
+**The drain.** A drain with `FULL` binds a catch-up execute as its `BACKFILL` by the same rules as a refresh (below):
+under 3 hours old, created after `FULL`, exactly the drain's scope, the export created after it. The run-name and
+the receipt's `mode` say which of the two it is. A catch-up gets no fingerprint comparison with `FULL`: the two differ
+by design (the org uploaded during the FULL run), and the catch-up re-read everything that could have changed.
+Instead its `revisions_since_ms` must equal t computed from the drain's `FULL`, so it followed that run.
+
+**Residual risks.** A revision upsert stamped by a transaction that began more than the margin before the FULL run's
+dispatch and committed after the FULL run read that row's window would be missed by both runs; ingest transactions
+are short (bounded by their leases), far below 15 minutes. An SQL writer that still moves a row after the stop (the
+catch-up reads after the stop and is not re-checked by a fingerprint) is the same assumption every full run makes.
 
 ### The refresh and its staleness rule
 
@@ -147,9 +207,10 @@ Every execute additionally needs all of the following:
 - **Receipts, checked before any credential is read:**
   - every bound receipt exited 0;
   - the backfill's `sections` are all `complete` (a refresh's: `fences` and `ownership` complete, `revisions`
-    `not_run`). A backfill-execute therefore cannot pass while any user is `needs_review`: the backfill leaves that
+    `not_run`; a catch-up's: all three complete, `failed` 0 in each, and `revisions_since_ms` equal to the gate's t). A backfill-execute therefore cannot pass while any user is `needs_review`: the backfill leaves that
     section incomplete until the user is resolved, and every later execute stays blocked until then;
-  - with `FULL`, the refresh's input fingerprint equals the full run's (`backlog_ops_backfill_stale` otherwise);
+  - with `FULL`, the refresh's input fingerprint equals the full run's (`backlog_ops_backfill_stale` otherwise); a
+    catch-up as the drain's `BACKFILL` is checked by its t instead (`backlog_ops_bound_backfill_since` otherwise);
   - the export has `failed = 0`, `fence_late = 0` and `orgs.incomplete = 0`.
 - **The tools' own refusals:**
   - the export refuses while the v2 claim-sessions reader gate is off (`export_claim_sessions_gate_off`);

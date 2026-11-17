@@ -43,6 +43,24 @@
  * lease (96bulls/.drain/lock.json). The workflow never passes --checkpoint-file or --start-after: the drain's
  * create-only `drained` markers make a rerun skip what is written, so a restart only re-lists.
  *
+ * Catch-up (decision 0005's two-phase cutover per org; docs/backlog-ops-workflow.md): phase A is a FULL
+ * backfill-execute while the org still uploads through SQL; phase B, after the org's HTTP admission stop and the
+ * Worker queue drained, is a CATCH-UP, its own two modes, binding that FULL:
+ *   backfill-catchup-dry      FULL <backfill-execute run>                (no confirmation, as every dry mode)
+ *   backfill-catchup-execute  DRY <backfill-catchup-dry run> FULL <backfill-execute run>
+ *   drain-execute             DRY <drain-dry run> BACKFILL <backfill-catchup-execute run> FULL <backfill-execute run> EXPORT <export-execute run>
+ * It runs all three sections, fences and ownership in full (as a refresh) and revisions with --revisions-since-ms t,
+ * where t = FULL's created_at minus BACKLOG_OPS_CATCHUP_MARGIN_MS, computed by the gate from the GitHub API (never an
+ * input) and handed to the credential step as a step output (BACKLOG_OPS_REVISIONS_SINCE_MS). Every revision row
+ * changed after t is re-applied; every row unchanged since t existed when FULL began, so FULL read it; merges never
+ * lower, so FULL + catch-up leave what one full run after the stop would. FULL: a successful backfill-execute at the
+ * same sha, under BACKLOG_OPS_BINDING_MAX_AGE_MS old, exactly the catch-up's scope, created before the catch-up (and
+ * before its DRY). The catch-up's receipt must show all three sections complete, failed 0 in each, and its
+ * `revisions_since_ms` equal to t (so its DRY, and a drain's BACKFILL, bound the same FULL). A drain binds a catch-up
+ * like a refresh (BACKFILL with FULL: fresh under BACKLOG_OPS_FRESH_BACKFILL_MS, FULL before it, the export after it)
+ * but without the fingerprint check: the fingerprints differ by design (the org uploaded during FULL), and the
+ * catch-up re-read everything that could have changed instead.
+ *
  * Org scope (BACKLOG_OPS_ORGS): an optional environment secret on both environments (a secret, so this public
  * repository's logs mask it): comma-separated lowercase org UUIDs; unset or empty runs every org, as before. The org
  * ids never reach the repository, a log or a receipt: the receipt records only the scope's id (`all`, or `orgs_` +
@@ -71,11 +89,19 @@ export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = true;
 export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";
 export const BACKLOG_OPS_MODES = [
   "backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
-  "backfill-refresh-dry", "backfill-refresh-execute",
+  "backfill-refresh-dry", "backfill-refresh-execute", "backfill-catchup-dry", "backfill-catchup-execute",
 ] as const;
 export type BacklogOpsMode = (typeof BACKLOG_OPS_MODES)[number];
 /** The backfill's fences+ownership refresh (its tool is `backfill`; see the header). */
 export const isRefresh = (mode: BacklogOpsMode) => mode.startsWith("backfill-refresh-");
+/** The backfill's catch-up after a FULL run (its tool is `backfill`; see the header). */
+export const isCatchup = (mode: BacklogOpsMode) => mode.startsWith("backfill-catchup-");
+/**
+ * t = FULL's created_at minus this. FULL's tool starts after its created_at (gate, approval), so t is before FULL's
+ * first read; the margin also covers clock skew between GitHub and the database, and a revision upsert's
+ * transaction-start stamp (updated_at = now()) from a transaction begun up to this long before FULL was created.
+ */
+export const BACKLOG_OPS_CATCHUP_MARGIN_MS = 15 * 60 * 1000;
 /** The input fingerprint every backfill receipt carries (upload-fence-backfill.ts BackfillFingerprint), field by field. */
 export const BACKLOG_OPS_FINGERPRINT_FIELDS = [
   "revisions_count", "revisions_max_updated_ms", "revisions_hash", "ownership_count", "ownership_hash",
@@ -149,8 +175,9 @@ export interface BacklogOpsDispatch {
   /** drain-execute: a successful export-execute at this commit, after the backfill. */
   exportRun: string | null;
   /**
-   * drain-execute only, optional: the FULL backfill-execute that `backfillRun` (then a backfill-refresh-execute)
-   * refreshes. Null: the drain's backfill is a full backfill-execute, as before.
+   * drain-execute, optional: the FULL backfill-execute that `backfillRun` (then a backfill-refresh-execute or a
+   * backfill-catchup-execute) refreshes or catches up. Null: the drain's backfill is a full backfill-execute, as
+   * before. backfill-catchup-dry/-execute: required, the FULL the catch-up follows.
    */
   fullBackfillRun: string | null;
   /** Drain modes only: the per-run object budget (empty = unbounded). */
@@ -184,8 +211,10 @@ export function backlogOpsDispatch(
   if (execute ? !RUN_ID.test(dryRun) : dryRun !== "") refuse("backlog_ops_dry_run");
   if (wantsBackfill ? !RUN_ID.test(backfillRun) : backfillRun !== "") refuse("backlog_ops_backfill_run");
   if (wantsExport ? !RUN_ID.test(exportRun) : exportRun !== "") refuse("backlog_ops_export_run");
-  // FULL: drain-execute only, and optional there (absent = the drain's backfill is a full one, as before).
-  if (fullBackfillRun !== "" && (m !== "drain-execute" || !RUN_ID.test(fullBackfillRun))) refuse("backlog_ops_full_backfill_run");
+  // FULL: optional on drain-execute (absent = the drain's backfill is a full one, as before), required on a catch-up,
+  // refused everywhere else.
+  if (isCatchup(m) ? !RUN_ID.test(fullBackfillRun) : fullBackfillRun !== "" && (m !== "drain-execute" || !RUN_ID.test(fullBackfillRun)))
+    refuse("backlog_ops_full_backfill_run");
   let budget: number | null = null;
   if (maxObjects !== "") {
     if (tool !== "drain" || !/^[1-9][0-9]{0,6}$/u.test(maxObjects) || Number(maxObjects) > BACKLOG_OPS_MAX_OBJECTS_CEILING)
@@ -265,9 +294,29 @@ export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "-
  */
 export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "60000", "--total-budget-ms", "180000"] as const;
 
+/**
+ * The catch-up's t (BACKLOG_OPS_REVISIONS_SINCE_MS, the gate's step output, never a dispatch input): an epoch ms, in the
+ * past. Required for a catch-up and for a drain-execute with FULL (whose BACKFILL may be one); empty for every other
+ * mode. Null when not needed.
+ */
+export function backlogOpsRevisionsSince(env: Record<string, string | undefined>, d: Pick<BacklogOpsDispatch, "mode" | "fullBackfillRun">, now = Date.now()): number | null {
+  const raw = env.BACKLOG_OPS_REVISIONS_SINCE_MS ?? "";
+  const wanted = isCatchup(d.mode) || (d.mode === "drain-execute" && d.fullBackfillRun !== null);
+  if (!wanted) {
+    if (raw !== "") refuse("backlog_ops_revisions_since");
+    return null;
+  }
+  if (!/^[1-9][0-9]{0,15}$/u.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) >= now) refuse("backlog_ops_revisions_since");
+  return Number(raw);
+}
+
 /** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
-export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL }): { script: string; args: string[]; needsDb: boolean } {
+export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL },
+  revisionsSinceMs: number | null = null): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
+  // A catch-up needs its t (backlogOpsRevisionsSince); nothing else passes one.
+  if (isCatchup(d.mode) !== (revisionsSinceMs !== null) || (revisionsSinceMs !== null && (!Number.isSafeInteger(revisionsSinceMs) || revisionsSinceMs < 1)))
+    refuse("backlog_ops_revisions_since");
   if (tool === "presence") {
     // Dry only, no bucket, region or key (it reads no S3): the per-statement timeout, the budget and the scope's orgs.
     if (execute) refuse("backlog_ops_presence_dry_only");
@@ -279,6 +328,8 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
     ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : tool === "export" ? BACKLOG_OPS_EXPORT_PAGING : []),
     // A refresh: the fences and ownership sections only (the tool's closed --section set); a full run passes none (all).
     ...(isRefresh(d.mode) ? ["--section", "fences", "--section", "ownership"] : []),
+    // A catch-up: all three sections, the revisions only those updated since t.
+    ...(isCatchup(d.mode) ? ["--section", "fences", "--section", "ownership", "--section", "revisions", "--revisions-since-ms", String(revisionsSinceMs)] : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
     ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
   return { script, args, needsDb: tool !== "drain" };
@@ -393,6 +444,14 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
       // Every other backfill receipt: all three complete.
       refuse("backlog_ops_backfill_incomplete");
     }
+    if (isCatchup(expect.mode)) {
+      // A catch-up: failed 0 in every section, and its t recorded (checked against the gate's by the credential step).
+      if (["fences", "ownership", "revisions"].some((k) => obj(s[k])?.failed !== 0)) refuse("backlog_ops_backfill_incomplete");
+      if (!Number.isSafeInteger(s.revisions_since_ms) || s.revisions_since_ms < 1) refuse("backlog_ops_backfill_since");
+    } else if (s.revisions_since_ms !== undefined) {
+      // Every other backfill read every revision: a since-filtered summary never stands in for one.
+      refuse("backlog_ops_backfill_since");
+    }
   }
   if (tool === "export") {
     const orgs = obj(s.orgs);
@@ -404,11 +463,12 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
 }
 
 /**
- * Which earlier runs an execute binds, with the mode each must have been. An execute's DRY is its own dry mode (a
- * refresh's is backfill-refresh-dry). The drain's BACKFILL is a backfill-refresh-execute exactly when FULL is given;
- * FULL, like export-execute's BACKFILL, is always a full backfill-execute.
+ * Which earlier runs an execute (or a catch-up dry) binds, with the mode each must have been. An execute's DRY is its
+ * own dry mode (a refresh's is backfill-refresh-dry, a catch-up's backfill-catchup-dry). The drain's BACKFILL is a
+ * backfill-refresh-execute or (`altMode`) a backfill-catchup-execute exactly when FULL is given; FULL, like
+ * export-execute's BACKFILL, is always a full backfill-execute.
  */
-export interface BacklogOpsBinding { run: string; mode: BacklogOpsMode; kind: BacklogOpsBindingKind }
+export interface BacklogOpsBinding { run: string; mode: BacklogOpsMode; kind: BacklogOpsBindingKind; altMode?: BacklogOpsMode }
 export function backlogOpsBindings(d: BacklogOpsDispatch): BacklogOpsBinding[] {
   const tool = toolOf(d.mode), out: BacklogOpsBinding[] = [];
   if (tool === "presence") {
@@ -416,9 +476,11 @@ export function backlogOpsBindings(d: BacklogOpsDispatch): BacklogOpsBinding[] {
     return out;
   }
   // Re-checked (backlogOpsDispatch already refuses it), so a hand-built dispatch cannot bind FULL anywhere else.
-  if (d.fullBackfillRun && (d.mode !== "drain-execute" || !d.backfillRun)) refuse("backlog_ops_full_backfill_run");
+  if (isCatchup(d.mode) ? !d.fullBackfillRun : d.fullBackfillRun && (d.mode !== "drain-execute" || !d.backfillRun)) refuse("backlog_ops_full_backfill_run");
   if (d.dryRun) out.push({ run: d.dryRun, mode: dryModeOf(d.mode), kind: "dry" });
-  if (d.backfillRun) out.push({ run: d.backfillRun, mode: d.fullBackfillRun ? "backfill-refresh-execute" : "backfill-execute", kind: "backfill" });
+  if (d.backfillRun) out.push(d.fullBackfillRun
+    ? { run: d.backfillRun, mode: "backfill-refresh-execute", altMode: "backfill-catchup-execute", kind: "backfill" }
+    : { run: d.backfillRun, mode: "backfill-execute", kind: "backfill" });
   if (d.fullBackfillRun) out.push({ run: d.fullBackfillRun, mode: "backfill-execute", kind: "full" });
   if (d.exportRun) out.push({ run: d.exportRun, mode: "export-execute", kind: "export" });
   return out;

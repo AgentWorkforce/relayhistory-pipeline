@@ -23,12 +23,20 @@
  * and the refresh makes the fingerprints differ and the drain refuses stale (a new full run is then needed). The credential step proves the rest unchanged before any credential is read
  * (a writer that still moved one of those rows changes it): the two receipts' input fingerprints must be equal
  * (checkRefreshFingerprint, backlog_ops_backfill_stale).
+ *
+ * Catch-up (backfill-catchup-dry/-execute, and a drain whose BACKFILL with FULL is a backfill-catchup-execute): FULL is
+ * a backfill-execute at the same sha under BACKLOG_OPS_BINDING_MAX_AGE_MS old (created before the catch-up execute's
+ * DRY too), and the gate computes t = FULL's created_at - BACKLOG_OPS_CATCHUP_MARGIN_MS from this API, never from an
+ * input, and writes it as the step output `revisions_since_ms` (the credential step passes it as
+ * --revisions-since-ms and checks the bound catch-up receipts recorded the same t). A drain's BACKFILL with FULL may be
+ * a refresh or a catch-up (its run-name says which); both obey the refresh's age and order rules.
  */
 import { appendFileSync } from "node:fs";
 import { PRIVATE_INGEST_RELEASE } from "../src/session-ingest/private-ingest-release.ts";
 import { SCHEMA_RELEASE as S } from "../src/hoopdb/schema-release-contract.ts";
 import {
   BACKLOG_OPS_BINDING_MAX_AGE_MS,
+  BACKLOG_OPS_CATCHUP_MARGIN_MS,
   BACKLOG_OPS_EXECUTE_ENABLED,
   BACKLOG_OPS_FRESH_BACKFILL_MS,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
@@ -37,6 +45,7 @@ import {
   backlogOpsDispatch,
   backlogOpsEnvironment,
   backlogOpsRunName,
+  isCatchup,
   refuseBacklogOps as refuse,
 } from "../src/session-ingest/backlog-ops.ts";
 import {
@@ -85,7 +94,8 @@ export async function backlogOpsGithubGate(
     if (String(bound.id) !== b.run || String(bound.id) === env.GITHUB_RUN_ID || bound.path !== BACKLOG_OPS_WORKFLOW ||
         bound.head_sha !== input.sha || bound.head_branch !== "main" || bound.event !== "workflow_dispatch" ||
         bound.run_attempt !== 1 || bound.status !== "completed" || bound.conclusion !== "success" ||
-        !isPinnedDispatcher(bound) || bound.display_title !== backlogOpsRunName(b.mode, input.sha) ||
+        !isPinnedDispatcher(bound) ||
+        (bound.display_title !== backlogOpsRunName(b.mode, input.sha) && (b.altMode === undefined || bound.display_title !== backlogOpsRunName(b.altMode, input.sha))) ||
         !Number.isFinite(at) || at > now || now - at >= maxAge)
       refuse(`backlog_ops_gate_${b.kind}_run`);
     const artifacts = await get(base + "/actions/runs/" + b.run + "/artifacts?per_page=100");
@@ -99,13 +109,22 @@ export async function backlogOpsGithubGate(
   // With FULL, the refresh refreshes it: FULL was created first.
   if (input.mode === "drain-execute" && input.fullBackfillRun !== null && !(created.full! < created.backfill!))
     refuse("backlog_ops_gate_full_order");
+  // A catch-up execute's FULL came before its DRY (which bound the same FULL: the credential step checks its t).
+  if (input.mode === "backfill-catchup-execute" && !(created.full! < created.dry!)) refuse("backlog_ops_gate_full_order");
+  // t: FULL's created_at minus the margin, from this API only. Every run binding FULL gets it (a drain's BACKFILL may be
+  // a catch-up; the credential step uses it only then).
+  let revisionsSinceMs: number | null = null;
+  if (input.fullBackfillRun !== null) {
+    revisionsSinceMs = created.full! - BACKLOG_OPS_CATCHUP_MARGIN_MS;
+    if (!Number.isSafeInteger(revisionsSinceMs) || revisionsSinceMs < 1) refuse("backlog_ops_gate_full_run");
+  } else if (isCatchup(input.mode)) refuse("backlog_ops_full_backfill_run");
   if (approved)
     await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, environment, gate, true, {
       approval: "backlog_ops_gate_human_approval",
       rejected: "backlog_ops_gate_human_rejected",
       dispatch: "backlog_ops_gate_human_dispatch",
     });
-  return { ...input, environment };
+  return { ...input, environment, revisionsSinceMs };
 }
 
 if (import.meta.main)
@@ -113,7 +132,9 @@ if (import.meta.main)
     .then((r) => {
       console.log("backlog_ops_github_gate_ok");
       // The protected environment the operate job must run in, derived from the mode (never an input).
-      if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `environment=${r.environment}\n`);
+      if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `environment=${r.environment}\n` +
+        // The catch-up's t (an epoch ms computed from FULL's created_at), for the credential step; never an input.
+        (r.revisionsSinceMs !== null ? `revisions_since_ms=${r.revisionsSinceMs}\n` : ""));
     })
     .catch((error) => {
       const code = (error as { code?: unknown })?.code;

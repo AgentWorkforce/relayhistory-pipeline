@@ -34,6 +34,17 @@
  * session). Every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked
  * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order (the lazy slots: heap block windows), optionally scoped to orgs. Fences are read from S3 per page.
  *
+ * Catch-up (`revisionsSinceMs`, decision 0005's two-phase cutover, docs/backlog-ops-workflow.md): the
+ * ingest_record_revisions pages keep their keyset order over the primary key but return only the rows whose
+ * `updated_at` (floored to the ms) is at or after the given time, plus each page's last scanned key (the cursor), so a
+ * page scans at most `rowPageSize` rows. No index serves `updated_at` (the primary key and the session index both lead
+ * with the org), so the SQL cost is still one walk of the scope's primary key, as a full run's; only the S3 work (fence
+ * reads and shard merges) shrinks to the changed rows. Every revision upsert stamps updated_at (insert default now(),
+ * each ON CONFLICT DO UPDATE sets now() or clock_timestamp()). Owned ingest_lazy_native_slots have no custody
+ * timestamp (initialized_at is the insert time only; a custody move rewrites current_* in place), so they are re-read
+ * in full, as are fences and ownership; merges of what is already stored write nothing. Monotone merges (never
+ * lowering) make a full run plus a catch-up since before it began converge to one full run over the final SQL state.
+ *
  * Fail closed: an unreadable fence is never rewritten; a user with any unrepresentable row gets no fence. Each
  * section reports `complete` only when nothing was skipped for want of a fence, needed review, was invalid or failed.
  * Nothing here logs; the summary holds counts only.
@@ -64,6 +75,11 @@ export interface BackfillOptions {
   dryRun: boolean;
   orgs?: string[];
   sections?: BackfillSection[];
+  /**
+   * Catch-up: only ingest_record_revisions rows with updated_at at or after this epoch ms (see the header). Needs the
+   * revisions section. Owned lazy slots, fences and ownership are still read in full.
+   */
+  revisionsSinceMs?: number;
   /** Users per fence page (default 500); rows per ownership/revision page (default 5000). */
   pageSize?: number;
   rowPageSize?: number;
@@ -111,6 +127,8 @@ export interface BackfillSummary {
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
   /** The run's input fingerprint, read before any section (BackfillFingerprint). */
   fingerprint: BackfillFingerprint;
+  /** A catch-up's `revisionsSinceMs` (an epoch ms, not identifying); absent on a full run. */
+  revisions_since_ms?: number;
 }
 
 /**
@@ -226,8 +244,9 @@ LIMIT $8::int`;
  * read and be missed, so a scoped run is exact only while its orgs admit nothing: run the execute after the scope's
  * HTTP admission stop (decision 0005's cutover order). The unscoped pass reads the same windows: run while other orgs
  * still admit, it pre-warms their shards and may miss their moved slots, so it certifies no org that was not stopped
- * before it began. Each org's cutover still takes a full run after its own stop (merges of what the pre-warm already
- * stored change nothing, so that run is mostly reads).
+ * before it began. Each org's cutover still takes a run that re-reads the slots after its own stop: a full run, or a
+ * catch-up after a full run made while the org was live (merges of what is already stored change nothing, so that run
+ * is mostly reads).
  */
 const SLOT_WINDOW_BLOCKS = 4096;
 /** About 4M entries (a few GB of heap) per merge pass; a 10M-slot org merges in three passes. */
@@ -243,6 +262,25 @@ FROM sessions.ingest_record_revisions
 WHERE ${SCOPE} AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
 ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
+/**
+ * The catch-up's page (revisionsSinceMs): the same keyset window of at most $6 rows over the primary key, returning
+ * only the rows updated at or after $7 (epoch ms, the fingerprint's floored-ms form) plus the window's last row, so the
+ * cursor always advances by one window whatever matched. `fresh` marks the rows to apply.
+ */
+const REVISIONS_SINCE_PAGE = `
+WITH p AS (
+  SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id,
+         floor(extract(epoch FROM updated_at) * 1000) >= $7::bigint AS fresh
+  FROM sessions.ingest_record_revisions
+  WHERE ${SCOPE} AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
+  ORDER BY org_id, workspace_id, origin_id, record_id
+  LIMIT $6::int
+), l AS (
+  SELECT org_id, workspace_id, origin_id, record_id FROM p ORDER BY org_id DESC, workspace_id DESC, origin_id DESC, record_id DESC LIMIT 1
+)
+SELECT p.* FROM p CROSS JOIN l
+WHERE p.fresh OR (p.org_id, p.workspace_id, p.origin_id, p.record_id) = (l.org_id, l.workspace_id, l.origin_id, l.record_id)
+ORDER BY p.org_id, p.workspace_id, p.origin_id, p.record_id`;
 
 /** The fingerprint's three reads (BackfillFingerprint), run in one read-only transaction, so one snapshot. */
 /** A row-content hash sum in [0, 2^40): hashtext is a signed int4 and % keeps the sign, so it is normalised. */
@@ -379,6 +417,9 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(opts.keyRoot)) throw new Error("backfill_key_root_invalid");
   if (opts.orgs) for (const org of opts.orgs) if (!ORG.test(org)) throw new Error("backfill_org_invalid");
   if (![...sections].every((s) => BACKFILL_SECTIONS.includes(s)) || sections.size === 0) throw new Error("backfill_sections_invalid");
+  const since = opts.revisionsSinceMs;
+  if (since !== undefined && (!Number.isSafeInteger(since) || since < 1)) throw new Error("backfill_revisions_since_invalid");
+  if (since !== undefined && !sections.has("revisions")) throw new Error("backfill_revisions_since_sections");
   const orgs = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
   // The dry run's defence in depth: every mutation throws (and is counted `failed`), so nothing is written.
   const store: ObjectStore = opts.dryRun
@@ -399,6 +440,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0, failed_codes: {} },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
     fingerprint: { revisions_count: 0, revisions_max_updated_ms: 0, revisions_hash: 0, ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 },
+    ...(since !== undefined ? { revisions_since_ms: since } : {}),
   };
   const { sql } = opts;
 
@@ -718,18 +760,22 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       }
       });
     }
-    // (a) ingest_record_revisions, seeded revision-only rows included.
+    // (a) ingest_record_revisions, seeded revision-only rows included; a catch-up only those updated since `since`.
     let cursor = ["", "", "", ""];
     const revisionBuf = newBuffer();
     for (;;) {
       if (!sections.has("revisions")) break;
-      const rows = await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize]);
+      const rows = since === undefined
+        ? await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize])
+        : await readOnly(REVISIONS_SINCE_PAGE, [orgs, ...cursor, rowPageSize, since]);
       if (!rows.length) break;
       const last = rows[rows.length - 1]!;
       cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
       const fences = new Map<string, Promise<FenceDoc | null>>();
       revisionBuf.batch++;
       for (const r of rows) {
+        // A catch-up page's last row is returned for the cursor even when it was not updated since.
+        if (since !== undefined && r.fresh !== true) continue;
         summary.revisions.rows++;
         if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
         await add(revisionBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
