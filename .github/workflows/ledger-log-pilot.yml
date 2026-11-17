@@ -1,0 +1,179 @@
+name: ledger log pilot
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('ledger log pilot {0} {1}', inputs.mode, inputs.sha) || format('ledger log pilot proof {0}', github.sha) }}
+
+# Dormant, guarded production pilot of ONE ledger-log stream (docs/design/s3-ledger-log-commit.md "Production pilot";
+# src/session-ingest/ledger-log-stream-production.ts; scripts/ledger-log-pilot.ts). status, measure and plan-* are
+# READ ONLY (the read role). switch and close (the write role) refuse while LEDGER_LOG_PRODUCTION_ENABLED is false, and
+# otherwise bind a successful plan-<action> run of this workflow at the same sha, younger than the plan TTL, whose
+# artifact holds exactly the typed confirmation; the operation rebuilds that phrase from a fresh preflight before it
+# writes anything. Every dispatch runs in the protected ledger-log-pilot environment, which does not exist until the
+# owner creates it together with its roles (in code): until then the gate refuses.
+# The stream's ids are the environment SECRET LEDGER_LOG_PILOT_STREAM (never a dispatch input, never env of any other
+# step), masked before anything is printed. Bucket, region, key root, KMS key and the role ARNs are the environment's
+# protected variables. Receipts carry digests and counts only.
+# Push and pull_request run only the credential-free tests (no secrets, no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [status, measure, plan-switch, switch, plan-close, close]
+        default: status
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      plan_run:
+        description: switch/close only - the successful plan-switch/plan-close run of this workflow at the same sha (under 30 min old); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'switch/close: LEDGER-LOG-<ACTION> BUCKET <b> STREAM <s> SHA <sha> STATE <st> EXPIRES <iso> PLAN <plan_run>, from the plan artifact. Other modes: empty'
+        type: string
+        default: ""
+      window_seconds:
+        description: measure only - the window in seconds (empty = 600)
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/ledger-log-pilot.yml
+      - scripts/ledger-log-pilot*.ts
+      - scripts/ledger-log-stream.ts
+      - src/session-ingest/ledger-log-stream-*.ts
+      - src/session-ingest/__tests__/ledger-log-stream-*.ts
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ledger-log-pilot.yml
+      - scripts/ledger-log-pilot*.ts
+      - scripts/ledger-log-stream.ts
+      - src/session-ingest/ledger-log-stream-*.ts
+      - src/session-ingest/__tests__/ledger-log-stream-*.ts
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Dispatches serialise with every guarded production operator (only one runs at a time). Proof runs get their own
+# per-sha group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('ledger-log-pilot-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  LEDGER_LOG_PILOT_MODE: ${{ inputs.mode }}
+  LEDGER_LOG_PILOT_SHA: ${{ inputs.sha }}
+  LEDGER_LOG_PILOT_PLAN_RUN: ${{ inputs.plan_run }}
+  LEDGER_LOG_PILOT_CONFIRMATION: ${{ inputs.confirmation }}
+  LEDGER_LOG_PILOT_WINDOW_SECONDS: ${{ inputs.window_seconds }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Operator, preflight, measure, gate and workflow tests (no credentials)
+        run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-log-stream-production.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, plan binding, exact main, dispatch identity and green CI
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/ledger-log-pilot-github.ts
+
+  operate:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    # A switch waits SWITCH_SETTLE_MS (5 min) after entry 0, a production close the same after its marker.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+      id-token: write
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and the recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/ledger-log-pilot-github.ts --approved
+      - name: Download the bound plan (switch and close only)
+        if: inputs.mode == 'switch' || inputs.mode == 'close'
+        uses: actions/download-artifact@v4
+        with:
+          name: ledger-log-pilot-plan
+          path: ${{ runner.temp }}/ledger-log-pilot-plan
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ github.token }}
+      # The only step given the stream secret, and the only step that requests the OIDC token and exchanges it for the
+      # mode's role (read for status, measure and plans; write for switch and close).
+      - name: Run the pilot step (the only step holding the stream or a role session)
+        env:
+          LEDGER_LOG_PILOT_STREAM: ${{ secrets.LEDGER_LOG_PILOT_STREAM }}
+          LEDGER_LOG_PILOT_BUCKET: ${{ vars.LEDGER_LOG_PILOT_BUCKET }}
+          LEDGER_LOG_PILOT_REGION: ${{ vars.LEDGER_LOG_PILOT_REGION }}
+          LEDGER_LOG_PILOT_KEY_ROOT: ${{ vars.LEDGER_LOG_PILOT_KEY_ROOT }}
+          LEDGER_LOG_PILOT_KMS_KEY_ARN: ${{ vars.LEDGER_LOG_PILOT_KMS_KEY_ARN }}
+          LEDGER_LOG_PILOT_READ_ROLE_ARN: ${{ vars.LEDGER_LOG_PILOT_READ_ROLE_ARN }}
+          LEDGER_LOG_PILOT_WRITE_ROLE_ARN: ${{ vars.LEDGER_LOG_PILOT_WRITE_ROLE_ARN }}
+          LEDGER_LOG_PILOT_PLAN_DIR: ${{ runner.temp }}/ledger-log-pilot-plan
+          LEDGER_LOG_PILOT_OUT: ${{ runner.temp }}/ledger-log-pilot-out
+        run: bun scripts/ledger-log-pilot.ts
+      - name: Publish the plan artifact (plan-switch and plan-close only)
+        if: startsWith(inputs.mode, 'plan-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-log-pilot-plan
+          path: ${{ runner.temp }}/ledger-log-pilot-out/ledger-log-pilot-plan.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish the digests-only receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledger-log-pilot-receipt
+          path: ${{ runner.temp }}/ledger-log-pilot-out/ledger-log-pilot-receipt.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -768,6 +768,15 @@ describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written dow
     // Reads the control objects, never a payload (session records).
     for (const x of [k.entry(0), k.checkpoint(64), k.head, k.closed, `${k.root}/stream.json`]) expect(can("s3:GetObject", at(x))).toBe(true);
     expect(can("s3:GetObject", at(k.payload("f".repeat(64))))).toBe(false);
+    // The production preflight's control reads: the fence-authority markers and the user's fence (real key functions).
+    for (const x of [fenceAuthorityKey(TENANT_KEY_BASE), orgFenceAuthorityKey(TENANT_KEY_BASE, tenant.orgId), fenceAuthorityStopKey(TENANT_KEY_BASE),
+      s3LedgerKeys(TENANT_KEY_BASE, tenant).fence]) {
+      expect(can("s3:GetObject", at(x))).toBe(true);
+      expect(can("s3:PutObject", at(x))).toBe(false);
+    }
+    // ...and nothing else of the user's directory (the privacy journal, revisions, manifests stay out).
+    for (const x of [`${s3LedgerKeys(TENANT_KEY_BASE, tenant).dir}/privacy-journal.json`, s3LedgerKeys(TENANT_KEY_BASE, tenant).revisions("origin-1", "r1")])
+      expect(can("s3:GetObject", at(x))).toBe(false);
     // ListBucket is a plain allow (no s3:prefix condition): a GET/HEAD carries no s3:prefix, and S3 answers 404 for a
     // missing key only to a ListBucket holder, so the request context of a read (no prefix) must match it.
     expect(can("s3:ListBucket", bucketArn)).toBe(true);

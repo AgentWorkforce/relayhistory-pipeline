@@ -27,6 +27,9 @@
  *       legacy stream, closed.json, the markers) into 403. Key names only; the GET grants stay narrow (never p/);
  *       PUT entry 0 (e/), closed.json, the identity doc, the registry; DELETE registry docs (the v1 registry migration);
  *       GET the deployment markers `.ledger/log-commit-on.json` and `.ledger/log-mode-nonprod.json`;
+ *       GET (the production preflight, docs/design/s3-ledger-log-commit.md "Production pilot") the fence-authority
+ *       markers and the user's fence `upload-fences.json`: control documents, never session records. The pilot
+ *       workflow's read role needs only the LIST and GET statements; its write role all of them;
  *       KMS GenerateDataKey/Decrypt via S3 for those keys.
  *   - the bucket's OnlyTheEraserDeletes deny refuses every delete outside the inbox carve-out to anyone but the eraser
  *     and the GC. LEDGER_LOG_DELETE_CARVE_OUT is what it must additionally exempt for the consumer (and, for the
@@ -56,6 +59,12 @@ export const LEDGER_LOG_LEGACY_BATCHES = `${LEDGER_LOG_USER_DIR}/ledger/batches/
 export const LEDGER_LOG_OPERATOR_READS = ["e/*", "c/*", "head.json", "closed.json", "stream.json"].map((x) => `${LEDGER_LOG_USER_DIR}/ledger/log/*/${x}`);
 /** The operator-written deployment markers (ledger-log-stream-ops.ts logCommitProofKey, logModeNonProdKey). */
 export const LEDGER_LOG_MARKERS = [`${TENANT_KEY_BASE}/.ledger/log-commit-on.json`, `${TENANT_KEY_BASE}/.ledger/log-mode-nonprod.json`] as const;
+/**
+ * What the production preflight additionally reads (ledger-log-stream-ops.ts streamPreflight): the fence-authority
+ * markers (deployment-wide, per org, and the STOP) and the user's fence (upload-fences.json). Control documents only.
+ */
+export const LEDGER_LOG_OPERATOR_PREFLIGHT_READS = [`${TENANT_KEY_BASE}/.ledger/fence-authority.json`, `${TENANT_KEY_BASE}/.ledger/fence-authority/*`,
+  `${LEDGER_LOG_USER_DIR}/upload-fences.json`] as const;
 /** What OnlyTheEraserDeletes must exempt for log mode (see the header): payloads, the admitted outcome, the registry. */
 export const LEDGER_LOG_DELETE_CARVE_OUT = [LEDGER_LOG_PAYLOADS, LEDGER_LOG_ADMITTED_OUTCOMES, LEDGER_LOG_REGISTRY] as const;
 
@@ -84,7 +93,8 @@ export function ledgerLogOperatorStatements(i: { bucketArn: string; operatorRole
     // marker, the non-production and proof markers, the migration's dropped path. Listing reveals key names only.
     { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn },
     { Sid: "LedgerLogOperatorReads", Effect: "Allow" as const, Principal, Action: ["s3:GetObject"],
-      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
+      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o),
+        ...LEDGER_LOG_OPERATOR_PREFLIGHT_READS.map(o)] },
     { Sid: "LedgerLogOperatorWrites", Effect: "Allow" as const, Principal, Action: ["s3:PutObject"],
       Resource: [o(LEDGER_LOG_ENTRIES), o(LEDGER_LOG_CLOSED), o(LEDGER_LOG_IDENTITY), o(LEDGER_LOG_REGISTRY)] },
     { Sid: "LedgerLogOperatorMigratesRegistry", Effect: "Allow" as const, Principal, Action: ["s3:DeleteObject"], Resource: [o(LEDGER_LOG_REGISTRY)] },
@@ -98,7 +108,8 @@ export function ledgerLogOperatorKeyStatement(i: { region: string; accountId: st
     Sid: "LedgerLogOperatorViaS3", Effect: "Allow" as const, Principal: { AWS: i.operatorRoleArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*",
     Condition: {
       StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
-      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(arn), arn(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(arn)] },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(arn), arn(LEDGER_LOG_REGISTRY),
+        ...LEDGER_LOG_MARKERS.map(arn), ...LEDGER_LOG_OPERATOR_PREFLIGHT_READS.map(arn)] },
     },
   };
 }

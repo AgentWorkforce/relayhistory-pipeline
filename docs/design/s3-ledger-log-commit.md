@@ -5,7 +5,9 @@ fixes) and 6 (the before-production items of Remaining) are implemented behind `
 off). With `on`, only a stream whose entry 0 exists is admitted through its log; entry 0 is written only by the
 operator tool (`scripts/ledger-log-stream.ts switch`). Production still needs: the review of slice 6, the
 `OnlyTheEraserDeletes` carve-out and the operator role's grants (Remaining 10), lifting the hosted and stack refusals
-together, and an explicit OK to deploy; the hosted runtime and the stack input both still refuse `on`.
+together, and an explicit OK to deploy; the hosted runtime and the stack input both still refuse `on`. A deliberate,
+dormant operator path to switch ONE production stream (and back) is in "Production pilot" below; it changes none of
+those refusals.
 
 Builds on the group-commit design (`docs/design/s3-ledger-group-commit.md`, rev 3) and the hosted ledger
 decision record (0008, benchmark first). It replaces that design's per-session manifest CAS on the critical path
@@ -468,6 +470,68 @@ Compaction (Remaining 5) stays out of scope beyond what the checkpoint start mak
     root; the migration's dry run, crash midway (listed once), apply and idempotent re-run, an erased stream's v1 doc
     dropped without writing into its directory, and an invalid v1 doc reported while the rest migrate. The CLI guard covers
     `migrate-registry` (`ledger-log-admit.test.ts`).
+
+## Production pilot: one stream, switched deliberately
+
+The owner pilots log-commit on ONE production stream (his own org) in parallel with the customer migration waves. The
+operator runbook is [docs/ledger-log-pilot-runbook.md](../ledger-log-pilot-runbook.md). Nothing here lifts the hosted
+runtime's or the stack's refusal of `INGEST_LEDGER_LOG_COMMIT=on`: until that separate change lands and the operator
+writes the deployment-wide proof, every production switch refuses at its preflight (`log_commit_not_proven_on`).
+
+- **The default refusal stays.** Without a production context, `switchToLogMode` still requires the bucket's
+  non-production marker, and the CLI still requires `--i-know-this-is-not-prod` and refuses production-like bucket
+  names. The production path is a separate, explicit opt-in.
+- **Opt-in** (`ledger-log-stream-production.ts`). A production switch or close needs ALL of: the dormant switch
+  `LEDGER_LOG_PRODUCTION_ENABLED` (false until a reviewed one-line flip; `production_dormant`); the CLI's `--production`
+  flag (never with `--i-know-this-is-not-prod`; only on switch and close); the code sha actually running (Actions:
+  `GITHUB_SHA`; locally a clean worktree whose HEAD is on `origin/main`); a plan (the same command without `--apply`);
+  and the typed confirmation
+  `LEDGER-LOG-<ACTION> BUCKET <sha256(bucket, keyRoot)> STREAM <sha256(keyRoot, org, workspace, user, origin)> SHA <sha> STATE <sha256(action, mode, entry-0 cutover)> EXPIRES <iso> PLAN <local | plan run>`.
+  The plan derives the phrase from its own preflight, with an expiry 30 minutes out. The apply runs the preflight
+  again, rebuilds the phrase with the expiry the phrase carries and refuses unless it is byte-equal, unexpired and at
+  most one TTL ahead. The check is inside the operation (`productionGate` in `ledger-log-stream-ops.ts`), not only in
+  the CLI. STATE binds the mode and the log instance, deliberately not the head or the legacy counts, which move every
+  second on a live stream; every count-based check runs again at apply.
+- **Preflight** (`streamPreflight`, read only, counts and verdicts only). Switch: the stream reads (no corrupt log),
+  is legacy, has at least one committed legacy batch (`stream_not_found`: a mistyped id or an unused stream), its org
+  has a valid fence-authority marker (org or deployment-wide, by the claim's own rules; a STOP refuses), the user's
+  fence has no reset begun-but-unfinished or pending, the deployment-wide proof exists, and no legacy batch is
+  pending. Close: the stream is in log mode with an epoch, and every entry is applied (cursor = head). Close needs no
+  fence authority, so a rollback stays possible while admission is stopped. The report also says whether the stream is
+  registered.
+- **No in-flight conflicting writer.** Before the switch there is no log writer (only the operator writes entry 0).
+  Legacy writers are the conflict: the switch re-lists the stream's legacy batch docs right before entry 0 (reading
+  only new or changed docs) and refuses if one is pending; after the settle wait it lists again, and any doc that is
+  new, changed or pending and is NOT a batch of the log is a legacy writer behind entry 0 (`legacy_raced_switch`).
+  Before this change the check compared the committed count, which the materializer moves itself (it writes the
+  legacy batch docs of logged batches), so a busy stream always reported a race; both the production and the
+  non-production switch use the precise check now. After entry 0, the first admission writer takes the stream by the
+  existing epoch protocol (an `epoch` entry; a stale writer is fenced at its next append), which needs no operator
+  step. For close, a writer that had the stream cached may append the entry it had in flight; a production close
+  waits the settle time and reports the stream again (`after`), so the receipt shows it.
+- **Rollback** is the existing close, with the same guards (plan, phrase, preflight). Half-done states: a switch that
+  died after entry 0, or reported `legacy_raced_switch`, leaves the stream in log mode (admission registers it on its
+  first take); drain it (`status` until the cursor equals the head) and close it. A close that died after its marker
+  is complete (`status` reads `closed`; a second close refuses with `stream_is_closed`). Close is one way: a pilot
+  stream is never reopened.
+- **Receipts** carry digests (bucket binding, stream identity, state, sha256 of the approving phrase), counts and
+  verdicts. Never a bucket name, key or id; `measure` names an origin only by a 12-hex prefix of its key hash.
+- **Measure** (`measureArrivalRate`, read only, allowed in production). Batch arrival rate per origin over a window:
+  legacy batch docs by their listing lastModified (the commit rewrites the doc), log entries by their own `atMs`,
+  counting each logged batch once (its materializer-written batch doc is left out). Reports the window average, the
+  busiest minute, and whether it reaches 1.4 batches/s (where a stream's latency becomes visible in-region). It lists
+  the user's batch docs and log objects (a page budget; `truncated` when it runs out) and GETs only entries inside the
+  window.
+- **The workflow** (`.github/workflows/ledger-log-pilot.yml`, dormant by the same constant). The org admission repair
+  pattern: exact live main head, first attempt, the pinned dispatcher, the run's own name, green push CI, the protected
+  `ledger-log-pilot` environment (main only; not created yet, so the gate refuses), and for switch and close a
+  successful same-sha `plan-<action>` run under 30 minutes old whose artifact holds exactly the typed phrase. The
+  stream is an environment secret (never a dispatch input), masked before anything prints; a read role serves status,
+  measure and plans, a write role switch and close. The operator role's grants now include the preflight's control
+  reads (`LEDGER_LOG_OPERATOR_PREFLIGHT_READS`: the fence-authority markers and the user's fence); nothing renders them.
+- Tests: `src/session-ingest/__tests__/ledger-log-stream-production.test.ts` (every refusal and the happy paths of
+  switch, close and measure, the CLI guard, the gate and the workflow's shape), the operator-grant cases in
+  `stacks/aws/__tests__/upload-inbox-infra.test.ts`.
 
 ## Remaining
 
