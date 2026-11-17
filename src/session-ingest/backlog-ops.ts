@@ -238,10 +238,10 @@ export function backlogOpsScope(env: Record<string, string | undefined>): Backlo
 // revision entries) and once had to bind the drain directly (BACKLOG_OPS_FRESH_BACKFILL_MS). The drain now binds a fresh
 // refresh run plus a FULL run up to 24 h old, so the full run may be slow. S3 writes are per-key CAS with no shared hot
 // key; SQL reads stay one transaction at a time on the connection.
-// Lower load (2026-11-16, production owner's request): the export's candidate statement and the backfill's native-slot
-// scans were the top statements by total time on the shared database, so pages are smaller and concurrency is the
-// tools' default 4. A full run takes longer; it binds a drain only through the refresh path (FULL may be up to 24 h old).
-export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "1000", "--row-page-size", "5000", "--statement-timeout-ms", "600000", "--concurrency", "4"] as const;
+// Middle load (2026-11-17, production owner's decision after the database IOPS raise to 12k): the backfill's native-slot
+// scans were among the top statements by total time, so concurrency is halved to 8 at the original page sizes. A full
+// run takes longer; it binds a drain only through the refresh path (FULL may be up to 24 h old).
+export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000", "--concurrency", "8"] as const;
 /**
  * The export's per-statement timeout (its reads over the buffer are as heavy as the backfill's), its page size and
  * concurrency. VERDICT_PAGE's per-stage work (the judged/kept CTEs filter materialized CTEs by
