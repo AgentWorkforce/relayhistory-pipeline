@@ -252,6 +252,21 @@ describe("session read api: Function URL (public by design, application auth)", 
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
     expect(src).toMatch(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
   });
+
+  it("route modules registered from app.ts are pinned too, and register after the bearer auth", () => {
+    const app = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/app.ts", import.meta.url)), "utf8");
+    const memory = readFileSync(fileURLToPath(new URL("../../../src/session-read-api/memory-documents.ts", import.meta.url)), "utf8");
+    // Memory documents (READ_API_MEMORY_DOCUMENTS_ENABLED) registers its routes outside app.ts.
+    expect([...memory.matchAll(/app\.(get|post|put|patch|delete|all|on|route|use)\("([^"]+)"/g)].map((m) => m[2]).sort())
+      .toEqual(["/v1/memory/documents", "/v1/memory/documents/:topic"]);
+    const auth = app.search(/if \(!m\) return c\.json\(\{ error: \{ code: "missing_authorization"/);
+    const bearer = app.lastIndexOf('app.use("/v1/*", async (c, next) => {', auth);
+    const register = app.indexOf("registerMemoryDocumentsRoutes(app");
+    expect(auth).toBeGreaterThan(0);
+    expect(bearer).toBeGreaterThan(0);
+    expect(register).toBeGreaterThan(auth);
+    expect(app.indexOf("registerMemoryDocumentsRoutes(app", register + 1)).toBe(-1);
+  });
 });
 
 import { sessionReadApiEnv as _envForJwks, sessionReadApiNames as _namesForJwks } from "../session-read-api.ts";
