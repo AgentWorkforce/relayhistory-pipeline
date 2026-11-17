@@ -121,6 +121,27 @@ test("max_objects: drain modes only, a positive bounded integer", () => {
   expect(on("export-execute", "10")).toBe("backlog_ops_max_objects");
 });
 
+test("slots_read: backfill modes only, empty or heap (default, unchanged argv) or org (--slots-by-org)", () => {
+  const t = backlogOpsTarget(target);
+  const on = (mode: BacklogOpsMode, v: string) => codeSync(() => backlogOpsDispatch(dispatchEnv(mode, { BACKLOG_OPS_SLOTS_READ: v }), true));
+  for (const mode of BACKLOG_OPS_MODES.filter((m) => m.startsWith("backfill-"))) {
+    for (const v of ["", "heap", "org"]) expect(on(mode, v)).toBeNull();
+    for (const v of ["ORG", "index", " org", "org "]) expect(on(mode, v)).toBe("backlog_ops_slots_read");
+    const since = mode.startsWith("backfill-catchup-") ? SINCE : null;
+    const base = backlogOpsToolArgs(backlogOpsDispatch(dispatchEnv(mode), true), t, undefined, since).args;
+    const heap = backlogOpsToolArgs(backlogOpsDispatch(dispatchEnv(mode, { BACKLOG_OPS_SLOTS_READ: "heap" }), true), t, undefined, since).args;
+    const org = backlogOpsToolArgs(backlogOpsDispatch(dispatchEnv(mode, { BACKLOG_OPS_SLOTS_READ: "org" }), true), t, undefined, since).args;
+    expect(heap).toEqual(base);
+    expect(base).not.toContain("--slots-by-org");
+    expect(org.filter((a) => a === "--slots-by-org").length).toBe(1);
+    expect(org.filter((a) => a !== "--slots-by-org")).toEqual(base);
+  }
+  for (const mode of ["export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry"] as BacklogOpsMode[]) {
+    expect(on(mode, "org")).toBe("backlog_ops_slots_read");
+    expect(on(mode, "")).toBeNull();
+  }
+});
+
 // ---- target and argv ----
 
 test("target variables are shape-checked: key in region, roles in the key's account and distinct", () => {
@@ -164,6 +185,7 @@ test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry 
     const section = spec.args.indexOf("--section");
     expect(section >= 0).toBe(mode.startsWith("backfill-refresh-") || mode.startsWith("backfill-catchup-"));
     expect(spec.args.includes("--revisions-since-ms")).toBe(mode.startsWith("backfill-catchup-"));
+    expect(spec.args.includes("--slots-by-org")).toBe(false); // opt-in only (slots_read=org)
     if (mode.startsWith("backfill-catchup-")) {
       expect(spec.args.slice(section, section + 8)).toEqual(["--section", "fences", "--section", "ownership", "--section", "revisions", "--revisions-since-ms", String(SINCE)]);
       expect(spec.script).toBe("scripts/upload-fence-backfill.ts");

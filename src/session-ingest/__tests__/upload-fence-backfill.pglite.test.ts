@@ -297,7 +297,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       await slot(i % 3 === 0 ? C : A, "origin-1", `w${String(i).padStart(4, "0")}`, i % 3 === 0 ? C.userId : A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
     }
     const log: string[] = [];
-    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1 }, log);
+    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1, slotsByOrg: true }, log);
     expect(summary.revisions).toMatchObject({ slot_rows: 100, slots_empty: 0, merged: 100, invalid: 0, failed: 0 });
     expect(summary.sections.revisions).toBe("complete");
     // No block walk for a scoped run under the cap: one cursor per org, inside one read-only transaction.
@@ -321,7 +321,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     }
     const blocks = Number((await db.query<{ n: number }>("SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::int AS n")).rows[0]!.n);
     const log: string[] = [];
-    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1, slotOrgReadMaxRows: 10 }, log);
+    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1, slotsByOrg: true, slotOrgReadMaxRows: 10 }, log);
     expect(summary.revisions).toMatchObject({ slot_rows: 100, slots_empty: 0, merged: 100, invalid: 0, failed: 0 });
     expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(blocks);
     for (let i = 0; i < log.length; i++) if (log[i]!.includes("ctid >= $2::tid")) {
@@ -331,6 +331,29 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(await entryOf(store, A, "origin-1", "v0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await fenceOf(store, C)).toBeNull();
     await expect(run(store, { orgs: ["org-a"], slotOrgReadMaxRows: -1 })).rejects.toThrow("backfill_slot_org_max_invalid");
+  });
+
+  test("org scope without slotsByOrg: the existing modes keep the heap block windows", async () => {
+    const store = scratch();
+    for (let i = 0; i < 60; i++) await slot(A, "origin-1", `d${String(i).padStart(4, "0")}`, A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
+    const log: string[] = [];
+    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1 }, log);
+    expect(summary.revisions).toMatchObject({ slot_rows: 60, failed: 0 });
+    expect(log.some((l) => l.includes("DECLARE backfill_slots"))).toBe(false);
+    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBeGreaterThan(0);
+  });
+
+  test("slotsByOrg: mixed orgs (one over the cap) and an org with no slots, every scoped slot exactly once", async () => {
+    const store = scratch();
+    for (let i = 0; i < 90; i++) await slot(i % 3 === 0 ? C : A, "origin-1", `m${String(i).padStart(4, "0")}`, i % 3 === 0 ? C.userId : A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
+    const log: string[] = [];
+    // org-a has 60 slots (over a cap of 40: block walk), org-b 30 (cursor), org-empty none (cursor, zero rows).
+    const summary = await run(store, { orgs: ["org-a", "org-b", "org-empty"], slotWindowBlocks: 1, slotsByOrg: true, slotOrgReadMaxRows: 40 }, log);
+    expect(summary.revisions).toMatchObject({ slot_rows: 90, merged: 90, invalid: 0, failed: 0 });
+    expect(log.filter((l) => l.includes("DECLARE backfill_slots")).length).toBe(3);
+    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBeGreaterThan(0);
+    expect(await entryOf(store, A, "origin-1", "m0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
+    expect(await entryOf(store, C, "origin-1", "m0003")).toEqual([4, null, hex("3"), sessionKeyHash("claude", "sess-3"), 0, 0]);
   });
 
   test("unscoped: lazy slots are read in heap block windows too, every slot of every org exactly once", async () => {
