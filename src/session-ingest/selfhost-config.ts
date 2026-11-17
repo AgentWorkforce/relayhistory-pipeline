@@ -100,7 +100,8 @@
  *   INGEST_LEDGER                    unset | "" | "sql" (default: ledger-sql.ts, unchanged) | "s3" (decision 0005:
  *                                    every admission, the consumer and the selection / reset fences through
  *                                    ledger-s3.ts, no SQL for upload accounting). s3 refuses the per-session erase
- *                                    route, the operator erase runtime and INGEST_UPLOAD_CONSENT other than off.
+ *                                    route, the operator erase runtime (except as INGEST_S3_ERASE_FENCE=on allows)
+ *                                    and INGEST_UPLOAD_CONSENT other than off.
  *                                    Until the read side moves, s3 controls also write SQL upload_deletions (S3
  *                                    first, reconciled to the fence; ledger-s3.ts withSqlControlMirror). No
  *                                    admission on ANY path (sync, async, direct upload) until the fence-authority
@@ -111,6 +112,16 @@
  *                                    takes INGEST_MAX_PER_USER / _ORG slots (429 delivery_busy at the cap); the
  *                                    async consumer has its own pool, INGEST_MAX_PER_USER per user and
  *                                    INGEST_ASYNC_MAX_PER_ORG per org, and defers (never dead-letters) at the cap.
+ *   INGEST_S3_ERASE_FENCE            unset | "" | "off" (default: no tombstone guard or write, unchanged) | exactly "on"
+ *                                    (anything else refuses startup). Needs INGEST_LEDGER=s3; refuses
+ *                                    INGEST_LEDGER_LOG_COMMIT=on. Lifts ONLY the operator per-session erase refusal
+ *                                    (SESSION_ERASE_API_ENABLED + SESSION_ERASE_FENCE_ENFORCED): the erase route writes
+ *                                    create-only S3 tombstones after the SQL fence and before it answers (503 if it
+ *                                    cannot), and every admission path refuses a tombstoned session 409
+ *                                    operator_session_erased (s3-erase-fence.ts). Set it on the async processes too.
+ *                                    Still refused on s3: SESSION_ERASE_BYTES_ENABLED, selection, consent, whole-user
+ *                                    erase. Tombstones are never deleted. Residual: a claim in another process past
+ *                                    its tombstone HEAD before the write can still land (as the SQL cross-process one).
  *   INGEST_LEDGER_BUCKET             unset | "" (default: the ledger lives in LOCKER_BUCKET, unchanged) | a bucket name other
  *                                    than LOCKER_BUCKET: the S3 ledger's own objects (ledger-store.ts: each user's ledger/
  *                                    and the ledger-home marker) live there; everything else, the fences included, stays
@@ -141,6 +152,7 @@ import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforce
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
 import { LEDGER_HOME_GUARD_VAR, ledgerHomeGuard } from "./ledger-store.ts";
 import { INGEST_LEDGER_LOG_COMMIT_VAR, ledgerLogCommitMode } from "./ledger-log.ts";
+import { S3_ERASE_FENCE_VAR, s3EraseFenceMode } from "./s3-erase-fence.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -223,6 +235,8 @@ export interface SelfhostIngestSettings {
   ledgerStore?: SelfhostLedgerStoreSettings;
   /** INGEST_LEDGER_HOME_GUARD=on (INGEST_LEDGER=s3 only). Absent (the default): no ledger-home read without ledgerStore. */
   ledgerHomeGuard?: true;
+  /** INGEST_S3_ERASE_FENCE=on (INGEST_LEDGER=s3 only, s3-erase-fence.ts). Absent (the default): no tombstone guard or write. */
+  s3EraseFence?: true;
 }
 
 /** The S3 ledger's own bucket (ledger-store.ts). `region`: INGEST_LEDGER_REGION, else LOCKER_REGION, else us-east-1. */
@@ -462,17 +476,22 @@ export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" | "on" {
  * all admit and fence through S3, and the database is never called for upload accounting. Refused with s3: the
  * features whose state is SQL-only (the per-session erase ledger, the operator erase runtime, upload consent).
  */
-function selfhostLedger(env: NodeJS.ProcessEnv, s: { sessionSelection: boolean; sessionErase: { enabled: boolean }; uploadConsent: UploadConsentEnforcement; eraseRuntime: { eraseFenceEnforced?: true; eraseBytesEnabled?: true } }): "s3" | undefined {
+function selfhostLedger(env: NodeJS.ProcessEnv, s: { sessionSelection: boolean; sessionErase: { enabled: boolean }; uploadConsent: UploadConsentEnforcement; eraseRuntime: { eraseFenceEnforced?: true; eraseBytesEnabled?: true }; eraseFence: boolean }): "s3" | undefined {
   let mode;
   try { mode = ingestLedgerMode(env[INGEST_LEDGER_VAR]?.trim() === "" ? undefined : env[INGEST_LEDGER_VAR]?.trim()); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_VAR} must be sql or s3`); }
   const logCommit = selfhostLedgerLogCommit(env);
   if (mode === "sql") {
     if (logCommit === "on") throw new Error(`96bulls: ${INGEST_LEDGER_LOG_COMMIT_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
+    if (s.eraseFence) throw new Error(`96bulls: ${S3_ERASE_FENCE_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
     return undefined;
   }
+  // A log append admits without deliver's session guard (ledger-log-admit.ts), so the fence would not hold there.
+  if (s.eraseFence && logCommit === "on") throw new Error(`96bulls: ${S3_ERASE_FENCE_VAR}=on refuses ${INGEST_LEDGER_LOG_COMMIT_VAR}=on`);
   const refuse = (what: string) => { throw new Error(`96bulls: ${INGEST_LEDGER_VAR}=s3 refuses ${what} (its state is SQL-only)`); };
   if (s.sessionSelection) refuse("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
-  if (s.sessionErase.enabled || s.eraseRuntime.eraseFenceEnforced || s.eraseRuntime.eraseBytesEnabled) refuse("the operator session erase");
+  // INGEST_S3_ERASE_FENCE=on lifts the per-session erase route and its fence only (s3-erase-fence.ts); the bytes
+  // worker stays refused (its staged-objects proof lists the admission inbox, which holds the S3 ledger).
+  if (s.eraseRuntime.eraseBytesEnabled || !s.eraseFence && (s.sessionErase.enabled || s.eraseRuntime.eraseFenceEnforced)) refuse("the operator session erase");
   if (s.uploadConsent !== "off") refuse(UPLOAD_CONSENT_VAR);
   return "s3";
 }
@@ -505,7 +524,9 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const admission = selfhostAdmissionSettings(env);
   const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
-  const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime });
+  let eraseFence: boolean;
+  try { eraseFence = s3EraseFenceMode(env[S3_ERASE_FENCE_VAR]) === "on"; } catch { throw new Error(`96bulls: ${S3_ERASE_FENCE_VAR} must be off or on`); }
+  const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime, eraseFence });
   const ledgerLogCommit = selfhostLedgerLogCommit(env);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
@@ -534,6 +555,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
     ...(ledger ? { ledger, ledgerLogCommit } : {}),
+    ...(eraseFence ? { s3EraseFence: true as const } : {}),
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
     ...(ledgerStore ? { ledgerStore } : {}),
     ...(homeGuard ? { ledgerHomeGuard: true as const } : {}),
