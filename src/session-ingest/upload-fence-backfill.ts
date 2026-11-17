@@ -90,7 +90,7 @@ export interface BackfillOptions {
   slotWindowBlocks?: number;
   /**
    * Read a scoped run's owned slots once per org through the org_id index (SLOTS_ORG_CURSOR) instead of the heap block
-   * windows. Off by default: only the catch-up modes pass it (`--slots-by-org`), so the existing modes are unchanged.
+   * windows. Off by default: a backfill mode passes it (`--slots-by-org`) only with the backlog-ops input slots_read=org.
    */
   slotsByOrg?: boolean;
   /** With slotsByOrg, the per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the windows. */
@@ -169,6 +169,17 @@ export const SLOTS_REVISION_SUM_MODULUS = "9007199254740992"; // 2^53
 export const FINGERPRINT_HASH_MODULUS = "1099511627776"; // 2^40
 
 const SCOPE = `($1::text[] IS NULL OR org_id = ANY($1::text[]))`;
+/**
+ * A scoped run's form of SCOPE (scopedSql). The "$1 IS NULL OR ..." form lets one text serve both scopes, but a generic
+ * plan for it cannot use an org_id index: on production FINGERPRINT_SLOTS planned a parallel sequential scan of the
+ * whole multi-GB ingest_lazy_native_slots heap for a six-org scope, and that read saturated the database's IO (an
+ * aborted backfill-dry, 2026-11-17). A scoped run sends plain `org_id = ANY($1)`, which the org index serves.
+ */
+const SCOPED = `org_id = ANY($1::text[])`;
+/** The text a run sends: unscoped runs unchanged (byte-identical); scoped runs with every SCOPE as SCOPED. */
+export function scopedSql(query: string, scoped: boolean): string {
+  return scoped ? query.split(SCOPE).join(SCOPED) : query;
+}
 /**
  * The users, collected ONCE per run (not per page): a keyset page over a DISTINCT union of six tables re-read and
  * re-sorted the whole (scoped) union on every page, minutes each on production. Every table but ingest_batches has an
@@ -443,6 +454,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   if (since !== undefined && (!Number.isSafeInteger(since) || since < 1)) throw new Error("backfill_revisions_since_invalid");
   if (since !== undefined && !sections.has("revisions")) throw new Error("backfill_revisions_since_sections");
   const orgs = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
+  /** A scoped run sends its scoped reads as plain `org_id = ANY($1)` (scopedSql) with custom plans. */
+  const scopedRun = orgs !== null;
   // The dry run's defence in depth: every mutation throws (and is counted `failed`), so nothing is written.
   const store: ObjectStore = opts.dryRun
     ? new Proxy(opts.store, {
@@ -481,10 +494,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
       if (ro !== "on") throw new Error("backfill_not_read_only");
       await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+      // A scoped run plans each statement for its actual org list (belt and braces with scopedSql).
+      if (scopedRun) await sql.query("SET LOCAL plan_cache_mode = force_custom_plan");
       // The block window must read the heap in order: never the org index once per window.
       if (heapOnly) { await sql.query("SET LOCAL enable_indexscan = off"); await sql.query("SET LOCAL enable_bitmapscan = off"); }
       const out: Record<string, unknown>[][] = [];
-      for (const [query, params] of queries) out.push((await sql.query(query, params)).rows);
+      for (const [query, params] of queries) out.push((await sql.query(scopedSql(query, scopedRun), params)).rows);
       return out;
     } finally {
       await sql.query("ROLLBACK").catch(() => {});

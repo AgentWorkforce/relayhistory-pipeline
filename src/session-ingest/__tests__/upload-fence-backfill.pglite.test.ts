@@ -6,7 +6,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
-import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
+import { backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { scratchStore } from "./support.ts";
@@ -354,6 +354,24 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBeGreaterThan(0);
     expect(await entryOf(store, A, "origin-1", "m0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await entryOf(store, C, "origin-1", "m0003")).toEqual([4, null, hex("3"), sessionKeyHash("claude", "sess-3"), 0, 0]);
+  });
+
+  test("scoped SQL: no generic \"$1 IS NULL OR\" branch (an org index can serve it), custom plans; unscoped text unchanged", async () => {
+    const q = "SELECT 1 FROM sessions.x WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND y";
+    expect(scopedSql(q, false)).toBe(q);
+    expect(scopedSql(q, true)).toBe("SELECT 1 FROM sessions.x WHERE org_id = ANY($1::text[]) AND y");
+    const store = scratch();
+    await slot(A, "origin-1", "p0001", A.userId, "claude", "sess-p", 1, hex("1"));
+    const scoped: string[] = [];
+    const summary = await run(store, { orgs: ["org-a"] }, scoped);
+    expect(summary.sections).toMatchObject({ fences: "complete", ownership: "complete", revisions: "complete" });
+    expect(scoped.some((l) => l.includes("IS NULL OR org_id"))).toBe(false);
+    expect(scoped.filter((l) => l.includes("org_id = ANY($1::text[])")).length).toBeGreaterThan(0);
+    expect(scoped).toContain("SET LOCAL plan_cache_mode = force_custom_plan");
+    const unscoped: string[] = [];
+    await run(scratch(), {}, unscoped);
+    expect(unscoped.some((l) => l.includes("IS NULL OR org_id"))).toBe(true);
+    expect(unscoped).not.toContain("SET LOCAL plan_cache_mode = force_custom_plan");
   });
 
   test("unscoped: lazy slots are read in heap block windows too, every slot of every org exactly once", async () => {
