@@ -123,7 +123,13 @@ name: deploy session-read-worker
 # owner_buffered=on/off) the guard (resolve-deploy-profile.ts unchangedAnalysisSettings) refuses a
 # dispatch that would drop a live READ_API_ANALYSIS_ENABLED or change/drop a live ANALYSIS_ADMIT
 # binding; analysis=disable is the explicit removal (no var, and the binding may go when the
-# variable is unset). The other summary inputs keep their profile/preserve-only guard. Dispatch is
+# variable is unset; a set variable must name the live binding's config, never replace it). The
+# other summary inputs keep their profile/preserve-only guard. Break-glass: explicit
+# owner_buffered=on/off WITH a directory (input or SESSION_READ_DIRECTORY_WORKSPACES) AND
+# analysis=disable reads no live metadata at all, so it deploys even when the live Worker is split,
+# absent or unreadable (a set SESSION_READ_ANALYSIS_HYPERDRIVE_ID then renders unchecked). Any other
+# explicit dispatch reads live for the analysis guard; with a directory it does not pin that version
+# (no PRESERVED_READER_VERSION, so the pre-deploy live-version check is skipped). Dispatch is
 # Khaliq's call.
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)

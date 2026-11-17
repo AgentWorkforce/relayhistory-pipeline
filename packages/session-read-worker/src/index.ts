@@ -637,17 +637,34 @@ export function summaryFallbackDeps(env: Env, run: TenantRunner, fetcher: typeof
 const ANALYSIS_RESULT_DEADLINE_MS = 10_000;
 /**
  * The most result bytes one GET reads in total (the read returns up to 50 analyses, each at most
- * 8 MiB): past it the request is a 503 (analysis_result_budget), never a partial page.
+ * 8 MiB): past it the request is a 503 (analysis_result_budget), never a partial page. 16 MiB
+ * keeps the parsed results plus the reserialized response well inside the 128 MB isolate.
  */
-export const ANALYSIS_RESULT_REQUEST_BUDGET_BYTES = 32 * 1024 * 1024;
+export const ANALYSIS_RESULT_REQUEST_BUDGET_BYTES = 16 * 1024 * 1024;
 
 type Store = RawStore["store"];
 
+/** The body, erroring (and cancelling the source) once more than `max` bytes have passed. */
+function cappedBody<B extends ReadableStream<Uint8Array>>(body: B, max: number): B {
+  let seen = 0;
+  return body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        seen += chunk.byteLength;
+        if (seen > max) controller.error(new AnalysisResultError("analysis_result_mismatch"));
+        else controller.enqueue(chunk);
+      },
+    }),
+  ) as B;
+}
+
 /**
  * The raw store as the analysis result reader sees it: read only, and get() refuses an object
- * whose response size (content-length) exceeds the size the job row recorded for that key,
- * before reading its body (the body is cancelled). readAnalysisResult still verifies the exact
- * size and SHA-256 of what it read.
+ * whose response size (content-length) exceeds the size the job row recorded for that key, or
+ * that names no size (0) when the row recorded one, before reading its body (the body is
+ * cancelled); the body it does return errors past the recorded size + 1 byte, so a response whose
+ * header understates it is never buffered whole. readAnalysisResult still verifies the exact size
+ * and SHA-256 of what it read.
  */
 function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>): Store {
   const refuse = () => Promise.reject(new Error("session read worker: the analysis result reader does not write"));
@@ -661,11 +678,12 @@ function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>):
     async getObject(key, range) {
       const got = await store.getObject(key, range);
       const want = recorded.get(String(key));
-      if (want === undefined || (Number.isFinite(got.meta.size) && got.meta.size > want)) {
+      const size = got.meta.size;
+      if (want === undefined || !Number.isFinite(size) || size > want || (size === 0 && want > 0)) {
         await got.body.cancel().catch(() => {});
         throw new AnalysisResultError(want === undefined ? "analysis_result_ref_invalid" : "analysis_result_mismatch");
       }
-      return got;
+      return { ...got, body: cappedBody(got.body, want + 1) };
     },
     async get(key, range) {
       return (await this.getObject(key, range)).body;

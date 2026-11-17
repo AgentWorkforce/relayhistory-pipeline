@@ -50,7 +50,8 @@ export const SUMMARY_FLAGS = {
  * The analysis input's values: off (the default; never drops a live analysis flag or ANALYSIS_ADMIT
  * binding, in every mode), on (renders READ_API_ANALYSIS_ENABLED=true), disable (the explicit
  * removal: renders no flag and lets the dispatch drop the live flag and, with
- * SESSION_READ_ANALYSIS_HYPERDRIVE_ID unset, the live binding).
+ * SESSION_READ_ANALYSIS_HYPERDRIVE_ID unset, the live binding; a set variable must name the live
+ * binding's config, so disable never silently replaces it).
  */
 const ANALYSIS_VALUES = ["", "off", "on", "disable"];
 
@@ -58,10 +59,16 @@ const ANALYSIS_VALUES = ["", "off", "on", "disable"];
  * The analysis guard, in every mode (profile, preserve, and explicit owner_buffered=on/off, which
  * otherwise renders its inputs without comparing live): unless analysis=disable, a live
  * READ_API_ANALYSIS_ENABLED=true needs analysis=on, and a live ANALYSIS_ADMIT binding needs
- * SESSION_READ_ANALYSIS_HYPERDRIVE_ID to name the same config.
+ * SESSION_READ_ANALYSIS_HYPERDRIVE_ID to name the same config. With analysis=disable, the variable
+ * must be unset (drop the binding) or name the live binding's config (keep it), never another one.
  */
 export function unchangedAnalysisSettings(version: Version, env: Environment): void {
-  if (env.ANALYSIS === "disable") return;
+  if (env.ANALYSIS === "disable") {
+    const set = (env.ANALYSIS_HYPERDRIVE_ID ?? "").trim();
+    const live = (version.resources?.bindings ?? []).find((b) => b.name === ANALYSIS_ADMIT_BINDING);
+    need(!set || !live || (live.type === "hyperdrive" && live.id === set), `analysis=disable would replace live Hyperdrive binding ${ANALYSIS_ADMIT_BINDING}; unset SESSION_READ_ANALYSIS_HYPERDRIVE_ID to drop it, or keep the live config's id`);
+    return;
+  }
   for (const b of version.resources?.bindings ?? []) {
     if (b.name === SUMMARY_FLAGS.ANALYSIS) {
       need(b.type === "plain_text" && typeof b.text === "string", `Live ${SUMMARY_FLAGS.ANALYSIS} is not plain text; explicit deployment review required`);
@@ -263,14 +270,22 @@ export async function resolveProfile(env: Environment, template: string, get: (p
     const children: Record<string, string> = {};
     for (const key of PROFILE_CHILDREN) children[key] = explicit[key] || (mode === "on" && profile ? profile[key] : key === "OWNER_BUFFERED_WORKSPACES" ? "" : "off");
     const directory = requestedDirectory(env);
-    // Explicit mode renders its inputs without the profile/preserve comparison, but still reads
-    // live for the analysis guard, so an owner_buffered=on/off dispatch never silently drops a
-    // live analysis flag or ANALYSIS_ADMIT binding.
-    const { id, version } = await readLive(get);
-    unchangedAnalysisSettings(version, env);
-    if (directory === undefined) {
-      resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
-    } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
+    if (directory !== undefined && env.ANALYSIS === "disable") {
+      // Break-glass: explicit owner_buffered=on/off with a directory and analysis=disable contacts
+      // no live metadata at all (it works with the live Worker split, absent or unreadable). It
+      // cannot compare live, so SESSION_READ_ANALYSIS_HYPERDRIVE_ID, if set, renders as given.
+      resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
+    } else {
+      // Otherwise explicit mode renders its inputs without the profile/preserve comparison, but
+      // still reads live for the analysis guard, so an owner_buffered=on/off dispatch never
+      // silently drops a live analysis flag or ANALYSIS_ADMIT binding. With a directory given,
+      // the version read here is not pinned (no PRESERVED_READER_VERSION).
+      const { id, version } = await readLive(get);
+      unchangedAnalysisSettings(version, env);
+      if (directory === undefined) {
+        resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
+      } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
+    }
   }
   // Use the same validation as the real render: no weaker second interpretation of privacy flags.
   renderDeployConfig(template, profileInputs({ ...env, ...resolved }));
