@@ -33,6 +33,7 @@ import {
   processSessionAnalysis,
   runAnalysisJob,
   type AnalysisJob,
+  type AnalysisJobOutput,
   type AnalysisJobStore,
 } from "../processor.ts";
 import {
@@ -410,6 +411,33 @@ describe("runAnalysisJob", () => {
     const refused = memoryStore(job(), { refuseReserve: true });
     expect(await runAnalysisJob(refused.store, { evidence: deps(), transport: fakeTransport() })).toBe("lease-lost");
     expect(refused.calls.map((c) => c[0])).toEqual(["claim", "reserve"]);
+  });
+
+  test("onCompleted runs once, only after complete; it never changes the outcome", async () => {
+    const hooked: string[] = [];
+    const onCompleted = async (j: AnalysisJob, out: AnalysisJobOutput) => { hooked.push(`${j.id}:${out.sourceFingerprint.length > 0}`); };
+    const ok = memoryStore(job());
+    expect(await runAnalysisJob(ok.store, { evidence: deps(), transport: fakeTransport(), onCompleted })).toBe("completed");
+    expect(hooked).toEqual([`${JOB_ID}:true`]);
+    // Flag off (no hook): the same store calls in the same order. The result digest differs
+    // between any two runs (the result carries its generation time), so it is masked.
+    const plain = memoryStore(job());
+    expect(await runAnalysisJob(plain.store, { evidence: deps(), transport: fakeTransport() })).toBe("completed");
+    const masked = (calls: unknown) => JSON.stringify(calls).replace(/[0-9a-f]{64}/gu, "<sha256>");
+    expect(masked(plain.calls)).toBe(masked(ok.calls));
+    const lost = memoryStore(job(), { lose: true });
+    expect(await runAnalysisJob(lost.store, { evidence: deps(), transport: fakeTransport(), onCompleted })).toBe("lease-lost");
+    const refused = memoryStore(job(), { refuseReserve: true });
+    expect(await runAnalysisJob(refused.store, { evidence: deps(), transport: fakeTransport(), onCompleted })).toBe("lease-lost");
+    expect(hooked.length).toBe(1);
+    // A throwing hook: still completed, and the job is never failed after its completion.
+    const throwing = memoryStore(job());
+    const outcome = await runAnalysisJob(throwing.store, {
+      evidence: deps(), transport: fakeTransport(),
+      onCompleted: async () => { throw new Error("sink down"); },
+    });
+    expect(outcome).toBe("completed");
+    expect(throwing.calls.map((c) => c[0])).toEqual(["claim", "reserve", "put", "complete"]);
   });
 
   test("persists only controlled codes", async () => {
