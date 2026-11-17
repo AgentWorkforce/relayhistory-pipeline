@@ -1,4 +1,13 @@
-import { checkHyperdriveConfig } from "./hyperdrive-config.ts";
+import { checkHyperdriveConfig, parseHyperdriveRole, type HyperdriveRole } from "./hyperdrive-config.ts";
+
+// HYPERDRIVE_ROLE: read_api (default, the SUPABASE binding) or analysis_admit (the ANALYSIS_ADMIT binding).
+let role: HyperdriveRole;
+try {
+  role = parseHyperdriveRole(process.env.HYPERDRIVE_ROLE);
+} catch (error) {
+  console.error(`hyperdrive check: ${(error as Error).message}`);
+  process.exit(1);
+}
 
 const id = process.env.HYPERDRIVE_ID?.trim();
 const caId = process.env.EXPECTED_CA_ID?.trim();
@@ -19,8 +28,8 @@ try {
   process.exit(1);
 }
 
-const report = checkHyperdriveConfig(body, { id, caId });
-console.log(JSON.stringify({ checks: report.checks }));
+const report = checkHyperdriveConfig(body, { id, caId, role });
+console.log(JSON.stringify({ role, checks: report.checks }));
 if (!report.ok) {
   const failed = Object.entries(report.checks).filter(([, ok]) => !ok).map(([field]) => field);
   console.error(`hyperdrive check failed: ${failed.join(",")}`);

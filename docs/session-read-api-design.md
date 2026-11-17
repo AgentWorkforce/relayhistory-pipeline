@@ -173,7 +173,7 @@ A self-host's relaycontrol proxies History reads with a user's `sh_at_` token. T
 
 ## 6. Out of scope here
 
-- Brief, analysis, turns, digest and onboarding.
+- Brief, analysis, turns, digest and onboarding (the Worker now serves analysis behind a flag: section 9).
 - Hybrid search.
 - Cloud's direct `sessions.*` SQL readers.
 - Delivery and auth for uploads.
@@ -373,3 +373,43 @@ secrets with GetObject on the summary objects. Not preserved from live, like the
 summary inputs. The self-host service and the hosted Lambda do not wire the fallback.
 
 **Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.
+
+## 9. Session analysis on the Worker (lane F1, `READ_API_ANALYSIS_ENABLED`, default off)
+
+The analysis contract (`GET` / `POST /v1/sessions/:sessionId/analysis`, `src/session-read-api/app.ts`, migration `20261105046000`) was wired only on the hosted Lambda (`lambda.ts`, `sqlAnalysisSource`). The Worker now wires the same `AnalysisDeps` (`packages/session-read-worker/src/index.ts` `analysisDeps`), behind one flag. This is a different lane from `/v1/canonical/analyses/` (`analysis-cache.ts`), which is unchanged.
+
+**Flag off (`READ_API_ANALYSIS_ENABLED` anything but exactly `true`, the default): byte-identical to before.** `GET` answers 501 `unsupported_by_backend` with reason `analysis_not_configured`; `POST` (and every other non-GET) answers 405 `method_not_allowed` with `Allow: GET`. No analysis SQL runs, no admission connection opens and no result object is read.
+
+**Flag on.**
+
+| request | answer |
+|---|---|
+| `GET /v1/sessions/:id/analysis?workspace=` | 200 `{sessionId, requests, analyses, correlationId}` (relayhistory's v1 read; `analyses[].result` from the verified result object, `resultRef`/`origin`/`harness` never on the wire); 404 `not_found`; 400 `source_mismatch`; 503 `backend_unavailable` for a missing, resized or altered result object |
+| `POST /v1/sessions/:id/analysis?workspace=` | 202 `{request}`, 404 `not_found`, 429 `rate_limited` (`Retry-After: 86400`), 400 `invalid_request`; 403 without `rth:sync`; 501 `analysis_admission_not_configured` without the `ANALYSIS_ADMIT` binding |
+| either, without the `PIPELINE_RAW_S3_*` raw store | 501 `analysis_not_configured` |
+| any other non-GET (another path, a trailing slash or longer path, `PUT`/`PATCH`/`DELETE`) | 405 `method_not_allowed`, `Allow: GET` |
+
+Both methods keep the app's gates: `attestWorkspace` (the `workspace` must be the token's), the canary allowlist (`READ_API_DIRECTORY_WORKSPACES`, route `analysis`) and the live-harness uniqueness check (`source_mismatch`).
+
+**Wiring.**
+
+- *Read side:* `sessions.analysis_read_v1` and the live-harness query run on the request's existing tenant runner (`requestTenantRunner`: `bulls96_read_api` through `SUPABASE`, `BEGIN READ ONLY`, `TENANT_SETTINGS_SQL` bound from the verified identity). The result object is read from the pipeline raw bucket (the canonical store the analysis worker publishes to) with the Worker's `PIPELINE_RAW_S3_*` secrets (`rawStoreFromEnv`, the store the summary fallback and timing reads use), bounded at 10 s per store call. The key, SHA-256 and size come from the job row the read function returned (server data); the key must match `…/normalized/session-analysis-v2/<uuid>/<sha256>.json` (`session-analysis/read.ts`), and `readAnalysisResult` refuses an object whose size or digest differs. Nothing from the request goes into the key.
+- *Admission side:* a second, optional Hyperdrive binding `ANALYSIS_ADMIT` connects as `bulls96_analysis_admit` (its own Hyperdrive config, caching disabled). `perRequestAdmitPool` (`src/session-read-api/analysis-source.ts`) gives `sqlAnalysisAdmit` the `AdmitPool` `connect()`/`release()` it expects over one fresh client per admission: `BEGIN` (read-write), `TENANT_SETTINGS_SQL`, `sessions.analysis_request_v1`, `COMMIT`, or `ROLLBACK` on any failure; the client is closed on release and, in `waitUntil`, any client never released. It never shares the read role's client. Without the binding, `POST` is 501 `analysis_admission_not_configured` and `GET` still serves.
+
+**Privacy and fences (the DB functions; no new fence work here, #614 is separate).** In `supabase/migrations/20261105046000_analysis_jobs.sql`:
+
+- `analysis_read_v1` takes its org from `sessions.session_directory_read_api_scope(p_workspace_id)` (line 748), which pins the read role's bound tenant, and filters every request and job row by that org and workspace. It answers `not_found` for a session with no live pointer and no request (lines 755-762) and for a session behind a purge fence that has not been re-uploaded since (lines 763-770). EXECUTE is granted to `bulls96_read_api` only (line 826).
+- `analysis_request_v1` first calls `sessions.session_analysis_admit_scope` (line 635; defined at 393-409), which refuses (42501) unless the caller is `bulls96_analysis_admit` and the org and workspace equal the transaction's bound `bulls96_read.*` settings. It takes the per-org and per-scope advisory locks the purge takes (637-640), answers `not_found` for a session with no live pointer (641-646) or behind a purge fence (648-655), and applies relayhistory's rate limits. EXECUTE is granted to `bulls96_analysis_admit` only (line 827).
+- Erasure: the forget triggers (lines 435-448) delete a tombstoned or deleted session's analysis rows and ticket its result objects for the sweeper.
+
+**Deploy (Khaliq's call).** The workflow input `analysis` (`off`/`on`, default `off`) adds `--var READ_API_ANALYSIS_ENABLED:true` to the deploy command. Like the summary inputs it is not preserved from live; the live-settings guard (`resolve-deploy-profile.ts` `SUMMARY_FLAGS`) refuses a dispatch that would drop a live one. An `on` dispatch fails before `wrangler deploy` unless the `PIPELINE_RAW_S3_*` secrets exist (names only). The binding is rendered by `scripts/render-deploy-config.ts` only when the GitHub environment variable `SESSION_READ_ANALYSIS_HYPERDRIVE_ID` is set (32 hex, not the read role's id); unset renders byte-identically to before. When it is set, the workflow first checks the live config with `check-hyperdrive-config.ts` `HYPERDRIVE_ROLE=analysis_admit`: caching disabled, `verify-full` against the uploaded Supabase CA, the same pooler host, port, scheme and database as the read role, and the admission role's pooler user. The guard also refuses a dispatch that would drop or change a live `ANALYSIS_ADMIT` binding.
+
+**Operator steps, in order (no values here; they live in 1Password and the private ops repository):**
+
+1. Database (approved operator step): make `bulls96_analysis_admit` `LOGIN` with a new password generated into 1Password, with role defaults `statement_timeout=2s` and `default_transaction_read_only=off` (the RDS activation profile's values). Verify it is still a member of no role and has no members.
+2. Hyperdrive: create a config whose origin is the admission role's pooler URL (that password is stored only as the Hyperdrive origin), with caching disabled and mTLS `verify-full` against the same uploaded Supabase CA as the read role's config.
+3. GitHub: set `SESSION_READ_ANALYSIS_HYPERDRIVE_ID` on the `session-read-worker` environment to that config's id.
+4. IAM: make sure the Worker's `PIPELINE_RAW_S3_*` principal can `GetObject` (and `kms:Decrypt`) the `normalized/session-analysis-v2/*` objects in the raw bucket.
+5. Deploy with `analysis=on` (repeat it on every later dispatch). Canary through `READ_API_DIRECTORY_WORKSPACES`.
+
+Out of scope here: the analysis job processor and its evidence reads (canonical S3, not Neon), and the census-seal gate for S3-only sessions.

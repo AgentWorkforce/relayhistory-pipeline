@@ -33,12 +33,16 @@ const FLAGS = {
   OWNER_BUFFERED_INDEX_VERIFY: ["READ_API_OWNER_BUFFERED_INDEX_VERIFY", ["on"]],
   BUFFERED_SEARCH_GATE: ["READ_API_BUFFERED_SEARCH_GATE", ["on"]],
 } as const;
-/** Deploy-command-only flags (--var, never the render): an "on" input renders exactly "true"; off renders nothing. */
+/**
+ * Deploy-command-only flags (--var, never the render): an "on" input renders exactly "true"; off renders
+ * nothing. Never preserved from live: a dispatch that would drop a live one is refused (unchangedOtherSettings).
+ */
 export const SUMMARY_FLAGS = {
   BRIEF_SUMMARY: "READ_API_BRIEF_SUMMARY_ENABLED",
   LIST_SHORT_SUMMARY: "READ_API_LIST_SHORT_SUMMARY_ENABLED",
   SUMMARY_FALLBACK: "READ_API_SUMMARY_FALLBACK_ENABLED",
   SUMMARY_SEARCH: "READ_API_SUMMARY_SEARCH_ENABLED",
+  ANALYSIS: "READ_API_ANALYSIS_ENABLED",
 } as const;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -190,6 +194,7 @@ export function profileInputs(env: Environment): RenderInputs {
     ownerBufferedStageConcurrency: env.OWNER_BUFFERED_STAGE_CONCURRENCY,
     ownerBufferedPhaseLog: env.OWNER_BUFFERED_PHASE_LOG, ownerBufferedIndexVerify: env.OWNER_BUFFERED_INDEX_VERIFY,
     ownerBufferedStatementTimeoutMs: env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
+    analysisHyperdriveId: env.ANALYSIS_HYPERDRIVE_ID,
   };
 }
 

@@ -11,9 +11,12 @@ import type pg from "pg";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
-import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
+import { boundedClickHouse, connectPg, handle, methodAllowed, ownerBufferedDeps, type Env } from "../src/index.ts";
 import { BufferedFenced, BufferedIndexVerifier } from "../../../src/session-read-api/owner-buffered.ts";
 import { BRIEF_SUMMARY_SIGNATURE } from "../../../src/session-read-api/brief-summary.ts";
+import { ANALYSIS_ADMIT_SQL, ANALYSIS_READ_SQL } from "../../../src/session-read-api/analysis-source.ts";
+import { SESSION_HARNESSES_SQL } from "../../../src/session-read-api/session-turns-source.ts";
+import { TENANT_SETTINGS_SQL } from "../../../src/session-read-api/liveness.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -868,5 +871,216 @@ describe("bulls96_read_api through Hyperdrive", () => {
       await expect(c.query("SELECT * FROM sessions.session_index LIMIT 1")).rejects.toMatchObject({ code: "42501" });
       await expect(c.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 'cols'")).rejects.toMatchObject({ code: expect.stringMatching(/^(25006|42501)$/) });
     });
+  });
+});
+
+describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
+  const RAW = { PIPELINE_RAW_S3_BUCKET: "raw-bucket-example", PIPELINE_RAW_S3_REGION: "us-east-1", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+  const JOB = "0b9f6a3e-5c1d-4e2f-8a7b-6c5d4e3f2a1b";
+  const result = { schemaVersion: 2, summary: "fixture analysis" };
+  const resultBytes = new TextEncoder().encode(JSON.stringify(result));
+  const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+  interface Fake { seen: Array<{ text: string; params?: unknown[] }>; ended: number; connects: number }
+  /** A fake pg client factory: records every statement; answers the harness and analysis SQL. */
+  const fakePg = (answer: (text: string, params?: unknown[]) => unknown[] | Error) => {
+    const f: Fake = { seen: [], ended: 0, connects: 0 };
+    const connect = async () => {
+      f.connects++;
+      return {
+        async query(text: string, params?: unknown[]) {
+          f.seen.push({ text, params });
+          const rows = answer(text, params);
+          if (rows instanceof Error) throw rows;
+          return { rows };
+        },
+        async end() { f.ended++; },
+      } as unknown as pg.Client;
+    };
+    return { f, connect };
+  };
+
+  const setup = async (t: Tenant) => {
+    const sha = hex(await crypto.subtle.digest("SHA-256", resultBytes));
+    const key = `${t.org}/${t.ws}/m-1/claude/2026-10-29/s-1/normalized/session-analysis-v2/${JOB}/${sha}.json`;
+    const rpc = {
+      outcome: "ok",
+      sessionId: "s-1",
+      requests: [{ id: "r-1", sessionId: "s-1", status: "completed", analysisId: JOB }],
+      analyses: [{ id: JOB, sessionId: "s-1", status: "completed", resultRef: { key, sha256: sha, bytes: resultBytes.length }, origin: "native", harness: "claude" }],
+    };
+    const read = fakePg((text) => (text === SESSION_HARNESSES_SQL ? [{ harness: "claude", pointers: 1, live: 1 }] : text === ANALYSIS_READ_SQL ? [{ r: rpc }] : []));
+    const fetched: string[] = [];
+    // The raw store: answers only the key the job row names; any other object is a 404.
+    const fetcher = (async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      fetched.push(decodeURIComponent(url.pathname));
+      if (decodeURIComponent(url.pathname).endsWith(key)) return new Response(resultBytes, { status: 200, headers: { "content-length": String(resultBytes.length), etag: '"e"' } });
+      return new Response("<Error><Code>NoSuchKey</Code></Error>", { status: 404 });
+    }) as typeof fetch;
+    return { key, rpc, read, fetched, fetcher };
+  };
+
+  const call = async (t: Tenant, method: string, path: string, over: Partial<Env>, overrides: Parameters<typeof handle>[3], scopes = ["rth:read", "rth:sync"]) => {
+    const ctx = createExecutionContext();
+    const r = await handle(new Request(`${ORIGIN}${path}`, { method, headers: { authorization: `Bearer ${await token(t, { scopes })}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, ...over }, ctx, overrides);
+    await waitOnExecutionContext(ctx);
+    return r;
+  };
+  const analysisSql = (f: Fake) => f.seen.filter((q) => q.text === ANALYSIS_READ_SQL || q.text === ANALYSIS_ADMIT_SQL);
+
+  test("methodAllowed: GET everywhere; POST only on exactly /v1/sessions/:id/analysis with the exact flag", () => {
+    const on = { READ_API_ANALYSIS_ENABLED: "true" };
+    expect(methodAllowed("GET", "/v1/events", {})).toBe(true);
+    expect(methodAllowed("POST", "/v1/sessions/s-1/analysis", on)).toBe(true);
+    for (const flag of [undefined, "", "1", "TRUE", " true", "true ", "on"]) expect(methodAllowed("POST", "/v1/sessions/s-1/analysis", { READ_API_ANALYSIS_ENABLED: flag }), String(flag)).toBe(false);
+    for (const path of ["/v1/events", "/v1/sessions/s-1/summary", "/v1/sessions/s-1/analysis/", "/v1/sessions/s-1/analysis/x", "/v1/sessions//analysis", "/v1/sessions/a/b/analysis", "/v2/sessions/s-1/analysis", "/v1/sessions/s-1/analysisx", "/v1/coordination/advisories/a-1/ack"]) {
+      expect(methodAllowed("POST", path, on), path).toBe(false);
+    }
+    for (const method of ["PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]) expect(methodAllowed(method, "/v1/sessions/s-1/analysis", on), method).toBe(false);
+  });
+
+  test("flag off (every value but exactly \"true\"): GET 501 analysis_not_configured, POST 405, no analysis SQL, no admission connection, no object read", async () => {
+    const t = tenant();
+    const { read, fetched, fetcher } = await setup(t);
+    const admit = fakePg(() => []);
+    for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
+      const g = await call(t, "GET", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: flag }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+      expect(g.status, String(flag)).toBe(501);
+      expect((await body(g)).error, String(flag)).toMatchObject({ code: "unsupported_by_backend", reason: "analysis_not_configured" });
+      const p = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: flag }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+      expect(p.status, String(flag)).toBe(405);
+      expect(p.headers.get("allow")).toBe("GET");
+      expect(await p.json()).toEqual({ error: { code: "method_not_allowed", message: "GET only" } });
+    }
+    expect(analysisSql(read.f)).toHaveLength(0);
+    expect(admit.f.connects).toBe(0);
+    expect(fetched).toHaveLength(0);
+  });
+
+  test("flag on: every other non-GET stays 405", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const admit = fakePg(() => []);
+    for (const [method, path] of [["POST", `/v1/events?workspace=${t.ws}&q=x`], ["POST", `/v1/sessions/s-1/summary?workspace=${t.ws}`], ["POST", `/v1/sessions/s-1/analysis/x?workspace=${t.ws}`], ["PUT", `/v1/sessions/s-1/analysis?workspace=${t.ws}`], ["DELETE", `/v1/sessions/s-1/analysis?workspace=${t.ws}`], ["PATCH", `/v1/sessions/s-1/analysis?workspace=${t.ws}`]] as const) {
+      const r = await call(t, method, path, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+      expect(r.status, `${method} ${path}`).toBe(405);
+      expect(r.headers.get("allow")).toBe("GET");
+    }
+    expect(admit.f.connects).toBe(0);
+  });
+
+  test("flag on without the raw store: GET and POST 501 analysis_not_configured", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    for (const method of ["GET", "POST"]) {
+      const r = await call(t, method, `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, fetcher });
+      expect(r.status, method).toBe(501);
+      expect((await body(r)).error, method).toMatchObject({ reason: "analysis_not_configured" });
+    }
+  });
+
+  test("flag on: GET serves the contract, the read as bulls96_read_api in a READ ONLY tenant transaction and the object at the job row's key", async () => {
+    const t = tenant();
+    const { key, read, fetched, fetcher } = await setup(t);
+    const r = await call(t, "GET", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, fetcher });
+    expect(r.status).toBe(200);
+    expect(r.headers.get("cache-control")).toContain("no-store");
+    const b = await body(r);
+    expect(b.sessionId).toBe("s-1");
+    expect(b.requests).toEqual([{ id: "r-1", sessionId: "s-1", status: "completed", analysisId: JOB }]);
+    expect(b.analyses).toEqual([{ id: JOB, sessionId: "s-1", status: "completed", result }]);
+    expect(JSON.stringify(b)).not.toContain("resultRef");
+    // The read: the workspace from the verified token and the path's session, in a tenant-bound READ ONLY transaction.
+    const q = read.f.seen.find((x) => x.text === ANALYSIS_READ_SQL);
+    expect(q?.params).toEqual([t.ws, "s-1"]);
+    const i = read.f.seen.indexOf(q!);
+    expect(read.f.seen.slice(0, i).map((x) => x.text)).toContain(TENANT_SETTINGS_SQL);
+    expect(read.f.seen.find((x) => x.text.startsWith("BEGIN"))?.text).toMatch(/READ ONLY/);
+    expect(read.f.seen.some((x) => x.text === ANALYSIS_ADMIT_SQL)).toBe(false);
+    // The object: exactly the key the row recorded, in the raw bucket.
+    expect(fetched).toHaveLength(1);
+    expect(fetched[0]!.endsWith(key)).toBe(true);
+    expect(fetched[0]).toContain("raw-bucket-example");
+  });
+
+  test("flag on: an altered result object is a 503, never the bytes", async () => {
+    const t = tenant();
+    const { key, read } = await setup(t);
+    const tampered = (async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (decodeURIComponent(url.pathname).endsWith(key)) return new Response(new TextEncoder().encode(JSON.stringify({ ...result, summary: "other text!" })), { status: 200 });
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    const r = await call(t, "GET", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, fetcher: tampered });
+    expect(r.status).toBe(503);
+    expect(JSON.stringify(await body(r))).not.toContain("other text");
+  });
+
+  test("flag on without ANALYSIS_ADMIT: POST 501 analysis_admission_not_configured; GET still serves", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const over = { ...RAW, READ_API_ANALYSIS_ENABLED: "true", ANALYSIS_ADMIT: undefined };
+    const p = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, over, { connect: read.connect, fetcher });
+    expect(p.status).toBe(501);
+    expect((await body(p)).error).toMatchObject({ reason: "analysis_admission_not_configured" });
+    expect((await call(t, "GET", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, over, { connect: read.connect, fetcher })).status).toBe(200);
+    expect(read.f.seen.some((x) => x.text === ANALYSIS_ADMIT_SQL)).toBe(false);
+  });
+
+  test("flag on with the admission principal: POST 202 through its own client, BEGIN / tenant / admit / COMMIT, closed after the response", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const request = { id: "r-2", sessionId: "s-1", status: "queued", analysisId: JOB };
+    const admit = fakePg((text) => (text === ANALYSIS_ADMIT_SQL ? [{ r: { outcome: "accepted", request } }] : []));
+    const r = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+    expect(r.status).toBe(202);
+    expect((await body(r)).request).toEqual(request);
+    expect(admit.f.seen.map((x) => x.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
+    expect(admit.f.seen[1]!.params).toEqual([t.org, t.ws]);
+    expect(admit.f.seen[2]!.params).toEqual([t.org, t.ws, t.user, "s-1"]);
+    expect(admit.f.connects).toBe(1);
+    expect(admit.f.ended).toBe(1);
+    // The read role's client never runs the admission; the admission's never runs a read.
+    expect(read.f.seen.some((x) => x.text === ANALYSIS_ADMIT_SQL)).toBe(false);
+    expect(admit.f.seen.some((x) => x.text === ANALYSIS_READ_SQL || x.text === SESSION_HARNESSES_SQL)).toBe(false);
+    // Rate limited and not found keep relayhistory's statuses.
+    for (const [outcome, status] of [["rate_limited", 429], ["not_found", 404]] as const) {
+      const a = fakePg((text) => (text === ANALYSIS_ADMIT_SQL ? [{ r: { outcome } }] : []));
+      const x = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: a.connect, fetcher });
+      expect(x.status, outcome).toBe(status);
+      expect(a.f.ended, outcome).toBe(1);
+    }
+  });
+
+  test("flag on: a failing admission rolls back and is a 5xx; POST without rth:sync is 403 and opens no admission connection", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const failing = fakePg((text) => (text === ANALYSIS_ADMIT_SQL ? Object.assign(new Error("tenant binding missing or not this tenant"), { code: "42501" }) : []));
+    const r = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: failing.connect, fetcher });
+    expect(r.status).toBeGreaterThanOrEqual(500);
+    expect(JSON.stringify(await body(r))).not.toContain("tenant binding");
+    expect(failing.f.seen.map((x) => x.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "ROLLBACK"]);
+    expect(failing.f.ended).toBe(1);
+    const unscoped = fakePg(() => []);
+    const f = await call(t, "POST", `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: unscoped.connect, fetcher }, ["rth:read"]);
+    expect(f.status).toBe(403);
+    expect(unscoped.f.connects).toBe(0);
+  });
+
+  test("flag on: the canary allowlist and the token's workspace still gate both methods", async () => {
+    const t = tenant();
+    const { read, fetcher } = await setup(t);
+    const admit = fakePg(() => []);
+    for (const method of ["GET", "POST"]) {
+      const off = await call(t, method, `/v1/sessions/s-1/analysis?workspace=${t.ws}`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true", READ_API_DIRECTORY_WORKSPACES: "" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+      expect(off.status, method).toBe(501);
+      const other = await call(t, method, `/v1/sessions/s-1/analysis?workspace=ws-not-mine`, { ...RAW, READ_API_ANALYSIS_ENABLED: "true" }, { connect: read.connect, connectAnalysisAdmit: admit.connect, fetcher });
+      expect(other.status, method).toBeGreaterThanOrEqual(400);
+      expect(other.status, method).not.toBe(200);
+      expect(other.status, method).not.toBe(202);
+    }
+    expect(admit.f.connects).toBe(0);
+    expect(analysisSql(read.f)).toHaveLength(0);
   });
 });

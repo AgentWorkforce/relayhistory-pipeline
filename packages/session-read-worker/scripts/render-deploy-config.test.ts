@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -462,6 +462,97 @@ describe("deploy workflow wiring", () => {
   });
 });
 
+
+describe("deploy config render, analysis admission binding (SESSION_READ_ANALYSIS_HYPERDRIVE_ID)", () => {
+  const AD = "fedcba9876543210fedcba9876543210";
+  const admitBindings = (config: Record<string, any>) => (config.hyperdrive as Array<{ binding: string; id: string }>).filter((h) => h.binding === ANALYSIS_ADMIT_BINDING);
+
+  test("unset or empty: byte-identical to the render without the input, in every mode", () => {
+    for (const analysisHyperdriveId of [undefined, "", "  "]) {
+      expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, analysisHyperdriveId })).toBe(sedRender(HD));
+      expect(renderDeployConfig(TEMPLATE, { ...ON, analysisHyperdriveId })).toBe(renderDeployConfig(TEMPLATE, ON));
+      expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, bufferedSearchGate: "on", analysisHyperdriveId })).toBe(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, bufferedSearchGate: "on" }));
+    }
+    expect(TEMPLATE).not.toContain(ANALYSIS_ADMIT_BINDING);
+  });
+
+  test("set: adds exactly one ANALYSIS_ADMIT Hyperdrive binding after SUPABASE and changes nothing else", () => {
+    const base = parse(renderDeployConfig(TEMPLATE, { hyperdriveId: HD }));
+    const config = parse(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, analysisHyperdriveId: ` ${AD} ` }));
+    expect(config.hyperdrive).toEqual([...base.hyperdrive, { binding: ANALYSIS_ADMIT_BINDING, id: AD }]);
+    expect(config.hyperdrive[0]).toEqual({ binding: "SUPABASE", id: HD });
+    const { hyperdrive: _a, ...rest } = config;
+    const { hyperdrive: _b, ...baseRest } = base;
+    expect(rest).toEqual(baseRest);
+    expect(config.vars.READ_API_ANALYSIS_ENABLED).toBeUndefined();
+    expect(config.services).toBeUndefined();
+  });
+
+  test("composes with owner_buffered=on and the search gate (the binding once, every other key unchanged)", () => {
+    for (const inputs of [ON, { hyperdriveId: HD, bufferedSearchGate: "on" }, { ...ON, bufferedSearchGate: "on", ownerBufferedEvents: "on" }] as RenderInputs[]) {
+      const base = parse(renderDeployConfig(TEMPLATE, inputs));
+      const config = parse(renderDeployConfig(TEMPLATE, { ...inputs, analysisHyperdriveId: AD }));
+      expect(admitBindings(config)).toEqual([{ binding: ANALYSIS_ADMIT_BINDING, id: AD }]);
+      expect({ ...config, hyperdrive: undefined }).toEqual({ ...base, hyperdrive: undefined });
+    }
+  });
+
+  test("refuses a malformed id, all zeros, and the read role's own Hyperdrive config", () => {
+    for (const analysisHyperdriveId of ["xyz", "0".repeat(32), "A".repeat(32), "a".repeat(31), "a".repeat(33)]) {
+      expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, analysisHyperdriveId }), analysisHyperdriveId).toThrow(/SESSION_READ_ANALYSIS_HYPERDRIVE_ID must be/);
+    }
+    expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, analysisHyperdriveId: HD })).toThrow(/must not be the read role's Hyperdrive config/);
+  });
+
+  test("refuses a template that already declares ANALYSIS_ADMIT, in every mode (also without the input)", () => {
+    const declared = TEMPLATE.replace('"binding": "SUPABASE",', '"binding": "SUPABASE",\n      "x": 1\n    },\n    {\n      "binding": "ANALYSIS_ADMIT", "id": "00000000000000000000000000000001",');
+    expect(declared).toContain('"ANALYSIS_ADMIT"');
+    for (const inputs of [{ hyperdriveId: HD }, { hyperdriveId: HD, analysisHyperdriveId: AD }, ON] as RenderInputs[]) {
+      expect(() => renderDeployConfig(declared, inputs)).toThrow(/must not declare the ANALYSIS_ADMIT Hyperdrive binding/);
+    }
+  });
+
+  test("the CLI renders it from ANALYSIS_HYPERDRIVE_ID", () => {
+    expect(readFileSync(here("./render-deploy-config.ts"), "utf8")).toContain("analysisHyperdriveId: process.env.ANALYSIS_HYPERDRIVE_ID");
+  });
+});
+
+describe("deploy workflow wiring, analysis", () => {
+  const step = (name: string) => { const i = WORKFLOW.indexOf(`      - name: ${name}`); expect(i, name).toBeGreaterThan(0); return i; };
+
+  test("analysis: default off; on adds only the exact \"true\" --var, never the template", () => {
+    expect(WORKFLOW).toMatch(/analysis:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("ANALYSIS: ${{ inputs.analysis }}");
+    expect(WORKFLOW).toContain(`case "$ANALYSIS" in off|on) ;; *) fail 'analysis must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain('analysis=""; if [ "$ANALYSIS" = "on" ]; then analysis=true; fi');
+    expect(WORKFLOW).toContain('${analysis:+--var "READ_API_ANALYSIS_ENABLED:$analysis"}');
+    expect(TEMPLATE).not.toContain("READ_API_ANALYSIS_ENABLED");
+  });
+
+  test("the admission Hyperdrive id comes from the environment variable only, is validated, and is checked live before render", () => {
+    expect(WORKFLOW).toContain("ANALYSIS_HYPERDRIVE_ID: ${{ vars.SESSION_READ_ANALYSIS_HYPERDRIVE_ID }}");
+    expect(WORKFLOW).not.toContain("inputs.analysis_hyperdrive");
+    expect(WORKFLOW).toContain('[ "$ANALYSIS_HYPERDRIVE_ID" != "$HYPERDRIVE_ID" ] || fail');
+    const check = step("Check the live admission Hyperdrive safety contract (only when SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set)");
+    const render = step("Render the deploy config (Hyperdrive id; control-head binding and flags only when owner_buffered or buffered_search_gate is on)");
+    expect(check).toBeLessThan(render);
+    const body = WORKFLOW.slice(check, render);
+    expect(body).toContain("if: env.ANALYSIS_HYPERDRIVE_ID != ''");
+    expect(body).toContain("hyperdrive/configs/$ANALYSIS_HYPERDRIVE_ID");
+    expect(body).toContain('HYPERDRIVE_ID="$ANALYSIS_HYPERDRIVE_ID" HYPERDRIVE_ROLE=analysis_admit bun run scripts/check-hyperdrive-config.ts');
+    expect(body).toContain("set -o pipefail");
+  });
+
+  test("analysis=on: the raw-store secret check runs before wrangler deploy", () => {
+    const check = step("Check the analysis Worker secrets exist before deploying (names only; analysis=on only)");
+    const deploy = step("Deploy");
+    expect(check).toBeLessThan(deploy);
+    const body = WORKFLOW.slice(check, deploy);
+    expect(body).toContain("if: env.ANALYSIS == 'on'");
+    expect(body).toContain("for n in PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do");
+    expect(body).toContain("exit 1");
+  });
+});
 
 describe("047010 exact-session RPC render", () => {
   test("default/off leaves the render byte-identical; on adds only its flag", () => {

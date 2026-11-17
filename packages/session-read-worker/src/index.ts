@@ -12,6 +12,14 @@
  *               One pg client per request; every check is one READ ONLY
  *               transaction that binds the tenant settings the role's RLS
  *               policy reads (liveness.ts TENANT_SETTINGS_SQL).
+ *   Admission   only with READ_API_ANALYSIS_ENABLED=true: the separate
+ *               `bulls96_analysis_admit` role through its own optional Hyperdrive
+ *               binding ANALYSIS_ADMIT (caching disabled, verify-full), one client
+ *               per admission, one READ WRITE transaction that binds the tenant
+ *               and calls sessions.analysis_request_v1. Never the read role's client.
+ *
+ * Methods: GET everywhere. POST only on exactly /v1/sessions/:sessionId/analysis and only
+ * with READ_API_ANALYSIS_ENABLED=true (the analysis admission); every other non-GET is 405.
  *
  * Env (wrangler.jsonc vars, set by the deploy workflow): READ_API_ORIGIN (this
  * Worker's own origin, the only audience accepted; unset = every /v1 request
@@ -27,9 +35,11 @@
  * the existing ClickHouse facts; every other value = 404),
  * READ_API_COORDINATION_ADVISORIES_ENABLED (exactly "true": GET /v1/coordination/advisories
  * through the 20261105062000 read functions; every other value = 501 unsupported_by_backend,
- * reason advisories_disabled). The POST ack is never served here: this Worker is GET-only and
- * its tenant transactions are READ ONLY, so the ack is a 405 and is served by the self-host
- * service),
+ * reason advisories_disabled). The POST ack is never served here: its tenant transactions are
+ * READ ONLY, so the ack is a 405 and is served by the self-host service),
+ * READ_API_ANALYSIS_ENABLED (exactly "true": GET and POST /v1/sessions/:sessionId/analysis, lane
+ * F1, migration 20261105046000, src/session-read-api/analysis-source.ts; see analysisDeps below;
+ * every other value = GET 501 analysis_not_configured and POST 405, exactly as before the flag),
  * READ_API_BRIEF_SUMMARY_ENABLED (exactly "true": GET /v1/sessions/:id/summary through the
  * brief-summary SQL, as the hosted Lambda; every other value = 501 summary_not_configured),
  * READ_API_SUMMARY_FALLBACK_ENABLED (exactly "true", with READ_API_BRIEF_SUMMARY_ENABLED: the
@@ -111,6 +121,8 @@ import { pointerSummaryFallback, type SummaryFallback } from "../../../src/sessi
 import { masterKeyring, parseMasterKeys } from "../../../src/shared/keyring.ts";
 import type { WorkspaceKeyring } from "../../../src/bob-costas/summary-objects.ts";
 import { sqlMemoryDocuments } from "../../../src/session-read-api/memory-documents.ts";
+import { perRequestAdmitPool, sqlAnalysisSource, type AdmitPool } from "../../../src/session-read-api/analysis-source.ts";
+import type { AnalysisDeps } from "../../../src/session-read-api/app.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
@@ -143,7 +155,7 @@ import {
   type OwnerBufferedDeps,
 } from "../../../src/session-read-api/owner-buffered.ts";
 
-/** The Worker never writes: its tenant transactions are READ ONLY and it answers GET only. */
+/** The read role never writes: its tenant transactions are READ ONLY (the analysis admission has its own role and client). */
 const workerAckRefused: TenantRunner = async () => {
   throw new Error("session read worker: the advisory ack is served by the self-host service only");
 };
@@ -170,6 +182,17 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
   /** Exactly "true": serve GET /v1/coordination/advisories (the ack stays 405 on this GET-only Worker). */
   READ_API_COORDINATION_ADVISORIES_ENABLED?: string;
+  /**
+   * Exactly "true": serve GET and POST /v1/sessions/:sessionId/analysis (analysisDeps); anything
+   * else = GET 501 analysis_not_configured and POST 405, as before the flag.
+   */
+  READ_API_ANALYSIS_ENABLED?: string;
+  /**
+   * The analysis admission principal (bulls96_analysis_admit) through its own Hyperdrive config,
+   * caching disabled. Read only with READ_API_ANALYSIS_ENABLED=true; unbound = POST 501
+   * analysis_admission_not_configured while GET still serves.
+   */
+  ANALYSIS_ADMIT?: Hyperdrive;
   /** Exactly "true": serve GET /v1/sessions/:id/summary (sqlBriefSummary); anything else = 501 summary_not_configured. */
   READ_API_BRIEF_SUMMARY_ENABLED?: string;
   /**
@@ -422,17 +445,30 @@ const json = (status: number, code: string, message: string, extra: Record<strin
     headers: { "content-type": "application/json", "cache-control": "private, no-store", "x-sessions-read-backend": "96bulls", ...extra },
   });
 
+/** The one non-GET route this Worker serves (with READ_API_ANALYSIS_ENABLED=true): the analysis admission. */
+export const ANALYSIS_POST_PATH = /^\/v1\/sessions\/[^/]+\/analysis$/;
+
+/** GET always; POST only on exactly the analysis route with the analysis flag on. */
+export function methodAllowed(method: string, pathname: string, env: Pick<Env, "READ_API_ANALYSIS_ENABLED">): boolean {
+  if (method === "GET") return true;
+  return method === "POST" && exactTrueFlag(env.READ_API_ANALYSIS_ENABLED) && ANALYSIS_POST_PATH.test(pathname);
+}
+
 export interface Overrides {
   /** Tests: the pg client factory in place of Hyperdrive's. */
   connect?: () => Promise<pg.Client>;
+  /** Tests: the admission principal's pg client factory in place of the ANALYSIS_ADMIT binding's. */
+  connectAnalysisAdmit?: () => Promise<pg.Client>;
   fetcher?: typeof fetch;
 }
 
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
-  if (new URL(request.url).pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
-  if (new URL(request.url).pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
-  // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has).
-  if (request.method !== "GET") return json(405, "method_not_allowed", "GET only", { allow: "GET" });
+  const pathname = new URL(request.url).pathname;
+  if (pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
+  if (pathname.startsWith("/v1/canonical/")) return canonicalHandle(request, env, overrides.fetcher);
+  // GET only, as the Lambda's Function URL adapter (HEAD is not a read the contract has), except
+  // the analysis admission POST with READ_API_ANALYSIS_ENABLED=true (methodAllowed).
+  if (!methodAllowed(request.method, pathname, env)) return json(405, "method_not_allowed", "GET only", { allow: "GET" });
   let ch: ClickHouseClient;
   let completeSinceMs: number;
   let authConfig: AuthConfig;
@@ -482,6 +518,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
     repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
   });
+  // The admission principal's own per-request connections; only with the flag on and a binding.
+  const admitConnect = exactTrueFlag(env.READ_API_ANALYSIS_ENABLED)
+    ? overrides.connectAnalysisAdmit ?? (env.ANALYSIS_ADMIT?.connectionString ? hyperdriveClient(env.ANALYSIS_ADMIT) : undefined)
+    : undefined;
+  const admit = admitConnect ? perRequestAdmitPool(admitConnect, (c) => endPg(c)) : undefined;
+  const analysis = exactTrueFlag(env.READ_API_ANALYSIS_ENABLED) ? analysisDeps(env, tenant.run, admit?.pool, overrides.fetcher) : undefined;
   // One sink per invocation (no state crosses requests): captured during the request, exported once in waitUntil.
   const analytics = createAnalyticsSink(analyticsSelection, "session-read-api", "worker", {
     ...(overrides.fetcher ? { fetch: overrides.fetcher } : {}),
@@ -512,6 +554,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)
       ? { summaryFallback: summaryFallbackDeps(env, tenant.run, overrides.fetcher) }
       : {}),
+    ...(analysis ? { analysis } : {}),
     ...(exactTrueFlag(env.READ_API_MEMORY_DOCUMENTS_ENABLED) ? { memoryDocuments: sqlMemoryDocuments(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
     ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
@@ -526,6 +569,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     return await app.fetch(request);
   } finally {
     ctx.waitUntil(tenant.close());
+    if (admit) ctx.waitUntil(admit.close());
     // Bounded (WORKER_LIMITS) and never rejecting; the response is already final.
     if (analyticsSelection.sink !== "noop") ctx.waitUntil(analytics.shutdown());
   }
@@ -579,6 +623,30 @@ export function summaryFallbackDeps(env: Env, run: TenantRunner, fetcher: typeof
       return summaryKeyringCache.keyring;
     },
   });
+}
+
+/** One analysis result object read's deadline per store call (results are at most 8 MiB, results.ts). */
+const ANALYSIS_RESULT_DEADLINE_MS = 10_000;
+
+/**
+ * Session analysis (lane F1, READ_API_ANALYSIS_ENABLED=true), the Lambda's sqlAnalysisSource:
+ *   read/harnesses  sessions.analysis_read_v1 and the live harnesses through the request's
+ *                   tenant runner (bulls96_read_api, READ ONLY, tenant-bound);
+ *   result          the result object from the pipeline raw bucket (PIPELINE_RAW_S3_*, the
+ *                   canonical store the analysis worker publishes to), at the key, SHA-256 and
+ *                   size the job row recorded (never derived from the request), bounded per call;
+ *   admit           the admission principal's pool (ANALYSIS_ADMIT); absent = POST 501
+ *                   analysis_admission_not_configured, GET unchanged.
+ * Without the raw store: undefined, so GET and POST answer 501 analysis_not_configured.
+ */
+export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | undefined, fetcher: typeof fetch = (input, init) => fetch(input, init)): AnalysisDeps | undefined {
+  const bounded: typeof fetch = (input, init) => {
+    const deadline = AbortSignal.timeout(ANALYSIS_RESULT_DEADLINE_MS);
+    return fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
+  };
+  const raw = rawStoreFromEnv(env, bounded);
+  if (!raw) return undefined;
+  return sqlAnalysisSource(run, raw.store, admit);
 }
 
 /**
