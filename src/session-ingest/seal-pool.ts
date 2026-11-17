@@ -4,8 +4,8 @@
  * (docs/design/admission-throughput-and-transcripts-region.md, step T2).
  *
  * `INGEST_SEAL_WORKERS`:
- * - unset, "" or "0": off. `sealPoolDeps` returns `routedRawChunkSealerDeps()` as it is
- *   (`{}` on the TypeScript engine), and nothing changes.
+ * - unset, "" or "0": off. `sealPoolDeps` returns `{}`, so a target that spreads
+ *   `...routedRawChunkSealerDeps(), ...sealPoolDeps(env)` is exactly today's object.
  * - an integer 1..32: that many worker threads.
  *
  * The output is today's, byte for byte. Each worker runs the pinned sealer
@@ -191,12 +191,14 @@ export function sealPoolSize(env: Record<string, string | undefined>): number {
 }
 
 /**
- * `{ rawChunkSealer }` for a writer target. Off: exactly `routedRawChunkSealerDeps()`
- * (today's object). On: the pool's sealer; refused next to a routed engine sealer.
+ * Spread after `...routedRawChunkSealerDeps()` in a writer target. Off: `{}`, so the
+ * routed spread stands as today. On: the pool's sealer, which overrides it; refused
+ * unless the engine is TypeScript, where the routed spread is `{}` anyway, so the
+ * override never hides a bound engine sealer.
  */
 export function sealPoolDeps(env: Record<string, string | undefined>, create: (size: number) => SealPool = createSealPool): { rawChunkSealer?: BoundRawChunkSealer; sealPool?: SealPool } {
   const size = sealPoolSize(env);
-  if (size === 0) return routedRawChunkSealerDeps();
+  if (size === 0) return {};
   // Checked before any engine selection: only the TypeScript engine (unset, "" or "ts"); an invalid value fails as today.
   if (parseScrubEngineKind(env.SCRUB_ENGINE) !== "ts") throw new Error("96bulls: INGEST_SEAL_WORKERS needs the TypeScript scrub engine (SCRUB_ENGINE unset or ts)");
   if (routedRawChunkSealerDeps().rawChunkSealer) throw new Error("96bulls: INGEST_SEAL_WORKERS needs the TypeScript scrub engine (SCRUB_ENGINE unset or ts)");
