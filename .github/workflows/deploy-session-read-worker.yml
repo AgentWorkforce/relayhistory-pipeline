@@ -93,6 +93,10 @@ name: deploy session-read-worker
 # no new secret). off (the default) renders no var: 501 summary_search_not_configured, as before
 # this input. Same not-preserved rule (the live-settings guard refuses a dispatch that would drop
 # a live one); dispatch is Khaliq's call.
+# relayfacts=on adds --var READ_API_RELAYFACTS_ENABLED:true: GET /v1/relayfacts and
+# GET /v1/relayfacts/:topic (docs/relayfacts.md; needs migrations 062080 and 062090 and, per
+# workspace, the relayfacts canary; no new secret). off (the default) renders no var: 501
+# relayfacts_disabled, as before this input. Same not-preserved rule; dispatch is Khaliq's call.
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
@@ -171,6 +175,11 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      relayfacts:
+        description: GET /v1/relayfacts and /v1/relayfacts/:topic (READ_API_RELAYFACTS_ENABLED=true); off = no var, 501 relayfacts_disabled. Not preserved from live; repeat it on later dispatches
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -225,6 +234,7 @@ jobs:
       LIST_SHORT_SUMMARY: ${{ inputs.list_short_summary }}
       SUMMARY_FALLBACK: ${{ inputs.summary_fallback }}
       SUMMARY_SEARCH: ${{ inputs.summary_search }}
+      RELAYFACTS: ${{ inputs.relayfacts }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -263,6 +273,7 @@ jobs:
           case "$LIST_SHORT_SUMMARY" in off|on) ;; *) fail 'list_short_summary must be "off" or "on"' ;; esac
           case "$SUMMARY_FALLBACK" in off|on) ;; *) fail 'summary_fallback must be "off" or "on"' ;; esac
           case "$SUMMARY_SEARCH" in off|on) ;; *) fail 'summary_search must be "off" or "on"' ;; esac
+          case "$RELAYFACTS" in off|on) ;; *) fail 'relayfacts must be "off" or "on"' ;; esac
           if [ "$SUMMARY_FALLBACK" = "on" ] && [ "$BRIEF_SUMMARY" != "on" ]; then fail 'summary_fallback=on needs brief_summary=on'; fi
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
@@ -308,6 +319,7 @@ jobs:
           list_short_summary=""; if [ "$LIST_SHORT_SUMMARY" = "on" ]; then list_short_summary=true; fi
           summary_fallback=""; if [ "$SUMMARY_FALLBACK" = "on" ]; then summary_fallback=true; fi
           summary_search=""; if [ "$SUMMARY_SEARCH" = "on" ]; then summary_search=true; fi
+          relayfacts=""; if [ "$RELAYFACTS" = "on" ]; then relayfacts=true; fi
           bunx wrangler deploy --config wrangler.deploy.jsonc \
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
@@ -318,6 +330,7 @@ jobs:
             ${list_short_summary:+--var "READ_API_LIST_SHORT_SUMMARY_ENABLED:$list_short_summary"} \
             ${summary_fallback:+--var "READ_API_SUMMARY_FALLBACK_ENABLED:$summary_fallback"} \
             ${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"} \
+            ${relayfacts:+--var "READ_API_RELAYFACTS_ENABLED:$relayfacts"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)
         env:
