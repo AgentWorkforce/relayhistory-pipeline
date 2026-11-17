@@ -1033,6 +1033,11 @@ describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
     await expect(deps.result({ key, sha256: sha, bytes: resultBytes.length })).rejects.toMatchObject({ name: "AnalysisResultError", message: "analysis_result_mismatch" });
     expect(fetches).toBe(1);
     expect(pulled).toBeLessThanOrEqual(1);
+    // No size on the response (content-length absent = 0) while the row recorded one: refused before the body too.
+    pulled = 0;
+    const unsized = (async () => new Response(new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024)); } }), { status: 200 })) as typeof fetch;
+    await expect(analysisDeps({ ...E, ...RAW } as Env, run, undefined, unsized)!.result({ key, sha256: sha, bytes: resultBytes.length })).rejects.toMatchObject({ name: "AnalysisResultError", message: "analysis_result_mismatch" });
+    expect(pulled).toBeLessThanOrEqual(1);
     // The budget: refs whose recorded sizes sum past it are refused before any fetch of the overflow.
     const counted = (async () => { fetches++; return new Response(resultBytes, { status: 200, headers: { "content-length": String(resultBytes.length) } }); }) as typeof fetch;
     fetches = 0;

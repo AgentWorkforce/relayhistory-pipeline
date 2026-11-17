@@ -140,11 +140,24 @@ describe("preserve the deployed Reader profile", () => {
       await expect(resolveProfile({ ...explicit, ANALYSIS: "on", ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", explicit.OWNER_BUFFERED);
       await expect(resolveProfile({ ...explicit, ANALYSIS: "on" }, template, live([binding]))).rejects.toThrow(/drop live Hyperdrive binding ANALYSIS_ADMIT/);
       await expect(resolveProfile({ ...explicit, ANALYSIS: "on", ANALYSIS_HYPERDRIVE_ID: "abcdefabcdefabcdefabcdefabcdefab" }, template, live([binding]))).rejects.toThrow(/drop live Hyperdrive binding ANALYSIS_ADMIT/);
-      // The explicit removal.
+      // The explicit removal; a set variable may keep the live config but never replace it.
       await expect(resolveProfile({ ...explicit, ANALYSIS: "disable" }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", explicit.OWNER_BUFFERED);
-      // Live metadata unreadable: refused (the guard cannot be skipped).
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "disable", ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", explicit.OWNER_BUFFERED);
+      const breakGlass = "DIRECTORY_WORKSPACES_INPUT" in explicit;
+      if (!breakGlass) await expect(resolveProfile({ ...explicit, ANALYSIS: "disable", ANALYSIS_HYPERDRIVE_ID: "abcdefabcdefabcdefabcdefabcdefab" }, template, live([binding]))).rejects.toThrow(/would replace live Hyperdrive binding ANALYSIS_ADMIT/);
+      // Live metadata unreadable: refused unless this is the break-glass path.
       await expect(resolveProfile({ ...explicit, ANALYSIS: "on" }, template, async () => { throw Error("unavailable"); })).rejects.toThrow();
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "off" }, template, async () => { throw Error("unavailable"); })).rejects.toThrow();
+      const unreadable = resolveProfile({ ...explicit, ANALYSIS: "disable" }, template, async () => { throw Error("must not call"); });
+      if (breakGlass) await expect(unreadable).resolves.toEqual({ OWNER_BUFFERED: explicit.OWNER_BUFFERED, OWNER_BUFFERED_WORKSPACES: explicit.OWNER_BUFFERED === "on" ? "*" : "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: explicit.DIRECTORY_WORKSPACES_INPUT === "off" ? "" : explicit.DIRECTORY_WORKSPACES_INPUT });
+      else await expect(unreadable).rejects.toThrow();
     }
+    // Break-glass: explicit off + directory + analysis=disable contacts no live metadata (split, absent or failing API).
+    for (const failing of [async () => { throw Error("must not call"); }, async () => ({ deployments: [{ versions: [{ version_id: id, percentage: 50 }] }] })]) {
+      await expect(resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off", ANALYSIS: "disable" }, template, failing)).resolves.toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
+    }
+    // preserve with disable: a replacing variable is refused too.
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable", ANALYSIS_HYPERDRIVE_ID: "abcdefabcdefabcdefabcdefabcdefab" }, template, live([binding]))).rejects.toThrow(/would replace live Hyperdrive binding ANALYSIS_ADMIT/);
     // profile/preserve: analysis=disable also lets the dispatch drop both.
     await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
     await expect(resolveProfile({ ...env, ANALYSIS: "off", ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding]))).rejects.toThrow(/drop live setting READ_API_ANALYSIS_ENABLED/);
