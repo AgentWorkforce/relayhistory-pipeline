@@ -221,6 +221,22 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.decision_records_insert_v1(text,text,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.decision_records_list_v1(text,text,text,timestamp with time zone,uuid,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.decision_records_supersede_v1(text,text,uuid,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.decision_records_topics_v1(text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.digest_narrative_read(text,date,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|ingest_origin_|ingest_turn_|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|ingest_origin_|ingest_turn_|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|decision_records_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -785,6 +785,32 @@ test("real tree: after the full tree including 062000, a dropped coordination ad
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
   const fn = "sessions.coordination_advisories_sweep_v1()";
   expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
+  await s.db.exec(`DROP FUNCTION ${fn}`);
+  // Nothing is held now, so nothing excuses the absent function.
+  const err = await refusal(runMigrations(client(s.db), { profile: SELFHOSTED }));
+  expect(err?.code).toBe("function_acl_drift");
+  expect(err?.message).toContain("runtime application functions missing from the schema");
+  expect(err?.message).toContain(fn);
+  expect((await marker(s.db)).some((m) => m.status === "pass")).toBe(false);
+});
+
+test("real tree: after the full tree including 062080, a dropped memory documents worker function refuses function_acl_drift on the next run", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const MD = "upstream:20261105062080_memory_documents.sql";
+  expect(s.split.held).toContain(MD);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(MD);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  const fn = "sessions.decision_records_insert_v1(text,text,jsonb)";
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
+  // The read-API functions are not runtime application functions.
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_records_")).sort()).toEqual([
+    "sessions.decision_records_insert_v1(text,text,jsonb)", "sessions.decision_records_supersede_v1(text,text,uuid,uuid)",
+  ]);
   await s.db.exec(`DROP FUNCTION ${fn}`);
   // Nothing is held now, so nothing excuses the absent function.
   const err = await refusal(runMigrations(client(s.db), { profile: SELFHOSTED }));

@@ -41,7 +41,7 @@ Migration slot `20261105062080` (`supabase/migrations/20261105062080_memory_docu
 | Column | Type | Bound |
 |---|---|---|
 | `id` | `uuid` primary key | |
-| `org_id`, `workspace_id` | `text` | non-empty, at most 256; the scope of every read and write |
+| `org_id`, `workspace_id` | `text` | non-empty, at most 512; the scope of every read and write |
 | `topic` | `text` | `^[a-z0-9][a-z0-9-]{0,63}$` |
 | `title` | `text` | 1 to 200 characters |
 | `title_key` | `text` | normalized title, used for deduplication |

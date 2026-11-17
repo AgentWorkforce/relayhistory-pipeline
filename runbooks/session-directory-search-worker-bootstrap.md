@@ -433,6 +433,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105062000_coordination_advisories.sql` | function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories (coordination live advisories; EXECUTE to service_role and bulls96_read_api only) |
 | `upstream:20261105062010_ingest_origin_claim_fence.sql` | table sessions.ingest_origin_claim_marks, the origin-scoped buffered entry points and the mark check in sessions.ingest_lock_fences (per-origin claim fence; EXECUTE to bulls96_session_ingest only; default off until the Worker sets INGEST_ORIGIN_CLAIM_FENCE=on) |
 | `upstream:20261105062020_turns_forward_gates.sql` | table sessions.turn_session_fences and function sessions.ingest_turn_register (cross-origin relay-turn erasure fence; registration is ingest-only) |
+| `upstream:20261105062080_memory_documents.sql` | tables sessions.decision_records_v1 and sessions.decision_evidence_v1 and function sessions.decision_records_insert_v1 (memory documents; EXECUTE to service_role and bulls96_read_api only) |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
