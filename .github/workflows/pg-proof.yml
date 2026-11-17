@@ -260,6 +260,15 @@ jobs:
             exit 0
           fi
           bun test --timeout 300000 src/hoopdb/__tests__/index-prebuild-058000.postgres.test.ts
+      - name: Prove the 062020 lock observer SQL on real PostgreSQL
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          if [ ! -f src/hoopdb/__tests__/lock-hold-observer.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::lock-hold-observer.postgres.test.ts absent at this head; forward-merge main to run the observer proof"
+            exit 0
+          fi
+          bun test --timeout 120000 src/hoopdb/__tests__/lock-hold-observer.postgres.test.ts
       - name: Prove one session's buffered stages answer under 1 s on a 167k-batch backlog via the records GIN (044040)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres

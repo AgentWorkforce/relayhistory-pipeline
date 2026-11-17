@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -57,6 +58,12 @@ describe("turns 062020 lock observer inputs", () => {
     } catch (error) {
       expect(String(error)).not.toContain("do-not-echo");
     }
+    expect(
+      observerConfig([], {
+        OBSERVER_DATABASE_URL:
+          "postgres://observer:secret@db.example.invalid/postgres?sslmode=verify-full",
+      }).databaseUrl,
+    ).toContain("sslmode=verify-full");
   });
 
   test("parses bounded evidence controls and refuses malformed tables or flags", () => {
@@ -161,6 +168,9 @@ describe("turns 062020 lock evidence", () => {
       max_migration_wait_ms: 0,
       max_waiters: 1,
       blocked_writer_count: 1,
+      target_lock_observed: true,
+      representative: true,
+      error_code: null,
       abort_evidence: [],
     });
   });
@@ -244,8 +254,9 @@ describe("turns 062020 lock evidence", () => {
 
   test("fails closed on checksum drift, deadlines, and external completion", () => {
     const mismatch = new LockHoldEvidence(config());
+    mismatch.observe(sample(0, { migrationPids: [10] }));
     mismatch.observe(
-      sample(0, { migrationPids: [10], ledgerSha256: "0".repeat(64) }),
+      sample(100, { ledgerSha256: "0".repeat(64) }),
     );
     expect(mismatch.summary("ledger")).toMatchObject({
       ok: false,
@@ -267,6 +278,70 @@ describe("turns 062020 lock evidence", () => {
       "migration_not_observed",
     ]);
   });
+
+  test("refuses a matching ledger that predates attachment or appears with the first migration sample", () => {
+    const preexisting = new LockHoldEvidence(config());
+    preexisting.observe(
+      sample(0, {
+        migrationPids: [10],
+        ledgerSha256: TURNS_MIGRATION_SHA256,
+      }),
+    );
+    expect(preexisting.summary("ledger").abort_evidence).toEqual([
+      "ledger_absence_not_observed",
+      "migration_not_observed_before_ledger",
+    ]);
+
+    const sameSample = new LockHoldEvidence(config());
+    sameSample.observe(sample(0));
+    sameSample.observe(
+      sample(100, {
+        migrationPids: [10],
+        ledgerSha256: TURNS_MIGRATION_SHA256,
+      }),
+    );
+    expect(sameSample.summary("ledger").abort_evidence).toEqual([
+      "migration_not_observed_before_ledger",
+    ]);
+  });
+
+  test("a zero-hold ordered run passes but is explicitly non-representative", () => {
+    const evidence = new LockHoldEvidence(config());
+    evidence.observe(sample(0, { migrationPids: [10] }));
+    evidence.observe(
+      sample(100, { ledgerSha256: TURNS_MIGRATION_SHA256 }),
+    );
+    expect(evidence.summary("ledger")).toMatchObject({
+      ok: true,
+      target_lock_observed: false,
+      representative: false,
+    });
+  });
+
+  test("query failures retain only a SQLSTATE-shaped code", () => {
+    const evidence = new LockHoldEvidence(config());
+    evidence.addError({ code: "42501", message: "do-not-emit-server-message" });
+    const summary = evidence.summary("error");
+    expect(summary.error_code).toBe("42501");
+    expect(summary.abort_evidence).toContain("observer_query_failed");
+    expect(JSON.stringify(summary)).not.toContain("do-not-emit-server-message");
+  });
+});
+
+test("a positional secret is never echoed in the JSONL refusal", () => {
+  const secret = "postgres://observer:never-print@db.example.invalid/postgres";
+  const result = spawnSync(
+    process.execPath,
+    [join(ROOT, "scripts/pg-proof/lock-hold-observer.ts"), secret],
+    {
+      encoding: "utf8",
+      env: { ...process.env, OBSERVER_DATABASE_URL: DATABASE_URL },
+    },
+  );
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain("argument 1 is unknown");
+  expect(result.stdout).not.toContain(secret);
+  expect(result.stdout).not.toContain("never-print");
 });
 
 test("the disposable rehearsal wires the observer without putting a URL in argv", () => {
@@ -280,6 +355,11 @@ test("the disposable rehearsal wires the observer without putting a URL in argv"
   expect(workflow).toContain("scripts/pg-proof/lock-hold-observer.ts");
   expect(workflow).toContain("turns-lock-hold.jsonl");
   expect(workflow).toContain("--until-file");
+  expect(workflow).toContain("--interval-ms 25");
+  expect(workflow.match(/OBSERVER_DATABASE_URL=/g)).toHaveLength(1);
+  expect(workflow).toMatch(
+    /OBSERVER_DATABASE_URL=postgres:\/\/supabase_admin@127\.0\.0\.1:5432\/postgres \\\n\s+bun \.rehearsal-tooling\/scripts\/pg-proof\/lock-hold-observer\.ts/,
+  );
   expect(workflow).not.toContain(
     "lock-hold-observer.ts --database-url",
   );

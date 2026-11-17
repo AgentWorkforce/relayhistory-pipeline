@@ -155,7 +155,7 @@ jobs:
           OBSERVER_DATABASE_URL=postgres://supabase_admin@127.0.0.1:5432/postgres \
             bun .rehearsal-tooling/scripts/pg-proof/lock-hold-observer.ts \
             --tables sessions.upload_deletions,sessions.operator_user_erasures,sessions.session_directory \
-            --interval-ms 100 --max-seconds 900 --until-file "$observer_done" \
+            --interval-ms 25 --max-seconds 900 --until-file "$observer_done" \
             >"$observer_log" &
           observer_pid=$!
           cleanup_observer() {

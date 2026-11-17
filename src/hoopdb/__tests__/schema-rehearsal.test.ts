@@ -658,10 +658,13 @@ describe("drift against production and the rehearsal files", () => {
       expect(/(?<![0-9a-zA-Z])[0-9]{12}(?![0-9a-zA-Z])/.test(text)).toBe(false);
       expect(HOSTED.test(text)).toBe(false);
       expect(CREDENTIAL.test(text)).toBe(false);
-      for (const m of text.matchAll(/postgres(?:ql)?:\/\/[^\s"'`]+/g))
-        expect(m[0]).toMatch(
-          /^postgres:\/\/(?:postgres|supabase_admin)@127\.0\.0\.1:5432\//,
-        );
+      for (const m of text.matchAll(/postgres(?:ql)?:\/\/[^\s"'`]+/g)) {
+        const allowed =
+          f === ".github/workflows/rehearse-session-schema.yml"
+            ? /^postgres:\/\/(?:postgres|supabase_admin)@127\.0\.0\.1:5432\//
+            : /^postgres:\/\/postgres@127\.0\.0\.1:5432\//;
+        expect(m[0]).toMatch(allowed);
+      }
     }
   });
   test("the workflow is read-only, secretless, environment-free, bounded and dispatch/PR only", () => {
