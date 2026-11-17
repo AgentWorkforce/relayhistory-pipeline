@@ -454,12 +454,11 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      (`stacks/aws/adopt-identities.ts`). Under `<root>/.admission-inbox/*/ledger/*` the read role needs
      `s3:GetObject`, and the write role `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption`
      condition, since the tools send no encryption header there. Both need `s3:GetObject` on
-     `<root>/.ledger/fence-authority/.ledger-home.json`, and `s3:ListBucket` on the bucket with `StringLike`
-     `s3:prefix` = `<root>/.admission-inbox/*`, required (without it a missing shard or stub reads as a 403, not a
-     404, and the run fails; the stack refuses a condition without it), and optionally also
-     `<root>/.ledger/fence-authority/.ledger-home.json`, so a missing marker reads as `ledger_home_missing` rather
-     than `access_denied` (a refusal either way). Whether S3 applies the `s3:prefix` condition to its 404-vs-403
-     decision on a `GetObject` is to be confirmed on the first real run against the ledger bucket. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     `<root>/.ledger/fence-authority/.ledger-home.json`, and `s3:ListBucket` on the bucket with **no condition**. S3
+     answers a `GetObject` or `HeadObject` of a missing key with 404 only when the caller holds `s3:ListBucket` for
+     that very request, and such a request carries no `s3:prefix`, so a prefix-conditioned List never applies there:
+     every missing shard, owner stub or marker would read as a 403 (`access_denied`) and every real run would fail.
+     The stack refuses any condition on this List. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
