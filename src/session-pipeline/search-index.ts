@@ -40,6 +40,7 @@ import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../sessi
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
 import {
   STREAM_DEADLINE,
+  STREAM_KEYED_RECORDS_CAP,
   STREAM_PASSES,
   STREAM_READ_EVENTS_BUDGET,
   StreamBudgetError,
@@ -71,6 +72,7 @@ import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirector
 import { outputFactsFromScope, passVersion, type OutputFactsScope } from "./output-facts.ts";
 import { clickhouseOutputFactsStore, type OutputFactsStore } from "./output-facts-store.ts";
 import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
+import { MAX_SCAN_PAGE } from "@rhc/search-index/contracts.ts";
 /** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
 const BUFFERED_FINGERPRINT_PREFIX = "bf";
 
@@ -158,7 +160,31 @@ export interface SearchIndexDeps {
   streamSlot?: { used: boolean };
   /** Tests only: how often the streaming reader keeps its transaction busy (default 20 s). */
   streamKeepaliveMs?: number;
+  /**
+   * SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true only (the self-host consumer, with `stream`, never
+   * with output facts; searchIndexStagedStartup), Phase 3 slice 1: the index scan of every pass
+   * walks the adapter's keyset pages (scanFingerprintsPage) instead of one read bounded by
+   * SEARCH_INDEX_MAX_ROWS, so there is no `search_index_truncated`; the streaming budgets bound
+   * each pass, not their sum, so there is no four-times refusal; and the records one pass keys
+   * in memory, and the index rows one scan holds (at least SEARCH_INDEX_MAX_ROWS), are capped at
+   * `keyedRecordsCap` (`stream_keyed_records_cap`, partial). Absent: every pass exactly as before.
+   */
+  staged?: StagedReconcile;
 }
+
+/** SearchIndexDeps.staged: the staged reconcile's interim bound. */
+export interface StagedReconcile {
+  /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
+  keyedRecordsCap: number;
+}
+
+/**
+ * The staged reconcile's interim cap on keyed records (about 1 KB of memory each): the largest
+ * scope the default streaming budgets stream today (2,000,000 / STREAM_PASSES), so turning the
+ * flag on never asks a pod for more key memory than streaming already does (about 0.5 GB). A
+ * later slice replaces the in-memory keys and removes it.
+ */
+export const STAGED_KEYED_RECORDS_CAP = 500_000;
 
 export interface SearchIndexLimits {
   /** Largest scope read into memory, summed over its manifests' raw bytes. */
@@ -383,7 +409,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
-    const io = deps.adapter ? adapterProjectionIo(deps.adapter, tx) : legacyProjectionIo(deps.ch!);
+    const io = deps.adapter
+      ? deps.staged
+        ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
+        : adapterProjectionIo(deps.adapter, tx)
+      : legacyProjectionIo(deps.ch!);
     const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
     const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
@@ -468,7 +498,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
-    const scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+    // Staged: keyset pages up to the keyed-records cap (never below SEARCH_INDEX_MAX_ROWS).
+    const stagedScan = deps.staged && io.scanPages ? stagedScanBounds(deps.staged, limits) : undefined;
+    const scan = stagedScan
+      ? await io.scanPages!(scope, pointerSnapshot.canonicalId, fromMs, stagedScan.pageSize, stagedScan.maxRows, async () => {})
+      : await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
     const chRows = scan.rows;
     const truncated = scan.truncated;
     const existing = new Map<string, ScopeIdentity[]>();
@@ -569,7 +603,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       inserted,
       deleted: deletedCount,
       complete,
-      reasons: [...s3.reasons, ...(truncated ? [deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
+      reasons: [...s3.reasons, ...(truncated ? [stagedScan ? STREAM_KEYED_RECORDS_CAP : deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
       ...(outputFacts ? { outputFacts } : {}),
     };
   });
@@ -617,6 +651,8 @@ async function streamedReconcile(
       keepalive: { everyMs: 0, ping: () => keepalive() }, // throttled here, shared with the scan and deletes
       // The same labels as the whole read (readCanonicalScope gets them through `deps`).
       ...(deps.originLabels ? { originLabels: true as const } : {}),
+      // Staged: each pass on its own budget, its keyed records capped.
+      ...(deps.staged ? { perPass: { keyedRecordsCap: deps.staged.keyedRecordsCap } } : {}),
     },
     budget, version, fromMs,
   );
@@ -641,7 +677,15 @@ async function streamedReconcile(
     // ClickHouse: keyset pages of one insert batch each, never the single LIMIT maxRows+1
     // read; past the events budget the scope is partial, never a delete. The adapter binding
     // keeps its own bounded scan.
-    scan = io.scanPages
+    const between = async () => {
+      atDeadline();
+      await keepalive();
+    };
+    // Staged: keyset pages on every binding, up to the keyed-records cap, never SEARCH_INDEX_MAX_ROWS.
+    const stagedScan = deps.staged && io.scanPages ? stagedScanBounds(deps.staged, limits) : undefined;
+    scan = stagedScan
+      ? await io.scanPages!(scope, pointerSnapshot.canonicalId, fromMs, stagedScan.pageSize, stagedScan.maxRows, between)
+      : io.scanPages
       ? await io.scanPages(scope, pointerSnapshot.canonicalId, fromMs, limits.insertBatch, budget.maxReadEvents, async () => {
           atDeadline();
           await keepalive();
@@ -652,6 +696,7 @@ async function streamedReconcile(
     if (error instanceof StreamBudgetError) return owing(["scope_too_large", error.budget], true);
     throw error;
   }
+  if (deps.staged && io.scanPages && scan.truncated) return owing(["scope_too_large", STREAM_KEYED_RECORDS_CAP], true);
   if (io.scanPages && scan.truncated) return owing(["scope_too_large", STREAM_READ_EVENTS_BUDGET], true);
   const truncated = scan.truncated;
   const existing = new Map<string, ScopeIdentity[]>();
@@ -970,6 +1015,52 @@ export function searchIndexStreamStartup(
     notice: budget
       ? { level: "warn", message: "pipeline consumer streaming reconcile on with read budgets no scope past the whole-read bound fits", fields: budget }
       : undefined,
+  };
+}
+
+/**
+ * The staged index scan's bounds: pages of one insert batch (at most MAX_SCAN_PAGE), up to the
+ * keyed-records cap but never below SEARCH_INDEX_MAX_ROWS, so turning the flag on never
+ * truncates a scan that the bounded read would have taken whole.
+ */
+function stagedScanBounds(staged: StagedReconcile, limits: SearchIndexLimits): { pageSize: number; maxRows: number } {
+  return { pageSize: Math.min(limits.insertBatch, MAX_SCAN_PAGE), maxRows: Math.max(staged.keyedRecordsCap, limits.maxRows) };
+}
+
+/**
+ * SEARCH_INDEX_STAGED_RECONCILE_ENABLED for the indexer SERVICE (consumer-service.ts serve()
+ * only; the hosted Lambda and the large-read worker never read it), Phase 3 slice 1, default
+ * off:
+ *
+ *   unset or ""  off (returns undefined: the search deps carry no `staged`)
+ *   "false"      off
+ *   "true"       on (SearchIndexDeps.staged); fails startup unless the streaming reconcile
+ *                resolved on (`stream`, SEARCH_INDEX_STREAMING_ENABLED), and fails together
+ *                with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true
+ *   anything     else fails startup ("1", "TRUE" and padded values included)
+ *
+ * Errors name the variables, never a value. On: `notice` is the one startup log line.
+ */
+export function searchIndexStagedStartup(
+  env: Record<string, string | undefined>,
+  stream: StreamReadLimits | undefined,
+  outputFacts: boolean,
+): { staged: StagedReconcile; notice: SearchIndexStreamNotice } | undefined {
+  const flag = env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED;
+  if (flag === undefined || flag === "" || flag === "false") return undefined;
+  if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
+  if (outputFacts)
+    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
+  if (!stream)
+    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)");
+  return {
+    staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP },
+    notice: {
+      level: "info",
+      // Allowlisted log fields only (src/shared/log.ts): the cap is a constant, so it rides in the message.
+      message: `pipeline consumer staged reconcile on (keyed records cap ${STAGED_KEYED_RECORDS_CAP})`,
+      fields: { state: "on" },
+    },
   };
 }
 

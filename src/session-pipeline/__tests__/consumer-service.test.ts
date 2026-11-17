@@ -212,6 +212,42 @@ describe("consumer service config", () => {
     // A malformed flag fails startup before the log line or any connection.
     await expect(serve(env({ SEARCH_INDEX_STREAMING_ENABLED: "1" }))).rejects.toThrow("SEARCH_INDEX_STREAMING_ENABLED must be true or false");
   });
+  test("serve() resolves SEARCH_INDEX_STAGED_RECONCILE_ENABLED before any connection opens", async () => {
+    // As the streaming line above: the staged line is logged, or the flag refused, before the
+    // HOOPDB_URL mismatch check, so no pool and no network.
+    const startup = async (overrides: Record<string, string | undefined>) => {
+      const lines: Array<Record<string, unknown>> = [];
+      const capture = (chunk: string | Uint8Array) => {
+        for (const line of String(chunk).split("\n")) if (line.startsWith("{")) lines.push(JSON.parse(line) as Record<string, unknown>);
+        return true;
+      };
+      const out = spyOn(process.stdout, "write").mockImplementation(capture as typeof process.stdout.write);
+      const err = spyOn(process.stderr, "write").mockImplementation(capture as typeof process.stderr.write);
+      try {
+        await expect(serve(env({ HOOPDB_URL: "postgresql://other@postgres:5432/hoopdb", ...overrides }))).rejects.toThrow(
+          "HOOPDB_URL must match the consumer secret hoopdb_url",
+        );
+      } finally {
+        out.mockRestore();
+        err.mockRestore();
+      }
+      return lines.filter((l) => String(l.message).includes("staged"));
+    };
+    // Off (the default): no line at all.
+    for (const off of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "" }, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }])
+      expect(await startup(off)).toEqual([]);
+    expect(await startup({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true" })).toEqual([
+      expect.objectContaining({ level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", state: "on", service: "session-pipeline-consumer" }),
+    ]);
+    const refused = (overrides: Record<string, string>) => serve(env(overrides));
+    await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "1" })).rejects.toThrow("SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
+    await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", SEARCH_INDEX_STREAMING_ENABLED: "false" })).rejects.toThrow(
+      "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on",
+    );
+    await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).rejects.toThrow(
+      "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
+    );
+  });
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());
     expect(config).toMatchObject({ enabled: true, backendId: "selfhost-pg", keyPrefix: "96bulls", floorMs: 0 });

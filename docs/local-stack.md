@@ -150,6 +150,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 0.5 GB of keys on top of its usual limit); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
+| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (no `search_index_truncated`), streaming budgets per pass instead of summed, and an interim cap of 500000 keyed records (`stream_keyed_records_cap`); see "Staged reconcile (Phase 3), slice 1" below. `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -421,6 +422,34 @@ its floor (four times the effective bound), gets those values checked on the nex
 malformed value that the old image ignored now fails startup, naming the variable and its range. Before upgrading,
 remove or correct those values, or set `SEARCH_INDEX_STREAMING_ENABLED="false"` (chart `enabled: false`), under
 which neither budget is read.
+
+### Staged reconcile (Phase 3), slice 1
+
+`SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only)
+is **default off**: unset, `""` and `false` are off, and off changes nothing (no log line, no reason code, the same
+SQL and index calls as before). `true` turns it on and needs the streaming reconcile above to resolve on: with
+`SEARCH_INDEX_STREAMING_ENABLED=false`, or with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (on or off by default),
+startup fails naming the variable. Any other value (`1`, `TRUE`, padded values included) fails startup. On, the
+consumer logs `pipeline consumer staged reconcile on` once at startup, and refuses to start on a search index without
+paged scans (the Postgres and OpenSearch adapters both have them). The hosted pipeline Lambda and the large-read
+worker never read it.
+
+With it on:
+
+- **Paged index scans.** The index scan of every pass, whole read or streamed, walks the adapter's keyset pages
+  (`scanFingerprintsPage`, one insert batch per page) instead of one read bounded by `SEARCH_INDEX_MAX_ROWS`, so a
+  scope with more index rows than that is no longer `search_index_truncated`: it reconciles, deletes included.
+- **Per-pass read budget.** `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` bound each pass of a streamed scope,
+  not the sum of its passes, so a scope is refused only when its own size exceeds a budget, never four times its
+  size: at the defaults a scope up to 2 GiB streams (records are capped below).
+- **Interim keyed-records cap.** Every record a pass reads is still keyed in memory (about 1 KB each), so one pass
+  may read at most 500000 records, and one index scan may hold at most 500000 rows (or `SEARCH_INDEX_MAX_ROWS` when
+  that is higher). Past either, the scope stays partial with `scope_too_large` and `stream_keyed_records_cap`,
+  nothing deleted, and is retried every reconcile tick like any partial session. That is the same key memory as
+  the default streaming budgets already need (about 0.5 GB), so the pod sizing above holds. The cap is a constant,
+  not a setting; a later slice replaces the in-memory keys and removes it.
+
+Turning the default on is a separate, gated step, not part of this slice.
 
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 

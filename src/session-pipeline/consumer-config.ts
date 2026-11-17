@@ -89,6 +89,17 @@
  *                                   searchIndexStreamFromEnv). Unset: 2 GiB / 2000000
  *                                   (scopes up to 512 MiB / 500000 stream); accepted
  *                                   from 4x the limits above up to that
+ *   SEARCH_INDEX_STAGED_RECONCILE_ENABLED     enabled only, default off (unset, "" or "false"):
+ *                                   exactly "true" turns on the staged reconcile (Phase 3
+ *                                   slice 1, search-index.ts searchIndexStagedStartup): the
+ *                                   index scan walks keyset pages (no search_index_truncated
+ *                                   up to the cap), the streaming budgets above bound each
+ *                                   pass instead of their sum, and the records one pass keys
+ *                                   are capped at 500000 (stream_keyed_records_cap). "true"
+ *                                   fails startup unless streaming resolved on, and with
+ *                                   RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true"; any other
+ *                                   value fails startup. Never read by the hosted Lambda or
+ *                                   the large-read worker
  *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |
  *                                   "collector" (one installation-scoped
  *                                   session_pipeline.index_tick_completed per completed

@@ -18,7 +18,7 @@ import {
   STREAM_READ_CEILING, indexSearchScope, searchIndexStreamBudgetWarning, searchIndexStreamFlag, searchIndexStreamFloor, searchIndexStreamFromEnv,
   searchIndexStreamStartup, type SearchIndexDeps,
 } from "../search-index.ts";
-import { STREAM_READ_BYTES_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
+import { STREAM_KEYED_RECORDS_CAP, STREAM_READ_BYTES_BUDGET, STREAM_READ_EVENTS_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
 import {
   SCOPE, T0, activity, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line,
 } from "../../session-read-api/__tests__/stream-fixture.ts";
@@ -448,4 +448,132 @@ test("gate matrix, adapter binding: output facts never stream, even with stream 
   expect(result.stream).toBeUndefined();
   expect(states).toEqual([false]);
   expect(await pg.scan()).toEqual([]);
+}, 60_000);
+
+// SEARCH_INDEX_STAGED_RECONCILE_ENABLED (Phase 3 slice 1): keyset-paged index scans and per-pass budgets.
+
+/** Counts the adapter's paged and bounded scans. */
+function countScans(b: Awaited<ReturnType<typeof backend>>) {
+  const index = b.adapter.index;
+  const counts = { pages: 0, bounded: 0 };
+  const page = index.scanFingerprintsPage!.bind(index);
+  const bounded = index.scanFingerprints.bind(index);
+  index.scanFingerprintsPage = (async (...args: Parameters<typeof page>) => { counts.pages += 1; return page(...args); }) as typeof page;
+  index.scanFingerprints = (async (...args: Parameters<typeof bounded>) => { counts.bounded += 1; return bounded(...args); }) as typeof bounded;
+  return counts;
+}
+
+/** Index rows of a regenerable kind the source does not hold: a complete pass deletes them. */
+async function addStale(b: Awaited<ReturnType<typeof backend>>, n: number) {
+  const [first] = await b.docs();
+  await b.adapter.index.upsert(Array.from({ length: n }, (_, i) => ({
+    ...first!, eventId: `${first!.eventId}-stale-${i}`, fingerprint: "stale", version: NOW.getTime() - 1, taskRefId: "", deliveryRecordId: "",
+  })));
+}
+
+const STAGED = { keyedRecordsCap: 10_000 };
+
+test("staged on: a streamed scope with more index rows than SEARCH_INDEX_MAX_ROWS is scanned in pages and ends complete", async () => {
+  const x = await scope(generate(51));
+  const whole = await backend(x, {});
+  expect(await indexSearchScope(SCOPE, whole.deps)).toMatchObject({ complete: true, reasons: [] });
+  const limits = { ...TINY, maxRows: 3, insertBatch: 4 };
+  const on = await backend(x, { limits, stream: UNLIMITED, staged: STAGED });
+  const off = await backend(x, { limits, stream: UNLIMITED });
+  for (const b of [on, off]) {
+    expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true }); // empty index: nothing to truncate
+    await addStale(b, 5);
+  }
+  const rows = (await whole.scan()).length;
+  expect(rows + 5).toBeGreaterThan(limits.maxRows);
+  // Off: the bounded scan stops past SEARCH_INDEX_MAX_ROWS, nothing is deleted.
+  const offScans = countScans(off);
+  expect(await indexSearchScope(SCOPE, off.deps)).toMatchObject({ complete: false, deleted: 0, reasons: ["search_index_truncated"] });
+  expect(offScans).toEqual({ pages: 0, bounded: 1 });
+  // On: every index row in pages of the insert batch; the stale rows are deleted and the pass is complete.
+  const onScans = countScans(on);
+  const s = await indexSearchScope(SCOPE, on.deps);
+  expect(s).toMatchObject({ complete: true, deleted: 5, inserted: 0, reasons: [] });
+  expect(s.stream).toMatchObject({ passes: 3 });
+  expect(onScans).toEqual({ pages: Math.ceil((rows + 5) / 4), bounded: 0 });
+  expect(await on.scan()).toEqual(await whole.scan());
+  expect(on.recorded.at(-1)).toEqual({ complete: true, rows });
+  expect(on.directory.length).toBeGreaterThan(0);
+}, 60_000);
+
+test("staged on: a whole read with more index rows than SEARCH_INDEX_MAX_ROWS is scanned in pages and ends complete", async () => {
+  const x = await scope(generate(52));
+  const limits = { maxRows: 3, insertBatch: 4 };
+  const on = await backend(x, { limits, stream: UNLIMITED, staged: STAGED });
+  const off = await backend(x, { limits, stream: UNLIMITED });
+  for (const b of [on, off]) {
+    expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true });
+    await addStale(b, 2);
+  }
+  expect(await indexSearchScope(SCOPE, off.deps)).toMatchObject({ complete: false, deleted: 0, reasons: ["search_index_truncated"] });
+  const scans = countScans(on);
+  const s = await indexSearchScope(SCOPE, on.deps);
+  expect(s).toMatchObject({ complete: true, deleted: 2, reasons: [] });
+  expect(s.stream).toBeUndefined();
+  expect(scans.bounded).toBe(0);
+  expect(scans.pages).toBeGreaterThan(1);
+}, 60_000);
+
+test("staged on: the read budgets bound each pass, so a scope past a quarter of a budget still streams", async () => {
+  const x = await scope(generate(53));
+  const probe = await backend(x, { limits: TINY, stream: UNLIMITED, staged: STAGED });
+  const read = (await indexSearchScope(SCOPE, probe.deps)).stream!;
+  expect(read.passes).toBe(4);
+  // Pass 1 to 3 read the same chunks and records; pass 4 reads them again.
+  const perPass = { bytes: read.bytes / 4, events: read.events / 4 };
+  expect(Number.isInteger(perPass.bytes) && Number.isInteger(perPass.events)).toBe(true);
+  // Twice one pass: fits each pass, not four of them.
+  for (const [budget, code] of [
+    [{ maxReadBytes: 2 * perPass.bytes, maxReadEvents: 1 << 24 }, STREAM_READ_BYTES_BUDGET],
+    [{ maxReadBytes: 1 << 30, maxReadEvents: 2 * perPass.events }, STREAM_READ_EVENTS_BUDGET],
+  ] as const) {
+    const off = await backend(x, { limits: TINY, stream: budget });
+    expect(await indexSearchScope(SCOPE, off.deps)).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large", code] });
+    const on = await backend(x, { limits: TINY, stream: budget, staged: STAGED });
+    const s = await indexSearchScope(SCOPE, on.deps);
+    expect(s).toMatchObject({ complete: true, reasons: [] });
+    // Summed over the passes it read well past the budget; no single pass did.
+    expect(s.stream!.bytes > budget.maxReadBytes || s.stream!.events > budget.maxReadEvents).toBe(true);
+    expect(await on.scan()).toEqual(await probe.scan());
+  }
+  // Under one pass is still refused, per pass.
+  const tight = await backend(x, { limits: TINY, stream: { maxReadBytes: 1 << 30, maxReadEvents: perPass.events - 1 }, staged: STAGED });
+  expect(await indexSearchScope(SCOPE, tight.deps)).toMatchObject({ complete: false, partial: true, inserted: 0, reasons: ["scope_too_large", STREAM_READ_EVENTS_BUDGET] });
+  expect(await tight.scan()).toEqual([]);
+}, 60_000);
+
+test("staged on: past the keyed-records cap the scope stays partial with stream_keyed_records_cap, nothing written or deleted", async () => {
+  const x = await scope(generate(54));
+  const probe = await backend(x, { limits: TINY, stream: UNLIMITED, staged: STAGED });
+  const read = (await indexSearchScope(SCOPE, probe.deps)).stream!;
+  const records = read.events / read.passes;
+  // Records of one pass past the cap.
+  const over = await backend(x, { limits: TINY, stream: UNLIMITED, staged: { keyedRecordsCap: records - 1 } });
+  const s = await indexSearchScope(SCOPE, over.deps);
+  expect(s).toMatchObject({ complete: false, partial: true, inserted: 0, deleted: 0, reasons: ["scope_too_large", STREAM_KEYED_RECORDS_CAP] });
+  expect(await over.scan()).toEqual([]);
+  expect(over.recorded).toEqual([{ complete: false, rows: 0 }]);
+  // At the cap the records fit; index rows past it stop the scan before any delete.
+  const at = await backend(x, { limits: { ...TINY, maxRows: 3 }, stream: UNLIMITED, staged: { keyedRecordsCap: records } });
+  expect(await indexSearchScope(SCOPE, at.deps)).toMatchObject({ complete: true });
+  const before = await at.scan();
+  expect(before.length).toBeLessThanOrEqual(records);
+  await addStale(at, records + 1 - before.length);
+  const capped = await indexSearchScope(SCOPE, at.deps);
+  expect(capped).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", STREAM_KEYED_RECORDS_CAP] });
+  expect((await at.scan()).length).toBe(records + 1);
+  expect(at.recorded.at(-1)).toEqual({ complete: false, rows: 0 });
+}, 60_000);
+
+test("staged on: an index without paged scans is refused, not scanned partially", async () => {
+  const x = await scope(generate(55));
+  const b = await backend(x, { limits: TINY, stream: UNLIMITED, staged: STAGED });
+  delete (b.adapter.index as { scanFingerprintsPage?: unknown }).scanFingerprintsPage;
+  await expect(indexSearchScope(SCOPE, b.deps)).rejects.toThrow("search paged scan unsupported by this index");
+  expect(await b.scan()).toEqual([]);
 }, 60_000);

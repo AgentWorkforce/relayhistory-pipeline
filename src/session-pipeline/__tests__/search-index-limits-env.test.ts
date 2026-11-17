@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STREAM_READ_CEILING, searchIndexLimitsFromEnv, searchIndexStreamChFromEnv } from "../search-index.ts";
+import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STAGED_KEYED_RECORDS_CAP, STREAM_READ_CEILING, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamChFromEnv, searchIndexStreamFromEnv } from "../search-index.ts";
 
 const MiB = 1024 * 1024;
 const NAMES = ["SEARCH_INDEX_MAX_SCOPE_BYTES", "SEARCH_INDEX_MAX_SCOPE_EVENTS", "SEARCH_INDEX_MAX_ROWS"] as const;
@@ -137,6 +137,59 @@ describe("SEARCH_INDEX_STREAMING_CH (hosted Lambda streaming reconcile)", () => 
       const got = message({ ...on, [name]: value });
       expect(got).toBe(expected);
       expect(got).not.toContain(value);
+    }
+  });
+});
+
+describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Phase 3 slice 1)", () => {
+  const VAR = "SEARCH_INDEX_STAGED_RECONCILE_ENABLED";
+  const stream = { ...STREAM_READ_CEILING };
+  const refusal = (env: Record<string, string | undefined>, streaming: typeof stream | undefined, outputFacts: boolean) => {
+    try {
+      searchIndexStagedStartup(env, streaming, outputFacts);
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return "accepted";
+  };
+
+  test("unset, empty and false are off: undefined, no notice, whatever streaming and output facts say", () => {
+    for (const env of [{}, { [VAR]: "" }, { [VAR]: "false" }])
+      for (const streaming of [stream, undefined])
+        for (const outputFacts of [false, true]) expect(searchIndexStagedStartup(env, streaming, outputFacts)).toBeUndefined();
+  });
+
+  test("true with streaming on is on, with the interim keyed-records cap and one info line", () => {
+    expect(STAGED_KEYED_RECORDS_CAP).toBe(500_000);
+    // The cap never asks for more key memory than the default streaming budgets already stream.
+    expect(STAGED_KEYED_RECORDS_CAP).toBeLessThanOrEqual(STREAM_READ_CEILING.maxReadEvents / 4);
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, false)).toEqual({
+      staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP },
+      notice: { level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", fields: { state: "on" } },
+    });
+    // Streaming resolved on by default (SEARCH_INDEX_STREAMING_ENABLED unset) is enough.
+    const defaultOn = searchIndexStreamFromEnv({}, {}, false);
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, defaultOn, false)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP });
+  });
+
+  test("true needs streaming on and refuses output facts, naming the variables", () => {
+    expect(refusal({ [VAR]: "true" }, undefined, false)).toBe(
+      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
+    );
+    // Streaming explicitly off resolves to no budgets: refused the same way.
+    expect(refusal({ [VAR]: "true" }, searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, false), false)).toContain("requires the streaming reconcile on");
+    for (const streaming of [stream, undefined])
+      expect(refusal({ [VAR]: "true" }, streaming, true)).toBe(
+        "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
+      );
+  });
+
+  test("any other value fails startup with a fixed message that never carries the value", () => {
+    for (const value of ["1", "0", "TRUE", "True", "FALSE", " true", "true ", "yes", "on", "off", "enabled"]) {
+      for (const streaming of [stream, undefined]) {
+        // One fixed message for every value: it cannot carry the value.
+        expect(refusal({ [VAR]: value }, streaming, false)).toBe("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
+      }
     }
   });
 });

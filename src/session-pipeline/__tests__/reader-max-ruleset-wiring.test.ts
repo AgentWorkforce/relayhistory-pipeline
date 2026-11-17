@@ -72,12 +72,15 @@ test("largeReadRuntime: MESSAGE_ORIGIN_LABELS_ENABLED labels like the Lambda tha
 test("hosted never streams: the Lambda and the large-read Job build search deps without `stream`, whatever the streaming env says", async () => {
   // Only the self-host consumer (consumer-service.ts serve()) reads SEARCH_INDEX_STREAMING_ENABLED and
   // SEARCH_INDEX_STREAM_MAX_READ_*; the hosted paths ignore them, malformed values included.
+  // Nor SEARCH_INDEX_STAGED_RECONCILE_ENABLED (Phase 3 slice 1): no `staged` either.
   for (const streaming of [{}, { SEARCH_INDEX_STREAMING_ENABLED: "true", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" },
-    { SEARCH_INDEX_STREAMING_ENABLED: "1", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }]) {
+    { SEARCH_INDEX_STREAMING_ENABLED: "1", SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" },
+    { SEARCH_INDEX_STREAMING_ENABLED: "true", SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true" }, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "nonsense" }]) {
     const rt = runtimeFromSecret(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", ...streaming }), secret, "synthetic-generation");
     try {
       expect(rt.deps.search).toBeDefined();
       expect("stream" in rt.deps.search!).toBe(false);
+      expect("staged" in rt.deps.search!).toBe(false);
     } finally {
       await (rt.deps.pointer.db as unknown as { end(): Promise<void> }).end();
     }
@@ -87,6 +90,7 @@ test("hosted never streams: the Lambda and the large-read Job build search deps 
     });
     try {
       expect("stream" in runtime.deps.search).toBe(false);
+      expect("staged" in runtime.deps.search).toBe(false);
     } finally {
       await runtime.close();
     }
