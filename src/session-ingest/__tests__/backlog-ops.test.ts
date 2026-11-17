@@ -145,13 +145,13 @@ test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry 
     if (timeout >= 0) expect(spec.args.slice(timeout, timeout + 2)).toEqual(["--statement-timeout-ms", "600000"]);
     expect(spec.args.includes("--page-size")).toBe(!mode.startsWith("drain"));
     if (mode.startsWith("export")) {
-      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "250"]);
-      expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "16"]);
+      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "100"]);
+      expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "4"]);
     }
     if (mode.startsWith("backfill")) {
-      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "5000"]);
-      expect(spec.args.slice(spec.args.indexOf("--row-page-size"), spec.args.indexOf("--row-page-size") + 2)).toEqual(["--row-page-size", "20000"]);
-      expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "16"]);
+      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "1000"]);
+      expect(spec.args.slice(spec.args.indexOf("--row-page-size"), spec.args.indexOf("--row-page-size") + 2)).toEqual(["--row-page-size", "5000"]);
+      expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "4"]);
     }
     expect(backlogOpsRole(d, t)).toBe(exec ? t.executeRoleArn : t.dryRoleArn);
     // Only a refresh names sections: exactly fences and ownership, never revisions.
