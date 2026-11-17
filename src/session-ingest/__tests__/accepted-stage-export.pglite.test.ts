@@ -329,9 +329,17 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     expect(dry).toMatchObject({ mode: "dry_run", would_write: 2, written: 0, orgs: { would_complete: 2, complete: 0 } });
     const beforeDry = (await allKeys(store)).filter((k) => !k.includes("upload-fences"));
     expect(beforeDry).toEqual([]);
-    const scoped = await run(store, { orgs: ["org-b"] });
+    const scopedLog: string[] = [];
+    const scoped = await run(store, { orgs: ["org-b"] }, scopedLog);
     expect(scoped).toMatchObject({ rows: 1, written: 1, orgs: { complete: 1 } });
-    await run(store);
+    // The SQL actually sent by a scoped run: no generic "$1 IS NULL OR" branch, custom plans in each read-only tx.
+    expect(scopedLog.some((l) => l.includes("$1::text[] IS NULL OR"))).toBe(false);
+    expect(scopedLog.some((l) => l.includes("o.org_id = ANY($1::text[])"))).toBe(true);
+    expect(scopedLog).toContain("SET LOCAL plan_cache_mode = force_custom_plan");
+    const unscopedLog: string[] = [];
+    await run(store, {}, unscopedLog);
+    expect(unscopedLog.some((l) => l.includes("($1::text[] IS NULL OR o.org_id = ANY($1::text[]))"))).toBe(true);
+    expect(unscopedLog).not.toContain("SET LOCAL plan_cache_mode = force_custom_plan");
     // Everything but the export's own lease (renewed and released by every run) is untouched by a rerun.
     // The completion objects are renewed by every execute run (revoked first, rewritten on a clean finish: P2-1).
     const completion = (k: string) => k.startsWith(`${ROOT}/.drain/accepted-stages/`);

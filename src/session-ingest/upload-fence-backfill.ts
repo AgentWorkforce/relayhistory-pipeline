@@ -90,7 +90,7 @@ export interface BackfillOptions {
   slotWindowBlocks?: number;
   /**
    * Read a scoped run's owned slots once per org through the org_id index (SLOTS_ORG_CURSOR) instead of the heap block
-   * windows. Off by default: a backfill mode passes it (`--slots-by-org`) only with the backlog-ops input slots_read=org.
+   * windows. Off by default (CLI `--slots-by-org`); backlog-ops passes it only for the input slots_read=org.
    */
   slotsByOrg?: boolean;
   /** With slotsByOrg, the per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the windows. */
