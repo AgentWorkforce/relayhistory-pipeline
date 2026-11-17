@@ -486,6 +486,44 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("memory documents: default off (501 memory_documents_disabled, no SQL), on only with the exact string \"true\"", async () => {
+    const t = tenant();
+    const seen: Array<{ text: string; params?: unknown[] }> = [];
+    // A fake pg client: records every statement; the memory documents functions read as not installed.
+    const connect = async () => ({
+      async query(text: string, params?: unknown[]) {
+        seen.push({ text, params });
+        return { rows: text.includes("to_regprocedure") ? [{ installed: false }] : [] };
+      },
+      async end() {},
+    }) as unknown as pg.Client;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, ...over }, ctx, { connect });
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const paths = [`/v1/memory/documents?workspace=${t.ws}`, `/v1/memory/documents/src-session-read-api?workspace=${t.ws}`];
+    const memorySql = () => seen.filter((q) => q.params?.some((p) => typeof p === "string" && p.startsWith("sessions.decision_records_")));
+    for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
+      for (const path of paths) {
+        seen.length = 0;
+        const r = await call(path, { READ_API_MEMORY_DOCUMENTS_ENABLED: flag });
+        expect(r.status, `${path} ${String(flag)}`).toBe(501);
+        expect(await r.json(), `${path} ${String(flag)}`).toEqual({ error: "memory_documents_disabled" });
+        expect(memorySql(), `${path} ${String(flag)}`).toHaveLength(0);
+      }
+    }
+    // Exactly "true": each route reaches its function check through the request's tenant runner.
+    for (const path of paths) {
+      seen.length = 0;
+      const on = await call(path, { READ_API_MEMORY_DOCUMENTS_ENABLED: "true" });
+      expect(memorySql(), path).toHaveLength(1);
+      expect(on.status, path).toBe(501);
+      expect((await body(on)).error, path).toMatchObject({ code: "unsupported_by_backend", reason: "memory_documents_not_migrated" });
+    }
+  });
+
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {
     const t = tenant();
     await insert([ev(t, { id: "d-1", session: "s-down", ts: "2026-10-23 08:00:00.000" })]);

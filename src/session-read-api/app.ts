@@ -171,6 +171,7 @@ import {
   type SelfhostDeps,
 } from "./selfhost.ts";
 import { registerSelfIssuedRoutes, type SelfIssuedDeps } from "./self-issued.ts";
+import { registerMemoryDocumentsRoutes, type MemoryDocuments } from "./memory-documents.ts";
 
 /**
  * The only scopes POST /v1/cli/login advertises (next to LOGIN_MAX_TTL_MS, selfhost.ts). This backend
@@ -240,6 +241,12 @@ export interface ReadApiDeps {
    * Absent = the route is byte-identical to before (kind=long is 501 `summary_kind`). Needs `briefSummary` too: its SQL is the fallback's authority.
    */
   summaryFallback?: SummaryFallback;
+  /**
+   * READ_API_MEMORY_DOCUMENTS_ENABLED=true (exactly "true"), on every entry: GET /v1/memory/documents
+   * and /v1/memory/documents/:topic (memory-documents.ts). Absent, both answer 501
+   * `memory_documents_disabled`. Uses directory workspace admission (the `memory` canary).
+   */
+  memoryDocuments?: MemoryDocuments;
   /**
    * READ_API_LIST_SHORT_SUMMARY_ENABLED=true (exactly "true"): GET /v1/sessions serves the opt-in
    * includeShortSummary=recorded (shortSummary, shortSummaryGeneratedAt). Not true = the param is a
@@ -1124,7 +1131,7 @@ export function createReadApi(deps: ReadApiDeps) {
   }
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary" | "memory"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -1800,6 +1807,20 @@ export function createReadApi(deps: ReadApiDeps) {
       clearTimeout(timer);
     }
   };
+  registerMemoryDocumentsRoutes(app as never, deps.memoryDocuments, {
+    guard: (c) => {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "memory");
+      rejectUnsupported(c);
+      return identity;
+    },
+    single,
+    bad,
+    unsupported,
+    fail,
+  });
+
   const turnsFail = (c: Context, error: unknown) => {
     if (error instanceof CanonicalReadError) return fail(c, unsupported(`turns_canonical_${error.reason}`, error.details));
     if (error instanceof TurnsInputError) return fail(c, unsupported(error.reason.startsWith("turns_") ? error.reason : `turns_${error.reason}`));
