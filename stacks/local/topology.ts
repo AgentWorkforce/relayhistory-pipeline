@@ -17,7 +17,7 @@ export const STACK = "96bulls";
 
 /** Images pinned by tag now; digests go into versions.lock.json on first release. */
 export const IMAGES = {
-  hoopdb: "pgvector/pgvector:pg17",
+  hoopdb: "postgres:17",
   // MinIO's own registries went private in 2025; Chainguard's build is public. Pinned by digest.
   locker:
     "cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7",

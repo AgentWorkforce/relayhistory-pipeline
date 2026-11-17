@@ -29,7 +29,7 @@ x-control-env: &control-env
   RELAYCONTROL_INTROSPECT_SECRET: ${E2E_INTROSPECT_SECRET:?}
 services:
   db:
-    image: pgvector/pgvector:pg17
+    image: postgres:17
     environment:
       POSTGRES_PASSWORD: ${E2E_PG_PASSWORD:?}
     # The key is bind-mounted from the host user; Postgres refuses a key it does not own.
@@ -92,7 +92,7 @@ services:
     restart: "no"
   # Service logins: what an operator does after migrate (docs/selfhost-composition.md section 4).
   roles:
-    image: pgvector/pgvector:pg17
+    image: postgres:17
     entrypoint: ["sh", "/e2e/roles.sh"]
     environment:
       PGHOST: db
