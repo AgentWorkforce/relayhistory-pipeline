@@ -39,6 +39,21 @@ What the gate does and does not prove:
 - **The `PRIVATE_INGEST_OVERLAP` check is a source proxy, not a live Worker readback.** It proves the release sha carries the reviewed `{G, H}` pair the Worker deploy reads; it does not prove the live Worker accepts H. Confirm the G+H deploy's own readback before step 2.
 - **The overlap table must already exist.** A database that has a lazy policy but not migration 20261105044030 (the overlap table) refuses `overlap_not_installed` for every readiness move, including the release that would install 044030, because no window can exist before it. This route is pinned to the one production project, which already has 044030. A self-hosted database does not use this route (it runs its own migrator and its own rebind, `src/hoopdb/ingest-generation-rebind.ts`), so the gate does not apply there; it should still install 044030 before its next lazy-policy release so the overlap order is available. If a database on this route ever were in that state, treat it as the break-glass case below (a planned buffered-ingest outage from apply to rebind, explicitly authorized), never as a reason to bypass the gate silently.
 
+### Schema-gated worker images: roll them in the same window
+
+Every queue worker built from this repository pauses when readiness moves off its build generation. `runWorker` (src/shared/worker.ts) checks `schemaVerdict` (src/shared/db.ts) on every `/readyz` probe and before every claim, and that check passes only while the marker is PASS at **the image's own** generation. After the apply writes PASS at H, every worker still on a G image logs `worker paused: live role validation gate closed; claiming nothing`, turns NotReady and claims nothing. It does not crash or restart, so a pod-crash alert never fires. On 2026-11-16 the 062010 apply paused the summary and status workers this way from 19:52Z to about 00:10Z, roughly 4 h with no alert and summaries piling into dead letters.
+
+The schema-gated SERVICEs (docker/entrypoint.sh) are `session-pipeline-consumer`, `bob-costas` (session summaries), `session-brief`, `referee`, `alleyoop-ingest` and `hoopdb-indexer`. The deployment names per environment live in the infra repository, next to the manifests.
+
+For every release that moves readiness (the same condition as the overlap gate above):
+
+1. **Before the plan**, build the services image at target_sha and record, per environment, every deployment running a schema-gated SERVICE with its current image and Ready replica count.
+2. **In the same window as the apply**, roll every one of those deployments to the target_sha image straight after the PASS at H. A G image cannot pass the gate once the marker is at H, so there is nothing to gain by waiting. Do not roll before PASS: an H image waits in `waitForSchema` and is not ready until the marker reaches PASS at H.
+3. **Post-apply check**: every listed deployment is back at its recorded Ready count on the new image, and the summary dead-letter count has not grown since step 1. Any shortfall is a release incident: page, do not wait for the next monitor summary.
+4. Record the list, the images and the readback in the release handoff.
+
+A NotReady-but-running worker is the failure mode this guards against. The standing alert (any schema-gated deployment below its desired Ready count for more than 5 minutes) is the backstop, not the plan.
+
 ### Failed apply without a window (`retry_marker_pending_no_window`)
 
 A failed apply leaves readiness **pending at H** (earlier steps committed, the marker never reached PASS) with the lazy policy and admissions still at G. While the G -> H window is still open with at least 900 seconds left, a new plan and apply of the same target pass the gate: re-plan and re-apply before it expires. If the window has expired, was closed or is too short, the stock CI route **cannot** recover:
