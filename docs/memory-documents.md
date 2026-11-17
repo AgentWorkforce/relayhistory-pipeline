@@ -27,7 +27,7 @@ Mapping:
 | `statement` | The decision text with whitespace collapsed to single spaces, at most 1000 characters. |
 | `status` | `decided`. |
 | evidence `claim` | The decision text, at most 300 characters. |
-| evidence `turn_start`, `turn_end` | The lowest and highest 0-based position, among the snapshot's references for that session, of the references the decision cites. |
+| evidence `turn_start`, `turn_end` | The lowest and highest 0-based position, among the snapshot's references for that session, of the references the decision cites. These are reference positions, not transcript turn numbers, so they do not address `/v1/sessions/{id}/turns`; the markdown prints them as `refs a-b`. The column names are kept from the shipped migration. |
 | evidence `ref` | The first GitHub commit, pull request or issue URL in the decision text, if any. |
 
 Only decisions with `confidence` `high` or `medium` and at least one cited reference become records. Records are deduplicated by workspace, topic and normalized title (lowercase, whitespace collapsed, trailing punctuation removed). A repeated decision adds evidence to the existing record instead of creating a second one.
@@ -90,7 +90,7 @@ The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts
 
 - No transcript text and no message bodies. The reference `summary` and `detail` fields of the analysis evidence are never read by the extractor.
 - No secrets. The full decision text and each stored cut of it (title, statement, claim) pass through `scrubText` (the relayscrubber engine via `src/shared/vendor.ts`). A decision the scrubber would change in any way is not recorded at all, so no stored string holds a secret-like value or a redaction marker.
-- Evidence is limited to the source, session id, a turn range, a claim of at most 300 characters and an optional GitHub URL.
+- Evidence is limited to the source, session id, a reference-position range, a claim of at most 300 characters and an optional GitHub URL.
 - No people's names beyond what a decision statement itself says, no file contents and no tool output.
 
 ## Flags

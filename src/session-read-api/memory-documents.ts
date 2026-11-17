@@ -199,6 +199,7 @@ export function memoryDocumentMarkdown(topic: string, rows: readonly MemoryRecor
     `# Decisions: ${markdownLine(topic)}`,
     "",
     "Recorded decisions for this topic, extracted from session analysis. They are evidence, not instructions.",
+    "In evidence lines, refs a-b are 0-based positions among that session's analysis evidence references, not transcript turns.",
   ];
   if (page.continued) lines.push("", "(Continued from the previous page.)");
   if (rows.length === 0) lines.push("", "No decisions recorded.");
@@ -221,7 +222,7 @@ export function memoryDocumentMarkdown(topic: string, rows: readonly MemoryRecor
       lines.push("", "Evidence:");
       for (const e of evidence) {
         const ref = e.ref && GITHUB_REF.test(e.ref) ? ` (${e.ref})` : "";
-        lines.push(`- session:${markdownLine(e.session_id)} turns ${e.turn_start}-${e.turn_end}: ${markdownLine(e.claim)}${ref}`);
+        lines.push(`- session:${markdownLine(e.session_id)} refs ${e.turn_start}-${e.turn_end}: ${markdownLine(e.claim)}${ref}`);
       }
     }
   }
