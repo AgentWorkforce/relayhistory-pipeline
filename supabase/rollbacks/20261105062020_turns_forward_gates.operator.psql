@@ -12,8 +12,9 @@
 \else
 \set turns_intake_paused false
 \endif
+SELECT set_config('turns.intake_paused', :'turns_intake_paused', false);
 DO $intake_guard$ BEGIN
- IF NOT :'turns_intake_paused'::boolean THEN
+ IF NOT coalesce(current_setting('turns.intake_paused',true),'false')::boolean THEN
   RAISE EXCEPTION 'turns forward gates: erasure and selection intake must be paused'
     USING ERRCODE='55000';
  END IF;
