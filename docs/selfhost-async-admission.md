@@ -88,6 +88,25 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
     HTTP status) or, for a request that failed below HTTP, `store_cause`: one of `econnreset`,
     `etimedout`, `econnrefused`, `epipe`, `abort`, `timeout`, `dns`, `tls`, `socket` or `other`,
     classified from the error's code and name, never its message.
+- **Waiting for fence authority (`SELFHOST_ADMISSION_AWAIT_AUTHORITY=on`, default off).** With
+  `INGEST_LEDGER=s3`, a claim for an org that has no fence-authority marker yet (no per-org marker and no
+  valid deployment-wide one) answers `ledger_fence_authority_missing`; while the deployment-wide stop is up
+  it answers `ledger_fence_authority_stopped`. Off (the default), each is an ordinary retry that counts
+  toward the dead-letter attempts, unchanged. On, each is a deferral, like the tenant-limit deferral: the
+  attempt does not count, so the object is never dead-lettered for it. The org's other entries wait
+  `AUTHORITY_WAIT_MS` (60 s) without starting. After the window, one probe claim per org runs (the others
+  wait for its answer), so a waiting org costs one claim per minute however large its backlog, holds no
+  other slot, and never delays another org. Use it while an org's desktops already upload direct and its
+  marker is still being prepared (wave rollouts: the stop, the backfill, then the marker). A waiting org
+  shows as `backlog` / `oldestAgeMs` in the status line and as `outcome=deferred` lines with the code,
+  never as dead letters. Dead letters written before the flag was turned on stay parked until they
+  expire or the operator deletes their markers.
+  - **Not a deferral:** `ledger_fence_authority_invalid` and `ledger_fence_authority_org_mismatch`. An
+    invalid per-org marker is the documented way to stop ONE org (`docs/selfhost-composition.md`,
+    "Stopping admission"), and an invalid or mismatched marker is an operator error that must surface.
+    Both stay ordinary retries and dead-letter after `SELFHOST_ADMISSION_MAX_ATTEMPTS`. To pause one org
+    without dead letters, remove its marker instead (with no valid deployment-wide marker), or raise the
+    deployment-wide stop.
 - **Dead letters.** After `SELFHOST_ADMISSION_MAX_ATTEMPTS` failures (default 20, the hosted queue's
   max retries) in one process, the consumer writes a marker at
   `<keyRoot>/.admission-dlq/<the inbox path>.json` holding `{v, kind, code, attempts, atMs}`. It holds

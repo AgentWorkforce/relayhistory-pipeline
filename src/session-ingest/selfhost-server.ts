@@ -330,6 +330,9 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...uploadConsent,
     // INGEST_S3_TENANT_LIMIT=on: the per-replica tenant limit defers an object (never dead-letters it). Off: unchanged.
     ...(asyncLimiter ? { deferTenantLimit: true } : {}),
+    // SELFHOST_ADMISSION_AWAIT_AUTHORITY=on: an org still waiting for its fence-authority marker defers (never
+    // dead-letters) while its uploads queue in the inbox (wave rollouts). Off: an ordinary retry, unchanged.
+    ...(admission.awaitAuthority ? { awaitAuthority: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:
