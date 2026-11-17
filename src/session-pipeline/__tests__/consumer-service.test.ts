@@ -779,6 +779,74 @@ describe("bootstrap ordering", () => {
 });
 
 /**
+ * bootstrapCheckOwner on a real catalog. Each scenario gets its own PGlite
+ * (SET SESSION AUTHORIZATION works once; RESET is a no-op): the superuser
+ * stages the schemas, a non-superuser owner and the consumer role's state,
+ * then switches to that owner so current_user is a real non-superuser that
+ * owns both schemas, with or without CREATEROLE.
+ */
+describe("bootstrapCheckOwner (PGlite, real catalog)", () => {
+  const CLAIM = `ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`;
+  async function asOwner(
+    stage: string,
+    opts: { createRole?: boolean; ownsSchemas?: boolean } = {},
+  ): Promise<{ code?: string; message?: string } | null> {
+    const pg = new PGlite();
+    try {
+      await pg.exec(`CREATE SCHEMA sessions; CREATE SCHEMA search_index;
+        CREATE ROLE check_owner LOGIN NOSUPERUSER ${opts.createRole ? "CREATEROLE" : "NOCREATEROLE"};`);
+      if (opts.ownsSchemas !== false)
+        await pg.exec(`ALTER SCHEMA sessions OWNER TO check_owner; ALTER SCHEMA search_index OWNER TO check_owner;`);
+      if (stage) await pg.exec(stage);
+      await pg.exec(`SET SESSION AUTHORIZATION check_owner`);
+      const who = await pg.query<{ u: string; cr: boolean; su: boolean }>(
+        `SELECT current_user AS u, rolcreaterole AS cr, rolsuper AS su FROM pg_roles WHERE rolname = current_user`,
+      );
+      expect(who.rows[0]).toEqual({ u: "check_owner", cr: opts.createRole === true, su: false });
+      try {
+        await bootstrapCheckOwner(asDb(pg));
+        return null;
+      } catch (error) {
+        return error as { code?: string; message?: string };
+      }
+    } finally {
+      await pg.close();
+    }
+  }
+  const CONVERGED = `CREATE ROLE search_consumer_runtime LOGIN NOINHERIT; ${CLAIM}`;
+
+  test("a converged role passes on schema ownership alone, without CREATEROLE", async () => {
+    expect(await asOwner(CONVERGED)).toBeNull();
+  }, 60_000);
+
+  test("a role that must still be created or promoted demands CREATEROLE", async () => {
+    const refused = (error: { code?: string; message?: string } | null) => {
+      expect(error?.code).toBe("42501");
+      expect(error?.message).toContain("may not create roles");
+    };
+    // Absent: the role SQL would CREATE ROLE.
+    refused(await asOwner(""));
+    // The migrate-provisioned bare NOLOGIN role: the role SQL would promote it.
+    refused(await asOwner(`CREATE ROLE search_consumer_runtime NOLOGIN NOINHERIT`));
+    // LOGIN without the claim marker, or INHERIT: not converged.
+    refused(await asOwner(`CREATE ROLE search_consumer_runtime LOGIN NOINHERIT`));
+    refused(await asOwner(`CREATE ROLE search_consumer_runtime LOGIN INHERIT; ${CLAIM}`));
+    // A different timeout value is not the claim.
+    refused(await asOwner(`CREATE ROLE search_consumer_runtime LOGIN NOINHERIT; ALTER ROLE search_consumer_runtime SET statement_timeout = '5s'`));
+    // Extra settings beside the claim, global or per-database.
+    refused(await asOwner(`${CONVERGED}; ALTER ROLE search_consumer_runtime SET search_path = attacker`));
+    refused(await asOwner(`${CONVERGED}; DO $x$ BEGIN EXECUTE format('ALTER ROLE search_consumer_runtime IN DATABASE %I SET search_path = attacker', current_database()); END $x$`));
+  }, 240_000);
+
+  test("CREATEROLE still admits creation, and ownership is still required when converged", async () => {
+    expect(await asOwner("", { createRole: true })).toBeNull();
+    const notOwner = await asOwner(CONVERGED, { ownsSchemas: false });
+    expect(notOwner?.code).toBe("42501");
+    expect(notOwner?.message).toContain("does not own the sessions/search_index schemas");
+  }, 60_000);
+});
+
+/**
  * Every Supabase and HoopDb migration, like pointer-race.test.ts: the role
  * files grant against the real catalog (policies, triggers, SECURITY DEFINER
  * functions), so a hand-made minimal schema hides exactly the drift verify
@@ -1066,6 +1134,94 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
         dbCode = (error as { code?: string })?.code;
       }
       expect(dbCode).toBe("55000");
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("the role SQL issues no top-level ALTER ROLE: the claim ALTERs sit in a conditional DO block", () => {
+    const roleSql = stripPsqlMeta(readFileSync(ROLE_SQL, "utf8"));
+    // No ALTER ROLE starts a line at the top level (statements in DO bodies are indented) ...
+    expect(roleSql).not.toMatch(/^ALTER\s+ROLE\b/im);
+    // ... and none is left once every DO block is removed.
+    const topLevel = roleSql.replace(/DO\s+\$(\w*)\$[\s\S]*?\$\1\$\s*;/g, "");
+    expect(topLevel).not.toMatch(/ALTER\s+ROLE/i);
+    expect(roleSql).toContain("ALTER ROLE search_consumer_runtime LOGIN NOINHERIT;");
+    expect(roleSql).toContain("ALTER ROLE search_consumer_runtime SET statement_timeout = '60s';");
+  });
+
+  test("a converged rerun of the role SQL succeeds and leaves the role and its single claim row unchanged", async () => {
+    const { pg } = await installed();
+    try {
+      const roleSql = stripPsqlMeta(readFileSync(ROLE_SQL, "utf8"));
+      const verifySql = stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8"));
+      const shape = async () =>
+        (await pg.query(
+          `SELECT r.rolcanlogin, r.rolinherit, r.rolcreaterole, r.rolsuper,
+                  (SELECT json_agg(json_build_object('db', s.setdatabase::int, 'config', s.setconfig))
+                     FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS settings
+             FROM pg_roles r WHERE r.rolname = 'search_consumer_runtime'`,
+        )).rows[0];
+      // The fixture starts from the migrate-provisioned bare NOLOGIN role:
+      // the first run promotes it (the ALTERs run exactly as before).
+      expect(await shape()).toMatchObject({ rolcanlogin: false, settings: null });
+      await pg.exec(roleSql);
+      const claimed = await shape();
+      expect(claimed).toEqual({
+        rolcanlogin: true,
+        rolinherit: false,
+        rolcreaterole: false,
+        rolsuper: false,
+        settings: [{ db: 0, config: ["statement_timeout=60s"] }],
+      });
+      await pg.exec(verifySql);
+      // The rerun converges: no error, same attributes, the one claim row.
+      await pg.exec(roleSql);
+      expect(await shape()).toEqual(claimed);
+      await pg.exec(verifySql);
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("a converged rerun needs no CREATEROLE: an owner-equivalent identity without it reruns the role SQL", async () => {
+    const { pg } = await installed();
+    try {
+      const roleSql = stripPsqlMeta(readFileSync(ROLE_SQL, "utf8"));
+      const verifySql = stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8"));
+      // First bootstrap with full authority (PGlite's superuser).
+      await pg.exec(roleSql);
+      await pg.exec(verifySql);
+      // Every object here is owned by the superuser, so a non-superuser
+      // NOCREATEROLE member inheriting it holds exactly the owner's object
+      // rights (grant, revoke, policies) but no role authority: the shape of
+      // an owner that dropped its temporary CREATEROLE after the first run.
+      await pg.exec(`CREATE ROLE rerun_owner LOGIN NOSUPERUSER NOCREATEROLE INHERIT; GRANT ${(await pg.query<{ u: string }>("SELECT current_user AS u")).rows[0].u} TO rerun_owner`);
+      await pg.exec(`SET SESSION AUTHORIZATION rerun_owner`);
+      const who = await pg.query<{ cr: boolean; su: boolean }>(
+        `SELECT rolcreaterole AS cr, rolsuper AS su FROM pg_roles WHERE rolname = current_user`,
+      );
+      expect(who.rows[0]).toEqual({ cr: false, su: false });
+      // Negative control: this identity really cannot alter the role, so the
+      // previous unconditional ALTER ROLE would have failed the rerun 42501.
+      let control: string | undefined;
+      try {
+        await pg.exec(`ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`);
+      } catch (error) {
+        control = (error as { code?: string })?.code;
+      }
+      expect(control).toBe("42501");
+      // The rerun itself converges. Verify is not rerun under this staging:
+      // it pins the writer tables' owner to current_user, which a member of
+      // the owner is not. The real-owner rerun plus verify without
+      // CREATEROLE is session-consumer-writer.postgres.test.ts's case.
+      await pg.exec(roleSql);
+      const role = await pg.query(
+        `SELECT r.rolcanlogin, r.rolinherit,
+                (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS n
+           FROM pg_roles r WHERE r.rolname = 'search_consumer_runtime'`,
+      );
+      expect(role.rows[0]).toEqual({ rolcanlogin: true, rolinherit: false, n: 1 });
     } finally {
       await pg.close();
     }

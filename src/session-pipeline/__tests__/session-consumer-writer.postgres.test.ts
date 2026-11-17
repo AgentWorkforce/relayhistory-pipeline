@@ -375,6 +375,67 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
     }
   }, 180_000);
 
+  // An owner that dropped its temporary CREATEROLE after the first bootstrap
+  // (the documented operator model) must still rerun the Job: the role is
+  // already claimed, so the bootstrap alters no role and needs only schema
+  // ownership. The superuser operator connection strips and restores the
+  // attribute; the bootstrap itself runs as the owner, like serve().
+  test.skipIf(!process.env.SESSION_PIPELINE_TEST_OPERATOR_PG_URL)(
+    "a claimed role reruns the full bootstrap as an owner without CREATEROLE",
+    async () => {
+      await bootstrapOnce(); // claimed by the CREATEROLE owner first
+      const [{ owner, rolsuper }] = (
+        await pool.query(`SELECT current_user AS owner, rolsuper FROM pg_roles WHERE rolname = current_user`)
+      ).rows as { owner: string; rolsuper: boolean }[];
+      // A superuser owner keeps role authority regardless, which would make
+      // this proof vacuous: fail loudly (the CI owner is the non-superuser
+      // CREATEROLE owner).
+      expect(rolsuper).toBe(false);
+      const claim = async () =>
+        (await pool.query(
+          `SELECT r.rolcanlogin, r.rolinherit, r.rolcreaterole,
+                  (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS settings,
+                  (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid AND s.setdatabase = 0
+                     AND s.setconfig = ARRAY['statement_timeout=60s']::text[]) AS claim
+             FROM pg_roles r WHERE r.rolname = 'search_consumer_runtime'`,
+        )).rows[0];
+      const before = await claim();
+      expect(before).toMatchObject({ rolcanlogin: true, rolinherit: false, settings: 1, claim: 1 });
+      const operator = new pg.Pool({ connectionString: process.env.SESSION_PIPELINE_TEST_OPERATOR_PG_URL });
+      try {
+        await operator.query(`ALTER ROLE ${pg.escapeIdentifier(owner)} NOCREATEROLE`);
+        const [{ rolcreaterole }] = (
+          await pool.query(`SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user`)
+        ).rows as { rolcreaterole: boolean }[];
+        expect(rolcreaterole).toBe(false);
+        // Negative control: the owner really lost role authority, so the
+        // previous unconditional ALTER ROLE would have failed this rerun.
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await expect(
+            client.query(`ALTER ROLE search_consumer_runtime SET statement_timeout = '60s'`),
+          ).rejects.toMatchObject({ code: "42501" });
+          await client.query("ROLLBACK");
+        } finally {
+          client.release();
+        }
+        // The full bootstrap (owner check, lock, schemas, tables, role SQL,
+        // verify) converges as the NOCREATEROLE owner.
+        await bootstrapOnce();
+        expect(await claim()).toEqual(before);
+      } finally {
+        await operator.query(`ALTER ROLE ${pg.escapeIdentifier(owner)} CREATEROLE`);
+        await operator.end();
+      }
+      const [{ restored }] = (
+        await pool.query(`SELECT rolcreaterole AS restored FROM pg_roles WHERE rolname = current_user`)
+      ).rows as { restored: boolean }[];
+      expect(restored).toBe(true);
+    },
+    180_000,
+  );
+
   test("the advisory lock names hashtextextended (typo fails 42883)", async () => {
     const client = await pool.connect();
     try {

@@ -46,10 +46,13 @@ other settings. Successful claimed-role reruns need no credential probe.
 
 After successful bootstrap/verification, the operator may provision the
 dedicated runtime password through the existing supported secret ceremony and
-remove temporary CREATEROLE from the owner. Normal migrations accept the
-claimed role without CREATEROLE; rerunning the owner bootstrap still requires
-its documented owner authority. Do not reset or erase an existing credential
-to get past a refusal. Stop and investigate the unexpected role state.
+remove temporary CREATEROLE from the owner. Creating or promoting the role
+needs CREATEROLE plus the creator ADMIN edge; normal migrations and reruns of
+the owner bootstrap against the already-claimed role need only ownership of
+`sessions` and `search_index`, because a converged rerun alters no role
+attribute or setting. An absent or bare role still needs CREATEROLE; any other existing LOGIN state is refused. Do not
+reset or erase an existing credential to get past a refusal. Stop and
+investigate the unexpected role state.
 
 ## Scope and proof
 

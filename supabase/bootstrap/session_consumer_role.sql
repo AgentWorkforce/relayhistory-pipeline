@@ -39,6 +39,14 @@
 -- partial commit behind when verify later fails. Grants converge on rerun:
 -- every grant below is revoked first, then granted exactly.
 --
+-- Authority: creating the role, or promoting the migrate-provisioned bare
+-- NOLOGIN role, needs CREATEROLE (PostgreSQL 16+: plus the creator ADMIN
+-- edge). A rerun against an already-claimed role (LOGIN NOINHERIT with
+-- exactly the global statement_timeout=60s claim) alters no role attribute
+-- or setting, so it needs only ownership of the sessions and search_index
+-- schemas: an owner that dropped its temporary CREATEROLE after the first
+-- bootstrap can still rerun this file.
+--
 --   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_consumer_role.sql
 --   psql -X -d <the HoopDb database> -c '\password search_consumer_runtime'
 --   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_consumer_role_verify.sql
@@ -195,15 +203,32 @@ END
 $role$;
 -- PostgreSQL 16+ lets only a superuser name SUPERUSER or REPLICATION in ALTER
 -- ROLE, even as NOSUPERUSER/NOREPLICATION (and BYPASSRLS needs BYPASSRLS).
--- CREATE ROLE above sets the safe attributes; here LOGIN NOINHERIT are
--- (re-)asserted, which also promotes the migrate-provisioned bare NOLOGIN
--- role to the dedicated LOGIN exactly once, by running this operator step.
+-- CREATE ROLE above sets the safe attributes; here LOGIN NOINHERIT and the
+-- statement_timeout claim marker are written, which also promotes the
+-- migrate-provisioned bare NOLOGIN role to the dedicated LOGIN exactly once,
+-- by running this operator step. Both ALTERs need CREATEROLE (PostgreSQL
+-- 16+: plus the creator ADMIN edge), so they run only while the role is not
+-- yet claimed: just created above, or the bare role being promoted. A
+-- converged rerun (LOGIN, NOINHERIT and exactly the one global claim row;
+-- the block above already refuses any other existing LOGIN) skips them and
+-- changes nothing, so an owner without CREATEROLE can rerun the bootstrap.
 -- session_consumer_role_verify.sql fails if an existing role has SUPERUSER,
 -- CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS or INHERIT.
-ALTER ROLE search_consumer_runtime LOGIN NOINHERIT;
--- Backstop matching the writer transactions' own SET LOCAL (60s); the pointer
--- publication sets tighter locals per statement.
-ALTER ROLE search_consumer_runtime SET statement_timeout = '60s';
+DO $claim$
+DECLARE
+  r pg_catalog.pg_roles%ROWTYPE;
+BEGIN
+  SELECT * INTO r FROM pg_catalog.pg_roles WHERE rolname = 'search_consumer_runtime';
+  IF NOT FOUND OR NOT r.rolcanlogin OR r.rolinherit
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])
+     OR EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND NOT (setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])) THEN
+    ALTER ROLE search_consumer_runtime LOGIN NOINHERIT;
+    -- Backstop matching the writer transactions' own SET LOCAL (60s); the
+    -- pointer publication sets tighter locals per statement.
+    ALTER ROLE search_consumer_runtime SET statement_timeout = '60s';
+  END IF;
+END
+$claim$;
 
 -- Schema access (revoke-first so a rerun converges drift).
 REVOKE ALL ON SCHEMA sessions FROM search_consumer_runtime;

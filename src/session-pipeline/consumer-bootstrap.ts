@@ -76,27 +76,48 @@ export async function bootstrapLock(owner: SqlExecutor): Promise<void> {
 
 /**
  * Owner proof, not a superuser demand: the invoker must own the schemas it
- * writes and be able to create the dedicated role. A CNPG hoop owner or a
- * managed-platform CREATEROLE owner passes; a bare reader or an unrelated
- * role fails here, before any DDL. On RDS and Cloud SQL the owner creates
- * search_consumer_runtime itself through the bootstrap chain
- * (supabase/bootstrap/session_consumer_roles.sql, same pattern as
- * hoopdb_runtime_role_rds.sql) and keeps the unavoidable ADMIN creator edge:
- * the managed-platform trampolines deliberately never provision the consumer
- * role, because a trampoline copy would leave the owner unable to promote it.
+ * writes and, while the dedicated role still has to be created or promoted,
+ * be able to do that. A CNPG hoop owner or a managed-platform CREATEROLE
+ * owner passes; a bare reader or an unrelated role fails here, before any
+ * DDL. On RDS and Cloud SQL the owner creates search_consumer_runtime itself
+ * through the bootstrap chain (supabase/bootstrap/session_consumer_roles.sql,
+ * same pattern as hoopdb_runtime_role_rds.sql) and keeps the unavoidable
+ * ADMIN creator edge: the managed-platform trampolines deliberately never
+ * provision the consumer role, because a trampoline copy would leave the
+ * owner unable to promote it.
+ *
+ * CREATEROLE (or superuser) is demanded only when the role SQL will ALTER
+ * the role: the role is absent, NOLOGIN (the bare role awaiting promotion),
+ * INHERIT, or lacks exactly the one global statement_timeout=60s claim row.
+ * Once the role is claimed (converged), the role SQL changes no attribute or
+ * setting, so schema ownership alone passes: an owner that dropped its
+ * temporary CREATEROLE after the first bootstrap can rerun the Job. The
+ * convergence predicate mirrors the conditional claim block in
+ * session_consumer_role.sql; the role SQL itself still fails closed on any
+ * other role state.
  */
 export async function bootstrapCheckOwner(owner: SqlExecutor): Promise<void> {
-  const { rows } = await owner.query<{ ok: boolean; canCreateRole: boolean }>(
+  const { rows } = await owner.query<{ ok: boolean; canCreateRole: boolean; roleConverged: boolean }>(
     `SELECT
        bool_and(n.nspowner = current_user::regrole) AS ok,
-       EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolcreaterole)) AS "canCreateRole"
+       EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND (rolsuper OR rolcreaterole)) AS "canCreateRole",
+       EXISTS (
+         SELECT 1 FROM pg_catalog.pg_roles r
+          WHERE r.rolname = 'search_consumer_runtime' AND r.rolcanlogin AND NOT r.rolinherit
+            AND EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s
+                         WHERE s.setrole = r.oid AND s.setdatabase = 0
+                           AND s.setconfig = ARRAY['statement_timeout=60s']::text[])
+            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s
+                             WHERE s.setrole = r.oid
+                               AND NOT (s.setdatabase = 0 AND s.setconfig = ARRAY['statement_timeout=60s']::text[]))
+       ) AS "roleConverged"
      FROM pg_namespace n WHERE n.nspname IN ('sessions', 'search_index')`,
   );
   if (!rows[0]?.ok)
     throw Object.assign(new Error("pipeline consumer bootstrap: current role does not own the sessions/search_index schemas"), {
       code: "42501",
     });
-  if (!rows[0]?.canCreateRole)
+  if (!rows[0]?.canCreateRole && rows[0]?.roleConverged !== true)
     throw Object.assign(
       new Error("pipeline consumer bootstrap: current role may not create roles (needs CREATEROLE or superuser)"),
       { code: "42501" },
