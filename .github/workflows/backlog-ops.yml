@@ -240,6 +240,15 @@ jobs:
           BACKLOG_OPS_KMS_KEY_ARN: ${{ vars.BACKLOG_OPS_KMS_KEY_ARN }}
           BACKLOG_OPS_DRY_ROLE_ARN: ${{ vars.BACKLOG_OPS_DRY_ROLE_ARN }}
           BACKLOG_OPS_EXECUTE_ROLE_ARN: ${{ vars.BACKLOG_OPS_EXECUTE_ROLE_ARN }}
+          # The relocated upload ledger (docs/ledger-relocation.md): both or neither. Set, the backfill and the drain
+          # write ledger/** there (INGEST_LEDGER_BUCKET / _REGION in the tool's environment); unset, the ledger is in
+          # BACKLOG_OPS_BUCKET.
+          BACKLOG_OPS_LEDGER_BUCKET: ${{ vars.BACKLOG_OPS_LEDGER_BUCKET }}
+          BACKLOG_OPS_LEDGER_REGION: ${{ vars.BACKLOG_OPS_LEDGER_REGION }}
+          # Never optional here: the credential step also forces it into every S3 tool's environment (backlogOpsLedgerEnv),
+          # so a run without the ledger variables refuses (ledger_home_moved) after a relocation instead of writing the
+          # Locker bucket's stale ledger copy.
+          INGEST_LEDGER_HOME_GUARD: "on"
           BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}
           BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}
         run: bun scripts/backlog-ops.ts

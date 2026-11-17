@@ -9,6 +9,7 @@ import type { OrderedControlInput } from "../ledger.ts";
 import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
+import { isLedgerKey, ledgerRoutedStore } from "../ledger-store.ts";
 import { scratchStore } from "./support.ts";
 
 setDefaultTimeout(60_000);
@@ -1336,5 +1337,59 @@ describe("catch-up (--revisions-since-ms): two-phase cutover", () => {
     expect((await entryOf(phaseA, A, "origin-1", "s0"))![0]).toBe(7);
     // Phase A alone differs from the single run (the comparison can tell).
     expect(beforeCatchup).not.toEqual(single);
+  });
+});
+
+describe("a relocated ledger (INGEST_LEDGER_BUCKET, docs/ledger-relocation.md): the routed store", () => {
+  const setup = async () => {
+    await reset(A, "req-1", "2030-01-02T00:00:00.000Z");
+    await del(A, "origin-1", "claude", "gone");
+    await own(A, "origin-1", "claude", "kept");
+    await rev(A, "origin-1", "rec-1", 1, "claude", "kept");
+    await batch(C, "origin-3", "batch-1");
+    const locker = scratch(), ledger = scratch();
+    return { locker, ledger, routed: ledgerRoutedStore(locker, ledger, ROOT) };
+  };
+  const bare = (keys: string[]) => keys.map((k) => k.slice(0, k.indexOf("@")));
+
+  test("ownership stubs and revision shards land in the ledger store; fences in the Locker store; nothing else crosses", async () => {
+    const { locker, ledger, routed } = await setup();
+    const summary = await run(routed);
+    expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+    const inLocker = bare(await allKeys(locker)), inLedger = bare(await allKeys(ledger));
+    expect(inLocker.length).toBeGreaterThan(0);
+    expect(inLedger.length).toBeGreaterThan(0);
+    expect(inLocker.every((k) => k.endsWith("/upload-fences.json"))).toBe(true);
+    expect(inLocker).toContain(s3LedgerKeys(ROOT, A).fence);
+    expect(inLocker).toContain(s3LedgerKeys(ROOT, C).fence);
+    expect(inLedger.every((k) => isLedgerKey(ROOT, k))).toBe(true);
+    expect(inLedger).toContain(s3LedgerKeys(ROOT, A).owner("origin-1", "claude", "kept"));
+    expect(inLedger).toContain(s3LedgerKeys(ROOT, A).revisions("origin-1", "rec-1"));
+    // Read back through each bucket alone: the ledger's objects only in the ledger bucket.
+    expect(await ownerOf(ledger, A, "origin-1", "claude", "kept")).toMatchObject({ sessionId: "kept" });
+    expect(await ownerOf(locker, A, "origin-1", "claude", "kept")).toBeUndefined();
+    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toBeDefined();
+    expect(await entryOf(locker, A, "origin-1", "rec-1")).toBeUndefined();
+    expect(await fenceOf(locker, A)).not.toBeNull();
+    expect(await fenceOf(ledger, A)).toBeNull();
+  });
+
+  test("a fences-only run writes the Locker store alone", async () => {
+    const { locker, ledger, routed } = await setup();
+    const summary = await run(routed, { sections: ["fences"] });
+    expect(summary.sections).toEqual({ fences: "complete", ownership: "not_run", revisions: "not_run" });
+    expect((await allKeys(locker)).length).toBe(2);
+    expect(await allKeys(ledger)).toEqual([]);
+  });
+
+  test("a dry run writes neither store", async () => {
+    const { locker, ledger, routed } = await setup();
+    await run(locker, { sections: ["fences"] });
+    const before = [await allKeys(locker), await allKeys(ledger)];
+    const summary = await run(routed, { dryRun: true });
+    expect(summary.ownership).toMatchObject({ would_register: 1, registered: 0, failed: 0 });
+    expect(summary.revisions).toMatchObject({ would_merge: 1, merged: 0, failed: 0 });
+    expect([await allKeys(locker), await allKeys(ledger)]).toEqual(before);
+    expect(before[1]).toEqual([]);
   });
 });

@@ -52,14 +52,46 @@ marker, and the result is cached with it for 60 s per org:
   with `INGEST_LEDGER_HOME_GUARD=on`, it checks the Locker bucket's marker and
   refuses on "moved". Its role then needs GetObject on the marker key; a 403
   exits 2 (`access_denied`).
-- The single-bucket operator tools (`scripts/buffered-drain.ts`,
-  `upload-fence-backfill.ts`, `ledger-reshard-revisions.ts`,
-  `ledger-log-stream.ts`) read their bucket's marker at start only with
-  `INGEST_LEDGER_HOME_GUARD=on` in their shell. Off, they make no request.
-  - The backfill reads it only when an ownership or revision section runs;
-    the fences never move.
+- The fence backfill (`scripts/upload-fence-backfill.ts`) and the buffered
+  drain (`scripts/buffered-drain.ts`) are ledger-bucket aware. They read
+  `INGEST_LEDGER_BUCKET`, `INGEST_LEDGER_REGION` and optionally
+  `INGEST_LEDGER_ENDPOINT`, parsed and validated exactly as the edge does
+  (`src/session-ingest/ledger-tool-store.ts`; a bad value refuses with
+  `ledger_bucket_invalid` before any request).
+  - Set, they use the edge's `ledgerRoutedStore`. The fences, staged batches,
+    drained markers, layout and lease stay in `--bucket` (SSE-KMS on an
+    execute). The ownership stubs, revision shards and re-arm markers go to
+    the ledger bucket with no encryption header, so its default applies. Both
+    stores use the same AWS credentials.
+  - Set, they first require the ledger bucket's marker to name that bucket,
+    whatever the guard says: `ledger_home_missing` or `ledger_home_moved`, as
+    the edge does.
+  - Unset, they behave as the other single-bucket tools below.
+  - The backfill checks the marker only when an ownership or revision section
+    runs. A fences-only run needs no ledger bucket and reads no marker; the
+    fences never move.
+  - A dry run writes neither bucket: the library refuses every put and delete
+    through the routed store.
+  - The backlog-ops workflow (`.github/workflows/backlog-ops.yml`) always runs
+    its tools with `INGEST_LEDGER_HOME_GUARD=on`. The credential step forces
+    it into the tool's environment, so the workflow file cannot drop it. It
+    passes the ledger bucket to the backfill and the drain from the protected
+    environment variables `BACKLOG_OPS_LEDGER_BUCKET` and
+    `BACKLOG_OPS_LEDGER_REGION` (docs/backlog-ops-workflow.md). Without them,
+    a run after the switch refuses with `ledger_home_moved` instead of writing
+    the Locker bucket's stale copy.
+  - The accepted-stage export, which the workflow also runs, reads the fences
+    and writes stage sidecars and completion records. None of these is a
+    ledger key, so it is unaffected.
+- The other single-bucket operator tools (`ledger-reshard-revisions.ts`,
+  `ledger-log-stream.ts`) are not ledger-bucket aware, and no workflow runs
+  them. They, like the two tools above without a ledger bucket, read their
+  bucket's marker at start only with `INGEST_LEDGER_HOME_GUARD=on` in their
+  shell. Off, they make no request.
   - The codes are exact:
     - `ledger_home_moved`: a valid marker names another bucket.
+    - `ledger_home_missing`: a ledger bucket is configured and its marker is
+      absent (the ledger-aware tools only).
     - `ledger_home_invalid`: the marker body is bad.
     - `access_denied`: a 403.
     - `ledger_home_unavailable`: a transient failure (5xx, 429, 408, or a
@@ -115,7 +147,10 @@ ServiceAccount, so no credential is ever on disk. It prints counts and codes onl
      Job with `INGEST_LEDGER_HOME_GUARD=on`. Without the flag they read no
      marker and would write the stale copies. The check stays flag-gated, so
      the flag remains required in every tool shell and Job after the move,
-     not just during the window.
+     not just during the window. The backlog-ops workflow always sets it.
+     After step 6, run the backfill and the drain with the ledger bucket
+     (`INGEST_LEDGER_BUCKET`, or the workflow's `BACKLOG_OPS_LEDGER_*`
+     variables).
    - Desktop uploads keep landing in the upload inbox and wait there.
 2. **`plan`.** This is read-only. Check that the source counts match what you
    expect, that the destination is empty, and that the stop is present.

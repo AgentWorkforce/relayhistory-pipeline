@@ -33,6 +33,8 @@ import {
   backlogOpsConfirmation,
   backlogOpsDispatch,
   backlogOpsEnvironment,
+  backlogOpsLedgerEnv,
+  backlogOpsLedgerTarget,
   backlogOpsReceipt,
   backlogOpsRevisionsSince,
   backlogOpsRole,
@@ -389,7 +391,7 @@ test("database URL: only the pinned release login, re-encoded with sslmode=verif
   const spawnBackfill = backlogOpsChildSpawn(env, backfill, aws, toolDbUrl(url));
   expect(Object.keys(JSON.parse(spawnBackfill.input!))).toEqual(["dbUrl"]);
   // Fixed argv, allowlisted env plus the session: never the GitHub token, the owner URL or a target variable.
-  expect(Object.keys(spawnBackfill.env).sort()).toEqual(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HOME", "PATH"]);
+  expect(Object.keys(spawnBackfill.env).sort()).toEqual(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HOME", "INGEST_LEDGER_HOME_GUARD", "PATH"]);
   expect([...BACKLOG_OPS_CHILD_ENV]).toEqual(["PATH", "HOME", "LANG", "TMPDIR"]);
   expect(spawnBackfill.args.join(" ")).not.toContain("postgresql");
   expect(spawnBackfill.args[0]).toEndWith("scripts/upload-fence-backfill.ts");
@@ -1075,4 +1077,60 @@ test("gate, drain-execute with FULL: a fresh catch-up as BACKFILL, as a refresh;
   expect(await g((f) => { f.bound[BACKFILL].display_title = backlogOpsRunName("backfill-catchup-dry", sha); })).toBe("backlog_ops_gate_backfill_run");
   expect(await gate("drain-execute", asCatchup)).toBe("backlog_ops_gate_backfill_run");
   expect(await gate("export-execute", asCatchup)).toBe("backlog_ops_gate_backfill_run");
+});
+
+test("relocated ledger: every S3 tool child gets INGEST_LEDGER_HOME_GUARD=on; the backfill and the drain get the ledger bucket when set", () => {
+  const aws = { accessKeyId: "ASIAEXAMPLEEXAMPLE", secretAccessKey: "s", sessionToken: "t" };
+  const base = { ...target, PATH: "/usr/bin", HOME: "/h" };
+  const ledger = { BACKLOG_OPS_LEDGER_BUCKET: "example-ledger-bucket", BACKLOG_OPS_LEDGER_REGION: "us-west-2" };
+  const db = (mode: BacklogOpsMode) => (mode.startsWith("drain-") ? null : "postgresql://x");
+  const session = (mode: BacklogOpsMode) => (mode === "presence-dry" ? "session-0001" : null);
+  for (const mode of ["backfill-dry", "backfill-refresh-dry", "drain-dry", "export-dry", "presence-dry"] as BacklogOpsMode[]) {
+    const d = backlogOpsDispatch(dispatchEnv(mode));
+    if (mode === "presence-dry") {
+      // Reads no S3: no ledger variable at all, even with the ledger target set.
+      for (const parent of [base, { ...base, ...ledger }]) expect(Object.keys(backlogOpsChildSpawn(parent, d, aws, db(mode), session(mode)).env).filter((k) => k.startsWith("INGEST_"))).toEqual([]);
+      continue;
+    }
+    // The guard is forced even when the parent sets it off or omits it: never inherited.
+    for (const parent of [base, { ...base, INGEST_LEDGER_HOME_GUARD: "off" }]) {
+      const plain = backlogOpsChildSpawn(parent, d, aws, db(mode), session(mode)).env;
+      expect(plain.INGEST_LEDGER_HOME_GUARD).toBe("on");
+      expect(plain).not.toHaveProperty("INGEST_LEDGER_BUCKET");
+      expect(plain).not.toHaveProperty("INGEST_LEDGER_REGION");
+    }
+    const routed = backlogOpsChildSpawn({ ...base, ...ledger }, d, aws, db(mode), session(mode)).env;
+    expect(routed.INGEST_LEDGER_HOME_GUARD).toBe("on");
+    if (mode.startsWith("backfill-") || mode.startsWith("drain-")) {
+      expect(routed.INGEST_LEDGER_BUCKET).toBe("example-ledger-bucket");
+      expect(routed.INGEST_LEDGER_REGION).toBe("us-west-2");
+    } else expect(routed).not.toHaveProperty("INGEST_LEDGER_BUCKET");
+    expect(routed).not.toHaveProperty("INGEST_LEDGER_ENDPOINT");
+    expect(routed).not.toHaveProperty("BACKLOG_OPS_LEDGER_BUCKET");
+  }
+  expect(backlogOpsLedgerEnv({ mode: "drain-execute" }, null)).toEqual({ INGEST_LEDGER_HOME_GUARD: "on" });
+});
+
+test("relocated ledger target: both or neither, shape-checked, never the Locker bucket", () => {
+  const t = backlogOpsTarget(target);
+  expect(backlogOpsLedgerTarget({}, t)).toBeNull();
+  expect(backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: "", BACKLOG_OPS_LEDGER_REGION: "" }, t)).toBeNull();
+  expect(backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: "example-ledger-bucket", BACKLOG_OPS_LEDGER_REGION: "us-west-2" }, t)).toEqual({ bucket: "example-ledger-bucket", region: "us-west-2" });
+  expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: "example-ledger-bucket" }, t))).toBe("backlog_ops_target_ledger_region");
+  expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: "example-ledger-bucket", BACKLOG_OPS_LEDGER_REGION: "west" }, t))).toBe("backlog_ops_target_ledger_region");
+  expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_REGION: "us-west-2" }, t))).toBe("backlog_ops_target_ledger_bucket");
+  expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: "Bad_Bucket", BACKLOG_OPS_LEDGER_REGION: "us-west-2" }, t))).toBe("backlog_ops_target_ledger_bucket");
+  expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: t.bucket, BACKLOG_OPS_LEDGER_REGION: "us-west-2" }, t))).toBe("backlog_ops_target_ledger_bucket");
+});
+
+test("workflow: the tool step always sets INGEST_LEDGER_HOME_GUARD=on and passes the ledger bucket from protected variables", () => {
+  const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
+  const step = yml.slice(yml.indexOf("      - name: Run the backlog tool"), yml.indexOf("run: bun scripts/backlog-ops.ts"));
+  expect(step).toContain('          INGEST_LEDGER_HOME_GUARD: "on"\n');
+  expect(step).toContain("          BACKLOG_OPS_LEDGER_BUCKET: ${{ vars.BACKLOG_OPS_LEDGER_BUCKET }}\n");
+  expect(step).toContain("          BACKLOG_OPS_LEDGER_REGION: ${{ vars.BACKLOG_OPS_LEDGER_REGION }}\n");
+  // Never a literal value, an input, or an endpoint; never a guard switched off anywhere.
+  expect(yml).not.toMatch(/INGEST_LEDGER_HOME_GUARD: (?!"on")/u);
+  expect(yml).not.toContain("INGEST_LEDGER_ENDPOINT");
+  expect(yml).not.toMatch(/INGEST_LEDGER_BUCKET:/u);
 });

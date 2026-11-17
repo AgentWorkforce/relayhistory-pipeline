@@ -265,6 +265,40 @@ export function backlogOpsTarget(env: Record<string, string | undefined>): Backl
   return { bucket, region, kmsKeyArn, dryRoleArn, executeRoleArn };
 }
 
+/**
+ * The relocated upload ledger (docs/ledger-relocation.md) for the tools that write it: the environment's protected
+ * variables BACKLOG_OPS_LEDGER_BUCKET and BACKLOG_OPS_LEDGER_REGION, both or neither (unset or empty: the ledger is in
+ * BACKLOG_OPS_BUCKET). The bucket must differ from BACKLOG_OPS_BUCKET. Null when unset.
+ */
+export interface BacklogOpsLedgerTarget { bucket: string; region: string }
+export function backlogOpsLedgerTarget(env: Record<string, string | undefined>, t: Pick<BacklogOpsTarget, "bucket">): BacklogOpsLedgerTarget | null {
+  const bucket = env.BACKLOG_OPS_LEDGER_BUCKET ?? "", region = env.BACKLOG_OPS_LEDGER_REGION ?? "";
+  if (bucket === "" && region === "") return null;
+  if (!BUCKET.test(bucket) || bucket.includes("..") || bucket === t.bucket) refuse("backlog_ops_target_ledger_bucket");
+  if (!REGION.test(region)) refuse("backlog_ops_target_ledger_region");
+  return { bucket, region };
+}
+
+/** The tools that write the upload ledger's own keys (ledger/**) and so take the ledger bucket: the backfill and the drain. */
+export const BACKLOG_OPS_LEDGER_TOOLS: readonly BacklogOpsTool[] = ["backfill", "drain"];
+
+/**
+ * The ledger variables every S3 tool child gets (the backfill, the export and the drain; never presence-dry, which
+ * reads no S3), added by scripts/backlog-ops.ts to its allowlisted environment:
+ * INGEST_LEDGER_HOME_GUARD=on, ALWAYS, so a single-bucket run refuses (`ledger_home_moved`) once a relocation wrote
+ * "moved" into BACKLOG_OPS_BUCKET's marker, instead of writing stale copies; and, for the ledger tools with a ledger
+ * target, INGEST_LEDGER_BUCKET / INGEST_LEDGER_REGION, which route their ledger/** keys to that bucket and require its
+ * marker to name it. No endpoint is ever passed (AWS S3).
+ */
+export function backlogOpsLedgerEnv(d: Pick<BacklogOpsDispatch, "mode">, ledger: BacklogOpsLedgerTarget | null): Record<string, string> {
+  // The presence tool reads no S3 at all: its environment stays exactly the allowlist plus the session.
+  if (toolOf(d.mode) === "presence") return {};
+  return {
+    INGEST_LEDGER_HOME_GUARD: "on",
+    ...(ledger && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode)) ? { INGEST_LEDGER_BUCKET: ledger.bucket, INGEST_LEDGER_REGION: ledger.region } : {}),
+  };
+}
+
 /** A run's org scope: the orgs (sorted, distinct) or null for every org, and its id for receipts. */
 export interface BacklogOpsScope { orgs: string[] | null; id: string }
 export const BACKLOG_OPS_SCOPE_ALL = "all";

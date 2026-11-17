@@ -197,7 +197,7 @@ function transientFailure(error: unknown): boolean {
 }
 
 /** The closed codes of `assertLedgerHomeHere`; the Error's message is exactly the code (safe to print). */
-export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable"
+export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_missing" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable"
   | "ledger_home_store_error" | "ledger_home_guard_invalid";
 export class LedgerHomeRefused extends Error {
   constructor(readonly code: LedgerHomeRefusal) { super(code); this.name = "LedgerHomeRefused"; }
@@ -224,13 +224,29 @@ export async function assertLedgerHomeHere(store: ObjectStore, keyRoot: string, 
   let on: boolean;
   try { on = ledgerHomeGuard(env); } catch { throw new LedgerHomeRefused("ledger_home_guard_invalid"); }
   if (!on) return;
+  await checkLedgerHome(store, keyRoot, bucket, false);
+}
+
+/**
+ * For a tool given the ledger's own bucket (INGEST_LEDGER_BUCKET, ledger-tool-store.ts), exactly as the edge configured
+ * with it checks every claim: ALWAYS reads the marker in `store` (the ledger store, or a routed store over it), whatever
+ * INGEST_LEDGER_HOME_GUARD says, and refuses unless it names `ledgerBucket`: absent `ledger_home_missing` (the
+ * relocation has not switched to it yet), naming another bucket `ledger_home_moved`. Read failures map as in
+ * `assertLedgerHomeHere`.
+ */
+export async function assertLedgerHomeIn(store: ObjectStore, keyRoot: string, ledgerBucket: string): Promise<void> {
+  await checkLedgerHome(store, keyRoot, ledgerBucket, true);
+}
+
+async function checkLedgerHome(store: ObjectStore, keyRoot: string, expect: string, required: boolean): Promise<void> {
   let home: LedgerHomeDoc | null;
   try { home = await readLedgerHome(store, keyRoot); } catch (error) {
     if (error instanceof Error && error.message === "ledger_home_invalid") throw new LedgerHomeRefused("ledger_home_invalid");
     if (isObjectStoreError(error, "unauthorized")) throw new LedgerHomeRefused("access_denied");
     throw new LedgerHomeRefused(transientFailure(error) ? "ledger_home_unavailable" : "ledger_home_store_error");
   }
-  if (ledgerHomeVerdict(home, bucket, false) !== "ok") throw new LedgerHomeRefused("ledger_home_moved");
+  const verdict = ledgerHomeVerdict(home, expect, required);
+  if (verdict !== "ok") throw new LedgerHomeRefused(verdict);
 }
 
 /**
