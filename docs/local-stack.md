@@ -9,7 +9,7 @@ services, same env contract, same migrations.
 
 | Container | Image | Role |
 | --- | --- | --- |
-| `96b-hoopdb` | pgvector/pgvector:pg17 | HoopDb (port 15432 on the host) |
+| `96b-hoopdb` | postgres:17 | HoopDb (port 15432 on the host) |
 | `96b-locker` | Chainguard MinIO (digest-pinned) | Locker, S3 API (port 19100) |
 | `96b-locker-init` | 96bulls/services | one-shot: creates the bucket (SigV4, no SDK), enables versioning |
 | `96b-hoopdb-migrate` | 96bulls/services | one-shot (`HOOPDB_DB_MODE=local`, `HOOPDB_SUPABASE_SHIM=true`, `HOOPDB_RUNTIME_ROLE=hoop`): shim roles + search Worker role bootstrap (`supabase/bootstrap`) + `sessions` migrations (supabase/migrations) + 96bulls migrations, ledger `sessions.__96bulls_migrations` |
