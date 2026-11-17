@@ -205,7 +205,7 @@ describe("config and sender", () => {
   });
   test("relay URL validated at config time, value never echoed", () => {
     const dm = (url: string) => () => advisorConfig({ COORDINATION_ADVISOR_RELAY_DM_ENABLED: "true", COORDINATION_ADVISOR_RELAY_TOKEN: "t", COORDINATION_ADVISOR_RELAY_URL: url });
-    for (const [url, msg] of [["not a url secretpart", /not a valid URL/], ["http://relay.example/secretpart", /must be https/], ["https://u:secretpart@relay.example/", /credentials/]] as const) {
+    for (const [url, msg] of [["not a url secretpart", /not a valid URL/], ["http://relay.example/secretpart", /must be https/], ["https://u:secretpart@relay.example/", /credentials/], ["https://relay.example/v1?token=secretpart", /query or fragment/], ["https://relay.example/#secretpart", /query or fragment/]] as const) {
       expect(dm(url)).toThrow(msg);
       try { dm(url)(); } catch (e) { expect(String((e as Error).message)).not.toContain("secretpart"); }
     }

@@ -11,6 +11,13 @@ export function parseCompleteSince(raw: string | undefined): number {
   return t;
 }
 
+/** READ_API_DIRECTORY_WORKSPACES: unset or blank = none; "*" = every workspace; else comma-separated ids. */
+export function parseDirectoryWorkspaces(raw: string | undefined): ReadonlySet<string> | "*" {
+  const value = raw?.trim() ?? "";
+  if (value === "*") return "*";
+  return new Set(value.split(",").map((v) => v.trim()).filter(Boolean));
+}
+
 /** The facts store an Output or digest backend reads: today's ClickHouse facts, or the self-host Postgres facts (migration 045040). */
 export type FactsBackendKind = "clickhouse" | "postgres";
 export const READ_API_OUTPUT_BACKEND = "READ_API_OUTPUT_BACKEND";

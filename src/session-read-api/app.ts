@@ -372,12 +372,8 @@ export interface TimingDeps {
   deadlineMs?: number;
 }
 
-/** READ_API_DIRECTORY_WORKSPACES: unset or blank = none; "*" = every workspace; else comma-separated ids. */
-export function parseDirectoryWorkspaces(raw: string | undefined): ReadonlySet<string> | "*" {
-  const value = raw?.trim() ?? "";
-  if (value === "*") return "*";
-  return new Set(value.split(",").map((v) => v.trim()).filter(Boolean));
-}
+/** Lives in config.ts (no Hono import for its other users); re-exported for existing importers. */
+export { parseDirectoryWorkspaces } from "./config.ts";
 
 /** The titles `key` values: 1 to 100 valid `<source>:<sessionId>` keys, duplicates dropped. */
 function titleKeys(raw: readonly string[]): BriefTitleKey[] {
