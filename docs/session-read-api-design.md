@@ -391,37 +391,81 @@ parameter is a 501 `param_<name>`. No paging, one indexed statement
 - `[]` = **unknown here**, a 200 like an empty directory page, not a 404: the id has no live row in
   this workspace (never published, erased, or owner-buffered only). Exactly one entry = the source
   is proven. Two or more = ambiguous. The caller decides only on exactly one.
-- Live = `deleted_at IS NULL` on `sessions.session_index`, exactly the rows the directory, timing
-  and turns routes read. An erased session (every pointer tombstoned) has none, so it answers
-  `[]`. The id matches the source RelayHistory id (`canonical_session_id`, NULL meaning
+- Live = `deleted_at IS NULL` on `sessions.session_index`, the same liveness the directory, timing,
+  turns and summary reads use. An erased session (every pointer tombstoned) has none, so it
+  answers `[]`. The id matches the source RelayHistory id (`canonical_session_id`, NULL meaning
   `session_id`) or the physical `session_id`, as the timing and turns pointer reads match it.
-  With the self-host operator erase fence configured (`SESSION_ERASE_FENCE_ENFORCED`), a fenced
-  source is dropped.
+- With the self-host operator erase fence configured (`SESSION_ERASE_FENCE_ENFORCED`, service entry
+  only), a source is dropped when its key is fenced under **any** form: the requested id and every
+  physical and source id the harness's live rows hold (`sessions.ingest_operator_runtime_erased`,
+  already granted to the read role). The checks run one after another on the request's runner.
+  The shared `/v1/sessions/:sessionId/*` fence middleware skips this path (as it skips the summary
+  search), so the flag check comes first there too and a flag-off request makes no database
+  statement. That middleware keys the fence on the requested id only; it is left as is.
 - Owner-buffered (unpublished) sessions have no pointer row and are never listed, even for their
-  owner. This matches the list's "canonical wins" rule: the list hides a buffered session whose id
-  has a live pointer under any harness, so whenever `sources` is non-empty it names exactly the
-  sessions the list shows for the id; a buffered-only id answers `[]` (unknown).
+  owner; a buffered-only id answers `[]` (unknown). This is close to, not identical with, the
+  list: the list hides a buffered session whose **physical** id has a live pointer under any
+  harness (`LIVE_POINTER_SESSIONS_SQL`), while `/sources` also matches a pointer by its source id
+  (`canonical_session_id`). So `sources` can name a harness for an id whose buffered copy the list
+  would still show beside it; it never names a harness without a live pointer row.
+
+**Privacy fences (what `deleted_at IS NULL` does and does not cover).** `/sources` excludes exactly
+what the directory list, timing, turns and summary reads exclude, and no more: none of them has an
+extra fence predicate (the list filters `sessions.session_directory.deleted_at IS NULL` in
+`sessions.session_directory_list_sql`, 20261101050000; the pointer reads and
+`session_brief_summary_for`, 20261105044100, filter `session_index.deleted_at IS NULL`). Per fence:
+
+- Operator per-session erase (`ingest_operator_erase_session`, 20261105050000): the fence row
+  (`session_erasure_fences`, every alias) and the pointer tombstone are one transaction
+  (`ingest_operator_erase_fence`: `UPDATE sessions.session_index ... SET deleted_at ...`). Two
+  windows leave a live row behind the fence: a fence failure (RH010) commits the fence and a
+  `failed` receipt without the tombstone, and a pointer guarded by a live managed publication head
+  is skipped (`pointerRows` stays pending). On the self-host service with the fence enforced the
+  route drops such sources (above); the hosted entries do not wire the fence check for any route.
+- Operator per-user erase (20261105058010): buffered uploads only; it refuses while the user has
+  any `session_index` row, so it never leaves a live pointer.
+- Self-host per-session selection erase (`ingest_selfhost_set_session_uploads`, latest 20261105062060):
+  selection and tombstone (revision raised to 2^53-1) in one transaction, for the caller's origins
+  known at erase time; a later first upload from a new origin, or a pointer indexed after the
+  erase, is not fenced (documented gaps of that function).
+- Hosted selection (stop-sync, `ingest_apply_selection`: `ingest_fence_versions` bump +
+  `upload_deletions`) and privacy reset (`ingest_apply_reset`: the same + `upload_resets`),
+  20261104030000: the AFTER triggers `ingest_publication_retire_version` / `_retire_reset`
+  (`ingest_publication_retire_fence`, 20261104060000, latest body 20261105044070) tombstone, in the
+  same transaction, only pointers of **managed publication heads**. A non-managed pointer (written
+  by `upsert_session_index` from a manifest event) stays live until its deletion manifest or the
+  eraser tombstones it. During that window the list, timing, turns, summary and `/sources` all
+  still see it. The read role holds no grant on `upload_deletions`, `upload_resets` or
+  `session_erasure_fences` (only `bulls96_legacy_export_privacy` reads them), so closing that
+  window needs a new granted function and a migration (separate approval), for every read route,
+  not only this one.
 
 Order of refusals, so nothing about another workspace is revealed: no or bad bearer 401 (and 403
 without `rth:read`); flag off 501 `sources_not_configured`; `workspace=` absent 501 `org_scope`,
 repeated 400, not the token's 403; off the directory canary allowlist
 (`READ_API_DIRECTORY_WORKSPACES`) 501 `directory_workspace_not_enabled`; an unknown parameter 501
 `param_<name>`; an id over 512 characters 400 `bad_request`. Then the read: a row outside the
-tenant 500, a database failure 503 `backend_unavailable`. Every 501 uses the standard
-`{"error":{"code":"unsupported_by_backend","message":"...","reason":"<reason>"},"correlationId":"..."}`
-envelope. (Self-host with the operator erase fence on: that fence's middleware attests the
-workspace for every `/v1/sessions/:sessionId/*` path first, so a mismatch there is the 403 even
-with the flag off.)
+tenant 500, a database failure or fence-check failure 503 `backend_unavailable`. Every 501 uses the
+standard `{"error":{"code":"unsupported_by_backend","message":"...","reason":"<reason>"},"correlationId":"..."}`
+envelope. Before this route existed the path answered the not-found 501 with reason `route`; with
+the flag off it now answers reason `sources_not_configured` (same status and code).
 
 Data path: the `bulls96_read_api` role's existing column SELECT on `sessions.session_index`
 (`org_id, workspace_id, harness, session_id, deleted_at, canonical_session_id`;
 `supabase/bootstrap/session_read_api_role.sql`) under its tenant RLS policy, in the request's
-tenant-bound READ ONLY transaction. No new function, grant or migration.
+tenant-bound READ ONLY transaction: one row per harness (with the physical and source ids its
+live rows hold), ordered by `harness COLLATE "C"`, `LIMIT 16`. The physical-id branch is an index
+lookup (`si_session`); the source-id branch scans the workspace's live aliased rows in the partial
+index `session_index_canonical_live`. No new function, grant or migration.
 
-Wiring: every entry enables it only on the exact string `true` (the Worker, the hosted Lambda and
-the self-host service). Worker deploy (Khaliq's call): `session_sources=on` adds
+Wiring: every entry enables it only on the exact string `true`. The Worker and the self-host
+service read it from their environment. The hosted Lambda reads it too, but its stack
+(`stacks/aws/session-read-api.ts`) does not pass the variable yet, so enabling it there needs a
+stack change (not made). Worker deploy (Khaliq's call): `session_sources=on` adds
 `--var READ_API_SESSION_SOURCES_ENABLED:true`; off (the default) renders no variable. Not
-preserved from live, like the summary inputs: once on, a later dispatch must repeat it, or the
-live-settings guard refuses the dispatch.
+preserved from live, like the summary inputs. In `profile`/`preserve` mode (`owner_buffered`
+unset, `profile` or `preserve`) the live-settings guard refuses a dispatch that would drop a live
+one; with an explicit `owner_buffered=on|off` the guard does not run, and `session_sources=off`
+then drops a live variable silently (true of every summary input).
 
 **Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.
