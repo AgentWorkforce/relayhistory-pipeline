@@ -24,6 +24,7 @@ import {
   LEGACY_EXPORT_ACTIVATION_GENERATION,
   LEGACY_EXPORT_GENERATION,
   LEGACY_EXPORT_GENERATION_SETTING,
+  LEGACY_EXPORT_PREACTIVATION_GENERATION,
 } from "../../shared/legacy-export-generation.ts";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import { CredentialRefusal, FORBIDDEN_CREDENTIAL_ENV, parseCredentialDocument, pinnedPgClient, pinnedPgConfig, readStdinCredentials, refuseCredentialEnv, s3Credentials } from "../stdin-credentials.ts";
@@ -365,10 +366,7 @@ async function world() {
   // The job's read-only connection: the same database (an owner session, as the operator's login would be).
   const authority = supabaseAuthority(f.queryable);
   const logs: Record<string, unknown>[] = [];
-  const job = (
-    a: ErasureAuthority = authority,
-    cfg = DEFAULT_ERASURE_CONFIG,
-  ) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), cfg, later, async () => {});
+  const job = (a: ErasureAuthority = authority) => new ErasureJob(a, state, storeEraser(store), (x) => logs.push(x), { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true }, later, async () => {});
   const keys = async () => {
     const out: string[] = [];
     let c: string | undefined;
@@ -451,8 +449,7 @@ describe("supabase privacy authority as the eraser's source", () => {
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
 
     // A dry run proves nothing about the deployed deleter and must not arm export.
-    const cfg = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true };
-    await w.job(undefined, cfg).sweep({ dryRun: true });
+    await w.job().sweep({ dryRun: true });
     expect((await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0]).toEqual({ n: 0 });
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
 
@@ -462,7 +459,7 @@ describe("supabase privacy authority as the eraser's source", () => {
     // transaction is read-write.
     await w.f.db.query("SET default_transaction_read_only=on");
     try {
-      await w.job(undefined, cfg).sweep();
+      await w.job().sweep();
     } finally {
       await w.f.db.query("SET default_transaction_read_only=off");
     }
@@ -470,7 +467,18 @@ describe("supabase privacy authority as the eraser's source", () => {
       authority: "supabase",
       generation: LEGACY_EXPORT_GENERATION,
     });
-    await expect(readyAs(LEGACY_EXPORT_ACTIVATION_GENERATION)).rejects.toMatchObject({ code: "55000" });
+    expect(LEGACY_EXPORT_GENERATION).toBe(LEGACY_EXPORT_ACTIVATION_GENERATION);
+    await w.f.db.query(
+      "UPDATE sessions.legacy_export_privacy_eraser_readiness SET generation=$1,last_success_at=clock_timestamp()",
+      [LEGACY_EXPORT_PREACTIVATION_GENERATION],
+    );
+    // A landing-era row can be fresh in wall-clock time when activation is
+    // deployed; generation equality still refuses it.
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+    await w.f.db.query(
+      "UPDATE sessions.legacy_export_privacy_eraser_readiness SET generation=$1",
+      [LEGACY_EXPORT_GENERATION],
+    );
     expect((await ready()).rows[0]).toEqual({ ready: true });
 
     // The equality branch is independently fail-closed even for a fresh row.
@@ -795,7 +803,7 @@ describe("supabase eraser covers post-cutover sessions (review P0) and runs leas
     const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     open.push(() => state.close());
     // Past the staged-object redrive window, so staged batch copies are erased in the same sweep.
-    const job = new ErasureJob(supabaseAuthority(w.f.queryable), state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});
+    const job = new ErasureJob(supabaseAuthority(w.f.queryable), state, storeEraser(store), () => {}, { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true }, () => Date.now() + 49 * 60 * 60 * 1000, async () => {});
     await job.sweep();
     const left = await allKeys(store);
     for (const k of live) expect(left).not.toContain(k);

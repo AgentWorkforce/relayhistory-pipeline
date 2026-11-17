@@ -234,6 +234,37 @@ test("gate 2: an ordinary unit keeps its date and key; the legacy manifest uses 
   }
 });
 
+exporterTest("export readiness is checked at run start and again before each scope PUT", async () => {
+  let readinessChecks = 0;
+  const freshPrivacy: Queryable = {
+    async query<T>(sql: string, params?: unknown[]) {
+      if (sql.includes("to_regprocedure('sessions.legacy_export_privacy_authority_ready()')"))
+        return { rows: [{ installed: true }] as T[] };
+      if (sql.includes("SELECT sessions.legacy_export_privacy_authority_ready() AS ready")) {
+        readinessChecks += 1;
+        return { rows: [{ ready: readinessChecks === 1 }] as T[] };
+      }
+      return privacyDb.query<T>(sql, params);
+    },
+  };
+  const checkpoint = new Checkpoint(join(root, "readiness-per-scope.sqlite"));
+  const store = createFsStore({ root: join(root, "readiness-per-scope") });
+  try {
+    await expect(
+      runOrg(
+        { db, privacyDb: freshPrivacy, target: { store, keyRoot: "96bulls", grantId: "g" }, checkpoint, hook: async () => {}, log: () => {} },
+        "org_1",
+        { export: true },
+        newCounters(),
+      ),
+    ).rejects.toMatchObject({ code: "legacy_export_authority_not_active" });
+    expect(readinessChecks).toBe(2);
+    expect((await store.list(objectKey("96bulls"))).items).toEqual([]);
+  } finally {
+    checkpoint.close();
+  }
+});
+
 exporterTest("gate 3: a rerun skips unchanged scopes by fingerprint, and every discovery statement is one table in one org", async () => {
   const seen: string[] = [];
   const spy: Queryable = {
@@ -556,12 +587,12 @@ activationTest("readiness is rechecked after the authority lock and before the s
 
 activationTest("authority deactivation after a PUT fails the scope and preserves its write evidence", async () => {
   const s = { ...scope, sessionId: "authority-deactivated" };
-  let ready = 0;
+  let registrations = 0;
   const flips: Queryable = {
     async query<T>(sql: string, params?: unknown[]) {
-      if (sql.includes("legacy_export_privacy_authority_ready")) {
-        ready += 1;
-        if (ready === 5)
+      if (sql.includes("ingest_legacy_export_scope_authority_register")) {
+        registrations += 1;
+        if (registrations === 3)
           throw Object.assign(new Error("authority deactivated"), {
             code: "privacy_authority_not_active",
           });
@@ -579,7 +610,7 @@ activationTest("authority deactivation after a PUT fails the scope and preserves
         { machineId: legacyMachineId(s.workspaceId, "person"), existing: false },
       ),
     ).rejects.toMatchObject({
-      code: "privacy_fence_unavailable",
+      code: "legacy_export_authority_not_active",
       privacyValue: { manifests: [{ manifestKey: "written/authority-deactivated/manifest.json" }] },
     });
   } finally {
