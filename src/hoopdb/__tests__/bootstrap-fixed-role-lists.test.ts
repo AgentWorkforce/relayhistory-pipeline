@@ -10,6 +10,16 @@ import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 const root = join(import.meta.dir, "../../..");
 const read = (rel: string) => readFileSync(join(root, rel), "utf8");
 
+const seededRoles = (): string[] => {
+  const seed = read("supabase/bootstrap/rds_migration_roles.sql");
+  const arrayStart = seed.indexOf("FOREACH v_role IN ARRAY ARRAY[");
+  expect(arrayStart).toBeGreaterThan(-1);
+  const arrayEnd = seed.indexOf("]", arrayStart + "FOREACH v_role IN ARRAY ARRAY[".length);
+  const seeded = [...seed.slice(arrayStart, arrayEnd).matchAll(/'([^']+)'::name/g)].map((m) => m[1]!);
+  expect(seeded.length).toBeGreaterThan(5);
+  return seeded;
+};
+
 describe("bootstrap fixed-role lists", () => {
   test("rehearse-relayhistory-t0.sh provisions exactly the single-sourced bootstrap chain", () => {
     const setup = read("scripts/rehearse-relayhistory-t0.sh").match(
@@ -25,12 +35,7 @@ describe("bootstrap fixed-role lists", () => {
   });
 
   test("hoopdb_runtime_role_rds.sql refuses every fixed role rds_migration_roles.sql seeds", () => {
-    const seed = read("supabase/bootstrap/rds_migration_roles.sql");
-    const arrayStart = seed.indexOf("FOREACH v_role IN ARRAY ARRAY[");
-    expect(arrayStart).toBeGreaterThan(-1);
-    const arrayEnd = seed.indexOf("]", arrayStart + "FOREACH v_role IN ARRAY ARRAY[".length);
-    const seeded = [...seed.slice(arrayStart, arrayEnd).matchAll(/'([^']+)'::name/g)].map((m) => m[1]!);
-    expect(seeded.length).toBeGreaterThan(5);
+    const seeded = seededRoles();
 
     const runtime = read("supabase/bootstrap/hoopdb_runtime_role_rds.sql");
     const inStart = runtime.indexOf("v_role IN (");
@@ -40,5 +45,19 @@ describe("bootstrap fixed-role lists", () => {
 
     const missing = seeded.filter((name) => !refused.has(name));
     expect(missing, `runtime refusal list is missing: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  test("rds-profile-proof.ts FIXED covers every role rds_migration_roles.sql seeds", () => {
+    const seeded = seededRoles();
+    const proof = read("scripts/pg-proof/rds-profile-proof.ts");
+    const start = proof.indexOf("const FIXED = [");
+    expect(start).toBeGreaterThan(-1);
+    const end = proof.indexOf("];", start);
+    expect(end).toBeGreaterThan(start);
+    const fixed = [...proof.slice(start, end).matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
+    expect(fixed.length).toBeGreaterThan(5);
+
+    const missing = seeded.filter((name) => !fixed.includes(name));
+    expect(missing, `pg-proof FIXED is missing: ${missing.join(", ")}`).toEqual([]);
   });
 });
