@@ -145,6 +145,19 @@
  *                                    when it names another bucket (`ledger_home_moved`). Needs INGEST_LEDGER=s3. Implied
  *                                    by INGEST_LEDGER_BUCKET (then the marker must name that bucket). docs/ledger-relocation.md
  *                                    requires it on before a relocation starts.
+ *   INGEST_ADMISSION_RESEND_SKIP     unset | "" | "off" (default: every promoted upload is handed to the admission
+ *                                    inbox, byte-identical) | exactly "on" (anything else refuses startup). Needs
+ *                                    INGEST_LEDGER=s3 and HISTORY_UPLOAD_DIRECT allowlist|on. Upload-inbox promotion
+ *                                    first runs the S3 ledger's claim narrowed to replay_fast (ledger-s3.ts
+ *                                    claimOrCurrent): when every live record of the batch is already stored at an
+ *                                    equal or higher revision, no session of it is deleted by the fence, no control is
+ *                                    pending or half done and the batch id is new, the claim commits the batch record
+ *                                    exactly as replay_fast does and the upload is finished there (outcome admitted,
+ *                                    code already_current, no admission-inbox object, nothing canonical written; the
+ *                                    status route answers admitted with the same receipt id). Anything else, or any
+ *                                    probe failure, falls through to the unchanged hand-off. Counted in the
+ *                                    ingest.upload_admission line's upload_results as already_current:<n>. For a
+ *                                    desktop re-sending history it already uploaded (upload-admission.ts skipIfCurrent)
  *   INGEST_ASYNC_MAX_PER_ORG         the async consumer's per-org cap with INGEST_S3_TENANT_LIMIT=on and
  *                                    SELFHOST_INGEST_ADMISSION=async|drain: 1..SELFHOST_ADMISSION_CONCURRENCY,
  *                                    default max(1, floor(concurrency / 2)), so one org never holds more than half
@@ -242,6 +255,8 @@ export interface SelfhostIngestSettings {
   ledgerHomeGuard?: true;
   /** INGEST_S3_ERASE_FENCE=on (INGEST_LEDGER=s3 only, s3-erase-fence.ts). Absent (the default): no tombstone guard or write. */
   s3EraseFence?: true;
+  /** INGEST_ADMISSION_RESEND_SKIP=on (INGEST_LEDGER=s3 + HISTORY_UPLOAD_DIRECT only). Absent (the default): every promotion hands off. */
+  admissionResendSkip?: true;
 }
 
 /** The S3 ledger's own bucket (ledger-store.ts). `region`: INGEST_LEDGER_REGION, else LOCKER_REGION, else us-east-1. */
@@ -314,6 +329,21 @@ export function selfhostS3TenantLimit(env: NodeJS.ProcessEnv, ledger: "s3" | und
     return {};
   }
   return { asyncMaxPerOrg: bounded(env, ASYNC_MAX_PER_ORG_VAR, defaultAsyncMaxPerOrg(admission.concurrency), 1, admission.concurrency) };
+}
+
+export const ADMISSION_RESEND_SKIP_VAR = "INGEST_ADMISSION_RESEND_SKIP";
+
+/**
+ * INGEST_ADMISSION_RESEND_SKIP: unset, "" or "off" is off; exactly "on" is on; anything else refuses startup. On needs
+ * INGEST_LEDGER=s3 (the probe is the S3 claim) and HISTORY_UPLOAD_DIRECT allowlist|on (promotion is where it runs).
+ */
+export function selfhostAdmissionResendSkip(env: NodeJS.ProcessEnv, ledger: "s3" | undefined, uploadDirect: SelfhostUploadDirectSettings | undefined): true | undefined {
+  const raw = env[ADMISSION_RESEND_SKIP_VAR];
+  if (raw === undefined || raw === "" || raw === "off") return undefined;
+  if (raw !== "on") throw new Error(`96bulls: ${ADMISSION_RESEND_SKIP_VAR} must be off or on`);
+  if (ledger !== "s3") throw new Error(`96bulls: ${ADMISSION_RESEND_SKIP_VAR}=on needs ${INGEST_LEDGER_VAR}=s3`);
+  if (!uploadDirect) throw new Error(`96bulls: ${ADMISSION_RESEND_SKIP_VAR}=on needs ${UPLOAD_DIRECT_FLAG}=allowlist or on`);
+  return true;
 }
 
 /** HISTORY_UPLOAD_DIRECT=allowlist|on. `witnessKey` is passed through raw: promoteUpload treats missing or malformed as retry. */
@@ -557,6 +587,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const s3TenantLimit = selfhostS3TenantLimit(env, ledger, admission);
   const ledgerStore = selfhostLedgerStore(env, ledger);
   const homeGuard = selfhostLedgerHomeGuard(env, ledger);
+  const admissionResendSkip = selfhostAdmissionResendSkip(env, ledger, uploadDirect);
   return {
     enabled: true,
     port: port(env),
@@ -584,5 +615,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(s3TenantLimit ? { s3TenantLimit } : {}),
     ...(ledgerStore ? { ledgerStore } : {}),
     ...(homeGuard ? { ledgerHomeGuard: true as const } : {}),
+    ...(admissionResendSkip ? { admissionResendSkip } : {}),
   };
 }

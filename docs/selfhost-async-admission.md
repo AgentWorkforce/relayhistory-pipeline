@@ -243,7 +243,24 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`async`/`drain` with `INGEST_LEDGER=s3`; a silent no-op with `sql`, which never answers these codes) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
+| `INGEST_ADMISSION_RESEND_SKIP` (`INGEST_LEDGER=s3` and `HISTORY_UPLOAD_DIRECT` allowlist/on, else startup refuses) | `on`, `off`; anything else refuses startup. `on`: promotion first runs the S3 claim narrowed to `replay_fast` (see "Re-sent history" below) | off |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |
+
+**Re-sent history (`INGEST_ADMISSION_RESEND_SKIP=on`).** A desktop that re-sends history it already uploaded,
+under new batch ids, costs a full promotion (status, inbox PUT) and then a full admission whose claim answers
+`replay_fast` (nothing to write), all under the consumer's per-user and per-org caps. With the flag on, promotion
+calls the S3 ledger's claim restricted to that case (`ledger-s3.ts` `claimOrCurrent`, `Ledger.claimIfCurrent`):
+the same reads and the same judge as the claim. It skips only when every live record of the batch is already
+stored at an equal or higher revision, the batch id is new, no session of the batch is deleted by the fence
+(disabled, reset or pending disable), no control is pending, no reset is half done, and the batch has records.
+Then it commits the batch record exactly as `replay_fast` does, writes the `admitted` outcome (code
+`already_current`), a tombstoned inbox attempt and the `handed_off` status, and removes the upload. Nothing
+canonical is written, as with `replay_fast`, and `GET /v1/delivery/admission` answers `admitted` with the same
+receipt id (the code is never shown to the desktop). Every other batch, and any probe failure, takes the
+unchanged hand-off. A concurrent newer write only raises a stored revision, so a skip judged against an older
+read is still the no-op the full path would have made. Skips are counted in the `ingest.upload_admission` line's
+`upload_results` as `already_current:<n>`; the admission consumer's own `replay_fast` answers stay in
+`ingest.admission` as `error_code=replay_fast`.
 
 To restore the pre-2026-11-15 promotion shape (serial, 16 per scan), set `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY=1` and `SELFHOST_UPLOAD_SCAN_BATCH=16`. The expiry rule (judged at the PUT time) has no switch: judging it at promotion time deleted valid uploads.
 

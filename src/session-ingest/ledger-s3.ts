@@ -1161,6 +1161,99 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     return true;
   };
 
+  /**
+   * The claim. `onlyCurrent` (INGEST_ADMISSION_RESEND_SKIP, upload-admission.ts `resendSkip`): the SAME claim, but it
+   * writes only when it would answer replay_fast (every live record already stored at an equal or higher revision),
+   * and otherwise answers `not_current` having written NOTHING (no owner stub, no batch record, no reset completion),
+   * so the caller runs the full path unchanged. It is stricter than replay_fast, never looser: it also answers
+   * not_current for a known batch id (any state), a batch with no records, a session the fence deletes (a disable,
+   * a reset tombstone or a pending disable), any pending control, a begun-but-unfinished reset, a revision conflict
+   * and a lost batch-record CAS. When it answers replay_fast it has written exactly the committed batch record the
+   * full path's replay_fast writes, from the same reads and the same judge, so the ledger's final state is the same.
+   * Races are the full path's own: a concurrent newer write only raises a stored revision (a skip judged against the
+   * older read is still a no-op the full path would also have made), and a control landing after the fence read is
+   * no different from one landing after a replay_fast claim's.
+   */
+  async function claimOrCurrent(input: ClaimInput, onlyCurrent: boolean): Promise<ClaimResult | { kind: "not_current" }> {
+    const notCurrent = { kind: "not_current" } as const;
+    checkClaimInput(input);
+    const keys = keysFor(input.tenant);
+    await requireFenceAuthority(input.tenant.orgId);
+    const batchKey = keys.batch(input.originId, input.batchId);
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      // (a) and (b) read at once: the batch record and the fence. Independent reads (the claim's own CAS below,
+      // and the commit's fence recheck, decide), so only the latency changes. Settled before either result is
+      // used, so a failure is answered in the same order as sequential reads would: the batch record's first.
+      // The index shards (c) are read only after both, and only for records the fence has not deleted: a replay
+      // or a batch-id 409 reads no shard, and a deleted session's shard (even a corrupt one) never fails a batch.
+      const [storedR, readR, modeR] = await Promise.allSettled([
+        readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence), logModeRead(input.tenant, input.originId)]);
+      // A stream in log mode is never claimed here (logModeGuard): its log is the only writer.
+      refuseLogMode(modeR);
+      if (storedR.status === "rejected") throw storedR.reason;
+      const stored = storedR.value;
+      // (a) A known batch id: its receipt, a resume, or a batch-id 409.
+      if (stored && onlyCurrent) return notCurrent;
+      if (stored) {
+        if (stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId) throw new LedgerUnavailableError("ledger_batch_record_invalid");
+        if (stored.doc.digest !== input.batchDigest) return { kind: "batch_conflict", currentDigest: stored.doc.digest };
+        if (stored.doc.state === "committed") return { kind: "replay", receiptId: stored.doc.receiptId };
+      }
+      // (b) + (c): the fence, then the stored revisions of what is left.
+      if (readR.status === "rejected") throw readR.reason;
+      const read = readR.value;
+      const fence = admissionView(read);
+      // An ordered reset SQL has not decided yet (s3ControlMirror): no claim until its verdict lands (fail closed).
+      if (hasPendingReset(fence)) throw new LedgerUnavailableError("ledger_control_pending");
+      if (onlyCurrent && (fence.resets !== fence.resetsCompleted || Object.keys(fence.pending ?? {}).length > 0 || input.records.length === 0)) return notCurrent;
+      // A reset begun but not finished (it crashed, or is still running): finish it before judging, so a reset is
+      // never left half done by a client that stopped retrying, then claim again (backed off, with jitter: many
+      // claims may race to finish it). A completion that fails (a corrupt owner stub, a store error) fails only
+      // the completion: this claim goes on against the fence as it is, and the reset's own retry reports the code.
+      if (claimCompletesResets && fence.resets > fence.resetsCompleted && attempt < attempts - 1) {
+        let finished = false;
+        try { await finishResets(keys); finished = true; } catch (error) { if (!(error instanceof LedgerUnavailableError)) throw error; }
+        if (finished) { await backoff(attempt); continue; }
+      }
+      const judged = judge(input, keys, fence, await readShards(input, keys, liveRecords(input, fence)));
+      if (onlyCurrent && (judged.twins > 0 || !judged.fast || judged.deleted.length > 0)) return notCurrent;
+      if (judged.twins > 0) return { kind: "revision_conflict", conflicts: judged.conflicts, count: judged.twins };
+      const pairs = batchPairs(input.sessions, input.records);
+      if (!judged.fast) {
+        // (c') Ownership (ingest_session_ownership) BEFORE any canonical write: a reset that begins after this
+        // lists these sessions. Then the fence again: if it moved meanwhile (a reset could have listed before
+        // the stubs landed), claim again under the new fence rather than carry a generation it outran.
+        const live = pairs.filter(([s, id]) => !judged.deletedSet.has(pairId(s, id)));
+        await mapLimit(live, parallel, ([s, id]) => {
+          const [, epoch, resets] = recordGeneration(fence, input.originId, s, id);
+          return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets,
+            machineId: liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId) });
+        });
+        // Claim again only if the fence moved in a way that touches THIS claim (a reset, or one of its sessions'
+        // epoch or deletion), never for an unrelated edit, so other sessions' controls cannot starve it.
+        // A recreated fence (another instance) is rechecked in full at commit, as any snapshot mismatch is.
+        const again = await readFence(keys.fence);
+        const next = admissionView(again);
+        if (next.resets !== fence.resets || pairs.some(([s, id]) => {
+          const k = sessionKeyHash(s, id);
+          return fenceEpoch(next, input.originId, k) !== fenceEpoch(fence, input.originId, k) || isDeletedForAdmission(next, input.originId, s, id) !== isDeletedForAdmission(fence, input.originId, s, id);
+        })) { await backoff(attempt); continue; }
+      }
+      // (d) The claim; committed at once when nothing needs writing (replay_fast).
+      const token = judged.fast ? null : newToken();
+      const epochs: Record<string, number> = {};
+      for (const [s, id] of pairs) { const k = sessionKeyHash(s, id); epochs[k] = fenceEpoch(fence, input.originId, k); }
+      const doc: BatchDoc = { v: 1, originId: input.originId, batchId: input.batchId, digest: input.batchDigest, receiptId: input.receiptId,
+        state: judged.fast ? "committed" : "pending", claimToken: token, fenceVersion: fence.version, fenceInstance: instanceOf(read), resets: fence.resets, epochs };
+      // A lost create or CAS is a concurrent claim of this batch id: answer as a retry would.
+      if (!(await casPut(store, batchKey, doc, stored?.version))) { if (onlyCurrent) return notCurrent; await backoff(attempt); continue; }
+      const base = { deleted: judged.deleted, stale: judged.stale, resets: fence.resets };
+      if (judged.fast) return { kind: "replay_fast", ...base };
+      return { kind: stored ? "resume" : "claimed", claimToken: token!, ...base };
+    }
+    throw new LedgerUnavailableError("ledger_batch_contended");
+  }
+
   return {
     frozenWitness: unsupported("frozen_witness"),
     frozenReceipt: unsupported("frozen_receipt"),
@@ -1176,80 +1269,12 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     babysitterRetentionWritten: unsupported("babysitter_retention"),
 
     async claim(input: ClaimInput): Promise<ClaimResult> {
-      checkClaimInput(input);
-      const keys = keysFor(input.tenant);
-      await requireFenceAuthority(input.tenant.orgId);
-      const batchKey = keys.batch(input.originId, input.batchId);
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        // (a) and (b) read at once: the batch record and the fence. Independent reads (the claim's own CAS below,
-        // and the commit's fence recheck, decide), so only the latency changes. Settled before either result is
-        // used, so a failure is answered in the same order as sequential reads would: the batch record's first.
-        // The index shards (c) are read only after both, and only for records the fence has not deleted: a replay
-        // or a batch-id 409 reads no shard, and a deleted session's shard (even a corrupt one) never fails a batch.
-        const [storedR, readR, modeR] = await Promise.allSettled([
-          readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence), logModeRead(input.tenant, input.originId)]);
-        // A stream in log mode is never claimed here (logModeGuard): its log is the only writer.
-        refuseLogMode(modeR);
-        if (storedR.status === "rejected") throw storedR.reason;
-        const stored = storedR.value;
-        // (a) A known batch id: its receipt, a resume, or a batch-id 409.
-        if (stored) {
-          if (stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId) throw new LedgerUnavailableError("ledger_batch_record_invalid");
-          if (stored.doc.digest !== input.batchDigest) return { kind: "batch_conflict", currentDigest: stored.doc.digest };
-          if (stored.doc.state === "committed") return { kind: "replay", receiptId: stored.doc.receiptId };
-        }
-        // (b) + (c): the fence, then the stored revisions of what is left.
-        if (readR.status === "rejected") throw readR.reason;
-        const read = readR.value;
-        const fence = admissionView(read);
-        // An ordered reset SQL has not decided yet (s3ControlMirror): no claim until its verdict lands (fail closed).
-        if (hasPendingReset(fence)) throw new LedgerUnavailableError("ledger_control_pending");
-        // A reset begun but not finished (it crashed, or is still running): finish it before judging, so a reset is
-        // never left half done by a client that stopped retrying, then claim again (backed off, with jitter: many
-        // claims may race to finish it). A completion that fails (a corrupt owner stub, a store error) fails only
-        // the completion: this claim goes on against the fence as it is, and the reset's own retry reports the code.
-        if (claimCompletesResets && fence.resets > fence.resetsCompleted && attempt < attempts - 1) {
-          let finished = false;
-          try { await finishResets(keys); finished = true; } catch (error) { if (!(error instanceof LedgerUnavailableError)) throw error; }
-          if (finished) { await backoff(attempt); continue; }
-        }
-        const judged = judge(input, keys, fence, await readShards(input, keys, liveRecords(input, fence)));
-        if (judged.twins > 0) return { kind: "revision_conflict", conflicts: judged.conflicts, count: judged.twins };
-        const pairs = batchPairs(input.sessions, input.records);
-        if (!judged.fast) {
-          // (c') Ownership (ingest_session_ownership) BEFORE any canonical write: a reset that begins after this
-          // lists these sessions. Then the fence again: if it moved meanwhile (a reset could have listed before
-          // the stubs landed), claim again under the new fence rather than carry a generation it outran.
-          const live = pairs.filter(([s, id]) => !judged.deletedSet.has(pairId(s, id)));
-          await mapLimit(live, parallel, ([s, id]) => {
-            const [, epoch, resets] = recordGeneration(fence, input.originId, s, id);
-            return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets,
-              machineId: liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId) });
-          });
-          // Claim again only if the fence moved in a way that touches THIS claim (a reset, or one of its sessions'
-          // epoch or deletion), never for an unrelated edit, so other sessions' controls cannot starve it.
-          // A recreated fence (another instance) is rechecked in full at commit, as any snapshot mismatch is.
-          const again = await readFence(keys.fence);
-          const next = admissionView(again);
-          if (next.resets !== fence.resets || pairs.some(([s, id]) => {
-            const k = sessionKeyHash(s, id);
-            return fenceEpoch(next, input.originId, k) !== fenceEpoch(fence, input.originId, k) || isDeletedForAdmission(next, input.originId, s, id) !== isDeletedForAdmission(fence, input.originId, s, id);
-          })) { await backoff(attempt); continue; }
-        }
-        // (d) The claim; committed at once when nothing needs writing (replay_fast).
-        const token = judged.fast ? null : newToken();
-        const epochs: Record<string, number> = {};
-        for (const [s, id] of pairs) { const k = sessionKeyHash(s, id); epochs[k] = fenceEpoch(fence, input.originId, k); }
-        const doc: BatchDoc = { v: 1, originId: input.originId, batchId: input.batchId, digest: input.batchDigest, receiptId: input.receiptId,
-          state: judged.fast ? "committed" : "pending", claimToken: token, fenceVersion: fence.version, fenceInstance: instanceOf(read), resets: fence.resets, epochs };
-        // A lost create or CAS is a concurrent claim of this batch id: answer as a retry would.
-        if (!(await casPut(store, batchKey, doc, stored?.version))) { await backoff(attempt); continue; }
-        const base = { deleted: judged.deleted, stale: judged.stale, resets: fence.resets };
-        if (judged.fast) return { kind: "replay_fast", ...base };
-        return { kind: stored ? "resume" : "claimed", claimToken: token!, ...base };
-      }
-      throw new LedgerUnavailableError("ledger_batch_contended");
+      const r = await claimOrCurrent(input, false);
+      // Unreachable: only the resend probe (onlyCurrent) answers not_current.
+      if (r.kind === "not_current") throw new LedgerUnavailableError("ledger_claim_invalid");
+      return r;
     },
+    claimIfCurrent: async (input: ClaimInput): Promise<boolean> => (await claimOrCurrent(input, true)).kind === "replay_fast",
 
     async commit(input: CommitInput): Promise<CommitResult> {
       if (!mapKey(input.originId) || !str(input.batchId) || typeof input.batchDigest !== "string" || !HEX64.test(input.batchDigest)

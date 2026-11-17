@@ -43,7 +43,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * Hypothesis, pending operator pg_stat_activity/lock/plan evidence: several sub-2 s lock
  * waits on the per-user fence row add up to the 5 s statement_timeout.
  */
-import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
+import type { ClaimInput, Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import { STORE_TRANSPORT_CAUSES } from "../shared/vendor.ts";
 
@@ -355,6 +355,24 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
 }
 
 /**
+ * The ledger claim input for a prepared batch, with no custody: the one shape deliverPrepared claims with, and the
+ * one the upload-inbox resend probe (upload-admission.ts resendSkip -> Ledger.claimIfCurrent) judges, so the two
+ * can never disagree about the batch's sessions or records.
+ */
+export function ledgerClaimInput(tenant: LedgerTenant, prepared: PreparedDelivery): ClaimInput {
+  const sessions = [...new Map(prepared.records.filter((r) => r.session_id).map((r) => [pair(r.source, r.session_id), [r.source, r.session_id!] as [string, string]])).values()];
+  return {
+    tenant,
+    originId: prepared.originId,
+    batchId: prepared.batchId,
+    batchDigest: prepared.batchDigest,
+    receiptId: prepared.receipt.receiptId,
+    sessions,
+    records: prepared.records.map((r) => ({ source: r.source, sessionId: r.session_id, recordId: r.record_id, revisionId: r.revision_id, revision: r.revision, digest: r.digest })),
+  };
+}
+
+/**
  * Lands an already-prepared relayhistory delivery through the same claim, fence,
  * stale-record, buffered-write and receipt path as a live public batch.
  *
@@ -381,18 +399,10 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   assertWithinBudget(deps, prepared.records, now());
   mark(firstTiming);
 
-  const sessions = [...new Map(prepared.records.filter((r) => r.session_id).map((r) => [pair(r.source, r.session_id), [r.source, r.session_id!] as [string, string]])).values()];
+  const claimInput = ledgerClaimInput(tenant, prepared);
+  const sessions = claimInput.sessions;
   const claim = await claimStage(deps, () =>
-    deps.ledger.claim({
-      tenant,
-      ...(deps.custody?{custody:deps.custody}:{}),
-      originId: prepared.originId,
-      batchId: prepared.batchId,
-      batchDigest: prepared.batchDigest,
-      receiptId: prepared.receipt.receiptId,
-      sessions,
-      records: prepared.records.map((r) => ({ source: r.source, sessionId: r.session_id, recordId: r.record_id, revisionId: r.revision_id, revision: r.revision, digest: r.digest })),
-    }),
+    deps.ledger.claim({ ...claimInput, ...(deps.custody?{custody:deps.custody}:{}) }),
   );
   mark("claim");
   const base = { records: prepared.records.length, sessions: sessions.length, deleted_sessions: 0, stale: 0, manifests_written: 0, replica: "off" as ReplicaOutcome, rearmed: 0 };

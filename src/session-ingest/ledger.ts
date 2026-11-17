@@ -204,6 +204,12 @@ export interface Ledger {
   /** Private verified-identity path. Unsupported stores must fail, never fall back. */
   applyOrderedControl?(input:OrderedControlInput):Promise<OrderedControlResult>;
   claim(input: ClaimInput): Promise<ClaimResult>;
+  /**
+   * S3 ledger only (ledger-s3.ts claimOrCurrent, INGEST_ADMISSION_RESEND_SKIP): the claim, restricted to the case it
+   * would answer replay_fast. true: it wrote exactly what that replay_fast writes (the committed batch record), so the
+   * batch is admitted with nothing to store. false: it wrote nothing; run the full path. Throws as claim does.
+   */
+  claimIfCurrent?(input: ClaimInput): Promise<boolean>;
   prepareBufferStage?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & BufferedStageSpec): Promise<BufferedStageIntent>;
   commitBuffered?(input: Pick<CommitInput,"tenant"|"originId"|"batchId"|"batchDigest"|"claimToken"> & {stageToken:string}): Promise<CurrentCustodyAck|void>;
   commit(input: CommitInput): Promise<CommitResult>;

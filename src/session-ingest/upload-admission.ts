@@ -28,7 +28,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { prepareForAdmission, TenantNotASegment } from "./admission-core.ts";
-import { enqueueAdmission, inboxKey, INBOX_MIN_BYTES, INBOX_NAMESPACE, outcomeKey, receiptDir, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionTarget } from "./async-admission.ts";
+import { enqueueAdmission, inboxKey, INBOX_MIN_BYTES, INBOX_NAMESPACE, outcomeKey, receiptDir, tombstoneInbox, witnessPrivacyJournal, writeOutcome, type AdmissionMessage, type AsyncAdmissionTarget } from "./async-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
@@ -177,11 +177,26 @@ export interface PromoteUploadDeps {
   enqueue: AsyncAdmissionTarget["enqueue"];
   nowMs?: () => number;
   nonce?: () => string;
+  /**
+   * INGEST_ADMISSION_RESEND_SKIP=on (selfhost-config.ts; S3 ledger only): after the section 6 checks and the prepare,
+   * the ledger's claim restricted to replay_fast (Ledger.claimIfCurrent over deliver.ts ledgerClaimInput). true: every
+   * live record is already stored at an equal or higher revision and the committed batch record is written, so the
+   * upload is finished here (RESEND_SKIP_CODE) without the admission-inbox round trip. false or a throw: the
+   * unchanged hand-off. Absent (the default): never called, byte-identical.
+   */
+  resendSkip?: (tenant: LedgerTenant, prepared: PreparedDelivery) => Promise<boolean>;
 }
+
+/**
+ * The admission outcome code of an upload finished by the resend skip. Server-side only: the status answer for an
+ * admitted upload carries no code (uploadAdmissionStatus), so the desktop sees exactly what the full path's
+ * replay_fast gives it (`admitted`, the same receipt id).
+ */
+export const RESEND_SKIP_CODE = "already_current";
 
 export type PromoteResult =
   /** handed_off: an admission-inbox object now holds the batch; refused: a terminal §6 refusal is recorded. */
-  | { action: "ack"; outcome: "handed_off" | "refused" | "already_promoted" | "gone"; code?: UploadRefusalCode }
+  | { action: "ack"; outcome: "handed_off" | "refused" | "already_promoted" | "gone" | typeof RESEND_SKIP_CODE; code?: UploadRefusalCode }
   /** Transient or configuration: leave the object, re-drive later. `code` is an operational code, never a refusal. */
   | { action: "retry"; code: string; error?: unknown }
   /** Not an upload key of this key root: nothing is read or written; the caller fails (DLQ) or skips it. */
@@ -383,7 +398,47 @@ export async function promoteUpload(key: string, deps: PromoteUploadDeps): Promi
     const code = uploadRefusalOf(error);
     return code ? refuse(code) : retry("admission_prepare_failed", error);
   }
+  if (deps.resendSkip) {
+    const skipped = await skipIfCurrent(deps, deps.resendSkip, statusKey, tenant, prepared, now, removeUpload);
+    if (skipped) return skipped;
+  }
   return handOff(deps, statusKey, tenant, prepared, witness, now, removeUpload);
+}
+
+/**
+ * INGEST_ADMISSION_RESEND_SKIP: finish an upload that adds nothing new (a desktop re-sending history it already
+ * uploaded, under new batch ids) without the admission inbox. The probe is the ledger's own claim, narrowed to the
+ * replay_fast case (ledger-s3.ts claimOrCurrent), so a skip happens only when the full path would have claimed
+ * replay_fast, minus every case that probe answers not_current; then it leaves what the full path leaves for that
+ * batch: the committed batch record (written by the probe), the `admitted` outcome marker in the receipt directory,
+ * a tombstoned inbox attempt next to it (pendingAdmissions skips tombstones; a redelivery's handedOffOutcome finds
+ * the pair and acks), the `handed_off` status pointing at it, and the upload object removed. Nothing canonical is
+ * written, as replay_fast writes nothing canonical. Only the outcome code differs (RESEND_SKIP_CODE, not
+ * replay_fast), and the status route never shows it. Null: run the hand-off (not current, or the probe failed: the
+ * full path decides, and answers `replay` if the probe committed the batch record before failing).
+ * A crash between these writes re-runs the promotion: the probe then finds the batch record and answers false, and
+ * the full hand-off's claim answers replay (admitted), so every interleaving ends admitted with nothing canonical.
+ */
+async function skipIfCurrent(deps: PromoteUploadDeps, probe: NonNullable<PromoteUploadDeps["resendSkip"]>, statusKey: string, tenant: LedgerTenant,
+  prepared: PreparedDelivery, now: number, removeUpload: (r: PromoteResult) => Promise<PromoteResult>): Promise<PromoteResult | null> {
+  const { store, keyRoot } = deps.deliver.target;
+  let current: boolean;
+  try {
+    current = await probe(tenant, prepared);
+  } catch {
+    return null;
+  }
+  if (!current) return null;
+  try {
+    const inbox = inboxKey(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId, now, (deps.nonce ?? randomNonce)());
+    // The outcome first: a status pointing at a receipt directory then always resolves to admitted, never to pending.
+    await writeOutcome(store, receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId), { v: 1, state: "admitted", code: RESEND_SKIP_CODE, atMs: now });
+    await tombstoneInbox(store, inbox);
+    await writeStatus(store, statusKey, { v: 1, kind: STATUS_KIND, state: "handed_off", originId: prepared.originId, receiptId: prepared.receipt.receiptId, inboxKey: inbox, receivedAtMs: now });
+  } catch (error) {
+    return retry("upload_status_unavailable", error);
+  }
+  return removeUpload({ action: "ack", outcome: RESEND_SKIP_CODE });
 }
 
 async function handOff(deps: PromoteUploadDeps, statusKey: string, tenant: LedgerTenant, prepared: PreparedDelivery, witness: UploadWitnessPayload,

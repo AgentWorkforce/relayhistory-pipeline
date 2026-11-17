@@ -87,7 +87,8 @@ import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
 import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage, type AdmissionTenantHint } from "./async-admission.ts";
 import { promoteUpload } from "./upload-admission.ts";
-import { assertWithinBudget, type DeliverDeps } from "./deliver.ts";
+import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
+import { assertWithinBudget, ledgerClaimInput, type DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import { s3Ledger, serverLedgerParallel, withSqlControlMirror } from "./ledger-s3.ts";
@@ -250,7 +251,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "ledgerLogErase" | "s3TenantLimit" | "s3EraseFence">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "ledgerLogCommit" | "ledgerLogErase" | "s3TenantLimit" | "s3EraseFence" | "admissionResendSkip">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
@@ -335,8 +336,14 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const notify = async (message: AdmissionMessage, hint?: AdmissionTenantHint) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key, hint); };
   // HISTORY_UPLOAD_DIRECT allowlist|on (selfhost-config.ts): the consumer's scan also promotes the upload inbox.
   const upload = settings.uploadDirect;
+  // INGEST_ADMISSION_RESEND_SKIP=on (selfhost-config.ts; S3 ledger only, refused again here for direct callers): a
+  // promoted upload that adds nothing new is finished by the S3 claim narrowed to replay_fast (upload-admission.ts
+  // skipIfCurrent). Off: no resendSkip, promotion byte-identical.
+  if (settings.admissionResendSkip && (!s3 || !ledger.claimIfCurrent)) throw new Error("96bulls: INGEST_ADMISSION_RESEND_SKIP=on needs INGEST_LEDGER=s3");
+  const resendSkip = settings.admissionResendSkip && ledger.claimIfCurrent
+    ? (tenant: LedgerTenant, prepared: PreparedDelivery) => ledger.claimIfCurrent!(ledgerClaimInput(tenant, prepared)) : undefined;
   const uploadInbox = upload
-    ? { batchSize: upload.scanBatch, concurrency: upload.promoteConcurrency, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
+    ? { batchSize: upload.scanBatch, concurrency: upload.promoteConcurrency, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(resendSkip ? { resendSkip } : {}) }) }
     : undefined;
   // INGEST_S3_TENANT_LIMIT=on: the consumer has its OWN limiter pool (per replica), INGEST_MAX_PER_USER per user and
   // INGEST_ASYNC_MAX_PER_ORG (default half the consumer) per org, so one org's backlog never holds every consumer slot.
