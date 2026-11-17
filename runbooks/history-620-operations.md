@@ -233,6 +233,31 @@ refusal at one generation is not hidden behind the other's `generation_not_ready
 `generation_not_ready` or `policy_unavailable` points at the schema generation overlap; any other class
 is a per-org or per-user state to investigate.
 
+### `org_prior_authority_unbound`: org admission repair
+
+A sustained `org_prior_authority_unbound` for an org means `ingest_lazy_begin` found prior rows for that org and
+will refuse every claim until the org is admitted. If those rows are only seed-epoch counters, admit the org through
+`.github/workflows/ingest-org-admission-repair.yml` (design: `docs/design/zero-503-schema-windows.md` 3.4). Each
+dispatch is from `main` at the exact head SHA and needs Khaliq's approval on `session-schema-production`. Pass the
+org ids only as the `orgs` input, comma-separated, and use the same list for every step. Never commit org ids.
+
+1. **readback** (allowed while dormant). For each org index, it reports whether the org is admitted and the row
+   count in every table the live scan sees. Continue only if every org shows only `ingest_seed_source_epochs` and
+   `drift` is `null`.
+2. **Enable.** Set `ORG_ADMISSION_REPAIR_ENABLED` to `true` in a reviewed one-line change, and set it back to
+   `false` after the repair.
+3. **plan.** This refuses if any org is admitted, has rows in another table, or has no rows, or if the policy is
+   expired or not at the PASS generation. From the 1-day plan artifact, copy the
+   `ADMIT-ORGS <project> <sha> GENERATION <g> VALID_UNTIL <v> ORGS <d> COUNT <n> PLAN <run>` confirmation.
+4. **admit** with the same `sha`, the same `orgs`, `plan_run` and that confirmation, within 24 h. Any drift since
+   the plan refuses and writes nothing. That includes a renewal, a new admission, a new table, or new rows outside
+   the allowlist. If it refuses, run readback and plan again.
+5. **Verify.** Check that the receipt says `ORG_ADMISSION_REPAIRED` with `committed: true` and that
+   `org_prior_authority_unbound` stops for those orgs. The clients' pending claims then apply on retry.
+
+This repairs only the orgs you list. The class fix, a forward migration that removes `ingest_seed_source_epochs`
+from the scan, is separate. After it lands, this operator refuses with `org_admission_repair_scan_drift`.
+
 Every line built from the batch route's fields (`route` `delivery.batches` and `turns.batches`: the
 outcome line, and the capture-policy and upload-consent lines emitted from that route) carries
 `client_kind` from the request User-Agent (`src/session-ingest/client-agent.ts`). The Desktop sends
