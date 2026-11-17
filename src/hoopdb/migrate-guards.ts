@@ -451,7 +451,8 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
 ] as const;
 
 /**
- * Self-host output-facts writers (migration 045040) granted EXECUTE to the consumer login
+ * Self-host output-facts writers (migration 045040) and the staged search reconcile writers
+ * (migration 062110) granted EXECUTE to the consumer login
  * `search_consumer_runtime` only. The live sessions-function gate (db.ts
  * SESSIONS_FUNCTION_GATE_SQL) accepts them when, and only when, current_user is that role.
  * Deliberately NOT part of RUNTIME_APPLICATION_FUNCTIONS: that list feeds
@@ -465,6 +466,14 @@ export const CONSUMER_RUNTIME_FUNCTIONS = [
   "sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)",
   "sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)",
   "sessions.output_facts_state(text,text,text,text[],text)",
+  // Staged search reconcile writers (migration 062110), same contract.
+  "sessions.search_reconcile_abandon_v1(bigint,uuid,text)",
+  "sessions.search_reconcile_advance_v1(bigint,uuid,text,text,text[],bigint,bigint,boolean)",
+  "sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)",
+  "sessions.search_reconcile_diff_page_v1(bigint,uuid,text,text,integer,text)",
+  "sessions.search_reconcile_erase_scope_v1(text,text,text,text[])",
+  "sessions.search_reconcile_finish_v1(bigint,uuid)",
+  "sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)",
 ] as const;
 
 /**
@@ -1652,7 +1661,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "61064e1f5391eb1161e5bc26b79983cc97596a31b78bbc01e62af8a035c226bc";
+  "37f9f599b42653628efd85d3b944d365485cb0d2e1773c4fa8f1990a7d8994bf";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
