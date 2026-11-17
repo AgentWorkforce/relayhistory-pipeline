@@ -40,6 +40,17 @@ describe("SELFHOST_INGEST_ADMISSION", () => {
     }
   });
 
+  test("SELFHOST_ADMISSION_LEARN_USERS: absent unless on; off/empty/unset unchanged; anything else refuses; refused with sync", () => {
+    const base = { SELFHOST_INGEST_ADMISSION: "async" };
+    expect(selfhostAdmissionSettings(base)).not.toHaveProperty("learnUsers");
+    for (const v of ["", "off"]) expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_LEARN_USERS: v })).toEqual(selfhostAdmissionSettings(base));
+    expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_LEARN_USERS: "on" })).toMatchObject({ learnUsers: true });
+    for (const v of ["true", "1", "ON"]) expect(() => selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_LEARN_USERS: v })).toThrow("SELFHOST_ADMISSION_LEARN_USERS must be on or off");
+    // It acts on the async consumer only: set with sync it would silently do nothing, so it is refused.
+    expect(() => selfhostAdmissionSettings({ SELFHOST_ADMISSION_LEARN_USERS: "on" })).toThrow("SELFHOST_ADMISSION_LEARN_USERS needs SELFHOST_INGEST_ADMISSION=async or drain");
+    expect(selfhostAdmissionSettings({ SELFHOST_ADMISSION_LEARN_USERS: "off" })).toBeUndefined();
+  });
+
   test("SELFHOST_ADMISSION_AWAIT_AUTHORITY: absent unless on; off/empty/unset leave the settings unchanged; anything else refuses", () => {
     const base = { SELFHOST_INGEST_ADMISSION: "async" };
     expect(selfhostAdmissionSettings(base)).not.toHaveProperty("awaitAuthority");

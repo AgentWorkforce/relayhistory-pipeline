@@ -67,7 +67,7 @@ async function until(cond: () => boolean | Promise<boolean>, what: string): Prom
   throw new Error(`timed out waiting for ${what}`);
 }
 
-function edge(opts: { admission?: { mode: "async"; concurrency: number; scanIntervalMs: number; maxAttempts: number }; direct?: boolean; ledger?: "s3";
+function edge(opts: { admission?: { mode: "async"; concurrency: number; scanIntervalMs: number; maxAttempts: number; learnUsers?: true }; direct?: boolean; ledger?: "s3";
   /** INGEST_S3_TENANT_LIMIT: on ({}, or with asyncMaxPerOrg) by default here; null = off. */
   limit?: { asyncMaxPerOrg?: number } | null; maxPerUser?: number;
   /** Share another edge's store (a second process: its consumer has none of the first one's notify hints). */
@@ -295,6 +295,42 @@ describe("INGEST_S3_TENANT_LIMIT=on, the pre-claim hint's per-directory branches
     // Each terminal outcome dropped its hint: nothing lingers.
     expect(e.consumer().userHints()).toBe(0);
     expect(e.logged.some((f) => f.outcome === "deferred")).toBe(false);
+    expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    expect(e.sql).toEqual([]);
+  });
+
+  for (const learnUsers of [true, false] as const)
+  test(`scan-only, one user on two machines: ${learnUsers ? "SELFHOST_ADMISSION_LEARN_USERS=on learns the user, so a later pass starts nothing while the user is at the cap" : "flag off (control): a later pass starts more and the limiter defers them again"}`, async () => {
+    // Per-user 2, per-org 8, concurrency 8, userHintMax 0 (no notify hints: the pre-restart backlog a scan finds).
+    // Three uploads on each of two machines of one user. The first pass starts two per directory (four); the limiter
+    // admits two and defers two. With the flag the deferred two taught both directories their user, so after their
+    // Retry-After the next pass sees the user at its cap (the two held admissions moved to the user's group) and starts
+    // nothing; without it each directory reads below the cap and the pass burns more claims on deferrals.
+    const e = edge({ admission: { mode: "async", concurrency: 8, scanIntervalMs: 15_000, maxAttempts: 20, ...(learnUsers ? { learnUsers: true as const } : {}) },
+      direct: true, limit: { asyncMaxPerOrg: 8 }, maxPerUser: 2, userHintMax: 0 });
+    await writeAuthority(e.base);
+    const keys: string[] = [];
+    for (const origin of ["origin-1", "origin-2"]) for (let i = 1; i <= 3; i++) keys.push(await upload(e.base, `batch-${origin}-${i}`, `${origin}-${i}`, TENANT, origin));
+    await e.consumer().scan();
+    e.hold();
+    const settling = e.consumer().settle();
+    const deferrals = () => e.logged.filter((f) => f.route === "ingest.admission" && f.outcome === "deferred").length;
+    const sessions = () => new Set(e.gatedKeys().map((k) => /\/s=([^/]+)\//.exec(k)?.[1])).size;
+    await until(() => sessions() === 2 && deferrals() === 2, "two admissions held at the user's cap and two deferred");
+    // Past the deferrals' Retry-After, with the user's two admissions still held: the next pass.
+    e.advance(11_000);
+    await e.consumer().scan();
+    await new Promise((r) => setTimeout(r, 80));
+    if (learnUsers) {
+      expect(deferrals()).toBe(2);
+      expect(e.consumer().status().inFlight).toBe(2);
+    } else {
+      expect(deferrals()).toBeGreaterThan(2);
+    }
+    e.open();
+    await settling;
+    for (let i = 0; i < 10 && (await Promise.all(keys.map(statusOf(e)))).some((s) => s !== "admitted"); i++) { e.advance(11_000); await e.consumer().scan(); await e.consumer().settle(); }
+    expect(await Promise.all(keys.map(statusOf(e)))).toEqual(keys.map(() => "admitted"));
     expect(e.consumer().status()).toMatchObject({ backlog: 0, deadLetters: 0 });
     expect(e.sql).toEqual([]);
   });

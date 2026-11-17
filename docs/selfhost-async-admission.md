@@ -110,6 +110,23 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
     Both stay ordinary retries and dead-letter after `SELFHOST_ADMISSION_MAX_ATTEMPTS`. To pause one org
     without dead letters, remove its marker instead (with no valid deployment-wide marker), or raise the
     deployment-wide stop.
+- **One user, many machines (`SELFHOST_ADMISSION_LEARN_USERS=on`, default off; needs the tenant limit,
+  `INGEST_S3_TENANT_LIMIT`).**
+  - **The gap.** The tenant-cap hint skips, without a claim, an entry whose user is already at
+    `INGEST_MAX_PER_USER`. It knows a key's user only from the in-process writer hint (request path and
+    promotion). A key found by a scan (the backlog written before a restart, or by another replica) is counted
+    by its machine directory instead. A user with N machine directories can therefore start up to
+    N x `INGEST_MAX_PER_USER` admissions, and the limiter defers the excess only after each one's claim and
+    inbox read. Measured on one replica: 1,259 deferrals in 10 minutes for one hot user, about 7 s of
+    admission slot each.
+  - **With the flag.** The consumer learns each machine directory's user from the tenant its first admission
+    decodes. A machine directory (`…/m=srv_<hash of workspace, origin, user>`) belongs to exactly one user,
+    so the mapping is exact. From then on, every key of that directory counts, and waits after a deferral, in
+    the user's group, which is the group the writer hint uses and the limiter counts. Admissions of the
+    directory already in flight move to the user's group when it is learned.
+  - **Limits.** The map is in-process and bounded (oldest out). The first admission of each directory can
+    still be deferred, as before. The limiter after the claim stays the authoritative guard, so the hint can
+    only skip a start the limiter would refuse.
 - **Several replicas (`SELFHOST_ADMISSION_SPREAD=on`, default off).** Every replica lists the same inbox.
   With strict oldest-first (off, unchanged) they all start on the same oldest entries, and the losers end as
   `already_terminal` / tombstoned or `retry ledger_attempt_superseded`: measured with 2 replicas, about half of
@@ -268,6 +285,7 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`async`/`drain` with `INGEST_LEDGER=s3`; a silent no-op with `sql`, which never answers these codes) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_ADMISSION_SPREAD` (`async`/`drain` only; set with `sync`: refused) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_ADMISSION_SPREAD_GRACE_MS` (`SELFHOST_ADMISSION_SPREAD=on` only; set otherwise: refused) | 1000..86400000 | max(120000, 4 x `SELFHOST_ADMISSION_SCAN_MS`) |
+| `SELFHOST_ADMISSION_LEARN_USERS` (`async`/`drain` only; set with `sync`: refused; acts only with the tenant limit) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |

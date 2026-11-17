@@ -48,6 +48,11 @@ export interface AdmissionConsumerDeps {
   uploadConsent?: UploadConsentConfig;
   log?: (fields: Record<string, unknown>) => void;
   /**
+   * The decoded inbox object's tenant, before any claim (selfhost-admission.ts learnUsers). In-process only;
+   * a throw is ignored, so it can never change an admission's outcome. Absent: nothing is called (unchanged).
+   */
+  onTenant?: (tenant: LedgerTenant) => void;
+  /**
    * INGEST_LEDGER_LOG_COMMIT=on (ledger-log-admit.ts): a batch whose stream is in log mode (entry 0 exists) is
    * admitted through the stream's log; every other stream keeps the legacy path, unchanged. Absent: legacy only.
    */
@@ -113,6 +118,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
   }
   if (!decoded) return { action: "ack", outcome: "already_terminal", code: "tombstoned" };
   const { tenant, prepared, receivedAtMs, journalSeq, consentCap } = decoded;
+  if (deps.onTenant) { try { deps.onTenant(tenant); } catch { /* a hint only */ } }
   const now = (deps.nowMs ?? Date.now)();
   const lagMs = Math.max(0, now - receivedAtMs);
   const dir = receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId);

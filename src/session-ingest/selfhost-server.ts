@@ -374,6 +374,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(admission.awaitAuthority ? { awaitAuthority: true } : {}),
     // SELFHOST_ADMISSION_SPREAD=on: replicas start on different machines' work (salted order) below the grace. Off: unchanged.
     ...(admission.spread ? { spread: { graceMs: admission.spread.graceMs } } : {}),
+    // SELFHOST_ADMISSION_LEARN_USERS=on: the tenant-cap hint groups scan-found keys by their learned user. Off: unchanged.
+    ...(admission.learnUsers ? { learnUsers: true } : {}),
     ...(options.userHintMax !== undefined ? { userHintMax: options.userHintMax } : {}),
     // INGEST_LEDGER_LOG_COMMIT=on (s3 only): a stream in log mode is admitted through its log; the rest stay legacy.
     // The materializer replays each logged batch through the legacy core on an UNGUARDED ledger (no tenant slots:

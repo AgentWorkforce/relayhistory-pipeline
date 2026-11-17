@@ -723,7 +723,9 @@ missing fence-authority marker or the deployment-wide stop then defers instead o
 counting toward the dead letter, `INGEST_LEDGER=s3` only) and `SELFHOST_ADMISSION_SPREAD`
 (`on`/`off`, default off; with more than one replica, each orders work younger than
 `SELFHOST_ADMISSION_SPREAD_GRACE_MS` by a per-process salted hash of its machine directory so replicas
-stop racing on the same oldest entries) are read only in `async` and `drain`. The mode is never taken from a
+stop racing on the same oldest entries) and `SELFHOST_ADMISSION_LEARN_USERS` (`on`/`off`,
+default off; with the tenant limit, scan-found inbox keys are counted per user, learned from each machine
+directory's first admission, instead of per machine directory) are read only in `async` and `drain`. The mode is never taken from a
 request. Semantics: `docs/selfhost-async-admission.md`.
 
 Sizing with `INGEST_LEDGER=s3`: one admission of a 100-record batch holds a few MB (the batch, its

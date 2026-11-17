@@ -77,6 +77,10 @@
  *   SELFHOST_ADMISSION_SPREAD_GRACE_MS  with SPREAD=on only (set otherwise: refused): 1000..86400000, default
  *                                    max(120000, 4 x SELFHOST_ADMISSION_SCAN_MS). The bound on how long spread may
  *                                    delay an entry before it is taken oldest-first by every replica
+ *   SELFHOST_ADMISSION_LEARN_USERS   on | off (default off: unchanged). on, with the tenant limit (INGEST_S3_TENANT_LIMIT):
+ *                                    the tenant-cap hint learns each machine directory's user from its first admission,
+ *                                    so inbox keys found by a scan (no notify hint) count, and wait, per user as the
+ *                                    limiter counts them, not per machine directory (selfhost-admission.ts learnUsers)
  *
  *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
  *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
@@ -205,6 +209,8 @@ export interface SelfhostAdmissionSettings {
   awaitAuthority?: true;
   /** SELFHOST_ADMISSION_SPREAD=on only (selfhost-admission.ts spread): the grace in ms. Absent when off (unchanged). */
   spread?: { graceMs: number };
+  /** SELFHOST_ADMISSION_LEARN_USERS=on only (selfhost-admission.ts learnUsers). Absent when off (unchanged). */
+  learnUsers?: true;
 }
 
 export interface SelfhostIngestSettings {
@@ -423,7 +429,7 @@ export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmis
   const raw = env[SELFHOST_INGEST_ADMISSION_VAR];
   if (raw === undefined || raw === "" || raw === "sync") {
     // The spread orders the async consumer's work: without one it would silently do nothing.
-    for (const name of [SELFHOST_ADMISSION_SPREAD_VAR, SELFHOST_ADMISSION_SPREAD_GRACE_VAR]) {
+    for (const name of [SELFHOST_ADMISSION_SPREAD_VAR, SELFHOST_ADMISSION_SPREAD_GRACE_VAR, SELFHOST_ADMISSION_LEARN_USERS_VAR]) {
       const v = env[name]?.trim();
       if (v && v !== "off") throw new Error(`96bulls: ${name} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
     }
@@ -438,7 +444,18 @@ export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmis
     maxAttempts: bounded(env, "SELFHOST_ADMISSION_MAX_ATTEMPTS", 20, 1, 100),
     ...(awaitAuthorityFlag(env) ? { awaitAuthority: true as const } : {}),
     ...spreadSettings(env, scanIntervalMs),
+    ...(learnUsersFlag(env) ? { learnUsers: true as const } : {}),
   };
+}
+
+export const SELFHOST_ADMISSION_LEARN_USERS_VAR = "SELFHOST_ADMISSION_LEARN_USERS";
+
+/** SELFHOST_ADMISSION_LEARN_USERS: on or off (unset / empty = off); anything else refuses startup. */
+function learnUsersFlag(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[SELFHOST_ADMISSION_LEARN_USERS_VAR];
+  if (raw === undefined || raw === "" || raw === "off") return false;
+  if (raw === "on") return true;
+  throw new Error(`96bulls: ${SELFHOST_ADMISSION_LEARN_USERS_VAR} must be on or off`);
 }
 
 export const SELFHOST_ADMISSION_SPREAD_VAR = "SELFHOST_ADMISSION_SPREAD";
