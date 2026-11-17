@@ -289,7 +289,9 @@ export async function runStagedReconcile<R>(
             k: haveKey(i), m: i.key, o: ownerOf(i), t: i.tsMs, f: i.fingerprint,
             p: { key: i.key, machineId: i.machineId, sessionId: i.sessionId, source: i.source, kind: i.kind, eventId: i.eventId, workspaceId: i.workspaceId, tsMs: i.tsMs, fingerprint: i.fingerprint },
           }));
-          for (let i = 0; i < entries.length; i += stageBatch) await stage(tx, "have", 0, entries.slice(i, i + stageBatch), page.next);
+          // The last page keeps the current cursor (a cursor is never cleared mid-phase); the advance resets it.
+          const at = page.next ?? cursor;
+          for (let i = 0; i < entries.length; i += stageBatch) await stage(tx, "have", 0, entries.slice(i, i + stageBatch), at);
           if (page.next === null) await advance(tx, "write", null);
           else if (!entries.length) await stage(tx, "have", 0, [], page.next);
           return page.next;

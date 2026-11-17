@@ -13,7 +13,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062110_search_reconcile_staging.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search reconcile staging: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062110_search_reconcile_staging.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'8912937044fed86f51511bc01ae1c4deceaacbcf0557a06ae4bc77b8e3d403b2'
+ IF NOT FOUND OR v_sha<>'45f673d4f5327162ccd271aed8c229d56dd6a953fa8b1bd3a7df657c3c3aeca6'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search reconcile staging: own applied checksum required';END IF;
  IF to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL
     AND EXISTS(SELECT 1 FROM sessions.search_reconcile_runs_v1 WHERE lease_nonce IS NOT NULL AND lease_expires_at>clock_timestamp())

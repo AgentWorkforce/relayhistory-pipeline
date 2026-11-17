@@ -264,7 +264,9 @@ describe("20261105062110 search reconcile staging", () => {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
         "SELECT p.prosecdef secdef, p.proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec FROM pg_proc p WHERE p.oid=$1::regprocedure", [fn])).rows[0]!;
       expect(r.secdef).toBe(WRITERS.includes(fn));
-      expect(r.cfg).toEqual([WRITERS.includes(fn) ? "search_path=pg_catalog, sessions, pg_temp" : "search_path=pg_catalog, pg_temp"]);
+      expect(r.cfg).toEqual(
+        fn === WRITERS[0] ? ["search_path=pg_catalog, sessions, pg_temp", "lock_timeout=2s"]
+        : [WRITERS.includes(fn) ? "search_path=pg_catalog, sessions, pg_temp" : "search_path=pg_catalog, pg_temp"]);
       expect(r.public_exec).toBe(false);
     }
     for (const t of TABLES) {
@@ -331,13 +333,17 @@ describe("20261105062110 search reconcile staging", () => {
     expect(await code(stageAt(second, "b"))).toBeNull();
     expect(await code(stageAt(second, "b"))).toBeNull();
     expect(await code(stageAt(second, "a"))).toBe("55000");
+    // Nor is a set cursor cleared mid-phase (only a phase change resets it).
+    expect(await code(transact((tx) => tx.query(
+      "SELECT sessions.search_reconcile_stage_batch_v1($1::bigint,$2::uuid,'want',3::smallint,'[]'::jsonb,NULL)", [second.run_id, second.lease_nonce])))).toBe("55000");
+    expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want',NULL,NULL,0,0,false)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want','a',NULL,0,0,false)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'write',NULL,NULL,0,0,false)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT sessions.search_reconcile_finish_v1($1::bigint,$2::uuid)", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT * FROM sessions.search_reconcile_diff_page_v1($1::bigint,$2::uuid,'insert',NULL,10,'bf')", [second.run_id, second.lease_nonce])))).toBe("55000");
     expect(await code(transact((tx) => tx.query("SELECT * FROM sessions.search_reconcile_diff_page_v1($1::bigint,$2::uuid,'insert',NULL,10,'')", [second.run_id, second.lease_nonce])))).toBe("22023");
     // A release frees the scope at once.
-    await transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want',NULL,NULL,0,0,true)", [second.run_id, second.lease_nonce]));
+    await transact((tx) => tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,'want','b',NULL,0,0,true)", [second.run_id, second.lease_nonce]));
     expect((await claim())[0]!.attempts).toBe(3);
   });
 
