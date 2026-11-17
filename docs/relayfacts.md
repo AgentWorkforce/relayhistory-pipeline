@@ -150,9 +150,9 @@ Out of scope, as follow-ups:
 
 Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
 
-1. Apply migrations `20261105062080` and `20261105062090` to the target database, then confirm both sentinels.
-2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then on the session-analysis worker. Only where the per-session erase reaches these tables (see Retention); not on hosted yet.
-3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, and add the workspace to the `relayfacts` canary.
+1. Apply migrations `20261105062080` and `20261105062090` with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm both sentinels.
+2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where the per-session erase reaches these tables (see Retention), so not on hosted yet.
+3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to the `relayfacts` canary.
 
 Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062090` first (its rollback refuses while a later migration is applied).
 
