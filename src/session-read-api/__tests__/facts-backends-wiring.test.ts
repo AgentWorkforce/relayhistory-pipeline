@@ -197,7 +197,7 @@ describe("coordination advisories wiring", () => {
   });
 });
 
-describe("memory documents flag (READ_API_MEMORY_DOCUMENTS_ENABLED)", () => {
+describe("relayfacts flag (READ_API_RELAYFACTS_ENABLED)", () => {
   const LAMBDA_SECRET = JSON.stringify({
     supabase_url: PG_URL,
     clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
@@ -206,10 +206,10 @@ describe("memory documents flag (READ_API_MEMORY_DOCUMENTS_ENABLED)", () => {
 
   test("neither entry wires it unless the flag is exactly \"true\"", async () => {
     for (const value of [undefined, "", "1", "TRUE", "True", "yes", " true", "true "]) {
-      const env = value === undefined ? {} : { READ_API_MEMORY_DOCUMENTS_ENABLED: value };
+      const env = value === undefined ? {} : { READ_API_RELAYFACTS_ENABLED: value };
       for (const built of [await buildLambda(env), await build({ ...ENV, ...env })]) {
         try {
-          expect([value, built.deps.memoryDocuments]).toEqual([value, undefined]);
+          expect([value, built.deps.relayfacts]).toEqual([value, undefined]);
         } finally {
           await built.close();
         }
@@ -218,10 +218,10 @@ describe("memory documents flag (READ_API_MEMORY_DOCUMENTS_ENABLED)", () => {
   });
 
   test("\"true\" wires the two reads on the hosted Lambda entry and the self-host service", async () => {
-    for (const built of [await buildLambda({ READ_API_MEMORY_DOCUMENTS_ENABLED: "true" }), await build({ ...ENV, READ_API_MEMORY_DOCUMENTS_ENABLED: "true" })]) {
+    for (const built of [await buildLambda({ READ_API_RELAYFACTS_ENABLED: "true" }), await build({ ...ENV, READ_API_RELAYFACTS_ENABLED: "true" })]) {
       try {
-        expect(typeof built.deps.memoryDocuments?.topics).toBe("function");
-        expect(typeof built.deps.memoryDocuments?.list).toBe("function");
+        expect(typeof built.deps.relayfacts?.topics).toBe("function");
+        expect(typeof built.deps.relayfacts?.list).toBe("function");
       } finally {
         await built.close();
       }

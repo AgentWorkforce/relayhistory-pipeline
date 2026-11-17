@@ -1,4 +1,4 @@
-/** 062080 memory documents: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback; 062090 operator erase. */
+/** 062080 relayfacts: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback; 062090 operator erase. */
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -21,10 +21,10 @@ const SQL = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062080_memory_documents.down.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 
-const INSERT = "sessions.decision_records_insert_v1(text,text,jsonb)";
-const SUPERSEDE = "sessions.decision_records_supersede_v1(text,text,uuid,uuid)";
-const TOPICS = "sessions.decision_records_topics_v1(text,text)";
-const LIST = "sessions.decision_records_list_v1(text,text,text,timestamp with time zone,uuid,integer)";
+const INSERT = "sessions.relayfacts_insert_v1(text,text,jsonb)";
+const SUPERSEDE = "sessions.relayfacts_supersede_v1(text,text,uuid,uuid)";
+const TOPICS = "sessions.relayfacts_topics_v1(text,text)";
+const LIST = "sessions.relayfacts_list_v1(text,text,text,timestamp with time zone,uuid,integer)";
 const WORKER_FNS = [INSERT, SUPERSEDE];
 const READER_FNS = [TOPICS, LIST];
 const ALL_FNS = [...WORKER_FNS, ...READER_FNS];
@@ -54,7 +54,7 @@ const rec = (over: Partial<Rec> = {}): Rec => ({
 });
 type Row = { id: string; topic: string; title: string; status: string; supersedes: string | null; created_at: string; evidence: Ev[] };
 
-describe("20261105062080 memory documents", () => {
+describe("20261105062080 relayfacts", () => {
   let db: PGlite;
   const as = async <R,>(role: string, run: (tx: Transaction) => Promise<R>, scope?: [string, string]) =>
     db.transaction(async (tx) => {
@@ -64,18 +64,18 @@ describe("20261105062080 memory documents", () => {
     });
   const insert = (org: string, ws: string, list: unknown) =>
     as("service_role", async (tx) => (await tx.query<{ inserted: number; merged: number; evidence_added: number }>(
-      "SELECT * FROM sessions.decision_records_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!);
+      "SELECT * FROM sessions.relayfacts_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!);
   const supersede = (org: string, ws: string, oldId: string, newId: string) =>
     as("service_role", async (tx) => (await tx.query<{ ok: boolean }>(
-      "SELECT sessions.decision_records_supersede_v1($1,$2,$3::uuid,$4::uuid) AS ok", [org, ws, oldId, newId])).rows[0]!.ok);
+      "SELECT sessions.relayfacts_supersede_v1($1,$2,$3::uuid,$4::uuid) AS ok", [org, ws, oldId, newId])).rows[0]!.ok);
   const topics = (org: string, ws: string, scope: [string, string] = [org, ws]) =>
     as("bulls96_read_api", async (tx) => (await tx.query<Record<string, unknown>>(
-      "SELECT * FROM sessions.decision_records_topics_v1($1,$2)", [org, ws])).rows, scope);
+      "SELECT * FROM sessions.relayfacts_topics_v1($1,$2)", [org, ws])).rows, scope);
   const list = (org: string, ws: string, topic: string, opts: { after?: [string, string]; limit?: number; scope?: [string, string] } = {}) =>
     as("bulls96_read_api", async (tx) => (await tx.query<Row>(
-      "SELECT * FROM sessions.decision_records_list_v1($1,$2,$3,$4::timestamptz,$5::uuid,$6)",
+      "SELECT * FROM sessions.relayfacts_list_v1($1,$2,$3,$4::timestamptz,$5::uuid,$6)",
       [org, ws, topic, opts.after?.[0] ?? null, opts.after?.[1] ?? null, opts.limit ?? 200])).rows, opts.scope ?? [org, ws]);
-  const reset = () => db.exec("DELETE FROM sessions.decision_records_v1");
+  const reset = () => db.exec("DELETE FROM sessions.relayfacts_v1");
 
   beforeAll(async () => {
     db = await migrated();
@@ -85,20 +85,20 @@ describe("20261105062080 memory documents", () => {
 
   test("inventory, sentinel and runtime allowlist name exactly the two tables, their indexes and the four functions", async () => {
     expect(inventoryOf(SQL).map((i) => `${i.kind}:${i.name}`).sort()).toEqual([
-      "function:sessions.decision_records_insert_v1", "function:sessions.decision_records_list_v1",
-      "function:sessions.decision_records_supersede_v1", "function:sessions.decision_records_topics_v1",
-      "index:decision_evidence_v1_dedupe", "index:decision_records_v1_dedupe", "index:decision_records_v1_topic",
-      "index:decision_records_v1_updated", "relation:sessions.decision_evidence_v1", "relation:sessions.decision_records_v1",
+      "function:sessions.relayfacts_insert_v1", "function:sessions.relayfacts_list_v1",
+      "function:sessions.relayfacts_supersede_v1", "function:sessions.relayfacts_topics_v1",
+      "index:relayfacts_evidence_v1_dedupe", "index:relayfacts_v1_dedupe", "index:relayfacts_v1_topic",
+      "index:relayfacts_v1_updated", "relation:sessions.relayfacts_evidence_v1", "relation:sessions.relayfacts_v1",
     ]);
     expect(SQL).not.toMatch(/CONCURRENTLY/i);
-    expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("decision_records_v1");
+    expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("relayfacts_v1");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(true);
-    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_records_")).sort()).toEqual([INSERT, SUPERSEDE].sort());
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_")).sort()).toEqual([INSERT, SUPERSEDE].sort());
     // Columns: no transcript body anywhere.
     const cols = async (t: string) => (await db.query<{ column_name: string }>(
       "SELECT column_name FROM information_schema.columns WHERE table_schema='sessions' AND table_name=$1 ORDER BY ordinal_position", [t])).rows.map((c) => c.column_name);
-    expect(await cols("decision_records_v1")).toEqual(["id", "org_id", "workspace_id", "topic", "title", "title_key", "statement", "status", "supersedes", "decided_at", "implemented_at", "implemented_ref", "created_at", "updated_at"]);
-    expect(await cols("decision_evidence_v1")).toEqual(["id", "decision_id", "source", "session_id", "turn_start", "turn_end", "claim", "ref", "created_at"]);
+    expect(await cols("relayfacts_v1")).toEqual(["id", "org_id", "workspace_id", "topic", "title", "title_key", "statement", "status", "supersedes", "decided_at", "implemented_at", "implemented_ref", "created_at", "updated_at"]);
+    expect(await cols("relayfacts_evidence_v1")).toEqual(["id", "decision_id", "source", "session_id", "turn_start", "turn_end", "claim", "ref", "created_at"]);
   });
 
   test("grants: PUBLIC cannot execute; each role runs only its own functions; no runtime role has a table privilege", async () => {
@@ -118,14 +118,14 @@ describe("20261105062080 memory documents", () => {
       expect(await can("service_role", fn)).toBe(WORKER_FNS.includes(fn));
       expect(await can("bulls96_read_api", fn)).toBe(READER_FNS.includes(fn));
     }
-    for (const table of ["sessions.decision_records_v1", "sessions.decision_evidence_v1"])
+    for (const table of ["sessions.relayfacts_v1", "sessions.relayfacts_evidence_v1"])
       for (const role of ["service_role", "bulls96_read_api", "memdocs_probe"])
         for (const priv of ["SELECT", "INSERT", "UPDATE", "DELETE"])
           expect((await db.query<{ ok: boolean }>("SELECT has_table_privilege($1, $2, $3) ok", [role, table, priv])).rows[0]!.ok).toBe(false);
-    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT * FROM sessions.decision_records_insert_v1('org-a','ws-a','[]'::jsonb)"), ["org-a", "ws-a"]))).toBe("42501");
-    expect(await code(as("service_role", (tx) => tx.query("SELECT * FROM sessions.decision_records_topics_v1('org-a','ws-a')")))).toBe("42501");
-    expect(await code(as("service_role", (tx) => tx.query("SELECT 1 FROM sessions.decision_records_v1")))).toBe("42501");
-    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT 1 FROM sessions.decision_evidence_v1"), ["org-a", "ws-a"]))).toBe("42501");
+    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT * FROM sessions.relayfacts_insert_v1('org-a','ws-a','[]'::jsonb)"), ["org-a", "ws-a"]))).toBe("42501");
+    expect(await code(as("service_role", (tx) => tx.query("SELECT * FROM sessions.relayfacts_topics_v1('org-a','ws-a')")))).toBe("42501");
+    expect(await code(as("service_role", (tx) => tx.query("SELECT 1 FROM sessions.relayfacts_v1")))).toBe("42501");
+    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT 1 FROM sessions.relayfacts_evidence_v1"), ["org-a", "ws-a"]))).toBe("42501");
     // The read-API role verifier still passes with the two new grants.
     expect(await code(db.exec(sqlFile("supabase/bootstrap/session_read_api_role_verify.sql")))).toBeNull();
   });
@@ -146,7 +146,7 @@ describe("20261105062080 memory documents", () => {
     expect(await code(list("org-a", "ws-b", "src-session-read-api", { scope: ["org-a", "ws-a"] }))).toBe("42501");
     expect(await code(topics("org-a", "ws-b", ["org-a", "ws-a"]))).toBe("42501");
     expect(await code(list("org-b", "ws-a", "src-session-read-api", { scope: ["org-a", "ws-a"] }))).toBe("42501");
-    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT * FROM sessions.decision_records_topics_v1('org-a','ws-a')")))).toBe("42501");
+    expect(await code(as("bulls96_read_api", (tx) => tx.query("SELECT * FROM sessions.relayfacts_topics_v1('org-a','ws-a')")))).toBe("42501");
     // The worker cannot supersede across workspaces.
     expect(await supersede("org-a", "ws-a", a[0]!.id, b[0]!.id)).toBe(false);
     expect(await supersede("org-a", "ws-b", a[0]!.id, b[0]!.id)).toBe(false);
@@ -171,7 +171,7 @@ describe("20261105062080 memory documents", () => {
     // Evidence is capped at 50 per record.
     for (let i = 0; i < 6; i++)
       await insert("org-a", "ws-a", [rec({ evidence: Array.from({ length: 10 }, (_, j) => ev(100 + i * 10 + j)) })]);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.decision_evidence_v1 e JOIN sessions.decision_records_v1 r ON r.id=e.decision_id WHERE r.topic='src-session-read-api'")).rows[0]!.n).toBe(50);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_evidence_v1 e JOIN sessions.relayfacts_v1 r ON r.id=e.decision_id WHERE r.topic='src-session-read-api'")).rows[0]!.n).toBe(50);
   });
 
   test("bounds: topic, title, statement, claim, turn range, ref, status, batch and evidence sizes", async () => {
@@ -199,7 +199,7 @@ describe("20261105062080 memory documents", () => {
     expect(await code(insert("org-a", "ws-a", Array.from({ length: 101 }, (_, i) => rec({ title: `t${i}` }))))).toBe("22023");
     expect(await code(insert("org-a", "ws-a", [{ ...rec(), topic: null }]))).toBe("23502");
     // A failed batch writes nothing.
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.decision_records_v1")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_v1")).rows[0]!.n).toBe(0);
     // Edge values pass.
     expect(await insert("org-a", "ws-a", [rec({
       topic: "a".repeat(64), title: "t".repeat(200), statement: "s".repeat(1000),
@@ -209,7 +209,7 @@ describe("20261105062080 memory documents", () => {
     // The list limit and cursor are validated.
     for (const limit of [0, 201]) expect(await code(list("org-a", "ws-a", "general", { limit }))).toBe("22023");
     expect(await code(as("bulls96_read_api", (tx) => tx.query(
-      "SELECT * FROM sessions.decision_records_list_v1('org-a','ws-a','general',now(),NULL,10)"), ["org-a", "ws-a"]))).toBe("22023");
+      "SELECT * FROM sessions.relayfacts_list_v1('org-a','ws-a','general',now(),NULL,10)"), ["org-a", "ws-a"]))).toBe("22023");
   });
 
   test("supersede, topic counts and oldest-first keyset paging", async () => {
@@ -217,7 +217,7 @@ describe("20261105062080 memory documents", () => {
     await insert("org-a", "ws-a", Array.from({ length: 5 }, (_, i) => rec({ title: `decision ${i}`, evidence: [ev(i)] })));
     await insert("org-a", "ws-a", [rec({ topic: "general", title: "open question", status: "open" })]);
     // Distinct created_at so the order is the insertion order.
-    await db.exec("UPDATE sessions.decision_records_v1 SET created_at = now() - make_interval(mins => 100 - substring(title from '[0-9]+$')::int) WHERE title LIKE 'decision %'");
+    await db.exec("UPDATE sessions.relayfacts_v1 SET created_at = now() - make_interval(mins => 100 - substring(title from '[0-9]+$')::int) WHERE title LIKE 'decision %'");
     const all = await list("org-a", "ws-a", "src-session-read-api");
     expect(all.map((r) => r.title)).toEqual(["decision 0", "decision 1", "decision 2", "decision 3", "decision 4"]);
     const page1 = await list("org-a", "ws-a", "src-session-read-api", { limit: 2 });
@@ -286,8 +286,8 @@ describe("20261105062080 rollback", () => {
       for (const step of later)
         await db.exec(read(`supabase/rollbacks/${step.name.slice("upstream:".length).replace(/\.sql$/, ".down.sql")}`));
       await db.exec(DOWN);
-      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.decision_records_v1')::text r")).rows[0]!.r).toBeNull();
-      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.decision_evidence_v1')::text r")).rows[0]!.r).toBeNull();
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.relayfacts_v1')::text r")).rows[0]!.r).toBeNull();
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.relayfacts_evidence_v1')::text r")).rows[0]!.r).toBeNull();
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_records\\_%'")).rows[0]!.n).toBe(0);
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname LIKE 'decision\\_%'")).rows[0]!.n).toBe(0);
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [STEP])).rows[0]!.n).toBe(0);
@@ -296,19 +296,19 @@ describe("20261105062080 rollback", () => {
       await db.exec("ROLLBACK");
       // The up applies again cleanly after the down.
       await db.exec(SQL);
-      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.decision_records_v1')::text r")).rows[0]!.r).toBe("sessions.decision_records_v1");
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.relayfacts_v1')::text r")).rows[0]!.r).toBe("sessions.relayfacts_v1");
     } finally { await db.close(); }
   });
 });
 
-const ERASE_FILE = "20261105062090_memory_documents_erase.sql";
+const ERASE_FILE = "20261105062090_relayfacts_erase.sql";
 const ERASE_STEP = `upstream:${ERASE_FILE}`;
 const ERASE_SQL = read(`supabase/migrations/${ERASE_FILE}`);
-const ERASE_DOWN = read("supabase/rollbacks/20261105062090_memory_documents_erase.down.sql");
-const ERASE = "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)";
-const GUARD = "sessions.decision_evidence_fence_guard_v1()";
+const ERASE_DOWN = read("supabase/rollbacks/20261105062090_relayfacts_erase.down.sql");
+const ERASE = "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)";
+const GUARD = "sessions.relayfacts_evidence_fence_guard_v1()";
 
-describe("20261105062090 memory documents operator erase", () => {
+describe("20261105062090 relayfacts operator erase", () => {
   let db: PGlite;
   const KEY = ["org-a", "ws-a", "claude", "s-1"] as const;
   const as = async <R,>(role: string, run: (tx: Transaction) => Promise<R>) =>
@@ -317,11 +317,11 @@ describe("20261105062090 memory documents operator erase", () => {
     (await tx.query<{ r: R }>(`SELECT sessions.${fn}(${params.map((_, i) => `$${i + 1}`).join(",")}) AS r`, params)).rows[0]!.r);
   const insert = (org: string, ws: string, list: unknown) =>
     as("service_role", async (tx) => (await tx.query<{ inserted: number; merged: number; evidence_added: number }>(
-      "SELECT * FROM sessions.decision_records_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!);
+      "SELECT * FROM sessions.relayfacts_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!);
   const records = async () => (await db.query<{ ws: string; title: string; statement: string; evidence: string[] }>(
     `SELECT t.workspace_id ws, t.title, t.statement,
-            coalesce((SELECT array_agg(e.source || '/' || e.session_id ORDER BY e.source, e.session_id) FROM sessions.decision_evidence_v1 e WHERE e.decision_id = t.id), '{}') evidence
-       FROM sessions.decision_records_v1 t ORDER BY t.workspace_id, t.title`)).rows;
+            coalesce((SELECT array_agg(e.source || '/' || e.session_id ORDER BY e.source, e.session_id) FROM sessions.relayfacts_evidence_v1 e WHERE e.decision_id = t.id), '{}') evidence
+       FROM sessions.relayfacts_v1 t ORDER BY t.workspace_id, t.title`)).rows;
   const e = (source: string, session_id: string, claim: string): Ev => ({ source, session_id, turn_start: 0, turn_end: 1, claim });
 
   beforeAll(async () => {
@@ -336,15 +336,15 @@ describe("20261105062090 memory documents operator erase", () => {
 
   test("inventory, sentinel and grants: two owner-pinned functions and one trigger, erase for the ingest login only, not a runtime application function", async () => {
     expect(inventoryOf(ERASE_SQL).map((i) => `${i.kind}:${i.name}`).sort()).toEqual([
-      "function:sessions.decision_evidence_erase_session_v1", "function:sessions.decision_evidence_fence_guard_v1",
-      "trigger:decision_evidence_fence_guard",
+      "function:sessions.relayfacts_evidence_erase_session_v1", "function:sessions.relayfacts_evidence_fence_guard_v1",
+      "trigger:relayfacts_evidence_fence_guard",
     ]);
     expect(ERASE_SQL).not.toMatch(/CONCURRENTLY/i);
     expect(ERASE_DOWN).toContain(createHash("sha256").update(ERASE_SQL).digest("hex"));
     expect(ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
     expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:")).sort().at(-1)).toBe(ERASE_STEP);
-    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.decision_evidence_"))).toEqual([]);
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
         "SELECT p.prosecdef secdef, p.proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec FROM pg_proc p WHERE p.oid=$1::regprocedure", [fn])).rows[0]!;
@@ -370,23 +370,23 @@ describe("20261105062090 memory documents operator erase", () => {
 
     // The erase function is not callable without the ingest login, nor without an authorized lease.
     expect(await code(as("service_role", (tx) => tx.query(`SELECT ${ERASE.replace(/\(.*$/, "")}('org-a','ws-a','claude','s-1',gen_random_uuid())`)))).toBe("42501");
-    expect(await code(ingest("decision_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
+    expect(await code(ingest("relayfacts_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
     expect(await ingest("ingest_operator_runtime_begin", [...KEY, crypto.randomUUID(), "user", "operator", "bucket", "96bulls", "a".repeat(64)]))
       .toMatchObject({ status: "in_progress", uploadsFenced: true });
     const lease = crypto.randomUUID();
     expect(await ingest("ingest_operator_runtime_next", [lease])).toMatchObject({ sessionIds: ["s-1"] });
-    expect(await code(ingest("decision_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
+    expect(await code(ingest("relayfacts_evidence_erase_session_v1", [...KEY, crypto.randomUUID()]))).toBe("RH014");
 
-    expect(await ingest("decision_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 2, recordsDeleted: 1, recordsRewritten: 1 });
+    expect(await ingest("relayfacts_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 2, recordsDeleted: 1, recordsRewritten: 1 });
     expect(await records()).toEqual([
       { ws: "ws-a", title: "Other org", statement: "Org B statement.", evidence: ["claude/s-1"] },
       { ws: "ws-a", title: "Other source", statement: "Codex statement.", evidence: ["codex/s-1"] },
       { ws: "ws-a", title: "Shared decision", statement: "Kept claim from s-2.", evidence: ["claude/s-2"] },
       { ws: "ws-b", title: "Other workspace", statement: "Workspace B statement.", evidence: ["claude/s-1"] },
     ]);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.decision_records_v1 WHERE statement LIKE 'Erased%'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_v1 WHERE statement LIKE 'Erased%'")).rows[0]!.n).toBe(0);
     // Idempotent: a retry within the lease finds nothing more.
-    expect(await ingest("decision_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 });
+    expect(await ingest("relayfacts_evidence_erase_session_v1", [...KEY, lease])).toEqual({ evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 });
 
     // A late analysis write for the fenced session is refused as a whole batch: no record without evidence.
     const before = await records();

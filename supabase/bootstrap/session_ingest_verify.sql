@@ -7,7 +7,6 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.canonical_project_events_claim_v1(jsonb)',
  'sessions.canonical_project_events_release_v1(jsonb)',
  'sessions.canonical_project_events_sent_v1(jsonb)',
- 'sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)',
  'sessions.ingest_acquire_slot(jsonb)',
  'sessions.ingest_babysitter_retention_register(jsonb)',
  'sessions.ingest_babysitter_retention_written(jsonb)',
@@ -72,6 +71,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_source_control_complete(jsonb)',
  'sessions.ingest_turn_capability(jsonb)',
  'sessions.ingest_turn_register(jsonb)',
+ 'sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)',
  'sessions.session_history_capture(jsonb)',
  'sessions.session_history_large_job(jsonb)',
  'sessions.session_history_mask_page(jsonb)',
@@ -106,7 +106,7 @@ BEGIN
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.ingest\_origin\_%');
  -- Allowed, not required: the decision-records erase entry point (before 20261105062090 is applied, and after
  -- its guarded rollback).
- v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.decision\_evidence\_%');
+ v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.relayfacts\_evidence\_%');
  -- Runtime RPCs are required once their table is installed, and absent on a validated prefix release.
  IF to_regclass('sessions.session_erasure_writes') IS NULL THEN
   v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.ingest\_operator\_runtime\_%');

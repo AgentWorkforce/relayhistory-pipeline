@@ -401,8 +401,6 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.coordination_advisories_recent_v1(text,text,timestamp with time zone)",
   "sessions.coordination_advisories_sweep_v1()",
   "sessions.coordination_advisories_upsert_v1(text,text,jsonb)",
-  "sessions.decision_records_insert_v1(text,text,jsonb)",
-  "sessions.decision_records_supersede_v1(text,text,uuid,uuid)",
   "sessions.discover_session_large_reads()",
   "sessions.enqueue_session_analysis_cache(text,text,text,text)",
   "sessions.enqueue_session_large_read(text,text,text,text)",
@@ -422,6 +420,8 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.publish_session_large_read(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer,uuid)",
   "sessions.publish_session_replay_pages(text,text,text,text,bigint,text,jsonb,text,text,text,text,text,integer)",
   "sessions.register_search_feature_source(text,text,text,text,text)",
+  "sessions.relayfacts_insert_v1(text,text,jsonb)",
+  "sessions.relayfacts_supersede_v1(text,text,uuid,uuid)",
   "sessions.repo_backfill_report()",
   "sessions.repo_backfill_step(integer,text)",
   "sessions.repo_group(text,uuid)",
@@ -1650,7 +1650,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "8eec0d017e34ab40ad73b2b411ef28238c38ec9e1044fce428c0fae9e34aac4f";
+  "cce153cc7e9e9a2cb38a04e5e8e05de1e5e909a02b4df28375bc47c17ab29ceb";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

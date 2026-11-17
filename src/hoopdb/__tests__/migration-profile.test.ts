@@ -2641,7 +2641,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const TSOG = "upstream:20261105062060_turns_selection_origin_guard.sql";
     const AR = "upstream:20261105062070_coordination_advisor_readers.sql";
     const MD = "upstream:20261105062080_memory_documents.sql";
-    const MDE = "upstream:20261105062090_memory_documents_erase.sql";
+    const MDE = "upstream:20261105062090_relayfacts_erase.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2703,18 +2703,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062090 is newest: the memory documents down refuses (55000) while the erase function and guard
+    // 20261105062090 is newest: the relayfacts down refuses (55000) while the erase function and guard
     // trigger are applied; the checksum-pinned erase down drops both and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(MDE);
     expect((await failure(rollback("20261105062080_memory_documents.down.sql")))?.code).toBe("55000");
-    expect(await relation("sessions.decision_records_v1")).toBe("sessions.decision_records_v1");
-    await rollback("20261105062090_memory_documents_erase.down.sql");
+    expect(await relation("sessions.relayfacts_v1")).toBe("sessions.relayfacts_v1");
+    await rollback("20261105062090_relayfacts_erase.down.sql");
     expect(await names()).not.toContain(MDE);
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_evidence\\_%'")).rows[0]!.n).toBe(0);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='decision_evidence_fence_guard'")).rows[0]!.n).toBe(0);
-    expect((await failure(rollback("20261105062090_memory_documents_erase.down.sql")))?.code).toBe("55000");
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='relayfacts_evidence_fence_guard'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062090_relayfacts_erase.down.sql")))?.code).toBe("55000");
     // 20261105062080 is newest: the legacy-export authority and coordination advisor reader downs refuse
-    // until the memory documents tables and functions are removed; a rerun of the memory documents down refuses.
+    // until the relayfacts tables and functions are removed; a rerun of the relayfacts down refuses.
     expect(await names()).toContain(MD);
     expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.legacy_export_scope_authority")).toBe("sessions.legacy_export_scope_authority");
@@ -2722,8 +2722,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(AR);
     await rollback("20261105062080_memory_documents.down.sql");
     expect(await names()).not.toContain(MD);
-    expect(await relation("sessions.decision_records_v1")).toBeNull();
-    expect(await relation("sessions.decision_evidence_v1")).toBeNull();
+    expect(await relation("sessions.relayfacts_v1")).toBeNull();
+    expect(await relation("sessions.relayfacts_evidence_v1")).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_records\\_%'")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062080_memory_documents.down.sql")))?.code).toBe("55000");
     // 20261105062070 (coordination advisor readers) is then newest: 062030's down refuses (55000) while it is applied;

@@ -148,7 +148,7 @@ export async function stagedObjectsAbsent(eraser: Pick<ReturnType<typeof createS
  return true;
 }
 
-/** The memory documents erase step (20261105062090). Same rule as decisionRecordsEnabled in
+/** The relayfacts erase step (20261105062090). Same rule as decisionRecordsEnabled in
  * session-analysis/decision-records.ts (not imported: it would pull the extractor into the eraser).
  * Off, the worker gets no port and the erase pass is unchanged. */
 export function decisionRecordsErasePort(env: NodeJS.ProcessEnv, run: SqlRun): EraseDecisionRecordsPort | undefined {
@@ -170,7 +170,7 @@ export async function buildSelfhostEraseRuntime(input: {
     "ingest_operator_runtime_purge(text,text,text,text,uuid)", "ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)"];
   const decisionRecords = decisionRecordsErasePort(env, run);
   // Enabled decision records without their erase function would leave erased sessions' evidence.
-  if (decisionRecords) required.push("decision_evidence_erase_session_v1(text,text,text,text,uuid)");
+  if (decisionRecords) required.push("relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)");
   const ready = await run("SELECT bool_and(to_regprocedure(fn) IS NOT NULL AND has_function_privilege(current_user,to_regprocedure(fn),'EXECUTE')) ready FROM unnest($1::text[]) fn", [required.map(fn => `sessions.${fn}`)]);
   if (ready.rows[0]?.ready !== true) throw Error("96bulls: operator erase runtime migration and grants required");
   const identity = eraseStoreIdentity(env, input.keyRoot);

@@ -25,8 +25,8 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * enqueues the index's summary/state fan-out on `sessions.pipeline_jobs`
  * (default off: no consumer runs in production yet, and Bob Costas's sweep
  * rebuilds missing summaries when it does). SUMMARY_DECISION_RECORDS_ENABLED=true (exactly
- * "true"; default off) writes each completed session analysis's decisions as memory-document
- * decision records (docs/memory-documents.md). SESSION_BRIEF_ENABLED=true arms brief
+ * "true"; default off) writes each completed session analysis's decisions as relayfacts
+ * decision records (docs/relayfacts.md). SESSION_BRIEF_ENABLED=true arms brief
  * wakeups as sessions index and lets the brief schedule run; with no
  * `openai_api_key` a brief tick claims nothing (src/session-brief/config.ts).
  * SESSION_DESKTOP_CATALOG_ENABLED=1 (only the literal "1"; default off) switches the
