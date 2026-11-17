@@ -390,8 +390,13 @@ ledger proof, the canonical timestamps, the 24 h plan artifact and the byte-equa
   plain `INSERT` per org (a conflict rolls back), re-reads the postconditions and runs `ingest_lazy_guard` per org
   before `COMMIT`. Receipts carry org indexes, never ids.
 
+- **Receipts** report, per org index, admission and the tables with rows (presence only). They never carry
+  per-org row counts, which would publish session volumes in a public run's artifact.
+
 The class fix is a separate forward migration that drops `ingest_seed_source_epochs` from the scan. Once it lands,
-this operator refuses as `org_admission_repair_scan_drift`.
+this operator refuses as `org_admission_repair_scan_drift`, and the workflow's proof job, which asserts 041000's loop
+verbatim, goes red. That migration must therefore retire this operator (workflow, operator and proof) in the same
+change.
 
 ## 4. Limits and residual risks
 
