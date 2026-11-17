@@ -973,10 +973,12 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   as well (cross-account, S3 needs the List from both sides before a missing key reads as 404; check the live bucket
   policy before the first real run). A Deny that could cover `s3:ListBucket` on the ledger bucket is refused
   whatever its condition: an Action pattern such as `s3:ListBucket`, `s3:List*`, `s3:*` or `*`, or a `NotAction`
-  that does not name it; on a Resource pattern such as `*`, `arn:aws:s3:::*` or one with a policy variable, or any
-  `NotResource`. Other Denies pass, and a malformed one is refused. The usual `Deny s3:*` on `Resource: "*"` with
-  `aws:SecureTransport` = `false` is one of them: re-scope its Resource to exclude the ledger bucket (list the other
-  buckets and object ARNs it should cover), rather than removing it. With the unconditioned List both roles can
+  none of whose entries matches `s3:ListBucket` (one naming it or a pattern such as `s3:List*` is exempt); on a
+  Resource pattern such as `*`, `arn:aws:s3:::*` or one with a policy variable, or any `NotResource`. Other Denies
+  pass. A malformed Deny is refused, and so is a Deny Action / NotAction entry with a policy variable (AWS does not
+  substitute them in actions) or a non-ASCII character. The usual `Deny s3:*` on `Resource: "*"` with
+  `aws:SecureTransport` = `false` is refused by this rule: re-scope its Resource to exclude the ledger bucket (list
+  the other buckets and object ARNs it should cover), rather than removing it. With the unconditioned List both roles can
   enumerate every key name in the ledger bucket (Get and Put stay key-scoped), acceptable only because that bucket
   is dedicated to the ledger. That bucket must also have S3 Object
   Ownership `BucketOwnerEnforced` (ACLs disabled): the writer puts cross-account with no ACL, so otherwise its objects

@@ -220,9 +220,15 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
           // NotAction does not (no entry matching it: a NotAction naming ListBucket can never deny it); and its Resource
           // covers the ledger bucket's ARN (a pattern matching it), or it uses NotResource. Then refuse it, whatever its
           // Condition says.
-          const matchesList = (a: unknown) => globMatches(a as string, "s3:ListBucket", true);
+          // AWS substitutes policy variables only in Resource and Condition, never in Action / NotAction; and an
+          // action is ASCII, so a non-ASCII entry (the Kelvin sign lowercases to k) cannot be judged by a
+          // case-insensitive match. Either refuses.
+          for (const a of (acts ?? notActs)!)
+            if ((a as string).includes("${") || /[^\x20-\x7e]/.test(a as string))
+              refuse(`${p}: a Deny Action / NotAction entry must be plain ASCII with no policy variable (\${...} is not substituted in actions)`);
+          const matchesList = (a: unknown) => globMatches(a as string, "s3:ListBucket", { ignoreCase: true });
           const coversList = acts !== undefined ? acts.some(matchesList) : !notActs!.some(matchesList);
-          const reachesLedger = notRes !== undefined || res!.some((r) => globMatches(r as string, ledger.bucketArn));
+          const reachesLedger = notRes !== undefined || res!.some((r) => globMatches(r as string, ledger.bucketArn, { variables: true }));
           if (coversList && reachesLedger)
             refuse(`${p}: a Deny that could cover s3:ListBucket on the ledger bucket is refused, whatever its Condition (a missing ledger key reads as 404 only while that List is allowed; denied, every missing shard, stub or marker is a 403)`);
         }
@@ -271,15 +277,18 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
 /**
  * IAM pattern matching (`*` any run of characters, `?` exactly one): could `pattern` cover `value`? A linear
  * two-pointer wildcard match (it resumes only from the last `*`, so no backtracking blow-up: O(pattern x value) at
- * worst). Policy variables are unknown at validation time, so `${...}` matches like `*`, except the escapes `${*}`,
- * `${?}` and `${$}`, which are the literal characters. Actions match case-insensitively.
+ * worst). With `variables` (Resource / NotResource, where AWS substitutes them), a policy variable `${...}` is
+ * unknown at validation time and matches like `*`, except the escapes `${*}`, `${?}` and `${$}`, which are the
+ * literal characters; without it (actions, where AWS does not substitute), `${` is plain text. `ignoreCase` for
+ * actions. Exported for its own tests.
  */
-function globMatches(pattern: string, value: string, ignoreCase = false): boolean {
+export function globMatches(pattern: string, value: string, opts: { ignoreCase?: boolean; variables?: boolean } = {}): boolean {
+  const ignoreCase = opts.ignoreCase === true;
   type Token = { lit: string } | "*" | "?";
   const tokens: Token[] = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i]!;
-    if (ch === "$" && pattern[i + 1] === "{") {
+    if (opts.variables === true && ch === "$" && pattern[i + 1] === "{") {
       const end = pattern.indexOf("}", i + 2);
       if (end > 0) {
         const name = pattern.slice(i + 2, end);

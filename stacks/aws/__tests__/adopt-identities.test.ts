@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, BACKLOG_OPS_OIDC_SUB_PREFIX, adoptedIdentities, adoptedIdentityDifferences,
-  assertAdoptIdentitiesInputs, backlogOpsLedgerStatements, inboxBridgeIdentityPolicy, type AdoptIdentitiesInputs, type LiveIdentity, type RenderedIdentity,
+  assertAdoptIdentitiesInputs, backlogOpsLedgerStatements, globMatches, inboxBridgeIdentityPolicy, type AdoptIdentitiesInputs, type LiveIdentity, type RenderedIdentity,
 } from "../adopt-identities.ts";
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE, transcriptNames } from "../transcript-store.ts";
@@ -201,15 +201,10 @@ describe("adopt identities: input", () => {
         { Effect: "Deny", Action: "s3:ListBucketVersions", Resource: L },
       ]) expect(() => checkRoles(roles([...grants, deny], []))).not.toThrow();
       expect(() => checkRoles(roles([{ Effect: "Deny", Action: "s3:*", Resource: L }], [], null))).not.toThrow();
-      // Pattern matching is a linear two-pointer match: long or alternating wildcard runs stay fast.
       const deny = (Resource: string) => ({ Effect: "Deny", Action: "s3:ListBucket", Resource });
-      let started = performance.now();
-      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::${"*?".repeat(12)}x`)], []))).not.toThrow();
-      expect(performance.now() - started).toBeLessThan(50);
-      started = performance.now();
-      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::${"*".repeat(5000)}x`)], []))).not.toThrow();
-      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::a${"*a".repeat(40)}x`)], []))).not.toThrow();
-      expect(performance.now() - started).toBeLessThan(50);
+      // The pattern shapes that would blow up a backtracking matcher are still judged (and not matched) here.
+      for (const r of [`arn:aws:s3:::${"*?".repeat(12)}x`, `arn:aws:s3:::${"*".repeat(5000)}x`, `arn:aws:s3:::a${"*a".repeat(40)}x`])
+        expect(() => checkRoles(roles([...grants, deny(r)], []))).not.toThrow();
       // ...and still exact: ? is one character, * any run (including none).
       expect(() => checkRoles(roles([...grants, deny("arn:aws:s3:::synthetic-ledger-bucke?")], []))).toThrow(refused);
       expect(() => checkRoles(roles([...grants, deny("arn:aws:s3:::synthetic-ledger-bucket?")], []))).not.toThrow();
@@ -234,6 +229,49 @@ describe("adopt identities: input", () => {
       expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction: "s3:GetObject", Resource: objects }], []))).not.toThrow();
     });
 
+    it("globMatches: a linear two-pointer match, timed alone (no backtracking blow-up)", () => {
+      const arn = "arn:aws:s3:::synthetic-ledger-bucket";
+      const started = performance.now();
+      for (const pattern of [`arn:aws:s3:::${"*?".repeat(12)}x`, `arn:aws:s3:::${"*".repeat(5000)}x`, `arn:aws:s3:::a${"*a".repeat(40)}x`, `${"*?".repeat(2000)}x`]) {
+        expect(globMatches(pattern, arn)).toBe(false);
+        expect(globMatches(pattern, arn, { variables: true })).toBe(false);
+      }
+      expect(globMatches("*".repeat(3000) + "*?".repeat(3000), "y".repeat(3000))).toBe(true);
+      expect(performance.now() - started).toBeLessThan(500);
+      // Exact otherwise; variables expand only on request (Resource / NotResource), with literal escapes.
+      expect(globMatches("arn:aws:s3:::synthetic-ledger-bucke?", arn)).toBe(true);
+      expect(globMatches("arn:aws:s3:::synthetic-ledger-bucket?", arn)).toBe(false);
+      expect(globMatches("arn:aws:s3:::${aws:username}", arn, { variables: true })).toBe(true);
+      expect(globMatches("arn:aws:s3:::${aws:username}", arn)).toBe(false);
+      expect(globMatches("arn:aws:s3:::synthetic-ledger-bucke${?}", arn, { variables: true })).toBe(false);
+      expect(globMatches("arn:aws:s3:::synthetic-ledger-bucke${?}", "arn:aws:s3:::synthetic-ledger-bucke?", { variables: true })).toBe(true);
+      expect(globMatches("S3:LIST*", "s3:ListBucket", { ignoreCase: true })).toBe(true);
+      expect(globMatches("S3:LIST*", "s3:ListBucket")).toBe(false);
+    });
+
+    it("set: a Deny Action / NotAction entry with a policy variable or a non-ASCII character is refused", () => {
+      const grants = backlogOpsLedgerStatements("read", ledgerBucket);
+      const odd = /must be plain ASCII with no policy variable/;
+      for (const deny of [
+        { Effect: "Deny", Action: "s3:${aws:username}", Resource: `${L}/*` },
+        { Effect: "Deny", Action: ["s3:GetObject", "${x}"], Resource: "arn:aws:s3:::other" },
+        { Effect: "Deny", NotAction: "s3:${*}", Resource: "*" },
+        { Effect: "Deny", NotAction: ["s3:GetObject", "s3:ListBuc\u212Aet"], Resource: "*" }, // the Kelvin sign
+        { Effect: "Deny", Action: "s3:Li\u017Ft*", Resource: L },                         // the long s
+        { Effect: "Deny", Action: "s3:ListBucket\u00a0", Resource: "*" },
+      ]) expect(() => checkRoles(roles([...grants, deny], []))).toThrow(odd);
+      // Unset, Denies are not judged at all.
+      expect(() => checkRoles(roles([{ Effect: "Deny", Action: "s3:${x}", Resource: "*" }], [], null))).not.toThrow();
+    });
+
+    it("set: NotAction with NotResource follows the same rule", () => {
+      const grants = backlogOpsLedgerStatements("read", ledgerBucket);
+      expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction: "s3:GetObject", NotResource: bucketArn }], [])))
+        .toThrow(/a Deny that could cover s3:ListBucket on the ledger bucket is refused/);
+      for (const NotAction of ["s3:ListBucket", ["s3:GetObject", "s3:List*"]])
+        expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction, NotResource: [bucketArn, `${bucketArn}/*`] }], []))).not.toThrow();
+    });
+
     it("set: a malformed Deny is refused (it cannot be judged)", () => {
       const grants = backlogOpsLedgerStatements("read", ledgerBucket);
       const malformed = /a Deny must name exactly one of Action \/ NotAction and one of Resource \/ NotResource/;
@@ -250,6 +288,9 @@ describe("adopt identities: input", () => {
         { Effect: "Deny", Action: "", Resource: "*" },
         { Effect: "Deny", Action: { a: 1 }, Resource: "*" },
       ]) expect(() => checkRoles(roles([...grants, deny], []))).toThrow(malformed);
+      // Unset: a malformed Deny is not checked (Denies are not judged without the input).
+      for (const deny of [{ Effect: "Deny", Resource: "*" }, { Effect: "Deny", Action: [], Resource: [] }, { Effect: "Deny", Action: "s3:*", NotAction: "x", Resource: "*" }])
+        expect(() => checkRoles(roles([deny], [], null))).not.toThrow();
     });
 
     it("set: a ledger Get with the List granted only on another ARN is refused (the List must be on the ledger bucket)", () => {

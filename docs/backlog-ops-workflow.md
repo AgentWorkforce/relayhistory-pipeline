@@ -471,9 +471,10 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      every missing shard, owner stub or marker would read as a 403 (`access_denied`) and every real run would fail.
      The stack refuses any condition on this List and requires it whenever a ledger `GetObject` or `PutObject` is
      granted. It refuses, whatever its condition, any Deny that could cover `s3:ListBucket` (an Action pattern such
-     as `s3:ListBucket`, `s3:List*`, `s3:*` or `*`, or a `NotAction` that does not name it) on the ledger bucket (a
-     Resource pattern such as `*`, `arn:aws:s3:::*` or one with a policy variable, or any `NotResource`), and any
-     malformed Deny. Other Denies, such as a protective `s3:DeleteObject` on the ledger keys, pass. The usual
+     as `s3:ListBucket`, `s3:List*`, `s3:*` or `*`, or a `NotAction` none of whose entries matches `s3:ListBucket`;
+     one naming it or a pattern such as `s3:List*` is exempt) on the ledger bucket (a Resource pattern such as `*`,
+     `arn:aws:s3:::*` or one with a policy variable, or any `NotResource`), any malformed Deny, and any Deny Action /
+     NotAction entry with a policy variable or a non-ASCII character. Other Denies, such as a protective `s3:DeleteObject` on the ledger keys, pass. The usual
      `Deny s3:*` on `Resource: "*"` with `aws:SecureTransport` = `false` is caught by this: re-scope its Resource to
      exclude the ledger bucket (name the buckets and object ARNs it should cover) rather than removing it. No
      `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
