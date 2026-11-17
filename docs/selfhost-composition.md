@@ -746,11 +746,11 @@ consulted during admission.
 
 | Prefix / key | Operations |
 | --- | --- |
-| `<root>/.admission-inbox` | ListBucket with prefix `<root>/.admission-inbox` |
+| `<root>/.admission-inbox` | Lists prefix `<root>/.admission-inbox` (covered by the unconditioned ListBucket, below) |
 | the inbox object | GetObject; PutObject **unconditional overwrite** with a small tombstone after the terminal outcome. Never DeleteObject. |
 | `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | PutObject overwrite |
 | `J` (the post-claim privacy gate) | GetObject. PutObject with `If-Match: <etag>` (or `If-None-Match: *` on a missing journal) only to complete a control left pending for more than 120 s. Self-host serves no journaled control today, so this write does not happen in practice, but grant it. |
-| `<root>/.admission-dlq/<inbox path minus .ndjson.zst>.json` | ListBucket with prefix `<root>/.admission-dlq`; PutObject overwrite (the dead-letter marker); DeleteObject (best effort after a later admission; also the operator's redrive) |
+| `<root>/.admission-dlq/<inbox path minus .ndjson.zst>.json` | Lists prefix `<root>/.admission-dlq` (covered by the unconditioned ListBucket, below); PutObject overwrite (the dead-letter marker); DeleteObject (best effort after a later admission; also the operator's redrive) |
 | tenant data `<root>/<org>/…` | exactly the synchronous path's set (chunks, manifests, pointers: GetObject, HeadObject, conditional PutObject). Canonical acceptance stages nothing, so there is no `buffered-batches` stage prefix. |
 
 *Startup gate (whichever role starts with `async` or `drain`; once per process start):*
@@ -831,8 +831,9 @@ What `s3` requires and changes:
   retryable, the reset stays in flight) and logs `ledger_log_erase_failed`; the design doc's slice 8 has the
   runbook. Cost per reset: a LIST of the user's stream index, a LIST of each stream's remaining payloads, and only
   for a stream that still holds some, O(log n) marker HEADs, its unapplied entries, and a DELETE plus a HEAD per
-  superseded payload. Needs ListBucket, GetObject and DeleteObject under `…/m=srv_<user>/ledger/log/`, and ListBucket
-  under `…/ledger/log-index/` (it only lists the index; the index writes are LOG_COMMIT's, above). Before turning it
+  superseded payload. Lists prefix `…/m=srv_<user>/ledger/log/` and `…/ledger/log-index/` (both covered by the unconditioned
+  ListBucket of the S3 / MinIO note above; it only lists the index, whose writes are LOG_COMMIT's, above), and needs GetObject and
+  DeleteObject under `…/m=srv_<user>/ledger/log/`. Before turning it
   on, run `bun scripts/ledger-log-stream.ts backfill-index --bucket <b> --apply --kms-key-arn <arn>
   --i-know-this-is-not-prod` once (dry run first, without `--apply`): a stream switched before the index existed and
   not taken since is otherwise invisible to the reset's erase (the design doc's runbook "before turning the erase on",

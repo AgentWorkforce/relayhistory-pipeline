@@ -174,10 +174,12 @@ const hasSseCondition = (condition: unknown) =>
  * No KMS action ever names the ledger bucket.
  * "The transcripts key" is its exact ARN when `keyArn` is given (the pre-apply diff and the capture, which resolve
  * the key's alias live), and otherwise a key ARN in this account and region (the stack's input check, before the
- * key's ARN is known). Deny statements may say anything (they only narrow), except that with `c.ledger` a Deny may
- * not reach the ledger bucket in a way that could turn a missing key's 404 into a 403: one naming the ledger bucket
- * (a Resource or NotResource under its ARN) is refused, and so is one with an s3:prefix condition whose Resource
- * pattern could match the ledger bucket (or that uses NotResource).
+ * key's ARN is known). Deny statements may say anything (they only narrow), except that with `c.ledger` a Deny is
+ * refused, whatever its Condition, when BOTH: its Action could cover s3:ListBucket (an Action pattern matching it,
+ * such as s3:ListBucket, s3:List*, s3:* or *, or any NotAction) AND its Resource could cover the ledger bucket's ARN
+ * (a Resource pattern matching it, such as * or arn:aws:s3:::*, or any NotResource). Such a Deny could take away the
+ * List that makes a missing ledger key a 404 instead of a 403. Any other Deny (a protective s3:DeleteObject on the
+ * ledger keys, say) passes.
  */
 export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write", c: RolePolicyContext, refuse: (why: string) => never): AdoptedRolePolicies {
   const at = `transcriptStore.adoptIdentities.backlogOpsRoles.${mode}`;
@@ -205,12 +207,14 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
       for (const k of Object.keys(s)) if (!STATEMENT_KEYS.has(k)) refuse(`${p}: a statement may not carry ${k}`);
       if (s.Effect === "Deny") {
         if (ledger) {
-          const named = [...(s.Resource === undefined ? [] : list(s.Resource)), ...(s.NotResource === undefined ? [] : list(s.NotResource))];
-          if (named.some((r) => typeof r === "string" && (r === ledger.bucketArn || r.startsWith(`${ledger.bucketArn}/`))))
-            refuse(`${p}: a Deny may not name the ledger bucket (it could make a missing ledger key read as 403, not 404)`);
-          const prefixCondition = plain(s.Condition) && Object.values(s.Condition).some((block) => plain(block) && Object.keys(block).some((k) => k.toLowerCase() === "s3:prefix"));
-          if (prefixCondition && (s.NotResource !== undefined || named.some((r) => typeof r === "string" && globMatches(r, ledger.bucketArn))))
-            refuse(`${p}: a Deny with an s3:prefix condition may not reach the ledger bucket (a GET carries no s3:prefix, so it would deny the List a missing key's 404 needs)`);
+          // Could it deny s3:ListBucket (any NotAction, or an Action pattern covering it) on the ledger bucket (any
+          // NotResource, or a Resource pattern covering its ARN)? Then refuse it, whatever its Condition says.
+          const coversList = s.NotAction !== undefined || s.Action === undefined ||
+            list(s.Action).some((a) => typeof a !== "string" || globMatches(a, "s3:ListBucket", true));
+          const reachesLedger = s.NotResource !== undefined || s.Resource === undefined ||
+            list(s.Resource).some((r) => typeof r !== "string" || globMatches(r, ledger.bucketArn));
+          if (coversList && reachesLedger)
+            refuse(`${p}: a Deny that could cover s3:ListBucket on the ledger bucket is refused, whatever its Condition (a missing ledger key reads as 404 only while that List is allowed; denied, every missing shard, stub or marker is a 403)`);
         }
         continue;
       }
@@ -254,10 +258,15 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
   return value as unknown as AdoptedRolePolicies;
 }
 
-/** IAM resource-pattern matching (`*` any run of characters, `?` one): could `pattern` cover `arn`? */
-function globMatches(pattern: string, arn: string): boolean {
-  const re = new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
-  return re.test(arn);
+/**
+ * IAM pattern matching (`*` any run of characters, `?` one): could `pattern` cover `value`? Runs of `*` collapse to
+ * one (no catastrophic backtracking); policy variables (`${...}`) are kept literal. Actions match case-insensitively.
+ */
+function globMatches(pattern: string, value: string, ignoreCase = false): boolean {
+  const esc = (t: string) => t.replace(/[.+^${}()|[\]\\*?]/g, "\\$&");
+  const body = pattern.split(/(\$\{[^}]*\})/).map((part, i) => (i % 2 === 1 ? esc(part)
+    : esc(part.replace(/\*+/g, "*")).replace(/\\\*/g, ".*").replace(/\\\?/g, "."))).join("");
+  return new RegExp(`^${body}$`, ignoreCase ? "i" : "").test(value);
 }
 
 /** `transcriptStore.adoptIdentities`: at least one group (omit the whole input for none), each exactly as documented. */

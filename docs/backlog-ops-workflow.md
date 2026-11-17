@@ -470,7 +470,10 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      that very request, and such a request carries no `s3:prefix`, so a prefix-conditioned List never applies there:
      every missing shard, owner stub or marker would read as a 403 (`access_denied`) and every real run would fail.
      The stack refuses any condition on this List, requires it whenever a ledger `GetObject` or `PutObject` is
-     granted, and refuses a Deny that names the ledger bucket (or reaches it with an `s3:prefix` condition). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     granted, and refuses, whatever its condition, any Deny whose Action could cover `s3:ListBucket`
+     (`s3:ListBucket`, `s3:List*`, `s3:*`, `*`, or any `NotAction`) and whose Resource could cover the ledger bucket
+     (a pattern such as `*` or `arn:aws:s3:::*`, or any `NotResource`). Other Denies, such as a protective
+     `s3:DeleteObject` on the ledger keys, pass. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
@@ -491,8 +494,10 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      `<root>/.admission-inbox/*/ledger/*` also matches the log-commit streams' payloads under
      `ledger/log/<stream>/p/`, which hold session records. Once `INGEST_LEDGER_LOG_COMMIT` is used with the relocated
      ledger, both roles could read them and the write role could overwrite them, though neither tool touches them.
-     Log-commit is off in production today; narrow the grants (to the ledger's `batches/`, `revisions/`, `owners/`
-     and `rearm/`) before turning it on there.
+     Log-commit is off in production today. Narrowing the grants (to the ledger's `batches/`, `revisions/`,
+     `owners/` and `rearm/`) before turning it on there is a code change, not just a policy edit: the validator
+     accepts only `<root>/.admission-inbox/*/ledger/*` (`backlogOpsLedgerResources` / `backlogOpsLedgerStatements` in
+     `stacks/aws/adopt-identities.ts`), so those must change first.
    - **Precondition: Object Ownership = `BucketOwnerEnforced` (ACLs disabled) on the ledger bucket.** The write role
      puts objects cross-account with no ACL. Under any other ownership setting those objects are owned by the
      roles' account, and the edge, in the bucket's own account, may be unable to read them. Check it before the

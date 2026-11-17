@@ -971,8 +971,8 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   policies), so unset or set without the grants, every declaration is byte-identical. It is the identity side only:
   the ledger bucket's own policy, in its own repository, must grant the roles too, its `s3:ListBucket` unconditioned
   as well (cross-account, S3 needs the List from both sides before a missing key reads as 404; check the live bucket
-  policy before the first real run). A Deny naming the ledger bucket, or reaching it with an `s3:prefix` condition, is
-  refused. With the unconditioned List both roles can enumerate every key name in the ledger bucket (Get and Put stay
+  policy before the first real run). A Deny that could cover `s3:ListBucket` (by Action pattern, or any `NotAction`) on the
+  ledger bucket (by Resource pattern, or any `NotResource`) is refused whatever its condition; other Denies pass. With the unconditioned List both roles can enumerate every key name in the ledger bucket (Get and Put stay
   key-scoped), acceptable only because that bucket is dedicated to the ledger. That bucket must also have S3 Object
   Ownership `BucketOwnerEnforced` (ACLs disabled): the writer puts cross-account with no ACL, so otherwise its objects
   may be unreadable to the edge in the bucket's own account.
