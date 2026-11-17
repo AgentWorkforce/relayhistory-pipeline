@@ -4,8 +4,7 @@
  * (config.ts exactTrueFlag, READ_API_COORDINATION_OVERLAPS_ENABLED): only the exact string "true"
  * enables; "1", "on", "TRUE" and every other value leave it off. Values are never echoed.
  */
-import { parseDirectoryWorkspaces } from "../session-read-api/app.ts";
-import { exactTrueFlag, type FactsBackendKind } from "../session-read-api/config.ts";
+import { exactTrueFlag, parseDirectoryWorkspaces, type FactsBackendKind } from "../session-read-api/config.ts";
 
 export const COORDINATION_ADVISOR_ENABLED = "COORDINATION_ADVISOR_ENABLED";
 export const COORDINATION_ADVISOR_INTERVAL_SECONDS = "COORDINATION_ADVISOR_INTERVAL_SECONDS";
@@ -59,6 +58,8 @@ function relayUrl(raw: string): string {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback(url.hostname)))
     throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_RELAY_URL} must be https (http only on loopback)`);
   if (url.username || url.password) throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_RELAY_URL} must not carry credentials`);
+  // A token in the query (?token=) would sit in the deploy values and the request log; the token has its own variable.
+  if (url.search || url.hash) throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_RELAY_URL} must not carry a query or fragment`);
   return raw;
 }
 

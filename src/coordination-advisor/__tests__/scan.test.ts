@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { LaneFacts } from "../../../packages/coordination-detect/src/index.ts";
 import type { CoordinationBackend, CoordinationFacts } from "../../session-read-api/coordination-backend.ts";
 import type { Directory } from "../../session-read-api/directory.ts";
+import type { WorkerOptions } from "../../shared/worker.ts";
 import { advisorMain, type AdvisorIo } from "../main.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
 import { AdvisorLimits, type CandidateLane, type RecentAdvisory, type SessionRef } from "../rubric.ts";
@@ -223,6 +224,17 @@ describe("scanOnce", () => {
     const down = new FakeStore([cand("a"), cand("b")]);
     down.upsertError = () => Object.assign(new Error("connection reset"), { code: "08006" });
     expect(await scanOnce({ workspaces: "*", store: down, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ failed: 1, rejected: 0, written: 0 });
+    // A class 22 row error (over-long value, untranslatable text) skips the row like a check violation.
+    for (const code of ["22001", "22P05"]) {
+      const clipped = new FakeStore([cand("a"), cand("b")]);
+      clipped.upsertError = (n) => (n === 1 ? Object.assign(new Error("value too long"), { code }) : undefined);
+      expect(await scanOnce({ workspaces: "*", store: clipped, backend: backend(shared), limits: limits() }, NOW))
+        .toMatchObject({ rejected: 1, written: 1, failed: 0 });
+    }
+    // The upsert's own 22023 raises (invalid tenant, malformed evidence) mean the worker is wrong: the workspace fails.
+    const malformed = new FakeStore([cand("a"), cand("b")]);
+    malformed.upsertError = () => Object.assign(new Error("invalid tenant"), { code: "22023" });
+    expect(await scanOnce({ workspaces: "*", store: malformed, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ failed: 1, rejected: 0, written: 0 });
   });
 
   test("advisorTick throttles to the interval and sweeps hourly", async () => {
@@ -261,5 +273,31 @@ describe("disabled worker", () => {
     expect(ran).toBe(false);
     expect(await advisorMain({ COORDINATION_ADVISOR_ENABLED: "true" }, io)).toBe("ran");
     expect(ran).toBe(true);
+  });
+  test("enabled: READ_API_DIRECTORY_WORKSPACES reaches the scan's candidates query", async () => {
+    for (const [raw, want] of [["ws-b, ws-a", ["ws-a", "ws-b"]], ["*", null]] as const) {
+      const io = throwingIo({ n: 0 });
+      let tick: WorkerOptions["tick"];
+      io.runWorker = async (opts) => { tick = opts.tick; };
+      io.backend = () => () => backend([]);
+      io.sender = () => undefined;
+      expect(await advisorMain({ COORDINATION_ADVISOR_ENABLED: "true", READ_API_DIRECTORY_WORKSPACES: raw }, io)).toBe("ran");
+      // The first query is the candidates read ($3 = the sorted allowlist, null = every workspace); the sweep follows.
+      const seen: unknown[][] = [];
+      const db = { query: async (_sql: string, params?: unknown[]) => { seen.push(params ?? []); return { rows: [] }; } };
+      await tick!(db as unknown as Parameters<NonNullable<WorkerOptions["tick"]>>[0], NOW);
+      expect(seen[0]?.[2]).toEqual(want);
+    }
+    // Unset: the worker runs and reads no candidates; only the retention sweep runs.
+    const io = throwingIo({ n: 0 });
+    let tick: WorkerOptions["tick"];
+    io.runWorker = async (opts) => { tick = opts.tick; };
+    io.backend = () => () => backend([]);
+    io.sender = () => undefined;
+    await advisorMain({ COORDINATION_ADVISOR_ENABLED: "true" }, io);
+    const sqls: string[] = [];
+    await tick!({ query: async (sql: string) => { sqls.push(sql); return { rows: [] }; } } as unknown as Parameters<NonNullable<WorkerOptions["tick"]>>[0], NOW);
+    expect(sqls).toHaveLength(1);
+    expect(sqls[0]).toContain("coordination_advisories_sweep");
   });
 });

@@ -191,8 +191,12 @@ export function boundedEvidence(evidence: Advisory["evidence"]): Advisory["evide
   return evidence.slice(0, n);
 }
 
-/** A data exception (class 22) or an integrity violation (class 23): this row is bad, not the database. */
-const rowRejected = (err: unknown) => /^2[23]/.test(String((err as { code?: unknown } | null)?.code ?? ""));
+/**
+ * This row is bad, not the database: an integrity violation (class 23, e.g. the 23514 evidence bounds), an
+ * over-long value (22001) or untranslatable text (22P05). Not the rest of class 22: the upsert's own 22023
+ * raises (invalid tenant, malformed evidence) mean the worker is wrong, so they fail the workspace.
+ */
+const rowRejected = (err: unknown) => /^(?:23...|22001|22P05)$/.test(String((err as { code?: unknown } | null)?.code ?? ""));
 
 function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryRowInput {
   return {
