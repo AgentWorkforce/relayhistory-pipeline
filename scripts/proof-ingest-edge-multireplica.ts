@@ -2,6 +2,7 @@
  * Multi-replica proof for the self-host session ingest edge with the S3 upload ledger (INGEST_LEDGER=s3).
  * Run by an operator against a DEV or STAGE deployment that already has 2+ ingest-edge replicas
  * (runbooks/ingest-edge-multireplica-proof.md). It never deploys, scales or dispatches anything.
+ * scripts/proof-ingest-edge-multireplica-local.ts runs the same runProof() against two local processes.
  *
  *   bun scripts/proof-ingest-edge-multireplica.ts --plan-only ...      # static preflight + the plan; no network
  *   bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env dev --deployment <name> \
@@ -304,7 +305,15 @@ export interface BatchObservation {
  */
 export interface RecordObservation { role: Chain["role"]; min: number; max: number; absentOk: boolean; indexRevision: number | null }
 export interface SessionObservation { role: Chain["role"]; min: number; max: number; manifestRevision: number | null; manifests: number }
-export interface LogTally { lines: number; admitted: number; refused: number; retry: number; deferred: number; deadLettered: number; uploads: number; codes: Record<string, number> }
+export interface LogTally { lines: number; admitted: number; refused: number; retry: number; deferred: number; deadLettered: number; uploads: number; promoted: number;
+  /** Admissions that claimed and wrote the batch (deliver outcome accepted*), not a replay of one already committed. */
+  firstWrites: number;
+  /**
+   * Admissions answered `replay_fast`: the claim found every revision already indexed and committed the batch record
+   * at once. Under contention that is how a replica TAKES OVER a batch another replica wrote but had not committed
+   * yet (that one's commit then answers ledger_attempt_superseded and its retry a replay): committed, no accepted line.
+   */
+  replayFast: number; codes: Record<string, number> }
 export interface Observation {
   batches: BatchObservation[];
   records: RecordObservation[];
@@ -312,7 +321,7 @@ export interface Observation {
   storage: { inboxPending: number; uploadInboxPending: number; deadLetters: number };
   http: { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number };
   reset: { count: number | null; replay: number | null; resetSessions: number; fenceResets: number | null };
-  replicas: { by: "kubectl" | "operator_flag"; ready: number | null; env?: Record<string, string | null> };
+  replicas: { by: "kubectl" | "operator_flag" | "local_compose"; ready: number | null; env?: Record<string, string | null> };
   logs?: Record<string, LogTally>;
   quiesced: boolean;
 }
@@ -328,7 +337,14 @@ export const RESET_REFUSAL_CODES = new Set(["delivery_privacy_superseded"]);
 
 export interface Verdict { verdict: "PASS" | "FAIL"; failures: Record<string, number>; counts: Record<string, unknown> }
 
-export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly string[] } = {}): Verdict {
+/**
+ * `requireAdmissionsPerReplica`: every replica's log must show at least one admission of its own (the local mode,
+ * where the logs are this run's only traffic), not just a request served.
+ */
+export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly string[]; requireAdmissionsPerReplica?: boolean } = {}): Verdict {
+  // requireAdmissionsPerReplica also means the logs are this run's only traffic. Then across the replicas: only the
+  // attempt that commits a batch answers `accepted`, so more accepted lines than admitted batches is a double admission;
+  // and every admitted batch was committed by an accepted or a replay_fast (takeover) admission somewhere.
   const f: Record<string, number> = {};
   const fail = (code: string, n = 1) => { if (n > 0) f[code] = (f[code] ?? 0) + n; };
   if (!o.quiesced) fail("not_quiesced_within_timeout");
@@ -378,13 +394,21 @@ export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly stri
   if (o.logs) {
     for (const t of Object.values(o.logs)) {
       if (t.admitted + t.uploads > 0) podsServing++;
+      if (opts.requireAdmissionsPerReplica && t.firstWrites === 0) fail("replica_admitted_nothing");
       fail("dead_lettered_in_logs", t.deadLettered);
       for (const [code, n] of Object.entries(t.codes)) {
         logCodes[code] = (logCodes[code] ?? 0) + n;
-        if (!allowed.has(code)) fail("unexpected_log_error_code", n);
+        if (!allowed.has(code) && !RESET_REFUSAL_CODES.has(code)) fail("unexpected_log_error_code", n);
       }
     }
     if (podsServing < 2) fail("fewer_than_two_replicas_did_work");
+    if (opts.requireAdmissionsPerReplica) {
+      const firstWrites = Object.values(o.logs).reduce((n, t) => n + t.firstWrites, 0);
+      const admitted = o.batches.filter((b) => b.terminal === "admitted").length;
+      const fast = Object.values(o.logs).reduce((n, t) => n + t.replayFast, 0);
+      if (firstWrites > admitted) fail("more_first_writes_than_admitted_batches", firstWrites - admitted);
+      if (firstWrites + fast < admitted) fail("admitted_batches_without_a_logged_commit", admitted - firstWrites - fast);
+    }
   }
   if (o.replicas.by === "kubectl") {
     if (o.replicas.ready === null || o.replicas.ready < 2) fail("fewer_than_two_ready_replicas");
@@ -434,7 +458,7 @@ export function parseDeployment(json: string): { ready: number; desired: number;
 
 /** One pod's log since the run started: the ingest's JSON lines tallied by route and outcome (no ids are kept). */
 export function tallyLog(text: string): LogTally {
-  const t: LogTally = { lines: 0, admitted: 0, refused: 0, retry: 0, deferred: 0, deadLettered: 0, uploads: 0, codes: {} };
+  const t: LogTally = { lines: 0, admitted: 0, refused: 0, retry: 0, deferred: 0, deadLettered: 0, uploads: 0, promoted: 0, firstWrites: 0, replayFast: 0, codes: {} };
   for (const line of text.split("\n")) {
     const at = line.indexOf("{");
     if (at < 0) continue;
@@ -442,9 +466,10 @@ export function tallyLog(text: string): LogTally {
     try { rec = JSON.parse(line.slice(at)); } catch { continue; }
     t.lines++;
     if (rec.route === "delivery.batches") t.uploads++;
+    if (rec.route === "ingest.upload_admission" && typeof rec.promoted === "number") t.promoted += rec.promoted;
     if (rec.route !== "ingest.admission") continue;
     const outcome = rec.outcome, code = typeof rec.error_code === "string" ? rec.error_code : undefined;
-    if (outcome === "admitted") t.admitted++;
+    if (outcome === "admitted") { t.admitted++; if (code?.startsWith("accepted")) t.firstWrites++; else if (code === "replay_fast") t.replayFast++; }
     else if (outcome === "refused") t.refused++;
     else if (outcome === "deferred") t.deferred++;
     else if (outcome === "dead_lettered") t.deadLettered++;
@@ -479,14 +504,30 @@ const errorCode = (json: any): string => {
   return typeof c === "string" && /^[a-z0-9_]{1,64}$/.test(c) ? c : "unknown";
 };
 
+/**
+ * The local mode's stand-in for relay-control's upload credentials plus the desktop's create-only PUT: writes
+ * `copies` concurrent create-only copies of the object into the upload inbox and answers its full key (or a code).
+ */
+export type DirectPut = (user: number, originId: string, body: { batch: { batch_id: string } }, bytes: Uint8Array, copies: number) => Promise<{ uploadKey: string } | { code: string }>;
+
 class Run {
   readonly http: Http = { statuses: {}, retryCodes: {}, unexpected: 0 };
+  /** Requests sent per ingest URL (index into ingestUrls): proof the client spread its load. */
+  readonly byTarget: number[];
   readonly limit: ReturnType<typeof semaphore>;
   readonly deadline: number;
   private witnessSeq = new Map<number, number>();
-  constructor(readonly c: ProofConfig, readonly tokens: string[], readonly startedMs: number) {
+  private rr = 0;
+  constructor(readonly c: ProofConfig, readonly tokens: string[], readonly startedMs: number, readonly ingestUrls: string[], readonly directPut?: DirectPut) {
     this.limit = semaphore(c.concurrency);
     this.deadline = startedMs + c.quiesceTimeoutS * 1000;
+    this.byTarget = ingestUrls.map(() => 0);
+  }
+  /** Round-robin over the ingest URLs, one pick per HTTP attempt (a single URL is a load balancer's). */
+  ingest(): string {
+    const i = this.rr++ % this.ingestUrls.length;
+    this.byTarget[i]!++;
+    return this.ingestUrls[i]!;
   }
   tenant(u: number) { return { sub: this.c.users[u]!.userId, org: this.c.org, workspace: this.c.workspace }; }
   ledgerTenant(u: number): LedgerTenant { return { orgId: this.c.org, workspaceId: this.c.workspace, userId: this.c.users[u]!.userId }; }
@@ -505,7 +546,7 @@ class Run {
     for (let attempt = 0; attempt < 30 && Date.now() < this.deadline; attempt++) {
       let r;
       try {
-        r = await this.fetchJson(`${this.c.ingestUrl}/v1/delivery/batches`, {
+        r = await this.fetchJson(`${this.ingest()}/v1/delivery/batches`, {
           method: "POST", headers: { authorization: `Bearer ${this.tokens[u]}`, "content-type": "application/json" }, body: JSON.stringify(body),
         });
       } catch { bump(this.http.retryCodes, "client_network_error"); await sleep(2_000); continue; }
@@ -524,7 +565,7 @@ class Run {
     let unknownSince = 0;
     while (Date.now() < this.deadline) {
       let r;
-      try { r = await this.fetchJson(`${this.c.ingestUrl}/v1/delivery/admission?${query}`, { headers: { authorization: `Bearer ${this.tokens[u]}` } }); }
+      try { r = await this.fetchJson(`${this.ingest()}/v1/delivery/admission?${query}`, { headers: { authorization: `Bearer ${this.tokens[u]}` } }); }
       catch { await sleep(2_000); continue; }
       if (r.res.status === 200) {
         const s = r.json?.state;
@@ -542,6 +583,11 @@ class Run {
   /** The presigned direct path (relay-upload-inbox-v1 sections 2, 4, 5): credentials, `copies` concurrent PUTs, poll. */
   async direct(u: number, originId: string, body: { batch: { batch_id: string } }, copies: number): Promise<{ terminal: Terminal; code?: string; receiptId?: string }> {
     const bytes = new Uint8Array(zstdCompressSync(Buffer.from(JSON.stringify(body))));
+    if (this.directPut) {
+      const put = await this.directPut(u, originId, body, bytes, copies);
+      if ("code" in put) return { terminal: "unsent", code: put.code };
+      return this.pollAdmission(u, `uploadKey=${encodeURIComponent(put.uploadKey)}`);
+    }
     const sha = uploadObjectSha256Hex(bytes), checksum = uploadChecksumSha256(bytes);
     let creds: NonNullable<ReturnType<typeof parseUploadCredentialsResponse>> | null = null;
     for (let attempt = 0; attempt < 20 && !creds && Date.now() < this.deadline; attempt++) {
@@ -611,12 +657,15 @@ async function runChain(run: Run, chain: Chain, out: Sent[]): Promise<void> {
   }
 }
 
-async function listAll(store: ObjectStore, prefix: string, cap = 50_000) {
+/** Every object under `prefix` (which ends in `/`). An object key cannot end in `/`, so list the bare prefix and keep the slash-bounded keys. */
+export async function listAll(store: ObjectStore, prefix: string, cap = 50_000) {
+  const bare = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
+  const bounded = bare + "/";
   const items: { key: string; size: number }[] = [];
   let cursor: string | undefined;
   do {
-    const page = await store.list(objectKey(prefix), cursor);
-    items.push(...page.items.map((i) => ({ key: String(i.key), size: i.size })));
+    const page = await store.list(objectKey(bare), cursor);
+    items.push(...page.items.filter((i) => String(i.key).startsWith(bounded)).map((i) => ({ key: String(i.key), size: i.size })));
     cursor = page.nextCursor;
   } while (cursor && items.length < cap);
   return items;
@@ -679,9 +728,50 @@ async function main(argv: string[]): Promise<number> {
   }
   if (pre.length) { process.stdout.write(JSON.stringify({ refused: pre }) + "\n"); return 2; }
 
-  const tokens = c.users.map((u) => process.env[u.tokenEnv]!);
+  const collectLogs = selector ? async (startedMs: number) => {
+    const logs: Record<string, LogTally> = {};
+    const pods = JSON.parse(kubectl(c, ["get", "pods", "-l", selector, "-o", "json"]) ?? "{}")?.items ?? [];
+    let i = 0;
+    for (const p of pods) {
+      const name = p?.metadata?.name;
+      if (typeof name !== "string") continue;
+      const text = kubectl(c, ["logs", name, "--all-containers", `--since-time=${new Date(startedMs - 5_000).toISOString()}`]);
+      if (text !== null) logs[`pod_${i++}`] = tallyLog(text);
+    }
+    return logs;
+  } : undefined;
+  const { receipt } = await runProof(c, {
+    runId, chains, store, tokens: c.users.map((u) => process.env[u.tokenEnv]!), ingestUrls: [c.ingestUrl], replicas,
+    ...(collectLogs ? { collectLogs } : {}),
+  });
+  const text = JSON.stringify(receipt, null, 2);
+  process.stdout.write(text + "\n");
+  if (c.receiptOut) writeFileSync(c.receiptOut, text + "\n");
+  return receipt.verdict === "PASS" ? 0 : 1;
+}
+
+/** What a run needs besides its config: the stores, the tokens, where to send, and how to read each replica's log. */
+export interface ProofContext {
+  runId: string;
+  chains: Chain[];
+  /** The canonical store (ledger-routed when split): read-back and the reset's fence write. */
+  store: ObjectStore;
+  tokens: string[];
+  /** One URL (a load balancer) or one per replica: every HTTP attempt picks the next one round-robin. */
+  ingestUrls: string[];
+  replicas: Observation["replicas"];
+  /** Every replica's log since the run started, tallied (tallyLog), keyed by a non-identifying replica name. */
+  collectLogs?: (startedMs: number) => Promise<Record<string, LogTally>>;
+  /** The direct path without relay-control (local mode); unset, the presigned path through --control-url. */
+  directPut?: DirectPut;
+  requireAdmissionsPerReplica?: boolean;
+}
+
+/** The burst, the mid-burst reset, quiescence, the read-back and the verdict. Never throws on a failed check. */
+export async function runProof(c: ProofConfig, ctx: ProofContext) {
+  const { runId, chains, store } = ctx;
   const startedMs = Date.now();
-  const run = new Run(c, tokens, startedMs);
+  const run = new Run(c, ctx.tokens, startedMs, ctx.ingestUrls, ctx.directPut);
   const sent: Sent[] = [];
 
   // ---- burst ----
@@ -772,33 +862,23 @@ async function main(argv: string[]): Promise<number> {
     reset.fenceResets = fence.state === "present" ? fence.fence.resets : 0;
   } catch { reset.fenceResets = null; }
 
-  // ---- per-pod logs (kubectl only): evidence that both replicas did the work, and their retry codes ----
-  let logs: Record<string, LogTally> | undefined;
-  if (selector) {
-    logs = {};
-    const pods = JSON.parse(kubectl(c, ["get", "pods", "-l", selector, "-o", "json"]) ?? "{}")?.items ?? [];
-    let i = 0;
-    for (const p of pods) {
-      const name = p?.metadata?.name;
-      if (typeof name !== "string") continue;
-      const text = kubectl(c, ["logs", name, "--all-containers", `--since-time=${new Date(startedMs - 5_000).toISOString()}`]);
-      if (text !== null) logs[`pod_${i++}`] = tallyLog(text);
-    }
-  }
+  // ---- per-replica logs: evidence that both replicas did the work, and their retry codes ----
+  const logs = ctx.collectLogs ? await ctx.collectLogs(startedMs) : undefined;
 
   const obs: Observation = {
     batches: sent.map((s, i) => ({ expect: s.batch.expect, path: s.chain.path, terminal: s.terminal, ...(s.code ? { refusedCode: s.code } : {}), ...records[i]!, ...(s.diverged ? { receiptsDiverged: true } : {}) })),
-    records: recordObs, sessions: sessionObs, storage, http: run.http, reset, replicas, ...(logs ? { logs } : {}), quiesced,
+    records: recordObs, sessions: sessionObs, storage, http: run.http, reset, replicas: ctx.replicas, ...(logs ? { logs } : {}), quiesced,
   };
   // Batches planned but never sent (a chain stopped at a non-admitted revision) are failures too.
   const planned = planCounts(chains).unique_batches;
   for (let k = sent.length; k < planned; k++) obs.batches.push({ expect: "admitted", path: "http", terminal: "unsent", record: "absent", receiptMatches: null });
-  const verdict = evaluate(obs, { allowRetryCodes: c.allowRetryCodes });
-  const receipt = { proof: "ingest-edge-multireplica", run_id: runId, started_at: new Date(startedMs).toISOString(), wall_s: Math.round((Date.now() - startedMs) / 1000), config: configSummary(c), plan: planCounts(chains), ...verdict };
-  const text = JSON.stringify(receipt, null, 2);
-  process.stdout.write(text + "\n");
-  if (c.receiptOut) writeFileSync(c.receiptOut, text + "\n");
-  return verdict.verdict === "PASS" ? 0 : 1;
+  const verdict = evaluate(obs, { allowRetryCodes: c.allowRetryCodes, ...(ctx.requireAdmissionsPerReplica ? { requireAdmissionsPerReplica: true } : {}) });
+  const receipt = {
+    proof: "ingest-edge-multireplica", run_id: runId, started_at: new Date(startedMs).toISOString(), wall_s: Math.round((Date.now() - startedMs) / 1000),
+    config: { ...configSummary(c), ingest_targets: ctx.ingestUrls.length, direct_upload: c.controlUrl !== undefined || ctx.directPut !== undefined },
+    plan: planCounts(chains), http_requests_by_target: run.byTarget, ...verdict,
+  };
+  return { receipt, observation: obs };
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));

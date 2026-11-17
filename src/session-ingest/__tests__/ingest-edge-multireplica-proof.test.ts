@@ -119,7 +119,7 @@ describe("planBurst", () => {
 /** A clean run: one admitted batch per kind, every record and session where it should be, two pods working. */
 function clean(): Observation {
   const b = (patch: Partial<BatchObservation> = {}): BatchObservation => ({ expect: "admitted", path: "http", terminal: "admitted", record: "committed", receiptMatches: true, ...patch });
-  const tally = { lines: 10, admitted: 5, refused: 0, retry: 2, deferred: 1, deadLettered: 0, uploads: 5, codes: { ledger_batch_contended: 1, tenant_limit: 1 } };
+  const tally = { lines: 10, admitted: 5, refused: 0, retry: 2, deferred: 1, deadLettered: 0, uploads: 5, promoted: 0, firstWrites: 2, replayFast: 0, codes: { ledger_batch_contended: 1, tenant_limit: 1 } };
   return {
     batches: [b(), b({ path: "direct" }), b({ expect: "either" }), b({ expect: "blocked" })],
     records: [
@@ -216,6 +216,19 @@ describe("evaluate", () => {
     failsWith((o) => { o.replicas.env!.INGEST_LEDGER = "sql"; }, "ingest_ledger_not_s3");
     failsWith((o) => { o.replicas.env!.INGEST_LEDGER_LOG_COMMIT = "on"; }, "ledger_log_commit_not_off");
   });
+  test("local mode: each replica must have first-written batches, and the first writes across replicas equal the admitted batches", () => {
+    const local = (patch: (o: Observation) => void) => { const o = clean(); o.replicas = { by: "local_compose", ready: 2 }; patch(o); return evaluate(o, { requireAdmissionsPerReplica: true }); };
+    expect(local(() => {}).verdict).toBe("PASS");
+    expect(local((o) => { o.logs!.pod_1 = { ...o.logs!.pod_1!, firstWrites: 0 }; o.logs!.pod_0 = { ...o.logs!.pod_0!, firstWrites: 4 }; }).failures).toEqual({ replica_admitted_nothing: 1 });
+    expect(local((o) => { o.logs!.pod_1 = { ...o.logs!.pod_1!, firstWrites: 3 }; }).failures).toEqual({ more_first_writes_than_admitted_batches: 1 });
+    expect(local((o) => { o.logs!.pod_1 = { ...o.logs!.pod_1!, firstWrites: 1 }; }).failures).toEqual({ admitted_batches_without_a_logged_commit: 1 });
+    // A takeover: the other replica committed the batch as replay_fast after this one wrote it.
+    expect(local((o) => { o.logs!.pod_1 = { ...o.logs!.pod_1!, firstWrites: 1, replayFast: 1 }; }).verdict).toBe("PASS");
+    // A replica that only replayed (admitted, but never the first writer) did not prove a second writer.
+    expect(local((o) => { o.logs!.pod_1 = { ...o.logs!.pod_1!, firstWrites: 0 }; o.logs!.pod_0 = { ...o.logs!.pod_0!, firstWrites: 4 }; }).verdict).toBe("FAIL");
+    // The reset refusal is an expected log code too.
+    expect(local((o) => { o.logs!.pod_0!.codes.delivery_privacy_superseded = 2; }).verdict).toBe("PASS");
+  });
   test("with the operator flag instead of kubectl, no replica or log check runs", () => {
     const o = clean();
     o.replicas = { by: "operator_flag", ready: null };
@@ -239,12 +252,15 @@ describe("kubectl parsing", () => {
     const line = (o: object) => `2026-11-16T00:00:00Z ${JSON.stringify(o)}`;
     const t = tallyLog([
       line({ route: "ingest.admission", outcome: "admitted", error_code: "accepted" }),
+      line({ route: "ingest.admission", outcome: "admitted", error_code: "replay" }),
+      line({ route: "ingest.admission", outcome: "admitted", error_code: "replay_fast" }),
+      line({ route: "ingest.upload_admission", outcome: "ok", promoted: 3 }),
       line({ route: "ingest.admission", outcome: "retry", error_code: "ledger_batch_contended" }),
       line({ route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit" }),
       line({ route: "ingest.admission", outcome: "dead_lettered", error_code: "admission_failed" }),
       line({ route: "delivery.batches", outcome: "accepted_queued" }),
       "plain text", "{ not json",
     ].join("\n"));
-    expect(t).toEqual({ lines: 5, admitted: 1, refused: 0, retry: 1, deferred: 1, deadLettered: 1, uploads: 1, codes: { ledger_batch_contended: 1, tenant_limit: 1, admission_failed: 1 } });
+    expect(t).toEqual({ lines: 8, admitted: 3, refused: 0, retry: 1, deferred: 1, deadLettered: 1, uploads: 1, promoted: 3, firstWrites: 1, replayFast: 1, codes: { ledger_batch_contended: 1, tenant_limit: 1, admission_failed: 1 } });
   });
 });

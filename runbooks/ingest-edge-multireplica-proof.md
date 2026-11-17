@@ -150,6 +150,48 @@ bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env 
 
 Afterwards, scale back to one replica, restore the caps, and resume the reconciler.
 
+## Local mode (no cloud, no credentials)
+
+`scripts/proof-ingest-edge-multireplica-local.ts` runs the same burst, reset and assertions (`runProof()` in the
+proof script) against two ingest-edge processes on this machine. Run it before the dev run, and after any change
+to the S3 ledger, the async consumer or upload promotion.
+
+```sh
+docker build -f docker/services.Dockerfile -t 96bulls/services:mrp-local .     # or omit --image: the script builds and removes its own
+bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp-local \
+  [--sessions-per-origin 12]  [--revisions 4] [--retry-copies 4] [--concurrency 12] [--receipt-out ~/.agent-tmp/<you>/local-receipt.json]
+```
+
+- **Stack.** A fresh compose project, `e2e/selfhost/compose.yaml` with `e2e/multireplica/compose.yaml` layered
+  over it: Postgres (the ingest's startup role check needs it; no upload accounting touches it), MinIO, the
+  migrations and role bootstrap, the Control introspection stub, and **two** ingest-edge processes `ingest-r1`
+  and `ingest-r2` with identical settings on one bucket and key root:
+  - `INGEST_LEDGER=s3` and `INGEST_LEDGER_LOG_COMMIT=off`;
+  - `SELFHOST_INGEST_ADMISSION=async`, `SELFHOST_ADMISSION_CONCURRENCY=8`, `SELFHOST_ADMISSION_SCAN_MS=2000`
+    (so each process's scan also picks up the other's inbox objects);
+  - `INGEST_S3_TENANT_LIMIT=on`, `INGEST_ASYNC_MAX_PER_ORG=2`, `INGEST_MAX_PER_USER=2`;
+  - `HISTORY_UPLOAD_DIRECT=on` with a per-run witness key.
+
+  Override with `E2E_MRP_CONCURRENCY`, `E2E_MRP_SCAN_MS`, `E2E_MRP_ASYNC_MAX_PER_ORG`, `E2E_MRP_MAX_PER_USER`, `E2E_MRP_MAX_PER_ORG`.
+- **Tenants.** Three synthetic users (`--users`) in one test org and workspace, with per-run `sh_at_` tokens in
+  the stub's table. The script writes the org's fence-authority marker into the local bucket before the burst.
+- **Load.** Every HTTP attempt (POST and admission poll) goes to the next process, round-robin
+  (`http_requests_by_target`). Origin `b` uses the upload inbox. The script stands in for relay-control: it reads
+  the user's privacy-journal seq, signs the witness and does the create-only PUT itself, with no presigned URL.
+  Both consumers promote from the same inbox.
+- **Extra assertions** (`requireAdmissionsPerReplica`; the logs are this run's only traffic):
+  - each process must have committed batches of its own (`firstWrites`, admissions answered `accepted*`);
+  - across both processes, `accepted` lines must not outnumber the admitted batches;
+  - every admitted batch must be covered by an `accepted` or a `replay_fast` line. A `replay_fast` is how one
+    process takes over a batch the other wrote but had not committed yet; the other's commit then answers
+    `ledger_attempt_superseded`, and its retry answers `replay`;
+  - neither process restarted.
+- **Cleanup.** The compose project, its volumes and network, the per-run certificate directory and (without
+  `--image`) the image are removed on exit. `--keep` leaves the project up and prints how to remove it.
+- **Exit codes.** 0 PASS, 1 FAIL, 2 the stack did not come up.
+- On a host with `umask 077`, build the image from a tree that is world-readable (`chmod -R a+rX` the checkout,
+  excluding `node_modules`). Otherwise the image's `/entrypoint.sh` and sources are unreadable to its `bun` user.
+
 ## If it fails
 
 | failure code | look at |
@@ -163,6 +205,9 @@ Afterwards, scale back to one replica, restore the caps, and resume the reconcil
 | `dead_lettered`, `dead_lettered_in_logs` | `<root>/.admission-dlq/<org>/…` for the run's machines; the `error_code` on the `dead_lettered` log line. |
 | `unexpected_retry_code`, `unexpected_log_error_code` | `counts.http.retryCodes` and `counts.log_codes`. `ledger_fence_authority_*` means the test org's marker is missing or invalid. `ledger_store_error` means S3 throttling or permissions. |
 | `fewer_than_two_replicas_did_work`, `fewer_than_two_ready_replicas` | The Service is not spreading the traffic (session affinity?), or one pod is not Ready. The proof says nothing until both pods work. |
+| `replica_admitted_nothing`, `replica_restarted` (local) | One process never committed a batch (it only replayed), or crashed. The local proof says nothing about two writers then. Check `--- ingest-r*` on stderr. |
+| `more_first_writes_than_admitted_batches` (local) | Two processes both committed one batch. **Exactly-once is broken**, as `duplicate_admission_manifest_written_twice` is. |
+| `admitted_batches_without_a_logged_commit` (local) | An admitted batch shows no `accepted` or `replay_fast` line on either process: a logging or attribution gap. Compare the ledger's batch records with `claimToken: null` (fast commits) against the logs. |
 | `unexpected_http_answer`, `batch_not_sent` | `counts.http.statuses`. A 401 or 403 is a token or scope problem; a 422 `delivery_account_mismatch` means `--org` / `--workspace` is not the tokens' tenant; a 404 `history_upload_direct_off` from control means direct upload is off for the test org (drop `--control-url` or allowlist the org). |
 
 ## Cleanup
@@ -193,11 +238,15 @@ The script deletes nothing. The S3 ledger is never deleted from, by design.
 - **Selection (per-session disable) is not exercised.** It is refused at startup under `INGEST_LEDGER=s3`.
 - **Visibility is proven at the ledger and canonical-object level.** It is not proven through search or
   the read API.
-- **The direct-upload path runs only with `--control-url`.** The witness seq is learned from relay-control's
-  first answer; this has not been run against a live relay-control.
+- **The direct-upload path runs only with `--control-url`** (or in local mode, where the script mints the witness
+  itself). The witness seq is learned from relay-control's first answer; this has not been run against a live
+  relay-control. Local mode does not cover the presigned URL, the bucket policy or SSE-KMS on PUT.
 - **Replica attribution comes from pod logs, which carry no tenant**, so dev background traffic counts too.
   Responses carry no instance id.
 - **`INGEST_LEDGER_LOG_COMMIT=on` (log mode) is out of scope**, as is the synchronous path's tenant limiter
   at its caps (`sync` mode).
-- **It has been unit-tested (the preflight, the plan, the assertions and the kubectl parsing) and type-checked
-  only. It has not yet been run against a live stack.** The first dev run is also its first end-to-end run.
+- **Local mode** runs on one host and one MinIO: no network partitions, no real S3 consistency or throttling, no
+  KMS, and no load balancer, so it does not test session affinity. It does not cover the kubectl preflight.
+  Postgres is there only for the ingest's startup role check.
+- **Coverage so far.** It has been unit-tested (the preflight, the plan, the assertions and the kubectl parsing)
+  and run end to end in local mode. It has not yet been run against a live dev stack.

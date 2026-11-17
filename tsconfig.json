@@ -46,6 +46,7 @@
     "scripts/proof-native-agent-catalog-activation.ts",
     "scripts/proof-ordered-controls.ts",
     "scripts/proof-ingest-edge-multireplica.ts",
+    "scripts/proof-ingest-edge-multireplica-local.ts",
     "scripts/sync-ingest-control-boundary.ts",
     "scripts/build-ordered-router-fixture.ts",
     "scripts/generate-ordered-control-neon-fixture.ts",
