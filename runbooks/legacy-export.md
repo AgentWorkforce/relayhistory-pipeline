@@ -91,18 +91,27 @@ them.
     the evidence names every target org and the handoff owner confirms the
     reviewed S3-side fence path for each S3-path org; do not run the SQL eraser
     against such an org before that confirmation. For every
-    `INGEST_LEDGER=s3` org, the export plan has a second hard gate: a per-org
-    receipt must prove that every applicable session erase, user erase, reset,
-    **Stop syncing**, privacy reset, and operator erase was mirrored into the
-    Supabase SQL ledgers read by the exporter and hosted eraser
-    (`session_erasure_receipts`, `upload_deletions`,
-    `ingest_frozen_source_deletions`, `upload_resets`, `turn_session_fences`,
-    and `operator_user_erasures`). If any erase class is missing or its mirror
-    cannot be proven, exclude that org from both canary and all-org export;
-    never interpret an absent SQL row as unfenced. Desktop **Stop syncing** and
-    privacy reset are the coordinated S3-fenced paths, but their SQL mirrors
-    must still appear in this receipt. Track the cross-path reconciliation in
-    relayhistory-pipeline#613. The set of S3-path orgs changes during the
+    `INGEST_LEDGER=s3` org, the export plan has a second hard gate with these
+    two per-org predicates:
+
+    1. the current S3 fence-deleted pairs are a subset of the pairs in SQL
+       `sessions.upload_deletions`; and
+    2. the SQL `sessions.upload_resets` epoch is greater than or equal to the
+       current S3 reset epoch.
+
+    **Stop syncing**, privacy reset, and ordered controls mirror fail-closed
+    into those SQL ledgers (the request returns 503 when the mirror cannot be
+    written), and there are no S3-only erase kinds. Still prove both predicates
+    from current state; do not infer them from a successful historical request.
+    The pipeline handoff owner runs and signs the SQL half. The S3 half requires
+    the ingest-edge read role owned by `infra-environments`: obtain its
+    read-only evidence through that owner, never pass its credential to this
+    exporter or grant that role to the exporter identity. If either half is
+    unavailable or either predicate fails, exclude the org from both canary and
+    all-org export; never interpret an absent SQL row as unfenced. Track the
+    cross-path reconciliation in relayhistory-pipeline#613. The exporter and
+    hosted eraser continue to enforce all six SQL ledgers listed under the
+    privacy-role rule above. The set of S3-path orgs changes during the
     migration; never rely on a copied org list or an earlier window's receipt.
   - Before the first S3 PUT for a scope, the exporter immutably registers
     `(org, normalized workspace, source, session, legacy user, legacy machine)`.
