@@ -275,21 +275,22 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
-  test("the 062060 turns origin guard changes no ACL capability and derives its exact guarded rollback", async () => {
+  test("the 062060 turns origin guard adds one owner-only helper, preserves public ACLs and derives its exact guarded rollback", async () => {
     const withLane = await generate(repo, LANES, VERIFIERS);
     const without = await generate(repo, LANES.filter((lane) => lane !== turnsSelectionOriginGuard), VERIFIERS);
     const downPath = "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql";
-    expect(withLane.summary.lanes["turns-selection-origin-guard"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
-    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
-    expect(Object.keys(withLane.outputs).filter((path) => !(path in without.outputs))).toEqual([downPath]);
+    expect(withLane.summary.lanes["turns-selection-origin-guard"]).toEqual({ functions: 1, replaces: 2, grants: 0 });
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
     const acl = JSON.parse(withLane.outputs[ACL_PATH]!).functions as Record<string, string[]>;
     const before = JSON.parse(without.outputs[ACL_PATH]!).functions as Record<string, string[]>;
-    expect(acl["sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)"]).toEqual(
-      before["sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)"],
-    );
+    expect(acl["sessions.ingest_set_session_uploads_internal(jsonb)"]).toEqual(["<owner>:EXECUTE"]);
+    expect(acl["sessions.ingest_set_session_uploads(jsonb)"]).toEqual(before["sessions.ingest_set_session_uploads(jsonb)"]);
+    expect(acl["sessions.ingest_selfhost_set_session_uploads(jsonb)"]).toEqual(before["sessions.ingest_selfhost_set_session_uploads(jsonb)"]);
     const down = withLane.outputs[downPath]!;
     expect(down).toContain(createHash("sha256").update(readFileSync(join(root, turnsSelectionOriginGuard.migration!), "utf8")).digest("hex"));
-    expect(down).toContain("PERFORM sessions.ingest_lock_fences(p_org,p_ws,p_user)");
+    expect(down).toContain("RETURN sessions.ingest_apply_ordered_control(p,'selection')");
+    expect(down).toContain("sessions.ingest_set_session_uploads(jsonb_build_object");
+    expect(down).toContain("DROP FUNCTION sessions.ingest_set_session_uploads_internal(jsonb)");
     expect(down).not.toContain("turns origin is reserved");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
