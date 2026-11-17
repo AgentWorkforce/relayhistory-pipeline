@@ -78,6 +78,7 @@ Both tables have row-level security enabled and no table privileges for any role
 | `sessions.decision_records_supersede_v1` | `service_role` | Mark one record superseded by another record in the same workspace. |
 | `sessions.decision_records_topics_v1` | `bulls96_read_api` | List topics with record counts for one workspace. |
 | `sessions.decision_records_list_v1` | `bulls96_read_api` | List one topic's records with evidence for one workspace, oldest first, keyset paginated. |
+| `sessions.decision_evidence_erase_session_v1` | `bulls96_session_ingest` | Operator per-session erase (`20261105062090`, see Retention). |
 
 Writes go to the worker role. The task asked for service_role only; the read API runs as `bulls96_read_api`, so the two read functions are granted to that role instead, following the coordination advisories template (`20261105062000`). Both read functions refuse with SQLSTATE `42501` unless `sessions.session_directory_read_api_scope(workspace)` equals the requested org, so a read-API caller cannot read another workspace even with a forged org.
 
@@ -97,13 +98,23 @@ The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts
 | Flag | Where | Default | Effect when exactly `true` |
 |---|---|---|---|
 | `SUMMARY_DECISION_RECORDS_ENABLED` | session-analysis worker | off | After an analysis job completes, extract decisions and call `decision_records_insert_v1`. Off: no extractor call, no DB call and no log line. |
+| `SUMMARY_DECISION_RECORDS_ENABLED` | self-host ingest (operator erase worker) | off | The operator per-session erase also calls `decision_evidence_erase_session_v1` before its purge, and startup requires that function. Off: the erase pass makes the same calls as before. |
 | `READ_API_MEMORY_DOCUMENTS_ENABLED` | read API (Lambda, Cloudflare worker, self-host) | off | Serve `GET /v1/memory/documents` and `GET /v1/memory/documents/{topic}`. Off: both routes answer `501 {"error":"memory_documents_disabled"}`. |
 
 ## Retention
 
-A record holds no transcript text, so it is not bound to the transcript retention windows. Records and their evidence are kept until the workspace's history is deleted. Superseded records are kept so a topic's history stays readable. Deleting a record deletes its evidence (`ON DELETE CASCADE`).
+A record holds no transcript text, so it is not bound to the transcript retention windows. Superseded records are kept so a topic's history stays readable. Deleting a record deletes its evidence (`ON DELETE CASCADE`). No workspace-level delete path reaches these tables yet; that is a follow-up.
 
-Evidence rows carry session ids. The operator per-session erase does not reach these tables in this slice. Wiring it in is a follow-up, and it is a precondition of activation step 2 below: no record is written until an erased session's evidence can be removed.
+Evidence rows carry session ids and a claim taken from that session. Migration `20261105062090` adds `sessions.decision_evidence_erase_session_v1`, which the self-host operator per-session erase calls with `SUMMARY_DECISION_RECORDS_ENABLED=true`:
+
+- It runs inside the erase pass's search lock, after the search delete and before the purge, under the pass's lease, and only as `bulls96_session_ingest`.
+- It deletes every evidence row of the erased session and its canonical ids (`session_erasure_scopes`), within the request's org, workspace and source only.
+- A record left with no evidence is deleted. A record that keeps evidence from other sessions keeps its title (the dedupe key, shared by those sessions) and gets the oldest remaining claim as its statement, so no text taken only from the erased session remains.
+- A trigger refuses any later evidence insert or update for an erased (fenced) session with SQLSTATE `RH016`, so a late extractor write fails as a whole instead of restoring the session.
+- A failure is not swallowed: the pass records `searchDocuments` as `failed_retryable` with code `decision_records_erase_failed`, skips the purge, and the request is retried. A retry after success deletes nothing more.
+- The rollback drops the function and trigger; it does not restore erased evidence.
+
+Hosted: the extractor runs in the hosted session-pipeline Lambda, and the operator per-session erase runs only in self-host. No hosted per-session erase reaches these tables yet, so activation step 2 stays blocked on hosted until one calls this function.
 
 ## Surfacing
 
@@ -114,7 +125,8 @@ Out of scope, as follow-ups:
 - A kit hook that pulls the topic document at the start of a turn (layered-agents kit).
 - DM supersede events when a new decision supersedes an old one (coordination advisor).
 - A Desktop or Cloud view (relayhistory-cloud).
-- Per-session erase of evidence rows (this repository; required before activation step 2).
+- A hosted per-session erase that calls `decision_evidence_erase_session_v1` (this repository; required before activation step 2 on hosted).
+- A workspace-level delete of records and evidence (this repository).
 
 ## Threat model
 
@@ -130,11 +142,11 @@ Out of scope, as follow-ups:
 
 Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
 
-1. Apply migration `20261105062080` to the target database, then confirm its sentinel.
-2. After the per-session erase removes evidence rows (see Retention), set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the session-analysis worker.
+1. Apply migrations `20261105062080` and `20261105062090` to the target database, then confirm both sentinels.
+2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then on the session-analysis worker. Only where the per-session erase reaches these tables (see Retention); not on hosted yet.
 3. Set `READ_API_MEMORY_DOCUMENTS_ENABLED=true` on the read API, and add the workspace to the `memory` canary.
 
-Rollback: unset the flags, then run the rollback file if the tables must go.
+Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062090` first (its rollback refuses while a later migration is applied).
 
 ## Implementation plan
 
@@ -146,3 +158,5 @@ Rollback: unset the flags, then run the rollback file if the tables must go.
 4. Read API routes, behind `READ_API_MEMORY_DOCUMENTS_ENABLED`.
    Implemented: `src/session-read-api/memory-documents.ts`, registered once in `app.ts` and wired by the Lambda and self-host entries (`lambda.ts`) and the Cloudflare worker; tests in `src/session-read-api/__tests__/memory-documents.test.ts`, `facts-backends-wiring.test.ts` and the worker suite.
 5. Self-host composition rows and the runbook.
+6. Operator per-session erase (`20261105062090`), behind `SUMMARY_DECISION_RECORDS_ENABLED`.
+   Implemented: the migration and rollback, the `memory-documents-erase` lane, `decisionRecords` in `src/session-erase/runtime.ts` and `selfhost-runtime.ts`; tests in `memory-documents.pglite.test.ts`, `runtime.test.ts` and `selfhost-runtime.test.ts`.

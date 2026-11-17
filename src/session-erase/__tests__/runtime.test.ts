@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { ARTIFACT_KEYS, erasureReceipt, SessionEraseServiceError } from "../receipt.ts";
 import { eraseRuntimeSettings } from "../flags.ts";
-import { sessionEraseWorker, sqlSessionWriteGuard, type EraseLedger, type EraseWork } from "../runtime.ts";
+import { sessionEraseWorker, sqlDecisionRecordsErase, sqlSessionWriteGuard, type EraseLedger, type EraseWork } from "../runtime.ts";
 const key = { orgId: "o", workspaceId: "w", source: "claude", sessionId: "s" };
 const identity = { bucket: "b", keyRoot: "root", storeRef: "a".repeat(64) };
 const work: EraseWork = { ...key, ...identity, sessionIds: ["s"] };
@@ -89,4 +89,47 @@ test("failure recording cannot release an ambiguous writer or mask its original 
  const guard=sqlSessionWriteGuard(async text=>{calls.push(text);if(text.includes("write_failed"))throw Error("private database detail");return{rows:[{result:true}]};});
  await expect(guard(key,[["claude","s"]],async()=>{throw original;})).rejects.toBe(original);
  expect(calls).toHaveLength(2);expect(calls.some(c=>c.includes("write_finish"))).toBe(false);
+});
+
+// Memory documents (20261105062090): the decision records erase step, wired only with the flag on.
+function recordsFixture(records: "off" | "ok" | "fail") {
+ const calls: string[] = [], codes: (string | undefined)[] = [], logs: Record<string, unknown>[] = [];
+ const ledger = { next: async () => work, authorize: async () => true,
+  release: async () => { calls.push("release"); }, purge: async () => { calls.push("purge"); },
+  step: async (_w: unknown, _lease: string, artifact: string, state: string, _count: number, code?: string) => { calls.push(`${artifact}:${state}`); codes.push(code); } } as unknown as EraseLedger;
+ const worker = sessionEraseWorker({ ledger, identity, log: fields => logs.push(fields),
+  bytes: { stagesAbsent: async () => true, erase: async () => { calls.push("bytes"); return { verified: true, transcriptObjects: 1, pointerObjects: 1 } as any; } },
+  search: { erase: async () => { calls.push("search"); } },
+  searchLock: async (_w, fn) => { calls.push("lock"); return fn(); },
+  ...(records === "off" ? {} : { decisionRecords: { erase: async (w: EraseWork, lease: string) => {
+   calls.push(`records:${w.sessionId}:${typeof lease}`); if (records === "fail") throw Error("private database detail"); } } }) });
+ return { worker, calls, codes, logs };
+}
+test("decision records off: the erase pass is unchanged and never calls the records step", async () => {
+ const f = recordsFixture("off"); await f.worker.scan();
+ expect(f.calls.some(c => c.startsWith("records"))).toBe(false);
+ expect(f.calls.slice(0, 5)).toEqual(["bytes", "transcriptObjects:done", "lock", "search", "purge"]);
+ expect(f.logs).toEqual([{ event: "operator_session_erase_pass", outcome: "verified" }]);
+});
+test("decision records on: the records step runs inside the search lock, after search and before purge", async () => {
+ const f = recordsFixture("ok"); await f.worker.scan();
+ expect(f.calls.slice(0, 6)).toEqual(["bytes", "transcriptObjects:done", "lock", "search", "records:s:string", "purge"]);
+ expect(f.logs).toEqual([{ event: "operator_session_erase_pass", outcome: "verified" }]);
+});
+test("decision records on: a records failure is not swallowed; no purge, a retryable failure with its own code", async () => {
+ const f = recordsFixture("fail"); await f.worker.scan();
+ expect(f.calls).not.toContain("purge"); expect(f.calls).not.toContain("historyDerivedObjects:not_applicable");
+ expect(f.calls).toContain("searchDocuments:failed_retryable");
+ expect(f.codes.at(-1)).toBe("decision_records_erase_failed"); expect(f.calls.at(-1)).toBe("release");
+ expect(f.logs).toEqual([{ event: "operator_session_erase_pass", outcome: "failed", step: "searchDocuments", code: "decision_records_erase_failed" }]);
+ expect(JSON.stringify(f.logs)).not.toContain("private");
+});
+test("the SQL records port calls only the 062090 erase function with the erase key and lease, and refuses a malformed result", async () => {
+ const seen: { text: string; values: unknown[] }[] = [];
+ const lease = "00000000-0000-4000-8000-000000000001";
+ await sqlDecisionRecordsErase(async (text, values) => { seen.push({ text, values: values ?? [] }); return { rows: [{ result: { evidenceRows: 1, recordsDeleted: 0, recordsRewritten: 1 } }] }; }).erase(work, lease);
+ expect(seen).toEqual([{ text: "SELECT sessions.decision_evidence_erase_session_v1($1,$2,$3,$4,$5) AS result", values: ["o", "w", "claude", "s", lease] }]);
+ await expect(sqlDecisionRecordsErase(async () => ({ rows: [{ result: null }] })).erase(work, lease)).rejects.toBeInstanceOf(SessionEraseServiceError);
+ await expect(sqlDecisionRecordsErase(async () => { throw Object.assign(Error("private"), { code: "RH014" }); }).erase(work, lease))
+  .rejects.toBeInstanceOf(SessionEraseServiceError);
 });

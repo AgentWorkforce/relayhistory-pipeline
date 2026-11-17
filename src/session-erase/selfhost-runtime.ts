@@ -12,7 +12,7 @@ import { INBOX_NAMESPACE } from "../session-ingest/async-admission.ts";
 import { INBOX_UPLOAD_NAMESPACE } from "../session-ingest/upload-inbox-contract.ts";
 import { eraseDiscoveredSessionBytes } from "./selfhost-eraser.ts";
 import { sessionEraseConfig as bytesConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
-import { sessionEraseWorker, sqlEraseLedger, sqlSessionWriteGuard, type EraseSearchPort, type EraseStoreIdentity, type EraseWork } from "./runtime.ts";
+import { sessionEraseWorker, sqlDecisionRecordsErase, sqlEraseLedger, sqlSessionWriteGuard, type EraseDecisionRecordsPort, type EraseSearchPort, type EraseStoreIdentity, type EraseWork } from "./runtime.ts";
 import { SessionEraseServiceError } from "./receipt.ts";
 
 function writerEndpoint(env: NodeJS.ProcessEnv): string | null {
@@ -148,6 +148,13 @@ export async function stagedObjectsAbsent(eraser: Pick<ReturnType<typeof createS
  return true;
 }
 
+/** The memory documents erase step (20261105062090). Same rule as decisionRecordsEnabled in
+ * session-analysis/decision-records.ts (not imported: it would pull the extractor into the eraser).
+ * Off, the worker gets no port and the erase pass is unchanged. */
+export function decisionRecordsErasePort(env: NodeJS.ProcessEnv, run: SqlRun): EraseDecisionRecordsPort | undefined {
+  return env.SUMMARY_DECISION_RECORDS_ENABLED === "true" ? sqlDecisionRecordsErase(run) : undefined;
+}
+
 export async function buildSelfhostEraseRuntime(input: {
   env: NodeJS.ProcessEnv; keyRoot: string; api: SessionEraseConfig; enforced?: true; bytesEnabled?: true;
   run: SqlRun; pool: pg.Pool; metadata: pg.PoolConfig; log?: (fields: Record<string, unknown>) => void;
@@ -161,6 +168,9 @@ export async function buildSelfhostEraseRuntime(input: {
     "ingest_operator_runtime_write_finish(text,text,uuid)", "ingest_operator_runtime_write_failed(text,text,uuid)", "ingest_operator_runtime_next(uuid)", "ingest_operator_runtime_authorize(text,text,text,text,uuid)",
     "ingest_operator_runtime_release(text,text,text,text,uuid)", "ingest_operator_erase_receipt(text,text,text,text)",
     "ingest_operator_runtime_purge(text,text,text,text,uuid)", "ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)"];
+  const decisionRecords = decisionRecordsErasePort(env, run);
+  // Enabled decision records without their erase function would leave erased sessions' evidence.
+  if (decisionRecords) required.push("decision_evidence_erase_session_v1(text,text,text,text,uuid)");
   const ready = await run("SELECT bool_and(to_regprocedure(fn) IS NOT NULL AND has_function_privilege(current_user,to_regprocedure(fn),'EXECUTE')) ready FROM unnest($1::text[]) fn", [required.map(fn => `sessions.${fn}`)]);
   if (ready.rows[0]?.ready !== true) throw Error("96bulls: operator erase runtime migration and grants required");
   const identity = eraseStoreIdentity(env, input.keyRoot);
@@ -175,7 +185,7 @@ export async function buildSelfhostEraseRuntime(input: {
   const eraser = createS3Eraser({ bucket: config.bucket, region: config.region, endpoint: config.endpoint, credentials: sessionEraseCredentials(env),
     fetch: (url, init) => fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) }) });
   const search = await searchPort(env, input.metadata);
-  const worker = sessionEraseWorker({ ledger, identity, search: search.port, log: input.log,
+  const worker = sessionEraseWorker({ ledger, identity, search: search.port, log: input.log, ...(decisionRecords ? { decisionRecords } : {}),
     bytes: {
       erase: (key, authorize) => eraseDiscoveredSessionBytes(eraser, key, { keyRoot: config.keyRoot, bucket: config.bucket, concurrency: config.concurrency,
         authorize, log: input.log }),
