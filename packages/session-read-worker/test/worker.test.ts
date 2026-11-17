@@ -914,7 +914,8 @@ describe("session analysis (READ_API_ANALYSIS_ENABLED; lane F1)", () => {
     // The raw store: answers only the key the job row names; any other object is a 404.
     const fetcher = (async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input));
-      fetched.push(decodeURIComponent(url.pathname));
+      // The bucket may be in the host (virtual-hosted style) or the path (path style): record both.
+      fetched.push(`${url.host}${decodeURIComponent(url.pathname)}`);
       if (decodeURIComponent(url.pathname).endsWith(key)) return new Response(resultBytes, { status: 200, headers: { "content-length": String(resultBytes.length), etag: '"e"' } });
       return new Response("<Error><Code>NoSuchKey</Code></Error>", { status: 404 });
     }) as typeof fetch;
