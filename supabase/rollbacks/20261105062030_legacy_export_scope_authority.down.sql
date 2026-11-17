@@ -3,6 +3,7 @@
 -- Guard, object removal and ledger removal are one transaction under the
 -- migrator lock. On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
+SET LOCAL lock_timeout='5s';
 SELECT pg_advisory_xact_lock(961996,1); -- same namespace as the real migrator
 DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL
@@ -11,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062030_legacy_export_scope_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'fcfe6d8915e4f8bb43b2c0eb7726f39d25a23106ee06093b65230c54d01db899'
+ IF NOT FOUND OR v_sha<>'a44b7286451c0804263cd8eaf7b6d8c2c2f9cc165380ddd9630991a92ac22270'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: own applied checksum required';END IF;
  LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)
@@ -31,10 +32,15 @@ END $turn_fence_policy$;
 REVOKE SELECT ON sessions.session_erasure_receipts,sessions.upload_deletions,
  sessions.ingest_frozen_source_deletions,sessions.upload_resets,sessions.operator_user_erasures
  FROM bulls96_legacy_export_privacy;
+DROP TRIGGER legacy_export_privacy_readiness_clear ON sessions.ingest_privacy_authority;
+DROP FUNCTION sessions.legacy_export_privacy_readiness_clear();
 DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb),
  sessions.legacy_export_privacy_eraser_page(jsonb),
+ sessions.legacy_export_privacy_eraser_activation(),
+ sessions.legacy_export_privacy_eraser_heartbeat(),
  sessions.legacy_export_privacy_authority_ready(),
  sessions.ingest_legacy_export_scope_authority_register(jsonb);
+DROP TABLE sessions.legacy_export_privacy_eraser_readiness;
 DROP TABLE sessions.legacy_export_scope_authority;
 REVOKE USAGE ON SCHEMA sessions FROM bulls96_legacy_export_privacy;
 DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql';
