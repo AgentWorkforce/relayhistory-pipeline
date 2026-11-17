@@ -210,6 +210,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105062090_relayfacts_erase.sql",
       // Relayfacts user erase: an owner-only erase function, a fence table and three triggers on the 062080 tables. No G4 function names them.
       "20261105062100_relayfacts_user_erase.sql",
+      // Search reconcile staging: new tables/functions only; no G4 function names them, no ingest path calls them.
+      "20261105062110_search_reconcile_staging.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

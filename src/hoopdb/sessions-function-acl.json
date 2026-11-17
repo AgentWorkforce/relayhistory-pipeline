@@ -1413,6 +1413,40 @@
     "sessions.search_feature_copy_state_valid(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.search_reconcile_abandon_v1(bigint,uuid,text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_advance_v1(bigint,uuid,text,text,text[],bigint,bigint,boolean)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_caller_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_diff_page_v1(bigint,uuid,text,text,integer,text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_erase_scope_v1(text,text,text,text[])": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_finish_v1(bigint,uuid)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.search_reconcile_lease_v1(bigint,uuid)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
     "sessions.search_session_directory(text,text,text,text,text,boolean,text,text,text,text,text,timestamp with time zone,timestamp with time zone,text,timestamp with time zone,text,text,text,integer)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"

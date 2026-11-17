@@ -2645,6 +2645,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const MD = "upstream:20261105062080_memory_documents.sql";
     const MDE = "upstream:20261105062090_relayfacts_erase.sql";
     const MUE = "upstream:20261105062100_relayfacts_user_erase.sql";
+    const SRS = "upstream:20261105062110_search_reconcile_staging.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2655,7 +2656,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2706,6 +2707,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062110 is newest: the 062100 down refuses (55000) while the staged reconcile tables are applied; the
+    // checksum-pinned 062110 down drops its nine functions, two tables and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(SRS);
+    expect((await failure(rollback("20261105062100_relayfacts_user_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(MUE);
+    await rollback("20261105062110_search_reconcile_staging.down.sql");
+    expect(await names()).not.toContain(SRS);
+    expect(await relation("sessions.search_reconcile_runs_v1")).toBeNull();
+    expect(await relation("sessions.search_reconcile_stage_v1")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'search\\_reconcile\\_%'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062110_search_reconcile_staging.down.sql")))?.code).toBe("55000");
     // 20261105062100 is newest: the 062090 erase down refuses (55000) while the per-user erase is applied; the
     // checksum-pinned 062100 down drops its function, triggers and fence table and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(MUE);
