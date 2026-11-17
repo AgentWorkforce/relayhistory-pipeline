@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { readAll, objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { resetScrubEngineForTests, sealRawChunk, selectScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { SealRawChunk } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
-import { createSealPool, parseSealWorkers, sealPoolDeps, sealPoolSize, type SealPool } from "../seal-pool.ts";
+import { createSealPool, parseSealWorkers, SEAL_POOL_MAX_RESPAWNS, sealPoolDeps, sealPoolSize, type SealPool } from "../seal-pool.ts";
 import { writeGroups } from "../writer.ts";
 import { scratchStore } from "./support.ts";
 
@@ -49,13 +49,23 @@ test("flag off: sealPoolDeps is exactly today's object and starts no pool", () =
   expect(created).toBe(0);
 });
 
-test("refused next to SCRUB_ENGINE=wasm-bindgen (never picks a sealer silently)", () => {
-  const previous = process.env.SCRUB_ENGINE;
-  process.env.SCRUB_ENGINE = "wasm-bindgen";
-  cleanup.push(() => { if (previous === undefined) delete process.env.SCRUB_ENGINE; else process.env.SCRUB_ENGINE = previous; });
+for (const engine of ["wasm-bindgen", "wasm"]) test(`refused with SCRUB_ENGINE=${engine}, before any engine is touched`, () => {
   let created = 0;
-  expect(() => sealPoolDeps({ INGEST_SEAL_WORKERS: "2" }, () => { created++; throw new Error("no"); })).toThrow();
+  // The env passed in is the only input: no process-wide engine selection or initialisation is needed to refuse.
+  expect(() => sealPoolDeps({ INGEST_SEAL_WORKERS: "2", SCRUB_ENGINE: engine }, () => { created++; throw new Error("no"); }))
+    .toThrow("INGEST_SEAL_WORKERS needs the TypeScript scrub engine");
   expect(created).toBe(0);
+});
+
+test("SCRUB_ENGINE unset or ts: the pool starts", () => {
+  selectScrubEngine({});
+  for (const env of [{ INGEST_SEAL_WORKERS: "1" }, { INGEST_SEAL_WORKERS: "1", SCRUB_ENGINE: "ts" }]) {
+    let created = 0;
+    const fake = { sealer: (() => {}) as never, size: 1, stats: () => ({}) as never, close: async () => {} };
+    const deps = sealPoolDeps(env, () => { created++; return fake; });
+    expect(created).toBe(1);
+    expect(deps.sealPool).toBe(fake);
+  }
 });
 
 test("byte identity: same key, bytes, metadata and entry as the pinned sealer", async () => {
@@ -111,6 +121,34 @@ test("a worker that dies is replaced, and its task is sealed on the main thread"
   expect(await p.sealer(b, input(sources[1]!))).toEqual(today);
   expect(p.stats().workerErrors).toBeGreaterThanOrEqual(1);
   expect(p.stats().fallback).toBe(1);
+});
+
+test("a worker that keeps dying is retired after the respawn cap; seals then run on the main thread", async () => {
+  selectScrubEngine({});
+  const p = pool(2, new URL("./fixtures/seal-pool-dying-worker.ts", import.meta.url));
+  const a = scratch(), b = scratch();
+  for (let i = 0; i < 12; i++) {
+    const x = input(enc.encode(`${JSON.stringify({ text: "retire " + i })}\n`), i);
+    expect(await p.sealer(b, x)).toEqual(await sealRawChunk(a, x));
+  }
+  const stats = p.stats();
+  expect(stats.retired).toBe(2);
+  // Bounded: at most SEAL_POOL_MAX_RESPAWNS respawns per slot, then no more workers.
+  expect(stats.respawned).toBe(2 * SEAL_POOL_MAX_RESPAWNS);
+  expect(stats.workerErrors).toBe(2 * (SEAL_POOL_MAX_RESPAWNS + 1));
+  expect(stats.fallback).toBe(12);
+});
+
+test("close resolves an in-flight seal (it completes on the main thread), and is idempotent", async () => {
+  selectScrubEngine({});
+  const p = createSealPool(1, { workerUrl: new URL("./fixtures/seal-pool-silent-worker.ts", import.meta.url) });
+  const a = scratch(), b = scratch(), x = input(sources[1]!);
+  const inFlight = p.sealer(b, x);
+  await new Promise((r) => setTimeout(r, 50));
+  await p.close();
+  await p.close();
+  expect(await inFlight).toEqual(await sealRawChunk(a, x));
+  expect(p.stats().workerErrors).toBe(0);
 });
 
 test("a PUT failure other than already_exists is thrown as the store threw it", async () => {

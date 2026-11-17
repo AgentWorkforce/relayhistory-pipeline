@@ -283,7 +283,19 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit, logErase: settings.ledgerLogErase === true, logger: options.log ?? log }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   // INGEST_SEAL_WORKERS (seal-pool.ts, default 0): the raw-chunk seal on worker threads, same bytes.
   // Off: exactly routedRawChunkSealerDeps() (SCRUB_ENGINE=wasm-bindgen's bound sealer, or {}).
-  const { sealPool: _sealPool, ...sealerDeps } = sealPoolDeps(process.env);
+  const { sealPool, ...sealerDeps } = sealPoolDeps(process.env);
+  // Counters only (seal-pool.ts): a pool that only falls back is visible, never silent.
+  const sealPoolTimer = sealPool ? setInterval(() => log.info("seal pool", { seal_pool_workers: sealPool.size, ...sealPool.stats() }), 60_000) : undefined;
+  sealPoolTimer?.unref?.();
+  if (sealPool) log.info("seal pool started", { seal_pool_workers: sealPool.size });
+  const closeParts = sealPool
+    ? async () => {
+      clearInterval(sealPoolTimer);
+      log.info("seal pool stopped", { seal_pool_workers: sealPool.size, ...sealPool.stats() });
+      await sealPool.close();
+      await parts.close();
+    }
+    : parts.close;
   const deliver: DeliverDeps = {
     ledger,
     ...(withSessionWrites ? { withSessionWrites } : {}),
@@ -328,7 +340,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
     const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics, ...capturePolicyUploads, ...uploadConsent }));
-    return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
+    return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: closeParts, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
   const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
@@ -406,7 +418,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // the database's health shows as consumer backlog, never as refused uploads. drain: the synchronous
     // request path needs the database too.
     ready: async () => consumer.status().healthy && (mode === "on" || await parts.ready()),
-    close: async () => { await consumer.stop(); await parts.close(); },
+    close: async () => { await consumer.stop(); await closeParts(); },
     admissionMode: admission.mode,
     admission: () => consumer.status(),
     routes: Object.freeze({ ...routes, [SELFHOST_ADMISSION_STATUS_PATH]: "GET" as const }),

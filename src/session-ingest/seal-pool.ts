@@ -4,7 +4,8 @@
  * (docs/design/admission-throughput-and-transcripts-region.md, step T2).
  *
  * `INGEST_SEAL_WORKERS`:
- * - unset, "" or "0": off. `sealPoolDeps` returns `{}` and nothing changes.
+ * - unset, "" or "0": off. `sealPoolDeps` returns `routedRawChunkSealerDeps()` as it is
+ *   (`{}` on the TypeScript engine), and nothing changes.
  * - an integer 1..32: that many worker threads.
  *
  * The output is today's, byte for byte. Each worker runs the pinned sealer
@@ -20,13 +21,19 @@
  *   object from its own metadata as always;
  * - any other PUT failure is thrown as it is, as the pinned sealer would throw it.
  *
- * TypeScript scrub engine only. `SCRUB_ENGINE=wasm-bindgen` installs its own
- * bound sealer (`routedRawChunkSealerDeps`), and the pool refuses to start with it
- * rather than pick one silently.
+ * TypeScript scrub engine only: with any other `SCRUB_ENGINE` (`wasm`, `wasm-bindgen`)
+ * the pool refuses to start rather than pick a sealer silently or fall back on
+ * every seal.
+ *
+ * A slot whose worker dies is respawned at most `SEAL_POOL_MAX_RESPAWNS` times in a
+ * row without a successful seal; then it is retired, and once every slot is
+ * retired each seal runs on the main thread (today's path). `stats()` counts
+ * pooled seals, fallbacks, worker errors, respawns and retired slots, never keys
+ * or content.
  */
 import { Worker } from "node:worker_threads";
 import { availableParallelism } from "node:os";
-import { activeScrubMarker, routedRawChunkSealerDeps, sealRawChunk } from "@rhc/lib/scrub-engine/index.ts";
+import { activeScrubMarker, parseScrubEngineKind, routedRawChunkSealerDeps, sealRawChunk } from "@rhc/lib/scrub-engine/index.ts";
 import type { BoundRawChunkSealer, EngineSealedChunk } from "../../packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts";
 import type { SealRawChunk, SealedChunk } from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 import type { ObjectStore, PutOpts } from "../../packages/object-store/src/types.ts";
@@ -38,6 +45,8 @@ export type SealPoolResponse =
   | { id: number; ok: false; code: string };
 
 export const SEAL_POOL_MAX_WORKERS = 32;
+/** Consecutive deaths of one slot's worker, without a successful seal between, before the slot is retired. */
+export const SEAL_POOL_MAX_RESPAWNS = 3;
 
 /** `INGEST_SEAL_WORKERS`: 0 (off) or 1..32. Anything else is a configuration error. */
 export function parseSealWorkers(value: string | undefined): number {
@@ -49,7 +58,7 @@ export function parseSealWorkers(value: string | undefined): number {
 }
 
 /** Counters only: no keys, no content. */
-export interface SealPoolStats { pooled: number; fallback: number; workerErrors: number; respawned: number }
+export interface SealPoolStats { pooled: number; fallback: number; workerErrors: number; respawned: number; retired: number }
 
 export interface SealPool {
   readonly sealer: BoundRawChunkSealer;
@@ -58,12 +67,12 @@ export interface SealPool {
   close(): Promise<void>;
 }
 
-interface Slot { worker: Worker; busy: boolean; pending?: { id: number; resolve: (r: SealPoolResponse) => void } }
+interface Slot { worker: Worker; busy: boolean; deaths: number; retired: boolean; pending?: { id: number; resolve: (r: SealPoolResponse) => void } }
 
 export function createSealPool(size: number, options: { workerUrl?: URL } = {}): SealPool {
   if (!Number.isInteger(size) || size < 1 || size > SEAL_POOL_MAX_WORKERS) throw new Error(`96bulls: seal pool size must be 1..${SEAL_POOL_MAX_WORKERS}`);
   const url = options.workerUrl ?? new URL("./seal-pool-worker.ts", import.meta.url);
-  const counters: SealPoolStats = { pooled: 0, fallback: 0, workerErrors: 0, respawned: 0 };
+  const counters: SealPoolStats = { pooled: 0, fallback: 0, workerErrors: 0, respawned: 0, retired: 0 };
   const queue: { request: SealPoolRequest; resolve: (r: SealPoolResponse) => void }[] = [];
   let nextId = 1;
   let closed = false;
@@ -71,35 +80,54 @@ export function createSealPool(size: number, options: { workerUrl?: URL } = {}):
   const spawn = (slot?: Slot): Slot => {
     const worker = new Worker(url);
     worker.unref();
-    const s: Slot = slot ?? { worker, busy: false };
+    const s: Slot = slot ?? { worker, busy: false, deaths: 0, retired: false };
     s.worker = worker;
     worker.on("message", (response: SealPoolResponse) => {
       const pending = s.pending;
       if (!pending || pending.id !== response.id) return;
       s.pending = undefined;
       s.busy = false;
+      if (response.ok) s.deaths = 0;
       pending.resolve(response);
       pump();
     });
+    let failed = false;
     const fail = () => {
-      if (s.worker !== worker || closed) return;
-      counters.workerErrors++;
+      if (failed || s.worker !== worker) return;
+      failed = true;
       const pending = s.pending;
       s.pending = undefined;
       s.busy = false;
       // The task falls back to the main thread: never lost, never a different error.
-      pending?.resolve({ id: pending.id, ok: false, code: "worker_exit" });
-      if (!closed) { counters.respawned++; spawn(s); pump(); }
+      pending?.resolve({ id: pending.id, ok: false, code: closed ? "closed" : "worker_exit" });
+      if (closed) return;
+      counters.workerErrors++;
+      void worker.terminate().catch(() => {});
+      if (++s.deaths > SEAL_POOL_MAX_RESPAWNS) {
+        s.retired = true;
+        counters.retired++;
+        if (slots.every((x) => x.retired)) drainToFallback();
+      } else {
+        counters.respawned++;
+        spawn(s);
+      }
+      pump();
     };
     worker.on("error", fail);
+    worker.on("messageerror", fail);
     worker.on("exit", fail);
     return s;
   };
-  const slots: Slot[] = Array.from({ length: size }, () => spawn());
+  const slots: Slot[] = [];
+  for (let i = 0; i < size; i++) slots.push(spawn());
+
+  function drainToFallback(): void {
+    for (const { resolve, request } of queue.splice(0)) resolve({ id: request.id, ok: false, code: "retired" });
+  }
 
   function pump(): void {
     for (const slot of slots) {
-      if (slot.busy || queue.length === 0) continue;
+      if (slot.busy || slot.retired || queue.length === 0) continue;
       const next = queue.shift()!;
       slot.busy = true;
       slot.pending = { id: next.request.id, resolve: next.resolve };
@@ -108,9 +136,9 @@ export function createSealPool(size: number, options: { workerUrl?: URL } = {}):
   }
 
   const run = (input: SealRawChunk): Promise<SealPoolResponse> => {
-    if (closed) return Promise.resolve({ id: 0, ok: false, code: "closed" });
-    // A copy crosses the thread boundary: the caller's source stays usable for a fallback.
-    const request: SealPoolRequest = { id: nextId++, input: { ...input, source: input.source.slice() } };
+    if (closed || slots.every((x) => x.retired)) return Promise.resolve({ id: 0, ok: false, code: closed ? "closed" : "retired" });
+    // postMessage copies the input (no transfer list), so the caller's source stays usable for a fallback.
+    const request: SealPoolRequest = { id: nextId++, input };
     return new Promise((resolve) => { queue.push({ request, resolve }); pump(); });
   };
 
@@ -141,9 +169,17 @@ export function createSealPool(size: number, options: { workerUrl?: URL } = {}):
     size,
     stats: () => ({ ...counters }),
     async close() {
+      if (closed) return;
       closed = true;
       for (const { resolve, request } of queue.splice(0)) resolve({ id: request.id, ok: false, code: "closed" });
-      await Promise.all(slots.map((s) => s.worker.terminate()));
+      // In-flight seals resolve as closed too (their caller seals on the main thread).
+      for (const slot of slots) {
+        const pending = slot.pending;
+        slot.pending = undefined;
+        slot.busy = false;
+        pending?.resolve({ id: pending.id, ok: false, code: "closed" });
+      }
+      await Promise.all(slots.map((s) => s.worker.terminate().catch(() => 0)));
     },
   };
 }
@@ -160,9 +196,10 @@ export function sealPoolSize(env: Record<string, string | undefined>): number {
  */
 export function sealPoolDeps(env: Record<string, string | undefined>, create: (size: number) => SealPool = createSealPool): { rawChunkSealer?: BoundRawChunkSealer; sealPool?: SealPool } {
   const size = sealPoolSize(env);
-  const routed = routedRawChunkSealerDeps();
-  if (size === 0) return routed;
-  if (routed.rawChunkSealer) throw new Error("96bulls: INGEST_SEAL_WORKERS needs the TypeScript scrub engine (SCRUB_ENGINE=wasm-bindgen installs its own sealer)");
+  if (size === 0) return routedRawChunkSealerDeps();
+  // Checked before any engine selection: only the TypeScript engine (unset, "" or "ts"); an invalid value fails as today.
+  if (parseScrubEngineKind(env.SCRUB_ENGINE) !== "ts") throw new Error("96bulls: INGEST_SEAL_WORKERS needs the TypeScript scrub engine (SCRUB_ENGINE unset or ts)");
+  if (routedRawChunkSealerDeps().rawChunkSealer) throw new Error("96bulls: INGEST_SEAL_WORKERS needs the TypeScript scrub engine (SCRUB_ENGINE unset or ts)");
   const pool = create(size);
   return { rawChunkSealer: pool.sealer, sealPool: pool };
 }
