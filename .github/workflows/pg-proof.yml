@@ -231,6 +231,10 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test src/session-pipeline/__tests__/brief-documents.postgres.test.ts
+      - name: Prove the staged reconcile claim never waits on a held run row (062110)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 300000 src/session-pipeline/__tests__/staged-reconcile-claim.postgres.test.ts
       - name: Prove the lazy claim reads the seat clock without serializing other users' claims (043500)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
