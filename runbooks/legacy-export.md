@@ -71,12 +71,27 @@ them.
     turn-session fences and user erasures before checkpointing. It overrides
     the privacy connection's idle-in-transaction timeout to a 15-minute scope
     bound and aborts the whole run if that connection or transaction is lost.
+    Every legacy-export object PUT carries a fixed two-minute abort signal, so
+    a stalled S3 request releases those shared locks well before that bound.
+    An aborted request has uncertain commit state; the already-durable owner
+    mapping lets the hosted eraser find and remove any object that did land.
+  - Every operator session or user erase must set a finite PostgreSQL
+    `lock_timeout` before requesting the exclusive `(961996,50000)` gate. The
+    built-in user eraser uses `SET LOCAL lock_timeout = 30000`; manual or new
+    callers must use at most 30 seconds, treat SQLSTATE `55P03` as retryable,
+    and must never disable the timeout. This prevents an erase waiting behind
+    an exporter from queueing later shared-lock ingest transactions indefinitely.
   - Before the first S3 PUT for a scope, the exporter immutably registers
     `(org, normalized workspace, source, session, legacy user, legacy machine)`.
     A replay must return the same tuple; an owner or machine change refuses.
     This is how the hosted eraser finds the exact legacy copy after any member,
     session, frozen-source or turn-fence deletion without deriving an owner
     from the deleting member.
+  - The exporter refuses before discovery unless the Supabase eraser has
+    recorded a healthy successful sweep in the last 30 minutes. It repeats the
+    durable readiness RPC before every scope, so a stale heartbeat or rollback
+    to the Neon authority aborts the run before another legacy PUT. An
+    environment setting in the exporter is never accepted as readiness.
   - The shared global privacy lock is held for one scope's Neon read and S3
     write. A queued exclusive erase can in turn delay later ingest/export shared
     lock requests. Run only in the approved window, keep scopes bounded, and
