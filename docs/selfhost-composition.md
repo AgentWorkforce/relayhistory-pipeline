@@ -675,7 +675,10 @@ which neither budget is read.
 (1000..600000, default 15000), `SELFHOST_ADMISSION_MAX_ATTEMPTS` (1..100,
 default 20) and `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`on`/`off`, default off; a
 missing fence-authority marker or the deployment-wide stop then defers instead of
-counting toward the dead letter, `INGEST_LEDGER=s3` only) are read only in `async` and `drain`. The mode is never taken from a
+counting toward the dead letter, `INGEST_LEDGER=s3` only) and `SELFHOST_ADMISSION_SPREAD`
+(`on`/`off`, default off; with more than one replica, each orders work younger than
+`SELFHOST_ADMISSION_SPREAD_GRACE_MS` by a per-process salted hash of its machine directory so replicas
+stop racing on the same oldest entries) are read only in `async` and `drain`. The mode is never taken from a
 request. Semantics: `docs/selfhost-async-admission.md`.
 
 Sizing with `INGEST_LEDGER=s3`: one admission of a 100-record batch holds a few MB (the batch, its
