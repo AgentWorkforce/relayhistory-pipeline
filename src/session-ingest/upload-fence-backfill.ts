@@ -96,6 +96,19 @@ export interface BackfillOptions {
   /** With slotsByOrg, the per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the windows. */
   slotOrgReadMaxRows?: number;
   /**
+   * With slotsByOrg only: milliseconds slept between two FETCHes of an org's slot cursor (default 0: no pause, the
+   * read unchanged), in [0, SLOT_PACE_MAX_MS]. A paced org read that would outlive SLOTS_ORG_PACED_READ_MAX_MS fails
+   * closed (slot_read_too_long, counted failed). See SLOTS_ORG_CURSOR.
+   */
+  slotPaceMs?: number;
+  /**
+   * With slotsByOrg only: rows per FETCH of the org slot cursor, in [SLOT_FETCH_ROWS_MIN, SLOT_FETCH_ROWS_MAX]. Default
+   * 5000 unpaced (the read unchanged) and SLOT_FETCH_ROWS_PACED (2000) when slotPaceMs > 0: smaller, evener bursts.
+   */
+  slotFetchRows?: number;
+  /** The clock for the paced read's duration bound (default Date.now); tests inject one. */
+  now?: () => number;
+  /**
    * Revision entries buffered across pages and windows before one merge pass (default MERGE_BUFFER_ENTRIES): each
    * shard is read and written once per pass, not once per page or window.
    */
@@ -154,6 +167,13 @@ export interface BackfillSummary {
  * checks, so the wrap loses only changes of an exact multiple of the modulus. hashtext is a server-internal hash,
  * stable within one server but not a cross-version contract: the fingerprint is compared only between two receipts
  * at the same commit from the same database, under 24 h apart, and is never stored outside the receipts.
+ *
+ * Snapshot caveat (slotsByOrg): a scoped slotsByOrg run whose slot pass runs (ownership or revisions) does not send
+ * FINGERPRINT_SLOTS; its three slots values are summed from the pass's own per-org cursor reads (SlotFingerprint, with
+ * hashtext computed by the server per row), equal to FINGERPRINT_SLOTS over the same rows, but read in each org's
+ * cursor snapshot, later than (and per org apart from) the one snapshot of the revisions and ownership values. They
+ * then describe exactly the slots the run processed. The gate's equality check keeps its meaning: an owned-slot row
+ * changed between two runs' reads still moves a value.
  */
 export interface BackfillFingerprint {
   revisions_count: number;
@@ -276,17 +296,55 @@ SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, cu
 FROM sessions.ingest_lazy_native_slots
 WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND ctid >= $2::tid AND ctid < $3::tid`;
 /**
- * A scoped run's slots, one org at a time through ingest_lazy_native_slots' org_id index in ONE short read-only
- * transaction (a server-side cursor fetched to the end before any S3 work, so no snapshot outlives the read). A keyset
- * page over key_sha256 re-sorts the whole org on every page, and the block walk reads the whole heap for any scope.
+ * The owned slot's row text the input fingerprint hashes (FINGERPRINT_SLOTS, and per row in SLOTS_ORG_CURSOR): every
+ * nullable column coalesced to a fixed sentinel, so a NULL keeps its position and the row still counts.
+ */
+const SLOT_FINGERPRINT_ROW = "concat_ws(E'\\t', key_sha256, current_owner, coalesce(current_source, '~'), coalesce(current_session, '~'), coalesce(current_revision::text, '~'), coalesce(current_digest, '~'))";
+/**
+ * A scoped run's slots, one org at a time through ingest_lazy_native_slots' org_id index in ONE read-only transaction
+ * (a server-side cursor fetched to the end before any S3 work, so no snapshot outlives the read and no S3 latency
+ * lengthens it). A keyset page over key_sha256 re-sorts the whole org on every page, and the block walk reads the
+ * whole heap for any scope.
+ *
+ * Each row also carries `fp_hash`, Postgres's own hashtext of SLOT_FINGERPRINT_ROW (the exact expression
+ * FINGERPRINT_SLOTS sums), so the run's slots fingerprint is summed from this pass in TypeScript (slotFingerprintOf)
+ * instead of a second read of the same rows: hashtext is server-internal and not reproduced in TypeScript; only the
+ * exact integer sum and the modulus normalisation are, and those are plain integer arithmetic (BigInt).
+ *
+ * Pacing (slotPaceMs, slotFetchRows): the read sleeps between FETCHes, so a multi-million-row org is read as a stream
+ * of small index-scan bursts instead of one IO-saturating sweep. The rows are still buffered to the end and processed
+ * after the ROLLBACK (not per batch): S3 work inside the open transaction would stretch the snapshot by minutes of
+ * merges, and the read must stay one snapshot (the fingerprint's and the ownership/revision pass's view of the org).
+ * Pacing lengthens the transaction by design, so a paced read is bounded by SLOTS_ORG_PACED_READ_MAX_MS: a read that
+ * would outlive it is abandoned (ROLLBACK) and the org fails closed (slot_read_too_long, counted failed in each run
+ * section, so the receipt is incomplete and binds nothing); it is never retried through the block windows, which
+ * would read the heap that pacing is meant to spare. Each FETCH stays under statement_timeout and the pause under the
+ * session's idle_in_transaction_session_timeout (60 s; SLOT_PACE_MAX_MS is 5 s).
  */
 const SLOTS_ORG_CURSOR = `
 DECLARE backfill_slots NO SCROLL CURSOR FOR
-SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
+SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest,
+       hashtext(${SLOT_FINGERPRINT_ROW})::bigint AS fp_hash
 FROM sessions.ingest_lazy_native_slots WHERE org_id = $1::text`;
-const SLOTS_ORG_FETCH = `FETCH FORWARD 5000 FROM backfill_slots`;
-/** Above this many slots in one org the org-scoped read falls back to the block walk (bounded memory). */
+const slotsOrgFetch = (rows: number) => `FETCH FORWARD ${rows} FROM backfill_slots`;
+/**
+ * Above this many slots in one org the org-scoped read stops buffering rows (bounded memory) and the org's rows are
+ * processed through the block walk; the cursor is still read to the end for the org's fingerprint.
+ */
 export const SLOTS_ORG_READ_MAX_ROWS = 2_000_000;
+/** slotPaceMs bounds (ms): 0 is unpaced. */
+export const SLOT_PACE_MAX_MS = 5_000;
+/** slotFetchRows bounds, and the defaults: unpaced (the original 5000) and paced. */
+export const SLOT_FETCH_ROWS_MIN = 100;
+export const SLOT_FETCH_ROWS_MAX = 50_000;
+export const SLOT_FETCH_ROWS_DEFAULT = 5_000;
+export const SLOT_FETCH_ROWS_PACED = 2_000;
+/**
+ * The longest a PACED org slot read may hold its read-only transaction (30 min). Long enough for an org of about 3M
+ * slots at 2000 rows and 500 ms a fetch (1500 fetches, about 13 min of pauses plus the reads); short enough that one
+ * snapshot does not hold back vacuum on the primary for hours. Unpaced reads are not bounded by it (unchanged).
+ */
+export const SLOTS_ORG_PACED_READ_MAX_MS = 30 * 60_000;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
@@ -328,11 +386,47 @@ const FINGERPRINT_OWNERSHIP = `
 SELECT count(*)::bigint AS n,
        ${hashSum("concat_ws(E'\\t', org_id, workspace_id, user_id, origin_id, source, session_id)")} AS h
 FROM sessions.ingest_session_ownership WHERE ${SCOPE}`;
-// Every nullable column coalesced to a fixed sentinel, so a NULL keeps its position and the row still counts.
+// Every nullable column coalesced to a fixed sentinel (SLOT_FINGERPRINT_ROW), so a NULL keeps its position and the row
+// still counts. A scoped slotsByOrg run does not send it: it sums the same values from its slot cursor (slotFingerprintOf).
 const FINGERPRINT_SLOTS = `
 SELECT count(*)::bigint AS n, (coalesce(sum(current_revision), 0) % ${SLOTS_REVISION_SUM_MODULUS})::bigint AS rev_sum,
-       ${hashSum("concat_ws(E'\\t', key_sha256, current_owner, coalesce(current_source, '~'), coalesce(current_session, '~'), coalesce(current_revision::text, '~'), coalesce(current_digest, '~'))")} AS h
+       ${hashSum(SLOT_FINGERPRINT_ROW)} AS h
 FROM sessions.ingest_lazy_native_slots WHERE ${SCOPE} AND current_owner IS NOT NULL`;
+
+/**
+ * FINGERPRINT_SLOTS's three values, accumulated in TypeScript over slot rows read with SLOTS_ORG_CURSOR (each with its
+ * server-computed `fp_hash`): count of owned rows, the exact sum of their non-NULL current_revision, the exact sum of
+ * their fp_hash. `result` applies the SQL's normalisation exactly: rev_sum = sum % 2^53, h = ((sum % 2^40) + 2^40) %
+ * 2^40, where BigInt's % keeps the dividend's sign as numeric's does. Sums over disjoint org sets add, so per-org
+ * accumulators combine into the scope's value.
+ */
+export class SlotFingerprint {
+  count = 0n;
+  revisionSum = 0n;
+  hashSum = 0n;
+  add(r: Record<string, unknown>): void {
+    if (r.current_owner === null || r.current_owner === undefined) return;
+    this.count++;
+    if (r.current_revision !== null && r.current_revision !== undefined) this.revisionSum += bigIntOf(r.current_revision);
+    this.hashSum += bigIntOf(r.fp_hash);
+  }
+  merge(o: SlotFingerprint): void {
+    this.count += o.count;
+    this.revisionSum += o.revisionSum;
+    this.hashSum += o.hashSum;
+  }
+  /** As FINGERPRINT_SLOTS's row: { n, rev_sum, h } (strings, as pg returns bigint). */
+  result(): { n: string; rev_sum: string; h: string } {
+    const rev = this.revisionSum % BigInt(SLOTS_REVISION_SUM_MODULUS), m = BigInt(FINGERPRINT_HASH_MODULUS);
+    return { n: String(this.count), rev_sum: String(rev), h: String(((this.hashSum % m) + m) % m) };
+  }
+}
+const bigIntOf = (v: unknown): bigint => {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number" && Number.isSafeInteger(v)) return BigInt(v);
+  if (typeof v === "string" && /^-?[0-9]{1,20}$/.test(v)) return BigInt(v);
+  throw new Error("backfill_fingerprint_invalid");
+};
 
 const userKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
 /**
@@ -440,6 +534,13 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   if (!Number.isInteger(slotWindow) || slotWindow < 1 || slotWindow > 1_048_576) throw new Error("backfill_slot_window_invalid");
   const slotOrgMax = opts.slotOrgReadMaxRows ?? SLOTS_ORG_READ_MAX_ROWS;
   if (!Number.isInteger(slotOrgMax) || slotOrgMax < 0) throw new Error("backfill_slot_org_max_invalid");
+  const slotPaceMs = opts.slotPaceMs ?? 0;
+  const slotFetchRows = opts.slotFetchRows ?? (slotPaceMs > 0 ? SLOT_FETCH_ROWS_PACED : SLOT_FETCH_ROWS_DEFAULT);
+  if (!Number.isInteger(slotPaceMs) || slotPaceMs < 0 || slotPaceMs > SLOT_PACE_MAX_MS ||
+      !Number.isInteger(slotFetchRows) || slotFetchRows < SLOT_FETCH_ROWS_MIN || slotFetchRows > SLOT_FETCH_ROWS_MAX ||
+      ((opts.slotPaceMs !== undefined || opts.slotFetchRows !== undefined) && opts.slotsByOrg !== true)) throw new Error("backfill_slot_pace_invalid");
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = opts.now ?? Date.now;
   const mergeBuffer = opts.mergeBufferEntries ?? MERGE_BUFFER_ENTRIES;
   if (!Number.isInteger(mergeBuffer) || mergeBuffer < 1 || mergeBuffer > 50_000_000) throw new Error("backfill_merge_buffer_invalid");
   const sections = new Set(opts.sections ?? BACKFILL_SECTIONS);
@@ -456,6 +557,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const orgs = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
   /** A scoped run sends its scoped reads as plain `org_id = ANY($1)` (scopedSql) with custom plans. */
   const scopedRun = orgs !== null;
+  /**
+   * A scoped slotsByOrg run whose slot pass runs (ownership or revisions) takes the slots fingerprint from that pass's
+   * per-org cursors (SlotFingerprint) instead of FINGERPRINT_SLOTS: each org's slots are read once. Those three values
+   * are then from each org's cursor snapshot, not from the run-start snapshot of the revisions and ownership values.
+   */
+  const slotsFromCursor = opts.slotsByOrg === true && orgs !== null && (sections.has("revisions") || sections.has("ownership"));
   // The dry run's defence in depth: every mutation throws (and is counted `failed`), so nothing is written.
   const store: ObjectStore = opts.dryRun
     ? new Proxy(opts.store, {
@@ -506,21 +613,37 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     }
   }
   const readOnly = async (query: string, params: unknown[]) => (await readOnlyAll([[query, params]]))[0]!;
-  /** One org's slots via SLOTS_ORG_CURSOR in one read-only transaction; null when over SLOTS_ORG_READ_MAX_ROWS. */
-  function readOnlySlotsOfOrg(org: string): Promise<Record<string, unknown>[] | null> {
+  /**
+   * One org's slots via SLOTS_ORG_CURSOR in one read-only transaction, read to the end (paced when slotPaceMs > 0), with
+   * the org's slot fingerprint. `rows` is null when over SLOTS_ORG_READ_MAX_ROWS (rows dropped, the cursor still read to
+   * the end for the fingerprint). A paced read that would outlive SLOTS_ORG_PACED_READ_MAX_MS throws `slot_read_too_long`.
+   */
+  function readOnlySlotsOfOrg(org: string): Promise<{ rows: Record<string, unknown>[] | null; fingerprint: SlotFingerprint }> {
+    const fetch = slotsOrgFetch(slotFetchRows);
     const run = txTail.then(async () => {
+      const started = now();
+      const tooLong = (more: number) => {
+        if (slotPaceMs > 0 && now() - started + more > SLOTS_ORG_PACED_READ_MAX_MS) throw Object.assign(new Error("slot_read_too_long"), { code: "slot_read_too_long" });
+      };
       await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       try {
         const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
         if (ro !== "on") throw new Error("backfill_not_read_only");
         await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
         await sql.query(SLOTS_ORG_CURSOR, [org]);
-        const out: Record<string, unknown>[] = [];
-        for (;;) {
-          const rows = (await sql.query(SLOTS_ORG_FETCH)).rows;
-          if (rows.length === 0) return out;
-          for (const r of rows) out.push(r);
-          if (out.length > slotOrgMax) return null;
+        let out: Record<string, unknown>[] | null = [];
+        const fingerprint = new SlotFingerprint();
+        for (let first = true; ; first = false) {
+          if (!first && slotPaceMs > 0) { tooLong(slotPaceMs); await sleep(slotPaceMs); }
+          const rows = (await sql.query(fetch)).rows;
+          tooLong(0);
+          if (rows.length === 0) return { rows: out, fingerprint };
+          for (const r of rows) {
+            fingerprint.add(r);
+            delete r.fp_hash;
+            out?.push(r);
+          }
+          if (out !== null && out.length > slotOrgMax) out = null;
         }
       } finally {
         await sql.query("ROLLBACK").catch(() => {});
@@ -609,8 +732,10 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
   // ---- input fingerprint: before any section, one snapshot, every value a safe integer or the run refuses ----
   {
-    const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]], [FINGERPRINT_SLOTS, [orgs]]]);
-    const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(revs![0]?.h), int(owns![0]?.n), int(owns![0]?.h), int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)];
+    const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]],
+      // From the slot pass instead (slotsFromCursor): placeholders here, replaced after it.
+      ...(slotsFromCursor ? [] : [[FINGERPRINT_SLOTS, [orgs]] as [string, unknown[]]])]);
+    const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(revs![0]?.h), int(owns![0]?.n), int(owns![0]?.h), ...(slotsFromCursor ? [0, 0, 0] : [int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)])];
     if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
     const [revisionsCount, maxMs, revisionsHash, ownershipCount, ownershipHash, slotsCount, revisionSum, slotsHash] = values as number[];
     summary.fingerprint = { revisions_count: revisionsCount!, revisions_max_updated_ms: maxMs!, revisions_hash: revisionsHash!, ownership_count: ownershipCount!,
@@ -860,10 +985,22 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     // hundred thousand slots, where the block walk reads the whole multi-GB heap. An org above SLOTS_ORG_READ_MAX_ROWS,
     // or the all-orgs scope, uses the block walk below.
     let walkOrgs: string[] | null = orgs ?? null;
+    const slotsFingerprint = new SlotFingerprint();
     if (opts.slotsByOrg === true && orgs && orgs.length > 0) {
       walkOrgs = [];
       for (const org of orgs) {
-        let rows = await readOnlySlotsOfOrg(org);
+        let read: Awaited<ReturnType<typeof readOnlySlotsOfOrg>>;
+        try {
+          read = await readOnlySlotsOfOrg(org);
+        } catch (error) {
+          if ((error as { code?: unknown })?.code !== "slot_read_too_long") throw error;
+          // Fail closed: the org's slots are neither processed nor walked, and each run section is incomplete.
+          if (sections.has("revisions")) { summary.revisions.failed++; summary.revisions.failed_codes.slot_read_too_long = (summary.revisions.failed_codes.slot_read_too_long ?? 0) + 1; }
+          if (sections.has("ownership")) failOwner("slot_read_too_long");
+          continue;
+        }
+        slotsFingerprint.merge(read.fingerprint);
+        let rows = read.rows;
         if (rows === null) { walkOrgs.push(org); continue; }
         // Slices are handed on and dropped as they go, so the org's rows are freed while the buffers fill.
         while (rows.length > 0) await slotRows(rows.splice(0, 5000));
@@ -881,6 +1018,13 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       if (block + slotWindow >= blocks) break;
     }
     await flush(slotBuf);
+    if (slotsFromCursor) {
+      // FINGERPRINT_SLOTS's values from the pass (an org that failed contributes nothing, but its sections are incomplete).
+      const fp = slotsFingerprint.result();
+      const values = [int(fp.n), int(fp.rev_sum), int(fp.h)];
+      if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
+      [summary.fingerprint.slots_owned_count, summary.fingerprint.slots_revision_sum, summary.fingerprint.slots_hash] = values as number[];
+    }
     if (sections.has("revisions")) {
       const v = summary.revisions;
       summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
