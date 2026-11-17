@@ -14,7 +14,8 @@ import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { runUserErase, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
+import { RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
+import { exitCodeForError } from "../user-erase-main.ts";
 
 setDefaultTimeout(300_000);
 const open: Array<() => unknown> = [];
@@ -736,3 +737,65 @@ describe("operator per-user erase (058010)", () => {
     expect(cand).not.toContain("Seq Scan");
   });
 });
+
+describe("operator per-user erase: relayfacts pre-begin step (062100)", () => {
+  /** One relayfacts record with one evidence row, written as the analysis worker writes it. */
+  const fact = (f: Fixture, t: Tenant, title: string, session: string) => f.db.transaction(async (tx) => {
+    await tx.exec("SET LOCAL ROLE service_role");
+    await tx.query("SELECT * FROM sessions.relayfacts_insert_v1($1,$2,$3::jsonb)", [t.orgId, t.workspaceId, JSON.stringify([{
+      topic: "src-session-erase", title, statement: `${title} statement.`,
+      evidence: [{ source: "claude", session_id: session, turn_start: 0, turn_end: 1, claim: `${title} claim.` }] }])]);
+  });
+  const evidence = async (f: Fixture) => (await f.db.query<{ s: string }>(
+    "SELECT session_id s FROM sessions.relayfacts_evidence_v1 ORDER BY 1")).rows.map((r) => r.s);
+
+  test("a buffered-only user: the step runs first through the real function, finds no session, and the erase completes", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    const db = pgDb(f);
+    const out = await runUserErase(db, { requestId: "req-rf", ...ALICE }, {
+      keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 0, sleep: async () => {}, relayfacts: sqlUserEraseRelayfacts(db),
+    });
+    expect(out).toMatchObject({ state: "bytes_verified", verified: true,
+      relayfacts: { sessions: 0, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 } });
+  });
+
+  test("a published user: the relayfacts erase commits and fences, then begin refuses RH040 (exit 2) and changes nothing else", async () => {
+    const f = await fixture();
+    await f.db.query("SET session_replication_role=replica");
+    await insertMinimal(f, "session_index", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, harness: "claude", session_id: "s-pub", machine_id: "srv_x", user_id: ALICE.userId, storage_provider: "s3" });
+    await insertMinimal(f, "session_index", { org_id: BOB.orgId, workspace_id: BOB.workspaceId, harness: "claude", session_id: "s-bob", machine_id: "srv_y", user_id: BOB.userId, storage_provider: "s3" });
+    await f.db.query("SET session_replication_role=origin");
+    await fact(f, ALICE, "Alice decision", "s-pub");
+    await fact(f, BOB, "Bob decision", "s-bob");
+    const logs: Record<string, unknown>[] = [];
+    const db = pgDb(f);
+    const err = await runUserErase(db, { requestId: "req-pub", ...ALICE }, {
+      keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), sleep: async () => {}, relayfacts: sqlUserEraseRelayfacts(db), log: (e) => logs.push(e),
+    }).then(() => null, (e: unknown) => e);
+    expect(sqlstateOf(err)).toBe("RH040");
+    expect(exitCodeForError(err)).toBe(2);
+    expect(logs[0]).toEqual({ event: "user_erase_relayfacts", sessions: 1, fencesAdded: 1, evidenceRows: 1, recordsDeleted: 1, recordsRewritten: 0 });
+    expect(await evidence(f)).toEqual(["s-bob"]);
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.operator_user_erasures")).rows[0]!.n).toBe(0);
+    // The fence outlives the refusal: a late analysis write for the erased session is refused.
+    expect(await sqlstate(fact(f, ALICE, "Late decision", "s-pub"))).toBe("RH016");
+  });
+
+  test("a relayfacts failure stops the job before begin: nothing of the erase ledger is written", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await f.db.query(`INSERT INTO sessions.operator_user_erasures(request_id, org_id, workspace_id, user_id, state, origins)
+                      VALUES ('req-bob', $1, $2, $3, 'purging', '{}')`, [BOB.orgId, BOB.workspaceId, BOB.userId]);
+    const db = pgDb(f);
+    const err = await runUserErase(db, { requestId: "req-bob", ...ALICE }, {
+      keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), sleep: async () => {}, relayfacts: sqlUserEraseRelayfacts(db),
+    }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayfactsEraseFailed);
+    expect((err as RelayfactsEraseFailed).sqlstate).toBe("22023");
+    expect(exitCodeForError(err)).toBe(2);
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.operator_user_erasures WHERE user_id=$1", [ALICE.userId])).rows[0]!.n).toBe(0);
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences")).rows[0]!.n).toBe(0);
+  });
+});
+const sqlstateOf = (e: unknown) => (e as { code?: string } | null)?.code ?? null;

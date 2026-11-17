@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { CONFIRMATION, parseUserEraseRequest, runUserErase, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
-import { exitCodeForError, exitCodeForResult, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
+import { CONFIRMATION, parseUserEraseRequest, RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
+import { exitCodeForError, exitCodeForResult, relayfactsUserEraseEnabled, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { LEGACY_EXPORT_ORIGIN_ID } from "../../shared/legacy-export-machine.ts";
 
@@ -87,5 +87,109 @@ describe("user-erase entry", () => {
     const failing = { query: async (text: string) => { seen.push(text); if (text.startsWith("SELECT")) throw Object.assign(new Error("lock"), { code: "55P03" }); return { rows: [] }; } };
     await expect(runUserErase(failing, { requestId: "r", orgId: "o", workspaceId: "w", userId: "u" }, { keyRoot: "96bulls", eraser: eraser as never })).rejects.toThrow("lock");
     expect(seen.at(-1)).toBe("ROLLBACK");
+  });
+});
+
+describe("user-erase relayfacts step (20261105062100, SUMMARY_DECISION_RECORDS_ENABLED)", () => {
+  const ENV = {
+    OPERATOR_USER_ERASE_ENABLED: "1", SESSION_ERASE_S3_BUCKET: "bkt", SESSION_ERASE_S3_REGION: "us-east-1",
+    SESSION_ERASE_S3_ACCESS_KEY_ID: "erase-key", SESSION_ERASE_S3_SECRET_ACCESS_KEY: "erase-secret-x",
+  };
+  const COUNTS = { sessions: 2, fencesAdded: 3, evidenceRows: 4, recordsDeleted: 1, recordsRewritten: 1 };
+  const VIEW = { state: "bytes_verified", origins: [], tokens_revoked: 0, deleted: {}, done: true };
+  const eraser = () => ({ eraseStep: async () => { throw new Error("no bytes phase expected"); } }) as never;
+  /** A fake owner connection: records every statement; `fail` maps a SQL prefix to a thrown error. */
+  function fakeDb(opts: { relayfacts?: unknown; fail?: Record<string, unknown> } = {}) {
+    const seen: { text: string; params?: unknown[] }[] = [];
+    return {
+      seen,
+      query: async (text: string, params?: unknown[]) => {
+        seen.push({ text, ...(params ? { params } : {}) });
+        for (const [prefix, err] of Object.entries(opts.fail ?? {})) if (text.startsWith(prefix)) throw err;
+        if (text.startsWith("SELECT sessions.relayfacts_user_erase_v1")) return { rows: [{ r: "relayfacts" in opts ? opts.relayfacts : COUNTS }] };
+        return { rows: text.startsWith("SELECT") ? [{ r: VIEW }] : [] };
+      },
+    };
+  }
+  const run = (env: Record<string, string | undefined>, db: ReturnType<typeof fakeDb>, logs: Record<string, unknown>[] = []) =>
+    runUserEraseMain(env, () => JSON.stringify(good), { db, eraser, log: (e) => logs.push(e) });
+
+  test("flag: exactly \"true\" enables; unset, \"1\", \"TRUE\" and empty are off", () => {
+    expect(relayfactsUserEraseEnabled({})).toBe(false);
+    for (const v of ["1", "TRUE", "", "yes", " true"]) expect(relayfactsUserEraseEnabled({ SUMMARY_DECISION_RECORDS_ENABLED: v })).toBe(false);
+    expect(relayfactsUserEraseEnabled({ SUMMARY_DECISION_RECORDS_ENABLED: "true" })).toBe(true);
+  });
+
+  test("flag off: no SQL names relayfacts, no relayfacts key in the result, no relayfacts log event", async () => {
+    for (const env of [ENV, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "1" }, { ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "TRUE" }]) {
+      const db = fakeDb(), logs: Record<string, unknown>[] = [];
+      const r = await run(env, db, logs);
+      expect(db.seen.some((q) => /relayfacts/i.test(q.text))).toBe(false);
+      expect(r).not.toHaveProperty("relayfacts");
+      expect(Object.keys(r)).toEqual(["enabled", "tokensRevoked", "steps", "leaseWaits", "state", "verified", "deleted", "prefixes", "versionsDeleted", "byteRounds"]);
+      expect(logs.some((e) => String(e.event).includes("relayfacts"))).toBe(false);
+      expect(db.seen.map((q) => q.text)).toEqual([
+        "BEGIN ISOLATION LEVEL READ COMMITTED", "SET LOCAL lock_timeout = 30000", "SET LOCAL statement_timeout = 900000",
+        "SELECT sessions.operator_user_erase_begin($1,$2,$3,$4) AS r", "COMMIT",
+      ]);
+    }
+  });
+
+  test("flag on: the relayfacts call runs first, in its own bounded transaction, before begin; counts in the result and the log", async () => {
+    const db = fakeDb(), logs: Record<string, unknown>[] = [];
+    const r = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs);
+    expect(db.seen.map((q) => q.text)).toEqual([
+      "BEGIN ISOLATION LEVEL READ COMMITTED", "SET LOCAL lock_timeout = 30000", "SET LOCAL statement_timeout = 900000",
+      "SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r", "COMMIT",
+      "BEGIN ISOLATION LEVEL READ COMMITTED", "SET LOCAL lock_timeout = 30000", "SET LOCAL statement_timeout = 900000",
+      "SELECT sessions.operator_user_erase_begin($1,$2,$3,$4) AS r", "COMMIT",
+    ]);
+    expect(db.seen[3]!.params).toEqual(["dsr-1", "org-a", "ws-a", "user-1"]);
+    expect(r).toMatchObject({ enabled: true, verified: true, relayfacts: COUNTS });
+    expect(logs[0]).toEqual({ event: "user_erase_relayfacts", ...COUNTS });
+    expect(logs[1]).toMatchObject({ event: "user_erase_begin" });
+  });
+
+  test("a failed relayfacts step: RelayfactsEraseFailed with the SQLSTATE only, rolled back, begin never called; 22023 exits 2, else 4", async () => {
+    for (const [sqlstate, exit] of [["RH015", 4], ["55P03", 4], ["22023", 2]] as const) {
+      const db = fakeDb({ fail: { "SELECT sessions.relayfacts_user_erase_v1": Object.assign(new Error("secret detail"), { code: sqlstate }) } });
+      const logs: Record<string, unknown>[] = [];
+      const err = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(RelayfactsEraseFailed);
+      expect((err as RelayfactsEraseFailed).sqlstate).toBe(sqlstate);
+      expect((err as Error).message).toBe("relayfacts_erase_failed");
+      expect(db.seen.at(-1)!.text).toBe("ROLLBACK");
+      expect(db.seen.some((q) => q.text.includes("operator_user_erase_begin"))).toBe(false);
+      expect(logs).toEqual([{ event: "user_erase_relayfacts", outcome: "failed" }]);
+      expect(exitCodeForError(err)).toBe(exit);
+    }
+    // A failure without a SQLSTATE (a dropped connection) is rerun.
+    expect(exitCodeForError(new RelayfactsEraseFailed())).toBe(4);
+  });
+
+  test("RH040 from begin after a successful relayfacts step exits 2; the relayfacts counts were logged first", async () => {
+    const db = fakeDb({ fail: { "SELECT sessions.operator_user_erase_begin": Object.assign(new Error("published"), { code: "RH040" }) } });
+    const logs: Record<string, unknown>[] = [];
+    const err = await run({ ...ENV, SUMMARY_DECISION_RECORDS_ENABLED: "true" }, db, logs).then(() => null, (e: unknown) => e);
+    expect((err as { code?: string }).code).toBe("RH040");
+    expect(exitCodeForError(err)).toBe(2);
+    expect(logs).toEqual([{ event: "user_erase_relayfacts", ...COUNTS }]);
+    expect(db.seen.filter((q) => q.text === "COMMIT").length).toBe(1);
+  });
+
+  test("the SQL port refuses a malformed result: not an object, a missing, extra, negative or fractional count", async () => {
+    const req = { requestId: "r", orgId: "o", workspaceId: "w", userId: "u" };
+    expect(await sqlUserEraseRelayfacts(fakeDb()).erase(req)).toEqual(COUNTS);
+    for (const bad of [null, [], "x", { ...COUNTS, sessions: -1 }, { ...COUNTS, evidenceRows: 1.5 }, { ...COUNTS, extra: 0 },
+      { sessions: 0, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0 }, { ...COUNTS, recordsRewritten: "1" }]) {
+      const db = fakeDb({ relayfacts: bad });
+      await expect(sqlUserEraseRelayfacts(db).erase(req)).rejects.toThrow("malformed result");
+    }
+    // Through runUserErase a malformed result is a failed relayfacts step: begin is never called.
+    const db = fakeDb({ relayfacts: { ...COUNTS, sessions: -1 } });
+    const err = await runUserErase(db, req, { keyRoot: "96bulls", eraser: eraser(), relayfacts: sqlUserEraseRelayfacts(db) }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayfactsEraseFailed);
+    expect(exitCodeForError(err)).toBe(4);
+    expect(db.seen.some((q) => q.text.includes("operator_user_erase_begin"))).toBe(false);
   });
 });

@@ -87,6 +87,7 @@ Both tables have row-level security enabled and no table privileges for any role
 | `sessions.relayfacts_topics_v1` | `bulls96_read_api` | List topics with record counts for one workspace. |
 | `sessions.relayfacts_list_v1` | `bulls96_read_api` | List one topic's records with evidence for one workspace, oldest first, keyset paginated. |
 | `sessions.relayfacts_evidence_erase_session_v1` | `bulls96_session_ingest` | Operator per-session erase (`20261105062090`, see Retention). |
+| `sessions.relayfacts_user_erase_v1` | owner only (the per-user erase job) | Hosted operator per-user erase (`20261105062100`, see Retention). |
 
 Writes go to the worker role. The task asked for service_role only; the read API runs as `bulls96_read_api`, so the two read functions are granted to that role instead, following the coordination advisories template (`20261105062000`). Both read functions refuse with SQLSTATE `42501` unless `sessions.session_directory_read_api_scope(workspace)` equals the requested org, so a read-API caller cannot read another workspace even with a forged org.
 
@@ -107,6 +108,7 @@ The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts
 |---|---|---|---|
 | `SUMMARY_DECISION_RECORDS_ENABLED` | session-analysis worker | off | After an analysis job completes, extract decisions and call `relayfacts_insert_v1`. Off: no extractor call, no DB call and no log line. |
 | `SUMMARY_DECISION_RECORDS_ENABLED` | self-host ingest (operator erase worker) | off | The operator per-session erase also calls `relayfacts_evidence_erase_session_v1` before its purge, and startup requires that function. Off: the erase pass makes the same calls as before. |
+| `SUMMARY_DECISION_RECORDS_ENABLED` | operator user-erase job (`src/session-erase/user-erase-main.ts`) | off | Before `operator_user_erase_begin`, the job calls `relayfacts_user_erase_v1` for the user, and logs and returns its counts. Off: the job makes the same calls as before, with no `relayfacts` result key and no relayfacts log line. |
 | `READ_API_RELAYFACTS_ENABLED` | read API (Lambda, Cloudflare worker, self-host) | off | Serve `GET /v1/relayfacts` and `GET /v1/relayfacts/{topic}`. Off: both routes answer `501 {"error":"relayfacts_disabled"}`. |
 
 ## Retention
@@ -122,7 +124,15 @@ Evidence rows carry session ids and a claim taken from that session. Migration `
 - A failure is not swallowed: the pass records `searchDocuments` as `failed_retryable` with code `relayfacts_erase_failed`, skips the purge, and the request is retried. A retry after success deletes nothing more.
 - The rollback drops the function and trigger; it does not restore erased evidence.
 
-Hosted: the extractor runs in the hosted session-pipeline Lambda, and the operator per-session erase runs only in self-host. No hosted per-session erase reaches these tables yet, so activation step 2 stays blocked on hosted until one calls this function.
+Hosted: the extractor runs in the hosted session-pipeline Lambda, and the operator per-session erase runs only in self-host. On hosted, these tables are reached by the operator per-user erase job (`docs/operator-user-erase.md`, Relayfacts step). Migration `20261105062100` adds `sessions.relayfacts_user_erase_v1`, which that job calls with `SUMMARY_DECISION_RECORDS_ENABLED=true`:
+
+- It is owner-only (no grant, not `SECURITY DEFINER`), and the job calls it in its own read-committed transaction before `operator_user_erase_begin`. It cannot run after begin, which refuses (`RH040`) while any `session_index` row of the user exists.
+- It resolves the user's sessions from `session_index` for the request's org, workspace and user, soft-deleted rows included, under both the session id and the canonical session id, and records each (source, id) pair in `sessions.relayfacts_erasure_fences`. Fence rows are permanent; only the rollback removes them.
+- It then applies the per-session rules above to every pair: the evidence rows go, a record left with no evidence is deleted, and a kept record gets the oldest remaining claim as its statement.
+- A trigger refuses (`RH016`) any later evidence insert or update for a fenced pair, so a late extractor write fails as a whole.
+- Every insert or update statement on the two tables takes a shared advisory lock that the erase takes exclusively, so the erase waits for in-flight writes and blocks new ones until it commits.
+- A failure is not swallowed: the job logs `{"event":"user_erase_relayfacts","outcome":"failed"}`, never calls begin, and exits 4 (`22023`, a malformed id or a request id that belongs to another user, exits 2). A rerun after success adds no fence and deletes nothing.
+- The rollback drops the function, the triggers and the fence table; it does not restore erased evidence.
 
 Per-user (data-subject) erase: the user erase job (`src/session-erase/user-erase.ts`) does not reach the relayfacts tables on any deployment yet. A hosted user-keyed erase is being added as migration `20261105062100` in a separate lane.
 
@@ -137,7 +147,6 @@ Out of scope, as follow-ups:
 - A kit hook that pulls the topic document at the start of a turn (layered-agents kit).
 - DM supersede events when a new decision supersedes an old one (coordination advisor).
 - A Desktop or Cloud view (relayhistory-cloud).
-- A hosted per-session erase that calls `relayfacts_evidence_erase_session_v1` (this repository; required before activation step 2 on hosted).
 - A workspace-level delete of records and evidence (this repository).
 
 ## Threat model
@@ -154,11 +163,11 @@ Out of scope, as follow-ups:
 
 Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
 
-1. Apply migrations `20261105062080` and `20261105062090` with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm both sentinels.
-2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where the per-session erase reaches these tables (see Retention), so not on hosted yet.
+1. Apply migrations `20261105062080` and `20261105062090` (and, for hosted, `20261105062100`) with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm the sentinels.
+2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where an erase reaches these tables (see Retention): on hosted, only after `20261105062100` is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the operator user-erase job.
 3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to `READ_API_DIRECTORY_WORKSPACES`, the shared canary allowlist that `requireCanary(identity, "relayfacts")` checks (see Surfacing). That also enables the other directory routes for that workspace, so add only a workspace that is cleared for them too.
 
-Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062090` first (its rollback refuses while a later migration is applied).
+Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062100` first, then `20261105062090` (each rollback refuses while a later migration is applied).
 
 ## Implementation plan
 
@@ -172,3 +181,5 @@ Rollback: unset the flags, then run the rollback files if the tables must go, `2
 5. Self-host composition rows and the runbook.
 6. Operator per-session erase (`20261105062090`), behind `SUMMARY_DECISION_RECORDS_ENABLED`.
    Implemented: the migration and rollback, the `relayfacts-erase` lane, `decisionRecords` in `src/session-erase/runtime.ts` and `selfhost-runtime.ts`; tests in `relayfacts.pglite.test.ts`, `runtime.test.ts` and `selfhost-runtime.test.ts`.
+7. Hosted operator per-user erase (`20261105062100`), behind `SUMMARY_DECISION_RECORDS_ENABLED` on the user-erase job.
+   Implemented: the migration and rollback, the `relayfacts-user-erase` lane, the pre-begin relayfacts step in `src/session-erase/user-erase.ts` and `user-erase-main.ts`; tests in `relayfacts.pglite.test.ts`, `user-erase-main.test.ts`, `migration-profile.test.ts` and `migration-target.pglite.test.ts`.

@@ -203,6 +203,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Relayfacts erase: one SECURITY DEFINER erase entry point for the operator erase (bulls96_session_ingest)
       // and a guard trigger on the 062080 evidence table. No G4 function names them, and no G4 ingest path calls them.
       "20261105062090_relayfacts_erase.sql",
+      // Relayfacts user erase: an owner-only erase function, a fence table and three triggers on the 062080 tables. No G4 function names them.
+      "20261105062100_relayfacts_user_erase.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

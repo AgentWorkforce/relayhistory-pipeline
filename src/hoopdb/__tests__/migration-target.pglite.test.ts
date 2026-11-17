@@ -860,6 +860,32 @@ test("real tree: after the full tree including 062090, the relayfacts erase func
   expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
 });
 
+test("real tree: after the full tree including 062100, the relayfacts per-user erase is owner-only and any grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const MUE = "upstream:20261105062100_relayfacts_user_erase.sql";
+  expect(s.split.held).toContain(MUE);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(MUE);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  // The per-user erase job connects as the schema owner; no runtime role, not even the ingest login, may call it.
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  for (const [fn, role] of [
+    ["sessions.relayfacts_user_erase_v1(text,text,text,text)", "bulls96_session_ingest"],
+    ["sessions.relayfacts_user_erase_guard_v1()", "service_role"],
+  ] as const) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
+});
+
 test("real tree: the live gate excuses only absent signatures a held, unledgered step creates", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);

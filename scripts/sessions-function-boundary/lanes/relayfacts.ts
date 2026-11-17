@@ -44,3 +44,26 @@ export const relayfactsErase: LaneManifest = {
   },
   replaces: {},
 };
+
+const USER_ERASE_MIGRATION = "supabase/migrations/20261105062100_relayfacts_user_erase.sql";
+
+/**
+ * Lane: relayfacts-user-erase (slot 062100).
+ * The hosted operator per-user erase of decision evidence, run by the schema-owner login of the per-user erase
+ * job before operator_user_erase_begin (owner-only: no EXECUTE grant), the statement triggers that serialize
+ * relayfacts writes against it, and the trigger that refuses evidence for a user-erased session. Its own prefix:
+ * "sessions.relayfacts_evidence_" belongs to the relayfacts-erase lane and the generator refuses overlaps.
+ */
+export const relayfactsUserErase: LaneManifest = {
+  lane: "relayfacts-user-erase",
+  owner: "relayfacts operator per-user erase of decision evidence (slot 062100)",
+  migration: USER_ERASE_MIGRATION,
+  prefixes: ["sessions.relayfacts_user_erase_"],
+  grantSources: [],
+  functions: {
+    "sessions.relayfacts_user_erase_v1(text,text,text,text)": { secdef: false, grants: [] },
+    "sessions.relayfacts_user_erase_lock_v1()": { secdef: true, grants: [] },
+    "sessions.relayfacts_user_erase_guard_v1()": { secdef: true, grants: [] },
+  },
+  replaces: {},
+};

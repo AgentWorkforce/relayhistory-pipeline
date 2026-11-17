@@ -83,7 +83,9 @@ way:
   same request (it resumes from `purging`). Do not delete the published rows by hand.
 - **Known gap: published AND buffered users.** The per-session erase refuses lazy/buffered orgs (`RH011`), and this
   lane refuses users with published state (`RH040`). A user with both has no automated path today: hold the request
-  and hand it to the operator session-erase owner explicitly; do not work around either refusal.
+  and hand it to the operator session-erase owner explicitly; do not work around either refusal. With
+  `SUMMARY_DECISION_RECORDS_ENABLED=true`, the relayfacts step still runs (and commits) before `begin` refuses
+  `RH040`: the user's relayfacts evidence is erased and fenced even though the rest of the request is refused.
 - **Not covered here** (each with the reason; report them in the request):
   - `upload_consent_holds`: operator containment records (`hold_id`, `''` widens a hold); deleting one would release
     a hold. They carry no session or origin, only org/workspace/user and a reason code.
@@ -95,6 +97,7 @@ way:
     models: they exist only for published sessions, which this lane refuses (`RH040`); the per-session erase owns them.
   - `babysitter_evidence_index`, `babysitter_retention_objects`, `migration_*` audit tables, `session_analysis_*`:
     separate lanes with their own retention and erase paths.
+  - Relayfacts (`relayfacts_v1`, `relayfacts_evidence_v1`) are now covered, with the flag on: see "Relayfacts step".
   - relayhistory-cloud's Neon `sessions.auth_sessions` and `sessions.probe_connections` copies: a separate database
     this function cannot reach. Revoke them on Neon **before** `begin` (runbook step 0 below).
   - database backups, WAL archives, S3 access logs and CloudTrail: they expire on their retention; report them.
@@ -174,6 +177,7 @@ decision. Then rerun the same request: `complete` deletes the now-unreferenced s
 
 | Phase | Where | Effect |
 |---|---|---|
+| relayfacts (pre-begin) | `sessions.relayfacts_user_erase_v1(request, org, ws, user)` | Only with `SUMMARY_DECISION_RECORDS_ENABLED=true`, in its own read-committed transaction before `begin`. Fences and erases the relayfacts evidence of every session of the user (see "Relayfacts step"). A failure stops the job before `begin`. |
 | `begin` | `sessions.operator_user_erase_begin(request, org, ws, user)` | Creates (if absent) and locks the user's fence row, deletes the user's `ingest_publication_frontiers` (publication and history-plan claims need them), refuses published state (`RH040`), captures the device origins, revokes this database's `auth_sessions` of the user (rows kept) and deletes the user's `read_api_tokens`, writes the ledger row (`purging`) in that same transaction, which turns on the ingest fence. Idempotent per `request_id`; a request id reused for another user is `22023`; a second active request for the same user is refused (`55000`) until the first reaches `bytes_verified`. |
 | `step` × N | `sessions.operator_user_erase_step(request, limit)` | One transaction per call; every call first re-runs the `RH040` probe and the shared-origin refusal (`55000` when another user's batches or slots appeared under a captured origin; nothing is changed). Phase `slots`: up to `limit` lazy slots tombstoned, plus their acks, record heads, ord seats and reconcile rows, and every seat of theirs no other slot references. Last call (`purged`, not bounded by `limit`): the user's remaining seats, every remaining per-user row in foreign-key order, the `RH040` probe once more, then probes prove none is left (`55000` otherwise), ledger → `metadata_purged`. Answers `gc_lease_active` + `retry_after_ms` while a buffered-GC lease is live on the user's stage. |
 | bytes | `src/session-erase/user-erase.ts` | Every version/delete marker under each machine prefix (strict paged eraser), settle wait, then a fresh read-only full listing. Anything found (a late in-flight PUT) is erased and re-verified, up to 3 rounds. |
@@ -196,6 +200,29 @@ wait there could deadlock with a step holding the erase lock and waiting for the
 the authority lock shared, activation and an erase transaction simply wait for each other in one direction.
 The bytes phase starts only after the stage rows are gone, so the GC can no longer claim the user's objects.
 
+## Relayfacts step
+
+Migration `20261105062100` (`docs/relayfacts.md`, Retention). With `SUMMARY_DECISION_RECORDS_ENABLED` exactly `true`
+on the job, it first calls the owner-only `sessions.relayfacts_user_erase_v1(request, org, ws, user)` in its own
+transaction (read committed, the same 30 s lock and 15 min statement timeouts), then runs `begin`. It must run before
+`begin`: `begin` refuses (`RH040`) while any `session_index` row of the user exists, soft-deleted rows included, and
+this step reads those rows to find the user's sessions.
+
+- Sessions: every `session_index` row of the org, workspace and user, soft-deleted rows included, under both the
+  session id and the canonical session id, per source (harness).
+- Fences: each (source, id) pair is recorded permanently in `sessions.relayfacts_erasure_fences` (with the request
+  id). A trigger refuses (`RH016`) any later relayfacts evidence write for a fenced pair.
+- Erase: the pairs' evidence rows are deleted; a record left without evidence is deleted; a kept record's statement
+  becomes its oldest remaining claim. `RH015` if any of the pairs' evidence remains.
+- Serialization: relayfacts writes take a shared advisory lock per statement; this step takes it exclusively, so it
+  waits for in-flight writes and blocks new ones until it commits.
+- Result and log: the job result gains `"relayfacts": {sessions, fencesAdded, evidenceRows, recordsDeleted,
+  recordsRewritten}` and logs `{"event":"user_erase_relayfacts", ...counts}`; a failure logs
+  `{"event":"user_erase_relayfacts","outcome":"failed"}` and stops before `begin`. A rerun adds no fence and deletes
+  nothing (zero counts except `sessions`). A workspace id of `''` returns zeros.
+- Flag off (unset or anything but `true`): no relayfacts SQL, no `relayfacts` result key and no relayfacts log line;
+  the job is unchanged.
+
 ## Running it
 
 **Step 0, before `begin`: revoke the user on relayhistory-cloud's Neon database** (`sessions.auth_sessions` there, and
@@ -211,6 +238,7 @@ One-shot job, `SERVICE=user-erase` (`src/session-erase/user-erase-main.ts`):
 ```bash
 OPERATOR_USER_ERASE_ENABLED=1 \
 OPERATOR_USER_ERASE_DATABASE_URL_FILE=/run/secrets/sessions-owner-url \
+SUMMARY_DECISION_RECORDS_ENABLED=true \
 SESSION_ERASE_S3_BUCKET=… SESSION_ERASE_S3_REGION=us-east-1 \
 SESSION_ERASE_S3_ACCESS_KEY_ID_FILE=… SESSION_ERASE_S3_SECRET_ACCESS_KEY_FILE=… \
 bun run src/session-erase/user-erase-main.ts --request /abs/path/request.json
@@ -228,8 +256,9 @@ bun run src/session-erase/user-erase-main.ts --request /abs/path/request.json
   `2` refused or misconfigured (do not retry unchanged; `RH040` means hand the published sessions to the
   per-session erase first; `user_rows_remain_at_completion` means an upload root or a control head of the user
   landed after the purge, see "Ingest fence"; `user_seat_ambiguity` means a seat naming the user is still referenced
-  by another user's slot, see "Seat ambiguity"), `4` other failure, including a `lock_timeout` (`55P03`) or `statement_timeout`
-  (`57014`) (rerun).
+  by another user's slot, see "Seat ambiguity"; a relayfacts step refused with `22023`, a malformed id or a request id
+  that belongs to another user), `4` other failure, including a `lock_timeout` (`55P03`) or `statement_timeout`
+  (`57014`), and `relayfacts_erase_failed` (any other relayfacts step failure, `RH015` included) (rerun).
 - Output is one JSON line of counts; nothing logged carries an id or a key.
 
 Rerunning the same `request_id` is always safe: a finished erase answers from its ledger row.

@@ -1,4 +1,4 @@
-/** 062080 relayfacts: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback; 062090 operator erase. */
+/** 062080 relayfacts: role grants, workspace isolation, bounds, dedupe, supersede, paging and rollback; 062090 operator erase; 062100 per-user erase. */
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -343,7 +343,8 @@ describe("20261105062090 relayfacts operator erase", () => {
     expect(ERASE_DOWN).toContain(createHash("sha256").update(ERASE_SQL).digest("hex"));
     expect(ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:")).sort().at(-1)).toBe(ERASE_STEP);
+    // 20261105062100 (the hosted per-user relayfacts erase) is the only later step.
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -406,5 +407,154 @@ describe("20261105062090 relayfacts operator erase", () => {
     // The metadata purge still runs in the same lease afterwards.
     await ingest("ingest_operator_runtime_purge", [...KEY, lease]);
     expect((await db.query("SELECT 1 FROM sessions.session_index WHERE org_id='org-a' AND workspace_id='ws-a'")).rows).toEqual([]);
+  });
+});
+
+const USER_ERASE_FILE = "20261105062100_relayfacts_user_erase.sql";
+const USER_ERASE_STEP = `upstream:${USER_ERASE_FILE}`;
+const USER_ERASE_SQL = read(`supabase/migrations/${USER_ERASE_FILE}`);
+const USER_ERASE_DOWN = read("supabase/rollbacks/20261105062100_relayfacts_user_erase.down.sql");
+const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
+const USER_ERASE_LOCK = "sessions.relayfacts_user_erase_lock_v1()";
+const USER_ERASE_GUARD = "sessions.relayfacts_user_erase_guard_v1()";
+const RUNTIME_ROLES = ["anon", "authenticated", "service_role", "search_consumer_runtime", "bulls96_read_api", "bulls96_session_ingest", "bulls96_session_ingest_seeder"];
+
+describe("20261105062100 relayfacts user erase", () => {
+  let db: PGlite;
+  type Counts = { sessions: number; fencesAdded: number; evidenceRows: number; recordsDeleted: number; recordsRewritten: number };
+  const ZERO: Counts = { sessions: 0, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 };
+  const insert = (org: string, ws: string, list: unknown) =>
+    db.transaction(async (tx) => { await tx.exec("SET LOCAL ROLE service_role"); return (await tx.query<{ inserted: number; merged: number; evidence_added: number }>(
+      "SELECT * FROM sessions.relayfacts_insert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)])).rows[0]!; });
+  /** The owner connection, as the per-user erase job calls it: read committed, one statement. */
+  const erase = async (request: string, org: string, ws: string, user: string) =>
+    (await db.query<{ r: Counts }>(`SELECT ${USER_ERASE.replace(/\(.*$/, "")}($1,$2,$3,$4) AS r`, [request, org, ws, user])).rows[0]!.r;
+  const records = async () => (await db.query<{ ws: string; title: string; statement: string; evidence: string[] }>(
+    `SELECT t.workspace_id ws, t.title, t.statement,
+            coalesce((SELECT array_agg(e.source || '/' || e.session_id ORDER BY e.source, e.session_id) FROM sessions.relayfacts_evidence_v1 e WHERE e.decision_id = t.id), '{}') evidence
+       FROM sessions.relayfacts_v1 t WHERE t.org_id = 'org-u' ORDER BY t.workspace_id, t.title`)).rows;
+  const e = (source: string, session_id: string, claim: string): Ev => ({ source, session_id, turn_start: 0, turn_end: 1, claim });
+  const pointer = (ws: string, session: string, user: string, over: { canonical?: string; deleted?: boolean } = {}) => db.query(
+    `INSERT INTO sessions.session_index(
+      org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id,canonical_session_id,deleted_at)
+      VALUES('org-u',$1,'claude',$2,'machine',$3,now(),now(),'s3','bucket',$4,decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',$5,$6)`,
+    [ws, session, user, `96bulls/org-u/v1/ws=${ws}/m=machine/h=claude/d=2026/11/11/s=${session}/manifest.json`, over.canonical ?? null, over.deleted ? new Date() : null]);
+
+  beforeAll(async () => {
+    db = await migrated();
+    // user-u: a live session with a different canonical id and a soft-deleted session; user-v in the same workspace;
+    // user-u again in another workspace.
+    await pointer("ws-u", "u-1", "user-u", { canonical: "u-1-canon" });
+    await pointer("ws-u", "u-2", "user-u", { deleted: true });
+    await pointer("ws-u", "v-1", "user-v");
+    await pointer("ws-b", "u-9", "user-u");
+  });
+  afterAll(async () => { await db?.close(); });
+
+  test("inventory, sentinel and grants: owner-only erase, two pinned trigger functions, one fence table, three triggers", async () => {
+    expect(inventoryOf(USER_ERASE_SQL).map((i) => `${i.kind}:${i.name}`).sort()).toEqual([
+      "function:sessions.relayfacts_user_erase_guard_v1", "function:sessions.relayfacts_user_erase_lock_v1",
+      "function:sessions.relayfacts_user_erase_v1", "relation:sessions.relayfacts_erasure_fences",
+      "trigger:relayfacts_user_erase_guard", "trigger:relayfacts_user_erase_lock_evidence", "trigger:relayfacts_user_erase_lock_records",
+    ]);
+    expect(USER_ERASE_SQL).not.toMatch(/CONCURRENTLY/i);
+    expect(USER_ERASE_DOWN).toContain(createHash("sha256").update(USER_ERASE_SQL).digest("hex"));
+    expect(USER_ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:")).sort().at(-1)).toBe(USER_ERASE_STEP);
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
+    for (const fn of [USER_ERASE, USER_ERASE_LOCK, USER_ERASE_GUARD]) {
+      const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
+        "SELECT p.prosecdef secdef, p.proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec FROM pg_proc p WHERE p.oid=$1::regprocedure", [fn])).rows[0]!;
+      expect(r.secdef).toBe(fn !== USER_ERASE);
+      expect(r.cfg).toEqual(["search_path=pg_catalog, sessions, pg_temp"]);
+      expect(r.public_exec).toBe(false);
+      for (const role of RUNTIME_ROLES)
+        expect((await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok).toBe(false);
+    }
+    for (const role of RUNTIME_ROLES)
+      expect((await db.query<{ ok: boolean }>(
+        "SELECT has_table_privilege($1, 'sessions.relayfacts_erasure_fences', 'SELECT,INSERT,UPDATE,DELETE') ok", [role])).rows[0]!.ok).toBe(false);
+    expect((await db.query<{ rls: boolean }>("SELECT relrowsecurity rls FROM pg_class WHERE oid='sessions.relayfacts_erasure_fences'::regclass")).rows[0]!.rls).toBe(true);
+    // The service role cannot call the erase.
+    expect(await code(db.transaction(async (tx) => { await tx.exec("SET LOCAL ROLE service_role"); await tx.query(`SELECT ${USER_ERASE.replace(/\(.*$/, "")}('r','org-u','ws-u','user-u')`); }))).toBe("42501");
+  });
+
+  test("an erase removes the user's evidence under both id forms, soft-deleted sessions included, and fences them; a rerun is zero", async () => {
+    await insert("org-u", "ws-u", [rec({ title: "Only user u", statement: "U statement.", evidence: [e("claude", "u-1", "U claim.")] })]);
+    await insert("org-u", "ws-u", [rec({ title: "Canonical id only", statement: "Canonical statement.", evidence: [e("claude", "u-1-canon", "Canonical claim.")] })]);
+    // First written from the soft-deleted session, then merged from user-v: kept, statement becomes user-v's claim.
+    await insert("org-u", "ws-u", [rec({ title: "Shared decision", statement: "Deleted-session statement.", evidence: [e("claude", "u-2", "Deleted-session claim.")] })]);
+    await insert("org-u", "ws-u", [rec({ title: "shared decision.", statement: "V statement.", evidence: [e("claude", "v-1", "V claim.")] })]);
+    // Untouched: user-v alone, the same id under another source, and user-u's id in another workspace.
+    await insert("org-u", "ws-u", [rec({ title: "Only user v", statement: "V only.", evidence: [e("claude", "v-1", "V only claim.")] })]);
+    await insert("org-u", "ws-u", [rec({ title: "Other source", statement: "Codex statement.", evidence: [e("codex", "u-1", "Codex claim.")] })]);
+    await insert("org-u", "ws-b", [rec({ title: "Other workspace", statement: "Workspace B statement.", evidence: [e("claude", "u-1", "Workspace B claim.")] })]);
+
+    expect(await erase("req-u", "org-u", "ws-u", "user-u")).toEqual({ sessions: 2, fencesAdded: 3, evidenceRows: 3, recordsDeleted: 2, recordsRewritten: 1 });
+    expect(await records()).toEqual([
+      { ws: "ws-b", title: "Other workspace", statement: "Workspace B statement.", evidence: ["claude/u-1"] },
+      { ws: "ws-u", title: "Only user v", statement: "V only.", evidence: ["claude/v-1"] },
+      { ws: "ws-u", title: "Other source", statement: "Codex statement.", evidence: ["codex/u-1"] },
+      { ws: "ws-u", title: "Shared decision", statement: "V claim.", evidence: ["claude/v-1"] },
+    ]);
+    expect((await db.query<{ f: string }>("SELECT source || '/' || session_id || '@' || workspace_id || ':' || request_id f FROM sessions.relayfacts_erasure_fences ORDER BY 1")).rows.map((r) => r.f))
+      .toEqual(["claude/u-1-canon@ws-u:req-u", "claude/u-1@ws-u:req-u", "claude/u-2@ws-u:req-u"]);
+    // Idempotent: the rerun adds no fence and deletes nothing.
+    expect(await erase("req-u", "org-u", "ws-u", "user-u")).toEqual({ ...ZERO, sessions: 2 });
+
+    // Late writes for any fenced id are refused as a whole batch; other sessions, sources and workspaces still write.
+    const before = await records();
+    for (const id of ["u-1", "u-1-canon", "u-2"])
+      expect(await code(insert("org-u", "ws-u", [rec({ title: `Late ${id}`, statement: "Late.", evidence: [e("claude", id, "Late claim.")] })]))).toBe("RH016");
+    expect(await code(insert("org-u", "ws-u", [
+      rec({ title: "Fresh from v", statement: "Fresh.", evidence: [e("claude", "v-1", "Fresh claim.")] }),
+      rec({ title: "Shared decision", statement: "Late merge.", evidence: [e("claude", "u-1", "Late merge claim.")] }),
+    ]))).toBe("RH016");
+    expect(await records()).toEqual(before);
+    expect(await insert("org-u", "ws-u", [rec({ title: "Shared decision", evidence: [e("claude", "v-2", "Another session.")] })]))
+      .toEqual({ inserted: 0, merged: 1, evidence_added: 1 });
+    expect(await insert("org-u", "ws-b", [rec({ title: "Other workspace", evidence: [e("claude", "u-1", "Workspace B again.")] })])).toMatchObject({ merged: 1 });
+    expect(await insert("org-u", "ws-u", [rec({ title: "Other source", evidence: [e("codex", "u-1", "Codex again.")] })])).toMatchObject({ merged: 1 });
+  });
+
+  test("refusals: another user's request id, malformed ids, a non read-committed transaction; an empty workspace is zero", async () => {
+    await db.query(`INSERT INTO sessions.operator_user_erasures(request_id, org_id, workspace_id, user_id, state, origins)
+                    VALUES ('req-v', 'org-u', 'ws-u', 'user-v', 'purging', '{}')`);
+    const fences = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences")).rows[0]!.n;
+    const n = await fences();
+    expect(await code(erase("req-v", "org-u", "ws-u", "user-u"))).toBe("22023");
+    expect(await code(erase("req-v", "org-u", "ws-b", "user-v"))).toBe("22023");
+    // The request id's own user is accepted.
+    expect(await erase("req-v", "org-u", "ws-u", "user-v")).toMatchObject({ sessions: 1, fencesAdded: 1 });
+    for (const bad of [["", "org-u", "ws-u", "user-u"], ["r", "", "ws-u", "user-u"], ["r", "org-u", "ws-u", ""], ["r", "org-u", "ws-u", "user\u0001"],
+      ["r", "org-u", "x".repeat(513), "user-u"]] as const)
+      expect(await code(erase(...bad))).toBe("22023");
+    expect(await erase("r", "org-u", "", "user-u")).toEqual(ZERO);
+    expect(await code(db.transaction(async (tx) => {
+      await tx.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await tx.query(`SELECT ${USER_ERASE.replace(/\(.*$/, "")}('r','org-u','ws-u','user-u')`);
+    }))).toBe("40001");
+    expect(await fences()).toBe(n + 1);
+  });
+
+  test("rollback: 062090's down refuses while 062100 is applied; the down drops everything and its ledger row; a rerun refuses", async () => {
+    const refusal = async (sql: string) => { const c = await code(db.exec(sql)); await db.exec("ROLLBACK"); return c; };
+    expect(await refusal(ERASE_DOWN)).toBe("55000");
+    await db.exec(USER_ERASE_DOWN);
+    const left = (await db.query<{ n: number }>(`SELECT
+      (SELECT count(*) FROM pg_proc WHERE proname LIKE 'relayfacts_user_erase%')
+      + (SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'relayfacts_user_erase%')
+      + (SELECT count(*) FROM pg_class WHERE relname = 'relayfacts_erasure_fences')
+      + (SELECT count(*) FROM sessions.__96bulls_migrations WHERE name = $1) AS n`, [USER_ERASE_STEP])).rows[0]!;
+    expect(Number(left.n)).toBe(0);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(false);
+    expect(await refusal(USER_ERASE_DOWN)).toBe("55000");
+    // The fences are gone: a write for an erased id is accepted again; erased evidence is not restored.
+    expect(await insert("org-u", "ws-u", [rec({ title: "After rollback", statement: "Late.", evidence: [e("claude", "u-1", "Late claim.")] })]))
+      .toMatchObject({ inserted: 1 });
+    // 062090 still rolls back after it.
+    await db.exec(ERASE_DOWN);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(false);
   });
 });

@@ -2,6 +2,10 @@
  * Operator per-user erase of buffered desktop uploads (data-subject deletion), DEFAULT OFF.
  * SQL: supabase/migrations/20261105058010_operator_user_erase.sql. Runbook: docs/operator-user-erase.md.
  *
+ *   0. relayfacts (flag-gated, pre-begin) only with the `relayfacts` port (SUMMARY_DECISION_RECORDS_ENABLED=true,
+ *                user-erase-main.ts): sessions.relayfacts_user_erase_v1 (20261105062100) in its own transaction
+ *                fences the user's sessions and erases their relayfacts evidence. Before begin, because begin refuses
+ *                (RH040) while the user has any session_index row; a later RH040 leaves this step done and fenced.
  *   1. begin     ledger row, the user's tokens held in this database revoked (auth_sessions revoked and kept,
  *                read_api_tokens deleted; Neon-held tokens are revoked out of band BEFORE this), the user's
  *                publication frontiers fenced, the user's device origins captured
@@ -69,6 +73,28 @@ export function parseUserEraseRequest(text: string): UserEraseRequest {
   return { requestId: o.request_id as string, orgId: o.org_id as string, workspaceId: o.workspace_id as string, userId: o.user_id as string };
 }
 
+/** Counts returned by sessions.relayfacts_user_erase_v1; never an id. */
+export interface RelayfactsUserEraseCounts {
+  sessions: number;
+  fencesAdded: number;
+  evidenceRows: number;
+  recordsDeleted: number;
+  recordsRewritten: number;
+}
+
+/** The relayfacts step (20261105062100). Absent unless SUMMARY_DECISION_RECORDS_ENABLED=true. */
+export interface UserEraseRelayfactsPort {
+  erase(req: UserEraseRequest): Promise<RelayfactsUserEraseCounts>;
+}
+
+/** The relayfacts step failed before begin; only the SQLSTATE is kept, never the message. */
+export class RelayfactsEraseFailed extends Error {
+  constructor(readonly sqlstate?: string) {
+    super("relayfacts_erase_failed");
+    this.name = "RelayfactsEraseFailed";
+  }
+}
+
 /** One SQL call in its own read-committed transaction (a pg Client or a test double). */
 export interface UserEraseDb {
   query(text: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -96,18 +122,35 @@ interface LedgerView {
 export const USER_ERASE_LOCK_TIMEOUT_MS = 30_000;
 export const USER_ERASE_STATEMENT_TIMEOUT_MS = 15 * 60_000;
 
-async function call(db: UserEraseDb, sql: string, params: unknown[]): Promise<LedgerView> {
+async function call<T = LedgerView>(db: UserEraseDb, sql: string, params: unknown[]): Promise<T> {
   await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
   try {
     await db.query(`SET LOCAL lock_timeout = ${USER_ERASE_LOCK_TIMEOUT_MS}`);
     await db.query(`SET LOCAL statement_timeout = ${USER_ERASE_STATEMENT_TIMEOUT_MS}`);
     const r = await db.query(sql, params);
     await db.query("COMMIT");
-    return r.rows[0]!.r as LedgerView;
+    return r.rows[0]!.r as T;
   } catch (e) {
     await db.query("ROLLBACK").catch(() => {});
     throw e;
   }
+}
+
+const RELAYFACTS_COUNT_KEYS = ["sessions", "fencesAdded", "evidenceRows", "recordsDeleted", "recordsRewritten"] as const;
+
+/** The relayfacts port over the owner connection: one call() transaction (read committed, same lock and statement bounds). */
+export function sqlUserEraseRelayfacts(db: UserEraseDb): UserEraseRelayfactsPort {
+  return {
+    async erase(req) {
+      const r = await call<unknown>(db, "SELECT sessions.relayfacts_user_erase_v1($1,$2,$3,$4) AS r", [req.requestId, req.orgId, req.workspaceId, req.userId]);
+      const o = r as Record<string, unknown> | null;
+      if (!o || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join() !== [...RELAYFACTS_COUNT_KEYS].sort().join()
+        || !RELAYFACTS_COUNT_KEYS.every((k) => Number.isSafeInteger(o[k]) && (o[k] as number) >= 0)) {
+        throw new Error("relayfacts user erase: malformed result");
+      }
+      return Object.fromEntries(RELAYFACTS_COUNT_KEYS.map((k) => [k, o[k]])) as unknown as RelayfactsUserEraseCounts;
+    },
+  };
 }
 
 export interface UserEraseOptions {
@@ -124,6 +167,8 @@ export interface UserEraseOptions {
   maxByteRounds?: number;
   sleep?: (ms: number) => Promise<void>;
   log?: (event: Record<string, unknown>) => void;
+  /** The relayfacts step, run before begin. Only when SUMMARY_DECISION_RECORDS_ENABLED=true (user-erase-main.ts). */
+  relayfacts?: UserEraseRelayfactsPort;
 }
 
 export interface UserEraseResult {
@@ -136,6 +181,8 @@ export interface UserEraseResult {
   prefixes: number;
   versionsDeleted: number;
   byteRounds: number;
+  /** Present only when the relayfacts step ran (flag on). */
+  relayfacts?: RelayfactsUserEraseCounts;
 }
 
 /** Every prefix a captured origin of this user can have written to. */
@@ -160,6 +207,19 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
   if (!Number.isInteger(stepLimit) || stepLimit < 1 || stepLimit > 20_000) refuse("config_invalid");
   const sleep = opts.sleep ?? sleeper, log = opts.log ?? (() => {});
 
+  let relayfacts: RelayfactsUserEraseCounts | undefined;
+  if (opts.relayfacts) {
+    try {
+      relayfacts = await opts.relayfacts.erase(req);
+    } catch (e) {
+      log({ event: "user_erase_relayfacts", outcome: "failed" });
+      const code = (e as { code?: unknown })?.code;
+      throw new RelayfactsEraseFailed(typeof code === "string" ? code : undefined);
+    }
+    log({ event: "user_erase_relayfacts", ...relayfacts });
+  }
+  const withRelayfacts = <T extends object>(r: T): T => (relayfacts ? { ...r, relayfacts } : r);
+
   let view = await call(db, "SELECT sessions.operator_user_erase_begin($1,$2,$3,$4) AS r", [req.requestId, req.orgId, req.workspaceId, req.userId]);
   log({ event: "user_erase_begin", state: view.state, origins: view.origins.length, tokens_revoked: view.tokens_revoked });
   const origins = view.origins;
@@ -180,7 +240,7 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
   // Only a verified erase short-circuits. A rerun of a metadata_purged request runs the byte phase and complete's
   // recheck again, whatever an earlier run reported.
   if (view.state === "bytes_verified") {
-    return { ...base, state: view.state, verified: true, deleted: view.deleted, prefixes: 0, versionsDeleted: 0, byteRounds: 0 };
+    return withRelayfacts({ ...base, state: view.state, verified: true, deleted: view.deleted, prefixes: 0, versionsDeleted: 0, byteRounds: 0 });
   }
 
   const prefixes = userErasePrefixes(opts.keyRoot, req, origins);
@@ -237,5 +297,5 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
       throw e;
     }
   }
-  return { ...base, state: view.state, verified, deleted: view.deleted, prefixes: prefixes.length, versionsDeleted, byteRounds };
+  return withRelayfacts({ ...base, state: view.state, verified, deleted: view.deleted, prefixes: prefixes.length, versionsDeleted, byteRounds });
 }

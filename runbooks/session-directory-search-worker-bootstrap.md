@@ -437,6 +437,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105062070_coordination_advisor_readers.sql` | functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1 (coordination advisor readers and durable limits; EXECUTE to service_role only) |
 | `upstream:20261105062080_memory_documents.sql` | tables sessions.relayfacts_v1 and sessions.relayfacts_evidence_v1 and function sessions.relayfacts_insert_v1 (relayfacts; EXECUTE to service_role and bulls96_read_api only) |
 | `upstream:20261105062090_relayfacts_erase.sql` | function sessions.relayfacts_evidence_erase_session_v1 and trigger relayfacts_evidence_fence_guard on sessions.relayfacts_evidence_v1 (relayfacts operator erase; EXECUTE to bulls96_session_ingest only) |
+| `upstream:20261105062100_relayfacts_user_erase.sql` | function sessions.relayfacts_user_erase_v1, table sessions.relayfacts_erasure_fences and triggers relayfacts_user_erase_guard, relayfacts_user_erase_lock_evidence and relayfacts_user_erase_lock_records (relayfacts per-user erase; owner-only, no EXECUTE grant) |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |

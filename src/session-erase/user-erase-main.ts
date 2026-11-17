@@ -11,12 +11,16 @@
  *                                              {"request_id","org_id","workspace_id","user_id",
  *                                               "confirmation":"ERASE ALL UPLOADS OF THIS USER"}
  *   OPERATOR_USER_ERASE_SETTLE_MS              wait before each byte verification, default 60000
+ *   SUMMARY_DECISION_RECORDS_ENABLED           exactly "true" adds the relayfacts step before begin
+ *                                              (sessions.relayfacts_user_erase_v1, 20261105062100); any other value or
+ *                                              unset: no relayfacts SQL, result and logs unchanged
  *   SESSION_ERASE_S3_BUCKET / _REGION / _ENDPOINT / _KEY_ROOT and SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE] /
  *   SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]  the transcript bucket and its ERASER key (the only principal the
  *                                              production bucket policy lets delete), as the per-session byte eraser
  *
  * Exit codes: 0 verified (or disabled); 3 not verified yet (rerun the same request: every phase resumes);
- * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun).
+ * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun). A failed relayfacts
+ * step prints relayfacts_erase_failed: 2 for 22023 (the request id belongs to another user, or a malformed id), else 4.
  * Output: one JSON result line with counts only. Runbook: docs/operator-user-erase.md.
  */
 import { readFileSync, statSync } from "node:fs";
@@ -26,7 +30,7 @@ import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migrat
 import { ownerClientConfig, OwnerUrlError } from "../shared/owner-pg-config.ts";
 import { sessionEraseConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
 import { SessionEraseRefused } from "./selfhost-eraser.ts";
-import { parseUserEraseRequest, runUserErase, UserEraseRefused, type UserEraseDb, type UserEraseResult } from "./user-erase.ts";
+import { parseUserEraseRequest, RelayfactsEraseFailed, runUserErase, sqlUserEraseRelayfacts, UserEraseRefused, type UserEraseDb, type UserEraseResult } from "./user-erase.ts";
 
 export const ENABLE_FLAG = "OPERATOR_USER_ERASE_ENABLED";
 const APPLICATION_NAME = "96bulls-operator-user-erase";
@@ -40,6 +44,12 @@ export function userEraseEnabled(env: NodeJS.ProcessEnv): boolean {
   if (raw === undefined || raw === "" || raw === "0") return false;
   if (raw === "1") return true;
   return refuse("flag_invalid");
+}
+
+/** The relayfacts step (20261105062100). Same rule as decisionRecordsEnabled in session-analysis/decision-records.ts
+ * (not imported: it would pull the extractor into the erase job): exactly "true". */
+export function relayfactsUserEraseEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.SUMMARY_DECISION_RECORDS_ENABLED === "true";
 }
 
 function readBounded(path: string): string {
@@ -108,6 +118,7 @@ export async function runUserEraseMain(
   try {
     const result = await runUserErase(db, req, {
       keyRoot: s3cfg.keyRoot, eraser, settleMs: settle,
+      ...(relayfactsUserEraseEnabled(env) ? { relayfacts: sqlUserEraseRelayfacts(db) } : {}),
       ...(overrides.sleep ? { sleep: overrides.sleep } : {}),
       log: overrides.log ?? ((e) => console.error(JSON.stringify(e))),
     });
@@ -124,6 +135,8 @@ export function exitCodeForResult(r: { enabled: false } | ({ enabled: true } & U
 /** 2: refused or misconfigured (never retried unchanged); 4: anything else, possibly partial (rerun). */
 export function exitCodeForError(e: unknown): 2 | 4 {
   if (e instanceof UserEraseRefused || e instanceof SessionEraseRefused || e instanceof OwnerUrlError) return 2;
+  // The relayfacts step ran before begin: 22023 is a refusal; anything else (RH015, a lock timeout) is rerun.
+  if (e instanceof RelayfactsEraseFailed) return e.sqlstate === "22023" ? 2 : 4;
   const code = (e as { code?: unknown })?.code;
   // RH040 (published sessions: use the per-session erase), 22023 (malformed, or the request id belongs to another
   // user), 55000 (another request is active for this user, or the purge found rows it could not remove).
@@ -153,7 +166,7 @@ if (import.meta.main) {
       process.exit(exitCodeForResult(r));
     })
     .catch((e) => {
-      const code = e instanceof UserEraseRefused || e instanceof SessionEraseRefused ? e.message
+      const code = e instanceof UserEraseRefused || e instanceof SessionEraseRefused || e instanceof RelayfactsEraseFailed ? e.message
         : e instanceof OwnerUrlError ? e.code
         : typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "user_erase_failed";
       console.error(JSON.stringify({ event: "user_erase", error: code }));
