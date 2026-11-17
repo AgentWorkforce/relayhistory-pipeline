@@ -707,7 +707,7 @@ describe("hosted presigned issuer user (cloud#6244)", () => {
 });
 
 describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written down, refused today)", async () => {
-  const { logKeys } = await import("../../../src/session-ingest/ledger-log.ts");
+  const { logKeys, logUserIndex } = await import("../../../src/session-ingest/ledger-log.ts");
   const { logStreamRegistryKey } = await import("../../../src/session-ingest/ledger-log-materialize.ts");
   const { outcomeKey, receiptDir } = await import("../../../src/session-ingest/async-admission.ts");
   const { logCommitProofKey, logModeNonProdKey } = await import("../../../src/session-ingest/ledger-log-stream-ops.ts");
@@ -739,6 +739,35 @@ describe("INGEST_LEDGER_LOG_COMMIT IAM (ledger-log-commit-policy.ts, written dow
     expect(glob(at(P.LEDGER_LOG_OUTCOMES), at(outcomeKey(dir, "refused")))).toBe(true);
     expect(glob(at(P.LEDGER_LOG_LEGACY_BATCHES), at(s3LedgerKeys(TENANT_KEY_BASE, tenant).batch("origin-1", "b1")))).toBe(true);
     expect([...P.LEDGER_LOG_MARKERS]).toEqual([logCommitProofKey(TENANT_KEY_BASE), logModeNonProdKey(TENANT_KEY_BASE)]);
+    // The user's stream index sits BESIDE ledger/log/, so the stream glob does not cover it: its own glob does.
+    expect(k.index.startsWith(logUserIndex(TENANT_KEY_BASE, tenant))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_OBJECTS), at(k.index))).toBe(false);
+    expect(glob(at(P.LEDGER_LOG_INDEX), at(k.index))).toBe(true);
+    expect(glob(at(P.LEDGER_LOG_INDEX), at(k.entry(0)))).toBe(false);
+  });
+
+  it("the stream index stands on its own: the consumer Get/Put/List and the operator Get/Put plus its KMS context, nothing else", () => {
+    const idx = at(k.index);
+    // The consumer, from this file's statements alone (not via UploadAdmissionPromotes), and its bucket-wide list.
+    const own = P.ledgerLogCommitConsumerStatements({ bucketArn, consumerRoleArn }) as Statement[];
+    for (const action of ["s3:GetObject", "s3:PutObject"]) {
+      expect(own.some((s) => s.Effect === "Allow" && matches(s, action, idx, ctx))).toBe(true);
+      expect(allowed([], withLog, action, idx, ctx)).toBe(true);
+    }
+    expect(own.some((s) => s.Effect === "Allow" && matches(s, "s3:DeleteObject", idx, ctx))).toBe(false);
+    expect(allowed([], withLog, "s3:ListBucket", bucketArn, { ...ctx, "s3:prefix": logUserIndex(TENANT_KEY_BASE, tenant) })).toBe(true);
+    // The operator: HEAD/GET and create-if-absent PUT (switch, migrate-registry, backfill-index), never DELETE.
+    const operatorRoleArn = `arn:aws:iam::${accountId}:role/synthetic-ledger-log-operator`;
+    const st = P.ledgerLogOperatorStatements({ bucketArn, operatorRoleArn }) as Statement[];
+    const octx = { ...tls, "aws:PrincipalArn": operatorRoleArn };
+    const can = (action: string, key: string) => st.some((s) => s.Effect === "Allow" && matches(s, action, key, octx));
+    expect(can("s3:GetObject", idx)).toBe(true);
+    expect(can("s3:PutObject", idx)).toBe(true);
+    expect(can("s3:DeleteObject", idx)).toBe(false);
+    const ctxArns = P.ledgerLogOperatorKeyStatement({ region, accountId, bucketName, operatorRoleArn }).Condition.StringLike["kms:EncryptionContext:aws:s3:arn"];
+    expect(ctxArns.some((g: string) => glob(g, `arn:aws:s3:::${bucketName}/${k.index}`))).toBe(true);
+    // Still never a payload, for the operator's key either.
+    expect(ctxArns.some((g: string) => glob(g, `arn:aws:s3:::${bucketName}/${k.payload("f".repeat(64))}`))).toBe(false);
   });
 
   it("on (were it accepted): the consumer reads and writes every log object and the registry; deletes stay walled off by OnlyTheEraserDeletes until its carve-out lands", () => {

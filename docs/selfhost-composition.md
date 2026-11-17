@@ -829,7 +829,11 @@ What `s3` requires and changes:
   runbook. Cost per reset: a LIST of the user's stream index, a LIST of each stream's remaining payloads, and only
   for a stream that still holds some, O(log n) marker HEADs, its unapplied entries, and a DELETE plus a HEAD per
   superseded payload. Needs ListBucket, GetObject and DeleteObject under `…/m=srv_<user>/ledger/log/`, and ListBucket
-  under `…/ledger/log-index/` (it only lists the index; the index writes are LOG_COMMIT's, above). Set it on every ingest process of the deployment: the materializer answers a batch whose
+  under `…/ledger/log-index/` (it only lists the index; the index writes are LOG_COMMIT's, above). Before turning it
+  on, run `bun scripts/ledger-log-stream.ts backfill-index --bucket <b> --apply --kms-key-arn <arn>
+  --i-know-this-is-not-prod` once (dry run first, without `--apply`): a stream switched before the index existed and
+  not taken since is otherwise invisible to the reset's erase (the design doc's runbook "before turning the erase on",
+  after slice 8; startup does not check it). Set it on every ingest process of the deployment: the materializer answers a batch whose
   payload a reset erased as `delivery_privacy_superseded` only where the flag is on (`payload_erased` elsewhere).
   Off: a reset touches nothing in the log, bytes unchanged.
 - **No admission for an org until a fence-authority marker covers it.** Until then, every claim for that org is a retry (in the async consumer with `SELFHOST_ADMISSION_AWAIT_AUTHORITY=on`, a deferral that never dead-letters; see `docs/selfhost-async-admission.md`). On the synchronous path that means its uploads answer 503; nothing of that org is admitted on any path. There are two forms:

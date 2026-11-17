@@ -76,7 +76,7 @@ export const logUserRoot = (keyRoot: string, tenant: LedgerTenant) => `${admissi
  * the streams' entries, markers or payloads (`list` is recursive on every backend and the ObjectStore has no
  * delimiter). Written create-if-absent BEFORE entry 0 (enableLogMode) and again by every registration
  * (registerLogStream, which admission runs before the take that precedes its first payload), so every stream that can
- * hold a payload is indexed. A hash only: no id inside. Under `<dir>/ledger/`, so it routes and relocates with the log.
+ * hold a payload is indexed (streams switched before the index existed: ledger-log-materialize.ts backfillLogIndex). A hash only: no id inside. Under `<dir>/ledger/`, so it routes and relocates with the log.
  */
 export const logUserIndex = (keyRoot: string, tenant: LedgerTenant) => `${admissionUserDir(keyRoot, tenant)}/ledger/log-index/`;
 const INDEXED_ROOT = /^(.*\/ledger)\/log\/(o=[0-9a-f]{32})$/;

@@ -30,11 +30,18 @@
  * The whole-user erase is rare and must be complete, so it ALSO lists the user's log directory (a stream the index does
  * not name, switched before the index existed and never taken since, is still erased); it is not on a request path.
  *
+ * No fixed cap on one reset's work, on purpose: a cap would either report the erase done with payloads left (a privacy
+ * miss) or fail that user's every reset until an operator stepped in. The work is bounded by the user's own data: the
+ * number of their streams (each costs one `p/` LIST when it holds no payload), and only for a stream that still holds
+ * payloads, its unapplied entries and superseded payloads, which the materializer drains on its own.
+ *
  * Fail closed: any store fault, an unreadable stream (LogCorrupt, LogUnavailable) or a payload still present after its
  * delete throws `LedgerUnavailableError` (`ledger_log_erase_failed` / `ledger_log_erase_unverified`): a retry, never
- * success. Each failure first emits one structured line through `opts.log` (route `ingest.ledger_log_erase`, outcome
+ * success. A failing stream does not stop the others: every stream is attempted, and the first failure is thrown once
+ * all ran. Each failure emits one structured line through `opts.log` (route `ingest.ledger_log_erase`, outcome
  * `ledger_log_erase_failed`, a closed `error_code`, `kind`, and `key_sha256` = sha256 of the stream root: never an id or
- * a key), so a stream that keeps failing its user's resets is visible (runbook: the design doc's slice 8).
+ * a key), one per failing stream, so a stream that keeps failing its user's resets is visible (runbook: the design
+ * doc's slice 8). A sink that throws is ignored: the erase's own error still surfaces.
  *
  * Ordering (what a reset relies on): log admission refuses a user while a reset is begun and not completed
  * (ledger-log-admit.ts: `ledger_reset_in_flight`, `ledger_control_pending`), and the reset's erase runs after its
@@ -88,10 +95,30 @@ function asRetry(error: unknown): unknown {
   return error;
 }
 
+/** Emit the failure line. A throwing sink never replaces the erase's own error (the reset must still fail as a retry). */
+function report(opts: LogEraseOptions, error: unknown, root: string | undefined): void {
+  try { opts.log?.(failureFields(error, root)); } catch { /* the sink's own fault: the erase error below still surfaces */ }
+}
+
 /** Run `work` for one stream (or the discovery, `root` undefined): a failure is logged once, then thrown as a retry. */
 async function reported<T>(opts: LogEraseOptions, root: string | undefined, work: () => Promise<T>): Promise<T> {
   try { return await work(); }
-  catch (error) { opts.log?.(failureFields(error, root)); throw asRetry(error); }
+  catch (error) { report(opts, error, root); throw asRetry(error); }
+}
+
+/**
+ * Run `work` on EVERY stream, even after one fails: one unreadable stream never leaves the user's other streams'
+ * payloads in place for this attempt. Each failing stream logs its own line (its `key_sha256`); if any failed, the
+ * first failure is thrown (as a retry) once all streams ran, so the erase is still never reported done.
+ */
+async function eachStream(opts: LogEraseOptions, streams: readonly LogKeys[], work: (keys: LogKeys) => Promise<number>): Promise<number> {
+  let n = 0, failed = false, first: unknown;
+  for (const keys of streams) {
+    try { n += await work(keys); }
+    catch (error) { report(opts, error, keys.root); if (!failed) { failed = true; first = error; } }
+  }
+  if (failed) throw asRetry(first);
+  return n;
 }
 
 /** A stream root found for the user, rechecked: exactly one stream directory directly under the user's own log root. */
@@ -136,17 +163,13 @@ async function deleteVerified(store: ObjectStore, keys: readonly string[]): Prom
  * A batch whose payload is gone is skipped by the materializer (`payload_erased`), never written.
  */
 export async function eraseLogPayloads(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, opts: LogEraseOptions = {}): Promise<number> {
-  let n = 0;
-  for (const keys of await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant))) {
-    n += await reported(opts, keys.root, async () => {
-      const found = await listKeysUnder(store, keys.payloads);
-      for (const k of found) await store.delete(objectKey(k));
-      // A fresh listing, not the deletes' answers: a payload PUT that raced the erase fails it.
-      if ((await listKeysUnder(store, keys.payloads)).length > 0) throw new LedgerUnavailableError("ledger_log_erase_unverified");
-      return found.length;
-    });
-  }
-  return n;
+  return eachStream(opts, await reported(opts, undefined, () => everyUserLogStream(store, keyRoot, tenant)), async (keys) => {
+    const found = await listKeysUnder(store, keys.payloads);
+    for (const k of found) await store.delete(objectKey(k));
+    // A fresh listing, not the deletes' answers: a payload PUT that raced the erase fails it.
+    if ((await listKeysUnder(store, keys.payloads)).length > 0) throw new LedgerUnavailableError("ledger_log_erase_unverified");
+    return found.length;
+  });
 }
 
 /** One stream's superseded payloads (the module header's cost list): `p/` first, and nothing more when it is empty. */
@@ -156,9 +179,11 @@ async function eraseSupersededIn(store: ObjectStore, keys: LogKeys, resets: numb
   // A lower bound: reading from below the true cursor reads more entries, never skips an unapplied one. A superseded
   // batch that is in fact applied already had its payload written (or skipped) and dropped (or about to be): deleting
   // it is the materializer's own next step.
+  // -1 (no marker 0: nothing applied yet, or marker 0 removed by a future compaction) falls back to reading from entry
+  // 0 and skipping nothing: more entries read, never one missed, and never a negative fromSeq.
   const through = await materializedAtLeast(store, keys);
   const doomed = new Set<string>(), live = new Set<string>();
-  for await (const e of readEntries(store, keys, Math.max(through, 0))) {
+  for await (const e of readEntries(store, keys, through < 0 ? 0 : through)) {
     if (e.seq <= through || e.kind !== "batches") continue;
     for (const b of e.batches) {
       const superseded = b.admitted !== undefined && b.admitted.resets < resets;
@@ -183,8 +208,5 @@ async function eraseSupersededIn(store: ObjectStore, keys: LogKeys, resets: numb
 export async function eraseSupersededLogPayloads(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, resets: number, opts: LogEraseOptions = {}): Promise<number> {
   if (!Number.isSafeInteger(resets) || resets < 0) throw new LedgerUnavailableError("ledger_input_refused");
   if (resets === 0) return 0;
-  let n = 0;
-  for (const keys of await reported(opts, undefined, () => userLogStreams(store, keyRoot, tenant)))
-    n += await reported(opts, keys.root, () => eraseSupersededIn(store, keys, resets));
-  return n;
+  return eachStream(opts, await reported(opts, undefined, () => userLogStreams(store, keyRoot, tenant)), (keys) => eraseSupersededIn(store, keys, resets));
 }

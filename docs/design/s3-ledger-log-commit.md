@@ -525,7 +525,9 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
     calls it too). So every stream that can hold a payload is indexed, and a stream switched before the index existed
     is indexed at its next take. Under `<dir>/ledger/`, so it routes and relocates with the log (`ledger-store.ts`).
     Written with `INGEST_LEDGER_LOG_COMMIT=on` whatever `INGEST_LEDGER_LOG_ERASE` says, so turning the erase on later
-    finds every stream: one more create-if-absent PUT per switch and per first take in a process.
+    finds every stream: one more create-if-absent PUT per switch and per first take in a process, and again after
+    an eviction (a process that dropped the stream registers it again at its next take), for every stream
+    `migrate-registry --apply` rewrites, and for every stream `backfill-index --apply` finds unindexed (slice 9).
   - `eraseSupersededLogPayloads` lists the index (one page per 1000 of the user's streams), rebuilds each root under
     the user's own log root (anything not `o=<32 hex>.json` names nothing; the root shape is rechecked), then per
     stream lists `p/` first (the payloads still present: unapplied, in flight or orphaned, never the applied history)
@@ -538,6 +540,8 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
   - Residual: a stream switched before this slice and never taken since is not in the index until its next take, so
     a reset does not erase its unapplied payloads (as with the erase off: the materializer never writes them and
     deletes them at apply). Log mode is cleared for non-production buckets only, so no production stream predates it.
+    Slice 9 closes it with a one-off backfill (`scripts/ledger-log-stream.ts backfill-index --apply`), which the
+    runbook below requires before `INGEST_LEDGER_LOG_ERASE` is turned on.
 - The alert. Every failure of either erase emits ONE error line before it throws: `message: "ledger log erase
   failed"`, `route: "ingest.ledger_log_erase"`, `outcome: "ledger_log_erase_failed"`, `kind` (`store`,
   `log_corrupt`, `log_unavailable`, `unverified`, `ledger`, `other`), `error_code` (a closed code, e.g. `transient`,
@@ -556,6 +560,18 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
   replay answers all erase first (and a stale or replay whose erase fails is not answered). `ledger-log-materialize`:
   the gone-payload answer with the flag on (superseded) and off (`payload_erased`).
 
+### Runbook: before turning the erase on
+
+- Run `bun scripts/ledger-log-stream.ts backfill-index --bucket <b>` (dry run: counts only), then the same with
+  `--apply --kms-key-arn <arn> --i-know-this-is-not-prod`, once, after every ingest process runs a build with the
+  stream index (slice 8) and BEFORE setting `INGEST_LEDGER_LOG_ERASE=on` anywhere. A rerun must print `written: 0`.
+  `skipped` counts registered streams with no entry 0 (never switched, or erased): nothing to index. `corrupt`
+  counts streams indexed although they read corrupt: each fails its user's resets once the erase is on (see below),
+  so repair them first. `invalid` counts registry docs with ids no key function accepts (left in place). Startup does
+  not check that the backfill ran (no marker): this step is the operator's.
+- The operator role needs GetObject and PutObject under `…/ledger/log-index/` (stacks/aws/ledger-log-commit-policy.ts
+  `LEDGER_LOG_INDEX`), with the key's GenerateDataKey for it, besides the registry and entry-0 reads.
+
 ### Runbook: a reset that keeps failing its erase
 
 - Detect: error lines with `"outcome":"ledger_log_erase_failed"` (route `ingest.ledger_log_erase`) on the session
@@ -573,6 +589,32 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
   and the superseded payloads stay (never written: the snapshot rule) until the stream is repaired and applied.
   `kind: "unverified"` (a payload still there after its DELETE) means the store or a bucket policy refuses deletes
   under the log prefix: fix the grant (the ingest role needs DeleteObject on `…/ledger/log/*/p/*`).
+
+## Slice 9: the stream index review fixes (IAM, backfill, every stream attempted)
+
+- IAM: `ledger-log-commit-policy.ts` names the index on its own (`LEDGER_LOG_INDEX`, `…/m=srv_*/ledger/log-index/*`):
+  in the consumer's Get/Put statement (its List is the existing bucket-wide grant), the operator's Get and Put, and
+  the operator key statement's encryption-context condition, so the policy no longer leans on
+  `UploadAdmissionPromotes` for it. Still not rendered (the stack refuses `ledgerLogCommit: "on"`). Tested in
+  `stacks/aws/__tests__/upload-inbox-infra.test.ts`.
+- Backfill: `backfillLogIndex` (`ledger-log-materialize.ts`) and `scripts/ledger-log-stream.ts backfill-index` walk
+  the stream registry (v1 and v2) and, for each stream with entry 0 whose index object is missing, write it
+  create-if-absent. Dry run by default; `--apply` is refused without `--i-know-this-is-not-prod` or for a
+  production-like bucket name, as the other mutating commands. Receipt: counts only (`streams`, `written`,
+  `present`, `skipped`, `corrupt`, `invalid`). Per stream: the registry reads, entry 0, one HEAD, and at most one PUT.
+  No startup gate: the runbook above makes it a step before the erase is enabled.
+- Every stream attempted: both erases now run every stream of the user even after one fails, log one line per
+  failing stream, and throw the first failure (a retry) once all ran; a throwing log sink is ignored, so it can never
+  replace the erase's error. `materializedAtLeast` returning -1 (no marker 0) is documented and tested as "read from
+  entry 0" (a future compaction must keep marker 0, or the reset replays from entry 0).
+- No fixed cap on one reset's work (`ledger-log-erase.ts` header): a cap would either leave payloads behind while
+  reporting the erase done, or fail that user's every reset. Its cost stays the user's own: one `p/` LIST per stream,
+  and entries and deletes only for streams that still hold payloads.
+- Tests: `ledger-log-erase.test.ts` (one corrupt stream does not stop the others, for both erases; one line per
+  failing stream; a throwing sink, also through `selfhostS3Ledger`; the `unverified` kind; marker 0 gone);
+  `ledger-log-materialize.test.ts` (the backfill's dry run, apply, rerun, skipped, corrupt, invalid and store fault;
+  an index PUT failing in `registerLogStream` and `enableLogMode`; log commit on with the erase off still indexes);
+  `ledger-log-admit.test.ts` (the CLI guard covers `backfill-index`).
 
 ## Remaining
 
