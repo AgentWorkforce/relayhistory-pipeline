@@ -427,6 +427,17 @@ describe("deploy workflow wiring", () => {
     expect(TEMPLATE).not.toContain("READ_API_BRIEF_SUMMARY_ENABLED");
     expect(TEMPLATE).not.toContain("READ_API_LIST_SHORT_SUMMARY_ENABLED");
   });
+
+  test("summary_fallback: default off; on needs brief_summary=on and the SUMMARY_MASTER_KEYS secret, and adds only the exact \"true\" --var", () => {
+    expect(WORKFLOW).toMatch(/summary_fallback:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("SUMMARY_FALLBACK: ${{ inputs.summary_fallback }}");
+    expect(WORKFLOW).toContain(`if [ "$SUMMARY_FALLBACK" = "on" ] && [ "$BRIEF_SUMMARY" != "on" ]; then fail 'summary_fallback=on needs brief_summary=on'; fi`);
+    expect(WORKFLOW).toContain('summary_fallback=""; if [ "$SUMMARY_FALLBACK" = "on" ]; then summary_fallback=true; fi');
+    expect(WORKFLOW).toContain('${summary_fallback:+--var "READ_API_SUMMARY_FALLBACK_ENABLED:$summary_fallback"}');
+    expect(WORKFLOW).toContain("for n in SUMMARY_MASTER_KEYS PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do");
+    expect(TEMPLATE).not.toContain("READ_API_SUMMARY_FALLBACK_ENABLED");
+    expect(TEMPLATE).not.toContain("SUMMARY_MASTER_KEYS");
+  });
 });
 
 

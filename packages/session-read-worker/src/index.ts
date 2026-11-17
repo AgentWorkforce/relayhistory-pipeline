@@ -27,6 +27,11 @@
  * the existing ClickHouse facts; every other value = 404),
  * READ_API_BRIEF_SUMMARY_ENABLED (exactly "true": GET /v1/sessions/:id/summary through the
  * brief-summary SQL, as the hosted Lambda; every other value = 501 summary_not_configured),
+ * READ_API_SUMMARY_FALLBACK_ENABLED (exactly "true", with READ_API_BRIEF_SUMMARY_ENABLED: the
+ * same route also serves Bob Costas's encrypted summary objects, kind=short without a brief and
+ * kind=long, src/session-read-api/summary-fallback.ts; it needs the PIPELINE_RAW_S3_* raw store
+ * and the SUMMARY_MASTER_KEYS secret, without which those reads answer 501
+ * summary_fallback_not_configured; every other value = the route exactly as without it),
  * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true": the GET /v1/sessions
  * includeShortSummary=recorded extension; every other value = 501 param_includeShortSummary),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
@@ -91,6 +96,9 @@ import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { serviceNarrativeGenerator, sqlNarrativeCache } from "../../../src/session-read-api/digest-narrative.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { sqlBriefSummary } from "../../../src/session-read-api/brief-summary.ts";
+import { pointerSummaryFallback, type SummaryFallback } from "../../../src/session-read-api/summary-fallback.ts";
+import { masterKeyring, parseMasterKeys } from "../../../src/shared/keyring.ts";
+import type { WorkspaceKeyring } from "../../../src/bob-costas/summary-objects.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
@@ -144,6 +152,17 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
   /** Exactly "true": serve GET /v1/sessions/:id/summary (sqlBriefSummary); anything else = 501 summary_not_configured. */
   READ_API_BRIEF_SUMMARY_ENABLED?: string;
+  /**
+   * Exactly "true" (and READ_API_BRIEF_SUMMARY_ENABLED): GET /v1/sessions/:id/summary falls back to
+   * Bob Costas's summary objects (summary-fallback.ts) and serves kind=long; anything else = the
+   * route unchanged.
+   */
+  READ_API_SUMMARY_FALLBACK_ENABLED?: string;
+  /**
+   * Secret: the summary master keys (src/shared/keyring.ts format, `<id>:<64 hex>[,...]`), the
+   * same value Bob Costas encrypts under. Read only by the summary fallback; never logged.
+   */
+  SUMMARY_MASTER_KEYS?: string;
   /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
   READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
@@ -463,6 +482,9 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
+    ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)
+      ? { summaryFallback: summaryFallbackDeps(env, tenant.run, overrides.fetcher) }
+      : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
@@ -489,6 +511,45 @@ export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchG
   const binding: ServiceBinding | undefined = typeof env.HISTORY_CONTROL_HEAD?.fetch === "function" ? env.HISTORY_CONTROL_HEAD : undefined;
   if (!binding) log("warn", "buffered search gate on without HISTORY_CONTROL_HEAD: buffered rows are dropped", {});
   return createBufferedSearchGate({ controlHeads: binding ? serviceBindingControlHeads(binding) : undefined, store: sqlGateStore(run) });
+}
+
+/** Per isolate: the keyring for the last SUMMARY_MASTER_KEYS value seen (keys import non-extractable). */
+let summaryKeyringCache: { raw: string; keyring: Promise<WorkspaceKeyring> } | undefined;
+/** The summary object read's deadline per store call (as summary-objects.ts DEFAULT_STORE_TIMEOUT_MS). */
+const SUMMARY_OBJECT_DEADLINE_MS = 5_000;
+
+/**
+ * The summary fallback (READ_API_SUMMARY_FALLBACK_ENABLED): pointers through the read role
+ * (tenant-bound), objects with the raw-store secrets the timing and /v1/canonical reads use,
+ * opened with SUMMARY_MASTER_KEYS. Either missing (or a malformed key value): those reads
+ * answer 501 summary_fallback_not_configured; the value itself is never logged or echoed.
+ */
+export function summaryFallbackDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): SummaryFallback {
+  const bounded: typeof fetch = (input, init) => {
+    const deadline = AbortSignal.timeout(SUMMARY_OBJECT_DEADLINE_MS);
+    return fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
+  };
+  return pointerSummaryFallback({
+    run,
+    raw: () => rawStoreFromEnv(env, bounded),
+    prefix: env,
+    keyring: () => {
+      const raw = env.SUMMARY_MASTER_KEYS?.trim();
+      if (!raw) return Promise.reject(new Error("summary keyring not configured"));
+      if (summaryKeyringCache?.raw !== raw) {
+        let keyring: Promise<WorkspaceKeyring>;
+        try {
+          keyring = masterKeyring(parseMasterKeys(raw));
+        } catch {
+          // parseMasterKeys names the field only; still, never pass its message on.
+          return Promise.reject(new Error("summary keyring not configured"));
+        }
+        summaryKeyringCache = { raw, keyring };
+        keyring.catch(() => { if (summaryKeyringCache?.keyring === keyring) summaryKeyringCache = undefined; });
+      }
+      return summaryKeyringCache.keyring;
+    },
+  });
 }
 
 /**

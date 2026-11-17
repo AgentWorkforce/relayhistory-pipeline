@@ -82,6 +82,11 @@ name: deploy session-read-worker
 # answers 501 summary_not_configured / param_includeShortSummary exactly as before these inputs.
 # Neither is preserved from live: once one is on, a later profile/preserve dispatch must repeat
 # it (the live-settings guard refuses a dispatch that would drop it). Dispatch is Khaliq's call.
+# summary_fallback=on (only with brief_summary=on) adds --var READ_API_SUMMARY_FALLBACK_ENABLED:true:
+# the same route also serves Bob Costas's encrypted summary objects (kind=short without a brief,
+# kind=long; src/session-read-api/summary-fallback.ts). It needs the Worker secrets
+# SUMMARY_MASTER_KEYS and PIPELINE_RAW_S3_*; the deploy refuses on without SUMMARY_MASTER_KEYS.
+# Same not-preserved rule; dispatch, and putting that secret on the Worker, are Khaliq's call.
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
@@ -150,6 +155,11 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      summary_fallback:
+        description: GET /v1/sessions/:id/summary Bob Costas fallback + kind=long (READ_API_SUMMARY_FALLBACK_ENABLED=true; needs brief_summary=on and the SUMMARY_MASTER_KEYS secret); off = no var, route unchanged. Not preserved from live
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -202,6 +212,7 @@ jobs:
       # Brief summaries (default off); on adds the exact "true" var on the deploy command only.
       BRIEF_SUMMARY: ${{ inputs.brief_summary }}
       LIST_SHORT_SUMMARY: ${{ inputs.list_short_summary }}
+      SUMMARY_FALLBACK: ${{ inputs.summary_fallback }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -238,6 +249,8 @@ jobs:
           test "$ORIGIN" = "https://sessions-read.agentrelay.com" || fail "SESSION_READ_ORIGIN must be https://sessions-read.agentrelay.com"
           case "$BRIEF_SUMMARY" in off|on) ;; *) fail 'brief_summary must be "off" or "on"' ;; esac
           case "$LIST_SHORT_SUMMARY" in off|on) ;; *) fail 'list_short_summary must be "off" or "on"' ;; esac
+          case "$SUMMARY_FALLBACK" in off|on) ;; *) fail 'summary_fallback must be "off" or "on"' ;; esac
+          if [ "$SUMMARY_FALLBACK" = "on" ] && [ "$BRIEF_SUMMARY" != "on" ]; then fail 'summary_fallback=on needs brief_summary=on'; fi
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
           fi
@@ -271,6 +284,7 @@ jobs:
           bun run scripts/resolve-deploy-profile.ts --check-live-version
           brief_summary=""; if [ "$BRIEF_SUMMARY" = "on" ]; then brief_summary=true; fi
           list_short_summary=""; if [ "$LIST_SHORT_SUMMARY" = "on" ]; then list_short_summary=true; fi
+          summary_fallback=""; if [ "$SUMMARY_FALLBACK" = "on" ]; then summary_fallback=true; fi
           bunx wrangler deploy --config wrangler.deploy.jsonc \
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
@@ -279,6 +293,7 @@ jobs:
             ${TIMING_ASSUME_NO_TURNS:+--var "READ_API_TIMING_ASSUME_NO_TURNS:$TIMING_ASSUME_NO_TURNS"} \
             ${brief_summary:+--var "READ_API_BRIEF_SUMMARY_ENABLED:$brief_summary"} \
             ${list_short_summary:+--var "READ_API_LIST_SHORT_SUMMARY_ENABLED:$list_short_summary"} \
+            ${summary_fallback:+--var "READ_API_SUMMARY_FALLBACK_ENABLED:$summary_fallback"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)
         env:
@@ -288,6 +303,11 @@ jobs:
           for n in CLICKHOUSE_PASSWORD CLICKHOUSE_URL CLICKHOUSE_USER; do
             case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; every read answers 503 until it is (runbook step 5)"; exit 1 ;; esac
           done
+          if [ "$SUMMARY_FALLBACK" = "on" ]; then
+            for n in SUMMARY_MASTER_KEYS PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do
+              case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; summary fallback reads answer 501 summary_fallback_not_configured until it is"; exit 1 ;; esac
+            done
+          fi
       - name: Smoke (health 200; an unauthenticated read 401)
         run: |
           curl --fail --silent --show-error --max-time 10 --retry 6 --retry-all-errors --retry-delay 5 "$ORIGIN/health" > /dev/null

@@ -277,4 +277,79 @@ The function returns no content, no timestamps and no other claim. The claim tok
 
 **Brief summary deploy inputs (hosted Lambda parity, default off).** `brief_summary=on` adds `--var READ_API_BRIEF_SUMMARY_ENABLED:true` to the Worker deploy command, wiring `GET /v1/sessions/:id/summary` (`src/session-read-api/brief-summary.ts`, migration `20261105044100`); off (the default) renders no variable and the route answers 501 `summary_not_configured`. `list_short_summary=on` adds `--var READ_API_LIST_SHORT_SUMMARY_ENABLED:true`, serving `includeShortSummary=recorded` on `GET /v1/sessions`; off answers 501 `param_includeShortSummary`. The Worker enables each only on the exact string `true`, as the Lambda does. Neither is preserved from live: once on, a later `profile`/`preserve` dispatch must repeat it, or the live-settings guard refuses the dispatch. The dispatch is Khaliq's call.
 
+### `GET /v1/sessions/:sessionId/summary` contract (with the Bob Costas fallback)
+
+Query: `workspace` (required, the token's), `source` (required harness), `kind` (`short`
+default). Any other parameter is a 501 `param_<name>`. Canary-gated (`summary`), brief SQL
+`sessions.session_brief_summary_for` (migration `20261105044100`) required
+(`READ_API_BRIEF_SUMMARY_ENABLED=true`).
+
+**Fallback off (`READ_API_SUMMARY_FALLBACK_ENABLED` anything but exactly `true`, the
+default): byte-identical to before.** `kind=long` (or any kind but `short`) is 501
+`summary_kind`; the body is exactly one of
+
+```json
+{"summary":{"status":"ready","kind":"short","summary":"<1..320 code points>","model":"<1..128 chars>","builtAt":"<ISO>","state":null}}
+{"summary":{"status":"empty","kind":"short","state":null}}
+```
+
+**Fallback on (`READ_API_SUMMARY_FALLBACK_ENABLED=true`, Worker only).** The inner `summary`
+object never gains a key in any mode (live consumers parse it strictly); provenance is a
+sibling `provenance` key, present on every 200 while the flag is on. `kind` is `short` or
+`long`; anything else stays 501 `summary_kind`.
+
+- `kind=short` with a native brief: the brief exactly as above, plus
+  `"provenance":{"source":"session_brief","kind":"short","generatedAt":"<builtAt>","revision":null,"truncated":false}`.
+- `kind=short` without a brief, and every `kind=long`: Bob Costas's summary object for the
+  session, when one is servable:
+
+```json
+{"summary":{"status":"ready","kind":"short|long","summary":"<text>","model":"<recorded model id>","builtAt":"<ISO>","state":null},
+ "provenance":{"source":"session_summary","kind":"short|long","generatedAt":"<ISO>","revision":4,"truncated":false}}
+```
+
+- Nothing servable: `{"summary":{"status":"empty","kind":"short|long","state":null},"provenance":null}`.
+
+Field meaning for `source:"session_summary"`: `summary` is the scrubbed text Bob Costas
+stored, cut on a word boundary (ending in `…`) to at most **320** code points for `short`
+(the brief ready variant's bound) and **16000** for `long`; `provenance.truncated` says
+whether the *returned* text was cut. `model` is the model id Bob Costas recorded inside the
+encrypted summary record with that text (e.g. `extractive/v1` or the summariser model); a
+record without a usable recorded model (non-empty, at most 128 chars) is not served, never
+labelled with a default. `builtAt` = `provenance.generatedAt` = the stored record's
+`built_at`. `provenance.kind` and `provenance.revision` are the *stored* summary object's
+(the revision always equals the session's live pointer revision: a summary built for an
+older revision is not served). For `source:"session_brief"`, `revision` is `null` (briefs
+carry per-machine source revisions, not one number) and `truncated` is `false`.
+
+What is servable (`src/session-read-api/summary-fallback.ts`), every step fail closed:
+`session_brief_summary_for` runs first for both kinds, so its tenant scope, alias,
+canonical-mapping and managed-history refusals hold (400 / 501 `summary_unqualified` / 503;
+the fallback is not read). Then the session's live `sessions.session_index` pointer is read
+as `bulls96_read_api` in the request's tenant-bound READ ONLY transaction (the same rows the
+timing and turns routes read the transcript through): no live pointer (unknown, tombstoned,
+erased) = empty; more than one live physical row (several machines) = empty, since each
+machine's summary covers only its own raw. The pointer must be this tenant's, in this
+Worker's raw bucket and provider, with a manifest key whose location matches the row and
+whose prefix is allowed for the org (`prefixAllowed`); the object key
+`<session prefix>/summary/<kind>.json.enc` is derived from it, never from the request. The
+object opens only with AES-256-GCM under the caller's workspace key (HKDF from
+`SUMMARY_MASTER_KEYS`, `src/shared/keyring.ts`) with associated data binding the key, kind
+and revision, and its recorded `source_content_sha256` must equal the pointer's
+`content_sha256` (revisions restart on a re-upload, so a leftover object from erased or
+replaced content is never served); a text-free record (opt-out, quarantine, empty) is empty. No migration and no
+grant: the read role never reads `sessions.session_summaries`.
+
+Errors with the flag on: a row outside the tenant 500 (`TenantMismatchError`); missing raw
+store or `SUMMARY_MASTER_KEYS` (or a malformed value) 501 `summary_fallback_not_configured`;
+a pointer that fails the checks, a malformed record, a store/deadline failure or a key id
+this Worker does not hold 503 `backend_unavailable`. Never an empty 200 for a failure.
+Nothing is logged but the route's usual request line; no text, key or path.
+
+Deploy (Khaliq's call): `summary_fallback=on` (only with `brief_summary=on`) adds
+`--var READ_API_SUMMARY_FALLBACK_ENABLED:true`; the Worker also needs the secret
+`SUMMARY_MASTER_KEYS` (the same value Bob Costas encrypts under) and the `PIPELINE_RAW_S3_*`
+secrets with GetObject on the summary objects. Not preserved from live, like the other
+summary inputs. The self-host service and the hosted Lambda do not wire the fallback.
+
 **Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.

@@ -387,6 +387,55 @@ export async function readSummaryObject(args: {
     : null;
 }
 
+/**
+ * 96bulls deviation (not upstream): the summary at `key` for exactly `kind` and
+ * `revision`, without a pointer row's ciphertext SHA-256. For the read API, which has
+ * no grant on `sessions.session_summaries` and derives the key from the session's live
+ * index pointer instead. Authenticity is the AES-GCM tag over the same associated data
+ * (`key`, `kind`, `revision`), so an object written for another key, kind or revision,
+ * under another workspace's key, or tampered with, never opens: null, as for a missing
+ * or oversized object. Throws only for a store or keyring failure. Nothing is logged.
+ */
+export async function readSummaryObjectAt(args: {
+  store: ObjectStore;
+  keyring: WorkspaceKeyring;
+  ids: WorkspaceIds;
+  key: string;
+  kind: SummaryKind;
+  revision: number;
+}): Promise<SummaryRecord | null> {
+  let body: Uint8Array;
+  try {
+    const object = await args.store.getObject(objectKey(args.key));
+    if (object.meta.size > MAX_SUMMARY_OBJECT_BYTES) {
+      await object.body.cancel().catch(() => undefined);
+      return null;
+    }
+    body = await readAll(object.body);
+  } catch (err) {
+    if (isObjectStoreError(err, "not_found")) return null;
+    throw storeError(err);
+  }
+  if (body.byteLength > MAX_SUMMARY_OBJECT_BYTES) return null;
+  const envelope = parseEnvelope(body);
+  if (!envelope) return null;
+  let key: CryptoKey;
+  try {
+    key = await args.keyring.keyById(args.ids, envelope.key_id);
+  } catch (err) {
+    throw err instanceof PipelineError
+      ? err
+      : fail("keyring_unavailable", true);
+  }
+  const record = await open(key, envelope, args.key, args.kind, args.revision);
+  return record &&
+    record.v === SUMMARY_ENVELOPE_VERSION &&
+    record.kind === args.kind &&
+    record.revision === args.revision
+    ? record
+    : null;
+}
+
 /** Associated data: the envelope only opens at its own key, kind and revision. */
 function aad(key: string, kind: SummaryKind, revision: number): Uint8Array {
   return new TextEncoder().encode(`${key}\n${kind}\n${revision}`);

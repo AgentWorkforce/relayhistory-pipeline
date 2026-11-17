@@ -449,6 +449,43 @@ describe("entry and configuration", () => {
     expect((await body(summaryOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
   });
 
+  test("summary fallback: off unless exactly \"true\" with the brief flag; on without key material is 501 summary_fallback_not_configured", async () => {
+    const t = tenant();
+    // A fake pg client: the brief-summary function is installed and returns no brief.
+    const connect = async () => ({
+      async query(text: string) {
+        return { rows: text.includes("to_regprocedure") ? [{ installed: true }] : [] };
+      },
+      async end() {},
+    }) as unknown as pg.Client;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, READ_API_BRIEF_SUMMARY_ENABLED: "true", ...over }, ctx, { connect });
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const long = `/v1/sessions/s-x/summary?workspace=${t.ws}&source=claude&kind=long`;
+    const short = `/v1/sessions/s-x/summary?workspace=${t.ws}&source=claude`;
+    for (const flag of [undefined, "", "1", "TRUE", " true", "on"]) {
+      const r = await call(long, { READ_API_SUMMARY_FALLBACK_ENABLED: flag, SUMMARY_MASTER_KEYS: `k1:${"a".repeat(64)}` });
+      expect(r.status, String(flag)).toBe(501);
+      expect((await body(r)).error, String(flag)).toMatchObject({ reason: "summary_kind" });
+      // Off: the short read is exactly today's empty body.
+      expect(await (await call(short, { READ_API_SUMMARY_FALLBACK_ENABLED: flag })).text(), String(flag)).toBe(JSON.stringify({ summary: { status: "empty", kind: "short", state: null } }));
+    }
+    // The fallback flag alone never enables the route.
+    const alone = await call(long, { READ_API_BRIEF_SUMMARY_ENABLED: undefined, READ_API_SUMMARY_FALLBACK_ENABLED: "true" });
+    expect((await body(alone)).error).toMatchObject({ reason: "summary_not_configured" });
+    // On, no (or a malformed) SUMMARY_MASTER_KEYS: a loud 501, never an empty 200; the value is never echoed.
+    for (const keys of [undefined, "", "not-a-key"]) {
+      const r = await call(long, { READ_API_SUMMARY_FALLBACK_ENABLED: "true", SUMMARY_MASTER_KEYS: keys });
+      expect(r.status, String(keys)).toBe(501);
+      const text = JSON.stringify(await body(r));
+      expect(text).toContain("summary_fallback_not_configured");
+      if (keys) expect(text).not.toContain(keys);
+    }
+  });
+
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {
     const t = tenant();
     await insert([ev(t, { id: "d-1", session: "s-down", ts: "2026-10-23 08:00:00.000" })]);

@@ -1,4 +1,5 @@
 import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
+import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "./summary-fallback.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
@@ -218,6 +219,14 @@ export interface ReadApiDeps {
    * workspace admission.
    */
   briefSummary?: BriefSummary;
+  /**
+   * READ_API_SUMMARY_FALLBACK_ENABLED=true (exactly "true"; the read Worker only): GET
+   * /v1/sessions/:id/summary also serves Bob Costas's encrypted summary objects
+   * (summary-fallback.ts): kind=short when there is no native brief, and kind=long. Every
+   * response then carries an outer `provenance` (the inner `summary` keys never change).
+   * Absent = the route is byte-identical to before (kind=long is 501 `summary_kind`). Needs `briefSummary` too: its SQL is the fallback's authority.
+   */
+  summaryFallback?: SummaryFallback;
   /**
    * READ_API_LIST_SHORT_SUMMARY_ENABLED=true (exactly "true"): GET /v1/sessions serves the opt-in
    * includeShortSummary=recorded (shortSummary, shortSummaryGeneratedAt). Not true = the param is a
@@ -1569,13 +1578,28 @@ export function createReadApi(deps: ReadApiDeps) {
       if(!deps.briefSummary)throw unsupported("summary_not_configured");
       for(const name of Object.keys(c.req.query()))if(!["workspace","source","kind"].includes(name))throw unsupported(`param_${name}`);
       const kind=single(c,"kind")??"short";
-      if(kind!=="short")throw unsupported("summary_kind");
+      const fallback=deps.summaryFallback;
+      if(kind!=="short"&&!(fallback&&kind==="long"))throw unsupported("summary_kind");
       const source=single(c,"source"),sessionId=c.req.param("sessionId");
       if(!source||!HARNESS_NAME.test(source)||!sessionId||sessionId.length>MAX_ID_CHARS)throw bad("invalid session key");
+      // Always first, also for kind=long: its tenant scope, alias and history refusals are the
+      // fallback's authority too (summary-fallback.ts), so a refused key never reaches it.
       const rows=await deps.briefSummary.read(identity.orgId,identity.workspaceId,source,sessionId);
       if(rows===null)throw unsupported("summary_not_migrated");
-      return c.json({summary:briefSummaryResponse(rows,{...identity,source,sessionId})});
+      if(!fallback)return c.json({summary:briefSummaryResponse(rows,{...identity,source,sessionId})});
+      // Flag on: the inner `summary` keeps exactly today's keys; provenance is beside it.
+      if(kind==="short"&&rows.length>0) {
+        const brief=briefSummaryResponse(rows,{...identity,source,sessionId});
+        return c.json({summary:brief,provenance:{source:"session_brief",kind:"short",generatedAt:brief.status==="ready"?brief.builtAt:null,revision:null,truncated:false}});
+      }
+      const ready=await fallback.read({orgId:identity.orgId,workspaceId:identity.workspaceId,source,sessionId},kind as "short"|"long");
+      return c.json(ready?sessionSummaryBody(ready):{summary:{status:"empty",kind,state:null},provenance:null});
     } catch(error) {
+      if(error instanceof SummaryFallbackError) {
+        if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
+        if(error.reason==="not_configured")return fail(c,unsupported("summary_fallback_not_configured"));
+        return c.json({error:{code:"backend_unavailable",message:"read backend unavailable"},correlationId:c.get("correlationId")},503);
+      }
       if(error instanceof BriefSummaryError) {
         if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
         if(error.reason==="invalid_argument")return fail(c,bad("invalid session key"));
