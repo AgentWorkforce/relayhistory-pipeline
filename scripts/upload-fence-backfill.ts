@@ -19,7 +19,7 @@
  * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
  * stubs, revision shard merges) and needs the owner's explicit OK. Rerunning is a no-op for what is there.
  *
- * --slots-by-org (the catch-up modes only): a scoped run reads each org's owned slots once through the org index
+ * --slots-by-org (backlog-ops slots_read=org, any backfill mode): a scoped run reads each org's owned slots once through the org index
  * instead of the heap block windows (upload-fence-backfill.ts SLOTS_ORG_CURSOR).
  * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
  * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full

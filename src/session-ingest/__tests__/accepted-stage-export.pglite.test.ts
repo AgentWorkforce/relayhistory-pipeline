@@ -5,7 +5,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { exportAcceptedStages, exportLockKey, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
+import { CANDIDATE_KEYS, exportAcceptedStages, exportLockKey, scopedExportSql, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
 import { ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, drainBufferedBatches, parseAcceptedComplete, parseAcceptedMarker } from "../buffered-drain.ts";
 import { applyFenceChange, fenceEpoch, orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedKey } from "../staging.ts";
@@ -701,4 +701,14 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
       expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, A.orgId)))).toMatchObject({ stages: 0 });
     }
   });
+});
+
+test("scoped export SQL: no generic \"$1 IS NULL OR\" branch, unscoped text unchanged", () => {
+  expect(CANDIDATE_KEYS).toContain("($1::text[] IS NULL OR o.org_id = ANY($1::text[]))");
+  expect(scopedExportSql(CANDIDATE_KEYS, false)).toBe(CANDIDATE_KEYS);
+  const scoped = scopedExportSql(CANDIDATE_KEYS, true);
+  expect(scoped).not.toContain("IS NULL OR");
+  expect(scoped).toContain("o.org_id = ANY($1::text[])");
+  const orgs = "WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))";
+  expect(scopedExportSql(orgs, true)).toBe("WHERE org_id = ANY($1::text[])");
 });
