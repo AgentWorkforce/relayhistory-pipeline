@@ -477,6 +477,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "tables sessions.decision_records_v1 and sessions.decision_evidence_v1 and function sessions.decision_records_insert_v1",
     sql: "SELECT to_regclass('sessions.decision_records_v1') IS NOT NULL AND to_regclass('sessions.decision_evidence_v1') IS NOT NULL AND to_regprocedure('sessions.decision_records_insert_v1(text,text,jsonb)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062090_memory_documents_erase.sql": {
+    evidence: "function sessions.decision_evidence_erase_session_v1 and trigger decision_evidence_fence_guard on sessions.decision_evidence_v1",
+    sql: "SELECT to_regprocedure('sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.decision_evidence_v1') AND tgname='decision_evidence_fence_guard' AND NOT tgisinternal) AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

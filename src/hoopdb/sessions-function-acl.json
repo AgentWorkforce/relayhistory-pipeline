@@ -237,6 +237,13 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.decision_evidence_fence_guard_v1()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.decision_records_insert_v1(text,text,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

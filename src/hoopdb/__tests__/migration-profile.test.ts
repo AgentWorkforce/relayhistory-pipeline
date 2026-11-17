@@ -2641,6 +2641,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const TSOG = "upstream:20261105062060_turns_selection_origin_guard.sql";
     const AR = "upstream:20261105062070_coordination_advisor_readers.sql";
     const MD = "upstream:20261105062080_memory_documents.sql";
+    const MDE = "upstream:20261105062090_memory_documents_erase.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2651,7 +2652,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, TSOG, AR, MD]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, TSOG, AR, MD, MDE]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2702,6 +2703,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062090 is newest: the memory documents down refuses (55000) while the erase function and guard
+    // trigger are applied; the checksum-pinned erase down drops both and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(MDE);
+    expect((await failure(rollback("20261105062080_memory_documents.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.decision_records_v1")).toBe("sessions.decision_records_v1");
+    await rollback("20261105062090_memory_documents_erase.down.sql");
+    expect(await names()).not.toContain(MDE);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_evidence\\_%'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='decision_evidence_fence_guard'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062090_memory_documents_erase.down.sql")))?.code).toBe("55000");
     // 20261105062080 is newest: the legacy-export authority and coordination advisor reader downs refuse
     // until the memory documents tables and functions are removed; a rerun of the memory documents down refuses.
     expect(await names()).toContain(MD);
