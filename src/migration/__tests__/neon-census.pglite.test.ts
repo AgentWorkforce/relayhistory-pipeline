@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,8 +32,19 @@ async function censusDdl(): Promise<string> {
   return `${take("session_neon_census")}\n${take("session_neon_census_seal")}`;
 }
 
-async function source(): Promise<PGlite> {
+const opened: PGlite[] = [];
+function openPglite(): PGlite {
   const pg = new PGlite();
+  opened.push(pg);
+  return pg;
+}
+
+afterEach(async () => {
+  await Promise.all(opened.splice(0).map((pg) => (pg.closed ? undefined : pg.close())));
+});
+
+async function source(): Promise<PGlite> {
+  const pg = openPglite();
   await pg.exec(`
     CREATE SCHEMA sessions;
     CREATE TABLE sessions.convergence_events (org_id text, workspace_id text, session_id text, event_id text);
@@ -51,7 +62,7 @@ async function source(): Promise<PGlite> {
 }
 
 async function target(): Promise<PGlite> {
-  const pg = new PGlite();
+  const pg = openPglite();
   await pg.exec(`CREATE SCHEMA sessions; ${await censusDdl()}`);
   return pg;
 }
@@ -162,7 +173,7 @@ describe("neon session census", () => {
   });
 
   test("P3-8: UTF-8 byte order differs from JS UTF-16 order, and backslash/quote keys; JS digest == SQL digest", async () => {
-    const pg = new PGlite();
+    const pg = openPglite();
     await pg.exec("CREATE SCHEMA sessions; CREATE TABLE sessions.t (org_id text, workspace_id text, session_id text);");
     // U+FF61 sorts after U+1F600 in UTF-16 (0xFF61 > 0xD83D) but before it in UTF-8 (EF.. < F0..).
     await pg.query("INSERT INTO sessions.t VALUES ($1,'w','s1'),($2,'w','s2'),('o\\\\x','w''q','s\"3')", ["\u{1F600}", "｡"]);
@@ -176,7 +187,7 @@ describe("neon session census", () => {
   test("the file round-trips and an empty census seals with sha256('')", async () => {
     const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     expect(() => verifyCensus(parseCensusFile(rows.map(censusLine).join("")), manifest)).not.toThrow();
-    const empty = new PGlite();
+    const empty = openPglite();
     await empty.exec("CREATE SCHEMA sessions; CREATE TABLE sessions.t (org_id text, workspace_id text, session_id text);");
     const e = await produceCensus(standby(empty), NEON);
     expect(e.manifest.census_sha256).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
