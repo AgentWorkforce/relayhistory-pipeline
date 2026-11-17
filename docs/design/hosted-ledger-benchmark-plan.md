@@ -1,7 +1,9 @@
 # Hosted ledger benchmark plan
 
 **As of 2026-11-17:** this plan has run. The harness and stacks are on main, and three repeats ran on 2026-11-16
-(results in the private ops docs). The cluster side is torn down; the data-side teardown waits for Khaliq's OK.
+(results in the private ops docs). Both sides are torn down and verified gone: the cluster side on 2026-11-16,
+the data side on 2026-11-17 by layered-infra-ops, which reports acting on Khaliq's confirmation to it. Only the
+three KMS keys remain, in their pending-deletion window.
 Differences from this plan as built: four CloudFormation stacks instead of one; a finished Job is
 kept 2 days (`stacks/aws/ledger-bench/job.template.yaml`, `ttlSecondsAfterFinished`), not the 1 hour in "Teardown"; the budget alarm only notifies and does not stop the run.
 
