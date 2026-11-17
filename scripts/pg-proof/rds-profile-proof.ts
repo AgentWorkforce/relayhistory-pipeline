@@ -56,7 +56,8 @@ const FIXED = [
   "anon", "authenticated", "service_role", "session_directory_search_worker",
   "session_token_verifier", "bulls96_session_ingest", "bulls96_session_ingest_seeder",
   "bulls96_canonical_feature_producer", "bulls96_read_api", "bulls96_project_events",
-  "bulls96_privacy_eraser", "bulls96_legacy_export_privacy", "bulls96_babysitter_retention",
+  "bulls96_analysis_admit", "bulls96_digest_narrative", "bulls96_privacy_eraser",
+  "bulls96_legacy_export_privacy", "bulls96_babysitter_retention",
 ];
 const RDS_ENV = {
   HOOPDB_DB_MODE: "rds",
