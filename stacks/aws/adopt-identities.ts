@@ -122,10 +122,11 @@ export function backlogOpsLedgerResources(l: BacklogOpsLedgerBucket) {
 /**
  * The identity-side statements a backlog-ops role needs on the ledger bucket, exactly (what the validator accepts,
  * and what an operator adds to the live role before pasting it back). Read: s3:GetObject on the ledger keys and the
- * marker, and s3:ListBucket on the ledger bucket with NO condition: S3 answers a GET or HEAD of a missing key with 404
- * only when the caller may s3:ListBucket for that very request, and a GET carries no s3:prefix, so a prefix-conditioned
- * List never applies there and a missing shard, stub or marker would read as 403 (access_denied, every real run
- * failing). Write: also s3:PutObject on the ledger keys, with NO s3:x-amz-server-side-encryption condition: the
+ * marker, and s3:ListBucket on the ledger bucket with NO condition: S3 can answer a GET or HEAD of a missing key with
+ * 404 only if the caller may s3:ListBucket for that very request, and a GET carries no s3:prefix, so a
+ * prefix-conditioned List never applies there and a missing shard, stub or marker would read as 403 (access_denied,
+ * every real run failing). The unconditioned List is what makes the 404 possible; cross-account, the bucket's own
+ * policy must allow it unconditioned too. Write: also s3:PutObject on the ledger keys, with NO s3:x-amz-server-side-encryption condition: the
  * tools send no encryption header there (the bucket's SSE-S3 default applies). No delete, no KMS. Cross-account, the
  * ledger bucket's own policy must grant the same to the role (kept with that bucket's infrastructure, not here).
  */
@@ -133,7 +134,7 @@ export function backlogOpsLedgerStatements(mode: "read" | "write", l: BacklogOps
   const r = backlogOpsLedgerResources(l);
   return [
     { Sid: "LedgerRead", Effect: "Allow", Action: "s3:GetObject", Resource: [r.objects, r.home] },
-    { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: r.bucketArn, },
+    { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: r.bucketArn },
     ...(mode === "write" ? [{ Sid: "LedgerWrite", Effect: "Allow", Action: "s3:PutObject", Resource: r.objects }] : []),
   ];
 }
@@ -164,15 +165,19 @@ const hasSseCondition = (condition: unknown) =>
  * With `c.ledger` (backlogOpsRoles.ledgerBucket) also, and only, `backlogOpsLedgerStatements`' grants on the ledger
  * bucket, each in a statement of its own bucket:
  *   s3:GetObject                  `<ledger>/<root>/.admission-inbox/*\/ledger/*` and the ledger-home marker;
- *   s3:ListBucket                 the ledger bucket itself, with NO condition (a missing key's GET is a 404 only
- *                                 with an unconditional List: a GET carries no s3:prefix, so a prefix-conditioned
- *                                 List would make it a 403);
+ *   s3:ListBucket                 the ledger bucket itself, with NO condition, and REQUIRED whenever any ledger
+ *                                 Get or Put is granted (S3 can answer a missing key's GET with 404 only if the
+ *                                 caller may List for that request, and a GET carries no s3:prefix, so with a
+ *                                 prefix-conditioned List, or none, every missing key reads as a 403);
  *   s3:PutObject                  (writer only) `<ledger>/<root>/.admission-inbox/*\/ledger/*`, with no
  *                                 s3:x-amz-server-side-encryption condition (the tools send no encryption header).
  * No KMS action ever names the ledger bucket.
  * "The transcripts key" is its exact ARN when `keyArn` is given (the pre-apply diff and the capture, which resolve
  * the key's alias live), and otherwise a key ARN in this account and region (the stack's input check, before the
- * key's ARN is known). Deny statements may say anything: they only narrow.
+ * key's ARN is known). Deny statements may say anything (they only narrow), except that with `c.ledger` a Deny may
+ * not reach the ledger bucket in a way that could turn a missing key's 404 into a 403: one naming the ledger bucket
+ * (a Resource or NotResource under its ARN) is refused, and so is one with an s3:prefix condition whose Resource
+ * pattern could match the ledger bucket (or that uses NotResource).
  */
 export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write", c: RolePolicyContext, refuse: (why: string) => never): AdoptedRolePolicies {
   const at = `transcriptStore.adoptIdentities.backlogOpsRoles.${mode}`;
@@ -188,6 +193,7 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
   const isKey = (r: unknown) => typeof r === "string" && (c.keyArn !== undefined ? r === c.keyArn : keyPattern.test(r));
   const allowed: readonly string[] = ROLE_ACTIONS[mode];
   const ledger = c.ledger !== undefined ? backlogOpsLedgerResources(c.ledger) : undefined;
+  let ledgerObjectGrant = false, ledgerList = false;
   for (const [name, doc] of Object.entries(policies)) {
     const p = `${at}.inlinePolicies[${JSON.stringify(name)}]`;
     if (!POLICY_NAME.test(name)) refuse(`${at}.inlinePolicies has an invalid policy name`);
@@ -197,7 +203,17 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
     for (const s of d.Statement as unknown[]) {
       if (!plain(s)) return refuse(`${p} has a statement that is not an object`);
       for (const k of Object.keys(s)) if (!STATEMENT_KEYS.has(k)) refuse(`${p}: a statement may not carry ${k}`);
-      if (s.Effect === "Deny") continue;
+      if (s.Effect === "Deny") {
+        if (ledger) {
+          const named = [...(s.Resource === undefined ? [] : list(s.Resource)), ...(s.NotResource === undefined ? [] : list(s.NotResource))];
+          if (named.some((r) => typeof r === "string" && (r === ledger.bucketArn || r.startsWith(`${ledger.bucketArn}/`))))
+            refuse(`${p}: a Deny may not name the ledger bucket (it could make a missing ledger key read as 403, not 404)`);
+          const prefixCondition = plain(s.Condition) && Object.values(s.Condition).some((block) => plain(block) && Object.keys(block).some((k) => k.toLowerCase() === "s3:prefix"));
+          if (prefixCondition && (s.NotResource !== undefined || named.some((r) => typeof r === "string" && globMatches(r, ledger.bucketArn))))
+            refuse(`${p}: a Deny with an s3:prefix condition may not reach the ledger bucket (a GET carries no s3:prefix, so it would deny the List a missing key's 404 needs)`);
+        }
+        continue;
+      }
       if (s.Effect !== "Allow") refuse(`${p}: Effect must be Allow or Deny`);
       if (s.NotAction !== undefined || s.NotResource !== undefined || s.Action === undefined || s.Resource === undefined)
         refuse(`${p}: an Allow statement names its Action and Resource (no NotAction, no NotResource)`);
@@ -209,12 +225,15 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
         // A statement naming the ledger bucket is judged by the ledger's rules alone (never mixed with the transcripts').
         const onLedger = ledger !== undefined && resources.some((r) => typeof r === "string" && (r === ledger.bucketArn || r.startsWith(`${ledger.bucketArn}/`)));
         if (ledger && onLedger && a === "s3:ListBucket") {
+          ledgerList = true;
           if (!resources.every((r) => r === ledger.bucketArn)) refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself`);
           if (s.Condition !== undefined)
             refuse(`${p}: s3:ListBucket on the ledger bucket takes no Condition: S3 answers a GET of a missing key with 404 only when the caller may List for that request, and a GET carries no s3:prefix, so any prefix condition makes every missing shard, stub or marker a 403 (access_denied)`);
         } else if (ledger && onLedger && a === "s3:GetObject") {
+          ledgerObjectGrant = true;
           if (!resources.every((r) => r === ledger.objects || r === ledger.home)) refuse(`${p}: s3:GetObject on the ledger bucket only on exactly ${ledger.objects} and ${ledger.home}`);
         } else if (ledger && onLedger && a === "s3:PutObject") {
+          ledgerObjectGrant = true;
           if (!resources.every((r) => r === ledger.objects)) refuse(`${p}: s3:PutObject on the ledger bucket only on exactly ${ledger.objects}`);
           if (hasSseCondition(s.Condition)) refuse(`${p}: s3:PutObject on the ledger bucket takes no s3:x-amz-server-side-encryption condition (the tools send no encryption header)`);
         } else if (a === "s3:ListBucket") {
@@ -230,7 +249,15 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
       }
     }
   }
+  if (ledgerObjectGrant && !ledgerList)
+    refuse(`${at}: a role granted s3:GetObject or s3:PutObject on the ledger bucket also needs s3:ListBucket on it, unconditioned (without it every missing ledger key reads as 403, not 404)`);
   return value as unknown as AdoptedRolePolicies;
+}
+
+/** IAM resource-pattern matching (`*` any run of characters, `?` one): could `pattern` cover `arn`? */
+function globMatches(pattern: string, arn: string): boolean {
+  const re = new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+  return re.test(arn);
 }
 
 /** `transcriptStore.adoptIdentities`: at least one group (omit the whole input for none), each exactly as documented. */

@@ -148,7 +148,42 @@ describe("adopt identities: input", () => {
       expect(checkRoles(roles([], []))).toBeDefined();
       expect(() => checkRoles(roles([{ ...listOk, Action: ["s3:ListBucket"], Resource: [L] }], []))).not.toThrow();
       expect(() => checkRoles(roles([{ Effect: "Allow", Action: ["s3:GetObject"], Resource: home }, listOk],
-        [{ Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [objects] }]))).not.toThrow();
+        [{ Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [objects] }, listOk]))).not.toThrow();
+    });
+
+    it("set: the unconditioned List is REQUIRED whenever a ledger Get or Put is granted (else every missing key is a 403)", () => {
+      for (const [read, write] of [
+        [[{ Effect: "Allow", Action: "s3:GetObject", Resource: [objects, home] }], []],
+        [[], [{ Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [objects] }]],
+        [[], [{ Effect: "Allow", Action: "s3:PutObject", Resource: objects }]],
+      ] as Record<string, unknown>[][][]) expect(() => checkRoles(roles(read!, write!))).toThrow(/also needs s3:ListBucket on it, unconditioned/);
+      // It may sit in another of the role's inline policies than the Get or Put.
+      const split = roles([], []) as { backlogOpsRoles: { read: { inlinePolicies: Record<string, unknown> } } };
+      split.backlogOpsRoles.read.inlinePolicies.get = { Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "s3:GetObject", Resource: [objects, home] }] };
+      split.backlogOpsRoles.read.inlinePolicies.list = { Version: "2012-10-17", Statement: [listOk] };
+      expect(() => checkRoles(split)).not.toThrow();
+    });
+
+    it("set: a Deny may not reach the ledger bucket in a way that turns a missing key's 404 into a 403", () => {
+      const grants = backlogOpsLedgerStatements("read", ledgerBucket);
+      for (const deny of [
+        { Effect: "Deny", Action: "s3:ListBucket", Resource: L },
+        { Effect: "Deny", Action: "s3:*", Resource: `${L}/*` },
+        { Effect: "Deny", Action: "s3:DeleteObject", Resource: objects },
+        { Effect: "Deny", Action: "s3:*", NotResource: L },
+      ]) expect(() => checkRoles(roles([...grants, deny], []))).toThrow(/a Deny may not name the ledger bucket/);
+      for (const deny of [
+        { Effect: "Deny", Action: "s3:ListBucket", Resource: "*", Condition: { StringNotLike: { "s3:prefix": "96bulls/.admission-inbox/*" } } },
+        { Effect: "Deny", Action: "s3:ListBucket", Resource: "arn:aws:s3:::synthetic-*", Condition: { StringNotLike: { "s3:prefix": "x" } } },
+        { Effect: "Deny", Action: "s3:ListBucket", NotResource: bucketArn, Condition: { StringNotLike: { "s3:prefix": "x" } } },
+      ]) expect(() => checkRoles(roles([...grants, deny], []))).toThrow(/a Deny with an s3:prefix condition may not reach the ledger bucket/);
+      // Denies that cannot reach it stay free: the transcripts' own, a wildcard without a prefix condition, a prefix
+      // condition on the transcripts bucket alone. And without the input, Denies are not judged at all.
+      for (const deny of [
+        { Effect: "Deny", Action: "s3:Delete*", Resource: "*" },
+        { Effect: "Deny", Action: "s3:ListBucket", Resource: bucketArn, Condition: { StringNotLike: { "s3:prefix": "96bulls/*" } } },
+      ]) expect(() => checkRoles(roles([...grants, deny], []))).not.toThrow();
+      expect(() => checkRoles(roles([{ Effect: "Deny", Action: "s3:*", Resource: L }], [], null))).not.toThrow();
     });
 
     it("unset: any ledger-bucket statement is refused for both roles, and the policies are judged exactly as before", () => {

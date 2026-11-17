@@ -965,11 +965,15 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   `s3:GetObject` on `<root>/.admission-inbox/*/ledger/*` and on `<root>/.ledger/fence-authority/.ledger-home.json`
   and `s3:ListBucket` on the bucket with no condition (S3 answers a GET of a missing key with 404 only when the caller
   may List for that request, and a GET carries no `s3:prefix`, so any prefix condition makes a missing shard, stub or
-  marker a 403; any condition on it is refused); the writer
+  marker a 403; any condition on it is refused, and it is required whenever a ledger Get or Put is granted); the writer
   also `s3:PutObject` on `<root>/.admission-inbox/*/ledger/*` with no `s3:x-amz-server-side-encryption` condition. No
   delete and no KMS action on it. The input renders nothing itself (the roles carry exactly the pasted live
   policies), so unset or set without the grants, every declaration is byte-identical. It is the identity side only:
-  the ledger bucket's own policy, in its own repository, must grant the roles too, and that bucket must have S3 Object
+  the ledger bucket's own policy, in its own repository, must grant the roles too, its `s3:ListBucket` unconditioned
+  as well (cross-account, S3 needs the List from both sides before a missing key reads as 404; check the live bucket
+  policy before the first real run). A Deny naming the ledger bucket, or reaching it with an `s3:prefix` condition, is
+  refused. With the unconditioned List both roles can enumerate every key name in the ledger bucket (Get and Put stay
+  key-scoped), acceptable only because that bucket is dedicated to the ledger. That bucket must also have S3 Object
   Ownership `BucketOwnerEnforced` (ACLs disabled): the writer puts cross-account with no ACL, so otherwise its objects
   may be unreadable to the edge in the bucket's own account.
 - `"uploadPresignIssuer": true`: the user `96bulls-<stage>-upload-presign-issuer` at `/96bulls/` and its managed

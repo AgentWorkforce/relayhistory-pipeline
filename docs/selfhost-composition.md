@@ -763,10 +763,13 @@ consulted during admission.
 
 Backend notes:
 
-- **S3 / MinIO.** Grant `s3:ListBucket` on the bucket (prefix-conditioned to the
-  two listings above, plus whatever the sync path already needs). Without it S3
-  answers a missing key with 403 instead of 404, and a missing privacy journal
-  (the normal case) would read as an error. Every upload would then be a 503.
+- **S3 / MinIO.** Grant `s3:ListBucket` on the bucket with **no condition**. S3
+  answers a GET or HEAD of a missing key with 404 only when the caller may
+  `s3:ListBucket` for that very request, and such a request carries no
+  `s3:prefix`, so a prefix-conditioned List never applies there: a missing key
+  reads as 403. A missing privacy journal (the normal case) would then read as
+  an error, and every upload would be a 503. (The same List also covers the two
+  listings above.)
   MinIO must honour `If-None-Match` and `If-Match` on PUT; the startup gate
   checks this.
 - **GCS.** Creates use `x-goog-if-generation-match: 0` and swaps use
@@ -873,7 +876,7 @@ What `s3` requires and changes:
 - **Controls also write SQL.** Selection, reset and ordered controls write the S3 fence first, then reconcile SQL `upload_deletions` (and write SQL's reset record) to the fence's final state. The read API and the eraser still read SQL. A failure on either side fails the control (503), and its retry is idempotent. This is deletion state for readers, never upload accounting: claims and commits never call SQL.
 - **A reset is completed only by its own retry** on self-host: a claim never completes a reset left running, so the SQL half is never skipped. A client that abandons a reset leaves it running until a retry with the same `request_id`.
 - **The conditional-write startup probe** (the `.admission-probe` row above) runs in every admission mode, including `sync`.
-- **Object store.** Besides the rows above, the Locker credential needs GetObject and conditional PutObject (`If-None-Match: *` and `If-Match`) under `…/m=srv_<user>/ledger/` (`batches/`, `revisions/`, `owners/`, `rearm/`) and on `…/upload-fences.json`. A reset also needs ListBucket with prefix `…/ledger/owners/`. The markers need GetObject on `<root>/.ledger/fence-authority.json` and `<root>/.ledger/fence-authority/*`. Nothing in the S3 ledger is ever deleted.
+- **Object store.** Besides the rows above, the Locker credential needs GetObject and conditional PutObject (`If-None-Match: *` and `If-Match`) under `…/m=srv_<user>/ledger/` (`batches/`, `revisions/`, `owners/`, `rearm/`) and on `…/upload-fences.json`. A reset also lists `…/ledger/owners/`. Grant ListBucket on the bucket with no condition: it covers that listing, and a GET of a missing ledger key (a revision shard or owner stub not written yet) reads as 404 only with an unconditioned List (a GET carries no `s3:prefix`), never with a prefix-conditioned one. The markers need GetObject on `<root>/.ledger/fence-authority.json` and `<root>/.ledger/fence-authority/*`. Nothing in the S3 ledger is ever deleted.
 - **A separate ledger bucket (`INGEST_LEDGER_BUCKET`, default unset).** The ledger's own objects (each user's `ledger/`: batch records, revision shards, ownership stubs, re-arm markers, log streams; and the ledger-home marker `<root>/.ledger/fence-authority/.ledger-home.json`) can live in a bucket in the edge's own region while everything else, the fences (`upload-fences.json`, which the hosted Worker's fence mirror writes) included, stays in `LOCKER_BUCKET` (`src/session-ingest/ledger-store.ts`). Unset changes nothing. `INGEST_LEDGER_HOME_GUARD=on` (default off) adds one GET, cached with the fence-authority marker (60 s per org), under the prefix the edge already reads: the ledger-home marker, which, when it names another bucket, refuses claims (`ledger_home_moved`). Moving an existing ledger is an offline, scripted step: [ledger-relocation.md](ledger-relocation.md).
 - **Tenant limits (`INGEST_S3_TENANT_LIMIT`, default off).** There is no slot table and no SQL on the upload path. With the flag unset, empty or `off`, `INGEST_MAX_PER_USER` and `INGEST_MAX_PER_ORG` bound nothing while the ledger is `s3`, exactly as before. Exactly `on` turns on an in-memory limit (`tenant-limiter.ts`), and any other value refuses startup. `on` needs `INGEST_LEDGER=s3`.
   - **The caps are per replica.** Each ingest-edge process counts only its own in-flight admissions, so with N replicas one tenant can have up to N times each cap in flight.

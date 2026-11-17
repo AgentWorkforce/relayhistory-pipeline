@@ -291,6 +291,17 @@ group, after releasing its lease, logging `drain_lease_release_failed` if that r
 next SQL page, slot window or org read, or after its current merge pass). The
 export touches no ledger key and does not take them.
 
+What a refusal mid-run looks like:
+- The page or merge pass in flight finishes first. Its remaining ledger writes are refused by the guard without a
+  request, but the backfill's store retry may still try each of them up to 5 times with backoff (the ledger library
+  can report the refusal under a retryable store code), so the stop can take that long, writing nothing.
+- The drain's failed stdout line is `{"refused": "<code>"}`, plus `"lease_release": "drain_lease_release_failed"` when
+  its lease release also failed (one stderr line says the same). The lease then runs out its 15-minute TTL, and a
+  following drain or export waits for it.
+- A drain that completes but cannot release its lease still exits 0. Its summary carries
+  `"lease_release": "drain_lease_release_failed"` (and the stderr line), and the lease is held until its TTL, so the
+  next dispatch within those 15 minutes refuses with `drain_locked`.
+
 **Set them as environment variables only.** `vars.*` falls back to a repository or organisation variable of the same
 name when the environment has none, and the workflow cannot tell the scopes apart. So never define
 `BACKLOG_OPS_LEDGER_*` at repository or organisation scope: define them on both `session-schema-production` and
@@ -458,7 +469,8 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      answers a `GetObject` or `HeadObject` of a missing key with 404 only when the caller holds `s3:ListBucket` for
      that very request, and such a request carries no `s3:prefix`, so a prefix-conditioned List never applies there:
      every missing shard, owner stub or marker would read as a 403 (`access_denied`) and every real run would fail.
-     The stack refuses any condition on this List. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     The stack refuses any condition on this List, requires it whenever a ledger `GetObject` or `PutObject` is
+     granted, and refuses a Deny that names the ledger bucket (or reaches it with an `s3:prefix` condition). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
@@ -466,7 +478,21 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      live roles (an IAM change: Khaliq's explicit OK), then paste the updated live policies and set the input, so
      the live diff stays clean.
    - **Resource side (not this repository).** The ledger bucket's policy granting the two role ARNs the same actions
-     on the same resources lives with that bucket's infrastructure, in its own repository.
+     on the same resources lives with that bucket's infrastructure, in its own repository. It must grant
+     `s3:ListBucket` on the bucket to these principals **unconditioned** too: cross-account, S3 needs the List
+     allowed on both sides before it answers a missing key with 404, so a prefix-conditioned List on the bucket side
+     keeps every missing shard, stub and marker a 403 however the roles are set. **Check the live bucket policy
+     before the first real run.**
+   - **Key names are visible.** With the unconditioned List, both roles can enumerate every key *name* in the ledger
+     bucket (`GetObject` and `PutObject` stay key-scoped, so not the contents). That is acceptable only because the
+     bucket is dedicated to the ledger ([ledger-relocation.md](ledger-relocation.md)); its owner must keep it that
+     way.
+   - **Known scope gap: log-commit payloads.** The `GetObject` / `PutObject` pattern
+     `<root>/.admission-inbox/*/ledger/*` also matches the log-commit streams' payloads under
+     `ledger/log/<stream>/p/`, which hold session records. Once `INGEST_LEDGER_LOG_COMMIT` is used with the relocated
+     ledger, both roles could read them and the write role could overwrite them, though neither tool touches them.
+     Log-commit is off in production today; narrow the grants (to the ledger's `batches/`, `revisions/`, `owners/`
+     and `rearm/`) before turning it on there.
    - **Precondition: Object Ownership = `BucketOwnerEnforced` (ACLs disabled) on the ledger bucket.** The write role
      puts objects cross-account with no ACL. Under any other ownership setting those objects are owned by the
      roles' account, and the edge, in the bucket's own account, may be unable to read them. Check it before the
