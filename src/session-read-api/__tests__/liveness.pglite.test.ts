@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { poolTenantRunner, sqlLiveness } from "../liveness.ts";
+import { poolTenantRunner, sqlLiveness, sqlOperatorErased } from "../liveness.ts";
+import { createReadApi } from "../app.ts";
 import { SESSION_SOURCES_MAX, sqlSessionSources } from "../session-sources.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
@@ -177,7 +178,7 @@ describe("sqlSessionSources as the role (GET /v1/sessions/:sessionId/sources)", 
     await pointer(db, { org: "org-b", session: "elsewhere", harness: "codex" });
     const sources = sqlSessionSources(poolTenantRunner(asRole(db)));
     const harnesses = async (org: string, ws: string, id: string) => (await sources(org, ws, id)).map((r) => r.harness);
-    expect(await sources("org-a", "ws-a", "one")).toEqual([{ org_id: "org-a", workspace_id: "ws-a", harness: "codex" }]);
+    expect(await sources("org-a", "ws-a", "one")).toEqual([{ org_id: "org-a", workspace_id: "ws-a", harness: "codex", session_ids: ["one"], canonical_ids: [] }]);
     expect(await harnesses("org-a", "ws-a", "two")).toEqual(["claude", "codex"]);
     expect(await harnesses("org-a", "ws-a", "gone")).toEqual([]);
     expect(await harnesses("org-a", "ws-a", "absent")).toEqual([]);
@@ -197,6 +198,11 @@ describe("sqlSessionSources as the role (GET /v1/sessions/:sessionId/sources)", 
     const sources = sqlSessionSources(poolTenantRunner(asRole(db)));
     expect((await sources("org-a", "ws-a", "source-id")).map((r) => r.harness)).toEqual(["claude", "codex"]);
     expect((await sources("org-a", "ws-a", "phys-1")).map((r) => r.harness)).toEqual(["claude"]);
+    // Every form of the key comes back for the fence check.
+    expect(await sources("org-a", "ws-a", "source-id")).toEqual([
+      { org_id: "org-a", workspace_id: "ws-a", harness: "claude", session_ids: ["phys-1"], canonical_ids: ["source-id"] },
+      { org_id: "org-a", workspace_id: "ws-a", harness: "codex", session_ids: ["source-id"], canonical_ids: [] },
+    ]);
   }, 60_000);
 
   test("RLS still holds if the statement's own tenant binding were wrong: another bound tenant sees nothing", async () => {
@@ -215,5 +221,36 @@ describe("sqlSessionSources as the role (GET /v1/sessions/:sessionId/sources)", 
     expect(got).toHaveLength(SESSION_SOURCES_MAX);
     expect(got).toEqual([...got].sort());
     expect(got[0]).toBe("h00");
+  }, 60_000);
+});
+
+describe("GET /v1/sessions/:sessionId/sources with the operator erase fence, as the role", () => {
+  test("a fence on the physical alias hides the source when the caller asks the source id, and the reverse", async () => {
+    const db = await database();
+    // claude: physical P, source id X (aliased); codex: physical X. Both live (an erase pending its tombstone).
+    await pointer(db, { session: "P", harness: "claude" });
+    await db.query("UPDATE sessions.session_index SET canonical_session_id = 'X' WHERE session_id = 'P'");
+    await pointer(db, { session: "X", harness: "codex" });
+    const run = poolTenantRunner(asRole(db));
+    const app = (fence: boolean) => createReadApi({
+      verify: async () => ({ userId: "u", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] }),
+      ch: { database: "d", async command() { throw new Error("never"); }, async insert() { throw new Error("never"); }, async select() { throw new Error("never"); } },
+      liveness: sqlLiveness(run),
+      completeSinceMs: 0,
+      directoryWorkspaces: "*",
+      sessionSources: sqlSessionSources(run),
+      ...(fence ? { operatorErased: sqlOperatorErased(run) } : {}),
+    });
+    const get = async (fence: boolean, id: string) => (await (await app(fence).request(`/v1/sessions/${id}/sources?workspace=ws-a`, { headers: { authorization: "Bearer t" } })).json()) as { sources: string[] };
+    expect((await get(true, "X")).sources).toEqual(["claude", "codex"]);
+    // The erase fence names the physical id only (as written for an alias), on claude.
+    await db.query("INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id) VALUES ('org-a', 'ws-a', 'claude', 'P')");
+    expect((await get(true, "X")).sources).toEqual(["codex"]);
+    expect((await get(true, "P")).sources).toEqual([]);
+    // Without the fence wired (the hosted entries), the live rows still answer.
+    expect((await get(false, "X")).sources).toEqual(["claude", "codex"]);
+    // A fence under the source id hides the codex copy whose physical id is X too.
+    await db.query("INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id) VALUES ('org-a', 'ws-a', 'codex', 'X')");
+    expect((await get(true, "X")).sources).toEqual([]);
   }, 60_000);
 });

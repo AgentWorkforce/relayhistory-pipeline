@@ -97,6 +97,9 @@ name: deploy session-read-worker
 # /v1/sessions/:sessionId/sources, the live harnesses of one session id from session_index through
 # the read role's existing columns (no migration, no grant, no secret). off (the default) renders
 # no var: 501 sources_not_configured. Same not-preserved rule; dispatch is Khaliq's call.
+# The live-settings guard behind that rule runs only in profile/preserve mode (owner_buffered unset,
+# profile or preserve): with an explicit owner_buffered=on|off, an off summary/sources input drops a
+# live var without a refusal (true of every input above).
 #
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password

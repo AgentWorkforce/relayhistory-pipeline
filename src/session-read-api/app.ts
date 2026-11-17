@@ -417,6 +417,8 @@ const MAX_LIST_ID_LENGTH = 255;
 const MAX_AGENT_LENGTH = 200;
 /** Must equal the literal route below (stacks/aws/__tests__/session-read-api.test.ts reads route literals). */
 const SUMMARY_SEARCH_PATH = "/v1/sessions/summaries/search";
+/** GET /v1/sessions/:sessionId/sources: fence-checks its own sources (both key forms) after its flag. */
+const SESSION_SOURCES_PATH = /^\/v1\/sessions\/[^/]+\/sources$/u;
 const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
 /** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
@@ -760,6 +762,11 @@ export function createReadApi(deps: ReadApiDeps) {
     // The workspace-wide summary search is a literal sub-path, not a session: never treat "summaries" as a
     // session id here (no fence lookup, and no attestation ahead of the route's own flag check).
     if (c.req.path === SUMMARY_SEARCH_PATH) return next();
+    // /sources has no `source` key, so this gate would only attest ahead of its flag check; the route
+    // applies the same fence itself, per source and under every form of the id.
+    // (This gate keys the fence on the requested id only: a fence written under another alias of
+    // the same session is not seen here. Left as is; the per-session routes it guards take one.)
+    if (SESSION_SOURCES_PATH.test(c.req.path)) return next();
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
@@ -1738,7 +1745,9 @@ export function createReadApi(deps: ReadApiDeps) {
    * `sources_not_configured`), the workspace attestation (403), the directory canary (501
    * `directory_workspace_not_enabled`), parameters (501 `param_<name>`), the id (400), then the
    * read; the bearer's 401 precedes all of them, so nothing about another workspace is revealed.
-   * With the self-host operator erase fence configured, a fenced source is dropped.
+   * With the self-host operator erase fence configured, a source is dropped when any form of its
+   * key is fenced (the requested id, and each physical and source id its live rows hold); the
+   * checks run one after another on the request's runner, never in parallel.
    */
   app.get("/v1/sessions/:sessionId/sources", async (c) => {
     try {
@@ -1757,11 +1766,26 @@ export function createReadApi(deps: ReadApiDeps) {
         if (row.org_id !== identity.orgId || row.workspace_id !== identity.workspaceId) throw new TenantMismatchError();
         if (typeof row.harness !== "string" || !HARNESS_NAME.test(row.harness)) throw new Error("session sources out of contract");
       }
-      let sources = [...new Set(rows.map((row) => row.harness))].sort();
+      const ids = new Map<string, Set<string>>();
+      for (const row of rows) {
+        const forms = ids.get(row.harness) ?? new Set([sessionId]);
+        for (const id of [...(Array.isArray(row.session_ids) ? row.session_ids : []), ...(Array.isArray(row.canonical_ids) ? row.canonical_ids : [])])
+          if (typeof id === "string" && id !== "") forms.add(id);
+        ids.set(row.harness, forms);
+      }
+      // Byte order, as the statement's ORDER BY harness COLLATE "C" (harness names are ASCII).
+      let sources = [...ids.keys()].sort();
       const erased = deps.operatorErased;
       if (erased) {
-        const fenced = await Promise.all(sources.map((source) => erased({ orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId })));
-        sources = sources.filter((_, i) => !fenced[i]);
+        const kept: string[] = [];
+        for (const source of sources) {
+          let fenced = false;
+          for (const id of ids.get(source)!) {
+            if (await erased({ orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId: id })) { fenced = true; break; }
+          }
+          if (!fenced) kept.push(source);
+        }
+        sources = kept;
       }
       // Counts only, never the session id or a source name.
       log({ route: c.req.routePath, reason: "session_sources_served", count: sources.length, status: 200, correlation_id: c.get("correlationId") });
