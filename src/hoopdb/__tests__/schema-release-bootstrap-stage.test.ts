@@ -247,8 +247,8 @@ test("stage success: chain SQL in order inside the transaction, COMMIT once afte
     created: [admit],
     target: T047,
     target_sha: TSHA,
-    required_roles: [...chainNames].sort(),
-    excluded: [],
+    required_roles: chainNames.filter((r) => r !== "bulls96_legacy_export_privacy").sort(),
+    excluded: ["supabase/bootstrap/legacy_export_privacy_roles.sql"],
   });
   expect(JSON.stringify(r.evidence)).not.toContain("d".repeat(64));
   expect(r.lines).toEqual(["release_bootstrap_created 1", "release_bootstrap_verified"]);
@@ -361,6 +361,7 @@ function expectNoMutation(r: Awaited<ReturnType<typeof run>>) {
   expect(r.evidence).toEqual([]);
 }
 const ingestFile = "supabase/bootstrap/session_ingest_roles.sql";
+const legacyPrivacyFile = "supabase/bootstrap/legacy_export_privacy_roles.sql";
 const consumerFile = "supabase/bootstrap/session_consumer_roles.sql";
 const workerFile = "supabase/bootstrap/session_directory_search_worker.sql";
 const verifierFile = "supabase/bootstrap/session_token_verifier.sql";
@@ -378,7 +379,7 @@ test("negative: a role above the target is not required, not created and not dri
   const planned = plan(files(), before, T_EARLY);
   expect(planned.required_roles).toEqual(["session_directory_search_worker", verifier]);
   expect(planned.will_create).toEqual([]);
-  expect(planned.excluded).toEqual([ingestFile, readApiFile, consumerFile]);
+  expect(planned.excluded).toEqual([ingestFile, legacyPrivacyFile, readApiFile, consumerFile]);
   for (const r of planned.roles.filter((x) => aboveEarly.includes(x.name)))
     expect({ n: r.name, required: r.required, will_create: r.will_create }).toEqual({ n: r.name, required: false, will_create: false });
   const r = await run({ before }, { planned });
@@ -386,7 +387,7 @@ test("negative: a role above the target is not required, not created and not dri
   expect(r.result).toBe("skipped");
   expect(control(r.log)).toEqual(refused);
   expect(r.log.some(chainSql)).toBe(false);
-  expect(r.evidence[0]).toMatchObject({ skipped: true, created: [], excluded: [ingestFile, readApiFile, consumerFile] });
+  expect(r.evidence[0]).toMatchObject({ skipped: true, created: [], excluded: [ingestFile, legacyPrivacyFile, readApiFile, consumerFile] });
   // The apply guard for this target checks only its required roles.
   requireBootstrapRoles(before, planned.required_roles, () => {});
   expect(code(() => requireBootstrapRoles(before, chainNames, () => {}))).toBe("release_bootstrap_required");
@@ -502,16 +503,16 @@ test("negative: target, target_sha or approval drift under the lock refuses befo
   }
 });
 
-test("positive: target 047000 requires all 14 roles and creates only the absent ones", async () => {
+test("positive: target 047000 requires the 14 roles consumed by then and creates only the absent ones", async () => {
   const absent = [admit, "bulls96_read_api", verifier];
   const before = state(absent);
   // A freshly created bulls96_read_api is NOLOGIN (its operator file adds LOGIN after migrate).
   const fresh = state([], { edges: absent.map(creatorEdge) });
   const after = { ...fresh, roles: fresh.roles.map((x) => (x.rolname === "bulls96_read_api" ? { ...x, rolcanlogin: false } : x)) };
   const planned = plan(files(), before);
-  expect(planned.required_roles).toEqual([...chainNames].sort());
+  expect(planned.required_roles).toEqual(chainNames.filter((r) => r !== "bulls96_legacy_export_privacy").sort());
   expect(planned.required_roles).toHaveLength(14);
-  expect(planned.excluded).toEqual([]);
+  expect(planned.excluded).toEqual([legacyPrivacyFile]);
   expect(planned.mixed).toEqual([]);
   expect(planned.will_create).toEqual([...absent].sort());
   const r = await run({ before, after }, { planned });
@@ -705,8 +706,11 @@ test("contract (d): an extra or missing role in the release map or the anchor re
   // release_bootstrap_manifest refuses before the coverage proof).
   expect(code(pre(extra, LEGACY))).toBe("release_bootstrap_manifest");
   // The coverage proof itself (the backstop under the per-file checks).
-  const scopes = SESSION_BOOTSTRAP_FILES.map((file) => ({ file, scope: "run" as const }));
-  const required = [...chainNames].sort();
+  const scopes = SESSION_BOOTSTRAP_FILES.map((file) => ({
+    file,
+    scope: file === legacyPrivacyFile ? "excluded" as const : "run" as const,
+  }));
+  const required = chainNames.filter((r) => r !== "bulls96_legacy_export_privacy").sort();
   const cover = (o: Partial<Parameters<typeof bootstrapContractCoverage>[0]>) => () =>
     bootstrapContractCoverage({ target: T047, files: files(), scopes, required_roles: required, map: SESSION_BOOTSTRAP_ROLES, ...o });
   expect(code(cover({}))).toBe("no refusal");

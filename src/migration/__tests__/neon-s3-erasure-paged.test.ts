@@ -13,9 +13,10 @@ import { join } from "node:path";
 import { FakeS3Versions } from "./fake-s3-versions.ts";
 import { DEFAULT_ERASURE_CONFIG, ErasureJob, eraseScope } from "../neon-s3-erasure/job.ts";
 import { liveStagedPrefix, liveTargets, livePointerPrefix } from "../neon-s3-erasure/live.ts";
-import type { ErasureAuthority } from "../neon-s3-erasure/authority.ts";
+import type { ErasureAuthority, LegacyFencedGroup } from "../neon-s3-erasure/authority.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+import { LEGACY_EXPORT_ORIGIN_ID, legacyMachineId } from "../../shared/legacy-export-machine.ts";
 
 // These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
 // The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
@@ -29,7 +30,11 @@ __modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OB
  * TEST-ONLY: exporter-path completion is opted into explicitly through the job's test seam
  * (ErasureConfig.obligationsSettled; production never sets it). The state file itself can never attest.
  */
-const SETTLED_CFG = { ...DEFAULT_ERASURE_CONFIG, obligationsSettled: () => true };
+const SETTLED_CFG = {
+  ...DEFAULT_ERASURE_CONFIG,
+  legacyExportErasure: true,
+  obligationsSettled: () => true,
+};
 const attestedState = (path: string) => new SyncState(path, { obligations: OBLIGATIONS_MODE === "on" });
 
 setDefaultTimeout(120_000);
@@ -67,6 +72,36 @@ const job = (s: FakeS3Versions, st: SyncState, a: ErasureAuthority, now = () => 
   new ErasureJob(a, st, s.eraser(), () => {}, SETTLED_CFG, now, async () => {});
 
 describe("E3 job on the shared paged eraser", () => {
+  test("only a healthy non-dry-run Supabase sweep records exporter readiness", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    let heartbeats = 0;
+    const base = {
+      fencedLivePage: async () => [],
+      recordSuccessfulSweep: async () => void (heartbeats += 1),
+      legacyFencedPage: async () => [] as LegacyFencedGroup[],
+      stillLegacyFenced: async () => true,
+    };
+    await job(s, st, authority(base)).sweep({ dryRun: true });
+    expect(heartbeats).toBe(0);
+    await job(s, st, authority(base)).sweep();
+    expect(heartbeats).toBe(1);
+    const broken = authority({
+      ...base,
+      legacyFencedPage: async () => { throw Object.assign(new Error("broken"), { code: "legacy_rpc_broken" }); },
+    });
+    const logs: Record<string, unknown>[] = [];
+    const j = new ErasureJob(broken, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
+    await j.sweep();
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs).toContainEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+    }));
+    expect(heartbeats).toBe(1);
+    st.close();
+  });
+
   test("a machine over 10k versions resumes across sweeps (and a fresh process) instead of failing closed; pointer last", async () => {
     const s = new FakeS3Versions();
     fill(s, 12_500);
@@ -166,6 +201,174 @@ describe("E3 job on the shared paged eraser", () => {
     expect(s.count(prefix)).toBe(0);
     expect(st.nextErasures(NOW + 1, 10)).toEqual([]);
     expect(j.counters.prefixesErased).toBe(1);
+    st.close();
+  });
+});
+
+describe("hosted legacy-export scope erasure", () => {
+  const L: LegacyFencedGroup = {
+    org_id: "org-1", workspace_id: "ws/1", source: "claude", session_id: "sess:1",
+    legacy_user_id: "owner-1", legacy_machine_id: legacyMachineId("ws/1", "owner-1"),
+  };
+  const LT = liveTargets("96bulls", {
+    org_id: L.org_id, workspace_id: L.workspace_id, user_id: L.legacy_user_id,
+    origin_id: LEGACY_EXPORT_ORIGIN_ID, source: L.source, session_id: L.session_id,
+  });
+  const legacyAuthority = (row: LegacyFencedGroup | LegacyFencedGroup[] = L) => authority({
+    fencedLivePage: async () => [],
+    legacyFencedPage: async (after) => after ? [] : Array.isArray(row) ? row : [row],
+    stillLegacyFenced: async () => true,
+  });
+  const legacyJob = (s: FakeS3Versions, st: SyncState, a: ErasureAuthority) =>
+    new ErasureJob(
+      a,
+      st,
+      s.eraser(),
+      () => {},
+      { ...SETTLED_CFG, legacyExportErasure: true },
+      () => NOW,
+      async () => {},
+    );
+
+  test("the production legacy fence feed is independently default-off", async () => {
+    const s = new FakeS3Versions();
+    const st = await state();
+    let reads = 0;
+    const a = legacyAuthority();
+    a.legacyFencedPage = async () => {
+      reads += 1;
+      return [L];
+    };
+    const j = new ErasureJob(
+      a,
+      st,
+      s.eraser(),
+      () => {},
+      { ...SETTLED_CFG, legacyExportErasure: false },
+      () => NOW,
+      async () => {},
+    );
+    await j.sweep();
+    expect(reads).toBe(0);
+    expect(j.counters.legacyFenceFailed).toBe(0);
+    st.close();
+  });
+
+  test("a caught per-scope legacy failure is a partial sweep: no readiness heartbeat, per-sweep and cumulative alarm counts differ", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    s.rewrite = () => "<malformed>";
+    const st = await state();
+    let heartbeats = 0;
+    const logs: Record<string, unknown>[] = [];
+    const a = legacyAuthority() as ErasureAuthority;
+    a.recordSuccessfulSweep = async () => void (heartbeats += 1);
+    const j = new ErasureJob(a, st, s.eraser(), (line) => logs.push(line), SETTLED_CFG, () => NOW, async () => {});
+    await j.sweep();
+    expect(heartbeats).toBe(0);
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 1,
+      legacyFenceFailed: 1,
+    }));
+
+    // A later healthy sweep can arm the exporter. Its delta is zero while the
+    // process-lifetime counter still records the earlier privacy failure.
+    s.rewrite = undefined;
+    await j.sweep();
+    expect(heartbeats).toBe(1);
+    expect(logs.at(-1)).toEqual(expect.objectContaining({
+      message: "erasure sweep",
+      legacy_fence_failed: 0,
+      legacyFenceFailed: 1,
+    }));
+    st.close();
+  });
+
+  test("an injected authority row erases only its encoded owner-machine session and pointer, idempotently", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/`;
+    const neighbour = `${LT.base}d=2026/10/30/s=sess_keep/`;
+    const otherOwner = liveTargets("96bulls", {
+      org_id: L.org_id, workspace_id: L.workspace_id, user_id: "owner-2",
+      origin_id: LEGACY_EXPORT_ORIGIN_ID, source: L.source, session_id: L.session_id,
+    });
+    for (const key of [`${target}manifest.json`, `${target}raw/c.ndjson.zst`, LT.pointerKey,
+      `${neighbour}manifest.json`, `${otherOwner.base}d=2026/10/30/${otherOwner.sessionSegment}/manifest.json`]) s.put(key, OLD);
+    const st = await state();
+    const j = legacyJob(s, st, legacyAuthority());
+    await j.sweep();
+    await j.sweep();
+    expect(s.count(target)).toBe(0);
+    expect(s.count(LT.pointerKey)).toBe(0);
+    expect(s.count(neighbour)).toBe(1);
+    expect(s.count(otherOwner.base)).toBe(1);
+    expect(j.counters.legacyVersionsDeleted).toBe(3);
+    st.close();
+  });
+
+  test("a stored machine that does not match the canonical owner tuple refuses before deletion", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    const st = await state();
+    const j = legacyJob(s, st, legacyAuthority({ ...L, legacy_machine_id: legacyMachineId(L.workspace_id, "someone-else") }));
+    await j.sweep();
+    expect(s.count(target)).toBe(1);
+    expect(j.counters.legacyFenceFailed).toBeGreaterThan(0);
+    st.close();
+  });
+
+  test("a corrupt machine row fails loudly without wedging later valid scopes", async () => {
+    const s = new FakeS3Versions();
+    const target = `${LT.base}d=2026/10/30/${LT.sessionSegment}/manifest.json`;
+    s.put(target, OLD);
+    const bad = {
+      ...L,
+      session_id: "sess:bad",
+      legacy_machine_id: legacyMachineId(L.workspace_id, "someone-else"),
+    };
+    const st = await state();
+    const j = legacyJob(s, st, legacyAuthority([bad, L]));
+    await j.sweep();
+    expect(j.counters.legacyFenceFailed).toBe(1);
+    expect(s.count(target)).toBe(0);
+    st.close();
+  });
+
+  test("a normalized default authority row follows the validated historical empty-workspace machine", async () => {
+    const row: LegacyFencedGroup = {
+      ...L,
+      workspace_id: "default",
+      legacy_machine_id: legacyMachineId("", L.legacy_user_id),
+    };
+    const target = liveTargets("96bulls", {
+      org_id: row.org_id,
+      workspace_id: "",
+      user_id: row.legacy_user_id,
+      origin_id: LEGACY_EXPORT_ORIGIN_ID,
+      source: row.source,
+      session_id: row.session_id,
+    });
+    const normalizedNeighbour = liveTargets("96bulls", {
+      org_id: row.org_id,
+      workspace_id: "default",
+      user_id: row.legacy_user_id,
+      origin_id: LEGACY_EXPORT_ORIGIN_ID,
+      source: row.source,
+      session_id: row.session_id,
+    });
+    const s = new FakeS3Versions();
+    s.put(`${target.base}d=2026/10/30/${target.sessionSegment}/manifest.json`, OLD);
+    s.put(target.pointerKey, OLD);
+    s.put(`${normalizedNeighbour.base}d=2026/10/30/${normalizedNeighbour.sessionSegment}/manifest.json`, OLD);
+    const st = await state();
+    await legacyJob(s, st, legacyAuthority(row)).sweep();
+    expect(s.count(target.base)).toBe(0);
+    expect(s.count(target.pointerKey)).toBe(0);
+    expect(s.count(normalizedNeighbour.base)).toBe(1);
     st.close();
   });
 });

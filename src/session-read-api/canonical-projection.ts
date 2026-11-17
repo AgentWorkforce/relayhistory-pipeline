@@ -47,6 +47,10 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
+import {
+  LEGACY_PROVENANCE_INVALID,
+  legacyProvenanceGate,
+} from "./legacy-provenance.ts";
 export interface SessionScope {
   orgId: string;
   workspaceId: string;
@@ -572,6 +576,17 @@ export async function readCanonicalScope(
     }
   }
 
+  // Legacy evidence skips delivery acceptance and owner binding. The shared
+  // gate is also used by streamCanonicalScope, so whole and streamed reads
+  // drop the same untrusted records with the same bounded reason code.
+  const legacyGate = legacyProvenanceGate(scope, parts);
+  for (let part = 0; part < parts.length; part++)
+    for (const record of parts[part]!.records) legacyGate.observe(part, record);
+  if (legacyGate.invalid) {
+    reasons.push(LEGACY_PROVENANCE_INVALID);
+    for (const part of parts)
+      part.records = part.records.filter((record) => !isLegacyRelayhistoryRecord(record));
+  }
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
   let canonicalRecords: RelayhistoryStreamRecord[] = [];

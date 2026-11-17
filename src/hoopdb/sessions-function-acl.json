@@ -742,6 +742,10 @@
     "sessions.ingest_lazy_user(jsonb,text,jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_legacy_export_scope_authority_register(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_legacy_export_privacy:EXECUTE"
+    ],
     "sessions.ingest_lock_fences(text,text,text)": [
       "<owner>:EXECUTE"
     ],
@@ -1106,6 +1110,29 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE",
       "authenticated:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_authority_ready()": [
+      "<owner>:EXECUTE",
+      "bulls96_legacy_export_privacy:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_eraser_activation()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_eraser_heartbeat()": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_eraser_page(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_eraser_still_fenced(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_privacy_eraser:EXECUTE"
+    ],
+    "sessions.legacy_export_privacy_readiness_clear()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.legacy_remote(text)": [
       "<owner>:EXECUTE",

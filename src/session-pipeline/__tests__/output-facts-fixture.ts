@@ -104,6 +104,26 @@ export function outputFixture(): { projectionRows: Row[]; records: RelayhistoryS
     },
   ];
   const records = [
+    {
+      kind: "legacy_scope",
+      origin_id: "legacy:scope",
+      record_id: "legacy:scope:coverage",
+      revision: "1",
+      operation: "upsert",
+      received_at: "2026-11-05T00:00:00.000000Z",
+      payload: {
+        org_id: "org-f4",
+        workspace_id: "ws-f4",
+        source: "codex",
+        session_id: "s1",
+        version: 1,
+        tables: [
+          "conversation_turns",
+          "session_links",
+          "session_outcomes",
+        ],
+      },
+    } as RelayhistoryStreamRecord,
     legacy("legacy_conversation_turn", "conversation_turns", "t-1", {
       id: "t-1", turn_index: 0, role: "assistant", session_owner: "u1", content: "old answer", actor_name: "a", actor_role: "owner", ts: "2026-11-05T08:00:00.000000Z",
     }),

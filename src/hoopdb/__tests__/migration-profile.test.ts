@@ -1473,6 +1473,24 @@ describe("runtime role: the exact least-privilege allowlist (hostile roles refus
 });
 
 describe("the ordered migration lanes: contiguous prefixes, no unledgered footprint", () => {
+  test("legacy authority rollback bounds every lock acquisition", () => {
+    const down = readFileSync(
+      join(
+        root,
+        "supabase/rollbacks/20261105062030_legacy_export_scope_authority.down.sql",
+      ),
+      "utf8",
+    );
+    const begin = down.indexOf("BEGIN;");
+    const timeout = down.indexOf("SET LOCAL lock_timeout='5s'");
+    const migratorLock = down.indexOf("SELECT pg_advisory_xact_lock(961996,1)");
+    const tableLock = down.indexOf(
+      "LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE",
+    );
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(begin < timeout && timeout < migratorLock && migratorLock < tableLock).toBe(true);
+  });
+
   test("turn-gates historical deletion backfill is derived and does not make rollback one-way", async () => {
     const db = await fresh();
     const tg = "upstream:20261105062020_turns_forward_gates.sql";
@@ -1483,12 +1501,17 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect(privacyGuard).toBeGreaterThan(privacyLock);
     expect(down).toContain("sessions.upload_deletions,sessions.operator_user_erasures IN SHARE ROW EXCLUSIVE MODE");
     const steps = await plan(LOCAL);
-    const prefix = steps.filter((step) => !step.name.startsWith("upstream:") || step.name < tg);
+    const turnsIndex = steps.findIndex((step) => step.name === tg);
+    expect(turnsIndex).toBeGreaterThan(0);
+    const prefix = steps.slice(0, turnsIndex);
+    const throughTurns = steps.slice(0, turnsIndex + 1);
     await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps: prefix });
     await db.query(
       "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
     );
-    await runMigrations(client(db), { profile: LOCAL, steps });
+    // Exercise 062020's own rollback without installing a later migration whose
+    // identity guard must correctly make that rollback refuse.
+    await runMigrations(client(db), { profile: LOCAL, steps: throughTurns });
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
@@ -1877,6 +1900,54 @@ describe("per-step catalog sentinels", () => {
     }
     for (const st of steps)
       expect(await sentinel(db, st.name), `${st.name} at the end`).toBe(true);
+  });
+
+  test("the privacy eraser verifier accepts the validated prefix, then requires both legacy RPCs once 062030 is installed", async () => {
+    const name = "upstream:20261105062030_legacy_export_scope_authority.sql";
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const i = steps.findIndex((st) => st.name === name);
+    expect(i).toBeGreaterThan(0);
+    const db = await prefix(i - 1, i);
+    const verify = () =>
+      db.exec(
+        readFileSync(
+          join(root, "supabase/bootstrap/privacy_eraser_verify.sql"),
+          "utf8",
+        ),
+      );
+    expect(await failure(verify())).toBeNull();
+    await db.exec(readFileSync(steps[i]!.path, "utf8"));
+    expect(await failure(verify())).toBeNull();
+    await db.exec(
+      "DROP FUNCTION sessions.legacy_export_privacy_eraser_still_fenced(jsonb)",
+    );
+    expect((await failure(verify()))?.code).toBe("55000");
+  });
+
+  test("the legacy-export phase-2 verifier enforces the 062020 predecessor", async () => {
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const legacyIndex = steps.findIndex(
+      (st) => st.name === "upstream:20261105062030_legacy_export_scope_authority.sql",
+    );
+    expect(legacyIndex).toBeGreaterThan(0);
+    const db = await prefix(legacyIndex, legacyIndex + 1);
+    const error = await failure(
+      db.exec(
+        readFileSync(
+          join(root, "supabase/bootstrap/legacy_export_privacy_verify.sql"),
+          "utf8",
+        ),
+      ),
+    );
+    const hasTurnsGate = steps.some((st) =>
+      st.name.endsWith("20261105062020_turns_forward_gates.sql"),
+    );
+    if (hasTurnsGate) expect(error).toBeNull();
+    else expect(error?.code).toBe("42P01");
   });
 
   for (const name of NON_CREATE_STEPS)
@@ -2511,13 +2582,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
+    const LA = "upstream:20261105062030_legacy_export_scope_authority.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2568,6 +2640,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062030 is newest: the per-origin claim-fence down refuses until
+    // the durable legacy-export authority and its grants/policies are removed.
+    expect(await names()).toContain(LA);
+    expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062030_legacy_export_scope_authority.down.sql");
+    expect(await names()).not.toContain(LA);
+    expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();
+    expect(await relation("sessions.legacy_export_privacy_eraser_readiness")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'legacy_export_privacy_%' OR proname='ingest_legacy_export_scope_authority_register')")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062030_legacy_export_scope_authority.down.sql")))?.code).toBe("55000");
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
     // row with its retained upload_deletions witness is derived and safe to drop.
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
@@ -2584,6 +2666,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_capability(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_register(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    // 20261105062010 (per-origin claim fence) is now newest. Its checksum-pinned
+    // down restores 058010's exact ingest_lock_fences and drops its functions.
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
@@ -3569,12 +3653,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_analysis_admit', 'bulls96_digest_narrative', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_analysis_admit', 'bulls96_digest_narrative', 'bulls96_privacy_eraser', 'bulls96_legacy_export_privacy', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(17);
+    expect(targets.rows).toHaveLength(18);
     const trampolined = targets.rows.filter(r => r.rolname !== "search_consumer_runtime");
-    expect(trampolined).toHaveLength(16);
+    expect(trampolined).toHaveLength(17);
     expect(trampolined.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     // The owner-created consumer carries exactly the creator edge: the owner
     // as member WITH ADMIN, neither INHERIT nor SET.
@@ -4559,6 +4643,15 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
           readFileSync(
             join(
               root,
+              "supabase/bootstrap/legacy_export_privacy_roles.sql",
+            ),
+            "utf8",
+          ),
+        );
+        await db.exec(
+          readFileSync(
+            join(
+              root,
               "supabase/bootstrap/session_read_api_roles.sql",
             ),
             "utf8",
@@ -4614,6 +4707,15 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
               join(
                 root,
                 "supabase/bootstrap/session_ingest_roles.sql",
+              ),
+              "utf8",
+            ),
+          );
+          await db.exec(
+            readFileSync(
+              join(
+                root,
+                "supabase/bootstrap/legacy_export_privacy_roles.sql",
               ),
               "utf8",
             ),

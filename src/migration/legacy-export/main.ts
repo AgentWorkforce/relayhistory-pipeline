@@ -1,0 +1,280 @@
+/**
+ * One-shot export of the Neon-only legacy tables (conversation_turns,
+ * session_links, session_outcomes) to canonical S3 objects.
+ *
+ *   <secrets on stdin> | bun run migration:legacy-export --plan   [--org=ORG ...|--all-orgs] [--since=ISO] [--until=ISO]
+ *   <secrets on stdin> | bun run migration:legacy-export --export [same scoping] [--refresh] [--force] [--max-scopes=N]
+ *   <secrets on stdin> | bun run migration:legacy-export --verify [--org=ORG]
+ *
+ * Secrets come ONLY on stdin, one per line, never argv, env or files:
+ *   line 1  the Neon URL of a SELECT-only role (direct, not the pooler)
+ *   line 2  dedicated HoopDb/Supabase privacy-role direct URL (ledger SELECT plus narrow RPCs)
+ *   line 3  S3 access key id       (--export / --verify)
+ *   line 4  S3 secret access key   (--export / --verify)
+ *   line 5  S3 session token       (optional)
+ * Non-secret configuration is flags:
+ *   --bucket= --expect-bucket= (must be equal) --region=us-east-1 --sse=aws:kms --kms-key=ARN
+ *   --key-root=96bulls --grant-id=neon-legacy-export --state=~/.agent-tmp/legacy-export/state.sqlite
+ *   --rows-per-sec=1000 --bytes-per-sec=3000000
+ *
+ * --plan reads discovery and fingerprints only and writes nothing anywhere.
+ * --export writes objects (write-only store; no deletes) and the checkpoint.
+ * --verify re-reads Neon and S3 and exits 2 on any mismatch. Output is JSON
+ * lines of counts and codes; the verify report names scopes (ids, not content).
+ */
+import { homedir } from "node:os";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
+import { createS3Store } from "../../shared/vendor.ts";
+import {
+  initScrubEngine,
+  routedRawChunkSealerDeps,
+} from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
+import type { Queryable } from "../relayhistory-export.ts";
+import { writeOnly } from "../neon-s3-sync/export-session.ts";
+import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
+import { Throttle } from "../neon-s3-sync/throttle.ts";
+import { LEGACY_TABLES, legacyOrgs } from "../neon-s3-sync/legacy-source.ts";
+import { Checkpoint, newCounters, runOrg, verifyExported } from "./runner.ts";
+
+const args = process.argv.slice(2);
+const flag = (n: string) => args.includes(`--${n}`);
+const arg = (n: string) => args.find((a) => a.startsWith(`--${n}=`))?.slice(n.length + 3);
+const all = (n: string) => args.filter((a) => a.startsWith(`--${n}=`)).map((a) => a.slice(n.length + 3));
+const log = (f: Record<string, unknown>) =>
+  process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), service: "legacy-export", ...f })}\n`);
+
+/**
+ * Dedicated direct privacy connection. The login remains table-SELECT-only,
+ * but its transactions must be write-capable so the one narrow SECURITY
+ * DEFINER authority registration RPC can insert before an S3 PUT.
+ */
+export async function legacyPrivacySession(client: Queryable): Promise<Queryable> {
+  await client.query(`SET default_transaction_read_only = off; SET statement_timeout = 20000;
+    SET lock_timeout = 5000; SET idle_in_transaction_session_timeout = 30000; SET TimeZone = 'UTC'`);
+  const { rows } = await client.query<{ ro: string; tz: string }>(
+    "SELECT current_setting('transaction_read_only') AS ro, current_setting('TimeZone') AS tz",
+  );
+  if (rows[0]?.ro !== "off" || rows[0]?.tz !== "UTC")
+    throw Object.assign(new Error("the privacy session cannot register export authority"), { code: "privacy_session_not_rpc_capable" });
+  return client;
+}
+
+/** Secrets from stdin only; refuses when stdin is a terminal (no echo, no history). */
+export async function readSecrets(text?: string): Promise<{ neonUrl: string; privacyUrl: string; s3?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string } }> {
+  if (text === undefined) {
+    if (process.stdin.isTTY) throw new Error("pipe the secrets on stdin (see the runbook); a terminal is refused");
+    const chunks: Buffer[] = [];
+    for await (const c of process.stdin) chunks.push(Buffer.from(c as Uint8Array));
+    text = Buffer.concat(chunks).toString("utf8");
+  }
+  const [neonUrl, privacyUrl, accessKeyId, secretAccessKey, sessionToken] = text.split(/\r?\n/u).map((l) => l.trim());
+  if (!neonUrl || !/^postgres(ql)?:\/\//u.test(neonUrl)) throw new Error("stdin line 1 must be the Neon URL");
+  if (!privacyUrl || !/^postgres(ql)?:\/\//u.test(privacyUrl)) throw new Error("stdin line 2 must be the live privacy-authority URL");
+  return {
+    neonUrl,
+    privacyUrl,
+    ...(accessKeyId && secretAccessKey ? { s3: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) } } : {}),
+  };
+}
+
+/** The privacy-authority role may observe erasure ledgers but never mutate them. */
+export async function assertPrivacySelectOnly(db: Queryable) {
+  for (const table of [
+    "session_erasure_receipts",
+    "upload_deletions",
+    "ingest_frozen_source_deletions",
+    "upload_resets",
+    "turn_session_fences",
+    "operator_user_erasures",
+  ]) {
+    const { rows } = await db.query<{ w: boolean; r: boolean; visible: boolean }>(
+      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r,
+              (NOT row_security_active('sessions.${table}'::regclass) OR (
+                EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid='sessions.${table}'::regclass
+                  AND p.polcmd='r' AND p.polpermissive
+                  AND (SELECT oid FROM pg_roles WHERE rolname=current_user)=ANY(p.polroles)
+                  AND pg_get_expr(p.polqual,p.polrelid) IN ('true','(true)'))
+                AND NOT EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid='sessions.${table}'::regclass
+                  AND p.polcmd IN('r','*') AND NOT p.polpermissive
+                  AND (0=ANY(p.polroles) OR (SELECT oid FROM pg_roles WHERE rolname=current_user)=ANY(p.polroles)))
+              )) AS visible`,
+    );
+    if (rows[0]?.w !== false || rows[0]?.r !== true || rows[0]?.visible !== true)
+      throw Object.assign(
+        new Error("the privacy role must read every erasure row without table write access"),
+        { code: "privacy_role_not_read_only" },
+      );
+  }
+  const authority = await db.query<{ w: boolean; x: boolean; a: boolean }>(
+    `SELECT has_table_privilege(current_user,'sessions.legacy_export_scope_authority','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+            has_function_privilege(current_user,'sessions.ingest_legacy_export_scope_authority_register(jsonb)','EXECUTE') AS x,
+            has_function_privilege(current_user,'sessions.legacy_export_privacy_authority_ready()','EXECUTE') AS a`,
+  );
+  if (authority.rows[0]?.w !== false || authority.rows[0]?.x !== true || authority.rows[0]?.a !== true)
+    throw Object.assign(new Error("the privacy role must have only the legacy authority register/readiness RPCs"), { code: "privacy_role_not_register_only" });
+  const identity = await db.query<{ who: string }>("SELECT current_user::text AS who");
+  if (identity.rows[0]?.who !== "bulls96_legacy_export_privacy")
+    throw Object.assign(new Error("the dedicated legacy-export privacy role is required"), { code: "privacy_role_identity" });
+}
+
+/** The Neon role must not be able to write any legacy table. */
+export async function assertSelectOnly(db: Queryable) {
+  for (const table of [...LEGACY_TABLES.map((s) => s.table), "deleted_upload_sessions", "conversation_turn_fences"]) {
+    const { rows } = await db.query<{ w: boolean; r: boolean }>(
+      `SELECT has_table_privilege(current_user,'sessions.${table}','INSERT,UPDATE,DELETE,TRUNCATE') AS w,
+              has_table_privilege(current_user,'sessions.${table}','SELECT') AS r`,
+    );
+    if (rows[0]?.w !== false || rows[0]?.r !== true) throw Object.assign(new Error("the Neon role must be SELECT-only for legacy evidence and fence tables"), { code: "neon_role_not_read_only" });
+  }
+}
+
+const iso = (v: string | undefined) => {
+  if (v === undefined) return undefined;
+  const ms = Date.parse(v);
+  if (!Number.isFinite(ms)) throw new Error(`invalid time ${v}`);
+  return ms;
+};
+
+export function assertDirectUrl(raw: string, label: string): URL {
+  const url = new URL(raw);
+  if (/(?:^|[.-])pooler(?:[.-]|$)/u.test(url.hostname) || url.port === "6543")
+    throw new Error(`use a direct (unpooled) ${label} URL`);
+  return url;
+}
+
+export async function main() {
+  const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
+  if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
+  // Landing safety: this branch ships the activation-final schema and eraser
+  // plumbing, but not an enabled exporter. The activation follow-up replaces
+  // this unconditional refusal with its fresh eraser-written heartbeat gate.
+  if (mode[0] === "export")
+    throw Object.assign(new Error("legacy export requires the activation heartbeat follow-up"), {
+      code: "legacy_export_requires_activation_heartbeat",
+    });
+  // Verify uses the same export target to read manifests. Bind its raw-chunk
+  // sealer exactly as export will once activation replaces the refusal above.
+  if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
+  const secrets = await readSecrets();
+  assertDirectUrl(secrets.neonUrl, "Neon");
+  assertDirectUrl(secrets.privacyUrl, "privacy");
+  const window = { sinceMs: iso(arg("since")), untilMs: iso(arg("until")) };
+  const statePath = arg("state") ?? `${homedir()}/.agent-tmp/legacy-export/state.sqlite`;
+  if (!flag("plan"))
+    mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
+  const { default: pg } = await import("pg");
+  const client = new pg.Client({ connectionString: secrets.neonUrl, application_name: "96bulls-legacy-export" });
+  const privacyClient = new pg.Client({
+    connectionString: secrets.privacyUrl,
+    application_name: "96bulls-legacy-export-privacy",
+  });
+  await client.connect();
+  await privacyClient.connect();
+  let stop = false;
+  for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => (stop = true));
+  const checkpoint = new Checkpoint(flag("plan") ? ":memory:" : statePath);
+  try {
+    const db = await sessionReadOnly(client as unknown as Queryable);
+    const privacyDb = await legacyPrivacySession(privacyClient as unknown as Queryable);
+    await assertSelectOnly(db);
+    await assertPrivacySelectOnly(privacyDb);
+    const needsS3 = !flag("plan");
+    let store;
+    if (needsS3) {
+      const bucket = arg("bucket");
+      if (!bucket || arg("expect-bucket") !== bucket) throw new Error("--bucket and --expect-bucket must be given and equal");
+      if (!secrets.s3) throw new Error("stdin lines 3-4 (S3 key) are required for --export/--verify");
+      const sse = arg("sse");
+      if (sse && sse !== "aws:kms" && sse !== "AES256") throw new Error("--sse must be aws:kms or AES256");
+      const kms = arg("kms-key");
+      store = writeOnly(
+        createS3Store({
+          bucket,
+          region: arg("region") ?? "us-east-1",
+          credentials: secrets.s3,
+          ...(sse ? { serverSideEncryption: sse as "aws:kms" | "AES256" } : {}),
+          ...(kms ? { sseKmsKeyId: kms } : {}),
+        }),
+      );
+    }
+    const decompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: 256 * 1024 * 1024 }));
+    if (flag("verify")) {
+      const report = await verifyExported(
+        db,
+        store!,
+        checkpoint,
+        decompress,
+        arg("org"),
+        privacyDb,
+      );
+      process.stdout.write(`${JSON.stringify({ service: "legacy-export", mode: "verify", ...report })}\n`);
+      if (!report.ok) process.exitCode = 2;
+      return;
+    }
+    let orgs = all("org");
+    if (flag("all-orgs")) orgs = [...new Set((await Promise.all(LEGACY_TABLES.map((s) => legacyOrgs(db, s.table)))).flat())].sort();
+    if (!orgs.length) throw new Error("--org=ORG (repeatable) or --all-orgs is required");
+    const throttle = new Throttle({
+      rowsPerSec: Number(arg("rows-per-sec") ?? 1000),
+      bytesPerSec: Number(arg("bytes-per-sec") ?? 3_000_000),
+      slowWindows: [],
+      slowFactor: 1,
+    });
+    const hook = async (rows: number, bytes: number) => {
+      if (stop) throw Object.assign(new Error("stopping"), { code: "interrupted" });
+      await throttle.take(rows, bytes);
+    };
+    const exporting = flag("export");
+    let remainingScopes = arg("max-scopes")
+      ? Number(arg("max-scopes"))
+      : undefined;
+    for (const org of orgs) {
+      if (remainingScopes !== undefined && remainingScopes <= 0) break;
+      const counters = newCounters();
+      await runOrg(
+        {
+          db,
+          privacyDb,
+          target: {
+            store: store!,
+            keyRoot: arg("key-root") ?? "96bulls",
+            grantId: arg("grant-id") ?? "neon-legacy-export",
+            ...routedRawChunkSealerDeps(),
+          },
+          checkpoint,
+          hook,
+          log,
+          stopped: () => stop,
+        },
+        org,
+        {
+          export: exporting,
+          window,
+          refresh: flag("refresh"),
+          force: flag("force"),
+          ...(remainingScopes !== undefined
+            ? { maxScopes: remainingScopes }
+            : {}),
+        },
+        counters,
+      );
+      log({ message: exporting ? "org exported" : "org plan", org, ...counters });
+      if (remainingScopes !== undefined)
+        remainingScopes -= counters.exported;
+      if (stop) break;
+    }
+  } finally {
+    checkpoint.close();
+    await client.end().catch(() => undefined);
+    await privacyClient.end().catch(() => undefined);
+  }
+}
+
+if (import.meta.main)
+  main().catch((error) => {
+    log({ message: "exit on error", error_code: String((error as { code?: unknown; name?: unknown })?.code ?? (error as { name?: unknown })?.name ?? "error").slice(0, 64) });
+    process.exit(1);
+  });

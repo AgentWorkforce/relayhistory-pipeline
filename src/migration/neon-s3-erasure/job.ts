@@ -9,10 +9,12 @@
  *    rollup has nothing left to keep), every 10 min;
  *  - whole session prefixes of groups a deletion fence covers
  *    (`deleted_upload_sessions`, `session_resets`), every 10 min;
+ *  - the exact owner-bound `legacy:tables:v1` machine copy of each fenced
+ *    legacy scope, including its live pointer, every 10 min;
  *  - what the exporter queued: objects a rewritten manifest no longer
  *    references, and session prefixes it no longer produces.
  *
- * It reads the privacy authority (read-only) and the shared watermark, never object content. The
+ * It reads the privacy authority (read-only except for the narrow durable readiness heartbeat) and the shared watermark, never object content. The
  * authority is Neon today, or Supabase once C3 activated it (`./authority.ts`, S3X_PRIVACY_AUTHORITY).
  * A session prefix is leased while it is erased, so the exporter never reuses
  * a chunk the eraser is deleting.
@@ -20,7 +22,8 @@
 import type { Queryable } from "../relayhistory-export.ts";
 import { orgPrefix } from "../neon-s3-sync/export-session.ts";
 import type { LiveFencedGroup } from "../neon-s3-sync/neon-reader.ts";
-import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence } from "./authority.ts";
+import { LEGACY_EXPORT_ORIGIN_ID, legacyMachineId } from "../../shared/legacy-export-machine.ts";
+import { isErasureAuthority, neonAuthority, type ErasureAuthority, type ErasurePresence, type LegacyFencedGroup } from "./authority.ts";
 import { liveObjectPrefix, livePointerPrefix, liveSessionsIn, liveStagedPrefix, liveTargets } from "./live.ts";
 
 /** Clock-skew margin between this host and S3 `LastModified`. */
@@ -58,10 +61,18 @@ export interface ErasureConfig {
   slaWarnMs: number;
   /**
    * Whether the existence guard also counts legacy-only evidence (conversation
-   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`; enable before the
-   * exporter's `S3X_INCLUDE_LEGACY_SOURCES`.
+   * turns, links, outcomes). `S3X_ERASER_RECOGNIZES_LEGACY`. Legacy manifests
+   * from `migration:legacy-export` are not in the ordinary exporter queue
+   * (the dedicated legacy fence sweep below owns them), so this only changes
+   * when a delivery group's ordinary prefixes may be erased.
    */
   recognizeLegacy: boolean;
+  /**
+   * Dedicated legacy-export fence feed. The process entry keeps this default
+   * off until 062030 and the Supabase authority are activated together.
+   * Every caller must opt in explicitly after the schema/authority gate.
+   */
+  legacyExportErasure: boolean;
   /**
    * TEST SEAM ONLY (never set by main.ts): whether exporter obligations may be treated as settled. Production has NO
    * value for it, so an exporter prefix or object is never marked erased (every genesis is unattested; there is no
@@ -77,6 +88,7 @@ export const DEFAULT_ERASURE_CONFIG: ErasureConfig = {
   progressEveryMs: 60 * 1000,
   slaWarnMs: 24 * 60 * 60 * 1000,
   recognizeLegacy: false,
+  legacyExportErasure: false,
 };
 
 const SESSION_PREFIX = /^[^/]+\/[^/]+\/v1\/ws=[^/]+\/m=[^/]+\/h=[^/]+\/d=\d{4}\/\d{2}\/\d{2}\/s=[^/]+\/$/;
@@ -94,7 +106,7 @@ export function sessionPrefixOf(keyRoot: string, orgId: string, key: string): st
 export type PagedOutcome = "incomplete" | "erased" | "unverified" | "unresolved" | "refused";
 
 export class ErasureJob {
-  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, resumable: 0, unverified: 0 };
+  readonly counters = { doneRefused: 0, unresolved: 0, reservationsRefused: 0, swept: 0, prefixesErased: 0, objectsErased: 0, versionsDeleted: 0, failed: 0, refused: 0, deferred: 0, fenceSweepFailed: 0, liveVersionsDeleted: 0, liveFenceFailed: 0, legacyVersionsDeleted: 0, legacyFenceFailed: 0, readinessHeartbeatFailed: 0, resumable: 0, unverified: 0 };
   #lastSweep = 0;
   #lastProgress = 0;
   readonly authority: ErasureAuthority;
@@ -328,7 +340,17 @@ export class ErasureJob {
   /** With `dryRun`, reports what it would erase; deletes nothing and marks nothing done. */
   async sweep(opts: { dryRun?: boolean } = {}) {
     const startedAt = this.now();
+    const dryRun = opts.dryRun ?? false;
     const authority = this.authority;
+    authority.beginSweep?.();
+    // The counters are process-lifetime totals. Snapshot them so both the
+    // readiness decision and summary describe this sweep, including failures
+    // caught inside a per-scope lane that do not reject the outer page walk.
+    const failuresAtStart = {
+      fence: this.counters.fenceSweepFailed,
+      live: this.counters.liveFenceFailed,
+      legacy: this.counters.legacyFenceFailed,
+    };
     try {
       await authority.ready();
     } catch (error) {
@@ -342,21 +364,40 @@ export class ErasureJob {
       this.log({ message: "sweep deferred: lock waiters", lock_waiters: waiters.total });
       return;
     }
+    let healthy = true;
     // Live (srv_) erasure first and on its own: it reads only tombstones, so
     // a failure or an early return in the rollup and catalog walks below
     // must not hold it back.
-    const live = await this.#eraseLiveFenced(opts.dryRun ?? false).catch((error) => {
+    const live = await this.#eraseLiveFenced(dryRun).catch((error) => {
+      healthy = false;
       this.counters.liveFenceFailed += 1;
       this.log({ message: "live fence sweep failed", error_code: errorCode(error) });
       return { groups: 0, versions: 0 };
     });
+    // The one-shot legacy exporter writes to a separate user-scoped srv_
+    // machine and never enters the ordinary export queue.  Consume its own
+    // scope-level fence feed independently of the live-origin feed.
+    let legacy: { groups: number; versions: number };
+    if (!this.cfg.legacyExportErasure) {
+      // A sweep with the legacy feed disabled cannot attest that the exporter
+      // is safe to activate, even when every ordinary live erasure succeeded.
+      healthy = false;
+      legacy = { groups: 0, versions: 0 };
+    } else {
+      legacy = await this.#eraseLegacyFenced(dryRun).catch((error) => {
+        healthy = false;
+        this.counters.legacyFenceFailed += 1;
+        this.log({ message: "legacy fence sweep failed", error_code: errorCode(error) });
+        return { groups: 0, versions: 0 };
+      });
+    }
     // Neon only: groups whose rollups and catalog rows vanished from Neon. Under the Supabase authority every
     // deletion is a fence row (a reset fences each owned session), so there is no presence sweep.
     let id = Number(this.state.meta("erasure_sweep_done") ?? 0);
     let seen = 0;
     let gone = 0;
     if (authority.presence) {
-      const r = await this.#presenceSweep(authority.presence, startedAt, opts.dryRun ?? false);
+      const r = await this.#presenceSweep(authority.presence, startedAt, dryRun);
       if (!r) return;
       ({ id, seen, gone } = r);
     }
@@ -370,12 +411,57 @@ export class ErasureJob {
         }
       }
     } catch (error) {
+      healthy = false;
       this.counters.fenceSweepFailed += 1;
       this.log({ message: "fence sweep failed", error_code: errorCode(error) });
     }
+    const sweepFailures = {
+      fence: this.counters.fenceSweepFailed - failuresAtStart.fence,
+      live: this.counters.liveFenceFailed - failuresAtStart.live,
+      legacy: this.counters.legacyFenceFailed - failuresAtStart.legacy,
+    };
+    // Per-scope live/legacy failures are deliberately caught so neighbouring
+    // scopes can proceed. They still make the sweep partial and must never
+    // refresh the exporter's durable readiness heartbeat.
+    if (sweepFailures.fence > 0 || sweepFailures.live > 0 || sweepFailures.legacy > 0)
+      healthy = false;
+    // The exporter's readiness signal is written only after a healthy real
+    // Supabase sweep. The eraser-only RPC rechecks active authority and reads
+    // the immutable legacy mapping before recording its durable timestamp.
+    if (!dryRun && !this.stopped() && authority.kind === "supabase") {
+      if (!healthy || !authority.recordSuccessfulSweep) {
+        if (!authority.recordSuccessfulSweep) {
+          this.counters.readinessHeartbeatFailed += 1;
+          this.log({ message: "eraser readiness heartbeat failed", error_code: "eraser_readiness_heartbeat_unavailable" });
+        }
+      } else {
+        try {
+          await authority.recordSuccessfulSweep();
+        } catch (error) {
+          this.counters.readinessHeartbeatFailed += 1;
+          this.log({ message: "eraser readiness heartbeat failed", error_code: errorCode(error) });
+        }
+      }
+    }
     this.counters.swept += 1;
-    if (!opts.dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
-    this.log({ message: opts.dryRun ? "erasure sweep (dry run)" : "erasure sweep", authority: authority.kind, sweep: id, count: seen, gone, fenced, live_fenced: live.groups, live_versions: live.versions });
+    if (!dryRun) this.state.setMeta("erasure_sweep_at", String(this.now()));
+    this.log({
+      message: dryRun ? "erasure sweep (dry run)" : "erasure sweep",
+      authority: authority.kind,
+      sweep: id,
+      count: seen,
+      gone,
+      fenced,
+      live_fenced: live.groups,
+      live_versions: live.versions,
+      legacy_fenced: legacy.groups,
+      legacy_versions: legacy.versions,
+      // Stable per-sweep alarm input as well as the edge metric emitted at
+      // failure time. A monitor that consumes only summaries must not turn a
+      // loud Neon-authority refusal into a silent successful sweep.
+      legacy_fence_failed: sweepFailures.legacy,
+      legacyFenceFailed: this.counters.legacyFenceFailed,
+    });
   }
 
   /** The Neon presence sweep. Undefined: stopped, or a broken read (saw nothing); nothing is erased then. */
@@ -583,6 +669,101 @@ export class ErasureJob {
           if (errorCode(error) === "erasure_reenabled") continue;
           this.counters.liveFenceFailed += 1;
           this.log({ message: "live erasure failed", error_code: errorCode(error) });
+        }
+      }
+    }
+    return { groups, versions };
+  }
+
+  /**
+   * Erase the legacy export's one owner-bound machine copy for every fenced
+   * scope.  A member other than the owner may have created the fence; the
+   * authority supplies the exporter's bound owner, so this never hashes the
+   * deleting member into the target machine.
+   *
+   * The transcript selection is the exact encoded `s=` segment under every
+   * date.  In particular, a canonical id containing `:` is mapped with the
+   * writer's component codec instead of being treated as a successful
+   * refusal.  The pointer is exact-key erased only after the transcript has a
+   * fresh zero-inventory proof.  Every page rechecks the exact scope fence.
+   */
+  async #eraseLegacyFenced(dryRun: boolean): Promise<{ groups: number; versions: number }> {
+    const page = this.authority.legacyFencedPage;
+    const stillFenced = this.authority.stillLegacyFenced;
+    // In-process test authorities predating this lane have no legacy feed.
+    // Production factories install both methods as a pair.
+    if (!page && !stillFenced) return { groups: 0, versions: 0 };
+    if (!page || !stillFenced) throw refusal("legacy_erasure_authority_incomplete");
+    let groups = 0;
+    let versions = 0;
+    let after: LegacyFencedGroup | null = null;
+    for (;;) {
+      if (this.stopped()) break;
+      const rows: LegacyFencedGroup[] = await page.call(this.authority, after);
+      if (rows.length === 0) break;
+      after = rows.at(-1)!;
+      for (const g of rows) {
+        if (this.stopped()) break;
+        try {
+          // The stored machine is evidence, not destructive authority by
+          // itself: derive it again from the canonical owner tuple and refuse
+          // corruption instead of following an arbitrary machine id. A bad
+          // row remains loudly retryable but cannot wedge later valid scopes.
+          const storageWorkspaces = g.workspace_id === "default" ? ["", "default"] : [g.workspace_id];
+          const storageWorkspace = storageWorkspaces.find(
+            (workspace) => legacyMachineId(workspace, g.legacy_user_id) === g.legacy_machine_id,
+          );
+          if (storageWorkspace === undefined)
+            throw refusal("legacy_erasure_machine_mismatch");
+          let t;
+          try {
+            t = liveTargets(this.cfg.keyRoot, {
+              org_id: g.org_id,
+              workspace_id: storageWorkspace,
+              user_id: g.legacy_user_id,
+              origin_id: LEGACY_EXPORT_ORIGIN_ID,
+              source: g.source,
+              session_id: g.session_id,
+            });
+          } catch {
+            this.counters.refused += 1;
+            throw refusal("legacy_erasure_scope_invalid");
+          }
+          groups += 1;
+          if (dryRun) continue;
+          const checkedAt = this.now();
+          if (!(await stillFenced.call(this.authority, g))) continue;
+          const before = checkedAt - LIVE_SKEW_MS;
+          const matchesSession = (key: string) => inSessionAnyDate(t.base, t.sessionSegment, key);
+          const authorize = async () => {
+            if (!(await stillFenced.call(this.authority, g))) throw refusal("erasure_reenabled");
+            await this.authority.ready();
+          };
+          const transcript = await this.#erasePaged(
+            t.base,
+            eraseScope(["legacy-session", this.authority.kind, g.org_id, g.workspace_id, g.legacy_user_id, g.source, g.session_id]),
+            (v) => matchesSession(v.key) && v.lastModified !== undefined && v.lastModified < before,
+            authorize,
+            matchesSession,
+          );
+          versions += transcript.deleted;
+          this.counters.legacyVersionsDeleted += transcript.deleted;
+          // A successor written after the fence re-read is deliberately kept;
+          // keep the pointer too so that successor remains discoverable and a
+          // later sweep can erase it after the skew window.
+          if (transcript.status !== "erased" || transcript.remaining > 0) continue;
+          const pointer = await this.#eraseKey(
+            t.pointerKey,
+            eraseScope(["legacy-pointer", this.authority.kind, g.org_id, g.workspace_id, g.legacy_user_id, g.source, g.session_id]),
+            (v) => v.lastModified !== undefined && v.lastModified < before,
+            authorize,
+          );
+          versions += pointer.deleted;
+          this.counters.legacyVersionsDeleted += pointer.deleted;
+        } catch (error) {
+          if (errorCode(error) === "erasure_reenabled") continue;
+          this.counters.legacyFenceFailed += 1;
+          this.log({ message: "legacy erasure failed", error_code: errorCode(error) });
         }
       }
     }
