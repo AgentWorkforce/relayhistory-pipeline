@@ -1950,6 +1950,29 @@ describe("per-step catalog sentinels", () => {
     else expect(error?.code).toBe("42P01");
   });
 
+  test("the legacy-export phase-2 verifier accepts the exact role and refuses an extra table grant", async () => {
+    const name = "upstream:20261105062030_legacy_export_scope_authority.sql";
+    const steps = (await plan(LOCAL)).filter(
+      (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
+    );
+    const i = steps.findIndex((st) => st.name === name);
+    expect(i).toBeGreaterThan(0);
+    const db = await prefix(i - 1, i);
+    await db.exec(`CREATE TABLE IF NOT EXISTS sessions.turn_session_fences(
+      org_id text NOT NULL, workspace_id text NOT NULL, source text NOT NULL,
+      session_id text NOT NULL, PRIMARY KEY(org_id,workspace_id,source,session_id));
+      ALTER TABLE sessions.turn_session_fences ENABLE ROW LEVEL SECURITY`);
+    await db.exec(readFileSync(steps[i]!.path, "utf8"));
+    const verify = () => db.exec(
+      readFileSync(join(root, "supabase/bootstrap/legacy_export_privacy_verify.sql"), "utf8"),
+    );
+    expect(await failure(verify())).toBeNull();
+    await db.exec(
+      "GRANT SELECT ON sessions.legacy_export_scope_authority TO bulls96_legacy_export_privacy",
+    );
+    expect((await failure(verify()))?.code).toBe("55000");
+  });
+
   for (const name of NON_CREATE_STEPS)
     test(`${name}: applied and ledgered is accepted; applied but unledgered is refused before any write`, async () => {
       const steps = (await plan(LOCAL)).filter(
@@ -2644,6 +2667,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // the durable legacy-export authority and its grants/policies are removed.
     expect(await names()).toContain(LA);
     expect((await failure(rollback("20261105062010_ingest_origin_claim_fence.down.sql")))?.code).toBe("55000");
+    const legacyDown = readFileSync(join(root, "supabase/rollbacks/20261105062030_legacy_export_scope_authority.down.sql"), "utf8");
+    expect(legacyDown.indexOf("LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE")).toBeGreaterThan(-1);
+    expect(legacyDown.indexOf("LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE")).toBeLessThan(
+      legacyDown.indexOf("IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)"),
+    );
     await rollback("20261105062030_legacy_export_scope_authority.down.sql");
     expect(await names()).not.toContain(LA);
     expect(await relation("sessions.legacy_export_scope_authority")).toBeNull();

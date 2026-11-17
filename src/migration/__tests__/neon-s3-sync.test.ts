@@ -30,7 +30,7 @@ import { canonicalManifestIdentity } from "../../shared/manifest-identity.ts";
 import { chunksAreServerSealed } from "../../alleyoop/manifests.ts";
 import { SCRUB_RULESET_VERSION } from "../../shared/vendor.ts";
 import { buildSessionStream, type DeliveryRecord, type Queryable } from "../relayhistory-export.ts";
-import { erasableByExporter, exportUnit, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
+import { erasableByExporter, exportUnit, LEGACY_EXPORT_PUT_TIMEOUT_MS, orgPrefix, writeOnly, type ExportTarget } from "../neon-s3-sync/export-session.ts";
 import { storeEraser } from "../neon-s3-erasure/eraser.ts";
 import { ErasureJob, DEFAULT_ERASURE_CONFIG } from "../neon-s3-erasure/job.ts";
 import { boundStrings, EXPORT_KINDS, fencedGroups, MAX_STRING_TOKEN, neonUnitSource, readOnly, sessionUnits, type SessionUnit, type StreamLine, type UnitSource } from "../neon-s3-sync/neon-reader.ts";
@@ -101,6 +101,44 @@ async function allKeys(store: ObjectStore, prefix = "96bulls"): Promise<string[]
 async function readText(store: ObjectStore, key: string) {
   return new TextDecoder().decode(await readAll(await store.get(objectKey(key))));
 }
+
+test("the legacy exporter aborts a stalled object PUT well before its privacy-lock idle bound", async () => {
+  const { store: inner } = await countingStore();
+  let observed: AbortSignal | undefined;
+  const stalled: ObjectStore = {
+    backend: inner.backend,
+    head: (k) => inner.head(k),
+    get: (k, r) => inner.get(k, r),
+    getObject: (k, r) => inner.getObject(k, r),
+    list: (p, c) => inner.list(p, c),
+    presignGet: (k, t) => inner.presignGet(k, t),
+    delete: (k) => inner.delete(k),
+    put: (_k, _b, opts) =>
+      new Promise((_resolve, reject) => {
+        observed = opts?.signal;
+        const abort = () => reject(observed?.reason ?? new Error("put aborted"));
+        if (observed?.aborted) abort();
+        else observed?.addEventListener("abort", abort, { once: true });
+      }),
+  };
+  const bounded = writeOnly(stalled, { putTimeoutMs: 20 });
+  const error = await bounded
+    .put(objectKey("timeout/probe.json"), new Uint8Array([1]))
+    .then(() => null, (cause) => cause as { code?: string });
+  expect(error?.code).toBe("legacy_export_put_timeout");
+  expect(observed?.aborted).toBe(true);
+
+  const caller = new AbortController();
+  const callerError = Object.assign(new Error("caller stopped"), { code: "caller_abort" });
+  const callerPut = bounded
+    .put(objectKey("timeout/caller.json"), new Uint8Array([1]), { signal: caller.signal })
+    .then(() => null, (cause) => cause);
+  caller.abort(callerError);
+  expect(await callerPut).toBe(callerError);
+
+  expect(LEGACY_EXPORT_PUT_TIMEOUT_MS).toBe(120_000);
+  expect(LEGACY_EXPORT_PUT_TIMEOUT_MS).toBeLessThan(15 * 60_000);
+});
 
 const T0 = Date.parse("2026-10-20T10:00:00Z");
 const unit = (orgId: string, over: Partial<SessionUnit> = {}): SessionUnit => ({

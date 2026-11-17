@@ -32,7 +32,10 @@ import {
   routedRawChunkSealerDeps,
 } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { Queryable } from "../relayhistory-export.ts";
-import { writeOnly } from "../neon-s3-sync/export-session.ts";
+import {
+  LEGACY_EXPORT_PUT_TIMEOUT_MS,
+  writeOnly,
+} from "../neon-s3-sync/export-session.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { Throttle } from "../neon-s3-sync/throttle.ts";
 import { LEGACY_TABLES, legacyOrgs } from "../neon-s3-sync/legacy-source.ts";
@@ -148,15 +151,8 @@ export function assertDirectUrl(raw: string, label: string): URL {
 export async function main() {
   const mode = (["plan", "export", "verify"] as const).filter((m) => flag(m));
   if (mode.length !== 1) throw new Error("choose exactly one of --plan, --export, --verify");
-  // Landing safety: this branch ships the activation-final schema and eraser
-  // plumbing, but not an enabled exporter. The activation follow-up replaces
-  // this unconditional refusal with its fresh eraser-written heartbeat gate.
-  if (mode[0] === "export")
-    throw Object.assign(new Error("legacy export requires the activation heartbeat follow-up"), {
-      code: "legacy_export_requires_activation_heartbeat",
-    });
-  // Verify uses the same export target to read manifests. Bind its raw-chunk
-  // sealer exactly as export will once activation replaces the refusal above.
+  // Unlike the landing branch's unconditional refusal, activation is guarded
+  // by the fresh eraser-written heartbeat in runOrg and every scope fence.
   if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
   const secrets = await readSecrets();
   assertDirectUrl(secrets.neonUrl, "Neon");
@@ -198,6 +194,7 @@ export async function main() {
           ...(sse ? { serverSideEncryption: sse as "aws:kms" | "AES256" } : {}),
           ...(kms ? { sseKmsKeyId: kms } : {}),
         }),
+        { putTimeoutMs: LEGACY_EXPORT_PUT_TIMEOUT_MS },
       );
     }
     const decompress = (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: 256 * 1024 * 1024 }));
