@@ -4,14 +4,18 @@
  * idles without opening HoopDb, ClickHouse or the relay: no reads and no writes.
  *
  * Enabled, it runs on runWorker (live gate, health, shutdown) with no stages and one side tick: the
- * scan in scan.ts every COORDINATION_ADVISOR_INTERVAL_SECONDS. Cooldown and cap state is in memory,
- * so a restart resets both; the upsert never re-inserts an existing row or touches an acked one,
- * so a restart never repeats a DM.
+ * scan in scan.ts every COORDINATION_ADVISOR_INTERVAL_SECONDS. Facts come from ClickHouse
+ * (COORDINATION_ADVISOR_FACTS_BACKEND=clickhouse) or from HoopDb through the 20261105062070
+ * service_role readers (postgres). Cooldown and cap state is held in memory and seeded from
+ * coordination_advisories_recent_v1 (062070) before each workspace writes, so a restart keeps both
+ * once 062070 is applied; without it a restart resets them. The upsert never re-inserts an existing
+ * row or touches an acked one, so a restart never repeats a DM.
  */
 import { parseSecret } from "../session-pipeline/lambda.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { clickhouseCoordinationBackend, type CoordinationBackend } from "../session-read-api/coordination-backend.ts";
-import { sqlLiveness, type SqlQuery } from "../session-read-api/liveness.ts";
+import { sqlLiveness, type SqlQuery, type TenantRunner } from "../session-read-api/liveness.ts";
+import { ADVISOR_COORDINATION_SQL, postgresCoordinationBackend } from "../session-read-api/postgres/coordination-query.ts";
 import { log } from "../shared/log.ts";
 import { runWorker, type WorkerOptions } from "../shared/worker.ts";
 import { advisorConfig, advisorEnabled, COORDINATION_ADVISOR_ENABLED, type AdvisorConfig } from "./config.ts";
@@ -51,6 +55,19 @@ export async function advisorMain(env: Record<string, string | undefined>, io: A
   return "ran";
 }
 
+/**
+ * The postgres facts backend over the 062070 service_role readers, on the worker's own HoopDb
+ * connection: the org is an explicit argument, so no read-API tenant settings. The scan never asks
+ * for window readiness, and the read-API readiness functions are not granted to service_role.
+ */
+export function postgresAdvisorBackend(db: SqlQuery): CoordinationBackend {
+  const run: TenantRunner = (_o, _w, work) => work(db);
+  return {
+    ...postgresCoordinationBackend({ run, liveness: sqlLiveness(run) }, ADVISOR_COORDINATION_SQL),
+    windowReadiness: () => Promise.reject(new Error("coordination advisor: window readiness is not used by the worker")),
+  };
+}
+
 export const productionIo: AdvisorIo = {
   runWorker,
   idle: () => new Promise<void>((resolve) => {
@@ -60,10 +77,7 @@ export const productionIo: AdvisorIo = {
     process.once("SIGINT", stop);
   }),
   backend(cfg, env) {
-    if (cfg.factsBackend === "postgres")
-      throw new Error("coordination advisor: COORDINATION_ADVISOR_FACTS_BACKEND=postgres is not available yet: the "
-        + "postgres facts readers (sessions.coordination_write_facts_for, coordination_output_facts_for, "
-        + "output_facts_events_for) are granted to bulls96_read_api only, with no EXECUTE for service_role");
+    if (cfg.factsBackend === "postgres") return postgresAdvisorBackend;
     const raw = env.SESSION_PIPELINE_SECRET_JSON;
     if (!raw) throw new Error("coordination advisor: the clickhouse facts backend needs SESSION_PIPELINE_SECRET_JSON");
     const secret = parseSecret(raw);

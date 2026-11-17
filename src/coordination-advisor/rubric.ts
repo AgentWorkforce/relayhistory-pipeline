@@ -200,10 +200,16 @@ export function orderAdvisories(advisories: Advisory[]): Advisory[] {
  * upsert (never re-inserts an existing row, never touches an acked one) keeps a DM from repeating.
  * `seed` loads durable state when a reader for it exists.
  */
+/** One row of 062070 coordination_advisories_recent_v1, times in epoch ms. */
+export type RecentAdvisory =
+  | { kind: "pair"; recipient: SessionRef; peer: SessionRef; latestAt: number }
+  | { kind: "recipient"; recipient: SessionRef; latestAt: number; sentLastHour: number };
+
 export class AdvisorLimits {
   private readonly pairs = new Map<string, number>();
   private readonly sent = new Map<string, number[]>();
   constructor(private readonly cfg: { pairCooldownMs: number; sessionHourlyCap: number }) {}
+  get pairCooldownMs(): number { return this.cfg.pairCooldownMs; }
 
   inCooldown(pair: string, now: number): boolean {
     const at = this.pairs.get(pair);
@@ -220,6 +226,19 @@ export class AdvisorLimits {
   recordSent(recipient: SessionRef, at: number): void {
     const k = refKey(recipient);
     this.sent.set(k, [...(this.sent.get(k) ?? []), at]);
+  }
+  /**
+   * Merges durable state (062070 coordination_advisories_recent_v1) so a restart keeps the cooldown and the
+   * cap. A pair keeps its later time. A recipient with fewer in-memory sends than the durable last-hour count
+   * gets the difference at the durable latest time, which ages out no earlier than the real sends.
+   */
+  seed(rows: RecentAdvisory[], now: number): void {
+    for (const r of rows) {
+      if (r.kind === "pair") { this.touchPair(pairKey(r.recipient, r.peer), r.latestAt); continue; }
+      const k = refKey(r.recipient);
+      const have = this.recent(k, now);
+      if (have.length < r.sentLastHour) this.sent.set(k, [...have, ...Array<number>(r.sentLastHour - have.length).fill(r.latestAt)]);
+    }
   }
   /** Drops state older than both windows. */
   prune(now: number): void {

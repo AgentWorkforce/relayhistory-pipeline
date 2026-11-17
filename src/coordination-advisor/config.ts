@@ -39,7 +39,7 @@ function positiveInteger(env: Record<string, unknown>, name: string, fallback: n
 }
 
 /**
- * Parsed only when the worker is enabled. A malformed value, a postgres/unknown facts backend
+ * Parsed only when the worker is enabled. A malformed value, an unknown facts backend
  * selection, or the DM flag without its credential refuses to start rather than run degraded.
  */
 export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {

@@ -97,7 +97,9 @@ describe("20261105062000 coordination advisories", () => {
     ]);
     expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("coordination_advisories");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(true);
-    const runtime = RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.coordination_advisories_")).sort();
+    const runtime = RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.coordination_advisories_")
+      // 062070 adds recent_v1 under the same stem; its own test covers it.
+      && !f.startsWith("sessions.coordination_advisories_recent_v1(")).sort();
     expect(runtime).toEqual([MARK, SWEEP, UPSERT].sort());
     // Columns: no transcript body, every id and tenant column NOT NULL.
     const cols = (await db.query<{ column_name: string; is_nullable: string }>(

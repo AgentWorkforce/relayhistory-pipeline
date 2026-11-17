@@ -116,6 +116,24 @@ describe("limits", () => {
     expect(l.inCooldown(pairKey(B, A), T0 + 6 * 3_600_000 - 1)).toBe(true);
     expect(l.inCooldown(pairKey(A, B), T0 + 6 * 3_600_000)).toBe(false);
   });
+  test("seed: durable pair times start the cooldown; durable last-hour counts fill the cap, never lower it", () => {
+    const l = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 });
+    l.recordSent(A, T0);
+    l.seed([
+      { kind: "pair", recipient: A, peer: B, latestAt: T0 - 3_600_000 },
+      { kind: "recipient", recipient: A, latestAt: T0 - 60_000, sentLastHour: 3 },
+      { kind: "recipient", recipient: B, latestAt: T0 - 60_000, sentLastHour: 1 },
+    ], T0);
+    expect(l.inCooldown(pairKey(B, A), T0 + 5 * 3_600_000 - 1)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), T0 + 5 * 3_600_000)).toBe(false);
+    expect(l.underCap(A, T0)).toBe(false);
+    expect(l.underCap(B, T0)).toBe(true);
+    // A later in-memory pair time wins; a smaller durable count does not drop in-memory sends.
+    l.touchPair(pairKey(A, B), T0);
+    l.seed([{ kind: "pair", recipient: A, peer: B, latestAt: T0 - 7_200_000 }, { kind: "recipient", recipient: A, latestAt: T0, sentLastHour: 1 }], T0);
+    expect(l.inCooldown(pairKey(A, B), T0 + 6 * 3_600_000 - 1)).toBe(true);
+    expect(l.underCap(A, T0)).toBe(false);
+  });
   test("per-recipient hourly cap, rolling", () => {
     const l = new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 });
     for (let i = 0; i < 3; i++) l.recordSent(A, T0 + i);

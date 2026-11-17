@@ -3,7 +3,8 @@
  * session directory, facts through a CoordinationBackend, the detector, the rubric, the limits, the
  * writes and the HIGH DMs. Writes go only through sessions.coordination_advisories_upsert_v1,
  * _mark_delivered_v1 and _sweep_v1 (supabase/migrations/20261105062000_coordination_advisories.sql).
- * It reads no transcript body.
+ * Before writing, it seeds the limits from _recent_v1 (20261105062070) so the cooldown and cap survive a
+ * restart. It reads no transcript body.
  */
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import type { CoordinationBackend } from "../session-read-api/coordination-backend.ts";
@@ -13,7 +14,7 @@ import { errorFields, log } from "../shared/log.ts";
 import type { RelaySender } from "./relay-sender.ts";
 import {
   ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS, highAdvisories, lowAdvisories, orderAdvisories,
-  pairKey, refKey, truncatedStreams, type Advisory, type CandidateLane, type SessionRef,
+  pairKey, refKey, truncatedStreams, type Advisory, type CandidateLane, type RecentAdvisory, type SessionRef,
 } from "./rubric.ts";
 import { advisoryMessage } from "./template.ts";
 
@@ -47,6 +48,8 @@ export const DIRECTORY_KEYS_SQL = `SELECT d.org_id, d.workspace_id, d.harness, d
 export const UPSERT_SQL = "SELECT inserted, upgraded, skipped FROM sessions.coordination_advisories_upsert_v1($1, $2, $3::jsonb)";
 export const MARK_DELIVERED_SQL = "SELECT sessions.coordination_advisories_mark_delivered_v1($1, $2, $3, $4, $5) AS matched";
 export const SWEEP_SQL = "SELECT expired, deleted FROM sessions.coordination_advisories_sweep_v1()";
+export const RECENT_SQL = `SELECT row_kind, harness, session_id, peer_harness, peer_session_id, latest_at, sent_last_hour
+  FROM sessions.coordination_advisories_recent_v1($1, $2, $3)`;
 
 const iso = (v: Date | string) => v instanceof Date ? v.toISOString() : new Date(v).toISOString();
 
@@ -89,6 +92,8 @@ export interface AdvisorStore {
   upsert(orgId: string, workspaceId: string, row: AdvisoryRowInput): Promise<UpsertResult>;
   markDelivered(orgId: string, workspaceId: string, advisoryId: string, recipient: SessionRef): Promise<boolean>;
   sweep(): Promise<{ expired: number; deleted: number }>;
+  /** Durable cooldown and cap state for one tenant (062070). */
+  recent(orgId: string, workspaceId: string, pairSince: Date): Promise<RecentAdvisory[]>;
 }
 
 export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
@@ -117,6 +122,16 @@ export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
     async sweep() {
       const { rows } = await db.query<{ expired: number; deleted: number }>(SWEEP_SQL);
       return { expired: Number(rows[0]?.expired ?? 0), deleted: Number(rows[0]?.deleted ?? 0) };
+    },
+    async recent(orgId, workspaceId, pairSince) {
+      const { rows } = await db.query<Record<string, unknown>>(RECENT_SQL, [orgId, workspaceId, pairSince]);
+      const ms = (v: unknown) => new Date(v as Date | string).getTime();
+      return rows.map((r): RecentAdvisory => {
+        const recipient = { harness: String(r.harness), sessionId: String(r.session_id) };
+        return r.row_kind === "pair"
+          ? { kind: "pair", recipient, peer: { harness: String(r.peer_harness), sessionId: String(r.peer_session_id) }, latestAt: ms(r.latest_at) }
+          : { kind: "recipient", recipient, latestAt: ms(r.latest_at), sentLastHour: Number(r.sent_last_hour ?? 0) };
+      });
     },
   };
 }
@@ -181,6 +196,20 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
   }
 }
 
+/**
+ * Loads the tenant's durable cooldown and cap state before writing. A HoopDb without 062070 (42883) keeps the
+ * in-memory limits, with a warning; any other failure fails the workspace, so nothing is written unchecked.
+ */
+async function seedLimits(deps: ScanDeps, orgId: string, workspaceId: string, now: number) {
+  try {
+    deps.limits.seed(await deps.store.recent(orgId, workspaceId, new Date(now - deps.limits.pairCooldownMs)), now);
+  } catch (err) {
+    if ((err as { code?: unknown } | null)?.code !== "42883") throw err;
+    log.warn("coordination advisor durable limits unavailable (20261105062070 not applied); using in-memory limits",
+      { org_id: orgId, workspace_id: workspaceId });
+  }
+}
+
 /** One full scan at `now`. A failing workspace is logged and does not stop the others. */
 export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
   const stats = emptyStats();
@@ -220,6 +249,7 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
       const low = lowAdvisories(workspaceId, live, candidates, new Set(high.map((a) => pairKey(a.lanes[0], a.lanes[1]))),
         since.toISOString(), truncated);
       stats.findings += high.length + low.length;
+      if (high.length + low.length) await seedLimits(deps, orgId, workspaceId, nowMs);
       await deliver(deps, orgId, workspaceId, [...high, ...low], nowMs, stats);
     } catch (err) {
       stats.failed++;
