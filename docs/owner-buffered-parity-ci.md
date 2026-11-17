@@ -16,9 +16,10 @@ tenant tuple or digest.
 
 ## State at merge
 
-- Both writes are dormant: `OWNER_PARITY_WRITE_ENABLED = false` and `OWNER_PARITY_BULK_WRITE_ENABLED = false`.
-  A write dispatch refuses its dormant code
-  in the gate job and again in the database step **before any credential is read**.
+- At merge both writes were dormant. Since commit 940c61e0 (guarded bulk owner recovery),
+  `OWNER_PARITY_BULK_WRITE_ENABLED = true` and `OWNER_PARITY_WRITE_ENABLED = false`: `bulk-write` is enabled (and
+  still guarded by the confirmation phrase below), the single-tenant `write` stays dormant. A dormant write dispatch
+  refuses its dormant code in the gate job and again in the database step **before any credential is read**.
 - The roster `src/migration/owner-buffered-parity-roster.json` ships **empty**, so every census, write and
   readback dispatch refuses `roster_empty`. Adding the eight digests is a separate follow-up PR. `discovery`
   is the only fixed-roster mode that runs on the empty roster. Bulk modes deliberately ignore the roster and
@@ -98,7 +99,7 @@ page. The plan performs a fresh G1 for every candidate and emits only aggregate 
 candidate count is nonzero, every G1 is equal, and there are no mismatches or tenant refusals. Its one-day artifact
 binds source SHA, generation, source, capture time, plan run, aggregate counts, and a descriptor digest.
 
-`bulk-write` is dormant. Once separately enabled it requires the exact phrase:
+`bulk-write` is enabled (`OWNER_PARITY_BULK_WRITE_ENABLED = true` since 940c61e0) and requires the exact phrase:
 
 ```
 WRITE-OWNER-PARITY-BULK <sha> GENERATION <generation> SOURCE neon DESCRIPTOR <descriptorSha256> PLAN <plan_run>

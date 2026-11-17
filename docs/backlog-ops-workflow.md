@@ -510,7 +510,11 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
    Both roles also need `s3:GetObject` on the marker key in the transcripts bucket (the forced guard, and the
    Locker-side marker check described above); `96bulls/*` already covers it.
 
-### Still to apply (before the first execute)
+### Applied (2026-11-13)
+
+All three steps below were applied on 2026-11-13 (see the dated note in step 1); they are kept as the reference for
+recreating the environment. Re-check them with a readback before an execute, since environment settings live outside
+the repo.
 
 1. Create the GitHub environment `session-backlog-execute` with deployments from `main` only (one branch policy,
    `main`, type branch), as on `session-schema-production`. The gate refuses an environment without that branch
@@ -521,7 +525,7 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
    narrowed to this subject the same day.)
 2. Set on it the environment secret `SUPABASE_MIGRATION_OWNER_URL` (the same value as on `session-schema-production`;
    backfill-execute and export-execute need it) and the same five `BACKLOG_OPS_*` variables.
-3. Change the write role's trust to the `session-backlog-execute` subject above (it currently trusts the
-   `session-schema-production` subject, like the read role).
+3. Change the write role's trust to the `session-backlog-execute` subject above (before 2026-11-13 it trusted the
+   `session-schema-production` subject, like the read role; narrowed that day, per step 1's note).
 
 Dry runs need none of this and can run now.
