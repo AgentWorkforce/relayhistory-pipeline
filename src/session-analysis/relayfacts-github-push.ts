@@ -211,9 +211,12 @@ export async function pushRelayfactsDocument(deps: RelayfactsPushDeps, input: Re
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": USER_AGENT,
   };
+  // Status of the most recent request only; null when that request got no response, so a
+  // failed PUT never logs the status of the GET before it.
   let lastStatus: number | null = null;
 
   const request = async (method: "GET" | "PUT", requestUrl: string, body?: string): Promise<Response | null> => {
+    lastStatus = null;
     try {
       const res = await deps.fetch(requestUrl, {
         method,

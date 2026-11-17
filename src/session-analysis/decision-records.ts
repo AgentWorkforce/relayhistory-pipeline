@@ -220,7 +220,7 @@ export async function recordDecisions(
 /**
  * The analysis tick's completion hook: records the decisions of a job that has just completed,
  * in that job's own workspace. Counts `decision_records` (records sent) and
- * `relayfacts_failed`; never throws, never logs.
+ * `decision_records_failed`; never throws, never logs.
  */
 export function decisionRecordsHook(
   sink: DecisionRecordsSink,
@@ -231,7 +231,7 @@ export function decisionRecordsHook(
       const sent = await recordDecisions(sink, { orgId: job.orgId, workspaceId: job.workspaceId }, output.result.analysis);
       counts.decision_records = (counts.decision_records ?? 0) + sent;
     } catch {
-      counts.relayfacts_failed = (counts.relayfacts_failed ?? 0) + 1;
+      counts.decision_records_failed = (counts.decision_records_failed ?? 0) + 1;
     }
   };
 }

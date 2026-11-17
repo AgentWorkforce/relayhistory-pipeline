@@ -288,8 +288,8 @@ describe("20261105062080 rollback", () => {
       await db.exec(DOWN);
       expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.relayfacts_v1')::text r")).rows[0]!.r).toBeNull();
       expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.relayfacts_evidence_v1')::text r")).rows[0]!.r).toBeNull();
-      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_records\\_%'")).rows[0]!.n).toBe(0);
-      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname LIKE 'decision\\_%'")).rows[0]!.n).toBe(0);
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'relayfacts\\_%'")).rows[0]!.n).toBe(0);
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname LIKE 'relayfacts\\_%'")).rows[0]!.n).toBe(0);
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [STEP])).rows[0]!.n).toBe(0);
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
       expect(await code(db.exec(DOWN))).toBe("55000");

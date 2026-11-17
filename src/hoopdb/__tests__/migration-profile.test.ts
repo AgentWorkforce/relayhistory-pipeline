@@ -2710,7 +2710,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.relayfacts_v1")).toBe("sessions.relayfacts_v1");
     await rollback("20261105062090_relayfacts_erase.down.sql");
     expect(await names()).not.toContain(MDE);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_evidence\\_%'")).rows[0]!.n).toBe(0);
+    // Exactly the four 062080 functions remain: the erase function and fence guard are gone, and nothing stray was added.
+    expect((await db.query<{ p: string }>("SELECT proname p FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'relayfacts\\_%' ORDER BY proname")).rows.map((r) => r.p))
+      .toEqual(["relayfacts_insert_v1", "relayfacts_list_v1", "relayfacts_supersede_v1", "relayfacts_topics_v1"]);
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='relayfacts_evidence_fence_guard'")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062090_relayfacts_erase.down.sql")))?.code).toBe("55000");
     // 20261105062080 is newest: the legacy-export authority and coordination advisor reader downs refuse
@@ -2724,7 +2726,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).not.toContain(MD);
     expect(await relation("sessions.relayfacts_v1")).toBeNull();
     expect(await relation("sessions.relayfacts_evidence_v1")).toBeNull();
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'decision\\_records\\_%'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'relayfacts\\_%'")).rows[0]!.n).toBe(0);
     expect((await failure(rollback("20261105062080_memory_documents.down.sql")))?.code).toBe("55000");
     // 20261105062070 (coordination advisor readers) is then newest: 062030's down refuses (55000) while it is applied;
     // its checksum-pinned down drops the four readers and its ledger row, and refuses on a rerun.
