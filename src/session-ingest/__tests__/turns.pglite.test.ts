@@ -159,6 +159,19 @@ test("HTTP: the private kind is never accepted on the public delivery route, and
  expect(await f.stages()).toHaveLength(0);
 });
 
+test("SQL: ordinary selection rejects the reserved turns origin without writing a fence",async()=>{
+ const f=await fixture(null);let refused:unknown;
+ try {
+  await f.db.query("SELECT sessions.ingest_apply_selection($1,$2,$3,$4,$5::jsonb,false)",[
+   TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,JSON.stringify([["claude",SESSION]]),
+  ]);
+ } catch(error) { refused=error }
+ expect((refused as {code?:string})?.code).toBe("22023");
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3 AND origin_id=$4",[
+  TENANT.orgId,TENANT.workspaceId,TENANT.userId,TURN_ORIGIN_ID,
+ ])).rows).toEqual([{n:0}]);
+});
+
 test("HTTP: turn-fence registration and capability are independently default-off",async()=>{
  const {createIngestApp}=await import("../app.ts");
  const f=await fixture();let registrations=0;

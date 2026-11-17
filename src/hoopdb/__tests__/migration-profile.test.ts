@@ -61,6 +61,19 @@ import {
 
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../..");
+function operatorTurnsRollbackSql(): string {
+  const wrapper = readFileSync(
+    join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql"),
+    "utf8",
+  );
+  const down = readFileSync(
+    join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"),
+    "utf8",
+  );
+  return wrapper
+    .replace(/^\\set .*$/m, "")
+    .replace("\\ir 20261105062020_turns_forward_gates.down.sql", down);
+}
 /** What supabase/bootstrap/hoopdb_function_default_revoke.sql does for the PGlite owner (postgres). */
 const OWNER_FN_DEFAULT_REVOKE =
   "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC";
@@ -1477,6 +1490,7 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     const db = await fresh();
     const tg = "upstream:20261105062020_turns_forward_gates.sql";
     const down = readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8");
+    const operatorDown = operatorTurnsRollbackSql();
     const privacyLock = down.indexOf("SELECT pg_advisory_xact_lock(961996,50000)");
     const privacyGuard = down.indexOf("DO $rollback_privacy_guard$");
     expect(privacyLock).toBeGreaterThan(0);
@@ -1492,21 +1506,24 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
+    // 062060 replaces ingest_apply_selection after the turns gates. Restore it first so
+    // this test exercises 062020's privacy refusals rather than its later-migration guard.
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql"), "utf8"));
     // A gated registration witness is intentionally not reversible even while its ordinary
     // upload_deletions witness still exists: dropping it would reveal a later projector retry.
     await db.exec("UPDATE sessions.turn_session_fences SET registered_writer_seen=true WHERE org_id='historical-org'");
-    expect((await failure(db.exec(down)))?.code).toBe("55000");
+    expect((await failure(db.exec(operatorDown)))?.code).toBe("55000");
     await db.exec("ROLLBACK");
     await db.exec("UPDATE sessions.turn_session_fences SET registered_writer_seen=false WHERE org_id='historical-org'");
     // Whole-user erase can remove the source ledger while the permanent logical fence must survive.
     // Such an orphan is no longer derivable, so rollback refuses until its witness exists again.
     await db.exec("DELETE FROM sessions.upload_deletions WHERE org_id='historical-org'");
-    expect((await failure(db.exec(down)))?.code).toBe("55000");
+    expect((await failure(db.exec(operatorDown)))?.code).toBe("55000");
     await db.exec("ROLLBACK");
     await db.query(
       "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('historical-org','historical-ws','historical-user','desktop-origin','claude','historical-session')",
     );
-    await db.exec(down);
+    await db.exec(operatorDown);
     expect((await db.query<{ n: number }>(
       "SELECT count(*)::int AS n FROM sessions.upload_deletions WHERE org_id='historical-org'",
     )).rows).toEqual([{ n: 1 }]);
@@ -2511,13 +2528,18 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CA = "upstream:20261105062000_coordination_advisories.sql";
     const OCF = "upstream:20261105062010_ingest_origin_claim_fence.sql";
     const TG = "upstream:20261105062020_turns_forward_gates.sql";
+    const TSOG = "upstream:20261105062060_turns_selection_origin_guard.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG]));
+    const rollbackTurns = async () => {
+      try { return await db.exec(operatorTurnsRollbackSql()); }
+      catch (error) { await db.exec("ROLLBACK"); throw error; }
+    };
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, TSOG]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2568,22 +2590,30 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // The append-only selection-origin guard is newest. Its down restores 030000's
+    // exact ingest_apply_selection body before the turns-gates rollback is considered.
+    expect((await procSrc("sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)")).s).toContain("turns origin is reserved");
+    await rollback("20261105062060_turns_selection_origin_guard.down.sql");
+    expect(await names()).not.toContain(TSOG);
+    expect((await procSrc("sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)")).s).toBe(
+      bodyOf("20261104030000_ingest_fence_ownership.sql", "ingest_apply_selection", "$apply$"),
+    );
     // Turns gates is newest. Imported frozen-Neon evidence refuses rollback. A live
     // row with its retained upload_deletions witness is derived and safe to drop.
     await db.query("INSERT INTO sessions.turn_session_fences(org_id,workspace_id,source,session_id,fence_basis) VALUES('rollback-org','rollback-ws','claude','rollback-session','legacy_import')");
-    expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollbackTurns()))?.code).toBe("55000");
     expect(await relation("sessions.turn_session_fences")).toBe("sessions.turn_session_fences");
     await db.query("DELETE FROM sessions.turn_session_fences WHERE org_id='rollback-org'");
     await db.query(
       "INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES('rollback-org','rollback-ws','rollback-user','desktop-origin','claude','historical-session')",
     );
-    await rollback("20261105062020_turns_forward_gates.down.sql");
+    await rollbackTurns();
     expect(await names()).not.toContain(TG);
     expect(await relation("sessions.turn_session_fences")).toBeNull();
     expect(await relation("sessions.turn_writers")).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_capability(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_turn_register(jsonb)')::text AS p")).rows[0]!.p).toBeNull();
-    expect((await failure(rollback("20261105062020_turns_forward_gates.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollbackTurns()))?.code).toBe("55000");
     expect(await names()).toContain(OCF);
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("ingest_origin_claim_marks");
     expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
