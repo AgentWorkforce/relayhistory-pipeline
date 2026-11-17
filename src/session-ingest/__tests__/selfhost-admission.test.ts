@@ -13,7 +13,7 @@ import { admissionStartupGate, conditionalWriteProbeKey } from "../selfhost-serv
 import { DEAD_LETTER_RETENTION_MS, deadLetterKey, selfhostAdmissionConsumer } from "../selfhost-admission.ts";
 import { enqueueAdmission, inboxKey } from "../async-admission.ts";
 import { LedgerUnavailableError } from "../ledger.ts";
-import { prepareDelivery } from "../vendor/delivery/prepare.ts";
+import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
 import { VersionedMemoryStore } from "./versioned-store.ts";
 
@@ -38,6 +38,14 @@ describe("SELFHOST_INGEST_ADMISSION", () => {
       expect(c).toEqual(base);
       expect(Object.hasOwn(c, "admission")).toBe(false);
     }
+  });
+
+  test("SELFHOST_ADMISSION_AWAIT_AUTHORITY: absent unless on; off/empty/unset leave the settings unchanged; anything else refuses", () => {
+    const base = { SELFHOST_INGEST_ADMISSION: "async" };
+    expect(selfhostAdmissionSettings(base)).not.toHaveProperty("awaitAuthority");
+    for (const v of ["", "off"]) expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_AWAIT_AUTHORITY: v })).not.toHaveProperty("awaitAuthority");
+    expect(selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_AWAIT_AUTHORITY: "on" })).toMatchObject({ awaitAuthority: true });
+    for (const v of ["true", "1", "ON"]) expect(() => selfhostAdmissionSettings({ ...base, SELFHOST_ADMISSION_AWAIT_AUTHORITY: v })).toThrow("SELFHOST_ADMISSION_AWAIT_AUTHORITY must be on or off");
   });
 
   test("async and drain parse with bounded knobs; anything else refuses, naming the variable only", () => {
@@ -238,31 +246,39 @@ describe("#405 INGEST_CLAIM_LOCK_BUSY through the self-host consumer", () => {
 });
 
 describe("awaiting fence authority (an org whose marker is not written yet)", () => {
-  async function setup(code: string, maxAttempts = 1) {
+  async function setup(code: string, maxAttempts = 1, o: { awaitAuthority?: boolean; concurrency?: number; perOrg?: number; otherOrg?: boolean } = {}) {
     const fs = scratchStore();
     cleanups.push(fs.done);
     const ledger = new MemoryLedger();
     const realClaim = ledger.claim.bind(ledger);
-    let claims = 0, missing = true;
+    let claims = 0, otherClaims = 0, missing = true;
     ledger.claim = (async (...args: Parameters<typeof realClaim>) => {
+      // Only org-a waits for its marker; any other org is admitted normally.
+      if (JSON.stringify(args).includes("org-b")) { otherClaims++; return realClaim(...args); }
       claims++;
       if (missing) throw new LedgerUnavailableError(code);
       return realClaim(...args);
     }) as typeof ledger.claim;
     let clock = Date.now();
     const keys: string[] = [];
-    for (const id of ["auth-1", "auth-2"]) {
-      const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: id })]));
+    for (let i = 0; i < (o.perOrg ?? 2); i++) {
+      const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: `auth-${i}` })], { batch_id: `batch-auth-${i}` }));
       keys.push(await enqueueAdmission({ store: fs.store, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, clock, 0));
+    }
+    const other = { ...TENANT, orgId: "org-b", workspaceId: "ws-b" };
+    if (o.otherOrg) {
+      const prepared = await prepareDelivery(other, await batch([record({ record_id: "other-1" })], { account_id: await deliveryAccount(other), batch_id: "batch-other-1" }));
+      await enqueueAdmission({ store: fs.store, keyRoot: "96bulls", enqueue: async () => {} }, other, prepared, clock, 0);
     }
     const lines: Record<string, unknown>[] = [];
     const sink = (_m: string, f: Record<string, unknown> = {}) => void lines.push(f);
     const consumer = selfhostAdmissionConsumer({
-      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts, nowMs: () => clock, log: { info: sink, warn: sink, error: sink },
+      mode: "on", concurrency: o.concurrency ?? 1, scanIntervalMs: 15_000, maxAttempts, nowMs: () => clock, log: { info: sink, warn: sink, error: sink },
       deliver: { ledger, acceptanceMode: "canonical", target: { store: fs.store, keyRoot: "96bulls" }, random: () => 0 },
+      ...(o.awaitAuthority === false ? {} : { awaitAuthority: true }),
     });
     const tick = async (ms: number) => { clock += ms; await consumer.scan(); await consumer.settle(); };
-    return { fs, keys, lines, consumer, tick, claims: () => claims, grant: () => { missing = false; } };
+    return { fs, keys, lines, consumer, tick, claims: () => claims, otherClaims: () => otherClaims, grant: () => { missing = false; } };
   }
 
   for (const code of ["ledger_fence_authority_missing", "ledger_fence_authority_stopped"]) {
@@ -290,6 +306,38 @@ describe("awaiting fence authority (an org whose marker is not written yet)", ()
       await t.consumer.stop();
     });
   }
+
+  test("flag off (the default): a missing marker is an ordinary retry that counts and dead-letters, unchanged", async () => {
+    const t = await setup("ledger_fence_authority_missing", 1, { awaitAuthority: false });
+    await t.tick(0);
+    expect(t.lines.find((l) => l.route === "ingest.admission")).toMatchObject({ outcome: "retry", error_code: "ledger_fence_authority_missing" });
+    expect(await t.fs.store.head(deadLetterKey("96bulls", t.keys[0]!) as never)).toBeDefined();
+    await t.consumer.stop();
+  });
+
+  test("concurrency > 1: one probe claim per waiting org per window, and another org is admitted meanwhile", async () => {
+    const t = await setup("ledger_fence_authority_missing", 1, { concurrency: 4, perOrg: 6, otherOrg: true });
+    await t.tick(0);
+    // org-a: the first pass can start up to `concurrency` of its entries before the first answer sets the window
+    // (fail-fast, none counted); org-b is admitted in the same pass.
+    const first = t.claims();
+    expect(first).toBeGreaterThanOrEqual(1);
+    expect(first).toBeLessThanOrEqual(4);
+    expect(t.otherClaims()).toBeGreaterThanOrEqual(1);
+    // After the window: exactly ONE probe claim for org-a per window, even with 4 slots.
+    await t.tick(61_000);
+    expect(t.claims()).toBe(first + 1);
+    await t.tick(61_000);
+    expect(t.claims()).toBe(first + 2);
+    for (const key of t.keys) expect(await t.fs.store.head(deadLetterKey("96bulls", key) as never)).toBeUndefined();
+    // Only org-a's six remain; the marker lands and they all admit.
+    expect(t.consumer.status()).toMatchObject({ backlog: 6, deadLetters: 0 });
+    t.grant();
+    await t.tick(61_000);
+    await t.tick(61_000);
+    expect(t.consumer.status()).toMatchObject({ backlog: 0, deadLetters: 0 });
+    await t.consumer.stop();
+  });
 
   test("an invalid marker is NOT a deferral: an ordinary retry that counts and dead-letters at maxAttempts", async () => {
     const t = await setup("ledger_fence_authority_invalid", 1);

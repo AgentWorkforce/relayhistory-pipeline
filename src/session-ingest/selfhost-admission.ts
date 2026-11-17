@@ -106,6 +106,13 @@ export interface SelfhostAdmissionOptions {
    */
   deferTenantLimit?: boolean;
   /**
+   * SELFHOST_ADMISSION_AWAIT_AUTHORITY=on: a claim answered with an AWAIT_AUTHORITY_CODES code (the org has no
+   * fence-authority marker yet, or the deployment-wide stop is up) is a DEFERRAL: it does not count toward
+   * `maxAttempts`, and the org's other entries wait AUTHORITY_WAIT_MS without starting (one probe claim per org per
+   * window). Absent: an ordinary retry that counts and can dead-letter, unchanged.
+   */
+  awaitAuthority?: boolean;
+  /**
    * How many inbox keys' writer users the tenant-cap hint remembers (default USER_HINT_MAX). 0 keeps none: every
    * entry falls back to the per-directory hint, as for a key found only by a scan.
    */
@@ -194,6 +201,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   const busyUntil = new Map<string, number>();
   /** Org -> no start before (ms): set when a claim answered an AWAIT_AUTHORITY_CODES code (no marker yet). */
   const authorityUntil = new Map<string, number>();
+  /** Orgs whose authority window ended and that have their one probe claim in flight (siblings wait for it). */
+  const authorityProbe = new Set<string>();
+  const probing = new Set<string>();
   const orgOf = (key: string): string | undefined => {
     if (!key.startsWith(inboxPrefix)) return undefined;
     const slash = key.indexOf("/", inboxPrefix.length);
@@ -385,7 +395,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     }
     // Matched on the retry's code: the claim's LedgerUnavailableError reaches here wrapped by the delivery layer,
     // which keeps its code (the same field the retry log line reports).
-    if (AWAIT_AUTHORITY_CODES.has(r.code)) {
+    if (opts.awaitAuthority && AWAIT_AUTHORITY_CODES.has(r.code)) {
       // The org has no fence-authority marker yet (or the deployment-wide stop is up): wait for the operator, never
       // dead-letter. The bytes stay in the inbox; the org's other entries wait the same window (pump skips them).
       entry.attempts -= 1;
@@ -422,16 +432,19 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const at = now();
     // Sweep expired deferral memos (a directory whose deferred entry left another way would otherwise linger).
     for (const [dir, until] of busyUntil) if (until <= at) busyUntil.delete(dir);
-    for (const [org, until] of authorityUntil) if (until <= at) authorityUntil.delete(org);
+    // An expired window becomes a probe: the org's next start is its only one until that claim answers.
+    for (const [org, until] of authorityUntil) if (until <= at) { authorityUntil.delete(org); authorityProbe.add(org); }
     const waiting = [...entries].filter(([key]) => !inflight.has(key)).sort((a, b) => a[1].receivedAtMs - b[1].receivedAtMs);
     let next = Infinity;
     for (const [key, entry] of waiting) {
       if (entry.notBefore > at) { next = Math.min(next, entry.notBefore); continue; }
       if (inflight.size >= opts.concurrency) break;
       // Its org is waiting for a fence-authority marker: skip without starting until the window ends.
-      const waitOrg = authorityUntil.size ? orgOf(key) : undefined;
+      const waitOrg = authorityUntil.size || authorityProbe.size || probing.size ? orgOf(key) : undefined;
       const authorityWait = waitOrg !== undefined ? authorityUntil.get(waitOrg) : undefined;
       if (authorityWait !== undefined && authorityWait > at) { next = Math.min(next, authorityWait); continue; }
+      // A probe of this org is already in flight: wait for its answer (it re-pumps on finish).
+      if (waitOrg !== undefined && probing.has(waitOrg)) continue;
       const tenant = caps ? tenantOf(key) : undefined;
       if (tenant && caps) {
         // At (or just deferred by) the tenant cap: leave it due and go on to other tenants. An ending admission
@@ -446,6 +459,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
           || (caps.maxPerUser >= 1 && (inflightGroup.get(tenant.group) ?? 0) >= caps.maxPerUser)) continue;
         bump(inflightOrg, tenant.org, 1); bump(inflightGroup, tenant.group, 1);
       }
+      // Past every skip: if its org's window just ended, this start is the org's one probe claim.
+      const probe = waitOrg !== undefined && authorityProbe.has(waitOrg);
+      if (probe) { authorityProbe.delete(waitOrg!); probing.add(waitOrg!); }
       inflight.add(key);
       let deferred = false;
       const p: Promise<void> = admitOne(key, entry)
@@ -453,6 +469,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         .catch(() => { entry.notBefore = now() + 300_000; })
         .finally(() => {
           inflight.delete(key);
+          if (probe) probing.delete(waitOrg!);
           if (tenant) {
             bump(inflightOrg, tenant.org, -1); bump(inflightGroup, tenant.group, -1);
             // A finished (non-deferred) admission freed this user's slot: its siblings may try again now.

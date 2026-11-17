@@ -64,6 +64,9 @@
  *   SELFHOST_ADMISSION_CONCURRENCY   admissions in flight in this process, 1..32, default 4
  *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
  *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
+ *   SELFHOST_ADMISSION_AWAIT_AUTHORITY  on | off (default off). on: an org with no fence-authority marker yet (or the
+ *                                    deployment-wide stop) is a deferral, never dead-lettered (selfhost-admission.ts
+ *                                    AWAIT_AUTHORITY_CODES); off: an ordinary retry, unchanged
  *
  *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
  *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
@@ -172,6 +175,8 @@ export interface SelfhostAdmissionSettings {
   concurrency: number;
   scanIntervalMs: number;
   maxAttempts: number;
+  /** SELFHOST_ADMISSION_AWAIT_AUTHORITY=on only; absent when off (byte-identical to before). */
+  awaitAuthority?: true;
 }
 
 export interface SelfhostIngestSettings {
@@ -387,7 +392,16 @@ export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmis
     concurrency: bounded(env, "SELFHOST_ADMISSION_CONCURRENCY", 4, 1, 32),
     scanIntervalMs: bounded(env, "SELFHOST_ADMISSION_SCAN_MS", 15_000, 1_000, 600_000),
     maxAttempts: bounded(env, "SELFHOST_ADMISSION_MAX_ATTEMPTS", 20, 1, 100),
+    ...(awaitAuthorityFlag(env) ? { awaitAuthority: true as const } : {}),
   };
+}
+
+/** SELFHOST_ADMISSION_AWAIT_AUTHORITY: on or off (unset / empty = off); anything else refuses startup. */
+function awaitAuthorityFlag(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.SELFHOST_ADMISSION_AWAIT_AUTHORITY;
+  if (raw === undefined || raw === "" || raw === "off") return false;
+  if (raw === "on") return true;
+  throw new Error("96bulls: SELFHOST_ADMISSION_AWAIT_AUTHORITY must be on or off");
 }
 
 /** Discrete fields from the sanitized URL (the read API service's rule): user, password and database required. */
