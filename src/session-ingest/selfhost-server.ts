@@ -80,7 +80,7 @@ import { Readable } from "node:stream";
 import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
 import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
-import { sealPoolDeps } from "./seal-pool.ts";
+import { sealPoolDeps, sealPoolLogFields } from "./seal-pool.ts";
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import { ledgerRoutedStore } from "./ledger-store.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
@@ -285,13 +285,13 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   // Off: {}, so the routed spread below stands as today. On: the pool's sealer overrides it (TS engine only).
   const { sealPool, ...sealerDeps } = sealPoolDeps(process.env);
   // Counters only (seal-pool.ts): a pool that only falls back is visible, never silent.
-  const sealPoolTimer = sealPool ? setInterval(() => log.info("seal pool", { seal_pool_workers: sealPool.size, ...sealPool.stats() }), 60_000) : undefined;
+  const sealPoolTimer = sealPool ? setInterval(() => log.info("seal pool", sealPoolLogFields(sealPool)), 60_000) : undefined;
   sealPoolTimer?.unref?.();
   if (sealPool) log.info("seal pool started", { seal_pool_workers: sealPool.size });
   const closeParts = sealPool
     ? async () => {
       clearInterval(sealPoolTimer);
-      log.info("seal pool stopped", { seal_pool_workers: sealPool.size, ...sealPool.stats() });
+      log.info("seal pool stopped", sealPoolLogFields(sealPool));
       await sealPool.close();
       await parts.close();
     }

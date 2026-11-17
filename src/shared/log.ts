@@ -20,6 +20,11 @@ export const ADMISSION_PHASE_FIELDS: ReadonlyMap<string, string> = new Map([
 ]);
 const ADMISSION_PHASE_FIELDS_LIST = [...ADMISSION_PHASE_FIELDS.values()];
 
+/** The ingest edge's seal pool (session-ingest/seal-pool.ts sealPoolLogFields): its size and counters only. */
+export const SEAL_POOL_LOG_FIELDS = [
+  "seal_pool_workers", "seal_pool_pooled", "seal_pool_fallback", "seal_pool_worker_errors", "seal_pool_respawned", "seal_pool_retired",
+];
+
 /**
  * Bob Costas's summary input (src/bob-costas/session-input.ts): how much of a capped session a
  * digest read, and the caps it logs at startup. Bounded counts only.
@@ -78,6 +83,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "reason_codes",
   // Analytics export counters (src/shared/analytics-config.ts analyticsCounterFields): bounded counts only.
   ...ANALYTICS_COUNTER_FIELDS,
+  // The seal pool's size and counters (SEAL_POOL_LOG_FIELDS): bounded counts only.
+  ...SEAL_POOL_LOG_FIELDS,
   // The consumer's streaming reconcile startup line (search-index.ts searchIndexStreamStartup):
   // `streaming` is on / off only (STREAMING_VALUES), the budgets bounded counts (STREAM_BUDGET_FIELDS).
   "streaming",
@@ -111,6 +118,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["fallback_until_ms", Number.MAX_SAFE_INTEGER],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);

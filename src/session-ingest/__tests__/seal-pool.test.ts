@@ -3,7 +3,8 @@ import { afterEach, expect, test } from "bun:test";
 import { readAll, objectKey, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { resetScrubEngineForTests, sealRawChunk, selectScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { SealRawChunk } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
-import { createSealPool, parseSealWorkers, SEAL_POOL_MAX_RESPAWNS, sealPoolDeps, sealPoolSize, type SealPool } from "../seal-pool.ts";
+import { createSealPool, parseSealWorkers, SEAL_POOL_MAX_RESPAWNS, sealPoolDeps, sealPoolLogFields, sealPoolSize, type SealPool } from "../seal-pool.ts";
+import { logLine } from "../../shared/log.ts";
 import { writeGroups } from "../writer.ts";
 import { scratchStore } from "./support.ts";
 
@@ -174,4 +175,12 @@ test("writer end to end: writeGroups with the pool writes exactly today's object
   const keys = async (s: ObjectStore) => (await s.list(objectKey("96bulls"))).items.map((i) => String(i.key)).sort();
   expect(await keys(b)).toEqual(await keys(a));
   for (const key of await keys(a)) expect((await stored(b, key)).bytes).toBe((await stored(a, key)).bytes);
+});
+
+test("the pool's log fields survive the log allowlist (sizes and counters only)", async () => {
+  selectScrubEngine({});
+  const p = pool(1), a = scratch();
+  await p.sealer(a, input(sources[1]!));
+  const line = JSON.parse(logLine("info", "seal pool", sealPoolLogFields(p)));
+  expect(line).toMatchObject({ seal_pool_workers: 1, seal_pool_pooled: 1, seal_pool_fallback: 0, seal_pool_worker_errors: 0, seal_pool_respawned: 0, seal_pool_retired: 0 });
 });

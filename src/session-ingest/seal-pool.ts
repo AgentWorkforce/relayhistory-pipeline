@@ -57,6 +57,13 @@ export function parseSealWorkers(value: string | undefined): number {
   return n;
 }
 
+/** The counters as allowlisted log fields (log.ts SEAL_POOL_LOG_FIELDS): bounded counts only. */
+export function sealPoolLogFields(pool: SealPool): Record<string, number> {
+  const s = pool.stats();
+  return { seal_pool_workers: pool.size, seal_pool_pooled: s.pooled, seal_pool_fallback: s.fallback, seal_pool_worker_errors: s.workerErrors,
+    seal_pool_respawned: s.respawned, seal_pool_retired: s.retired };
+}
+
 /** Counters only: no keys, no content. */
 export interface SealPoolStats { pooled: number; fallback: number; workerErrors: number; respawned: number; retired: number }
 
