@@ -36,7 +36,7 @@ Exactly the markdown that the read route `GET /v1/relayfacts/:topic` renders, pr
 
 ## What is never pushed
 
-- Transcripts or transcript excerpts. The document only carries scrubbed decision statements, titles, statuses and evidence pointers (session id and turn range).
+- Transcripts or transcript excerpts. The document only carries scrubbed decision statements, titles, statuses and evidence pointers (session id, a `refs a-b` range of 0-based positions among that session's analysis evidence references, not transcript turns, the scrubbed claim, and an optional GitHub URL).
 - Workspace ids or org ids. They are not in the document, the path, the commit message or the logged events.
 - Customer names, beyond whatever the scrubbed statement text already contains.
 - The token, response bodies or the markdown, in any log event.
@@ -65,6 +65,12 @@ The push never blocks the pipeline. HTTP and network failures come back as `{ ou
 Programming errors do throw: a target or path that `relayfactsDocumentPath` would not produce (traversal, absolute, wrong dir, bad characters). `pushRelayfactsTopic` checks every target before its first request, then pushes to each target in turn. One target's failure never stops the others, and it returns one result per target.
 
 Each push emits one log event through the optional `log` callback: `event`, `outcome`, `status`, `reason` (on skip or failure), `repository` (`owner/repo`), `branch`, `path` and `at`. A logger that throws does not change the result.
+
+## Retention and known limitations
+
+Pushed documents become git history in the target repositories. No operator erase reaches them: neither the per-session erase (`relayfacts_evidence_erase_session_v1`) nor a per-user erase removes a pushed document or its earlier revisions, and a later push only adds a new revision. For that reason the module stays unwired and default off until that retention model is accepted.
+
+Known limitation before wiring: the document path is topic-only (`<dir>/<slug>.md`, with no workspace segment). Two workspaces that push the same topic to the same target repository and dir would overwrite each other's document. The wiring commit must resolve this (for example one target per workspace, or an opaque per-workspace path segment, since workspace ids must stay out of the path) before the push is enabled for more than one workspace.
 
 ## Activation (not done by this commit)
 

@@ -225,6 +225,6 @@ describe("decisionRecordsHook", () => {
     expect(counts).toEqual({ decision_records: 0 });
     const failing: Record<string, number> = {};
     await decisionRecordsHook(async () => { throw new Error("db down"); }, failing)(job, output([claim("Use a flag.", ["e0"])]));
-    expect(failing).toEqual({ relayfacts_failed: 1 });
+    expect(failing).toEqual({ decision_records_failed: 1 });
   });
 });

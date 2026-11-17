@@ -241,7 +241,14 @@ describe("pushRelayfactsDocument", () => {
     expect(await pushRelayfactsDocument(a.d, input)).toEqual({ outcome: "failed", reason: "network" });
     const b = deps([json(404, {}), new TypeError("socket hang up")]);
     expect(await pushRelayfactsDocument(b.d, input)).toEqual({ outcome: "failed", reason: "network" });
-    assertNoLeak([...a.events, ...b.events]);
+    // A PUT that gets no response logs no status, not the status of the GET before it.
+    const c = deps([json(200, fileBody("old")), new TypeError("socket hang up")]);
+    expect(await pushRelayfactsDocument(c.d, input)).toEqual({ outcome: "failed", reason: "network" });
+    for (const events of [a.events, b.events, c.events]) {
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ outcome: "failed", reason: "network", status: null });
+    }
+    assertNoLeak([...a.events, ...b.events, ...c.events]);
     expect(JSON.stringify(a.events)).not.toContain("connect failed");
   });
 

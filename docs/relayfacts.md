@@ -92,7 +92,7 @@ Writes go to the worker role. The task asked for service_role only; the read API
 
 ## Extractor runtime
 
-The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts`), as a hook that `runAnalysisJob` calls once after `store.complete` has succeeded. It never runs for a failed, lease-lost or refused job, and it writes to the completed job's own org and workspace. A failing write is contained: the job stays completed, the tick counts `relayfacts_failed`, and nothing is logged. The tick counts the records it sent as `decision_records`. With the flag off the tick has no hook, so it makes the same store calls as before and adds no count.
+The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts`), as a hook that `runAnalysisJob` calls once after `store.complete` has succeeded. It never runs for a failed, lease-lost or refused job, and it writes to the completed job's own org and workspace. A failing write is contained: the job stays completed, the tick counts `decision_records_failed`, and nothing is logged. The tick counts the records it sent as `decision_records`. With the flag off the tick has no hook, so it makes the same store calls as before and adds no count.
 
 ## What is not stored
 
@@ -124,9 +124,13 @@ Evidence rows carry session ids and a claim taken from that session. Migration `
 
 Hosted: the extractor runs in the hosted session-pipeline Lambda, and the operator per-session erase runs only in self-host. No hosted per-session erase reaches these tables yet, so activation step 2 stays blocked on hosted until one calls this function.
 
+Per-user (data-subject) erase: the user erase job (`src/session-erase/user-erase.ts`) does not reach the relayfacts tables on any deployment yet. A hosted user-keyed erase is being added as migration `20261105062100` in a separate lane.
+
 ## Surfacing
 
-The first slice is pull only: `GET /v1/relayfacts` lists topics with counts, and `GET /v1/relayfacts/{topic}` returns `{topic, records, nextCursor, markdown}`, where `markdown` renders one page of the topic's records. Each route requires the workspace attestation and the `relayfacts` canary, rejects unsupported parameters, returns at most 200 records per page (oldest first) with a cursor, and renders only stored fields. Every line of stored text is escaped, so it cannot open a heading, list, link, HTML tag or code span, or add a line.
+The first slice is pull only: `GET /v1/relayfacts` lists topics with counts, and `GET /v1/relayfacts/{topic}` returns `{topic, records, nextCursor, markdown}`, where `markdown` renders one page of the topic's records. Each route requires the workspace attestation and the canary allowlist, rejects unsupported parameters, returns at most 200 records per page (oldest first) with a cursor, and renders only stored fields. Every line of stored text is escaped, so it cannot open a heading, list, link, HTML tag or code span, or add a line.
+
+The "relayfacts canary" is not a separate allowlist. It is the shared read-API canary allowlist `READ_API_DIRECTORY_WORKSPACES`, checked through `requireCanary(identity, "relayfacts")`; the `"relayfacts"` argument only sets the error label (`relayfacts_workspace_not_enabled`). Adding a workspace to that allowlist also enables, for that workspace, every other read-API route gated by the same check (directory, timing, turns, analysis, output, summary, digest, coordination, catalog and login).
 
 Out of scope, as follow-ups:
 
@@ -152,7 +156,7 @@ Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
 
 1. Apply migrations `20261105062080` and `20261105062090` with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm both sentinels.
 2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where the per-session erase reaches these tables (see Retention), so not on hosted yet.
-3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to the `relayfacts` canary.
+3. Set `READ_API_RELAYFACTS_ENABLED=true` on the read API, either through the read-API stack input `relayfacts` (`stacks/aws/session-read-api.ts`) or through the `relayfacts=on` input of `.github/workflows/deploy-session-read-worker.yml`. That input is not preserved from live, so repeat it on later dispatches. Then add the workspace to `READ_API_DIRECTORY_WORKSPACES`, the shared canary allowlist that `requireCanary(identity, "relayfacts")` checks (see Surfacing). That also enables the other directory routes for that workspace, so add only a workspace that is cleared for them too.
 
 Rollback: unset the flags, then run the rollback files if the tables must go, `20261105062090` first (its rollback refuses while a later migration is applied).
 
