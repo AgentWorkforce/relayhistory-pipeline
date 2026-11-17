@@ -115,6 +115,13 @@ export interface BackfillOptions {
   mergeBufferEntries?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /**
+   * A stop the caller raises mid-run (scripts/upload-fence-backfill.ts: the ledger-home re-check's sticky refusal).
+   * Checked at every boundary of the ownership and revision sections (before each SQL page, slot window or org read,
+   * after each merge pass): once it returns an error the run throws it there, reading no further page and starting no
+   * further write. The fences section runs first and is not checked (it writes no ledger key).
+   */
+  halt?: () => unknown;
 }
 
 export interface BackfillSummary {
@@ -881,9 +888,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     const fences = new Map<string, Promise<FenceDoc | null>>();
     await mapLimit(fresh, concurrency, (r) => ownRow(r, fences));
   };
+  /** The caller's stop (opts.halt), at a section boundary. */
+  const stopIfHalted = () => {
+    const halted = opts.halt?.();
+    if (halted !== undefined) throw halted;
+  };
   if (sections.has("ownership")) {
     let cursor = ["", "", "", "", "", ""];
     for (;;) {
+      stopIfHalted();
       const rows = await readOnly(OWNERSHIP_PAGE, [orgs, ...cursor, rowPageSize]);
       if (!rows.length) break;
       const last = rows[rows.length - 1]!;
@@ -960,12 +973,14 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         summary.revisions.failed_codes[code] = (summary.revisions.failed_codes[code] ?? 0) + g.entries;
       }
       });
+      stopIfHalted();
     }
     // (a) ingest_record_revisions, seeded revision-only rows included; a catch-up only those updated since `since`.
     let cursor = ["", "", "", ""];
     const revisionBuf = newBuffer();
     for (;;) {
       if (!sections.has("revisions")) break;
+      stopIfHalted();
       const rows = since === undefined
         ? await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize])
         : await readOnly(REVISIONS_SINCE_PAGE, [orgs, ...cursor, rowPageSize, since]);
@@ -982,12 +997,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await add(revisionBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
       }
     }
+    stopIfHalted();
     await flush(revisionBuf);
     // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope): first their
     // sessions' owner stubs (the ownership section), then their revisions.
     const slotBuf = newBuffer();
     const slotRows = async (rows: Record<string, unknown>[]) => {
+      stopIfHalted();
       if (sections.has("ownership")) await registerSlotOwners(rows);
+      stopIfHalted();
       if (!sections.has("revisions")) return;
       const fences = new Map<string, Promise<FenceDoc | null>>();
       slotBuf.batch++;
@@ -1005,6 +1023,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     if (opts.slotsByOrg === true && orgs && orgs.length > 0) {
       walkOrgs = [];
       for (const org of orgs) {
+        stopIfHalted();
         let read: Awaited<ReturnType<typeof readOnlySlotsOfOrg>>;
         try {
           read = await readOnlySlotsOfOrg(org);
@@ -1030,12 +1049,14 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     // 21 s a page on production's tens of millions of slots. The heap's size is re-read in each window's snapshot so
     // growth is followed.
     for (let block = 0; walkOrgs === null || walkOrgs.length > 0; block += slotWindow) {
+      stopIfHalted();
       const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [walkOrgs, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
       const blocks = int(size![0]?.blocks);
       if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
       await slotRows(rows!);
       if (block + slotWindow >= blocks) break;
     }
+    stopIfHalted();
     await flush(slotBuf);
     if (slotsFromCursor) {
       // FINGERPRINT_SLOTS's values from the pass (an org that failed contributes nothing, but its sections are incomplete).

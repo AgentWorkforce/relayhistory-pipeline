@@ -73,9 +73,12 @@ marker, and the result is cached with it for 60 s per org:
   - During a run they re-check, as the edge does about once a minute: before
     any ledger-key write made a minute or more after the last good check, the
     same check runs again. A refusal blocks every later ledger-key write; the
-    tool stops at its next boundary (the drain at its next batch group, after
-    releasing its lease, a Locker write the check never blocks) and exits 1
-    with the code.
+    tool stops at its next boundary and exits 1 with the code. The drain stops
+    before its next batch group, after releasing its lease (a Locker write the
+    check never blocks; a failed release is reported as
+    `drain_lease_release_failed`). The backfill stops before its next
+    ownership or revision SQL page, slot window or org read, or after its
+    current merge pass; its fences section runs first and is never stopped.
   - Unset, they behave as the other single-bucket tools below.
   - The backfill checks the markers unless every section it runs is
     `fences` (an empty section list is checked too). A fences-only run needs

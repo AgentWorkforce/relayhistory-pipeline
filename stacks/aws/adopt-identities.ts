@@ -117,8 +117,9 @@ export function backlogOpsLedgerResources(l: BacklogOpsLedgerBucket) {
     /** The ledger-home marker (ledger-store.ts ledgerHomeKey). */
     home: `${bucketArn}/${l.keyRoot}/.ledger/fence-authority/.ledger-home.json`,
     /**
-     * The s3:prefix values the roles may list under: the ledger keys' tree, and the marker's exact key (so a missing
-     * marker reads as a 404, `ledger_home_missing`, rather than a 403, `access_denied`).
+     * The s3:prefix values the roles may list under: the ledger keys' tree (required), and the marker's exact key
+     * (optional; meant to make a missing marker a 404, `ledger_home_missing`, rather than a 403, `access_denied`:
+     * whether S3 applies the prefix condition to that 404-vs-403 decision is to be confirmed on the first real run).
      */
     listPrefixes: [`${l.keyRoot}/.admission-inbox/*`, `${l.keyRoot}/.ledger/fence-authority/.ledger-home.json`] as const,
   };
@@ -154,10 +155,14 @@ export function assertBacklogOpsLedgerBucket(value: unknown, transcriptsBucket: 
 /** Any s3:x-amz-server-side-encryption* key under any condition operator. */
 const hasSseCondition = (condition: unknown) =>
   plain(condition) && Object.values(condition).some((block) => plain(block) && Object.keys(block).some((k) => k.toLowerCase().startsWith("s3:x-amz-server-side-encryption")));
-/** An s3:prefix condition value naming only allowed prefixes (a string or a non-empty list of distinct ones). */
+/**
+ * An s3:prefix condition value (a string or a list of distinct ones) that names the REQUIRED prefix (the first: the
+ * ledger keys' tree; without it a missing shard or stub reads as a 403 and the run fails) and otherwise only the
+ * optional ones (the marker's key).
+ */
 const listPrefixesOk = (value: unknown, allowed: readonly string[]) => {
   const values = Array.isArray(value) ? value : [value];
-  return values.length > 0 && new Set(values).size === values.length && values.every((v) => typeof v === "string" && allowed.includes(v));
+  return new Set(values).size === values.length && values.includes(allowed[0]) && values.every((v) => typeof v === "string" && allowed.includes(v));
 };
 
 /**
@@ -173,8 +178,9 @@ const listPrefixesOk = (value: unknown, allowed: readonly string[]) => {
  * With `c.ledger` (backlogOpsRoles.ledgerBucket) also, and only, `backlogOpsLedgerStatements`' grants on the ledger
  * bucket, each in a statement of its own bucket:
  *   s3:GetObject                  `<ledger>/<root>/.admission-inbox/*\/ledger/*` and the ledger-home marker;
- *   s3:ListBucket                 the ledger bucket itself, with StringLike s3:prefix exactly one or both of
- *                                 `<root>/.admission-inbox/*` and `<root>/.ledger/fence-authority/.ledger-home.json`;
+ *   s3:ListBucket                 the ledger bucket itself, with StringLike s3:prefix exactly
+ *                                 `<root>/.admission-inbox/*` (required) and optionally
+ *                                 `<root>/.ledger/fence-authority/.ledger-home.json`;
  *   s3:PutObject                  (writer only) `<ledger>/<root>/.admission-inbox/*\/ledger/*`, with no
  *                                 s3:x-amz-server-side-encryption condition (the tools send no encryption header).
  * No KMS action ever names the ledger bucket.
@@ -221,7 +227,7 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
           if (!resources.every((r) => r === ledger.bucketArn) || !plain(s.Condition) || Object.keys(s.Condition).length !== 1 ||
               !plain(s.Condition.StringLike) || Object.keys(s.Condition.StringLike).length !== 1 ||
               !listPrefixesOk(prefix, ledger.listPrefixes))
-            refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself, with exactly StringLike s3:prefix one or both of ${ledger.listPrefixes.join(", ")}`);
+            refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself, with StringLike s3:prefix exactly ${ledger.listPrefixes[0]} (required) and optionally ${ledger.listPrefixes[1]}`);
         } else if (ledger && onLedger && a === "s3:GetObject") {
           if (!resources.every((r) => r === ledger.objects || r === ledger.home)) refuse(`${p}: s3:GetObject on the ledger bucket only on exactly ${ledger.objects} and ${ledger.home}`);
         } else if (ledger && onLedger && a === "s3:PutObject") {

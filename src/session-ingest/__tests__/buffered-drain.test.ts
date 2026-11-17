@@ -20,7 +20,7 @@ import {
   type DrainLedger,
   type DrainOptions,
 } from "../buffered-drain.ts";
-import { parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
+import { drainRefusal, parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
 import { isLedgerKey, ledgerHomeKey } from "../ledger-store.ts";
 import { TOOL_HOME_RECHECK_MS } from "../ledger-tool-store.ts";
 import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as writeFileSyncFs } from "node:fs";
@@ -54,13 +54,13 @@ function group(source: string, sessionId: string, recs: Rec[]): Group {
  * start of every run() (as an export just before the drain), with a snapshot of the user's CURRENT S3 fence.
  * `live` / `keep` stand for SQL's verdict; a test that needs the snapshot to go stale passes { refresh: false }.
  */
-type Verdict = { sha: string; lineCounts: number[]; sessions: [string, string][]; live: boolean; keep?: number[][] };
+type Verdict = { sha: string; lineCounts: number[]; sessions: [string, string][]; live: boolean; keep?: number[][]; tenant?: typeof TENANT };
 const VERDICTS = new Map<string, Verdict>();
 const accept = (key: string, v: Verdict) => { VERDICTS.set(key, v); };
 async function refreshVerdicts(store: ObjectStore) {
-  // An unreadable fence gives no fence view (the drain refuses it before the verdict matters).
-  const read = await s3LedgerObjects(store, ROOT).readFence(s3LedgerKeys(ROOT, TENANT).fence).catch(() => ({ state: "absent" as const }));
   for (const [key, v] of VERDICTS) {
+    // An unreadable fence gives no fence view (the drain refuses it before the verdict matters).
+    const read = await s3LedgerObjects(store, ROOT).readFence(s3LedgerKeys(ROOT, v.tenant ?? TENANT).fence).catch(() => ({ state: "absent" as const }));
     const fence = read.state === "present" ? read.fence : null;
     const marker = {
       v: 2, kind: "buffered-accepted", stage_sha256: v.sha, live: v.live,
@@ -79,18 +79,19 @@ async function putStaged(store: ObjectStore, key: string, bytes: Uint8Array) {
   accept(key, { sha: sha(bytes), lineCounts: [], sessions: [], live: true });
 }
 
-async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean; live?: boolean; keep?: number[][] } = {}): Promise<string> {
+async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean; live?: boolean; keep?: number[][]; tenant?: typeof TENANT } = {}): Promise<string> {
   let ord = 0;
+  const tenant = over.tenant ?? TENANT;
   const prepared = prepareBufferedStage(ROOT, {
     claim_token: over.claim ?? randomUUID(),
     batch_digest: sha(over.batch ?? randomUUID()),
     received_at: over.received ?? RECEIVED,
-    org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, origin_id: ORIGIN, user_id: TENANT.userId,
+    org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: ORIGIN, user_id: tenant.userId,
   }, groups, groups.map((g) => g.lines.map(() => ord++)));
   await putBufferedStage(store, prepared);
   if (over.accepted !== false) accept(prepared.spec.key, {
     sha: prepared.spec.sha256, lineCounts: groups.map((g) => g.lines.length), sessions: groups.map((g) => [g.source, g.sessionId] as [string, string]),
-    live: over.live ?? true, ...(over.keep ? { keep: over.keep } : {}),
+    live: over.live ?? true, ...(over.keep ? { keep: over.keep } : {}), ...(over.tenant ? { tenant: over.tenant } : {}),
   });
   return prepared.spec.key;
 }
@@ -868,10 +869,18 @@ describe("buffered backlog drain (0005)", () => {
     const marker = (bucket: string) => enc.encode(JSON.stringify({ v: 1, home: bucket, writtenAtMs: 1 }));
     await locker.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
     await ledger.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
-    const keys = [];
-    for (let i = 0; i < 3; i++) keys.push(await stage(locker, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]));
+    // Three users, one batch each: whatever their listing order, the third batch belongs to a user other than the
+    // second's, so only the loop-top halt (not user_stopped) can be what skips it.
+    const users = [TENANT, { ...TENANT, userId: "user-2" }, { ...TENANT, userId: "user-3" }];
+    const keys: string[] = [];
+    for (const [i, u] of users.entries()) {
+      await s3LedgerObjects(locker, ROOT).editFence(s3LedgerKeys(ROOT, u).fence, (f) => ({ next: f, result: undefined }));
+      keys.push(await stage(locker, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])], { tenant: u }));
+    }
     await refreshVerdicts(locker);
+    const order = [...keys].sort();
     let t = 0, flipped = false;
+    const readAfterFlip: string[] = [];
     const ledgerWritesAfterFlip: string[] = [];
     // The ledger bucket as the tool sees it: records every write that reaches it after the flip.
     const ledgerSeen: ObjectStore = { ...ledger, backend: ledger.backend,
@@ -881,7 +890,10 @@ describe("buffered backlog drain (0005)", () => {
     // The Locker bucket: once the first batch is marked drained, a relocation elsewhere rewrites its marker, and a
     // minute passes on the re-check's clock.
     const lockerSeen: ObjectStore = { ...locker, backend: locker.backend,
-      head: (k) => locker.head(k), get: (k, r) => locker.get(k, r), getObject: (k, r) => locker.getObject(k, r), list: (p, c) => locker.list(p, c), presignGet: (k, x) => locker.presignGet(k, x),
+      head: (k) => { if (flipped) readAfterFlip.push(String(k)); return locker.head(k); },
+      get: (k, r) => { if (flipped) readAfterFlip.push(String(k)); return locker.get(k, r); },
+      getObject: (k, r) => { if (flipped) readAfterFlip.push(String(k)); return locker.getObject(k, r); },
+      list: (p, c) => locker.list(p, c), presignGet: (k, x) => locker.presignGet(k, x),
       delete: (k) => locker.delete(k),
       put: async (k, b, o) => {
         const ack = await locker.put(k, b, o);
@@ -904,12 +916,39 @@ describe("buffered backlog drain (0005)", () => {
     await expect(run).rejects.toThrow(/^ledger_home_mismatch$/);
     expect(flipped).toBe(true);
     expect(ledgerWritesAfterFlip).toEqual([]);
-    // Exactly the first batch was drained; the run stopped before starting the third.
+    // Exactly the first listed batch was drained. The second (its ledger write found the refusal) was read; the
+    // third, another user's, was never even read: the halt at the loop top stopped the run before it.
     const drained = [];
     for (const k of keys) if (await exists(locker, k + DRAINED_SUFFIX)) drained.push(k);
-    expect(drained.length).toBe(1);
+    expect(drained).toEqual([order[0]]);
+    expect(readAfterFlip).toContain(order[1]);
+    expect(readAfterFlip.filter((k) => k.startsWith(order[2]!))).toEqual([]);
     // The lease is released (expired in place), not left for its TTL: a following drain or export may start at once.
     expect((await readJson(locker, drainLockKey(ROOT))).expiresAtMs).toBe(0);
+  });
+
+  test("a failed lease release is reported (drain_lease_release_failed), never swallowed; the run still fails with its code", async () => {
+    // The release (expiry 0) fails; taking and renewing the lease work. (A failed release leaves the lease held for its
+    // TTL, so each run below gets its own store.)
+    const failRelease = (store: ObjectStore): ObjectStore => ({ ...store, backend: store.backend,
+      head: (k) => store.head(k), get: (k, r) => store.get(k, r), getObject: (k, r) => store.getObject(k, r), list: (p, c) => store.list(p, c),
+      presignGet: (k, x) => store.presignGet(k, x), delete: (k) => store.delete(k),
+      put: (k, b, o) => (String(k) === drainLockKey(ROOT) && JSON.parse(dec.decode(b)).expiresAtMs === 0
+        ? Promise.reject(new ObjectStoreError("transient", "fs", "synthetic")) : store.put(k, b, o)) });
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const halted = new Error("ledger_home_moved");
+    const error = await run(failRelease(store), { halt: () => halted }).then(() => null, (e) => e);
+    expect(error).toBe(halted);
+    const lines: string[] = [];
+    expect(drainRefusal(error, (l) => lines.push(l))).toEqual({ refused: "ledger_home_moved", lease_release: "drain_lease_release_failed" });
+    expect(lines).toEqual(["drain_lease_release_failed\n"]);
+    // A run that completes with a failed release says so in its summary.
+    const ok = await run(failRelease(await scratch()));
+    expect(ok.lease_release).toBe("drain_lease_release_failed");
+    // And a clean release adds nothing.
+    expect(drainRefusal(new Error("ledger_home_moved"), () => { throw new Error("no line expected"); })).toEqual({ refused: "ledger_home_moved" });
+    expect((await run(await scratch())).lease_release).toBeUndefined();
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {
