@@ -500,9 +500,27 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const inWindow = s3.rows.filter((r) => tsMillis(`${r.ts.replace(" ", "T")}Z`) >= fromMs);
     // Staged: keyset pages up to the keyed-records cap (never below SEARCH_INDEX_MAX_ROWS).
     const stagedScan = deps.staged && io.scanPages ? stagedScanBounds(deps.staged, limits) : undefined;
-    const scan = stagedScan
-      ? await io.scanPages!(scope, pointerSnapshot.canonicalId, fromMs, stagedScan.pageSize, stagedScan.maxRows, async () => {})
-      : await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+    let scan: Awaited<ReturnType<SearchProjectionIo["scan"]>>;
+    if (stagedScan) {
+      // Between pages, as the streamed scan: the deadline (if any) and a throttled keepalive, so a
+      // long walk neither outlives the deadline nor idles the transaction past the pool's timeout.
+      const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
+      let pinged = Date.now();
+      try {
+        scan = await io.scanPages!(scope, pointerSnapshot.canonicalId, fromMs, stagedScan.pageSize, stagedScan.maxRows, async () => {
+          if (streamDeadlinePassed(deps.streamDeadline)) throw new StreamBudgetError(STREAM_DEADLINE);
+          if (Date.now() - pinged < everyMs) return;
+          await tx.query("SELECT 1 AS stream_keepalive");
+          pinged = Date.now();
+        });
+      } catch (error) {
+        if (!(error instanceof StreamBudgetError)) throw error;
+        // Past the deadline: nothing written or deleted, the scope owes a pass.
+        await invalidateDirectoryEvents(tx, scope);
+        await io.record(scope, s3.revision, 0, false, at, pointerSnapshot.canonicalId);
+        return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, reasons: [...s3.reasons, error.budget] };
+      }
+    } else scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
     const chRows = scan.rows;
     const truncated = scan.truncated;
     const existing = new Map<string, ScopeIdentity[]>();
@@ -1016,6 +1034,15 @@ export function searchIndexStreamStartup(
       ? { level: "warn", message: "pipeline consumer streaming reconcile on with read budgets no scope past the whole-read bound fits", fields: budget }
       : undefined,
   };
+}
+
+/**
+ * The staged reconcile walks the index in keyset pages: serve() refuses an index without
+ * scanFingerprintsPage at startup (not on the first scope).
+ */
+export function assertStagedSearchIndex(staged: StagedReconcile | undefined, index: { scanFingerprintsPage?: unknown }): void {
+  if (staged && typeof index.scanFingerprintsPage !== "function")
+    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires a search index with paged scans");
 }
 
 /**

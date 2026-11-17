@@ -149,7 +149,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 0.5 GB of keys on top of its usual limit); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
-| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (no `search_index_truncated`), streaming budgets per pass instead of summed, and an interim cap of 500000 keyed records (`stream_keyed_records_cap`); see "Staged reconcile (Phase 3), slice 1" below. `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -437,16 +437,31 @@ With it on:
 
 - **Paged index scans.** The index scan of every pass, whole read or streamed, walks the adapter's keyset pages
   (`scanFingerprintsPage`, one insert batch per page) instead of one read bounded by `SEARCH_INDEX_MAX_ROWS`, so a
-  scope with more index rows than that is no longer `search_index_truncated`: it reconciles, deletes included.
+  scope with more index rows than that is no longer `search_index_truncated`: up to the cap below it reconciles,
+  deletes included.
 - **Per-pass read budget.** `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` bound each pass of a streamed scope,
   not the sum of its passes, so a scope is refused only when its own size exceeds a budget, never four times its
   size: at the defaults a scope up to 2 GiB streams (records are capped below).
 - **Interim keyed-records cap.** Every record a pass reads is still keyed in memory (about 1 KB each), so one pass
   may read at most 500000 records, and one index scan may hold at most 500000 rows (or `SEARCH_INDEX_MAX_ROWS` when
-  that is higher). Past either, the scope stays partial with `scope_too_large` and `stream_keyed_records_cap`,
-  nothing deleted, and is retried every reconcile tick like any partial session. That is the same key memory as
-  the default streaming budgets already need (about 0.5 GB), so the pod sizing above holds. The cap is a constant,
-  not a setting; a later slice replaces the in-memory keys and removes it.
+  that is higher). The cap counts records read, not unique keys: a record carried by two sibling manifests counts
+  twice. Past it, nothing is deleted and the scope is retried every reconcile tick, with one of two outcomes:
+  - a **streamed** scope (past the whole-read bound) stays partial with `scope_too_large` and
+    `stream_keyed_records_cap`, like a spent budget;
+  - a **whole-read** scope whose index scan passes the cap is marked incomplete (not partial) with
+    `stream_keyed_records_cap` alone, in place of `search_index_truncated`. Its missing rows are still written.
+
+  That is the same key memory as the default streaming budgets already need (about 0.5 GB), so the pod sizing
+  above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
+- **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
+  1` at most every 20 seconds), on the whole-read path as on the streamed one.
+
+What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
+reads no more index rows than the bounded scan did; only the reason code past that point changes. A
+`SEARCH_INDEX_MAX_ROWS` set between 500000 and 1000000 keeps its higher bound. The flag never lowers it (the cap is
+a floor, so a `SEARCH_INDEX_MAX_ROWS` below 500000, as tests set it, is raised to the cap). A session above 500000
+records read per pass stays incomplete until a later slice removes the cap; what slice 1 adds today is the per-pass
+byte budget (scopes up to 2 GiB under 500000 records) and the paged scan itself.
 
 Turning the default on is a separate, gated step, not part of this slice.
 

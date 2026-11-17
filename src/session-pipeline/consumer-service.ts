@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
-import { searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
+import { assertStagedSearchIndex, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1194,8 +1194,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
 
   // The staged reconcile walks the index in keyset pages: refuse an index without them now,
   // not on the first scope.
-  if (searchStaged && typeof binding.index.scanFingerprintsPage !== "function")
-    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires a search index with paged scans");
+  assertStagedSearchIndex(searchStaged?.staged, binding.index);
   const raw = lockerStore();
   const reader = lockerManifestReader();
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: config.keyPrefix };

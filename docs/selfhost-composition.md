@@ -684,16 +684,31 @@ With it on:
 
 - **Paged index scans.** The index scan of every pass, whole read or streamed, walks the adapter's keyset pages
   (`scanFingerprintsPage`, one insert batch per page) instead of one read bounded by `SEARCH_INDEX_MAX_ROWS`, so a
-  scope with more index rows than that is no longer `search_index_truncated`: it reconciles, deletes included.
+  scope with more index rows than that is no longer `search_index_truncated`: up to the cap below it reconciles,
+  deletes included.
 - **Per-pass read budget.** `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` bound each pass of a streamed scope,
   not the sum of its passes, so a scope is refused only when its own size exceeds a budget, never four times its
   size: at the defaults a scope up to 2 GiB streams (records are capped below).
 - **Interim keyed-records cap.** Every record a pass reads is still keyed in memory (about 1 KB each), so one pass
   may read at most 500000 records, and one index scan may hold at most 500000 rows (or `SEARCH_INDEX_MAX_ROWS` when
-  that is higher). Past either, the scope stays partial with `scope_too_large` and `stream_keyed_records_cap`,
-  nothing deleted, and is retried every reconcile tick like any partial session. That is the same key memory as
-  the default streaming budgets already need (about 0.5 GB), so the pod sizing above holds. The cap is a constant,
-  not a setting; a later slice replaces the in-memory keys and removes it.
+  that is higher). The cap counts records read, not unique keys: a record carried by two sibling manifests counts
+  twice. Past it, nothing is deleted and the scope is retried every reconcile tick, with one of two outcomes:
+  - a **streamed** scope (past the whole-read bound) stays partial with `scope_too_large` and
+    `stream_keyed_records_cap`, like a spent budget;
+  - a **whole-read** scope whose index scan passes the cap is marked incomplete (not partial) with
+    `stream_keyed_records_cap` alone, in place of `search_index_truncated`. Its missing rows are still written.
+
+  That is the same key memory as the default streaming budgets already need (about 0.5 GB), so the pod sizing
+  above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
+- **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
+  1` at most every 20 seconds), on the whole-read path as on the streamed one.
+
+What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
+reads no more index rows than the bounded scan did; only the reason code past that point changes. A
+`SEARCH_INDEX_MAX_ROWS` set between 500000 and 1000000 keeps its higher bound. The flag never lowers it (the cap is
+a floor, so a `SEARCH_INDEX_MAX_ROWS` below 500000, as tests set it, is raised to the cap). A session above 500000
+records read per pass stays incomplete until a later slice removes the cap; what slice 1 adds today is the per-pass
+byte budget (scopes up to 2 GiB under 500000 records) and the paged scan itself.
 
 Turning the default on is a separate, gated step, not part of this slice.
 

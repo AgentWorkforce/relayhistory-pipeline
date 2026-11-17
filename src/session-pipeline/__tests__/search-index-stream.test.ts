@@ -15,10 +15,10 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
 import {
-  STREAM_READ_CEILING, indexSearchScope, searchIndexStreamBudgetWarning, searchIndexStreamFlag, searchIndexStreamFloor, searchIndexStreamFromEnv,
+  STREAM_READ_CEILING, assertStagedSearchIndex, indexSearchScope, searchIndexStreamBudgetWarning, searchIndexStreamFlag, searchIndexStreamFloor, searchIndexStreamFromEnv,
   searchIndexStreamStartup, type SearchIndexDeps,
 } from "../search-index.ts";
-import { STREAM_KEYED_RECORDS_CAP, STREAM_READ_BYTES_BUDGET, STREAM_READ_EVENTS_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
+import { STREAM_DEADLINE, STREAM_KEYED_RECORDS_CAP, STREAM_READ_BYTES_BUDGET, STREAM_READ_EVENTS_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
 import {
   SCOPE, T0, activity, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line,
 } from "../../session-read-api/__tests__/stream-fixture.ts";
@@ -576,4 +576,113 @@ test("staged on: an index without paged scans is refused, not scanned partially"
   delete (b.adapter.index as { scanFingerprintsPage?: unknown }).scanFingerprintsPage;
   await expect(indexSearchScope(SCOPE, b.deps)).rejects.toThrow("search paged scan unsupported by this index");
   expect(await b.scan()).toEqual([]);
+}, 60_000);
+
+/** Counts upsert and deleteEvents calls made from now on. */
+function countWrites(b: Awaited<ReturnType<typeof backend>>) {
+  const index = b.adapter.index;
+  const writes = { upserts: 0, deletes: 0 };
+  const upsert = index.upsert.bind(index);
+  const remove = index.deleteEvents.bind(index);
+  index.upsert = (async (...args: Parameters<typeof upsert>) => { writes.upserts += 1; return upsert(...args); }) as typeof upsert;
+  index.deleteEvents = (async (...args: Parameters<typeof remove>) => { writes.deletes += 1; return remove(...args); }) as typeof remove;
+  return writes;
+}
+
+test("staged on: SEARCH_INDEX_MAX_ROWS above the cap is the scan bound, so the walk reads past the cap and ends complete", async () => {
+  const x = await scope(generate(56));
+  const b = await backend(x, { limits: { maxRows: 1_000, insertBatch: 2 }, stream: UNLIMITED, staged: { keyedRecordsCap: 3 } });
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true });
+  await addStale(b, 2);
+  const rows = (await b.scan()).length;
+  expect(rows).toBeGreaterThan(3 + 1); // past the cap (and past cap + 1, the cap-only bound)
+  const scans = countScans(b);
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true, deleted: 2, reasons: [] });
+  expect(scans).toEqual({ pages: Math.ceil(rows / 2), bounded: 0 });
+}, 60_000);
+
+test("staged on: a whole read whose index scan passes the cap is incomplete with stream_keyed_records_cap alone, nothing deleted", async () => {
+  const x = await scope(generate(31));
+  const b = await backend(x, { limits: { maxRows: 2, insertBatch: 2 }, stream: UNLIMITED, staged: { keyedRecordsCap: 3 } });
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true }); // empty index
+  await addStale(b, 1);
+  const before = await b.scan();
+  expect(before.length).toBeGreaterThan(3);
+  const writes = countWrites(b);
+  const s = await indexSearchScope(SCOPE, b.deps);
+  expect(s.reasons).toEqual([STREAM_KEYED_RECORDS_CAP]);
+  expect(s).toMatchObject({ complete: false, deleted: 0 });
+  expect(s.partial).toBeUndefined();
+  expect(s.stream).toBeUndefined();
+  expect(writes.deletes).toBe(0);
+  expect(await b.scan()).toEqual(before);
+  expect(b.recorded.at(-1)).toMatchObject({ complete: false });
+}, 60_000);
+
+test("staged on: a malformed scan page is refused before any write or delete, on both paths", async () => {
+  type Page = NonNullable<Awaited<ReturnType<typeof backend>>["adapter"]["index"]["scanFingerprintsPage"]>;
+  const corrupt: Array<[string, (real: Page) => Page]> = [
+    ["next is not the last row", (real) => async (sc, o) => { const p = await real(sc, o); return p.next ? { ...p, next: positionOf(p.rows[0]!) } : p; }],
+    ["rows out of order", (real) => async (sc, o) => { const p = await real(sc, o); return { ...p, rows: [...p.rows].reverse() }; }],
+    ["a row repeated across pages", (real) => {
+      let last: Awaited<ReturnType<Page>>["rows"][number] | undefined;
+      return async (sc, o) => {
+        const p = await real(sc, o);
+        const rows = last ? [last, ...p.rows.slice(0, -1)] : p.rows;
+        last = p.rows[p.rows.length - 1];
+        return { rows, ...(p.next ? { next: positionOf(rows[rows.length - 1]!) } : {}) };
+      };
+    }],
+    ["an empty page with next", () => async () => ({ rows: [], next: { tsMs: 0, sessionId: "s", source: "claude", machineId: "m", kind: "k", eventId: "e" } })],
+    ["a page larger than the page size", (real) => async (sc, o) => real(sc, { ...o, limit: o.limit + 1 })],
+  ];
+  const x = await scope(generate(33));
+  for (const [name, wrap] of corrupt)
+    for (const limits of [{ maxRows: 1_000, insertBatch: 2 }, { ...TINY, maxRows: 1_000, insertBatch: 2 }]) {
+      const b = await backend(x, { limits, stream: UNLIMITED, staged: STAGED });
+      expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true });
+      await addStale(b, 3);
+      const before = await b.scan();
+      const index = b.adapter.index;
+      index.scanFingerprintsPage = wrap(index.scanFingerprintsPage!.bind(index));
+      const writes = countWrites(b);
+      const recorded = b.recorded.length;
+      await expect(indexSearchScope(SCOPE, b.deps), name).rejects.toThrow(/search scan (result|order) invalid/);
+      expect({ name, ...writes }).toEqual({ name, upserts: 0, deletes: 0 });
+      expect(b.recorded.length).toBe(recorded);
+      expect(await b.scan()).toEqual(before);
+    }
+}, 120_000);
+
+test("staged on: the consumer refuses at startup an index without paged scans; off never checks", () => {
+  const without = {};
+  const withPages = { scanFingerprintsPage: async () => ({ rows: [] }) };
+  expect(() => assertStagedSearchIndex(STAGED, without)).toThrow(
+    "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires a search index with paged scans",
+  );
+  expect(() => assertStagedSearchIndex(STAGED, withPages)).not.toThrow();
+  expect(() => assertStagedSearchIndex(undefined, without)).not.toThrow();
+});
+
+test("staged on: the whole-read page walk keeps the transaction busy and stops at the deadline between pages", async () => {
+  const x = await scope(generate(31));
+  const b = await backend(x, { limits: { maxRows: 1_000, insertBatch: 2 }, stream: UNLIMITED, staged: STAGED });
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true });
+  await addStale(b, 1);
+  const rows = (await b.scan()).length;
+  // Due every time: one ping between each pair of pages, none before the first.
+  b.sb.calls.length = 0;
+  const scans = countScans(b);
+  expect(await indexSearchScope(SCOPE, { ...b.deps, streamKeepaliveMs: 0 })).toMatchObject({ complete: true, deleted: 1 });
+  expect(scans.pages).toBe(Math.ceil(rows / 2));
+  expect(b.sb.calls.filter((c) => c === PING).length).toBe(scans.pages - 1);
+  // Past the deadline: stopped after the first page, nothing written or deleted, the scope owes a pass.
+  await addStale(b, 1);
+  const before = await b.scan();
+  const writes = countWrites(b);
+  const s = await indexSearchScope(SCOPE, { ...b.deps, streamDeadline: { at: 0 } });
+  expect(s).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: [STREAM_DEADLINE] });
+  expect(writes).toEqual({ upserts: 0, deletes: 0 });
+  expect(await b.scan()).toEqual(before);
+  expect(b.recorded.at(-1)).toEqual({ complete: false, rows: 0 });
 }, 60_000);
