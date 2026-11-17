@@ -24,6 +24,7 @@ import { NEON_FREE_SQL } from "../shared/never-in-neon.ts";
 import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.ts";
 import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
+import { type DecisionRecordsSink, decisionRecordsHook } from "./decision-records.ts";
 import { runAnalysisJob } from "./processor.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
 import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
@@ -127,6 +128,11 @@ export function analysisTick(deps: {
   transact?: <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
   /** The shared strict paged eraser (createS3Eraser); see sweepAnalysisTickets. Absent = no sweep. */
   eraser?: PagedEraser;
+  /**
+   * Memory documents (SUMMARY_DECISION_RECORDS_ENABLED): each completed job's decisions become
+   * decision records in that job's workspace. Absent = no extractor, no call, no count.
+   */
+  decisionRecords?: DecisionRecordsSink;
 }) {
   return async (): Promise<Record<string, number>> => {
     const counts: Record<string, number> = { completed: 0, failed: 0, "lease-lost": 0, idle: 0 };
@@ -150,7 +156,12 @@ export function analysisTick(deps: {
     for (let i = 0; i < deps.config.batch; i += 1) {
       const outcome = await runAnalysisJob(
         store,
-        { evidence, transport: deps.transport, assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns },
+        {
+          evidence,
+          transport: deps.transport,
+          assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns,
+          ...(deps.decisionRecords ? { onCompleted: decisionRecordsHook(deps.decisionRecords, counts) } : {}),
+        },
         { leaseSeconds: deps.config.leaseSeconds },
       );
       counts[outcome] = (counts[outcome] ?? 0) + 1;
