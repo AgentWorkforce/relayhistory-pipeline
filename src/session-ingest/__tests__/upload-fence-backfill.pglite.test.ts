@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
@@ -968,5 +968,149 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(parseBackfillArgs(["--dry-run", "--bucket", "my-bucket", "--org", "o1", "--section", "fences"])).toEqual({
       mode: "dry_run", bucket: "my-bucket", region: "us-east-1", orgs: ["o1"], sections: ["fences"], pageSize: 500, rowPageSize: 5_000, concurrency: 4, statementTimeoutMs: 30_000,
     });
+  });
+
+  test("CLI: --revisions-since-ms is a positive epoch ms and needs the revisions section", () => {
+    const base = ["--dry-run", "--bucket", "my-bucket"];
+    expect(parseBackfillArgs([...base, "--revisions-since-ms", "1700000000000"]).revisionsSinceMs).toBe(1_700_000_000_000);
+    expect(parseBackfillArgs([...base, "--section", "revisions", "--revisions-since-ms", "5"]).revisionsSinceMs).toBe(5);
+    expect("revisionsSinceMs" in parseBackfillArgs(base)).toBe(false);
+    for (const bad of ["0", "-1", "1.5", "1e12", "abc", "99999999999999999"])
+      expect(() => parseBackfillArgs([...base, "--revisions-since-ms", bad])).toThrow("--revisions-since-ms");
+    expect(() => parseBackfillArgs([...base, "--section", "fences", "--section", "ownership", "--revisions-since-ms", "5"])).toThrow("needs the revisions section");
+    expect(() => parseBackfillArgs([...base, "--revisions-since-ms", "5", "--revisions-since-ms", "6"])).toThrow("given twice");
+  });
+});
+
+describe("catch-up (--revisions-since-ms): two-phase cutover", () => {
+  const HOUR_AGO = "now() - interval '1 hour'";
+  /** Every revision row stamped an hour back, as rows written before the full run began. */
+  const age = () => db.exec(`UPDATE sessions.ingest_record_revisions SET updated_at = ${HOUR_AGO}`);
+  const setUpdated = (record: string, ms: number) =>
+    q("UPDATE sessions.ingest_record_revisions SET updated_at = to_timestamp($2::bigint / 1000.0) WHERE record_id = $1", [record, ms]);
+
+  test("only rows updated at or after t are applied; the keyset cursor crosses windows with no match; slots are read in full", async () => {
+    const store = scratch();
+    for (let i = 0; i < 12; i++) await rev(A, "origin-1", `c${String(i).padStart(3, "0")}`, i + 1, "claude", "sess-1");
+    await slot(A, "origin-1", "slot-1", A.userId, "claude", "sess-1", 3, hex("b"));
+    const t = 1_900_000_000_000;
+    await db.exec("UPDATE sessions.ingest_record_revisions SET updated_at = to_timestamp(1800000000)");
+    await setUpdated("c003", t - 1); // just before t: not applied
+    await setUpdated("c007", t);     // exactly t: applied
+    await setUpdated("c011", t + 5_000);
+    const summary = await run(store, { revisionsSinceMs: t, rowPageSize: 2 });
+    expect(summary.revisions_since_ms).toBe(t);
+    expect(summary.revisions).toMatchObject({ rows: 2, slot_rows: 1, failed: 0, invalid: 0 });
+    expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+    for (let i = 0; i < 12; i++) {
+      const r = `c${String(i).padStart(3, "0")}`;
+      expect(await entryOf(store, A, "origin-1", r) !== undefined).toBe(r === "c007" || r === "c011");
+    }
+    expect(await entryOf(store, A, "origin-1", "slot-1")).toBeDefined(); // the slot, though it has no timestamp
+    // A full run records no revisions_since_ms and applies every row.
+    const full = await run(scratch(), { rowPageSize: 2 });
+    expect("revisions_since_ms" in full).toBe(false);
+    expect(full.revisions.rows).toBe(12);
+    // A window size that is not a multiple of the rows, and one larger than all: the same two rows.
+    for (const rowPageSize of [5, 100]) expect((await run(scratch(), { revisionsSinceMs: t, rowPageSize })).revisions.rows).toBe(2);
+    // Read-only, like every page.
+    const log: string[] = [];
+    await run(scratch(), { revisionsSinceMs: t, dryRun: true }, log);
+    expect(log.filter((l) => /^(INSERT|UPDATE|DELETE)/i.test(l))).toEqual([]);
+  });
+
+  test("refusals: not a positive safe integer, or without the revisions section", async () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, 2 ** 53]) await expect(run(scratch(), { revisionsSinceMs: bad })).rejects.toThrow("backfill_revisions_since_invalid");
+    await expect(run(scratch(), { revisionsSinceMs: 5, sections: ["fences", "ownership"] })).rejects.toThrow("backfill_revisions_since_sections");
+  });
+
+  /**
+   * The ledger as readers see it: fences without their random instance id and CAS version; revision entries not
+   * forgotten under the tenant's fence; owner stubs of sessions not deleted and on the fence's current epoch.
+   */
+  async function logicalState(store: ObjectStore) {
+    const docs = new Map<string, any>();
+    let cursor: string | undefined;
+    do {
+      const page = await store.list(objectKey(ROOT), cursor);
+      for (const i of page.items) docs.set(String(i.key), JSON.parse(dec.decode(await readAll(await store.get(i.key)))));
+      cursor = page.nextCursor;
+    } while (cursor);
+    const out: Record<string, unknown> = {};
+    for (const [key, doc] of [...docs].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      if (key.endsWith("/upload-fences.json")) { const { instance: _i, version: _v, ...rest } = doc; out[key] = rest; continue; }
+      const fence = docs.get(key.slice(0, key.indexOf("/ledger/")) + "/upload-fences.json") as FenceDoc;
+      if (key.includes("/ledger/revisions/")) {
+        const kept = Object.entries(doc.records).filter(([, e]) => !entryForgotten(fence, doc.originId, e as any));
+        if (kept.length) out[key] = Object.fromEntries(kept);
+      } else if (key.includes("/ledger/owners/")) {
+        if (!isDeleted(fence, doc.originId, doc.source, doc.sessionId) && doc.epoch >= fenceEpoch(fence, doc.originId, sessionKeyHash(doc.source, doc.sessionId))) out[key] = doc;
+      } else out[key] = doc;
+    }
+    return out;
+  }
+
+  test("a full run while live, then a catch-up since before it began, converges to one full run over the final SQL state", async () => {
+    // Phase A's inputs: written before the full run began.
+    for (let i = 0; i < 8; i++) await rev(A, "origin-1", `a${i}`, 1, "claude", i < 4 ? "sess-1" : "sess-2");
+    await rev(B, "origin-1", "b0", 2, "codex", "sess-b");
+    await rev(C, "origin-3", "x0", 1, "claude", null);
+    await own(A, "origin-1", "claude", "sess-1");
+    await slot(A, "origin-1", "s0", A.userId, "claude", "sess-1", 2, hex("1"));
+    await slot(A, "origin-1", "s1", A.userId, "claude", "sess-2", 2, hex("2"));
+    await age();
+    // t: phase A's start minus a margin (the gate uses the FULL run's created_at minus BACKLOG_OPS_CATCHUP_MARGIN_MS).
+    const t = Date.now() - 60_000;
+    expect(Number((await db.query<{ n: string }>(`SELECT count(*)::text AS n FROM sessions.ingest_record_revisions
+      WHERE floor(extract(epoch FROM updated_at) * 1000) >= ${t}`)).rows[0]!.n)).toBe(0);
+
+    // Phase A, the FULL run while the org still uploads: a revision it already paged is upserted mid-run.
+    const phaseA = scratch();
+    let firstPage = false, bumped = false;
+    const live: BackfillSql = {
+      async query(text, params) {
+        const rows = (await db.query(text, params as unknown[])).rows as Record<string, unknown>[];
+        if (text.includes("FROM sessions.ingest_record_revisions") && text.includes("LIMIT $6")) firstPage = true;
+        if (text === "ROLLBACK" && firstPage && !bumped) {
+          bumped = true;
+          await db.exec("UPDATE sessions.ingest_record_revisions SET revision = 5, revision_id = 'a0:r5', updated_at = now() WHERE record_id = 'a0'");
+        }
+        return { rows };
+      },
+    };
+    const a = await backfillUploadFences({ sql: live, store: phaseA, keyRoot: ROOT, dryRun: false, sleep: async () => {}, rowPageSize: 3 });
+    expect(bumped).toBe(true);
+    expect(Object.values(a.sections)).toEqual(["complete", "complete", "complete"]);
+    expect((await entryOf(phaseA, A, "origin-1", "a0"))![0]).toBe(1); // phase A read a0 before the upsert
+
+    // Until the admission stop: more uploads, a custody move on a slot (no timestamp), a new ownership row, and a
+    // deletion (SQL's ingest_apply_selection forgets that session's revision and ownership rows).
+    await rev(A, "origin-1", "a8", 1, "claude", "sess-1");
+    await db.exec("UPDATE sessions.ingest_record_revisions SET revision = 3, revision_id = 'b0:r3', updated_at = now() WHERE record_id = 'b0'");
+    await db.exec("UPDATE sessions.ingest_lazy_native_slots SET current_revision = 7, current_digest = repeat('7', 64) WHERE record_id = 's0'");
+    await slot(A, "origin-1", "s2", A.userId, "claude", "sess-1", 1, hex("3"));
+    await own(B, "origin-1", "codex", "sess-b");
+    await del(A, "origin-1", "claude", "sess-2");
+    await db.exec("DELETE FROM sessions.ingest_record_revisions WHERE session_id = 'sess-2'");
+
+    const beforeCatchup = await logicalState(phaseA);
+    // Phase B, after the stop: the catch-up applies only what changed since t, but every fence, owner and slot.
+    const catchup = await run(phaseA, { revisionsSinceMs: t, rowPageSize: 3 });
+    expect(Object.values(catchup.sections)).toEqual(["complete", "complete", "complete"]);
+    expect(catchup.revisions.rows).toBe(3); // a0 (upserted during A), a8 (new), b0 (upserted after A)
+    expect(catchup.revisions.slot_rows).toBe(3);
+    expect(catchup.fences.pairs_added).toBe(1);
+
+    // One full run over the final SQL state.
+    const once = scratch();
+    const one = await run(once, { rowPageSize: 3 });
+    expect(Object.values(one.sections)).toEqual(["complete", "complete", "complete"]);
+    const [twoPhase, single] = [await logicalState(phaseA), await logicalState(once)];
+    expect(Object.keys(twoPhase).length).toBeGreaterThan(5);
+    expect(twoPhase).toEqual(single);
+    expect((await entryOf(phaseA, A, "origin-1", "a0"))![0]).toBe(5);
+    expect((await entryOf(phaseA, A, "origin-1", "s0"))![0]).toBe(7);
+    // Phase A alone differs from the single run (the comparison can tell).
+    expect(beforeCatchup).not.toEqual(single);
   });
 });

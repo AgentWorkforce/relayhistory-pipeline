@@ -153,7 +153,11 @@ schema drift lists.
      took effect (`http_admission_stopped` log lines, no new SQL admission for the org), run its fence,
      revision and ownership backfills, then write the marker. The stop comes first because the desktop falls
      back to the Worker's SQL-ledger POST on a direct-upload credential error; an SQL admission after the
-     backfills would be missing from the S3 index and owner stubs.
+     backfills would be missing from the S3 index and owner stubs. To keep the stop window short, the full
+     backfill may instead run while the org is still live, followed after the stop (and the queue drain) by
+     a catch-up: fences, ownership and owned lazy slots in full, plus only the revision rows updated since
+     the full run began (`backfill-catchup-execute`, docs/backlog-ops-workflow.md "The two-phase cutover").
+     Monotone merges make the two converge to one backfill after the stop.
   5. Widen, then set it to `on`.
 - **The Worker's HTTP path:** once direct uploads carry all traffic, the Worker's buffered SQL path is
   retired with it (0004, "Worker: retired last").

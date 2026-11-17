@@ -17,6 +17,10 @@
  * in the same stdin payload, {"dbUrl": ..., "session": ...}. The value is never printed, masked by an echoed command,
  * put in argv or written to the receipt; every other mode refuses a non-empty value.
  *
+ * A catch-up (backfill-catchup-*, or a drain's BACKFILL that is one) also reads BACKLOG_OPS_REVISIONS_SINCE_MS, the
+ * gate's step output t (FULL's created_at minus the margin; backlogOpsRevisionsSince), passes it as
+ * --revisions-since-ms, and refuses unless every bound catch-up receipt recorded the same t (it bound the same FULL).
+ *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
@@ -32,6 +36,7 @@ import {
   backlogOpsDispatch,
   backlogOpsPresenceSession,
   backlogOpsReceipt,
+  backlogOpsRevisionsSince,
   backlogOpsRole,
   backlogOpsScope,
   backlogOpsSessionName,
@@ -40,6 +45,7 @@ import {
   checkBoundReceipt,
   checkRefreshFingerprint,
   checkStsExpiration,
+  isCatchup,
   parseStsCredentials,
   refuseBacklogOps as refuse,
   type BacklogOpsDispatch,
@@ -73,7 +79,8 @@ export function backlogOpsChildSpawn(
   dbUrl: string | null,
   session: string | null = null,
 ) {
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, backlogOpsScope(env));
+  const since = isCatchup(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, backlogOpsScope(env), since);
   if (spec.needsDb !== (dbUrl !== null)) refuse("backlog_ops_db_binding");
   // The session reaches the presence tool, and only it, beside the URL on stdin.
   if ((d.mode === "presence-dry") !== (session !== null) || (session !== null && dbUrl === null)) refuse("backlog_ops_session_binding");
@@ -92,24 +99,36 @@ export function backlogOpsChildSpawn(
 
 /**
  * Every bound run's receipt, from the artifacts the workflow downloaded, before any credential: same org scope, the
- * binding's mode (a refresh only where the binding is one). With FULL, the refresh's input fingerprint must equal
- * FULL's (checkRefreshFingerprint, backlog_ops_backfill_stale).
+ * binding's mode (a refresh or a catch-up only where the binding is one). With FULL, the drain's refresh must carry
+ * FULL's input fingerprint (checkRefreshFingerprint, backlog_ops_backfill_stale); a catch-up (the drain's BACKFILL, or
+ * a catch-up execute's DRY) must have recorded the gate's t (`revisionsSinceMs`), so it bound the same FULL.
  */
-export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8")) {
+export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
+  revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)) {
   const paths = backlogOpsPaths(env), scope = backlogOpsScope(env).id;
   const raws: Partial<Record<string, string>> = {};
+  const modes: Partial<Record<string, string>> = {};
   for (const b of backlogOpsBindings(d)) {
     const path = paths.bound(b.kind);
     let raw: string;
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
-    // The drain's BACKFILL and FULL: exactly the drain's scope (never an unscoped run standing in for a scoped drain).
-    const exact = d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full");
-    checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact });
+    // The drain's BACKFILL and FULL, and a catch-up's FULL: exactly the run's scope (never an unscoped run standing in).
+    const exact = (d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full")) || (isCatchup(d.mode) && b.kind === "full");
+    // The drain's BACKFILL with FULL: a refresh or a catch-up, whichever the receipt says (the gate checked its run-name).
+    let mode = b.mode;
+    if (b.altMode !== undefined) {
+      try { if (JSON.parse(raw)?.mode === b.altMode) mode = b.altMode; } catch { /* checkBoundReceipt refuses it */ }
+    }
+    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact });
+    if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
+      refuse(`backlog_ops_bound_${b.kind}_since`);
     raws[b.kind] = raw;
+    modes[b.kind] = mode;
   }
-  if (d.fullBackfillRun !== null) {
+  if (d.mode === "drain-execute" && d.fullBackfillRun !== null) {
     if (raws.full === undefined || raws.backfill === undefined) refuse("backlog_ops_bound_full_missing");
-    checkRefreshFingerprint(raws.full, raws.backfill);
+    // A catch-up's fingerprint differs from FULL's by design (the org uploaded during FULL); it re-read what changed.
+    if (modes.backfill !== "backfill-catchup-execute") checkRefreshFingerprint(raws.full, raws.backfill);
   }
 }
 
@@ -179,8 +198,9 @@ export async function backlogOpsRun(
   const scope = backlogOpsScope(env);
   // GitHub masks the secret's whole value; mask each org too, so a tool line naming one org never shows it.
   for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope);
-  checkBoundReceipts(env, d);
+  const since = backlogOpsRevisionsSince(env, d);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null);
+  checkBoundReceipts(env, d, undefined, since);
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.

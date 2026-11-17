@@ -12,12 +12,16 @@
  *
  *   bun run scripts/upload-fence-backfill.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]
  *       [--section fences|ownership|revisions ...] [--page-size 500] [--row-page-size 5000] [--concurrency 4]
- *       [--statement-timeout-ms 30000]
+ *       [--statement-timeout-ms 30000] [--revisions-since-ms <epoch ms>]
  *   bun run scripts/upload-fence-backfill.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags]
  *
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing fences and
  * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
  * stubs, revision shard merges) and needs the owner's explicit OK. Rerunning is a no-op for what is there.
+ *
+ * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
+ * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full
+ * (src/session-ingest/upload-fence-backfill.ts header). The summary records it as `revisions_since_ms`.
  *
  * Output: one JSON line of counts only (never a tenant id, session id, key or URL), with each section's
  * completion (`sections.fences|ownership|revisions`: complete | incomplete | not_run), which the
@@ -48,9 +52,10 @@ export interface BackfillArgs {
   concurrency: number;
   statementTimeoutMs: number;
   kmsKeyArn?: string;
+  revisionsSinceMs?: number;
 }
 
-const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn"]);
+const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn", "--revisions-since-ms"]);
 const BOOL_FLAGS = new Set(["--dry-run", "--execute"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
@@ -92,9 +97,18 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
   const kmsKeyArn = one.get("--kms-key-arn");
   if (mode === "execute" && (kmsKeyArn === undefined || !KMS.test(kmsKeyArn))) throw new Error("--execute requires --kms-key-arn (the bucket's KMS key ARN)");
   if (mode === "dry_run" && kmsKeyArn !== undefined) throw new Error("--kms-key-arn is only for --execute");
+  const chosen = sections.length ? [...new Set(sections)] : [...BACKFILL_SECTIONS];
+  const sinceRaw = one.get("--revisions-since-ms");
+  let revisionsSinceMs: number | undefined;
+  if (sinceRaw !== undefined) {
+    if (!/^[1-9][0-9]{0,15}$/.test(sinceRaw) || !Number.isSafeInteger(Number(sinceRaw))) throw new Error("--revisions-since-ms must be a positive epoch ms");
+    if (!chosen.includes("revisions")) throw new Error("--revisions-since-ms needs the revisions section");
+    revisionsSinceMs = Number(sinceRaw);
+  }
   return {
-    mode, bucket, region, orgs, sections: sections.length ? [...new Set(sections)] : [...BACKFILL_SECTIONS], pageSize, rowPageSize, concurrency, statementTimeoutMs,
+    mode, bucket, region, orgs, sections: chosen, pageSize, rowPageSize, concurrency, statementTimeoutMs,
     ...(kmsKeyArn !== undefined ? { kmsKeyArn } : {}),
+    ...(revisionsSinceMs !== undefined ? { revisionsSinceMs } : {}),
   };
 }
 
@@ -127,7 +141,7 @@ if (import.meta.main) {
   try {
     args = parseBackfillArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -169,6 +183,7 @@ if (import.meta.main) {
       store, keyRoot: "96bulls", dryRun: args.mode === "dry_run",
       ...(args.orgs.length ? { orgs: args.orgs } : {}),
       sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
+      ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

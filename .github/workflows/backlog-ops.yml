@@ -9,7 +9,11 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # whose receipts are checked before any credential is read. The workflow never passes --checkpoint-file or
 # --start-after: a rerun is safe because the drain skips objects it already marked. backfill-refresh-dry/-execute run
 # the backfill's fences and ownership sections only; a drain may bind a fresh refresh beside the full backfill-execute
-# it refreshes (full_backfill_run) when the two receipts' input fingerprints are equal. The optional org scope is the
+# it refreshes (full_backfill_run) when the two receipts' input fingerprints are equal. backfill-catchup-dry/-execute
+# (the two-phase cutover's phase B) bind a full backfill-execute (full_backfill_run) and run all three sections, the
+# revisions only since t = that run's created_at minus a fixed margin, computed by the gate from the GitHub API (the
+# recheck step's output revisions_since_ms, never an input); a drain may bind a fresh catch-up beside its FULL as it
+# binds a refresh. The optional org scope is the
 # environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
 # empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
 # presence-dry is DRY ONLY (no presence-execute exists or is accepted): a counts-only look at ONE session for support
@@ -23,7 +27,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute]
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute]
         default: backfill-dry
         required: true
       sha:
@@ -43,7 +47,7 @@ on:
         type: string
         default: ""
       full_backfill_run:
-        description: drain-execute only, optional - the full backfill-execute (under 24h old) that backfill_run, then a backfill-refresh-execute, refreshes; empty otherwise
+        description: backfill-catchup-dry/-execute (required) - the full backfill-execute (under 24h old) the catch-up follows; drain-execute (optional) - the one backfill_run, then a refresh or catch-up execute, follows; empty otherwise
         type: string
         default: ""
       max_objects:
@@ -51,7 +55,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>]. Dry modes: empty'
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run>). Dry modes: empty'
         type: string
         default: ""
   pull_request:
@@ -169,6 +173,8 @@ jobs:
       - name: Install without credentials
         run: bun install --frozen-lockfile
       - name: Recheck live gates and the recorded environment approval
+        id: recheck
+        # Also writes revisions_since_ms (FULL's created_at minus the catch-up margin) whenever full_backfill_run is bound.
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/backlog-ops-github.ts --approved
@@ -190,8 +196,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.backfill_run }}
           github-token: ${{ github.token }}
-      - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run)
-        if: inputs.mode == 'drain-execute' && inputs.full_backfill_run != ''
+      - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run, backfill-catchup-*)
+        if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-')) && inputs.full_backfill_run != ''
         uses: actions/download-artifact@v4
         with:
           name: backlog-ops-receipt
@@ -225,6 +231,7 @@ jobs:
           BACKLOG_OPS_DRY_ROLE_ARN: ${{ vars.BACKLOG_OPS_DRY_ROLE_ARN }}
           BACKLOG_OPS_EXECUTE_ROLE_ARN: ${{ vars.BACKLOG_OPS_EXECUTE_ROLE_ARN }}
           BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}
+          BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}
         run: bun scripts/backlog-ops.ts
       - name: Publish the counts-only receipt
         if: always()
