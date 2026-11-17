@@ -40,6 +40,7 @@ import {
   assertDocument,
   assertPosition,
   assertQuery,
+  assertScanPage,
   assertScope,
   assertTenant,
   positionOf,
@@ -777,6 +778,38 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
       }
       const truncated = rows.length > options.limit;
       return { truncated, rows: rows.slice(0, options.limit) };
+    },
+
+    async scanFingerprintsPage(scope: SearchScope, options, context) {
+      assertScope(scope);
+      assertScanPage(options);
+      // scanFingerprints' query, sort and search_after, one page per call: limit + 1 hits to
+      // tell whether another page exists.
+      const a = options.after;
+      const hits = await search(
+        {
+          size: options.limit + 1,
+          track_total_hits: false,
+          _source: ["workspace_id", ...KEY_FIELDS, "fingerprint"],
+          query: { bool: { filter: [...scopeFilter(scope), { range: { ts_ms: { gte: options.fromMs } } }] } },
+          sort: sortClause("asc"),
+          ...(a ? { search_after: [a.tsMs, a.sessionId, a.source, a.machineId, a.kind, a.eventId] } : {}),
+        },
+        context,
+      );
+      const page = hits.slice(0, options.limit).map(
+        (s): SearchFingerprint => ({
+          tsMs: Number(s.ts_ms),
+          sessionId: s.session_id,
+          source: s.source,
+          machineId: s.machine_id,
+          kind: s.kind,
+          eventId: s.event_id,
+          workspaceId: s.workspace_id,
+          fingerprint: s.fingerprint,
+        }),
+      );
+      return hits.length > options.limit ? { rows: page, next: positionOf(page[page.length - 1]!) } : { rows: page };
     },
 
     async query(query: SearchQuery, context): Promise<SearchPage> {

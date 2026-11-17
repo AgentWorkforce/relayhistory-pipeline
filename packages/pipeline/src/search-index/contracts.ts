@@ -25,6 +25,8 @@ export const CONTENT_PREFIX_CHARS = 4096;
 export const MAX_QUERY_CHARS = 500;
 export const MAX_PAGE_LIMIT = 1000;
 export const MAX_UPSERT_BATCH = 5000;
+/** The most rows one scanFingerprintsPage call may ask for. */
+export const MAX_SCAN_PAGE = 5000;
 /**
  * The longest SearchQuery.excludeSessionIds list. Equals the read API's
  * PARTIAL_SESSIONS_CAP (src/session-read-api/queries.ts): the read API excludes
@@ -199,6 +201,21 @@ export interface SearchIndexAdapter {
     options: { readonly fromMs: number; readonly limit: number },
     context?: SearchCallContext,
   ): Promise<{ rows: readonly SearchFingerprint[]; truncated: boolean }>;
+  /**
+   * Optional: one keyset page of the rows scanFingerprints returns, in the same page
+   * order (tsMs, sessionId, source, machineId, kind, eventId ascending, code-point), so a
+   * caller can walk a scope of any size without holding a single bounded read. `limit`
+   * is 1..MAX_SCAN_PAGE. `after` is the last position of the previous page: the page
+   * starts strictly after it. `next` is present when another page may exist (it is the
+   * position of the last row returned; pass it back as `after`) and absent once the
+   * scope is exhausted. A row written or deleted between pages may or may not be seen;
+   * no row present for the whole walk is skipped or returned twice.
+   */
+  scanFingerprintsPage?(
+    scope: SearchScope,
+    options: { readonly fromMs: number; readonly limit: number; readonly after?: SearchPosition },
+    context?: SearchCallContext,
+  ): Promise<{ rows: readonly SearchFingerprint[]; next?: SearchPosition }>;
   query(query: SearchQuery, context?: SearchCallContext): Promise<SearchPage>;
   health(context?: SearchCallContext): Promise<SearchIndexHealth>;
 }
@@ -279,6 +296,14 @@ export function assertScope(scope: SearchScope): void {
   ) {
     throw new SearchIndexError("invalid_argument");
   }
+}
+
+/** The options of scanFingerprintsPage: a safe-integer floor, a page size in 1..MAX_SCAN_PAGE, a valid `after`. */
+export function assertScanPage(options: { readonly fromMs: number; readonly limit: number; readonly after?: SearchPosition }): void {
+  if (!options || !Number.isSafeInteger(options.fromMs) || !Number.isInteger(options.limit) || options.limit < 1 || options.limit > MAX_SCAN_PAGE) {
+    throw new SearchIndexError("invalid_argument");
+  }
+  if (options.after !== undefined) assertPosition(options.after);
 }
 
 export function assertQuery(query: SearchQuery): void {

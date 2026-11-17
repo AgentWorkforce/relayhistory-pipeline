@@ -43,6 +43,7 @@ import {
   assertDocument,
   assertPosition,
   assertQuery,
+  assertScanPage,
   assertScope,
   assertTenant,
   positionOf,
@@ -487,6 +488,39 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
           }),
         ),
       };
+    },
+
+    async scanFingerprintsPage(scope: SearchScope, options, context) {
+      assertScope(scope);
+      assertScanPage(options);
+      // scanFingerprints' predicate and order, one keyset page: (KEY) > (after) on the
+      // primary key's order, limit + 1 rows to tell whether another page exists.
+      const after = options.after;
+      const rows = await run<Row & { fingerprint: string }>(
+        `SELECT workspace_id, ${KEY}, fingerprint FROM ${table}
+          WHERE org_id = $1 AND workspace_id = $2 AND source = $3 AND session_id = ANY($4::text[]) AND ts_ms >= $5${
+            after ? ` AND (${KEY}) > ($7, $8, $9, $10, $11, $12)` : ""}
+          ORDER BY ${KEY} LIMIT $6`,
+        [
+          scope.orgId, scope.workspaceId, scope.source, [...scope.sessionIds], options.fromMs, options.limit + 1,
+          ...(after ? [after.tsMs, after.sessionId, after.source, after.machineId, after.kind, after.eventId] : []),
+        ],
+        context,
+        scope,
+      );
+      const page = rows.slice(0, options.limit).map(
+        (r): SearchFingerprint => ({
+          tsMs: Number(r.ts_ms),
+          sessionId: r.session_id,
+          source: r.source,
+          machineId: r.machine_id,
+          kind: r.kind,
+          eventId: r.event_id,
+          workspaceId: r.workspace_id,
+          fingerprint: r.fingerprint,
+        }),
+      );
+      return rows.length > options.limit ? { rows: page, next: positionOf(page[page.length - 1]!) } : { rows: page };
     },
 
     async query(query: SearchQuery, context): Promise<SearchPage> {

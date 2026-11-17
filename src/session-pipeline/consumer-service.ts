@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
-import { searchIndexLimitsFromEnv, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
+import { searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1154,6 +1154,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // undefined and the search deps carry no `stream`.
   const { stream: searchStream, notice: streamNotice } = searchIndexStreamStartup(env, searchLimits, config.outputFacts);
   if (streamNotice) log[streamNotice.level](streamNotice.message, { service: "session-pipeline-consumer", ...streamNotice.fields });
+  // SEARCH_INDEX_STAGED_RECONCILE_ENABLED, default off (Phase 3 slice 1; search-index.ts
+  // searchIndexStagedStartup): "true" needs streaming on and no output facts. Off returns
+  // undefined, logs nothing, and the search deps carry no `staged`.
+  const searchStaged = searchIndexStagedStartup(env, searchStream, config.outputFacts);
+  if (searchStaged) log.info(searchStaged.notice.message, { service: "session-pipeline-consumer", ...searchStaged.notice.fields });
   // Dormant never opens a database, so smuggled startup options there are
   // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);
@@ -1187,6 +1192,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     tenantRunner,
   );
 
+  // The staged reconcile walks the index in keyset pages: refuse an index without them now,
+  // not on the first scope.
+  if (searchStaged && typeof binding.index.scanFingerprintsPage !== "function")
+    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires a search index with paged scans");
   const raw = lockerStore();
   const reader = lockerManifestReader();
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: config.keyPrefix };
@@ -1226,6 +1235,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
     ...(Object.keys(searchLimits).length ? { limits: searchLimits } : {}),
     ...(searchStream ? { stream: searchStream } : {}),
+    ...(searchStaged ? { staged: searchStaged.staged } : {}),
     ...outputFactsDeps(config),
     ...(config.originLabels ? { originLabels: true as const } : {}),
   };

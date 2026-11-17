@@ -2,7 +2,7 @@
  * state is a separate explicit binding: an index alone cannot declare a partial
  * canonical read complete. No storage, clients or schema are created here. */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import { assertPosition, MAX_UPSERT_BATCH, type SearchIndexAdapter, type SearchEventDocument, type SearchTenant, type SearchFingerprint } from "@rhc/search-index/contracts.ts";
+import { assertPosition, comparePositions, MAX_SCAN_PAGE, MAX_UPSERT_BATCH, type SearchIndexAdapter, type SearchEventDocument, type SearchTenant, type SearchFingerprint, type SearchPosition } from "@rhc/search-index/contracts.ts";
 import type { IndexRow } from "./vendor/search-index/rows.ts";
 
 /** Minimal public service scope. Importing pointer.ts here would pull its
@@ -61,11 +61,65 @@ export interface SearchProjectionIo {
   remove(scope: SearchProjectionScope, positions: readonly SearchFingerprint[]): Promise<number>;
   erase(scope: SearchProjectionScope, canonicalId: string): Promise<void>;
   record(scope: SearchProjectionScope, revision: number, rows: number, complete: boolean, at: Date, canonicalId: string): Promise<void>;
+  /**
+   * The scope's in-window index identities in keyset pages of `pageSize`, in scan order,
+   * `between` awaited before each page after the first. Stops at `maxRows + 1` rows:
+   * `truncated` then, and the caller must not delete. Present on the ClickHouse io, and on
+   * the adapter io only when asked for (the staged reconcile, SEARCH_INDEX_STAGED_RECONCILE_ENABLED).
+   */
+  scanPages?(
+    scope: SearchProjectionScope,
+    canonicalId: string,
+    fromMs: number,
+    pageSize: number,
+    maxRows: number,
+    between: () => Promise<void>,
+  ): Promise<{ rows: SearchFingerprint[]; truncated: boolean }>;
 }
 
-export function adapterProjectionIo(binding: SearchServiceBinding, tx: SqlExecutor): SearchProjectionIo {
+/**
+ * `pagedScan` (the staged reconcile only) adds `scanPages` over the adapter's
+ * scanFingerprintsPage, and refuses an adapter without it. Absent: the io is exactly the
+ * one without paging.
+ */
+export function adapterProjectionIo(binding: SearchServiceBinding, tx: SqlExecutor, options?: { pagedScan: true }): SearchProjectionIo {
   const scopeFor = (scope: SearchProjectionScope, canonicalId: string) => ({ orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionIds: [...new Set([scope.sessionId, canonicalId])] });
+  const checkRow = (row: SearchFingerprint, scope: SearchProjectionScope, canonicalId: string, fromMs: number) => {
+    assertPosition(row);
+    if (row.workspaceId !== scope.workspaceId || row.source !== scope.harness || ![scope.sessionId, canonicalId].includes(row.sessionId) || row.tsMs < fromMs || typeof row.fingerprint !== "string") throw new Error("search scan scope invalid");
+  };
+  const paged: Pick<SearchProjectionIo, "scanPages"> = {};
+  if (options?.pagedScan) {
+    const page = binding.index.scanFingerprintsPage?.bind(binding.index);
+    if (!page) throw new Error("search paged scan unsupported by this index");
+    paged.scanPages = async (scope, canonicalId, fromMs, pageSize, maxRows, between) => {
+      if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_SCAN_PAGE || !Number.isSafeInteger(maxRows) || maxRows < 0)
+        throw new Error("search keyset scan bounds invalid");
+      const rows: SearchFingerprint[] = [];
+      let after: SearchPosition | undefined;
+      for (;;) {
+        if (after) await between();
+        const want = Math.min(pageSize, maxRows + 1 - rows.length);
+        const result = await page(scopeFor(scope, canonicalId), { fromMs, limit: want, ...(after ? { after } : {}) });
+        if (!result || !Array.isArray(result.rows) || result.rows.length > want) throw new Error("search scan result invalid");
+        for (const row of result.rows) {
+          checkRow(row, scope, canonicalId, fromMs);
+          // Strictly after the previous row: the walk always advances and never repeats a row.
+          const previous = rows[rows.length - 1] ?? after;
+          if (previous && comparePositions(previous, row) >= 0) throw new Error("search scan order invalid");
+          rows.push(row);
+        }
+        if (rows.length > maxRows) return { rows, truncated: true };
+        if (!result.next) return { rows, truncated: false };
+        if (result.rows.length === 0) throw new Error("search scan result invalid");
+        after = { ...result.next };
+        assertPosition(after);
+        if (comparePositions(after, rows[rows.length - 1]!) !== 0) throw new Error("search scan result invalid");
+      }
+    };
+  }
   return {
+    ...paged,
     async fromMs(at) {
       const value = await binding.state.fromMs(at);
       if (!Number.isSafeInteger(value) || value < 0) throw new Error("search coverage floor invalid");

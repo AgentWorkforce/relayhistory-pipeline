@@ -16,14 +16,18 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   CONTENT_PREFIX_CHARS,
   MAX_EXCLUDED_SESSIONS,
+  MAX_SCAN_PAGE,
   SearchIndexError,
   comparePositions,
   matchesQuery,
   positionOf,
   type SearchEventDocument,
+  type SearchFingerprint,
   type SearchHit,
   type SearchIndexAdapter,
+  type SearchPosition,
   type SearchQuery,
+  type SearchScope,
 } from "./contracts.js";
 import { planScopeReconcile } from "./reconcile.js";
 
@@ -78,6 +82,33 @@ async function allPages(adapter: SearchIndexAdapter, query: Omit<SearchQuery, "c
 }
 
 const key = (h: { eventId: string; tsMs: number }) => `${h.tsMs}:${h.eventId}`;
+
+/**
+ * Walks scanFingerprintsPage to the end, `between` awaited after each page that has a
+ * `next`. Returns the rows and the number of calls.
+ */
+async function walkPages(
+  adapter: SearchIndexAdapter,
+  scope: SearchScope,
+  fromMs: number,
+  limit: number,
+  between: (page: number) => Promise<void> = async () => {},
+): Promise<{ rows: SearchFingerprint[]; calls: number }> {
+  const rows: SearchFingerprint[] = [];
+  let after: SearchPosition | undefined;
+  for (let calls = 1; calls <= 10_000; calls++) {
+    const page = await adapter.scanFingerprintsPage!(scope, { fromMs, limit, ...(after ? { after } : {}) });
+    expect(page.rows.length).toBeLessThanOrEqual(limit);
+    rows.push(...page.rows);
+    if (!page.next) return { rows, calls };
+    // `next` is the last row served, so the walk always advances.
+    expect(page.rows.length).toBe(limit);
+    expect(page.next).toEqual(positionOf(page.rows[page.rows.length - 1]!));
+    after = page.next;
+    await between(calls);
+  }
+  throw new Error("page walk did not terminate");
+}
 
 export function searchIndexConformance(name: string, factory: () => Promise<ConformanceTarget>): void {
   describe(`SearchIndexAdapter conformance: ${name}`, () => {
@@ -322,6 +353,88 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
       const cut = await a.scanFingerprints(scope, { fromMs: 0, limit: 2 });
       expect(cut.truncated).toBe(true);
       expect(cut.rows).toHaveLength(2);
+    });
+
+    it("pages a fingerprint scan in scanFingerprints order: ts ties, alias session ids, the fromMs floor", async () => {
+      // Optional method: the staged reconcile requires it (SEARCH_INDEX_STAGED_RECONCILE_ENABLED).
+      if (!a.scanFingerprintsPage) return;
+      const org = `org-${rand()}`;
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const t = 1_767_225_600_000;
+      const docs: SearchEventDocument[] = [];
+      for (let i = 0; i < 17; i++)
+        docs.push(syntheticDoc({
+          orgId: org,
+          tsMs: t + (i % 3), // ties on ts across both session ids
+          sessionId: i % 2 ? "sess-alias" : "sess-a",
+          machineId: `m${i % 4}`,
+          kind: i % 5 ? "message" : "tool_call",
+          eventId: `p${String(i).padStart(2, "0")}`,
+          fingerprint: `fp${i}`,
+        }));
+      // Outside the scope (another session, source, workspace) and below the floor.
+      docs.push(syntheticDoc({ orgId: org, tsMs: t, sessionId: "other", eventId: "x-session" }));
+      docs.push(syntheticDoc({ orgId: org, tsMs: t, sessionId: "sess-a", source: "codex", eventId: "x-source" }));
+      docs.push(syntheticDoc({ orgId: org, tsMs: t, sessionId: "sess-a", workspaceId: "ws-b", eventId: "x-workspace" }));
+      docs.push(syntheticDoc({ orgId: org, tsMs: t - 1, sessionId: "sess-a", eventId: "x-floor" }));
+      await a.upsert(docs);
+      const scope = { ...tenant, source: "claude", sessionIds: ["sess-a", "sess-alias"] };
+      const whole = await a.scanFingerprints(scope, { fromMs: t, limit: 1000 });
+      expect(whole.truncated).toBe(false);
+      expect(whole.rows.map((r) => r.eventId).sort()).toEqual(docs.slice(0, 17).map((d) => d.eventId).sort());
+      expect([...whole.rows].sort(comparePositions)).toEqual(whole.rows);
+      for (const limit of [1, 2, 3, 5, 17, 100]) {
+        const walk = await walkPages(a, scope, t, limit);
+        expect(walk.rows, `limit=${limit}`).toEqual(whole.rows);
+        expect(walk.calls, `limit=${limit}`).toBe(Math.max(1, Math.ceil(17 / limit)));
+      }
+      // The floor is inclusive and applies on every page.
+      const floored = await walkPages(a, scope, t + 2, 2);
+      expect(floored.rows).toEqual(whole.rows.filter((r) => r.tsMs >= t + 2));
+      // Exhausted: a page after the last row is empty and has no next.
+      expect(await a.scanFingerprintsPage(scope, { fromMs: t, limit: 5, after: positionOf(whole.rows[whole.rows.length - 1]!) })).toEqual({ rows: [] });
+      // An empty scope is one empty page.
+      expect(await a.scanFingerprintsPage({ ...scope, sessionIds: ["none"] }, { fromMs: 0, limit: 5 })).toEqual({ rows: [] });
+    });
+
+    it("a fingerprint page walk skips no row present throughout when rows are deleted between pages", async () => {
+      if (!a.scanFingerprintsPage) return;
+      const org = `org-${rand()}`;
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const t = 1_767_225_600_000;
+      const docs = Array.from({ length: 12 }, (_, i) =>
+        syntheticDoc({ orgId: org, tsMs: t + Math.floor(i / 3), machineId: `m${i % 3}`, eventId: `d${String(i).padStart(2, "0")}` }));
+      await a.upsert(docs);
+      const scope = { ...tenant, source: "claude", sessionIds: ["sess-1"] };
+      const before = (await a.scanFingerprints(scope, { fromMs: 0, limit: 100 })).rows;
+      expect(before).toHaveLength(12);
+      // After the first page (rows 0..3): delete its last row (the walk's `after`) and a row two pages on.
+      const cursor = before[3]!;
+      const ahead = before[8]!;
+      const walk = await walkPages(a, scope, 0, 4, async (page) => {
+        if (page === 1) expect(await a.deleteEvents(tenant, [positionOf(cursor), positionOf(ahead)])).toEqual({ deleted: 2 });
+      });
+      const seen = walk.rows.map(key);
+      expect(new Set(seen).size).toBe(seen.length); // nothing twice
+      expect(seen).toEqual(before.filter((r) => r !== ahead).map(key)); // the cursor row was served before it went
+      expect((await a.scanFingerprints(scope, { fromMs: 0, limit: 100 })).rows).toHaveLength(10);
+    });
+
+    it("refuses an invalid fingerprint page request before touching the backend", async () => {
+      if (!a.scanFingerprintsPage) return;
+      const scope = { orgId: "org-x", workspaceId: "ws-a", source: "claude", sessionIds: ["s"] };
+      const bad = async (p: Promise<unknown>) => {
+        const error = await p.then(() => null, (e: unknown) => e);
+        expect(error).toBeInstanceOf(SearchIndexError);
+        expect((error as SearchIndexError).code).toBe("invalid_argument");
+      };
+      const at = { tsMs: 1, sessionId: "s", source: "claude", machineId: "m", kind: "message", eventId: "e" };
+      await bad(a.scanFingerprintsPage(scope, { fromMs: 0, limit: 0 }));
+      await bad(a.scanFingerprintsPage(scope, { fromMs: 0, limit: MAX_SCAN_PAGE + 1 }));
+      await bad(a.scanFingerprintsPage(scope, { fromMs: 0.5, limit: 1 }));
+      await bad(a.scanFingerprintsPage(scope, { fromMs: 0, limit: 1, after: { ...at, tsMs: 1.5 } }));
+      await bad(a.scanFingerprintsPage(scope, { fromMs: 0, limit: 1, after: { ...at, eventId: "" } }));
+      await bad(a.scanFingerprintsPage({ ...scope, sessionIds: [] }, { fromMs: 0, limit: 1 }));
     });
 
     it("converges a scope through planScopeReconcile (insert, change, move, retract)", async () => {

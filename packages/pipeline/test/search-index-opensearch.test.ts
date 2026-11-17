@@ -311,6 +311,37 @@ describe("opensearch adapter request shapes", () => {
     expect(JSON.parse(calls[0]!.body!).query.bool.filter).toContainEqual({ range: { ts_ms: { gte: 0 } } });
   });
 
+  it("pages a fingerprint scan one search_after request per call, with the scan's query and sort", async () => {
+    const row = (i: number) => ({ _source: { workspace_id: "ws-a", ts_ms: i, session_id: "s", source: "claude", machine_id: "m", kind: "k", event_id: `e${i}`, fingerprint: `f${i}` } });
+    const { calls, fetch } = fake((call) => {
+      const body = JSON.parse(call.body!);
+      const start = body.search_after ? body.search_after[0] + 1 : 0;
+      return json(200, { hits: { hits: Array.from({ length: Math.max(0, Math.min(body.size, 7 - start)) }, (_, i) => row(start + i)) } });
+    });
+    const a = createOpenSearchSearchIndex({ url: BASE, fetch });
+    const scope = { ...tenant, source: "claude", sessionIds: ["s", "s-alias"] };
+    const first = await a.scanFingerprintsPage!(scope, { fromMs: 3, limit: 3 });
+    expect(first.rows.map((r) => r.eventId)).toEqual(["e0", "e1", "e2"]);
+    expect(first.next).toEqual({ tsMs: 2, sessionId: "s", source: "claude", machineId: "m", kind: "k", eventId: "e2" });
+    const second = await a.scanFingerprintsPage!(scope, { fromMs: 3, limit: 3, after: first.next! });
+    expect(second.rows.map((r) => r.eventId)).toEqual(["e3", "e4", "e5"]);
+    const last = await a.scanFingerprintsPage!(scope, { fromMs: 3, limit: 3, after: second.next! });
+    expect(last).toEqual({ rows: [{ tsMs: 6, sessionId: "s", source: "claude", machineId: "m", kind: "k", eventId: "e6", workspaceId: "ws-a", fingerprint: "f6" }] });
+    const bodies = calls.map((c) => JSON.parse(c.body!));
+    expect(calls.map((c) => c.url)).toEqual(Array(3).fill(`${BASE}/${INDEX}/_search`));
+    expect(bodies.map((b) => b.size)).toEqual([4, 4, 4]);
+    expect(bodies[0].search_after).toBeUndefined();
+    expect(bodies[1].search_after).toEqual([2, "s", "claude", "m", "k", "e2"]);
+    // The same query, sort and source fields as scanFingerprints.
+    const scan = fake(() => json(200, { hits: { hits: [] } }));
+    await createOpenSearchSearchIndex({ url: BASE, fetch: scan.fetch }).scanFingerprints(scope, { fromMs: 3, limit: 3 });
+    const { size: _s, ...scanBody } = JSON.parse(scan.calls[0]!.body!);
+    const { size: _p, ...pageBody } = bodies[0];
+    expect(pageBody).toEqual(scanBody);
+    await rejects(a.scanFingerprintsPage!(scope, { fromMs: 0, limit: 0 }), "invalid_argument");
+    expect(calls).toHaveLength(3);
+  });
+
   it("rejects invalid tenants, scopes and queries before any request", async () => {
     const { calls, fetch } = fake(() => json(200, {}));
     const a = createOpenSearchSearchIndex({ url: BASE, fetch });

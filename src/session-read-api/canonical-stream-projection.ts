@@ -25,7 +25,9 @@
  * changes between passes stops it with `stream_source_changed`.
  *
  * Reads are metered across all passes (`StreamReadLimits`); past either budget
- * the scope stays partial with `scope_too_large` and the budget's code.
+ * the scope stays partial with `scope_too_large` and the budget's code. The staged
+ * reconcile (`StreamDeps.perPass`, SEARCH_INDEX_STAGED_RECONCILE_ENABLED) meters each
+ * pass on its own instead, and caps the records one pass keys in memory.
  */
 import { createHash } from "node:crypto";
 import {
@@ -78,7 +80,7 @@ import {
 type Json = Record<string, unknown>;
 const SEP = "\u001f";
 
-/** Read budgets summed over every pass of one scope. */
+/** Read budgets summed over every pass of one scope (per pass with `StreamDeps.perPass`). */
 export interface StreamReadLimits {
   maxReadBytes: number;
   maxReadEvents: number;
@@ -109,6 +111,20 @@ export interface StreamDeps {
    * Absent: no deadline, exactly as before.
    */
   deadline?: StreamDeadline;
+  /**
+   * The staged reconcile only (SEARCH_INDEX_STAGED_RECONCILE_ENABLED): each budget bounds one
+   * pass, not the sum of every pass, so a scope is refused when its size exceeds a budget
+   * (never four times its size), and a pass that reads more than `keyedRecordsCap` records
+   * (each keyed in memory, about 1 KB apiece) stops the stream with
+   * STREAM_KEYED_RECORDS_CAP. Absent: summed budgets, exactly as before.
+   */
+  perPass?: StreamPerPass;
+}
+
+/** StreamDeps.perPass: the staged reconcile's per-pass metering. */
+export interface StreamPerPass {
+  /** The most records one pass may read (and so key in memory). */
+  keyedRecordsCap: number;
 }
 
 /** A wall-clock bound on one streamed scope (SearchIndexDeps.streamDeadline). */
@@ -129,6 +145,8 @@ export const STREAM_READ_EVENTS_BUDGET = "stream_read_events_budget";
 /** The scope's wall-clock deadline passed (StreamDeps.deadline): partial like a spent budget. */
 export const STREAM_DEADLINE = "stream_deadline";
 export const STREAM_SOURCE_CHANGED = "stream_source_changed";
+/** The staged reconcile only: one pass reads more records than StreamPerPass.keyedRecordsCap. */
+export const STREAM_KEYED_RECORDS_CAP = "stream_keyed_records_cap";
 /**
  * Two surviving events share an index key (other than an activity event
  * replacing a direct line): the whole read keeps the later one in its list, which
@@ -140,7 +158,9 @@ export const STREAM_PASSES = 4;
 
 /** A read budget ran out: the scope stays `scope_too_large`, `budget` says which. */
 export class StreamBudgetError extends PipelineError {
-  constructor(readonly budget: typeof STREAM_READ_BYTES_BUDGET | typeof STREAM_READ_EVENTS_BUDGET | typeof STREAM_DEADLINE) {
+  constructor(
+    readonly budget: typeof STREAM_READ_BYTES_BUDGET | typeof STREAM_READ_EVENTS_BUDGET | typeof STREAM_DEADLINE | typeof STREAM_KEYED_RECORDS_CAP,
+  ) {
     super("scope_too_large", `the streaming read budget ran out (${budget})`, false);
   }
 }
@@ -170,32 +190,60 @@ export function streamIndexKey(i: { machineId: string; source: string; kind: str
     .slice(0, 22);
 }
 
-/** Meters the chunk reads of every pass against the budgets. */
+/**
+ * Meters the chunk reads of every pass against the budgets. `bytes`, `events`, `chunks` and
+ * `passes` are always summed over every pass (what the stream reports). Summed budgets by
+ * default; with `perPass` each budget is checked against the current pass's reads only
+ * (`passBytes`, `passEvents`), and a pass's records against the keyed-records cap.
+ */
 export class StreamReadMeter implements ChunkReadObserver {
   bytes = 0;
   events = 0;
   chunks = 0;
   passes = 0;
+  /** `perPass` only: what the current pass has read. */
+  passBytes = 0;
+  passEvents = 0;
   /**
    * The most any chunk check has asked for so far: bytes read before it plus its declared
-   * size. After pass 1 this bounds what the same chunk checks need in a later pass.
+   * size (before it in the same pass, with `perPass`). After pass 1 this bounds what the
+   * same chunk checks need in a later pass.
    */
   peak = 0;
-  constructor(readonly limits: StreamReadLimits, readonly deadline?: StreamDeadline) {}
+  constructor(readonly limits: StreamReadLimits, readonly deadline?: StreamDeadline, readonly perPass?: StreamPerPass) {}
+  /** A pass starts: counted, and with `perPass` its own reads start from zero. */
+  startPass(): void {
+    this.passes += 1;
+    if (this.perPass) {
+      this.passBytes = 0;
+      this.passEvents = 0;
+    }
+  }
   chunk(entry: Readonly<{ bytes: number; stored_raw_bytes?: number }>): void {
     // Between chunks, before this one is fetched: nothing of it is read or written.
     if (streamDeadlinePassed(this.deadline)) throw new StreamBudgetError(STREAM_DEADLINE);
-    const need = this.bytes + Math.max(entry.bytes, entry.stored_raw_bytes ?? 0);
+    const need = (this.perPass ? this.passBytes : this.bytes) + Math.max(entry.bytes, entry.stored_raw_bytes ?? 0);
     if (need > this.limits.maxReadBytes) throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
     if (need > this.peak) this.peak = need;
     this.chunks += 1;
   }
   decompressed(bytes: number): void {
     this.bytes += bytes;
+    if (this.perPass) {
+      this.passBytes += bytes;
+      if (this.passBytes > this.limits.maxReadBytes) throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
+      return;
+    }
     if (this.bytes > this.limits.maxReadBytes) throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
   }
   record(): void {
     this.events += 1;
+    if (this.perPass) {
+      this.passEvents += 1;
+      if (this.passEvents > this.limits.maxReadEvents) throw new StreamBudgetError(STREAM_READ_EVENTS_BUDGET);
+      if (this.passEvents > this.perPass.keyedRecordsCap) throw new StreamBudgetError(STREAM_KEYED_RECORDS_CAP);
+      return;
+    }
     if (this.events > this.limits.maxReadEvents) throw new StreamBudgetError(STREAM_READ_EVENTS_BUDGET);
   }
 }
@@ -266,7 +314,8 @@ export async function streamCanonicalScope(
   version: number,
   fromMs: number,
 ): Promise<StreamedScope> {
-  const meter = new StreamReadMeter(limits, deps.deadline);
+  const perPass = deps.perPass;
+  const meter = perPass ? new StreamReadMeter(limits, deps.deadline, perPass) : new StreamReadMeter(limits, deps.deadline);
   const prefix = deps.prefixFor(scope.orgId);
   const userIds = admitted.map(({ manifest }) => manifestUserId(manifest));
   const identities = admitted.map(({ manifest }) => canonicalManifestIdentity(manifest));
@@ -292,7 +341,7 @@ export async function streamCanonicalScope(
   });
 
   // The whole read refuses before reading what it cannot afford; so does this:
-  // every pass may read every chunk once.
+  // every pass may read every chunk once (with `perPass`, each pass on its own budget).
   const declaredBytes = admitted.reduce(
     (n, { manifest }) => n + manifest.raw.chunks.reduce((b, c) => b + Math.max(c.bytes, c.stored_raw_bytes ?? 0), 0),
     0,
@@ -301,12 +350,21 @@ export async function streamCanonicalScope(
     (n, { manifest }) => n + manifest.raw.chunks.reduce((b, c) => b + (c.records ?? 0), 0),
     0,
   );
-  const overBudget = (bytes: number, events: number) =>
-    bytes * STREAM_PASSES > limits.maxReadBytes
-      ? STREAM_READ_BYTES_BUDGET
-      : events * STREAM_PASSES > limits.maxReadEvents
-        ? STREAM_READ_EVENTS_BUDGET
-        : null;
+  const overBudget = perPass
+    ? (bytes: number, events: number) =>
+        bytes > limits.maxReadBytes
+          ? STREAM_READ_BYTES_BUDGET
+          : events > limits.maxReadEvents
+            ? STREAM_READ_EVENTS_BUDGET
+            : events > perPass.keyedRecordsCap
+              ? STREAM_KEYED_RECORDS_CAP
+              : null
+    : (bytes: number, events: number) =>
+        bytes * STREAM_PASSES > limits.maxReadBytes
+          ? STREAM_READ_BYTES_BUDGET
+          : events * STREAM_PASSES > limits.maxReadEvents
+            ? STREAM_READ_EVENTS_BUDGET
+            : null;
   const budgetStop = (budget: string) =>
     result({ partial: true, reasons: ["scope_too_large", budget] });
   const upFront = overBudget(declaredBytes, declaredEvents);
@@ -326,7 +384,7 @@ export async function streamCanonicalScope(
   }
 
   async function* read(): AsyncGenerator<{ part: number; record: RelayhistoryStreamRecord }> {
-    meter.passes += 1;
+    meter.startPass();
     for (let part = 0; part < admitted.length; part++) {
       const { manifest, key } = admitted[part]!;
       for await (const record of streamManifestRecords(
@@ -444,8 +502,14 @@ export async function streamCanonicalScope(
     // later pass checks every chunk's declared size against what was read before it, so the
     // last pass needs three passes' bytes plus pass 1's peak: a chunk declared larger than it
     // reads must not pass here and then stop pass 4 after some rows were written.
-    const actual =
-      meter.bytes * (STREAM_PASSES - 1) + Math.max(meter.bytes, meter.peak) > limits.maxReadBytes
+    // With `perPass` every later pass reads what pass 1 read, checked chunk by chunk against
+    // the same per-pass budget pass 1 already fit (its peak included), so pass 1's own reads
+    // decide it.
+    const actual = perPass
+      ? Math.max(meter.passBytes, meter.peak) > limits.maxReadBytes
+        ? STREAM_READ_BYTES_BUDGET
+        : overBudget(0, meter.passEvents)
+      : meter.bytes * (STREAM_PASSES - 1) + Math.max(meter.bytes, meter.peak) > limits.maxReadBytes
         ? STREAM_READ_BYTES_BUDGET
         : overBudget(0, meter.events);
     if (actual) return budgetStop(actual);
