@@ -122,7 +122,7 @@ describe("adopt identities: input", () => {
     const ledgerBucket = { bucket: "synthetic-ledger-bucket", keyRoot: "96bulls" };
     const L = "arn:aws:s3:::synthetic-ledger-bucket";
     const objects = `${L}/96bulls/.admission-inbox/*/ledger/*`, home = `${L}/96bulls/.ledger/fence-authority/.ledger-home.json`;
-    const listOk = { Effect: "Allow", Action: "s3:ListBucket", Resource: L, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" } } };
+    const listOk = { Effect: "Allow", Action: "s3:ListBucket", Resource: L };
     const roles = (read: Record<string, unknown>[], write: Record<string, unknown>[], ledger: unknown = ledgerBucket) => ({ backlogOpsRoles: {
       read: { inlinePolicies: { "backlog-ops-read": readPolicy, ...(read.length ? { ledger: { Version: "2012-10-17", Statement: read } } : {}) } },
       write: { inlinePolicies: { "backlog-ops-write": writePolicy, ...(write.length ? { ledger: { Version: "2012-10-17", Statement: write } } : {}) } },
@@ -133,8 +133,8 @@ describe("adopt identities: input", () => {
     it("renders exactly the documented grants: read Get + List, write also Put with no SSE condition; no Delete, no KMS", () => {
       expect(backlogOpsLedgerStatements("read", ledgerBucket)).toEqual([
         { Sid: "LedgerRead", Effect: "Allow", Action: "s3:GetObject", Resource: [objects, home] },
-        { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: L,
-          Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*", "96bulls/.ledger/fence-authority/.ledger-home.json"] } } },
+        // Unconditional: a missing key's GET is a 404 only with List for that request, and a GET has no s3:prefix.
+        { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: L },
       ]);
       const write = backlogOpsLedgerStatements("write", ledgerBucket);
       expect(write.slice(0, 2)).toEqual(backlogOpsLedgerStatements("read", ledgerBucket));
@@ -146,10 +146,8 @@ describe("adopt identities: input", () => {
       expect(checkRoles(roles(backlogOpsLedgerStatements("read", ledgerBucket), backlogOpsLedgerStatements("write", ledgerBucket)))).toBeDefined();
       // The input alone (no ledger statements pasted yet) is fine too: the roles are simply as before.
       expect(checkRoles(roles([], []))).toBeDefined();
-      // The marker's own key as an extra list prefix, beside the required tree (either order).
-      for (const prefix of [["96bulls/.ledger/fence-authority/.ledger-home.json", "96bulls/.admission-inbox/*"], ["96bulls/.admission-inbox/*", "96bulls/.ledger/fence-authority/.ledger-home.json"]])
-        expect(() => checkRoles(roles([{ ...listOk, Condition: { StringLike: { "s3:prefix": prefix } } }], []))).not.toThrow();
-      expect(() => checkRoles(roles([{ Effect: "Allow", Action: ["s3:GetObject"], Resource: home }, { ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*"] } } }],
+      expect(() => checkRoles(roles([{ ...listOk, Action: ["s3:ListBucket"], Resource: [L] }], []))).not.toThrow();
+      expect(() => checkRoles(roles([{ Effect: "Allow", Action: ["s3:GetObject"], Resource: home }, listOk],
         [{ Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [objects] }]))).not.toThrow();
     });
 
@@ -167,18 +165,16 @@ describe("adopt identities: input", () => {
         [{ Effect: "Allow", Action: "s3:GetObject", Resource: `${L}/96bulls/.ledger/fence-authority/*` }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
         [{ Effect: "Allow", Action: "s3:GetObject", Resource: [objects, `${bucketArn}/96bulls/*`] }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
         [{ Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::another-ledger/96bulls/.admission-inbox/*/ledger/*" }, /only on exactly/, ["read", "write"]],
-        [{ ...listOk, Condition: undefined }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/*" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*", "*"] } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" }, StringNotLike: { "s3:prefix": "x" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
         [{ ...listOk, Resource: [L, bucketArn] }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.ledger/fence-authority/*" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.ledger/*" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*", "96bulls/.admission-inbox/*"] } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": [] } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
-        // The marker alone: a missing shard or stub would read as a 403. The tree is required.
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.ledger/fence-authority/.ledger-home.json" } } }, /\(required\)/, ["read", "write"]],
-        [{ ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.ledger/fence-authority/.ledger-home.json"] } } }, /\(required\)/, ["read", "write"]],
+        // Any Condition on the ledger List is refused: a GET carries no s3:prefix, so missing keys would read as 403.
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" } } }, /takes no Condition: .*403/, ["read", "write"]],
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*", "96bulls/.ledger/fence-authority/.ledger-home.json"] } } }, /takes no Condition/, ["read", "write"]],
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "*" } } }, /takes no Condition/, ["read", "write"]],
+        [{ ...listOk, Condition: { Bool: { "aws:SecureTransport": "true" } } }, /takes no Condition/, ["read", "write"]],
+        [{ ...listOk, Condition: {} }, /takes no Condition/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:ListBucketVersions", Resource: L }, /may be allowed only/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:GetObjectVersion", Resource: objects }, /may be allowed only/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:DeleteObjectVersion", Resource: objects }, /may be allowed only/, ["read", "write"]],
         [{ ...listOk, Resource: `${L}/*` }, /ListBucket on the ledger bucket only/, ["read", "write"]],
         [{ Effect: "Allow", Action: "s3:PutObject", Resource: objects }, /read role may be allowed only/, ["read"]],
         [{ Effect: "Allow", Action: "s3:PutObject", Resource: home }, /PutObject on the ledger bucket only on exactly/, ["write"]],

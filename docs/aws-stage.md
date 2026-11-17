@@ -963,8 +963,9 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   "keyRoot": "96bulls" }` beside `read` and `write` (the relocated upload ledger, docs/backlog-ops-workflow.md "IAM"
   item 5) also admits exactly `backlogOpsLedgerStatements` on that bucket, each in a statement of its own: both roles
   `s3:GetObject` on `<root>/.admission-inbox/*/ledger/*` and on `<root>/.ledger/fence-authority/.ledger-home.json`
-  and `s3:ListBucket` on the bucket with `StringLike` `s3:prefix` exactly `<root>/.admission-inbox/*` (required) and
-  optionally `<root>/.ledger/fence-authority/.ledger-home.json` (a marker-only condition is refused); the writer
+  and `s3:ListBucket` on the bucket with no condition (S3 answers a GET of a missing key with 404 only when the caller
+  may List for that request, and a GET carries no `s3:prefix`, so any prefix condition makes a missing shard, stub or
+  marker a 403; any condition on it is refused); the writer
   also `s3:PutObject` on `<root>/.admission-inbox/*/ledger/*` with no `s3:x-amz-server-side-encryption` condition. No
   delete and no KMS action on it. The input renders nothing itself (the roles carry exactly the pasted live
   policies), so unset or set without the grants, every declaration is byte-identical. It is the identity side only:
