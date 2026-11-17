@@ -220,6 +220,14 @@ BEGIN
         ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE'),
         -- 20261105045030: the project-text index helper.
         ('sessions.session_directory_project_text(text,text,text)', 'EXECUTE'),
+        -- 20261105062110: the staged reconcile writers (SECURITY DEFINER, each checks the caller).
+        ('sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)', 'EXECUTE'),
+        ('sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)', 'EXECUTE'),
+        ('sessions.search_reconcile_advance_v1(bigint,uuid,text,text,text[],bigint,bigint,boolean)', 'EXECUTE'),
+        ('sessions.search_reconcile_diff_page_v1(bigint,uuid,text,text,integer,text)', 'EXECUTE'),
+        ('sessions.search_reconcile_finish_v1(bigint,uuid)', 'EXECUTE'),
+        ('sessions.search_reconcile_abandon_v1(bigint,uuid,text)', 'EXECUTE'),
+        ('sessions.search_reconcile_erase_scope_v1(text,text,text,text[])', 'EXECUTE'),
         -- 20261105045040: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
         ('sessions.output_facts_state(text,text,text,text[],text)', 'EXECUTE'),
         ('sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)', 'EXECUTE'),
@@ -285,6 +293,13 @@ BEGIN
         OR (p.pronamespace = to_regnamespace('sessions')
             AND p.oid::regprocedure::text IN (
               'sessions.ingest_operator_runtime_upsert(jsonb,text,text)',
+              'sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)',
+              'sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)',
+              'sessions.search_reconcile_advance_v1(bigint,uuid,text,text,text[],bigint,bigint,boolean)',
+              'sessions.search_reconcile_diff_page_v1(bigint,uuid,text,text,integer,text)',
+              'sessions.search_reconcile_finish_v1(bigint,uuid)',
+              'sessions.search_reconcile_abandon_v1(bigint,uuid,text)',
+              'sessions.search_reconcile_erase_scope_v1(text,text,text,text[])',
               'sessions.output_facts_state(text,text,text,text[],text)',
               'sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)',
               'sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)',
