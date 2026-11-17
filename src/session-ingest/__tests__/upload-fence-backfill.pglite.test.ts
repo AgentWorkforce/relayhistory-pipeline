@@ -291,29 +291,46 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await expect(run(store, { orgs: ["../x"] })).rejects.toThrow("backfill_org_invalid");
   });
 
-  test("org scope: lazy slots are read in heap block windows, every scoped slot exactly once, none of another org", async () => {
+  test("org scope: lazy slots are read once per org through the org index, every scoped slot exactly once, none of another org", async () => {
     const store = scratch();
     for (let i = 0; i < 150; i++) {
       await slot(i % 3 === 0 ? C : A, "origin-1", `w${String(i).padStart(4, "0")}`, i % 3 === 0 ? C.userId : A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
     }
-    const blocks = Number((await db.query<{ n: number }>("SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::int AS n")).rows[0]!.n);
-    expect(blocks).toBeGreaterThan(2); // the windows below really cross blocks
     const log: string[] = [];
     const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1 }, log);
     expect(summary.revisions).toMatchObject({ slot_rows: 100, slots_empty: 0, merged: 100, invalid: 0, failed: 0 });
     expect(summary.sections.revisions).toBe("complete");
-    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(blocks);
-    // Each window's transaction pins the heap read (never the org index once per window).
-    for (let i = 0; i < log.length; i++) if (log[i]!.includes("ctid >= $2::tid")) {
-      const tx = log.slice(log.lastIndexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", i), i);
-      expect(tx).toContain("SET LOCAL enable_indexscan = off");
-      expect(tx).toContain("SET LOCAL enable_bitmapscan = off");
-    }
-    expect(summary.ownership).toMatchObject({ rows: 100, registered: 100, failed: 0 }); // the slots' sessions, from the window pass
+    // No block walk for a scoped run under the cap: one cursor per org, inside one read-only transaction.
+    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(0);
+    const declare = log.findIndex((l) => l.includes("DECLARE backfill_slots"));
+    expect(declare).toBeGreaterThan(0);
+    const tx = log.slice(log.lastIndexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", declare), declare);
+    expect(tx).toContain("SHOW transaction_read_only");
+    expect(log.slice(declare).find((l) => l === "ROLLBACK" || l.startsWith("ROLLBACK"))).toBeDefined();
+    expect(summary.ownership).toMatchObject({ rows: 100, registered: 100, failed: 0 });
     expect(log.some((l) => l.includes("key_sha256 > $2::text"))).toBe(false);
     expect(await entryOf(store, A, "origin-1", "w0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await fenceOf(store, C)).toBeNull();
     await expect(run(store, { orgs: ["org-a"], slotWindowBlocks: 0 })).rejects.toThrow("backfill_slot_window_invalid");
+  });
+
+  test("org scope over the per-org cap: that org falls back to heap block windows, same result", async () => {
+    const store = scratch();
+    for (let i = 0; i < 150; i++) {
+      await slot(i % 3 === 0 ? C : A, "origin-1", `v${String(i).padStart(4, "0")}`, i % 3 === 0 ? C.userId : A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
+    }
+    const blocks = Number((await db.query<{ n: number }>("SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::int AS n")).rows[0]!.n);
+    const log: string[] = [];
+    const summary = await run(store, { orgs: ["org-a"], slotWindowBlocks: 1, slotOrgReadMaxRows: 10 }, log);
+    expect(summary.revisions).toMatchObject({ slot_rows: 100, slots_empty: 0, merged: 100, invalid: 0, failed: 0 });
+    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(blocks);
+    for (let i = 0; i < log.length; i++) if (log[i]!.includes("ctid >= $2::tid")) {
+      const tx = log.slice(log.lastIndexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", i), i);
+      expect(tx).toContain("SET LOCAL enable_indexscan = off");
+    }
+    expect(await entryOf(store, A, "origin-1", "v0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
+    expect(await fenceOf(store, C)).toBeNull();
+    await expect(run(store, { orgs: ["org-a"], slotOrgReadMaxRows: -1 })).rejects.toThrow("backfill_slot_org_max_invalid");
   });
 
   test("unscoped: lazy slots are read in heap block windows too, every slot of every org exactly once", async () => {

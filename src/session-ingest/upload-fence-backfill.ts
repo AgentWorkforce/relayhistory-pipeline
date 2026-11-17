@@ -87,6 +87,8 @@ export interface BackfillOptions {
   statementTimeoutMs?: number;
   /** Heap blocks per slot window, scoped or not (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
   slotWindowBlocks?: number;
+  /** A scoped run's per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the block walk. */
+  slotOrgReadMaxRows?: number;
   /**
    * Revision entries buffered across pages and windows before one merge pass (default MERGE_BUFFER_ENTRIES): each
    * shard is read and written once per pass, not once per page or window.
@@ -256,6 +258,18 @@ const SLOTS_WINDOW = `
 SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
 FROM sessions.ingest_lazy_native_slots
 WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND ctid >= $2::tid AND ctid < $3::tid`;
+/**
+ * A scoped run's slots, one org at a time through ingest_lazy_native_slots' org_id index in ONE short read-only
+ * transaction (a server-side cursor fetched to the end before any S3 work, so no snapshot outlives the read). A keyset
+ * page over key_sha256 re-sorts the whole org on every page, and the block walk reads the whole heap for any scope.
+ */
+const SLOTS_ORG_CURSOR = `
+DECLARE backfill_slots NO SCROLL CURSOR FOR
+SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
+FROM sessions.ingest_lazy_native_slots WHERE org_id = $1::text`;
+const SLOTS_ORG_FETCH = `FETCH FORWARD 5000 FROM backfill_slots`;
+/** Above this many slots in one org the org-scoped read falls back to the block walk (bounded memory). */
+export const SLOTS_ORG_READ_MAX_ROWS = 2_000_000;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
@@ -407,6 +421,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const statementTimeoutMs = opts.statementTimeoutMs ?? 30_000;
   const slotWindow = opts.slotWindowBlocks ?? SLOT_WINDOW_BLOCKS;
   if (!Number.isInteger(slotWindow) || slotWindow < 1 || slotWindow > 1_048_576) throw new Error("backfill_slot_window_invalid");
+  const slotOrgMax = opts.slotOrgReadMaxRows ?? SLOTS_ORG_READ_MAX_ROWS;
+  if (!Number.isInteger(slotOrgMax) || slotOrgMax < 0) throw new Error("backfill_slot_org_max_invalid");
   const mergeBuffer = opts.mergeBufferEntries ?? MERGE_BUFFER_ENTRIES;
   if (!Number.isInteger(mergeBuffer) || mergeBuffer < 1 || mergeBuffer > 50_000_000) throw new Error("backfill_merge_buffer_invalid");
   const sections = new Set(opts.sections ?? BACKFILL_SECTIONS);
@@ -469,6 +485,29 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     }
   }
   const readOnly = async (query: string, params: unknown[]) => (await readOnlyAll([[query, params]]))[0]!;
+  /** One org's slots via SLOTS_ORG_CURSOR in one read-only transaction; null when over SLOTS_ORG_READ_MAX_ROWS. */
+  function readOnlySlotsOfOrg(org: string): Promise<Record<string, unknown>[] | null> {
+    const run = txTail.then(async () => {
+      await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      try {
+        const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
+        if (ro !== "on") throw new Error("backfill_not_read_only");
+        await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+        await sql.query(SLOTS_ORG_CURSOR, [org]);
+        const out: Record<string, unknown>[] = [];
+        for (;;) {
+          const rows = (await sql.query(SLOTS_ORG_FETCH)).rows;
+          if (rows.length === 0) return out;
+          for (const r of rows) out.push(r);
+          if (out.length > slotOrgMax) return null;
+        }
+      } finally {
+        await sql.query("ROLLBACK").catch(() => {});
+      }
+    });
+    txTail = run.catch(() => {});
+    return run;
+  }
 
   /** A failure's code for the receipt: the error's own short code, lowercased; never its message. */
   const failureCode = (error: unknown): string => {
@@ -796,11 +835,23 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await add(slotBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
       }
     };
-    // Block windows (SLOTS_WINDOW), scoped or not: a TID range reads the heap in order, where keyset paging on
-    // key_sha256 cost about 21 s a page on production's tens of millions of slots. The heap's size is re-read in each
-    // window's snapshot so growth is followed.
-    for (let block = 0; ; block += slotWindow) {
-      const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs ?? null, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
+    // A scoped run reads each org's slots once through the org index (SLOTS_ORG_CURSOR): seconds for an org with a few
+    // hundred thousand slots, where the block walk reads the whole multi-GB heap. An org above SLOTS_ORG_READ_MAX_ROWS,
+    // or the all-orgs scope, uses the block walk below.
+    let walkOrgs: string[] | null = orgs ?? null;
+    if (orgs && orgs.length > 0) {
+      walkOrgs = [];
+      for (const org of orgs) {
+        const rows = await readOnlySlotsOfOrg(org);
+        if (rows === null) { walkOrgs.push(org); continue; }
+        for (let i = 0; i < rows.length; i += 5000) await slotRows(rows.slice(i, i + 5000));
+      }
+    }
+    // Block windows (SLOTS_WINDOW): a TID range reads the heap in order, where keyset paging on key_sha256 cost about
+    // 21 s a page on production's tens of millions of slots. The heap's size is re-read in each window's snapshot so
+    // growth is followed.
+    for (let block = 0; walkOrgs === null || walkOrgs.length > 0; block += slotWindow) {
+      const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [walkOrgs, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
       const blocks = int(size![0]?.blocks);
       if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
       await slotRows(rows!);

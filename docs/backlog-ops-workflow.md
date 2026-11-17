@@ -88,9 +88,11 @@ the catch-up leave the same ledger, as readers see it, as one full run after the
 **Cost.** No index serves `updated_at` (the primary key and the session index both lead with the org), so the catch-up
 still walks the scope's `ingest_record_revisions` primary key in keyset windows of `--row-page-size` rows (each page
 returns its matching rows and its last key, so a window with no match still advances); only the S3 work (fence reads
-and shard compare-and-swaps) shrinks to the changed rows. The owned-slot pass is a full heap read as in every run,
-and its merges of what is already stored read each shard once and write nothing. Expect the SQL reads of a FULL run
-and the S3 writes of the changes only.
+and shard compare-and-swaps) shrinks to the changed rows. In a scoped run the owned slots are read once per org
+through the `org_id` index (one short read-only transaction with a server-side cursor fetched to the end before any S3
+work; measured about 6 s for an org with ~270k slots on a 48 GB heap), and their merges of what is already stored read
+each shard once and write nothing. Expect seconds to minutes of SQL for a wave-sized scope plus the S3 writes of the
+changes.
 
 **Receipts and bindings.** The catch-up's receipt must show all three sections `complete`, `failed` 0 in each, and
 `revisions_since_ms` (a number) equal to the gate's t; a catch-up execute's DRY must have recorded the same t, so
@@ -175,8 +177,9 @@ the sorted list).
   backfill (for example an all-orgs pre-warm) says nothing about a scoped org's admission stop or freshness, so it
   can never satisfy a scoped drain. A receipt from before scoping counts as unscoped. So change the secret only between complete
   sequences, and set it on both environments to the same value.
-- Every backfill, scoped or unscoped, reads `ingest_lazy_native_slots` in heap block windows (one sequential pass)
-  instead of walking the primary key, which fetched every slot at random. A slot rewritten during the pass can be
+- An unscoped backfill reads `ingest_lazy_native_slots` in heap block windows (one sequential pass) instead of walking
+  the primary key, which fetched every slot at random. A scoped one reads each org once through the `org_id` index
+  (`SLOTS_ORG_CURSOR`); an org above `SLOTS_ORG_READ_MAX_ROWS` (2M slots, bounded memory) falls back to the windows. A slot rewritten during the pass can be
   missed, so run a scoped backfill-execute after the scope's HTTP admission stop (decision 0005's cutover order).
 - An unscoped backfill run while orgs still admit (a pre-warm) certifies no org that was not stopped before it
   began. Each org's cutover takes its own scoped backfill-execute after its stop.
