@@ -93,6 +93,7 @@ import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
+import { ADVISORIES_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
@@ -254,6 +255,12 @@ export interface ReadApiDeps {
   digest?: DigestNarrativeDeps & { backend?: DigestBackend };
   /** READ_API_COORDINATION_OVERLAPS_ENABLED=true: on-request deterministic findings. */
   coordination?: { enabled: boolean; backend?: CoordinationBackend };
+  /**
+   * READ_API_COORDINATION_ADVISORIES_ENABLED=true (coordination-advisories.ts): GET
+   * /v1/coordination/advisories and POST /v1/coordination/advisories/:advisoryId/ack. Absent or not
+   * enabled: both answer 501 `advisories_disabled` and nothing is read or written.
+   */
+  coordinationAdvisories?: { enabled: boolean; source: AdvisoriesSource };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -437,6 +444,11 @@ class HttpError extends Error {
 const unsupported = (reason: string, details: readonly string[] = []) =>
   new HttpError(501, "unsupported_by_backend", `not served by this backend: ${reason}`, reason, details);
 const bad = (message: string) => new HttpError(400, "bad_request", message);
+
+/** POST /v1/coordination/advisories/:advisoryId/ack, exact; the self-host service reads its body. */
+export const ADVISORY_ACK_PATH = /^\/v1\/coordination\/advisories\/[^/]+\/ack$/u;
+/** The ack body is {"source","sessionId"}; anything larger is refused before it is parsed. */
+export const ADVISORY_ACK_MAX_BODY_BYTES = 8 * 1024;
 
 /**
  * `origin` on /v1/events: only events this label wrote (message-origin.ts), e.g.
@@ -629,8 +641,10 @@ export function createReadApi(deps: ReadApiDeps) {
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
-          c.header("Access-Control-Allow-Methods", "GET");
-          c.header("Access-Control-Allow-Headers", "authorization, x-correlation-id");
+          // The advisory ack is the one CORS POST, and only while its routes are enabled.
+          const ackPost = deps.coordinationAdvisories?.enabled === true && ADVISORY_ACK_PATH.test(c.req.path);
+          c.header("Access-Control-Allow-Methods", ackPost ? "GET, POST" : "GET");
+          c.header("Access-Control-Allow-Headers", ackPost ? "authorization, content-type, x-correlation-id" : "authorization, x-correlation-id");
           c.header("Access-Control-Max-Age", "600");
         }
         return c.body(null, 204);
@@ -1860,6 +1874,73 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /**
+   * Live coordination advisories, pull side (docs/coordination-live-advisories.md). The workspace
+   * comes from the verified identity; `source` and `sessionId` select the recipient's rows. The GET
+   * serves pending or delivered rows (oldest first, at most 10); the ack is the only write.
+   */
+  const advisoriesDisabled = (c: Context) => c.json({ error: "advisories_disabled" }, 501);
+  const recipientOf = (identity: VerifiedIdentity, source: unknown, sessionId: unknown) => {
+    if (typeof source !== "string" || source === "" || source.length > 64) throw bad("source must be given exactly once");
+    if (typeof sessionId !== "string" || sessionId === "" || sessionId.length > 256) throw bad("sessionId must be given exactly once");
+    return { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+  };
+  const exactlyOnce = (c: Context, name: string) => {
+    const all = c.req.queries(name);
+    if (!all || all.length !== 1) throw bad(`${name} must be given exactly once`);
+    return all[0];
+  };
+
+  app.get("/v1/coordination/advisories", async (c) => {
+    const advisories = deps.coordinationAdvisories;
+    if (advisories?.enabled !== true) return advisoriesDisabled(c);
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "coordination");
+      rejectUnsupported(c);
+      const recipient = recipientOf(identity, exactlyOnce(c, "source"), exactlyOnce(c, "sessionId"));
+      const status = single(c, "status") ?? "pending";
+      if (status !== "pending") throw bad("status must be pending");
+      const rows = await advisories.source.pending(recipient);
+      log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
+      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map(advisoryItem), nextCursor: null });
+    } catch (error) {
+      return fail(c, error);
+    }
+  });
+
+  app.post("/v1/coordination/advisories/:advisoryId/ack",
+    bodyLimit({ maxSize: ADVISORY_ACK_MAX_BODY_BYTES, onError: (c) => c.json({ error: { code: "body_too_large", message: "body is too large" }, correlationId: c.get("correlationId") }, 413) }),
+    async (c) => {
+      const advisories = deps.coordinationAdvisories;
+      if (advisories?.enabled !== true) return advisoriesDisabled(c);
+      try {
+        const identity = c.get("identity");
+        attestWorkspace(c, identity);
+        requireCanary(identity, "coordination");
+        rejectUnsupported(c);
+        const advisoryId = c.req.param("advisoryId");
+        if (!/^[0-9a-f]{16,64}$/u.test(advisoryId)) throw new HttpError(404, "not_found", "advisory not found");
+        let body: unknown;
+        try {
+          body = await c.req.json();
+        } catch {
+          throw bad("body must be JSON");
+        }
+        if (typeof body !== "object" || body === null || Array.isArray(body)) throw bad("body must be a JSON object");
+        const { source, sessionId, ...rest } = body as Record<string, unknown>;
+        if (Object.keys(rest).length > 0) throw bad("body accepts source and sessionId only");
+        const recipient = recipientOf(identity, source, sessionId);
+        // 404 whether the id is unknown or belongs to another recipient: nothing is disclosed.
+        if (!(await advisories.source.ack(recipient, advisoryId))) throw new HttpError(404, "not_found", "advisory not found");
+        log({ route: c.req.routePath, reason: "coordination_advisory_acked", correlation_id: c.get("correlationId") });
+        return c.body(null, 204);
+      } catch (error) {
+        return fail(c, error);
+      }
+    });
 
   // Babysitter evidence (Neon GET /v1/delivery/records parity for session_lineage /
   // turn_receipt; babysitter-evidence.ts). Tenant from the verified identity, as Neon's
