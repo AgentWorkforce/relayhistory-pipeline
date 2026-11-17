@@ -729,9 +729,14 @@ What `s3` requires and changes:
   its layout pair, in `LOCKER_BUCKET`) after the SQL fence and before it answers; a store failure is a 503 that
   Control retries. Every admission path (synchronous, async consumer, direct-upload promotion) HEADs the tombstones
   after the claim and before any write and refuses 409 `operator_session_erased`; a store error fails closed (503).
-  Set it on every ingest process of the deployment, the async ones too: they have no SQL erase fence. Still refused
-  with `s3`: `SESSION_ERASE_BYTES_ENABLED`, session selection, upload consent and whole-user erase (follow-ups);
-  `on` also refuses `INGEST_LEDGER_LOG_COMMIT=on` and `INGEST_LEDGER=sql`. Tombstones are never deleted (no
+  An erase refused `too_many_owners` (the owner cap; the SQL fence is kept) writes the tombstones too.
+  Set it on **every** ingest process on the same store, the async consumers and promotion too: they have no SQL erase
+  fence, and a process started without the flag does not read the tombstones, so it fails open. Each `s3` process
+  without the flag logs `S3 erase fence off: operator erase tombstones are not checked by this process` at startup;
+  enforcing the flag across processes is a follow-up. Still refused with `s3`: `SESSION_ERASE_BYTES_ENABLED`,
+  session selection, upload consent and whole-user erase (follow-ups); `on` also refuses
+  `INGEST_LEDGER_LOG_COMMIT=on` (log appends bypass the check) and `INGEST_LEDGER=sql`. Not covered: the hosted
+  upload-admission Lambda (`upload-admission-hosted.ts`). Tombstones are never deleted (no
   un-erase). Residual: a claim in another process that passed its tombstone check just before the write can still
   land that batch, the same kind of cross-process obligation as the SQL fence's; alias session ids only SQL knows
   are fenced by the SQL guard in the erase process only. Off: no guard, no write, bytes unchanged.

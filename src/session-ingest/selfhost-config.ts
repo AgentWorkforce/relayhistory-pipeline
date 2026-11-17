@@ -118,7 +118,9 @@
  *                                    (SESSION_ERASE_API_ENABLED + SESSION_ERASE_FENCE_ENFORCED): the erase route writes
  *                                    create-only S3 tombstones after the SQL fence and before it answers (503 if it
  *                                    cannot), and every admission path refuses a tombstoned session 409
- *                                    operator_session_erased (s3-erase-fence.ts). Set it on the async processes too.
+ *                                    operator_session_erased (s3-erase-fence.ts). Set it on EVERY process on the
+ *                                    store (async consumers and promotion too): one without it fails open (a startup
+ *                                    warning is logged when s3 runs with it off). Not the hosted Lambda.
  *                                    Still refused on s3: SESSION_ERASE_BYTES_ENABLED, selection, consent, whole-user
  *                                    erase. Tombstones are never deleted. Residual: a claim in another process past
  *                                    its tombstone HEAD before the write can still land (as the SQL cross-process one).

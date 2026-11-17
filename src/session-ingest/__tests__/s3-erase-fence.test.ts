@@ -15,7 +15,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { objectKey, ObjectStoreError, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { ARTIFACT_KEYS, type EraseKey } from "../../session-erase/receipt.ts";
+import { ARTIFACT_KEYS, SessionEraseServiceError, type EraseKey } from "../../session-erase/receipt.ts";
 import type { SessionWriteGuard } from "../../session-erase/runtime.ts";
 import { SYNC_SCOPE, type IngestIdentity } from "../app.ts";
 import { fenceAuthorityKey } from "../ledger-s3.ts";
@@ -42,13 +42,19 @@ const json = async (store: ObjectStore, key: string) => JSON.parse(new TextDecod
 /** The SQL erase ledger, in memory: begin records the fence and answers an in_progress receipt. */
 function fakeSqlErase() {
   const erased = new Set<string>();
+  const overCap = new Set<string>();
   const calls: EraseKey[] = [];
   const id = (k: EraseKey) => JSON.stringify([k.orgId, k.workspaceId, k.source, k.sessionId]);
   const receipt = (k: EraseKey, requestId: string) => ({ ...k, requestId, status: "in_progress", requestedAt: new Date(T0).toISOString(), completedAt: null,
     unreadable: true, unreadableAt: new Date(T0).toISOString(), bytesErased: false, bytesErasedAt: null, uploadsFenced: true, legacyScope: "excluded",
     artifacts: Object.fromEntries(ARTIFACT_KEYS.map(a => [a, { count: 0, state: "pending" }])), failure: null });
   const service: SessionEraseService = {
-    async erase(key, request) { calls.push(key); erased.add(id(key)); return receipt(key, request.requestId); },
+    async erase(key, request) {
+      calls.push(key); erased.add(id(key));
+      // The owner cap (RH010 at the fence step): the SQL fence and a failed receipt are kept, the begin throws.
+      if (overCap.has(id(key))) throw new SessionEraseServiceError("too_many_owners");
+      return receipt(key, request.requestId);
+    },
     async receipt(key) { return erased.has(id(key)) ? receipt(key, "req") : null; },
   };
   /** The SQL write guard, in memory: refuses a pair fenced in SQL (`fence` adds one only SQL knows, an alias). */
@@ -59,7 +65,7 @@ function fakeSqlErase() {
       throw Object.assign(new (await import("../vendor/delivery/delivery-contracts.ts")).DeliveryError("operator_session_erased", 409, "sql"), {});
     return work();
   };
-  return { service, guard, calls, guardCalls, fence: (k: EraseKey) => erased.add(id(k)) };
+  return { service, guard, calls, guardCalls, fence: (k: EraseKey) => erased.add(id(k)), overCap: (k: EraseKey) => overCap.add(id(k)) };
 }
 
 /** sha256 of the bytes, with the ledger's random claim token (ledger-s3.ts newToken, a UUID per claim) masked. */
@@ -212,6 +218,45 @@ describe("INGEST_S3_ERASE_FENCE=on fails closed", () => {
     expect(new Set(e.puts.filter(p => p.startsWith(TOMBSTONES))).size).toBe(1);
   });
 
+  test("a partial tombstone write (the first pair written, the second fails): 503; the retry completes it, idempotently", async () => {
+    const e = edge({ fence: true });
+    await writeAuthority(e.base);
+    // "sess:1" has two pairs (canonical and the physical "sess_1"); fail only the physical one.
+    const physical = sessionEraseTombstoneKey(ROOT, TENANT, "claude", "sess_1");
+    e.failWhen((op, k) => /^put/i.test(op) && k === physical);
+    const failed = await e.erase("sess:1");
+    expect(failed.status).toBe(503);
+    expect(await exists(e.base, sessionEraseTombstoneKey(ROOT, TENANT, "claude", "sess:1"))).toBe(true);
+    expect(await exists(e.base, physical)).toBe(false);
+    e.failWhen(undefined);
+    expect((await e.erase("sess:1")).status).toBe(202);
+    expect((await e.erase("sess:1")).status).toBe(202);
+    expect(await exists(e.base, physical)).toBe(true);
+    expect(new Set(e.puts.filter(p => p.startsWith(TOMBSTONES)).map(p => p.split(" ")[0])).size).toBe(2);
+    const refused = await e.post("batch-1", "r1", "sess_1");
+    expect([refused.status, await errorCode(refused)]).toEqual([409, "operator_session_erased"]);
+  });
+
+  test("too_many_owners (the SQL fence is kept, contract section 7): the tombstones are written, the 503 is unchanged, and uploads stay refused", async () => {
+    const e = edge({ fence: true });
+    await writeAuthority(e.base);
+    e.sql!.overCap(key("sess-1"));
+    const capped = await e.erase("sess-1");
+    expect(capped.status).toBe(503);
+    expect(JSON.stringify(await capped.json())).toContain("too_many_owners");
+    expect(await exists(e.base, sessionEraseTombstoneKey(ROOT, TENANT, "claude", "sess-1"))).toBe(true);
+    // Another process (no SQL fence) refuses the session from the tombstone alone.
+    const other = edge({ fence: true, base: e.base, sql: null });
+    const refused = await other.post("batch-1", "r1", "sess-1");
+    expect([refused.status, await errorCode(refused)]).toEqual([409, "operator_session_erased"]);
+    // A tombstone write failure on that path is a 503 unavailable (retried), never a silent too_many_owners.
+    e.sql!.overCap(key("sess-2"));
+    e.failWhen((op, k) => /^put/i.test(op) && k.startsWith(TOMBSTONES));
+    const failed = await e.erase("sess-2");
+    expect(failed.status).toBe(503);
+    expect(await failed.json()).toEqual({ error: "unavailable", feature: "session_erase" });
+  });
+
   test("a tombstone read failure: 503, nothing written; a later read admits", async () => {
     const e = edge({ fence: true });
     await writeAuthority(e.base);
@@ -237,6 +282,13 @@ describe("INGEST_S3_ERASE_FENCE off (the default): unchanged", () => {
     expect(() => selfhostIngestRuntime({ ...base, s3EraseFence: true, uploadConsent: "enforce" }, parts)).toThrow(/INGEST_LEDGER=s3 refuses SQL-only features/);
     expect(() => selfhostIngestRuntime({ ...base, ledger: undefined, s3EraseFence: true }, parts)).toThrow(/INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3/);
     expect(() => selfhostIngestRuntime({ ...base, s3EraseFence: true, ledgerLogCommit: "on" }, parts)).toThrow(/INGEST_S3_ERASE_FENCE=on refuses INGEST_LEDGER_LOG_COMMIT=on/);
+  });
+
+  test("an s3 process without the flag logs that it does not check the tombstones; with the flag, no such line", () => {
+    const off = edge({ fence: false, sql: null });
+    expect(off.logged).toContainEqual({ ledger: "s3", s3_erase_fence: "off" });
+    const on = edge({ fence: true, sql: null });
+    expect(on.logged.some(f => f.s3_erase_fence === "off")).toBe(false);
   });
 
   test("no tombstone is read or written, and the writes are byte-identical to the flag on with no erase", async () => {
@@ -300,6 +352,10 @@ describe("INGEST_S3_ERASE_FENCE config (selfhost-config.ts)", () => {
     expect(() => selfhostIngestConfig({ ...on, RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true" })).toThrow(/INGEST_LEDGER=s3 refuses RELAYHISTORY_SELFHOST_SESSION_SELECTION/);
     expect(() => selfhostIngestConfig({ ...on, INGEST_UPLOAD_CONSENT: "enforce" })).toThrow(/INGEST_LEDGER=s3 refuses INGEST_UPLOAD_CONSENT/);
     expect(() => selfhostIngestConfig({ ...on, INGEST_LEDGER: "sql" })).toThrow(/INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3/);
+    // INGEST_LEDGER unset or empty is the sql default: refused the same way.
+    const { INGEST_LEDGER: _unset, ...noLedger } = on;
+    expect(() => selfhostIngestConfig(noLedger)).toThrow(/INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3/);
+    expect(() => selfhostIngestConfig({ ...on, INGEST_LEDGER: "" })).toThrow(/INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3/);
     expect(() => selfhostIngestConfig({ ...on, INGEST_LEDGER_LOG_COMMIT: "on" })).toThrow(/INGEST_S3_ERASE_FENCE=on refuses INGEST_LEDGER_LOG_COMMIT=on/);
   });
 });
