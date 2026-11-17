@@ -96,7 +96,7 @@ describe("preserve the deployed Reader profile", () => {
     await expect(resolveProfile(env, template, get(withBinding({ name: "CLICKHOUSE_DATABASE", type: "secret_text" })))).rejects.toThrow(/replacing secret binding CLICKHOUSE_DATABASE/);
   });
   test("brief_summary / list_short_summary: off renders no var, on is the exact \"true\" --var, and a dispatch never silently drops a live one", async () => {
-    for (const [key, name] of [["BRIEF_SUMMARY", "READ_API_BRIEF_SUMMARY_ENABLED"], ["LIST_SHORT_SUMMARY", "READ_API_LIST_SHORT_SUMMARY_ENABLED"], ["SUMMARY_FALLBACK", "READ_API_SUMMARY_FALLBACK_ENABLED"], ["SUMMARY_SEARCH", "READ_API_SUMMARY_SEARCH_ENABLED"], ["RELAYFACTS", "READ_API_RELAYFACTS_ENABLED"]] as const) {
+    for (const [key, name] of [["BRIEF_SUMMARY", "READ_API_BRIEF_SUMMARY_ENABLED"], ["LIST_SHORT_SUMMARY", "READ_API_LIST_SHORT_SUMMARY_ENABLED"], ["SUMMARY_FALLBACK", "READ_API_SUMMARY_FALLBACK_ENABLED"], ["SUMMARY_SEARCH", "READ_API_SUMMARY_SEARCH_ENABLED"], ["RELAYFACTS", "READ_API_RELAYFACTS_ENABLED"], ["SESSION_SOURCES", "READ_API_SESSION_SOURCES_ENABLED"]] as const) {
       // Not live and off (the default dispatch, or no input): unchanged.
       for (const flag of [undefined, "", "off"]) await expect(resolveProfile({ ...env, [key]: flag }, template, get()), `${key}=${flag}`).resolves.toHaveProperty("OWNER_BUFFERED", "on");
       // Not live and on: a new variable, not a collateral change.

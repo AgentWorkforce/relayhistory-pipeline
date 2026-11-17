@@ -372,4 +372,56 @@ Deploy (Khaliq's call): `summary_fallback=on` (only with `brief_summary=on`) add
 secrets with GetObject on the summary objects. Not preserved from live, like the other
 summary inputs. The self-host service and the hosted Lambda do not wire the fallback.
 
+### `GET /v1/sessions/:sessionId/sources` contract (`READ_API_SESSION_SOURCES_ENABLED`, default off)
+
+For a caller that holds a session id without its harness (Cloud resolving an id the iPad sends
+without a `source`): the distinct harnesses that hold a **live** pointer row for the id in the
+token's org and the attested workspace. Query: `workspace` only (required, the token's); any other
+parameter is a 501 `param_<name>`. No paging, one indexed statement
+(`src/session-read-api/session-sources.ts`).
+
+```json
+{"sessionId":"<the id>","sources":[]}
+{"sessionId":"<the id>","sources":["claude"]}
+{"sessionId":"<the id>","sources":["claude","codex"]}
+```
+
+- `sources` is deduplicated and sorted by name, at most 16 entries (more is never expected; an id
+  under more harnesses lists the first 16 and is ambiguous either way).
+- `[]` = **unknown here**, a 200 like an empty directory page, not a 404: the id has no live row in
+  this workspace (never published, erased, or owner-buffered only). Exactly one entry = the source
+  is proven. Two or more = ambiguous. The caller decides only on exactly one.
+- Live = `deleted_at IS NULL` on `sessions.session_index`, exactly the rows the directory, timing
+  and turns routes read. An erased session (every pointer tombstoned) has none, so it answers
+  `[]`. The id matches the source RelayHistory id (`canonical_session_id`, NULL meaning
+  `session_id`) or the physical `session_id`, as the timing and turns pointer reads match it.
+  With the self-host operator erase fence configured (`SESSION_ERASE_FENCE_ENFORCED`), a fenced
+  source is dropped.
+- Owner-buffered (unpublished) sessions have no pointer row and are never listed, even for their
+  owner. This matches the list's "canonical wins" rule: the list hides a buffered session whose id
+  has a live pointer under any harness, so whenever `sources` is non-empty it names exactly the
+  sessions the list shows for the id; a buffered-only id answers `[]` (unknown).
+
+Order of refusals, so nothing about another workspace is revealed: no or bad bearer 401 (and 403
+without `rth:read`); flag off 501 `sources_not_configured`; `workspace=` absent 501 `org_scope`,
+repeated 400, not the token's 403; off the directory canary allowlist
+(`READ_API_DIRECTORY_WORKSPACES`) 501 `directory_workspace_not_enabled`; an unknown parameter 501
+`param_<name>`; an id over 512 characters 400 `bad_request`. Then the read: a row outside the
+tenant 500, a database failure 503 `backend_unavailable`. Every 501 uses the standard
+`{"error":{"code":"unsupported_by_backend","message":"...","reason":"<reason>"},"correlationId":"..."}`
+envelope. (Self-host with the operator erase fence on: that fence's middleware attests the
+workspace for every `/v1/sessions/:sessionId/*` path first, so a mismatch there is the 403 even
+with the flag off.)
+
+Data path: the `bulls96_read_api` role's existing column SELECT on `sessions.session_index`
+(`org_id, workspace_id, harness, session_id, deleted_at, canonical_session_id`;
+`supabase/bootstrap/session_read_api_role.sql`) under its tenant RLS policy, in the request's
+tenant-bound READ ONLY transaction. No new function, grant or migration.
+
+Wiring: every entry enables it only on the exact string `true` (the Worker, the hosted Lambda and
+the self-host service). Worker deploy (Khaliq's call): `session_sources=on` adds
+`--var READ_API_SESSION_SOURCES_ENABLED:true`; off (the default) renders no variable. Not
+preserved from live, like the summary inputs: once on, a later dispatch must repeat it, or the
+live-settings guard refuses the dispatch.
+
 **Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.

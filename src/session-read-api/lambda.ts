@@ -54,6 +54,9 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * READ_API_RELAYFACTS_ENABLED (exactly "true", either entry) serves GET /v1/relayfacts
  * and /v1/relayfacts/:topic (migration 20261105062080); otherwise both are 501
  * `relayfacts_disabled`.
+ * READ_API_SESSION_SOURCES_ENABLED (exactly "true", either entry) serves GET
+ * /v1/sessions/:sessionId/sources (session-sources.ts, the read role's existing session_index
+ * columns); otherwise 501 `sources_not_configured`.
  * READ_API_SEARCH_PARTIAL_SESSIONS (self-host service only; unset/""/"refuse" here, "skip"
  * fails startup on this entry, see searchSkipsPartialSessions).
  *
@@ -72,6 +75,7 @@ import { PIPELINE_RUNTIMES, validateAdapterEnv } from "@rhc/adapters/registry.ts
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
+import { sqlSessionSources } from "./session-sources.ts";
 import { sqlBriefTitles } from "./brief-titles.ts";
 import {
   READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT,
@@ -86,7 +90,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
@@ -713,6 +717,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(exactTrueFlag(env[READ_API_RELAYFACTS_ENABLED]) ? { relayfacts: sqlRelayfacts(poolTenantRunner(pool as never)) } : {}),
     ...(listShortSummary ? { listShortSummary: true } : {}),
     ...(summarySearch ? { summarySearch: true } : {}),
+    ...(exactTrueFlag(env[READ_API_SESSION_SOURCES_ENABLED]) ? { sessionSources: sqlSessionSources(poolTenantRunner(pool as never)) } : {}),
     ...(messageOrigin ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
