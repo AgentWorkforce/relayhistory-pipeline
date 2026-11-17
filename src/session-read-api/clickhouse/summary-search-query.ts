@@ -73,7 +73,7 @@ export function buildSummarySearchQuery(database: string, input: SummarySearchIn
   const params: QueryParams = { org: input.orgId, ws: input.workspaceId, qf: foldSummaryText(input.q), n: input.limit + 1, cap: SUMMARY_SEARCH_MAX_CANDIDATES };
   const tenant = "org_id = {org:String} AND workspace_id = {ws:String}";
   const branch = (column: "summary_folded" | "title_folded") =>
-    `SELECT source, session_id FROM ${table} WHERE ${tenant} AND hasAllTokens(${column}, {qf:String}) AND position(${column}, {qf:String}) > 0 ORDER BY last_activity_at DESC LIMIT {cap:UInt32}`;
+    `SELECT source, session_id FROM ${table} WHERE ${tenant} AND hasAllTokens(${column}, {qf:String}) AND position(${column}, {qf:String}) > 0 ORDER BY last_activity_at DESC, source DESC, session_id DESC LIMIT {cap:UInt32}`;
   const newest = `SELECT source, session_id, deleted, title_folded, summary_folded, last_activity_at FROM ${table}
 WHERE ${tenant}
   AND (source, session_id) IN (SELECT source, session_id FROM (${branch("summary_folded")}) UNION ALL SELECT source, session_id FROM (${branch("title_folded")}))
