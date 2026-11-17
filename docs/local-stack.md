@@ -266,6 +266,38 @@ FAIL, on a build where that route still answers 501).
 courier pipeline (AlleyOop, indexer, referee, Bob Costas), and asserts every piece
 of the pipeline on its own line: [pipeline-e2e.md](pipeline-e2e.md).
 
+## Local Postgres TLS in two commands
+
+The services refuse plaintext Postgres and trust only an explicitly pinned CA
+(`src/shared/postgres-tls.ts`). For a single-user local stack, mint a throwaway
+CA and server certificate (needs `openssl`; the CA key is deleted on exit, so
+rerun into a new directory to rotate):
+
+```sh
+bun scripts/selfhost-local-ca.ts --out .96bulls/pg-tls   # default --host db --host localhost --host 127.0.0.1 --days 825
+```
+
+It writes `ca.crt`, `server.crt` and `server.key` (0600), refuses a non-empty
+`--out`, and prints one line, `SESSION_POSTGRES_CA_SHA256=<hex>`. Give every
+service `SESSION_POSTGRES_TLS_PROFILE=custom-ca`,
+`SESSION_POSTGRES_CA_FILE=<path to ca.crt as the service sees it>` and that
+printed `SESSION_POSTGRES_CA_SHA256`. Then start Postgres with TLS on, copying
+the key in as the `postgres` user first, because Postgres refuses a key it does
+not own (as in `e2e/selfhost/compose.yaml`):
+
+```sh
+docker run -d --name rh-db -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=... \
+  -v "$PWD/.96bulls/pg-tls:/certs:ro" --entrypoint sh postgres:17 -c '
+  install -o postgres -g postgres -m 0600 /certs/server.key /var/lib/postgresql/server.key &&
+  install -o postgres -g postgres -m 0644 /certs/server.crt /var/lib/postgresql/server.crt &&
+  exec docker-entrypoint.sh postgres -c ssl=on \
+    -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key'
+psql "host=localhost user=postgres sslmode=verify-full sslrootcert=.96bulls/pg-tls/ca.crt"
+```
+
+Use `sslmode=verify-full` so `psql` checks the chain and host name, too. The
+services strip URL `sslmode` and always verify. `.96bulls/` is gitignored.
+
 ## Ports and credentials
 
 Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and

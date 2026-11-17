@@ -33,6 +33,7 @@
     "e2e/pipeline",
     "src/types/*.d.ts",
     "scripts/proof-buffer-gc.ts",
+    "scripts/selfhost-local-ca.ts",
     "scripts/sync-ingest-buffer-gc-boundary.ts",
     "scripts/session-ingest-seed.ts",
     "scripts/proof-ingest-s3-seed.ts",
