@@ -64,13 +64,14 @@ test("the operator's scan is 041000's lazy_begin loop verbatim, and the allowlis
 });
 
 test("dormant: plan and admit refuse while ORG_ADMISSION_REPAIR_ENABLED is false; readback is allowed", async () => {
-  expect(ORG_ADMISSION_REPAIR_ENABLED).toBe(false);
+  // Enabled for the 2026-11-17 repair window; the dormant path is pinned with an explicit enabled=false.
+  expect(typeof ORG_ADMISSION_REPAIR_ENABLED).toBe("boolean");
   const env = (mode: string, extra: Record<string, string> = {}) =>
     ({ ORG_REPAIR_MODE: mode, ORG_REPAIR_SHA: F.sha, ORG_REPAIR_ORGS: "org-a", ...extra });
-  expect(await code(() => orgAdmissionRepairDispatch(env("plan")))).toBe("org_admission_repair_dormant");
-  expect(await code(() => orgAdmissionRepairDispatch(env("admit", { ORG_REPAIR_PLAN_RUN: F.planRun, ORG_REPAIR_CONFIRMATION: "ADMIT-ORGS x" }))))
+  expect(await code(() => orgAdmissionRepairDispatch(env("plan"), false))).toBe("org_admission_repair_dormant");
+  expect(await code(() => orgAdmissionRepairDispatch(env("admit", { ORG_REPAIR_PLAN_RUN: F.planRun, ORG_REPAIR_CONFIRMATION: "ADMIT-ORGS x" }), false)))
     .toBe("org_admission_repair_dormant");
-  expect(orgAdmissionRepairDispatch(env("readback")).mode).toBe("readback");
+  expect(orgAdmissionRepairDispatch(env("readback"), false).mode).toBe("readback");
   const f = await fixture();
   expect(await code(() => f.op("plan", { enabled: false }))).toBe("org_admission_repair_dormant");
   expect((await f.op("readback", { enabled: false })).receipt).toMatchObject({ status: "ORG_ADMISSION_REPAIR_READBACK", drift: null, committed: false });

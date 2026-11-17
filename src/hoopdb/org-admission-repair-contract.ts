@@ -8,7 +8,7 @@
  * committed), and the policy, generation, scan and ledger proof are captured by a `plan` run and carried in
  * its artifact.
  */
-export const ORG_ADMISSION_REPAIR_ENABLED: boolean = false;
+export const ORG_ADMISSION_REPAIR_ENABLED: boolean = true;
 
 /**
  * The only ingest_/upload_ tables whose rows for an org may be adopted by a repair admission. Exactly the

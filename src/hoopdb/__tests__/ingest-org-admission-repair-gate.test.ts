@@ -66,7 +66,8 @@ const gate = (e: Record<string, string>, f: Fixture, enabled = true) =>
   code(() => orgAdmissionRepairGithubGate(e, githubGet(f), true, { enabled }));
 
 test("dormant gate: plan and admit refuse while disabled; readback passes every gate", async () => {
-  expect(ORG_ADMISSION_REPAIR_ENABLED).toBe(false);
+  // Enabled for the 2026-11-17 repair window; the dormant path is pinned with an explicit enabled=false.
+  expect(typeof ORG_ADMISSION_REPAIR_ENABLED).toBe("boolean");
   expect(await gate(env("plan"), githubFixture(), false)).toBe("org_admission_repair_dormant");
   expect(await gate(admitEnv, githubFixture(), false)).toBe("org_admission_repair_dormant");
   expect(await gate(env("readback"), githubFixture(), false)).toBeNull();
