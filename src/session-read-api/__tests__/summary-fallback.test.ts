@@ -113,8 +113,9 @@ describe("pointerSummaryFallback: decryption with a test keyring", () => {
 
   test("an object under another workspace's key, or another kind's object at this key, never opens", async () => {
     const f = await fixture();
+    // Metadata claims this kind, revision and key id but the tag fails: a key/integrity failure, not empty.
     await f.write(record(), { ids: { orgId: "org_1", workspaceId: "ws_other" } });
-    expect(await f.fallback.read(scope, "long")).toBeNull();
+    expect(await reason(f.fallback.read(scope, "long"))).toBe("decrypt_failed");
     const g = await fixture();
     // A short record written at the long key: the AAD binds the kind.
     await g.write(record({ kind: "short" }), { kind: "long" });
@@ -125,6 +126,26 @@ describe("pointerSummaryFallback: decryption with a test keyring", () => {
     const f = await fixture();
     await f.write(record(), { ring: await masterKeyring(parseMasterKeys(`k9:${HEX_B}`)) });
     expect(await reason(f.fallback.read(scope, "long"))).toBe("unavailable");
+  });
+
+  test("a key id held with other bytes than the writer's is decrypt_failed (503), not empty; a stale revision stays empty", async () => {
+    const f = await fixture();
+    // Written under k1 with other master bytes; the deployment holds k1 = HEX_A.
+    await f.write(record(), { ring: await masterKeyring(parseMasterKeys(`k1:${HEX_B}`)) });
+    expect(await reason(f.fallback.read(scope, "long"))).toBe("decrypt_failed");
+    // Tampered ciphertext under the right key at the pointer's revision: the same failure.
+    const g = await fixture();
+    const key = await g.write(record());
+    const stored = await g.store.getObject(key as never);
+    const body = JSON.parse(await new Response(stored.body).text());
+    const ct = Uint8Array.from(atob(body.ct), (ch) => ch.charCodeAt(0)); ct[0] = ct[0]! ^ 1;
+    body.ct = btoa(String.fromCharCode(...ct));
+    await g.store.put(key as never, new TextEncoder().encode(JSON.stringify(body)), { metadata: Object.fromEntries(Object.entries(stored.meta.metadata).filter(([k]) => k.startsWith("summary-"))) });
+    expect(await reason(g.fallback.read(scope, "long"))).toBe("decrypt_failed");
+    // The wrong key at an older revision is indistinguishable from stale: still empty, as before.
+    const h = await fixture();
+    await h.write(record({ revision: 3 }), { ring: await masterKeyring(parseMasterKeys(`k1:${HEX_B}`)) });
+    expect(await h.fallback.read(scope, "long")).toBeNull();
   });
 
   test("no live pointer (erased/tombstoned/unknown) or several physical rows: nothing served, no object read", async () => {
@@ -194,12 +215,14 @@ function api(opts: { rows?: BriefSummaryRow[] | null; briefError?: unknown; fall
       return v ? { ...v, kind } : null;
     },
   };
+  const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: async (t) => { if (t !== "good") throw new AuthError(401, "invalid_token", "invalid"); return id; },
+    log: (fields) => logs.push(fields),
     ch: { database: "x" } as never, liveness: memoryLiveness().liveness, completeSinceMs: 0, directoryWorkspaces: new Set(["w"]), briefSummary,
     ...(opts.fallback === false ? {} : { summaryFallback }),
   });
-  return { order, get: (q = "kind=short", token = "good") => app.request(`/v1/sessions/s/summary?workspace=w&source=codex&${q}`, { headers: token ? { authorization: `Bearer ${token}` } : {} }) };
+  return { order, logs, get: (q = "kind=short", token = "good") => app.request(`/v1/sessions/s/summary?workspace=w&source=codex&${q}`, { headers: token ? { authorization: `Bearer ${token}` } : {} }) };
 }
 
 describe("GET /v1/sessions/:id/summary with the fallback", () => {
@@ -257,7 +280,19 @@ describe("GET /v1/sessions/:id/summary with the fallback", () => {
     const nc = await api({ rows: [], fallback: new SummaryFallbackError("not_configured") }).get();
     expect(nc.status).toBe(501);
     expect(JSON.stringify(await nc.json())).toContain("summary_fallback_not_configured");
-    for (const r of ["pointer_invalid", "parse", "unavailable"] as const) expect((await api({ rows: [], fallback: new SummaryFallbackError(r) }).get()).status).toBe(503);
+    for (const r of ["pointer_invalid", "parse", "unavailable"] as const) {
+      const a = api({ rows: [], fallback: new SummaryFallbackError(r) });
+      const res = await a.get();
+      expect(res.status).toBe(503);
+      expect((await res.json()).error).toEqual({ code: "backend_unavailable", message: "read backend unavailable" });
+      // One structured line, the reason code only.
+      expect(a.logs.filter((l) => l.status === 503 && "reason" in l)).toEqual([{ route: "/v1/sessions/:sessionId/summary", reason: `summary_fallback_${r}`, status: 503, correlation_id: expect.any(String) }]);
+    }
+    const d = api({ rows: [], fallback: new SummaryFallbackError("decrypt_failed") });
+    const res = await d.get("kind=long");
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toEqual({ code: "backend_unavailable", message: "read backend unavailable", reason: "summary_decrypt_failed" });
+    expect(d.logs.filter((l) => l.status === 503 && "reason" in l)).toEqual([{ route: "/v1/sessions/:sessionId/summary", reason: "summary_decrypt_failed", status: 503, correlation_id: expect.any(String) }]);
   });
 
   test("flag on: auth, unknown kinds and extra params refuse before any read", async () => {

@@ -31,6 +31,12 @@ export const SUMMARY_SEARCH_MIN_CHARS = 3;
 /** Page size bound: every candidate is hydrated through one directory call (its 1..200 keys). */
 export const SUMMARY_SEARCH_MAX_LIMIT = 50;
 export const SUMMARY_SEARCH_DEFAULT_LIMIT = 20;
+/**
+ * Bound on each column branch of the candidate subquery (any version, newest activity first), so
+ * a very common q never materialises an unbounded key set for the IN. Past it the search is
+ * best-effort like the rest of the route: older matches may be missed.
+ */
+export const SUMMARY_SEARCH_MAX_CANDIDATES = 5_000;
 
 export interface SummarySearchInput {
   orgId: string;
@@ -64,13 +70,13 @@ export function summaryMatches(row: { title: string | null; short_summary: strin
  */
 export function buildSummarySearchQuery(database: string, input: SummarySearchInput): Built {
   const table = qualifiedTable(database, BRIEF_DOCUMENTS_TABLE);
-  const params: QueryParams = { org: input.orgId, ws: input.workspaceId, qf: foldSummaryText(input.q), n: input.limit + 1 };
+  const params: QueryParams = { org: input.orgId, ws: input.workspaceId, qf: foldSummaryText(input.q), n: input.limit + 1, cap: SUMMARY_SEARCH_MAX_CANDIDATES };
   const tenant = "org_id = {org:String} AND workspace_id = {ws:String}";
   const branch = (column: "summary_folded" | "title_folded") =>
-    `SELECT source, session_id FROM ${table} WHERE ${tenant} AND hasAllTokens(${column}, {qf:String}) AND position(${column}, {qf:String}) > 0`;
+    `SELECT source, session_id FROM ${table} WHERE ${tenant} AND hasAllTokens(${column}, {qf:String}) AND position(${column}, {qf:String}) > 0 ORDER BY last_activity_at DESC LIMIT {cap:UInt32}`;
   const newest = `SELECT source, session_id, deleted, title_folded, summary_folded, last_activity_at FROM ${table}
 WHERE ${tenant}
-  AND (source, session_id) IN (SELECT source, session_id FROM (${branch("summary_folded")} UNION ALL ${branch("title_folded")}))
+  AND (source, session_id) IN (SELECT source, session_id FROM (${branch("summary_folded")}) UNION ALL SELECT source, session_id FROM (${branch("title_folded")}))
 ORDER BY source, session_id, epoch DESC
 LIMIT 1 BY source, session_id`;
   const query = `SELECT source, session_id FROM (${newest})

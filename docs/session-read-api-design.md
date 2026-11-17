@@ -326,8 +326,12 @@ What is servable (`src/session-read-api/summary-fallback.ts`), every step fail c
 `session_brief_summary_for` runs first for both kinds, so its tenant scope, alias,
 canonical-mapping and managed-history refusals hold (400 / 501 `summary_unqualified` / 503;
 the fallback is not read). Then the session's live `sessions.session_index` pointer is read
-as `bulls96_read_api` in the request's tenant-bound READ ONLY transaction (the same rows the
-timing and turns routes read the transcript through): no live pointer (unknown, tombstoned,
+as `bulls96_read_api` in a second tenant-bound READ ONLY transaction on the request's client
+(the Worker's `requestTenantRunner` opens one transaction per check, so the brief check and
+the pointer read are two transactions with their own snapshots, whatever
+`READ_API_REPEATABLE_READ` says; a change committed between them, such as an erasure, is seen
+by the pointer read, which itself requires `deleted_at IS NULL`). These are the same rows the
+timing and turns routes read the transcript through: no live pointer (unknown, tombstoned,
 erased) = empty; more than one live physical row (several machines) = empty, since each
 machine's summary covers only its own raw. The pointer must be this tenant's, in this
 Worker's raw bucket and provider, with a manifest key whose location matches the row and
@@ -337,14 +341,25 @@ object opens only with AES-256-GCM under the caller's workspace key (HKDF from
 `SUMMARY_MASTER_KEYS`, `src/shared/keyring.ts`) with associated data binding the key, kind
 and revision, and its recorded `source_content_sha256` must equal the pointer's
 `content_sha256` (revisions restart on a re-upload, so a leftover object from erased or
-replaced content is never served); a text-free record (opt-out, quarantine, empty) is empty. No migration and no
+replaced content is never served); a text-free record (opt-out, quarantine, empty) is empty.
+An object that does not open is empty only while it is stale: when its plaintext object
+metadata (written with it) names exactly the pointer's revision, the requested kind and the
+envelope's key id, and it still fails the AES-GCM tag, the cause is key material (a key id
+this Worker holds with other bytes than the writer's), tampering or an object written under
+another workspace's key, and the route answers 503 `summary_decrypt_failed`. (A wrong key
+cannot be told from staleness on an object whose metadata names an older revision: that stays
+empty until Bob Costas rewrites the object at the current revision, which then fails loudly.) No migration and no
 grant: the read role never reads `sessions.session_summaries`.
 
 Errors with the flag on: a row outside the tenant 500 (`TenantMismatchError`); missing raw
 store or `SUMMARY_MASTER_KEYS` (or a malformed value) 501 `summary_fallback_not_configured`;
 a pointer that fails the checks, a malformed record, a store/deadline failure or a key id
-this Worker does not hold 503 `backend_unavailable`. Never an empty 200 for a failure.
-Nothing is logged but the route's usual request line; no text, key or path.
+this Worker does not hold 503 `backend_unavailable`; an object at the pointer's revision that
+does not open under the key id it names 503 `backend_unavailable` with
+`"reason":"summary_decrypt_failed"`. Never an empty 200 for a failure. Each 503 logs one line
+with its reason code (`summary_fallback_pointer_invalid`, `summary_fallback_parse`,
+`summary_fallback_unavailable` or `summary_decrypt_failed`) beside the route's usual request
+line; no text, key, path or id.
 
 Deploy (Khaliq's call): `summary_fallback=on` (only with `brief_summary=on`) adds
 `--var READ_API_SUMMARY_FALLBACK_ENABLED:true`; the Worker also needs the secret
