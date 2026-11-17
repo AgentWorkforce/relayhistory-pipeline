@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -878,6 +878,40 @@ test("real tree: after the full tree including 062100, the relayfacts per-user e
   for (const [fn, role] of [
     ["sessions.relayfacts_user_erase_v1(text,text,text,text)", "bulls96_session_ingest"],
     ["sessions.relayfacts_user_erase_guard_v1()", "service_role"],
+  ] as const) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
+});
+
+test("real tree: after the full tree including 062110, the staged reconcile writers are EXECUTE for search_consumer_runtime only and any other grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const SRS = "upstream:20261105062110_search_reconcile_staging.sql";
+  expect(s.split.held).toContain(SRS);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(SRS);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  // Consumer-only: never in the general runtime list; the seven writers are the consumer's, the two helpers nobody's.
+  expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.search_reconcile_"))).toEqual([]);
+  const writers = CONSUMER_RUNTIME_FUNCTIONS.filter((f) => f.startsWith("sessions.search_reconcile_"));
+  expect(writers.length).toBe(7);
+  const grantees = async (fn: string) =>
+    (await s.db.query<{ g: string }>(
+      "SELECT DISTINCT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END g FROM pg_proc p, aclexplode(p.proacl) a WHERE p.oid = $1::regprocedure AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner ORDER BY 1",
+      [fn])).rows.map((r) => r.g);
+  for (const fn of writers) expect(await grantees(fn), fn).toEqual(["search_consumer_runtime"]);
+  for (const fn of ["sessions.search_reconcile_caller_v1()", "sessions.search_reconcile_lease_v1(bigint,uuid)"]) expect(await grantees(fn), fn).toEqual([]);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  for (const [fn, role] of [
+    ["sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)", "bulls96_read_api"],
+    ["sessions.search_reconcile_lease_v1(bigint,uuid)", "search_consumer_runtime"],
   ] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);

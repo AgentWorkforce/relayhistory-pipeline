@@ -500,6 +500,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.relayfacts_user_erase_v1, table sessions.relayfacts_erasure_fences and triggers relayfacts_user_erase_guard, relayfacts_user_erase_lock_evidence and relayfacts_user_erase_lock_records",
     sql: "SELECT to_regprocedure('sessions.relayfacts_user_erase_v1(text,text,text,text)') IS NOT NULL AND to_regclass('sessions.relayfacts_erasure_fences') IS NOT NULL AND (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND ((tgrelid=to_regclass('sessions.relayfacts_evidence_v1') AND tgname IN ('relayfacts_user_erase_guard','relayfacts_user_erase_lock_evidence')) OR (tgrelid=to_regclass('sessions.relayfacts_v1') AND tgname='relayfacts_user_erase_lock_records')))=3 AS applied",
   },
+  "upstream:20261105062110_search_reconcile_staging.sql": {
+    evidence: "tables sessions.search_reconcile_runs_v1 and sessions.search_reconcile_stage_v1 and function sessions.search_reconcile_claim_v1",
+    sql: "SELECT to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL AND to_regclass('sessions.search_reconcile_stage_v1') IS NOT NULL AND to_regprocedure('sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

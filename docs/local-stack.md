@@ -443,7 +443,7 @@ wiring is a later change, so applying the migration changes no runtime path.
 - **Rollback.** `supabase/rollbacks/20261105062110_search_reconcile_staging.down.sql` drops only in-progress runs,
   which then start over. It refuses while any run holds a live lease.
 
-Preconditions before the flag may be turned on anywhere (open; tracked for slice 2b):
+Preconditions before the flag may be turned on anywhere (1-3 and 5 open, tracked for slice 2b):
 
 1. **Erasure.** Session erasure must call `search_reconcile_erase_scope_v1` (`eraseStagedReconcileRuns`). Until it
    does, the staged rows of an erased session outlive the erase. Those rows hold index identities (machine, session
@@ -453,9 +453,9 @@ Preconditions before the flag may be turned on anywhere (open; tracked for slice
    and (for a run resumed at that step) the source read all run in one transaction under the advisory locks.
 3. **Fast-changing sessions.** A session whose source stamp changes faster than one run completes never finishes.
    This needs a policy and metrics on `attempts` and `last_error`.
-4. **Consumer registration.** The writers must be registered for the consumer login: `CONSUMER_RUNTIME_FUNCTIONS`
-   (the live sessions-function gate) and the `session_consumer_role_verify.sql` allowlist. Without that, applying the
-   migration fails the consumer's readiness.
+4. **Consumer registration.** Done with the migration: the seven writers are in `CONSUMER_RUNTIME_FUNCTIONS` (the live
+   sessions-function gate accepts them for the consumer login only) and in the `session_consumer_role_verify.sql`
+   allowlist; the boundary lane is `search-reconcile-staging`. Keep both lists in step with any new writer.
 5. **Passes 1-3 are not staged** (the stage table reserves the `fold` and `directory_seen` sides). A resumed run reads
    the source again whenever it still needs the read.
 

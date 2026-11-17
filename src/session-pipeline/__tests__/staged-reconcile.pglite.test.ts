@@ -11,6 +11,8 @@ import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pg
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../../hoopdb/migrate.ts";
+import { CONSUMER_RUNTIME_FUNCTIONS, RUNTIME_APPLICATION_FUNCTIONS } from "../../hoopdb/migrate-guards.ts";
+import { MIGRATION_SENTINELS } from "../../hoopdb/migration-sentinels.ts";
 import { streamIndexKey } from "../../session-read-api/canonical-stream-projection.ts";
 import { S3_ACTIVITY_KINDS } from "../search-index.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -72,18 +74,9 @@ function client(db: PGlite): MigrationClient {
   };
 }
 const code = async (p: Promise<unknown>) => ((await p.then(() => null, (e: unknown) => e)) as { code?: string } | null)?.code ?? null;
-/**
- * The real migrator over the real plan. Until 062110 is registered (phase B: migration-sentinels.ts
- * and the migrate-guards pin), its sentinel is the step's own, as the migrator lets a test inject.
- */
-const SENTINEL = {
-  evidence: "tables sessions.search_reconcile_runs_v1 and sessions.search_reconcile_stage_v1 and function sessions.search_reconcile_claim_v1",
-  sql: "SELECT to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL AND to_regclass('sessions.search_reconcile_stage_v1') IS NOT NULL AND to_regprocedure('sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)') IS NOT NULL AS applied",
-};
-const steps = async () => (await plan(LOCAL)).map((s) => (s.name === STEP && !s.sentinel ? { ...s, sentinel: SENTINEL } : s));
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
-  await runMigrations(client(db), { profile: LOCAL, steps: await steps() });
+  await runMigrations(client(db), { profile: LOCAL });
   return db;
 }
 
@@ -263,6 +256,10 @@ describe("20261105062110 search reconcile staging", () => {
   });
 
   test("objects: SECURITY DEFINER writers with a pinned search_path, owner-only helpers, RLS on both tables", async () => {
+    expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("search_reconcile_runs_v1");
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(true);
+    expect(CONSUMER_RUNTIME_FUNCTIONS.filter((f) => f.startsWith("sessions.search_reconcile_")).sort()).toEqual([...WRITERS].sort());
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.search_reconcile_"))).toEqual([]);
     for (const fn of [...WRITERS, ...HELPERS]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
         "SELECT p.prosecdef secdef, p.proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec FROM pg_proc p WHERE p.oid=$1::regprocedure", [fn])).rows[0]!;
