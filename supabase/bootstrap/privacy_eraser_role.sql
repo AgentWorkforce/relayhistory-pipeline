@@ -1,8 +1,8 @@
 -- Operator-only phase after migrations (20261105041000): make the E3 transcript eraser's login able to log in.
 -- Run only under an explicit apply OK, after the Supabase privacy authority is activated. The password is set
 -- separately from 1Password in memory; never place it here or in a connection file. Run privacy_eraser_verify.sql
--- before and after. The role may EXECUTE only the six eraser read RPCs (state, groups, live page/still-fenced,
--- legacy page/still-fenced) and holds
+-- before and after. The role may EXECUTE only its reviewed eraser RPC surface (state, groups, live
+-- page/still-fenced, legacy page/still-fenced, sweep activation and heartbeat) and holds
 -- no table right, so the host that holds the destructive S3 eraser key holds no owner or BYPASSRLS database credential.
 BEGIN;
 DO $role$ BEGIN

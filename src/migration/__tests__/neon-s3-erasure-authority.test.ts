@@ -430,6 +430,26 @@ describe("supabase privacy authority as the eraser's source", () => {
     const ready = () => readyAs(LEGACY_EXPORT_GENERATION);
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
 
+    // The fixed heartbeat RPC is never a generic health-control endpoint: it
+    // must carry the activation captured when this exact sweep began.
+    await w.f.db.query("SELECT set_config($1,$2,false)", [
+      LEGACY_EXPORT_GENERATION_SETTING,
+      LEGACY_EXPORT_GENERATION,
+    ]);
+    await expect(
+      w.f.db.query("SELECT sessions.legacy_export_privacy_eraser_heartbeat()"),
+    ).rejects.toMatchObject({ code: "55000" });
+    expect(
+      (await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0],
+    ).toEqual({ n: 0 });
+
+    // A real sweep with the legacy feed disabled must not arm the exporter.
+    await w.job(undefined, DEFAULT_ERASURE_CONFIG).sweep();
+    expect(
+      (await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0],
+    ).toEqual({ n: 0 });
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
     // A dry run proves nothing about the deployed deleter and must not arm export.
     const cfg = { ...DEFAULT_ERASURE_CONFIG, legacyExportErasure: true };
     await w.job(undefined, cfg).sweep({ dryRun: true });
@@ -451,6 +471,14 @@ describe("supabase privacy authority as the eraser's source", () => {
       generation: LEGACY_EXPORT_GENERATION,
     });
     await expect(readyAs(LEGACY_EXPORT_ACTIVATION_GENERATION)).rejects.toMatchObject({ code: "55000" });
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+
+    // The equality branch is independently fail-closed even for a fresh row.
+    await w.f.db.query(
+      "UPDATE sessions.legacy_export_privacy_eraser_readiness SET authority_activated_at=authority_activated_at-interval '1 microsecond'",
+    );
+    await expect(ready()).rejects.toMatchObject({ code: "55000" });
+    await w.job(undefined, cfg).sweep();
     expect((await ready()).rows[0]).toEqual({ ready: true });
 
     await w.f.db.query("UPDATE sessions.legacy_export_privacy_eraser_readiness SET last_success_at=clock_timestamp()-interval '31 minutes'");
@@ -507,6 +535,28 @@ describe("supabase privacy authority as the eraser's source", () => {
     expect(await activatedAt()).not.toBe(before);
     expect(await readinessCount()).toBe(0);
     await expect(ready()).rejects.toMatchObject({ code: "55000" });
+
+    // Only a new healthy sweep under the new activation re-arms readiness.
+    await w.job(undefined, cfg).sweep();
+    expect(await readinessCount()).toBe(1);
+    expect((await ready()).rows[0]).toEqual({ ready: true });
+  });
+
+  test("a late heartbeat from the prior activation is refused and writes no readiness", async () => {
+    const w = await world();
+    await w.activate();
+    const authority = supabaseAuthority(w.f.queryable);
+    authority.beginSweep?.();
+    await authority.ready();
+
+    // Capture activation A, then move the authority to activation B before
+    // the sweep's heartbeat transaction begins.
+    await w.f.ownerRpc("ingest_privacy_authority_release", { controlEpoch: epoch });
+    await w.activate();
+    await expect(authority.recordSuccessfulSweep!()).rejects.toMatchObject({ code: "55000" });
+    expect(
+      (await w.f.db.query("SELECT count(*)::int AS n FROM sessions.legacy_export_privacy_eraser_readiness")).rows[0],
+    ).toEqual({ n: 0 });
   });
 
   test("the exporter-only RPC registers an immutable owner tuple consumed by a turn-fence legacy page", async () => {

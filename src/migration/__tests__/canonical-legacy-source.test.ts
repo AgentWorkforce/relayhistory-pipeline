@@ -554,7 +554,7 @@ activationTest("readiness is rechecked after the authority lock and before the s
   }
 });
 
-test("authority deactivation after a PUT fails the scope and preserves its write evidence", async () => {
+activationTest("authority deactivation after a PUT fails the scope and preserves its write evidence", async () => {
   const s = { ...scope, sessionId: "authority-deactivated" };
   let ready = 0;
   const flips: Queryable = {

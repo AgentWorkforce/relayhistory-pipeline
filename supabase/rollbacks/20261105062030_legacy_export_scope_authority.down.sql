@@ -12,7 +12,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062030_legacy_export_scope_authority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062030_legacy_export_scope_authority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'a44b7286451c0804263cd8eaf7b6d8c2c2f9cc165380ddd9630991a92ac22270'
+ IF NOT FOUND OR v_sha<>'3232f917be840fc9f7265765cc7b9ecf4ea3cd8f9fdbe49574330e76de7780d0'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: own applied checksum required';END IF;
  LOCK TABLE sessions.legacy_export_scope_authority IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.legacy_export_scope_authority)

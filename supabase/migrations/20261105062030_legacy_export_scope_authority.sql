@@ -113,7 +113,9 @@ BEGIN
  IF NOT FOUND OR v_authority_activated_at IS NULL THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: supabase privacy authority not active';END IF;
  v_sweep_authority:=current_setting('s3x.legacy_export_sweep_authority_activated_at',true);
- IF coalesce(v_sweep_authority,'')<>'' AND v_authority_activated_at IS DISTINCT FROM v_sweep_authority::timestamptz THEN
+ IF coalesce(v_sweep_authority,'')='' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: eraser sweep activation missing';END IF;
+ IF v_authority_activated_at IS DISTINCT FROM v_sweep_authority::timestamptz THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='legacy export authority: eraser sweep belongs to another activation';END IF;
  v_generation:=current_setting('s3x.legacy_export_generation',true);
  IF v_generation IS NULL OR v_generation NOT IN ('legacy-export-preactivation-v1','legacy-export-activation-v1') THEN
