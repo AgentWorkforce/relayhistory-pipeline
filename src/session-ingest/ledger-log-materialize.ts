@@ -78,7 +78,7 @@ async function putOnce(store: ObjectStore, key: string, doc: unknown) {
  * directory) is written FIRST, so a registry pointer never names a stream whose identity was not yet written; a
  * pointer left behind by an erasure only reads as gone. Before both, the stream's entry in its user's stream index
  * (ledger-log.ts logUserIndex), which a reset's erase lists: so a stream switched before the index existed is indexed
- * at its next take (admission registers before it takes, and takes before its first payload).
+ * at its next take (admission registers before it takes, and takes before its first payload), or by backfillLogIndex.
  */
 export async function registerLogStream(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string): Promise<void> {
   const keys = logKeys(keyRoot, tenant, originId);
@@ -187,6 +187,47 @@ export async function migrateLogStreamRegistry(store: ObjectStore, keyRoot: stri
   return out;
 }
 
+/**
+ * written: index objects created (or, in a dry run, that would be). present: already indexed. skipped: registered
+ * streams with no entry 0 (never switched, or the user's directory was erased): nothing is written back into an
+ * erased directory. corrupt: entries without a readable entry 0 (LogCorrupt): indexed all the same (and counted in
+ * written or present too), since such a stream may still hold payloads (a reset of its user then fails closed and
+ * logs it: the design doc's slice 8 runbook). invalid: ids no key function accepts, left alone. Counts only: never a
+ * key or an id.
+ */
+export interface LogIndexBackfill { streams: number; written: number; present: number; skipped: number; corrupt: number; invalid: number }
+
+/**
+ * One-off backfill of the users' stream index (ledger-log.ts logUserIndex) from the stream registry, for streams
+ * switched before the index existed and not registered since (docs/design/s3-ledger-log-commit.md, slice 9): the reset
+ * erase (INGEST_LEDGER_LOG_ERASE) finds a user's streams only through the index. Run it with --apply before turning
+ * the erase on. Per registered stream: entry 0 (logModeMarker), a HEAD of its index object, and only when that is
+ * missing a create-if-absent PUT of the same `{"v":1}` bytes writeLogIndex always writes. Dry run unless `apply`.
+ * Idempotent and resumable: a rerun counts what the last one wrote as present. A store fault stops the run (rerun it).
+ */
+export async function backfillLogIndex(store: ObjectStore, keyRoot: string, opts: { apply: boolean }): Promise<LogIndexBackfill> {
+  const out: LogIndexBackfill = { streams: 0, written: 0, present: 0, skipped: 0, corrupt: 0, invalid: 0 };
+  for await (const ref of listLogStreams(store, keyRoot)) {
+    out.streams++;
+    let keys: LogKeys;
+    try { assertTenantSegment(keyRoot, ref.tenant.orgId); keys = logKeys(keyRoot, ref.tenant, ref.originId); }
+    catch (error) { if (error instanceof LogCorrupt || error instanceof IngestWriteError) { out.invalid++; continue; } throw error; }
+    let live: boolean;
+    try { live = await logModeMarker(store, keys); }
+    catch (error) {
+      if (isObjectStoreError(error) && error.code === "invalid_key") { out.invalid++; continue; }
+      if (!(error instanceof LogCorrupt)) throw error;
+      out.corrupt++;
+      live = true;
+    }
+    if (!live) { out.skipped++; continue; }
+    if ((await store.head(objectKey(keys.index))) !== undefined) { out.present++; continue; }
+    if (opts.apply) await writeLogIndex(store, keys);
+    out.written++;
+  }
+  return out;
+}
+
 /** Record a batch the materializer skipped for good (idempotent: the same code every time for a final refusal). */
 export async function writeLogSkip(store: ObjectStore, keys: LogKeys, batchId: string, code: string, atMs: number): Promise<void> {
   await store.put(objectKey(keys.skipped(batchId)), enc({ v: 1, code, atMs }), { contentType: "application/json" });
@@ -222,7 +263,9 @@ export async function materializedThrough(store: ObjectStore, keys: LogKeys): Pr
  * binary search). Markers are written in seq order from 0 (`#mark` after every entry, each only once all before it are
  * applied), so their seqs are a dense prefix 0..through. The answer is always a seq whose marker exists (or -1), so it
  * never exceeds the true cursor, whatever the store holds: a gap (a future compaction removing old markers) only makes
- * it lower, and a caller that starts reading there reads more entries, never fewer.
+ * it lower, and a caller that starts reading there reads more entries, never fewer. -1 (no marker 0) means "read
+ * from entry 0": a caller clamps it to 0 and skips nothing (ledger-log-erase.ts). So compaction (Remaining 5) must
+ * keep marker 0, or a reset falls back to replaying from entry 0, which then needs every entry after it.
  */
 export async function materializedAtLeast(store: ObjectStore, keys: LogKeys): Promise<number> {
   const marked = async (seq: number) => (await store.head(objectKey(keys.marker(seq)))) !== undefined;

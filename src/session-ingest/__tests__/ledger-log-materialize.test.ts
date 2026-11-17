@@ -732,3 +732,95 @@ describe("Remaining 8: the stream registry holds no raw user or origin id outsid
     expect(await exists(store, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(true);
   });
 });
+
+describe("slice 9: the user's stream index (written with log commit on, backfilled for older streams)", () => {
+  const fresh = () => { const sc = scratchStore(); cleanups.push(sc.done); return sc.store; };
+  const U2 = { ...TENANT, userId: "user-2" };
+
+  test("backfill-index: dry run writes nothing; apply indexes every registered live stream (v1 or v2) that lacks it; idempotent; counts only", async () => {
+    const { backfillLogIndex, legacyLogStreamRegistryKey, logStreamsRoot, registerLogStream } = await import("../ledger-log-materialize.ts");
+    const { userLogStreams } = await import("../ledger-log-erase.ts");
+    const store = fresh();
+    // Two streams switched and registered (v2), one registered only in v1; then their index objects removed, as for
+    // streams switched before the index existed. One more is already indexed.
+    const a = logKeys(ROOT, TENANT, ORIGIN), b = logKeys(ROOT, TENANT, "origin-2"), c = logKeys(ROOT, U2, ORIGIN), d = logKeys(ROOT, TENANT, "origin-3");
+    for (const [t, o] of [[TENANT, ORIGIN], [TENANT, "origin-2"], [U2, ORIGIN], [TENANT, "origin-3"]] as const) await enableLogMode(store, logKeys(ROOT, t, o), null, { writer: "operator", now: () => T0 });
+    await registerLogStream(store, ROOT, TENANT, ORIGIN);
+    await registerLogStream(store, ROOT, TENANT, "origin-3");
+    await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, "origin-2"), { v: 1, ...TENANT, originId: "origin-2" });
+    await registerLogStream(store, ROOT, U2, ORIGIN);
+    for (const k of [a, b, c]) await store.delete(objectKey(k.index));
+    // A registered stream with no entry 0 (never switched, or its user's directory erased): skipped, nothing written.
+    const gone = logKeys(ROOT, TENANT, "origin-gone");
+    await putJson(store, legacyLogStreamRegistryKey(ROOT, TENANT, "origin-gone"), { v: 1, ...TENANT, originId: "origin-gone" });
+    // A v1 doc with ids admission refuses: invalid, left alone.
+    await putJson(store, `${logStreamsRoot(ROOT)}${"b".repeat(40)}.json`, { v: 1, orgId: "../escape", workspaceId: TENANT.workspaceId, userId: TENANT.userId, originId: ORIGIN });
+    expect((await userLogStreams(store, ROOT, TENANT)).map((k) => k.root)).toEqual([d.root]);
+
+    const dry = await backfillLogIndex(store, ROOT, { apply: false });
+    expect(dry).toEqual({ streams: 6, written: 3, present: 1, skipped: 1, corrupt: 0, invalid: 1 });
+    for (const k of [a, b, c, gone]) expect(await exists(store, k.index)).toBe(false);
+    expect(await backfillLogIndex(store, ROOT, { apply: true })).toEqual(dry);
+    for (const k of [a, b, c, d]) expect(await exists(store, k.index)).toBe(true);
+    expect(await exists(store, gone.index)).toBe(false);
+    expect((await userLogStreams(store, ROOT, TENANT)).map((k) => k.root).sort()).toEqual([a.root, b.root, d.root].sort());
+    expect((await userLogStreams(store, ROOT, U2)).map((k) => k.root)).toEqual([c.root]);
+    // Rerun: everything present, nothing written.
+    expect(await backfillLogIndex(store, ROOT, { apply: true })).toEqual({ streams: 6, written: 0, present: 4, skipped: 1, corrupt: 0, invalid: 1 });
+    // The receipt carries counts only.
+    const text = JSON.stringify(dry);
+    for (const id of [TENANT.orgId, TENANT.userId, ORIGIN, a.root]) expect(text.includes(id)).toBe(false);
+  });
+
+  test("backfill-index: a stream whose entry 0 is gone but whose entries remain (LogCorrupt) is indexed all the same; a store fault stops the run", async () => {
+    const { backfillLogIndex, registerLogStream } = await import("../ledger-log-materialize.ts");
+    const base = fresh();
+    const keys = logKeys(ROOT, TENANT, ORIGIN);
+    await enable(base);
+    await registerLogStream(base, ROOT, TENANT, ORIGIN);
+    await putJson(base, keys.entry(1), { v: 1 });
+    await base.delete(objectKey(keys.entry(0)));
+    await base.delete(objectKey(keys.index));
+    expect(await backfillLogIndex(base, ROOT, { apply: true })).toEqual({ streams: 1, written: 1, present: 0, skipped: 0, corrupt: 1, invalid: 0 });
+    expect(await exists(base, keys.index)).toBe(true);
+    // A store fault on the index write: thrown (a rerun resumes), never counted as written.
+    await base.delete(objectKey(keys.index));
+    const f = faulty(base);
+    f.setFault((key) => (key.includes("/ledger/log-index/") ? "before" : "ok"));
+    await expect(backfillLogIndex(f.store, ROOT, { apply: true })).rejects.toMatchObject({ code: "transient" });
+    expect(await exists(base, keys.index)).toBe(false);
+  });
+
+  test("an index PUT that fails fails registerLogStream before the identity doc and pointer, and enableLogMode before entry 0", async () => {
+    const { logStreamRegistryKey, registerLogStream } = await import("../ledger-log-materialize.ts");
+    const base = fresh();
+    const keys = logKeys(ROOT, TENANT, ORIGIN);
+    const f = faulty(base);
+    f.setFault((key) => (key.includes("/ledger/log-index/") ? "before" : "ok"));
+    await expect(registerLogStream(f.store, ROOT, TENANT, ORIGIN)).rejects.toMatchObject({ code: "transient" });
+    expect(await exists(base, keys.identity)).toBe(false);
+    expect(await exists(base, logStreamRegistryKey(ROOT, TENANT, ORIGIN))).toBe(false);
+    await expect(enableLogMode(f.store, keys, null, { writer: "operator", now: () => T0 })).rejects.toMatchObject({ code: "transient" });
+    expect(await exists(base, keys.entry(0))).toBe(false);
+    // A PUT that landed but answered an error: the retry finds the same bytes and goes on (create-if-absent).
+    f.setFault((key) => (key.includes("/ledger/log-index/") ? "after" : "ok"));
+    await expect(enableLogMode(f.store, keys, null, { writer: "operator", now: () => T0 })).rejects.toMatchObject({ code: "transient" });
+    f.setFault(undefined);
+    await enableLogMode(f.store, keys, null, { writer: "operator", now: () => T0 });
+    await registerLogStream(f.store, ROOT, TENANT, ORIGIN);
+    expect(await exists(base, keys.entry(0))).toBe(true);
+    expect(await exists(base, keys.index)).toBe(true);
+  });
+
+  test("INGEST_LEDGER_LOG_COMMIT=on with INGEST_LEDGER_LOG_ERASE off still (re)writes the index: admission indexes an unindexed stream", async () => {
+    const e = edge("on");
+    await writeAuthority(e.base);
+    await enable(e.base);
+    const keys = logKeys(ROOT, TENANT, ORIGIN);
+    await e.base.delete(objectKey(keys.index));
+    await upload(e.base, "b1", ["r1"]);
+    await rounds(e, 2);
+    expect(await exists(e.base, keys.index)).toBe(true);
+    expect((await keysUnder(e.base, keys.markers)).length).toBe((await entries(e.base)).length);
+  });
+});

@@ -469,3 +469,89 @@ describe("INGEST_LEDGER_LOG_ERASE", () => {
       .toThrow(/INGEST_LEDGER_LOG_ERASE=on needs/);
   });
 });
+
+describe("slice 9: every stream is attempted, a throwing sink, the unverified kind, a missing marker 0", () => {
+  test("a reset: one corrupt stream does not stop the others; each failing stream logs its own line; the erase still fails", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1"), b = await stream(base, TENANT, "origin-2"), c = await stream(base, TENANT, "origin-3");
+    const ka = await logged(base, a, "a1", 0), kb = await logged(base, b, "b1", 0), kc = await logged(base, c, "c1", 0);
+    // Corrupt a and c (sorted roots decide the order; whichever comes first, the healthy b is still erased).
+    for (const s of [a, c]) await base.put(objectKey(s.keys.entry(1)), new TextEncoder().encode("{not json"));
+    const lines: Record<string, unknown>[] = [];
+    await expect(eraseSupersededLogPayloads(base, ROOT, TENANT, 1, { log: (f) => { lines.push(f); } })).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+    expect(await exists(base, kb)).toBe(false);
+    expect(await exists(base, ka)).toBe(true);
+    expect(await exists(base, kc)).toBe(true);
+    expect(lines.map((l) => l.key_sha256).sort()).toEqual([sha256(a.keys.root), sha256(c.keys.root)].sort());
+    for (const l of lines) expect(l).toMatchObject({ route: "ingest.ledger_log_erase", outcome: "ledger_log_erase_failed", kind: "log_corrupt" });
+  });
+
+  test("the whole-user erase: a failing stream does not stop the others either", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1"), b = await stream(base, TENANT, "origin-2");
+    const ka = await logged(base, a, "a1", 0), kb = await logged(base, b, "b1", 0);
+    const lines: Record<string, unknown>[] = [];
+    const store = hooked(base, (op, key) => { if (op === "delete" && key.startsWith(a.keys.payloads)) throw transient(); });
+    await expect(eraseLogPayloads(store, ROOT, TENANT, { log: (f) => { lines.push(f); } })).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+    expect(await exists(base, ka)).toBe(true);
+    expect(await exists(base, kb)).toBe(false);
+    expect(lines).toEqual([{ route: "ingest.ledger_log_erase", outcome: "ledger_log_erase_failed", kind: "store", error_code: "transient", key_sha256: sha256(a.keys.root) }]);
+  });
+
+  test("a sink that throws never replaces the erase's own error (per stream and on discovery)", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1");
+    await logged(base, a, "a1", 0);
+    const log = () => { throw new Error("sink down"); };
+    const faulty = hooked(base, (op, key) => { if (op === "list" && key.endsWith("/p")) throw transient(); });
+    await expect(eraseSupersededLogPayloads(faulty, ROOT, TENANT, 1, { log })).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+    const blind = hooked(base, (op, key) => { if (op === "list" && key.endsWith("/log-index")) throw transient(); });
+    await expect(eraseSupersededLogPayloads(blind, ROOT, TENANT, 1, { log })).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+    await expect(eraseLogPayloads(faulty, ROOT, TENANT, { log })).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+  });
+
+  test("a payload still there after its delete logs kind unverified with its closed code", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1");
+    await logged(base, a, "a1", 0);
+    const lines: Record<string, unknown>[] = [];
+    const lying: ObjectStore = { ...hooked(base, () => {}), delete: async () => {} };
+    await expect(eraseSupersededLogPayloads(lying, ROOT, TENANT, 1, { log: (f) => { lines.push(f); } })).rejects.toMatchObject({ code: "ledger_log_erase_unverified" });
+    expect(lines).toEqual([{ route: "ingest.ledger_log_erase", outcome: "ledger_log_erase_failed", kind: "unverified", error_code: "ledger_log_erase_unverified", key_sha256: sha256(a.keys.root) }]);
+    lines.length = 0;
+    await expect(eraseLogPayloads(lying, ROOT, TENANT, { log: (f) => { lines.push(f); } })).rejects.toMatchObject({ code: "ledger_log_erase_unverified" });
+    expect(lines).toEqual([{ route: "ingest.ledger_log_erase", outcome: "ledger_log_erase_failed", kind: "unverified", error_code: "ledger_log_erase_unverified", key_sha256: sha256(a.keys.root) }]);
+  });
+
+  test("marker 0 gone (a future compaction) with later markers present: the reset falls back to entry 0 and still erases", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1");
+    const applied = await logged(base, a, "a1", 0);
+    const pending = await logged(base, a, "a2", 0);
+    const later = await logged(base, a, "a3", 1);
+    await mark(base, a.keys, 1);
+    await base.delete(objectKey(a.keys.marker(0)));
+    expect(await materializedAtLeast(base, a.keys)).toBe(-1);
+    const { store, calls } = counted(base);
+    // From entry 0: the applied entry is re-read too, so its leftover payload goes with the unapplied one (the
+    // materializer's own next step); the post-reset batch stays.
+    expect(await eraseSupersededLogPayloads(store, ROOT, TENANT, 1)).toBe(2);
+    for (const k of [applied, pending]) expect(await exists(base, k)).toBe(false);
+    expect(await exists(base, later)).toBe(true);
+    expect(calls.includes(`get:${a.keys.entry(0)}`)).toBe(true);
+    expect(calls.includes(`get:${a.keys.entry(1)}`)).toBe(true);
+  });
+
+  test("self-host wiring: a logger that throws does not mask the erase failure, and SQL is never called", async () => {
+    const base = fresh();
+    const a = await stream(base, TENANT, "origin-1");
+    const k1 = await logged(base, a, "a1", 0);
+    const sql: string[] = [];
+    const logger = { error: () => { throw new Error("logger down"); } };
+    const store = hooked(base, (op, key) => { if (op === "delete" && key.includes("/ledger/log/")) throw transient(); });
+    const ledger = selfhostS3Ledger(ROOT, { store, run: (async (...args: unknown[]) => { sql.push(String(args[0])); throw new Error("sql"); }) as never }, undefined, { logModeGuard: true, logErase: true, logger });
+    await expect(ledger.resetUploadedSessions(TENANT, "req-1")).rejects.toMatchObject({ code: "ledger_log_erase_failed" });
+    expect(sql).toEqual([]);
+    expect(await exists(base, k1)).toBe(true);
+  });
+});

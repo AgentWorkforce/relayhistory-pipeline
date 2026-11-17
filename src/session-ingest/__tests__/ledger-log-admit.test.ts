@@ -445,7 +445,7 @@ describe("slice 5: a skipped batch stays refused, retries write fresh payloads, 
 
   test("the CLI guard is an allowlist: mutations need --i-know-this-is-not-prod and a non-production-like bucket", async () => {
     const { mutationRefusal } = await import("../../../scripts/ledger-log-stream.ts");
-    for (const command of ["switch", "close", "migrate-registry"]) {
+    for (const command of ["switch", "close", "migrate-registry", "backfill-index"]) {
       expect(mutationRefusal(command, "sessions-dev-bench", true, false)).toBe("not_declared_nonprod");
       for (const b of ["sessionsprod", "prod2-history", "prd-ledger", "relayhistoryproduction", "acme-live", "hosted-x", "customer-data"])
         expect(mutationRefusal(command, b, true, true)).toBe("bucket_name_production_like");

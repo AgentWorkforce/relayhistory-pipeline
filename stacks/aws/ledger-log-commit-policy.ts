@@ -11,10 +11,11 @@
  *   - the admission consumer AND the materializer (one process, the upload-admission consumer role on hosted):
  *       GET/PUT  every object of a stream: `<user dir>/ledger/log/o=<h>/` entries e/, checkpoints c/, the head hint,
  *                payloads p/, materializer markers m/, skip records s/, closed.json and the stream identity doc
- *                (stream.json); the receipt outcomes (`r=<receipt>/outcome-*.json`); the stream registry
- *                (`.ledger/log-streams/`);
+ *                (stream.json); the user's stream index beside the streams (`<user dir>/ledger/log-index/o=<h>.json`,
+ *                written create-if-absent before entry 0 and by every registration, ledger-log.ts logUserIndex); the
+ *                receipt outcomes (`r=<receipt>/outcome-*.json`); the stream registry (`.ledger/log-streams/`);
  *       DELETE   payloads p/ (applied, erased or orphaned) and the admitted outcome a final skip retires;
- *       LIST     the bucket (the entry directories, m/, p/, the registry): the consumer already holds
+ *       LIST     the bucket (the entry directories, m/, p/, the stream index, the registry): the consumer already holds
  *                UploadAdmissionListsForMissingKeys on the whole bucket;
  *       KMS      already covered by UploadAdmissionEncryptsAndReadsViaS3 (every object under TENANT_KEY_BASE).
  *     Its existing UploadAdmissionPromotes grant (GET/PUT on the m=srv_* layout) already covers the GET/PUTs; they are
@@ -25,6 +26,8 @@
  *       LIST the bucket, unconditionally: S3 answers 404 for a missing key only to a caller holding s3:ListBucket, and a
  *       GET/HEAD carries no s3:prefix, so a prefix-conditioned ListBucket would turn every missing read (entry 0 of a
  *       legacy stream, closed.json, the markers) into 403. Key names only; the GET grants stay narrow (never p/);
+ *       GET/PUT the user's stream index (`ledger/log-index/`: the switch writes it before entry 0, the registry migration
+ *       and `backfill-index` write it per registered stream; a HEAD of a missing index object needs the GET grant);
  *       PUT entry 0 (e/), closed.json, the identity doc, the registry; DELETE registry docs (the v1 registry migration);
  *       GET the deployment markers `.ledger/log-commit-on.json` and `.ledger/log-mode-nonprod.json`;
  *       KMS GenerateDataKey/Decrypt via S3 for those keys.
@@ -38,6 +41,11 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 export const LEDGER_LOG_USER_DIR = `${TENANT_KEY_BASE}/.admission-inbox/*/v1/ws=*/m=srv_*`;
 /** Every object of every stream (entries, checkpoints, head hint, payloads, markers, skips, closed.json, stream.json). */
 export const LEDGER_LOG_OBJECTS = `${LEDGER_LOG_USER_DIR}/ledger/log/*`;
+/**
+ * The user's stream index (ledger-log.ts logUserIndex, logKeysAt(...).index): one `o=<hash>.json` per stream, `{"v":1}`,
+ * no id inside. Beside `ledger/log/`, not under it, so LEDGER_LOG_OBJECTS does not cover it.
+ */
+export const LEDGER_LOG_INDEX = `${LEDGER_LOG_USER_DIR}/ledger/log-index/*`;
 /** Content-addressed payloads: deleted once applied, erased or orphaned. */
 export const LEDGER_LOG_PAYLOADS = `${LEDGER_LOG_USER_DIR}/ledger/log/*/p/*`;
 /** Entries, written by the consumer (every seq) and the operator tool (entry 0 only). */
@@ -67,7 +75,7 @@ export function ledgerLogCommitConsumerStatements(i: { bucketArn: string; consum
   const Principal = { AWS: i.consumerRoleArn };
   const o = (glob: string) => `${i.bucketArn}/${glob}`;
   return [
-    { Sid: "LedgerLogReadsWritesStreams", Effect: "Allow" as const, Principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: [o(LEDGER_LOG_OBJECTS), o(LEDGER_LOG_OUTCOMES)] },
+    { Sid: "LedgerLogReadsWritesStreams", Effect: "Allow" as const, Principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: [o(LEDGER_LOG_OBJECTS), o(LEDGER_LOG_INDEX), o(LEDGER_LOG_OUTCOMES)] },
     { Sid: "LedgerLogDeletesPayloadsAndAdmittedOutcomes", Effect: "Allow" as const, Principal, Action: ["s3:DeleteObject"], Resource: [o(LEDGER_LOG_PAYLOADS), o(LEDGER_LOG_ADMITTED_OUTCOMES)] },
     { Sid: "LedgerLogRegistersStreams", Effect: "Allow" as const, Principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: [o(LEDGER_LOG_REGISTRY)] },
   ];
@@ -84,9 +92,9 @@ export function ledgerLogOperatorStatements(i: { bucketArn: string; operatorRole
     // marker, the non-production and proof markers, the migration's dropped path. Listing reveals key names only.
     { Sid: "LedgerLogOperatorLists", Effect: "Allow" as const, Principal, Action: ["s3:ListBucket"], Resource: i.bucketArn },
     { Sid: "LedgerLogOperatorReads", Effect: "Allow" as const, Principal, Action: ["s3:GetObject"],
-      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
+      Resource: [o(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(o), o(LEDGER_LOG_INDEX), o(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(o)] },
     { Sid: "LedgerLogOperatorWrites", Effect: "Allow" as const, Principal, Action: ["s3:PutObject"],
-      Resource: [o(LEDGER_LOG_ENTRIES), o(LEDGER_LOG_CLOSED), o(LEDGER_LOG_IDENTITY), o(LEDGER_LOG_REGISTRY)] },
+      Resource: [o(LEDGER_LOG_ENTRIES), o(LEDGER_LOG_CLOSED), o(LEDGER_LOG_IDENTITY), o(LEDGER_LOG_INDEX), o(LEDGER_LOG_REGISTRY)] },
     { Sid: "LedgerLogOperatorMigratesRegistry", Effect: "Allow" as const, Principal, Action: ["s3:DeleteObject"], Resource: [o(LEDGER_LOG_REGISTRY)] },
   ];
 }
@@ -98,7 +106,7 @@ export function ledgerLogOperatorKeyStatement(i: { region: string; accountId: st
     Sid: "LedgerLogOperatorViaS3", Effect: "Allow" as const, Principal: { AWS: i.operatorRoleArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*",
     Condition: {
       StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
-      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(arn), arn(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(arn)] },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": [arn(LEDGER_LOG_LEGACY_BATCHES), ...LEDGER_LOG_OPERATOR_READS.map(arn), arn(LEDGER_LOG_INDEX), arn(LEDGER_LOG_REGISTRY), ...LEDGER_LOG_MARKERS.map(arn)] },
     },
   };
 }

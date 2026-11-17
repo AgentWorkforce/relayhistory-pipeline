@@ -9,9 +9,14 @@
  *       rewrites v1 stream registry docs (raw ids outside the user's directory) as hash-keyed pointers plus the
  *       identity doc inside the user's directory, then deletes the v1 docs (ledger-log-materialize.ts
  *       migrateLogStreamRegistry). Bucket-wide: takes no stream ids.
+ *   bun scripts/ledger-log-stream.ts backfill-index --bucket <b> [--apply --kms-key-arn <arn> --i-know-this-is-not-prod]
+ *       writes the users' stream index object (create-if-absent) for every registered stream in log mode that lacks
+ *       one (ledger-log-materialize.ts backfillLogIndex): streams switched before the index existed are otherwise
+ *       invisible to the reset erase. Run it with --apply before turning INGEST_LEDGER_LOG_ERASE on. Bucket-wide;
+ *       prints counts only.
  *
- * --apply on switch/close/migrate-registry is refused without --i-know-this-is-not-prod, and for any production-like
- * bucket name.
+ * --apply on switch/close/migrate-registry/backfill-index is refused without --i-know-this-is-not-prod, and for any
+ * production-like bucket name.
  *
  * Credentials: --credentials keys (default: AWS_* environment) | podIdentity, as scripts/ledger-reshard-revisions.ts.
  * Prints one JSON result; never a key, token or header value.
@@ -20,19 +25,22 @@ import { parseArgs } from "node:util";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { assertLedgerHomeHere, LedgerHomeRefused } from "../src/session-ingest/ledger-store.ts";
 import { closeLogStream, streamStatus, switchToLogMode } from "../src/session-ingest/ledger-log-stream-ops.ts";
-import { migrateLogStreamRegistry } from "../src/session-ingest/ledger-log-materialize.ts";
+import { backfillLogIndex, migrateLogStreamRegistry } from "../src/session-ingest/ledger-log-materialize.ts";
 import { reshardCredentials, type ReshardCredentialMode } from "./ledger-reshard-revisions.ts";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 
+const MUTATING = new Set(["switch", "close", "migrate-registry", "backfill-index"]);
+
 /**
- * The CLI's guard for a MUTATING step (switch or close with --apply): an allowlist, not a denylist. It needs the
- * explicit --i-know-this-is-not-prod flag, and it still refuses any bucket whose name looks production-like (a
- * belt on top: the operation itself also requires the bucket's non-production marker, ledger-log-stream-ops.ts).
+ * The CLI's guard for a MUTATING step (switch, close, migrate-registry or backfill-index with --apply): an allowlist,
+ * not a denylist. It needs the explicit --i-know-this-is-not-prod flag, and it still refuses any bucket whose name
+ * looks production-like (a belt on top: switch and close also require the bucket's non-production marker,
+ * ledger-log-stream-ops.ts).
  * Returns the refusal code, or undefined when allowed. Read-only steps (status, dry runs) are always allowed.
  */
 export function mutationRefusal(command: string | undefined, bucket: string, apply: boolean, declaredNonProd: boolean): string | undefined {
-  if (!apply || (command !== "switch" && command !== "close" && command !== "migrate-registry")) return undefined;
+  if (!apply || !MUTATING.has(command ?? "")) return undefined;
   if (!declaredNonProd) return "not_declared_nonprod";
   if (/prod|prd|live|hosted|customer/i.test(bucket)) return "bucket_name_production_like";
   return undefined;
@@ -58,11 +66,11 @@ if (import.meta.main) {
     console.error(JSON.stringify({ refused: refusal }));
     process.exit(2);
   }
-  const bucketWide = command === "migrate-registry";
-  if (!values?.bucket || !["status", "switch", "close", "migrate-registry"].includes(command ?? "") || (!bucketWide && ids.some((v) => !v || !ID.test(v)))
+  const bucketWide = command === "migrate-registry" || command === "backfill-index";
+  if (!values?.bucket || !["status", "switch", "close", "migrate-registry", "backfill-index"].includes(command ?? "") || (!bucketWide && ids.some((v) => !v || !ID.test(v)))
       || (values.apply && !values["kms-key-arn"]?.startsWith("arn:aws:kms:")) || !/^[a-z0-9_.-]{1,64}$/.test(values["key-root"]!)
       || (values.credentials !== "keys" && values.credentials !== "podIdentity")) {
-    console.error("usage: status|switch|close --bucket <b> --org <o> --workspace <w> --user <u> --origin <origin> [--region r] [--key-root 96bulls] [--credentials keys|podIdentity] [--apply --kms-key-arn <arn>]\n       migrate-registry --bucket <b> [--region r] [--key-root 96bulls] [--credentials keys|podIdentity] [--apply --kms-key-arn <arn>]");
+    console.error("usage: status|switch|close --bucket <b> --org <o> --workspace <w> --user <u> --origin <origin> [--region r] [--key-root 96bulls] [--credentials keys|podIdentity] [--apply --kms-key-arn <arn>]\n       migrate-registry|backfill-index --bucket <b> [--region r] [--key-root 96bulls] [--credentials keys|podIdentity] [--apply --kms-key-arn <arn>]");
     process.exit(2);
   }
   let credentials: Awaited<ReturnType<typeof reshardCredentials>>;
@@ -84,7 +92,8 @@ if (import.meta.main) {
   const tenant = { orgId: values.org!, workspaceId: values.workspace!, userId: values.user! };
   let result;
   try {
-    result = command === "migrate-registry" ? { ...(await migrateLogStreamRegistry(store, keyRoot, { apply: values.apply! })), applied: values.apply! }
+    result = command === "backfill-index" ? { ...(await backfillLogIndex(store, keyRoot, { apply: values.apply! })), applied: values.apply! }
+      : command === "migrate-registry" ? { ...(await migrateLogStreamRegistry(store, keyRoot, { apply: values.apply! })), applied: values.apply! }
       : command === "status" ? await streamStatus(store, keyRoot, tenant, values.origin!)
       : command === "switch" ? await switchToLogMode(store, keyRoot, tenant, values.origin!, { apply: values.apply!, writer: `operator_${crypto.randomUUID()}` })
       : await closeLogStream(store, keyRoot, tenant, values.origin!, { apply: values.apply! });
