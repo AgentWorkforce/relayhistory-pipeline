@@ -10,6 +10,7 @@ case "${SERVICE:-}" in
   hoopdb-indexer)   exec bun run /app/src/hoopdb/indexer.ts ;;
   referee)          exec bun run /app/src/referee/main.ts ;;
   bob-costas)       exec bun run /app/src/bob-costas/main.ts ;;
+  coordination-advisor) exec bun run /app/src/coordination-advisor/main.ts ;;
   session-brief)    exec bun run /app/src/session-brief/main.ts ;;
   acquisition)      exec bun run /app/src/acquisition/main.ts ;;
   session-read-api) exec bun run /app/src/session-read-api/server.ts ;;
