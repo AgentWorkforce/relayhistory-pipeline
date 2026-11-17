@@ -18,12 +18,17 @@
  *   write  pass 4: pages of `diff_page('insert')` (the keys the index lacks or holds stale),
  *          regenerated (`regenerate`) and written in the same transaction that moves the
  *          cursor and the written/wanted counters.
- *   final  one short transaction: the scope and canonical advisory locks (the same keys
- *          indexSearchScope takes; busy releases the lease), the source stamp re-read and
- *          compared (changed: the run is abandoned and restarts), then, only when every
+ *   final  one transaction: the scope advisory lock, the run row, the source stamp re-read and
+ *          compared (changed: the run is abandoned and restarts), the canonical advisory
+ *          lock (the same keys and order as indexSearchScope; busy releases the lease), the
+ *          read if this attempt has none yet, then, only when every
  *          wanted row was written, `diff_page('delete')` pages through `remove`, then
  *          `commit` (directory events, catalog, search state), then the run and its stage
  *          rows go (`finish`). A throw anywhere in it rolls all of it back.
+ *
+ * The lease: every call renews it; its expiry only lets another tick take the run over (a new
+ * nonce), so a long source read keeps the run unless someone did. A taken-over, finished,
+ * abandoned or erased run answers RH062 to the old holder.
  *
  * Passes 1-3 are not staged in this slice (the stage table reserves the 'fold' and
  * 'directory_seen' sides for that): a resumed run that still needs the read (staging
@@ -86,7 +91,10 @@ export interface StagedReconcileOps<R> {
   wanted(read: R): Iterable<StagedWant>;
   /** The kinds a delete may remove: S3_ACTIVITY_KINDS and the read's in-window kinds. */
   regenerableKinds(read: R): Iterable<string>;
-  /** One keyset page of the scope's index rows after `after` (null: the first). `next` null: the last page. */
+  /**
+   * One keyset page of the scope's index rows after `after` (null: the first). `next` null: the
+   * last page; otherwise it must sort after `after` (C order).
+   */
   scanPage(tx: SqlExecutor, after: string | null, limit: number): Promise<{ rows: StagedIdentity[]; next: string | null; truncated?: boolean }>;
   /** Pass 4: write the rows of these keys on `tx`; returns the rows the index accepted. */
   regenerate(tx: SqlExecutor, read: R, keys: ReadonlySet<string>): Promise<number>;
@@ -128,7 +136,7 @@ export interface StagedReconcileDeps {
   writeKeys?: number;
   /** Index identities per delete page (default 5000, at most 10000). */
   deletePage?: number;
-  /** A fingerprint prefix kept when its key is not wanted (default "bf", the buffered feed). */
+  /** A fingerprint prefix kept when its key is not wanted (default "bf", the buffered feed; 1 to 16 characters). */
   keepFingerprintPrefix?: string;
   /** An op error this returns a reason for abandons the run (the scope owes a pass) instead of throwing. */
   abandonOn?: (error: unknown) => string | null;
@@ -153,10 +161,11 @@ export type StagedReconcileOutcome =
       resumedFrom: { phase: StagedPhase; cursor: string | null } | null;
     };
 
-/** The fingerprint of a scope's admitted manifests (key and revision, order-free). */
+/** The fingerprint of a scope's admitted manifests (key and revision, order-free, unambiguous for any characters). */
 export function admittedManifestFingerprint(sources: ReadonlyArray<{ manifestKey: string; revision: string }>): string {
-  const lines = sources.map((s) => `${s.manifestKey}${SEP}${s.revision}`).sort();
-  return createHash("sha256").update(lines.join("\n")).digest("hex");
+  const pairs = sources.map((s): [string, string] => [s.manifestKey, s.revision]);
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  return createHash("sha256").update(JSON.stringify(pairs)).digest("hex");
 }
 
 /** The canonical directory-events advisory lock key indexSearchScope takes. */
@@ -164,9 +173,9 @@ export function canonicalLockKey(scope: SessionScope, canonicalId: string): stri
   return ["96bulls:directory-events", scope.orgId, scope.workspaceId, scope.harness, canonicalId].join(SEP);
 }
 
-const ownerOf = (i: { workspaceId: string; sessionId: string }) => `${i.workspaceId}${SEP}${i.sessionId}`;
+const ownerOf = (i: { workspaceId: string; sessionId: string }) => JSON.stringify([i.workspaceId, i.sessionId]);
 const haveKey = (i: StagedIdentity) =>
-  createHash("sha256").update([i.key, ownerOf(i), String(i.tsMs), i.fingerprint, i.machineId, i.source, i.kind, i.eventId].join(SEP)).digest("base64url");
+  createHash("sha256").update(JSON.stringify([i.key, i.workspaceId, i.sessionId, i.tsMs, i.fingerprint, i.machineId, i.source, i.kind, i.eventId])).digest("base64url");
 
 interface Lease {
   runId: string;
@@ -274,6 +283,8 @@ export async function runStagedReconcile<R>(
         const step = await deps.transact(async (tx) => {
           const page = await ops.scanPage(tx, cursor, scanSize);
           if (page.truncated) return "truncated" as const;
+          // A scan that does not move forward would page forever.
+          if (page.next !== null && cursor !== null && page.next <= cursor) throw new Error("staged reconcile: index scan cursor did not advance");
           const entries = page.rows.map((i) => ({
             k: haveKey(i), m: i.key, o: ownerOf(i), t: i.tsMs, f: i.fingerprint,
             p: { key: i.key, machineId: i.machineId, sessionId: i.sessionId, source: i.source, kind: i.kind, eventId: i.eventId, workspaceId: i.workspaceId, tsMs: i.tsMs, fingerprint: i.fingerprint },
@@ -330,18 +341,16 @@ export async function runStagedReconcile<R>(
       await boundary("write:done");
     }
 
-    const r = await source();
-    if (r === null) {
-      await abandon("source_incomplete");
-      return { status: "incomplete", reasons: ["source_incomplete"] };
-    }
     const outcome = await deps.transact(async (tx): Promise<StagedReconcileOutcome> => {
+      // Locks first, in indexSearchScope's order (scope, then the source, then canonical); then
+      // the run row, held to the end so no takeover can interleave with the final step.
       const lock = async (key: string) =>
         (await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [key])).rows[0]?.ok === true;
       if (!(await lock(scopeLockKey(scope, "search")))) {
         await advance(tx, "final", null, { release: true });
         return { status: "busy", reason: "scope_busy" };
       }
+      await advance(tx, "final", null);
       const now = await ops.currentSource(tx);
       if (now.canonicalId !== stamp.canonicalId || now.epoch !== stamp.epoch || now.manifestFingerprint !== stamp.manifestFingerprint) {
         await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_changed"]);
@@ -350,6 +359,12 @@ export async function runStagedReconcile<R>(
       if (!(await lock(canonicalLockKey(scope, stamp.canonicalId)))) {
         await advance(tx, "final", null, { release: true });
         return { status: "busy", reason: "canonical_scope_busy" };
+      }
+      // A run resumed at the final step reads the source here, under the locks.
+      const r = await source();
+      if (r === null) {
+        await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_incomplete"]);
+        return { status: "incomplete", reasons: ["source_incomplete"] };
       }
       await boundary("final:locked");
       // As streamedReconcile: a refused write (stale version) deletes nothing and is not current.

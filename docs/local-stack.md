@@ -466,6 +466,43 @@ byte budget (scopes up to 2 GiB under 500000 records) and the paged scan itself.
 
 Turning the default on is a separate, gated step, not part of this slice.
 
+### Staged reconcile (Phase 3, not wired yet)
+
+Migration `20261105062110_search_reconcile_staging.sql` and `src/session-pipeline/staged-reconcile.ts` let the
+streaming reconcile above keep its diff state in Postgres instead of in memory, commit it in batches, and resume after
+a crash. They sit behind `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (default off). Nothing calls them yet: the consumer
+wiring is a later change, so applying the migration changes no runtime path.
+
+- **Tables.** `sessions.search_reconcile_runs_v1` holds one run per scope: the source stamp it started from
+  (canonical id, directory epoch, admitted-manifest fingerprint), its phase (`want`, `have`, `write`, `final`), the
+  cursor reached in that phase, and its lease. `sessions.search_reconcile_stage_v1` holds the staged keys: the wanted
+  identities from passes 1-3 and the index scan. Both tables have RLS on and no table grants.
+- **Functions.** The seven `sessions.search_reconcile_*_v1` writers are SECURITY DEFINER, and only
+  `search_consumer_runtime` may execute them. Each call checks the run's lease nonce and renews the lease. Once a lease
+  has expired, the next claim takes the run over and resumes at its committed cursor. The old holder then gets
+  SQLSTATE `RH062`.
+- **Final step.** The final step is one transaction. It takes the scope and canonical advisory locks that
+  `indexSearchScope` takes and re-reads the source stamp; if the stamp changed, the run is abandoned and the next tick
+  restarts it. Otherwise it deletes, writes the directory events, catalog and state, and drops the run.
+- **Rollback.** `supabase/rollbacks/20261105062110_search_reconcile_staging.down.sql` drops only in-progress runs,
+  which then start over. It refuses while any run holds a live lease.
+
+Preconditions before the flag may be turned on anywhere (open; tracked for slice 2b):
+
+1. **Erasure.** Session erasure must call `search_reconcile_erase_scope_v1` (`eraseStagedReconcileRuns`). Until it
+   does, the staged rows of an erased session outlive the erase. Those rows hold index identities (machine, session
+   and event ids, timestamps, fingerprints) but no content. A run left behind by a session that never comes back also
+   has no sweep.
+2. **Final transaction.** The final transaction is not bounded and has no keepalive. Its deletes, the directory write
+   and (for a run resumed at that step) the source read all run in one transaction under the advisory locks.
+3. **Fast-changing sessions.** A session whose source stamp changes faster than one run completes never finishes.
+   This needs a policy and metrics on `attempts` and `last_error`.
+4. **Consumer registration.** The writers must be registered for the consumer login: `CONSUMER_RUNTIME_FUNCTIONS`
+   (the live sessions-function gate) and the `session_consumer_role_verify.sql` allowlist. Without that, applying the
+   migration fails the consumer's readiness.
+5. **Passes 1-3 are not staged** (the stage table reserves the `fold` and `directory_seen` sides). A resumed run reads
+   the source again whenever it still needs the read.
+
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 
 The hosted session pipeline Lambda has its own flags, separate from the self-host ones above (it keeps ignoring

@@ -1,6 +1,7 @@
 -- Drops the 20261105062110 search reconcile staging functions, its two tables
 -- (sessions.search_reconcile_stage_v1 and sessions.search_reconcile_runs_v1, with their indexes) and its ledger row.
 -- Dropping the stage tables loses only in-progress staged runs: their next reconcile tick starts the scope over.
+-- Refused while a run holds a live lease (a consumer is mid-run): stop the consumer or wait for the lease to expire.
 -- Guard, object removal and ledger removal are one transaction under the migrator lock.
 -- On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
@@ -12,8 +13,11 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062110_search_reconcile_staging.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search reconcile staging: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062110_search_reconcile_staging.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'2ffc8d71cc716ad67f478324a51c9865e2f2bb73ce326e903bda30c2a56d79e1'
+ IF NOT FOUND OR v_sha<>'8912937044fed86f51511bc01ae1c4deceaacbcf0557a06ae4bc77b8e3d403b2'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search reconcile staging: own applied checksum required';END IF;
+ IF to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL
+    AND EXISTS(SELECT 1 FROM sessions.search_reconcile_runs_v1 WHERE lease_nonce IS NOT NULL AND lease_expires_at>clock_timestamp())
+ THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='search reconcile staging: a staged run holds a live lease';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer),
  sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text),
