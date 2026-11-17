@@ -194,14 +194,16 @@ The backup is created private to you (`umask 077`, a 0700 directory). The
 `alpine` image is the same digest-pinned one `local-init` uses.
 
 ```sh
-umask 077
-mkdir -m 700 -p ~/relayhistory-backup
-rhc stop proxy session-ingest session-pipeline-consumer session-read-api
-rhc exec -T db pg_dump -U postgres -Fc postgres > ~/relayhistory-backup/pg.dump
-docker run --rm -v relayhistory-local_locker:/locker:ro -v ~/relayhistory-backup:/out \
-  alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
-  tar -C /locker -czf /out/locker.tgz .
-rhc start session-ingest session-pipeline-consumer session-read-api proxy
+( umask 077
+  mkdir -m 700 -p ~/relayhistory-backup
+  chmod 700 ~/relayhistory-backup
+  rhc stop proxy session-ingest session-pipeline-consumer session-read-api
+  rhc exec -T db pg_dump -U postgres -Fc postgres > ~/relayhistory-backup/pg.dump
+  docker run --rm -v relayhistory-local_locker:/locker:ro -v ~/relayhistory-backup:/out \
+    alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
+    tar -C /locker -czf /out/locker.tgz .
+  rhc start session-ingest session-pipeline-consumer session-read-api proxy
+)
 ```
 
 To restore into a fresh install:
@@ -210,7 +212,8 @@ To restore into a fresh install:
 that already exists in the database before recreating it. Run it only against
 the install you mean to overwrite.
 
-1. Run `rhc up -d roles local-init`. That starts `db` and runs `migrate`,
+1. If the stack is already running, first run `rhc stop proxy session-ingest session-pipeline-consumer session-read-api`.
+   Then run `rhc up -d roles local-init`. That starts `db` and runs `migrate`,
    `consumer-bootstrap`, `roles` and `local-init`, so the roles and schema
    exist, but never starts the proxy, ingest, consumer or read API, so nothing
    writes while you restore.

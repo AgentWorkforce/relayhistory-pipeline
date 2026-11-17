@@ -51,7 +51,7 @@ const SOURCE_NAMES: Set<string> = (() => {
     for (const entry of readdirSync(path, { withFileTypes: true })) {
       const full = join(path, entry.name);
       if (entry.isDirectory()) {
-        if (entry.name !== "node_modules" && entry.name !== "__tests__" && entry.name !== "dist") walk(full);
+        if (!["node_modules", "__tests__", "dist", "test", "fixtures"].includes(entry.name)) walk(full);
         continue;
       }
       if (/\.test\.[cm]?[jt]sx?$/.test(entry.name)) continue;
@@ -96,7 +96,8 @@ function envKeyProblems(svcs: Record<string, Service>): string[] {
     const script = DEPLOY_SCRIPT_KEYS[key];
     if (script) {
       if (name !== script.service) problems.push(`${name}.${key}: only ${script.service} may set it`);
-      if (!readFileSync(join(DIR, script.file), "utf8").includes(key)) problems.push(`${name}.${key}: not read by ${script.file}`);
+      if (!/^[A-Z0-9_]+$/.test(key)) problems.push(`${name}.${key}: key is not [A-Z0-9_]+`);
+      else if (!new RegExp("\\b" + key + "\\b").test(readFileSync(join(DIR, script.file), "utf8"))) problems.push(`${name}.${key}: not read by ${script.file}`);
     } else if (LIBPQ_KEYS.has(key)) {
       if (name !== "roles" || !(svc.entrypoint ?? []).includes("/deploy/roles.sh")) problems.push(`${name}.${key}: libpq key outside roles.sh`);
     } else if (IMAGE_KEYS[key] !== undefined) {
@@ -111,7 +112,7 @@ function interpolationProblems(svcs: Record<string, Service>, text: string): str
   const referenced = new Set([...code.matchAll(/\$\{([A-Z0-9_]+)/g)].map(m => m[1]!));
   const problems: string[] = [];
   for (const name of referenced) {
-    const used = inEnv.includes(`\${${name}`);
+    const used = new RegExp("\\$\\{" + name + "[:}?-]").test(inEnv);
     if (INTERPOLATION_ONLY[name] !== undefined && used) problems.push(`${name}: listed interpolation-only but reaches an environment`);
     if (INTERPOLATION_ONLY[name] === undefined && !used) problems.push(`${name}: referenced but not in any environment nor INTERPOLATION_ONLY`);
   }
