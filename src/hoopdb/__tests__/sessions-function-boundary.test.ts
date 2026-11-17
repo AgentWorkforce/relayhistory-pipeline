@@ -21,6 +21,7 @@ import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from
 import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions-reader.ts";
 import { ingestOriginClaimFence, originalBodies as originalOriginFenceBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-origin-claim-fence.ts";
+import { turnsSelectionOriginGuard } from "../../../scripts/sessions-function-boundary/lanes/turns-selection-origin-guard.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -94,6 +95,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105057030_selfhost_erase_directory_membership.down.sql",
       "supabase/rollbacks/20261105059000_ingest_publication_gcs_provider.down.sql",
       "supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql",
+      "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql",
     ]);
   });
 
@@ -268,6 +270,27 @@ describe("unified sessions function-boundary generator", () => {
     expect(down.indexOf(bodies[0]!)).toBeLessThan(down.indexOf("DROP TABLE sessions.ingest_origin_claim_marks;"));
     expect(down).not.toContain("status='pending'");
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 062060 turns origin guard changes no ACL capability and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((lane) => lane !== turnsSelectionOriginGuard), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql";
+    expect(withLane.summary.lanes["turns-selection-origin-guard"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((path) => !(path in without.outputs))).toEqual([downPath]);
+    const acl = JSON.parse(withLane.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const before = JSON.parse(without.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    expect(acl["sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)"]).toEqual(
+      before["sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)"],
+    );
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, turnsSelectionOriginGuard.migration!), "utf8")).digest("hex"));
+    expect(down).toContain("PERFORM sessions.ingest_lock_fences(p_org,p_ws,p_user)");
+    expect(down).not.toContain("turns origin is reserved");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);

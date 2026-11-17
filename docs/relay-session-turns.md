@@ -61,6 +61,10 @@ Khaliq's explicit approval. In order:
    registration shares its global privacy lock, and the erase-ledger insert removes that user's
    auxiliary writer rows. Its separate erase path removes the user's bytes and index rows; it does
    not claim a per-session directory witness.
+   The append-only `20261105062060_turns_selection_origin_guard.sql` migration separately reserves
+   the synthetic turns origin at the ordinary selection SQL boundary. The public delivery,
+   selection, and archive-recovery HTTP boundaries reject the same origin before it can reach an
+   ordinary ingest path.
 3. **Custody.** Cloud forward is Neon-free only in `frozen-supabase`. `supabase-authority` continues
    to refuse all non-empty turn writes and must not be used for this migration. Flip custody first,
    under its own runbook and approval.
@@ -84,12 +88,31 @@ Khaliq's explicit approval. In order:
    `(workspace, source, session, turn_index)`. Run `--verify` successfully after the final export;
    once forward begins, never return to `neon` without re-exporting the affected scopes.
 
-Activation is allowed only after the migration is applied, the legacy fence import and legacy export
+Activation is allowed only after the required migrations are applied (including the append-only
+selection-origin guard), the legacy fence import and legacy export
 both verify equal, `frozen-supabase` is already healthy, owner-buffered exact-session reads and
 canonical reads are healthy for the canary, and publication/GC have no backlog. `TURNS_WRITE_PATH`
 stays unset/`neon` while these code changes are reviewed.
 
+Before the approved schema apply, rehearse the rollout backfill against the disposable rehearsal copy
+and record its lock-hold duration. The apply may hold `upload_deletions`,
+`operator_user_erasures`, and `session_directory` locks for up to the migration's 120-second
+statement timeout; any timeout or unexplained lock wait fails the release closed.
+
 ## Rollback
-Unset `TURNS_WRITE_PATH` (live in seconds). Records already forwarded stay canonical. Neon is
-complete only for a preceding `dual` interval; after any direct `forward` interval, returning to
-Neon would split authority and is forbidden until the affected scopes are re-exported and verified.
+Unset `TURNS_WRITE_PATH` (live in seconds); this runtime flag-off is the supported rollback. The
+database down migration is permanently refused after the first successful turn registration because
+dropping its durable witness could reveal a later directory retry. Records already forwarded stay
+canonical. Neon is complete only for a preceding `dual` interval; after any direct `forward`
+interval, returning to Neon would split authority and is forbidden until the affected scopes are
+re-exported and verified.
+
+Before the first registration only, a separately approved schema rollback must first roll back
+`20261105062060_turns_selection_origin_guard.sql`, then run
+`supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql` with psql
+`ON_ERROR_STOP`. The wrapper sets the statement and lock timeouts, validates the exact migration
+ledger entry, and then invokes the frozen down file in the same transaction. The frozen down can
+abort a concurrent erasure because their table-lock orders differ; the abort is retriable and fails
+closed, but the operator must first pause every selection and erasure intake path and use a quiet
+window. Treat any timeout as a failed rollback. Never run the bare
+`20261105062020_turns_forward_gates.down.sql` directly.

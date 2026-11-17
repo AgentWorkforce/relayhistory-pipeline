@@ -469,6 +469,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.turn_session_fences and turns capability/registration RPCs",
     sql: "SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_capability(jsonb)') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_register(jsonb)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062060_turns_selection_origin_guard.sql": {
+    evidence: "replacement: ingest_apply_selection rejects the reserved turns origin",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)') AND NOT prosecdef AND prosrc LIKE '%turns origin is reserved%') AS applied",
+  },
   "upstream:20261105062080_memory_documents.sql": {
     evidence: "tables sessions.decision_records_v1 and sessions.decision_evidence_v1 and function sessions.decision_records_insert_v1",
     sql: "SELECT to_regclass('sessions.decision_records_v1') IS NOT NULL AND to_regclass('sessions.decision_evidence_v1') IS NOT NULL AND to_regprocedure('sessions.decision_records_insert_v1(text,text,jsonb)') IS NOT NULL AS applied",

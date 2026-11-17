@@ -1,0 +1,30 @@
+\set ON_ERROR_STOP on
+-- Canonical operator wrapper for the frozen 062020 down migration. Do not run
+-- 20261105062020_turns_forward_gates.down.sql directly.
+--
+-- PRECONDITION: pause every erasure/selection intake path before invoking this file.
+-- The frozen down's table-lock order can abort a concurrent erasure; that failure is
+-- retriable and fail-closed, but the wrapper must not be used while intake is live.
+-- The migration lock orders the ledger preflight against every schema apply. The
+-- frozen down takes the same lock re-entrantly after this wrapper sets both timeouts.
+BEGIN;
+SET LOCAL statement_timeout='120s';
+SET LOCAL lock_timeout='5s';
+SELECT pg_advisory_xact_lock(961996,1);
+DO $operator_guard$
+DECLARE v_sha text;
+BEGIN
+  SELECT sha256 INTO v_sha
+    FROM sessions.__96bulls_migrations
+   WHERE name = 'upstream:20261105062020_turns_forward_gates.sql';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'turns forward gates: migration ledger entry missing'
+      USING ERRCODE = '55000';
+  END IF;
+  IF v_sha IS DISTINCT FROM '63ca3c75bd1b09ec32369e761446da6a592e57fd90aca6640e9fb6a5dbd8ff5a' THEN
+    RAISE EXCEPTION 'turns forward gates: applied checksum mismatch'
+      USING ERRCODE = '55000';
+  END IF;
+END
+$operator_guard$;
+\ir 20261105062020_turns_forward_gates.down.sql
