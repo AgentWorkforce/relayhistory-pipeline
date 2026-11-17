@@ -92,7 +92,7 @@ test("inputs: the org list is validated, deduplicated and C ordered (1..50); mod
   expect(await d({ ORG_REPAIR_MODE: "plan", ORG_REPAIR_ORGS: "" })).toBe("org_admission_repair_orgs");
 });
 
-test("readback writes nothing and reports, per org index, admission and the rows every scanned table holds; drift is reported, not refused", async () => {
+test("readback writes nothing and reports, per org index, admission and which scanned tables hold rows (never counts); drift is reported, not refused", async () => {
   const f = await fixture();
   const before = await f.state();
   const r = (await f.op("readback", { orgs: [...F.targets, F.admitted, F.foreign].join(",") })).receipt;
@@ -101,8 +101,10 @@ test("readback writes nothing and reports, per org index, admission and the rows
   expect(r.orgCount).toBe(4);
   expect(r.orgsSha256).toBe(sha256(sorted.join("\n")));
   const at = (org: string) => r.orgs[sorted.indexOf(org)]!;
-  for (const org of F.targets)
-    expect(at(org)).toMatchObject({ admitted: false, tablesWithRows: ["ingest_seed_source_epochs"], counts: { ingest_seed_source_epochs: 2 } });
+  for (const org of F.targets) {
+    expect(at(org)).toMatchObject({ admitted: false, tablesWithRows: ["ingest_seed_source_epochs"] });
+    expect(at(org)).not.toHaveProperty("counts");
+  }
   expect(at(F.admitted)).toMatchObject({ admitted: true, tablesWithRows: ["ingest_seed_source_epochs"] });
   expect(at(F.foreign).tablesWithRows).toEqual(["ingest_seed_fence_baselines", "ingest_seed_source_epochs"]);
   expect(r).toMatchObject({ drift: "org_admission_repair_already_admitted", driftDetail: `org#${sorted.indexOf(F.admitted)}`,

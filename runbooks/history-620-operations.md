@@ -241,22 +241,30 @@ will refuse every claim until the org is admitted. If those rows are only seed-e
 dispatch is from `main` at the exact head SHA and needs Khaliq's approval on `session-schema-production`. Pass the
 org ids only as the `orgs` input, comma-separated, and use the same list for every step. Never commit org ids.
 
-1. **readback** (allowed while dormant). For each org index, it reports whether the org is admitted and the row
-   count in every table the live scan sees. Continue only if every org shows only `ingest_seed_source_epochs` and
-   `drift` is `null`.
+1. **readback** (allowed while dormant: with the flag off, plan and admit cannot write; readback still takes the
+   migrator advisory lock for its scan). For each org index, it reports whether the org is admitted and which
+   tables the live scan sees rows in, never row counts. Continue only if every org shows only
+   `ingest_seed_source_epochs` and `drift` is `null`. Also check that every id passed the format check; an id
+   outside `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` is refused and needs a reviewed widening first.
 2. **Enable.** Set `ORG_ADMISSION_REPAIR_ENABLED` to `true` in a reviewed one-line change, and set it back to
    `false` after the repair.
 3. **plan.** This refuses if any org is admitted, has rows in another table, or has no rows, or if the policy is
    expired or not at the PASS generation. From the 1-day plan artifact, copy the
    `ADMIT-ORGS <project> <sha> GENERATION <g> VALID_UNTIL <v> ORGS <d> COUNT <n> PLAN <run>` confirmation.
+   Plan and admit must run at the same `main` head: ask `layered-sessions-pipeline` to hold landings from the
+   enable commit until the admit has run, and wait for push CI on the enable commit before planning.
 4. **admit** with the same `sha`, the same `orgs`, `plan_run` and that confirmation, within 24 h. Any drift since
    the plan refuses and writes nothing. That includes a renewal, a new admission, a new table, or new rows outside
-   the allowlist. If it refuses, run readback and plan again.
+   the allowlist. If it refuses, run readback and plan again. Expect a brief claim stall during the admit: it holds
+   `ingest_buffer_admission` in `SHARE ROW EXCLUSIVE` for the scan, the inserts and the guard calls, so every
+   `ingest_lazy_begin` (its `INSERT ... ON CONFLICT`) waits behind it, as with renewal.
 5. **Verify.** Check that the receipt says `ORG_ADMISSION_REPAIRED` with `committed: true` and that
    `org_prior_authority_unbound` stops for those orgs. The clients' pending claims then apply on retry.
 
-This repairs only the orgs you list. The class fix, a forward migration that removes `ingest_seed_source_epochs`
-from the scan, is separate. After it lands, this operator refuses with `org_admission_repair_scan_drift`.
+This repairs only the orgs you list, at most 50 per dispatch: a stop-gap. 040000 backfilled
+`ingest_seed_source_epochs` from every `session_index` row, so any org with session history and no admission row
+hits the same loop. The class fix, a forward migration that removes `ingest_seed_source_epochs` from the scan, is
+separate. After it lands, this operator refuses with `org_admission_repair_scan_drift`.
 
 Every line built from the batch route's fields (`route` `delivery.batches` and `turns.batches`: the
 outcome line, and the capture-policy and upload-consent lines emitted from that route) carries

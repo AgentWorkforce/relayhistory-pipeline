@@ -119,7 +119,7 @@ async function main() {
     const before = await f.state();
     const read = await f.op("readback");
     if (read.receipt.drift !== null || read.receipt.orgs.some((o) => o.admitted ||
-        JSON.stringify(o.tablesWithRows) !== '["ingest_seed_source_epochs"]' || o.counts?.ingest_seed_source_epochs !== 2))
+        JSON.stringify(o.tablesWithRows) !== '["ingest_seed_source_epochs"]' || "counts" in o))
       fail("readback");
     const planned = await f.op("plan");
     if (!planned.plan || JSON.stringify(await f.state()) !== JSON.stringify(before)) fail("plan_wrote");
