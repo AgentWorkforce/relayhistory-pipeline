@@ -54,7 +54,7 @@
  * lock in the same transaction as the insert, exactly as lazy_begin's does.
  *
  * Canonical timestamps and ledger proof are the renewal operator's (canonicalMs, admissionRenewalLedger). Never
- * prints org ids or identity hashes; receipts carry indexes, counts, table names, canonical timestamps, an
+ * prints org ids or identity hashes; receipts carry indexes, table names (never per-org row counts), canonical timestamps, an
  * 8-character generation prefix, the bound digests and verdicts.
  */
 import { createHash } from "node:crypto";
@@ -305,8 +305,6 @@ export interface OrgAdmissionRepairOrgScan {
   index: number;
   admitted: boolean;
   tablesWithRows: string[];
-  /** readback only: rows per scanned table with any (the count lazy_begin's EXISTS would see as non-zero). */
-  counts: Record<string, number> | null;
   scanSha256: string;
 }
 export interface OrgAdmissionRepairVerdicts {
@@ -332,12 +330,12 @@ export interface OrgAdmissionRepairSnapshot {
 
 /**
  * One consistent read: clock, marker, policy, (lock: the admission table), live scan body, the scanned tables, the
- * orgs' admission rows and, per table, which orgs have rows (counts in readback; skipped with scan: false, whose
+ * orgs' admission rows and, per table, which orgs have rows (presence only, never counts; skipped with scan: false, whose
  * drift and per-org scans are then not meaningful). `lock` (admit only): the marker row
  * FOR SHARE, the policy row FOR SHARE, then the admission table SHARE ROW EXCLUSIVE, in ingest_lazy_begin's order.
  */
 async function snapshot(client: MigrationClient, orgs: readonly string[], ledger: AdmissionRenewalLedger | null,
-  ledgerDrift: string | null, opts: { lock: boolean; counts: boolean; scan?: boolean }): Promise<OrgAdmissionRepairSnapshot> {
+  ledgerDrift: string | null, opts: { lock: boolean; scan?: boolean }): Promise<OrgAdmissionRepairSnapshot> {
   const clock = (await client.query<{ now: string; now_us: string }>(NOW_SQL)).rows[0]!;
   const nowUs = BigInt(clock.now_us);
   const marker = (await client.query<{ generation: string; status: string }>(
@@ -354,24 +352,20 @@ async function snapshot(client: MigrationClient, orgs: readonly string[], ledger
   const admissionTotal = Number((await client.query<{ n: string }>(
     "SELECT count(*)::text AS n FROM sessions.ingest_buffer_admission")).rows[0]!.n);
   const withRows = orgs.map(() => [] as string[]);
-  const counts = orgs.map(() => ({} as Record<string, number>));
   const index = new Map(orgs.map((o, i) => [o, i] as const));
   for (const t of opts.scan === false ? [] : tables) {
-    const sql = opts.counts
-      ? `SELECT o AS org_id,(SELECT count(*) FROM sessions.${quoteIdent(t)} WHERE org_id=o)::text AS n
-          FROM jsonb_array_elements_text($1::jsonb) o`
-      : `SELECT o AS org_id,'1' AS n FROM jsonb_array_elements_text($1::jsonb) o
+    // Presence only: per-org row counts would publish session volumes in a public run's receipt.
+    const sql = `SELECT o AS org_id,'1' AS n FROM jsonb_array_elements_text($1::jsonb) o
           WHERE EXISTS(SELECT 1 FROM sessions.${quoteIdent(t)} WHERE org_id=o)`;
     for (const r of (await client.query<{ org_id: string; n: string }>(sql, [orgsJson])).rows) {
       const i = index.get(r.org_id), n = Number(r.n);
       if (i === undefined || !(n > 0)) continue;
       withRows[i]!.push(t);
-      counts[i]![t] = n;
     }
   }
   const admittedSet = new Set(rows.map((r) => r.org_id));
   const scans: OrgAdmissionRepairOrgScan[] = orgs.map((o, i) => ({
-    index: i, admitted: admittedSet.has(o), tablesWithRows: withRows[i]!, counts: opts.counts ? counts[i]! : null,
+    index: i, admitted: admittedSet.has(o), tablesWithRows: withRows[i]!,
     scanSha256: orgAdmissionRepairScanDigest(tables, withRows[i]!, admittedSet.has(o)),
   }));
   const policy = policies.length === 1 ? policies[0]! : null;
@@ -474,13 +468,13 @@ export async function runOrgAdmissionRepair(client: MigrationClient, input: OrgA
         const c = (error as { code?: unknown }).code;
         ledgerDrift = typeof c === "string" && /^[a-z0-9_]{1,64}$/u.test(c) ? c : "org_admission_repair_ledger";
       }
-      const s = await snapshot(client, input.orgs, ledger, ledgerDrift, { lock: false, counts: true });
+      const s = await snapshot(client, input.orgs, ledger, ledgerDrift, { lock: false });
       await client.query("ROLLBACK");
       return { receipt: receiptOf(input, ledger, s, s, "ORG_ADMISSION_REPAIR_READBACK", false), plan: null };
     }
     const ledger = await admissionRenewalLedger(client);
     if (input.mode === "plan") {
-      const s = await snapshot(client, input.orgs, ledger, null, { lock: false, counts: false });
+      const s = await snapshot(client, input.orgs, ledger, null, { lock: false });
       if (s.drift !== null) refuse(s.drift, s.driftDetail ?? undefined);
       const capturedMs = canonicalMs(s.now);
       if (capturedMs === null || BigInt(capturedMs) * 1000n !== s.nowUs) refuse("org_admission_repair_timestamp_precision");
@@ -500,7 +494,7 @@ export async function runOrgAdmissionRepair(client: MigrationClient, input: OrgA
     if (plan.ledgerTail !== ledger.ledgerTail || plan.stepCount !== ledger.stepCount ||
         plan.ledgerPrefixDigest !== ledger.ledgerPrefixDigest)
       refuse("org_admission_repair_ledger_drift");
-    const before = await snapshot(client, input.orgs, ledger, null, { lock: true, counts: false });
+    const before = await snapshot(client, input.orgs, ledger, null, { lock: true });
     if (before.drift !== null) refuse(before.drift, before.driftDetail ?? undefined);
     if (before.generation !== plan.generation) refuse("org_admission_repair_generation_stale");
     const ageUs = before.nowUs - BigInt(Date.parse(plan.capturedAt)) * 1000n;
@@ -528,7 +522,7 @@ export async function runOrgAdmissionRepair(client: MigrationClient, input: OrgA
       inserted += n;
     }
     // No per-table rescan here (the table lock is held): the rows, totals, policy and scanned-table set are re-read.
-    const after = await snapshot(client, input.orgs, ledger, null, { lock: false, counts: false, scan: false });
+    const after = await snapshot(client, input.orgs, ledger, null, { lock: false, scan: false });
     const byOrg = new Map(after.rows.map((r) => [r.org_id, r] as const));
     if (inserted !== input.orgs.length || after.admissionTotal !== before.admissionTotal + input.orgs.length ||
         after.rows.length !== input.orgs.length || after.policyDescriptorSha256 !== before.policyDescriptorSha256 ||
