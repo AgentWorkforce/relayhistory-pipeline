@@ -63,18 +63,27 @@ marker, and the result is cached with it for 60 s per org:
     execute). The ownership stubs, revision shards and re-arm markers go to
     the ledger bucket with no encryption header, so its default applies. Both
     stores use the same AWS credentials.
-  - Set, they first require the ledger bucket's marker to name that bucket,
-    whatever the guard says: `ledger_home_missing` or `ledger_home_moved`, as
-    the edge does.
+  - Set, they first check both markers, whatever the guard says. The Locker
+    bucket's own marker (the "moved" one step 5 writes) must exist and name
+    exactly that ledger bucket, else `ledger_home_mismatch`: a setting that
+    points at another environment's or a stale ledger refuses before any
+    write, even if that bucket's own marker names itself. Then the ledger
+    bucket's marker must name it: `ledger_home_missing` or
+    `ledger_home_moved`, as the edge does.
+  - During a run they re-check, as the edge does about once a minute: before
+    any write made a minute or more after the last good check, the same check
+    runs again, and a refusal stops every later write.
   - Unset, they behave as the other single-bucket tools below.
-  - The backfill checks the marker only when an ownership or revision section
-    runs. A fences-only run needs no ledger bucket and reads no marker; the
-    fences never move.
+  - The backfill checks the markers unless every section it runs is
+    `fences` (an empty section list is checked too). A fences-only run needs
+    no ledger bucket and reads no marker; the fences never move.
   - A dry run writes neither bucket: the library refuses every put and delete
     through the routed store.
   - The backlog-ops workflow (`.github/workflows/backlog-ops.yml`) always runs
-    its tools with `INGEST_LEDGER_HOME_GUARD=on`. The credential step forces
-    it into the tool's environment, so the workflow file cannot drop it. It
+    the backfill and the drain with `INGEST_LEDGER_HOME_GUARD=on`. The
+    credential step adds it to the tool's environment in code, so the
+    workflow file cannot drop it (or add it: the step's own environment never
+    reaches the tool). It
     passes the ledger bucket to the backfill and the drain from the protected
     environment variables `BACKLOG_OPS_LEDGER_BUCKET` and
     `BACKLOG_OPS_LEDGER_REGION` (docs/backlog-ops-workflow.md). Without them,
@@ -82,7 +91,8 @@ marker, and the result is cached with it for 60 s per org:
     the Locker bucket's stale copy.
   - The accepted-stage export, which the workflow also runs, reads the fences
     and writes stage sidecars and completion records. None of these is a
-    ledger key, so it is unaffected.
+    ledger key, so it is unaffected. It is given the guard variable too, but
+    never reads a marker, so the variable does nothing for it.
 - The other single-bucket operator tools (`ledger-reshard-revisions.ts`,
   `ledger-log-stream.ts`) are not ledger-bucket aware, and no workflow runs
   them. They, like the two tools above without a ledger bucket, read their
@@ -92,6 +102,9 @@ marker, and the result is cached with it for 60 s per org:
     - `ledger_home_moved`: a valid marker names another bucket.
     - `ledger_home_missing`: a ledger bucket is configured and its marker is
       absent (the ledger-aware tools only).
+    - `ledger_home_mismatch`: a ledger bucket is configured and the Locker
+      bucket's marker is absent or names another bucket (the ledger-aware
+      tools only).
     - `ledger_home_invalid`: the marker body is bad.
     - `access_denied`: a 403.
     - `ledger_home_unavailable`: a transient failure (5xx, 429, 408, or a

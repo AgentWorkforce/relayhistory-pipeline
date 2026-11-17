@@ -18,13 +18,18 @@
  * (`<root>/.admission-inbox/<org>/v1/ws=<ws>/m=<srv>/ledger/...` and the ledger-home marker) to the ledger store, which sends
  * NO encryption header (the bucket's default, SSE-S3, applies, as on the edge). Both stores use the same credentials.
  *
- * The home check (`assertToolLedgerHome`): with a ledger bucket, always, in the ledger bucket, refusing unless its
- * marker names that bucket (`ledger_home_missing`, `ledger_home_moved`), as the edge does. Without one, the existing
- * single-bucket check (`assertLedgerHomeHere`: with INGEST_LEDGER_HOME_GUARD=on, `ledger_home_moved` when the Locker
- * bucket's marker names another bucket; off, no request).
+ * The home check (`assertToolLedgerHome`): with a ledger bucket, always, on BOTH sides: the Locker bucket's own marker
+ * (the old location, where the relocation wrote "moved") must exist and name exactly that ledger bucket
+ * (`ledger_home_mismatch`: a setting pointing at another environment's or a stale ledger refuses here, before any
+ * write), and the ledger bucket's marker must name it (`ledger_home_missing`, `ledger_home_moved`), as the edge checks.
+ * Without one, the existing single-bucket check (`assertLedgerHomeHere`: with INGEST_LEDGER_HOME_GUARD=on,
+ * `ledger_home_moved` when the Locker bucket's marker names another bucket; off, no request).
+ *
+ * Long runs re-check (`homeRecheckingStore`): every write after TOOL_HOME_RECHECK_MS (60 s, the edge's cadence) since
+ * the last good check first runs the same check again; a refusal stops every later write with that code.
  */
 import { createS3Store, type ObjectStore } from "../shared/vendor.ts";
-import { assertLedgerHomeHere, assertLedgerHomeIn, ledgerRoutedStore } from "./ledger-store.ts";
+import { assertLedgerHomeHere, assertLedgerHomeIn, assertLedgerHomeMovedTo, LedgerHomeRefused, ledgerRoutedStore } from "./ledger-store.ts";
 import { selfhostLedgerStore, type SelfhostLedgerStoreSettings } from "./selfhost-config.ts";
 
 export type ToolLedgerBucket = SelfhostLedgerStoreSettings;
@@ -57,9 +62,11 @@ export function toolStores(opts: {
   credentials: S3Credentials;
   kmsKeyArn?: string;
   create?: (config: Parameters<typeof createS3Store>[0]) => unknown;
+  /** The caller's own toolLedgerBucket(env, ...) result, when it already parsed it (parsed once); else parsed here. */
+  ledgerBucket?: ToolLedgerBucket | null;
 }): ToolStores {
   const create = opts.create ?? createS3Store;
-  const sep = toolLedgerBucket(opts.env, { bucket: opts.bucket, region: opts.region });
+  const sep = opts.ledgerBucket !== undefined ? opts.ledgerBucket : toolLedgerBucket(opts.env, { bucket: opts.bucket, region: opts.region });
   const locker = create({
     bucket: opts.bucket, region: opts.region, credentials: opts.credentials,
     ...(opts.kmsKeyArn !== undefined ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: opts.kmsKeyArn } : {}),
@@ -73,6 +80,51 @@ export function toolStores(opts: {
 /** The tool's fork guard (see the header). Throws LedgerHomeRefused with a closed code. */
 export async function assertToolLedgerHome(stores: ToolStores, keyRoot: string, lockerBucket: string,
   env: Record<string, string | undefined> = process.env): Promise<void> {
-  if (stores.ledger) return assertLedgerHomeIn(stores.store, keyRoot, stores.ledger.bucket);
+  if (stores.ledger) {
+    await assertLedgerHomeMovedTo(stores.locker, keyRoot, stores.ledger.bucket);
+    return assertLedgerHomeIn(stores.store, keyRoot, stores.ledger.bucket);
+  }
   return assertLedgerHomeHere(stores.locker, keyRoot, lockerBucket, env);
+}
+
+/** The edge re-reads the ledger-home marker about every minute; the tools do the same before a write. */
+export const TOOL_HOME_RECHECK_MS = 60_000;
+
+/**
+ * `store` with the home check re-run before a write (put or delete) once `intervalMs` has passed since the last good
+ * check (the caller ran the first one: the clock starts at creation). A refusal is sticky: every later write throws
+ * it without another request, except `ledger_home_unavailable` (transient), which the next write retries. Reads pass
+ * through unchecked (they change nothing). Concurrent writes share one re-check.
+ */
+export function homeRecheckingStore(store: ObjectStore, recheck: () => Promise<void>,
+  opts: { intervalMs?: number; now?: () => number } = {}): ObjectStore {
+  const interval = opts.intervalMs ?? TOOL_HOME_RECHECK_MS, now = opts.now ?? Date.now;
+  let checkedAt = now();
+  let refused: unknown;
+  let inflight: Promise<void> | null = null;
+  const gate = async () => {
+    if (refused !== undefined) throw refused;
+    if (now() - checkedAt < interval) return;
+    inflight ??= recheck().then(
+      () => { checkedAt = now(); },
+      (error) => { if (!(error instanceof LedgerHomeRefused && error.code === "ledger_home_unavailable")) refused = error; throw error; },
+    ).finally(() => { inflight = null; });
+    await inflight;
+  };
+  return {
+    backend: store.backend,
+    head: (key) => store.head(key),
+    get: (key, range) => store.get(key, range),
+    getObject: (key, range) => store.getObject(key, range),
+    list: (prefix, cursor) => store.list(prefix, cursor),
+    presignGet: (key, ttl) => store.presignGet(key, ttl),
+    put: async (key, body, putOpts) => { await gate(); return store.put(key, body, putOpts); },
+    delete: async (key) => { await gate(); return store.delete(key); },
+  };
+}
+
+/** The tool's store with its home check re-run during a long run (assertToolLedgerHome, homeRecheckingStore). */
+export function homeGuardedToolStore(stores: ToolStores, keyRoot: string, lockerBucket: string,
+  env: Record<string, string | undefined> = process.env, opts: { intervalMs?: number; now?: () => number } = {}): ObjectStore {
+  return homeRecheckingStore(stores.store, () => assertToolLedgerHome(stores, keyRoot, lockerBucket, env), opts);
 }

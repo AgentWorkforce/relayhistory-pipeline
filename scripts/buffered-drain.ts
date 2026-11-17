@@ -36,8 +36,10 @@
  * ledger_home_store_error | ledger_home_guard_invalid). With INGEST_LEDGER_BUCKET [/ INGEST_LEDGER_REGION /
  * INGEST_LEDGER_ENDPOINT] (the edge's variables, docs/ledger-relocation.md; invalid: ledger_bucket_invalid) the
  * ledger's own keys (the revision index, re-arm markers, ownership stubs) route to that bucket with no encryption
- * header, under the same credentials, and both modes first require ITS marker to name it (ledger_home_missing |
- * ledger_home_moved), whatever the guard says; the fences, staged batches, drained markers and layout stay in --bucket.
+ * header, under the same credentials, and both modes first require --bucket's marker to name it (ledger_home_mismatch)
+ * and ITS marker to name it (ledger_home_missing | ledger_home_moved), whatever the guard says; the fences, staged
+ * batches, drained markers and layout stay in --bucket. The check runs again before a write once a minute has passed
+ * since the last good one (homeGuardedToolStore); a refusal stops every later write.
  * --execute writes the canonical layout, the 0005 revision index, re-arm markers and the drained markers, and needs the
  * owner's explicit OK.
  *
@@ -54,7 +56,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
 import type { createS3Store, ObjectStore } from "../src/shared/vendor.ts";
 import { assertLedgerHomeGuardValid } from "../src/session-ingest/ledger-store.ts";
-import { assertToolLedgerHome, toolStores, type ToolStores } from "../src/session-ingest/ledger-tool-store.ts";
+import { assertToolLedgerHome, homeGuardedToolStore, toolLedgerBucket, toolStores, type ToolLedgerBucket, type ToolStores } from "../src/session-ingest/ledger-tool-store.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
@@ -218,12 +220,33 @@ export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs
  * refused by the library itself (drain_dry_run_write_refused), through either store.
  */
 export function drainStores(args: Pick<DrainArgs, "mode" | "bucket" | "region" | "kmsKeyArn">, env: Record<string, string | undefined>,
-  credentials: Parameters<typeof createS3Store>[0]["credentials"], create?: (config: Parameters<typeof createS3Store>[0]) => unknown): ToolStores {
+  credentials: Parameters<typeof createS3Store>[0]["credentials"], create?: (config: Parameters<typeof createS3Store>[0]) => unknown,
+  ledgerBucket?: ToolLedgerBucket | null): ToolStores {
   return toolStores({
     env, bucket: args.bucket, region: args.region, keyRoot: KEY_ROOT, credentials,
     ...(args.mode === "execute" ? { kmsKeyArn: args.kmsKeyArn! } : {}),
     ...(create ? { create } : {}),
+    ...(ledgerBucket !== undefined ? { ledgerBucket } : {}),
   });
+}
+
+/**
+ * The drain's process entry after its preflight, in order: the stores (INGEST_LEDGER_* parsed once), the fork guard
+ * (assertToolLedgerHome) BEFORE the first listing or write, then runDrain through a store that re-runs the guard
+ * before a write once a minute has passed since the last good check (homeGuardedToolStore).
+ */
+export async function runDrainTool(args: DrainArgs, deps: {
+  env: Record<string, string | undefined>;
+  credentials: Parameters<typeof createS3Store>[0]["credentials"];
+  orgs: () => Promise<string[]>;
+  create?: (config: Parameters<typeof createS3Store>[0]) => unknown;
+  stderr?: (line: string) => void;
+  recheck?: { intervalMs?: number; now?: () => number };
+}): Promise<DrainSummary> {
+  const stores = drainStores(args, deps.env, deps.credentials, deps.create, toolLedgerBucket(deps.env, args));
+  await assertToolLedgerHome(stores, KEY_ROOT, args.bucket, deps.env);
+  const store = homeGuardedToolStore(stores, KEY_ROOT, args.bucket, deps.env, deps.recheck);
+  return runDrain(args, { store, orgs: deps.orgs, ...(deps.stderr ? { stderr: deps.stderr } : {}) });
 }
 
 if (import.meta.main) {
@@ -242,10 +265,7 @@ if (import.meta.main) {
   const credentials: AwsCredentials = { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) };
   try {
     assertLedgerHomeGuardValid();
-    const stores = drainStores(args, process.env, credentials);
-    await assertToolLedgerHome(stores, KEY_ROOT, args.bucket, process.env);
-    const store = stores.store;
-    const summary = await runDrain(args, { store, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
+    const summary = await runDrainTool(args, { env: process.env, credentials, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {
     // A closed reason only: an S3 error message can carry a key.

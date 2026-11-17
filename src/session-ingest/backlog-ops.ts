@@ -146,6 +146,7 @@ const ROLE_ARN = /^arn:aws:iam::([0-9]{12}):role\/[A-Za-z0-9+=,.@_-]{1,64}$/u;
 const CODE = /^[a-z][a-z0-9_]{0,39}$/u;
 const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SCOPE_ID = /^(all|orgs_[0-9a-f]{32})$/u;
+const LEDGER_ID = /^(none|ledger_[0-9a-f]{32})$/u;
 /** The most orgs one scoped run may name. */
 export const BACKLOG_OPS_MAX_ORGS = 64;
 const KEY = /^[a-z][a-z0-9_]{0,63}$/u;
@@ -285,10 +286,12 @@ export const BACKLOG_OPS_LEDGER_TOOLS: readonly BacklogOpsTool[] = ["backfill", 
 /**
  * The ledger variables every S3 tool child gets (the backfill, the export and the drain; never presence-dry, which
  * reads no S3), added by scripts/backlog-ops.ts to its allowlisted environment:
- * INGEST_LEDGER_HOME_GUARD=on, ALWAYS, so a single-bucket run refuses (`ledger_home_moved`) once a relocation wrote
- * "moved" into BACKLOG_OPS_BUCKET's marker, instead of writing stale copies; and, for the ledger tools with a ledger
- * target, INGEST_LEDGER_BUCKET / INGEST_LEDGER_REGION, which route their ledger/** keys to that bucket and require its
- * marker to name it. No endpoint is ever passed (AWS S3).
+ * INGEST_LEDGER_HOME_GUARD=on, ALWAYS, so a single-bucket backfill or drain refuses (`ledger_home_moved`) once a
+ * relocation wrote "moved" into BACKLOG_OPS_BUCKET's marker, instead of writing stale copies. The accepted-stage export
+ * gets it too but never reads the marker (it writes no ledger key), so for the export the variable changes nothing.
+ * For the ledger tools with a ledger target, also INGEST_LEDGER_BUCKET / INGEST_LEDGER_REGION, which route their
+ * ledger/** keys to that bucket and require both markers to name it (BACKLOG_OPS_BUCKET's and the ledger bucket's
+ * own). No endpoint is ever passed (AWS S3).
  */
 export function backlogOpsLedgerEnv(d: Pick<BacklogOpsDispatch, "mode">, ledger: BacklogOpsLedgerTarget | null): Record<string, string> {
   // The presence tool reads no S3 at all: its environment stays exactly the allowlist plus the session.
@@ -297,6 +300,18 @@ export function backlogOpsLedgerEnv(d: Pick<BacklogOpsDispatch, "mode">, ledger:
     INGEST_LEDGER_HOME_GUARD: "on",
     ...(ledger && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode)) ? { INGEST_LEDGER_BUCKET: ledger.bucket, INGEST_LEDGER_REGION: ledger.region } : {}),
   };
+}
+
+/**
+ * The ledger target a run's tool was given, as recorded in its receipt: `none` (the tool takes no ledger bucket: the
+ * export, presence, or a backfill / drain with BACKLOG_OPS_LEDGER_* unset) or `ledger_<32 hex>`, a hash of the bucket
+ * and region. Never the name itself: receipts are echoed to this public repository's logs. An execute refuses unless
+ * the ledger tools it binds recorded the same target (checkBoundReceipts, `backlog_ops_bound_<kind>_ledger`).
+ */
+export const BACKLOG_OPS_LEDGER_NONE = "none";
+export function backlogOpsLedgerId(d: Pick<BacklogOpsDispatch, "mode">, ledger: BacklogOpsLedgerTarget | null): string {
+  if (!ledger || !BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode))) return BACKLOG_OPS_LEDGER_NONE;
+  return "ledger_" + createHash("sha256").update(`backlog-ops-ledger/v1\n${ledger.bucket}\n${ledger.region}`).digest("hex").slice(0, 32);
 }
 
 /** A run's org scope: the orgs (sorted, distinct) or null for every org, and its id for receipts. */
@@ -447,13 +462,17 @@ export interface BacklogOpsReceipt {
   run: string;
   /** The org scope's id (backlogOpsScope): `all` or `orgs_<32 hex>`; never an org id. */
   scope: string;
+  /** The ledger target's id (backlogOpsLedgerId): `none` or `ledger_<32 hex>`; never a bucket name. */
+  ledger: string;
   exitCode: number;
   summary: unknown;
 }
 
 /** Parse the tool's last stdout line into a counts-only receipt (or a refused one). */
-export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string, scope: string = BACKLOG_OPS_SCOPE_ALL): BacklogOpsReceipt {
+export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string, scope: string = BACKLOG_OPS_SCOPE_ALL,
+  ledger: string = BACKLOG_OPS_LEDGER_NONE): BacklogOpsReceipt {
   if (!SCOPE_ID.test(scope)) refuse("backlog_ops_scope");
+  if (!LEDGER_ID.test(ledger)) refuse("backlog_ops_ledger_id");
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
   let summary: unknown = { refused: "no_summary" };
   const last = lines.at(-1);
@@ -462,7 +481,7 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
     try { parsed = JSON.parse(last); } catch { parsed = undefined; }
     summary = parsed === undefined ? { refused: "summary_unparsed" } : countsOnly(parsed);
   }
-  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, exitCode, summary };
+  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger, exitCode, summary };
 }
 
 const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : null);
@@ -475,7 +494,7 @@ const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "obje
  * scoped org's admission stop or freshness, so it must never satisfy a scoped drain).
  */
 export type BacklogOpsBindingKind = "dry" | "backfill" | "full" | "export";
-export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind; exact?: boolean }): void {
+export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind; exact?: boolean; ledger?: string }): void {
   // A presence receipt never feeds an execute (presence binds nothing and nothing binds it).
   if (toolOf(expect.mode) === "presence") refuse("backlog_ops_bound_presence_receipt");
   let r: Record<string, any> | null;
@@ -488,6 +507,13 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
   if (typeof got !== "string" || !SCOPE_ID.test(got) || !SCOPE_ID.test(want) ||
       (got !== want && (expect.exact === true || !(expect.kind !== "dry" && expect.kind !== undefined && got === BACKLOG_OPS_SCOPE_ALL))))
     refuse(`backlog_ops_bound_${toolOf(expect.mode)}_scope`);
+  // The ledger target (only where the caller binds it: a ledger tool binding a ledger tool). A receipt from before the
+  // field had no ledger bucket (`none`).
+  if (expect.ledger !== undefined) {
+    const gotLedger = r.ledger === undefined ? BACKLOG_OPS_LEDGER_NONE : r.ledger;
+    if (typeof gotLedger !== "string" || !LEDGER_ID.test(gotLedger) || !LEDGER_ID.test(expect.ledger) || gotLedger !== expect.ledger)
+      refuse(`backlog_ops_bound_${toolOf(expect.mode)}_ledger`);
+  }
   const s = obj(r.summary);
   if (!s || s.refused !== undefined) refuse(`backlog_ops_bound_${toolOf(expect.mode)}_refused`);
   const wantMode = isExecute(expect.mode) ? "execute" : "dry_run";

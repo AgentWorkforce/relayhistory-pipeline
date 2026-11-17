@@ -20,7 +20,8 @@ import {
   type DrainLedger,
   type DrainOptions,
 } from "../buffered-drain.ts";
-import { parseDrainArgs, runDrain, validResumeKey } from "../../../scripts/buffered-drain.ts";
+import { parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
+import { isLedgerKey, ledgerHomeKey } from "../ledger-store.ts";
 import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as writeFileSyncFs } from "node:fs";
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
@@ -817,6 +818,44 @@ describe("buffered backlog drain (0005)", () => {
     writeFileSyncFs(checkpoint, saved + "\n");
     await expect(runDrain(args([]), deps)).rejects.toThrow("checkpoint_invalid");
     expect((await canonical(store)).size).toBe(3);
+  });
+
+  test("CLI entry (runDrainTool) through two buckets: ledger keys only in the ledger bucket; drained markers, layout and lock only in the Locker", async () => {
+    const locker = await scratch();
+    const l = scratchStore();
+    cleanup.push(l.done);
+    const ledger = l.store;
+    const LOCKER = "example-locker-bucket", LEDGER = "example-ledger-bucket";
+    const marker = (bucket: string) => enc.encode(JSON.stringify({ v: 1, home: bucket, writtenAtMs: 1 }));
+    await locker.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    const key = await stage(locker, [group("claude", "sess-1", [{ id: "r1", rev: 1 }, { id: "r2", rev: 2 }])]);
+    await refreshVerdicts(locker);
+    const kms = `arn:aws:kms:us-east-1:000000000000:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`;
+    const args = parseDrainArgs(["--execute", "--bucket", LOCKER, "--kms-key-arn", kms, "--org", TENANT.orgId, "--concurrency", "1"]);
+    const env = { INGEST_LEDGER_BUCKET: LEDGER, INGEST_LEDGER_REGION: "eu-west-1", INGEST_LEDGER_HOME_GUARD: "on" };
+    const lockerBefore = new Set(await allKeys(locker));
+    const summary = await runDrainTool(args, {
+      env, credentials: { accessKeyId: "AKIAEXAMPLE", secretAccessKey: "secret" }, orgs: async () => [TENANT.orgId], stderr: () => {},
+      create: (c) => (c.bucket === LOCKER ? locker : c.bucket === LEDGER ? ledger : (() => { throw new Error("unexpected_bucket"); })()),
+    });
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.lines).toMatchObject({ written: 2 });
+    const inLedger = await allKeys(ledger), lockerNew = (await allKeys(locker)).filter((k) => !lockerBefore.has(k));
+    // Every key the drain wrote in the ledger bucket is a ledger key; it wrote no ledger key in the Locker bucket.
+    expect(inLedger.every((k) => isLedgerKey(ROOT, k))).toBe(true);
+    expect(inLedger).toContain(KEYS.revisions(ORIGIN, "r1"));
+    expect(inLedger).toContain(ownerKey("claude", "sess-1"));
+    expect(lockerNew.filter((k) => isLedgerKey(ROOT, k))).toEqual([]);
+    expect(lockerNew).toContain(key + DRAINED_SUFFIX);
+    expect(lockerNew).toContain(drainLockKey(ROOT));
+    expect(lockerNew.some((k) => k.includes("/raw/"))).toBe(true);
+    expect(await exists(ledger, key + DRAINED_SUFFIX)).toBe(false);
+    expect(await exists(ledger, drainLockKey(ROOT))).toBe(false);
+    expect((await canonical(locker)).get("sess-1")).toEqual(["r1@1", "r2@2"]);
+    // The fence stays in the Locker bucket.
+    expect(await exists(locker, uploadFenceKey())).toBe(true);
+    expect(await exists(ledger, uploadFenceKey())).toBe(false);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {

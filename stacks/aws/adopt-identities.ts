@@ -10,6 +10,8 @@
  *                        subjects, 6 h sessions. The repository records no identity policy for them, so the inline
  *                        policies come from the private stage inputs, pasted from the live roles, and are refused
  *                        unless they stay inside backlog-ops' documented needs (assertAdoptedRolePolicies).
+ *                        Optional `ledgerBucket` { bucket, keyRoot } (the relocated upload ledger) also admits
+ *                        exactly `backlogOpsLedgerStatements` on that bucket; unset, nothing changes.
  *   uploadPresignIssuer  the user 96bulls-<stage>-upload-presign-issuer (path /96bulls/) and its managed policy of
  *                        the same name (path /): upload-inbox.ts uploadPresignIssuerPolicy. Identity only: the wall
  *                        entry and key statements that name it are a separate input.
@@ -70,9 +72,16 @@ export interface AdoptedRolePolicies {
   description?: string;
 }
 
+/**
+ * The relocated upload ledger's bucket (docs/ledger-relocation.md, docs/backlog-ops-workflow.md "IAM" item 5), which
+ * the backlog-ops roles may also reach once it is set: its plain bucket name (it may be in another account) and the
+ * key root the tools use (`96bulls`). Unset: the roles may touch only the transcripts bucket, exactly as before.
+ */
+export interface BacklogOpsLedgerBucket { bucket: string; keyRoot: string }
+
 export interface AdoptIdentitiesInputs {
   githubOidcProvider?: true;
-  backlogOpsRoles?: { read: AdoptedRolePolicies; write: AdoptedRolePolicies };
+  backlogOpsRoles?: { read: AdoptedRolePolicies; write: AdoptedRolePolicies; ledgerBucket?: BacklogOpsLedgerBucket };
   uploadPresignIssuer?: true;
   inboxBridge?: true;
 }
@@ -88,8 +97,61 @@ const ROLE_ACTIONS = {
 const POLICY_NAME = /^[A-Za-z0-9+=,.@_-]{1,128}$/;
 const STATEMENT_KEYS = new Set(["Sid", "Effect", "Action", "NotAction", "Resource", "NotResource", "Condition"]);
 
-/** The validation context: the stage's bucket, and the transcripts key's ARN once known (the pre-apply diff). */
-export interface RolePolicyContext { accountId: string; region: string; bucketName: string; keyArn?: string }
+/**
+ * The validation context: the stage's bucket, the transcripts key's ARN once known (the pre-apply diff), and the
+ * ledger bucket when `backlogOpsRoles.ledgerBucket` is set (assertAdoptIdentitiesInputs fills it in).
+ */
+export interface RolePolicyContext { accountId: string; region: string; bucketName: string; keyArn?: string; ledger?: BacklogOpsLedgerBucket }
+
+const S3_BUCKET_NAME = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+/** One literal path segment: no wildcard, no slash, never `.` or `..`. */
+const LEDGER_KEY_ROOT = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/;
+
+/** The ledger bucket's ARNs the roles may name (and nothing else in it). */
+export function backlogOpsLedgerResources(l: BacklogOpsLedgerBucket) {
+  const bucketArn = `arn:aws:s3:::${l.bucket}`;
+  return {
+    bucketArn,
+    /** Batch records, revision shards, ownership stubs, re-arm markers (ledger-store.ts isLedgerKey). */
+    objects: `${bucketArn}/${l.keyRoot}/.admission-inbox/*/ledger/*`,
+    /** The ledger-home marker (ledger-store.ts ledgerHomeKey). */
+    home: `${bucketArn}/${l.keyRoot}/.ledger/fence-authority/.ledger-home.json`,
+    /** The one s3:prefix the roles may list under. */
+    listPrefix: `${l.keyRoot}/.admission-inbox/*`,
+  };
+}
+
+/**
+ * The identity-side statements a backlog-ops role needs on the ledger bucket, exactly (what the validator accepts,
+ * and what an operator adds to the live role before pasting it back). Read: s3:GetObject on the ledger keys and the
+ * marker, s3:ListBucket on the bucket under `<root>/.admission-inbox/*` (without it a missing shard or stub is a 403,
+ * not a 404). Write: also s3:PutObject on the ledger keys, with NO s3:x-amz-server-side-encryption condition: the
+ * tools send no encryption header there (the bucket's SSE-S3 default applies). No delete, no KMS. Cross-account, the
+ * ledger bucket's own policy must grant the same to the role (kept with that bucket's infrastructure, not here).
+ */
+export function backlogOpsLedgerStatements(mode: "read" | "write", l: BacklogOpsLedgerBucket): Record<string, unknown>[] {
+  const r = backlogOpsLedgerResources(l);
+  return [
+    { Sid: "LedgerRead", Effect: "Allow", Action: "s3:GetObject", Resource: [r.objects, r.home] },
+    { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: r.bucketArn, Condition: { StringLike: { "s3:prefix": r.listPrefix } } },
+    ...(mode === "write" ? [{ Sid: "LedgerWrite", Effect: "Allow", Action: "s3:PutObject", Resource: r.objects }] : []),
+  ];
+}
+
+/** `backlogOpsRoles.ledgerBucket`: { bucket: a plain bucket name other than the transcripts bucket, keyRoot }. */
+export function assertBacklogOpsLedgerBucket(value: unknown, transcriptsBucket: string, refuse: (why: string) => never): BacklogOpsLedgerBucket {
+  const at = "transcriptStore.adoptIdentities.backlogOpsRoles.ledgerBucket";
+  if (!plain(value) || Object.keys(value).length !== 2 || !("bucket" in value) || !("keyRoot" in value)) return refuse(`${at} must be exactly { bucket, keyRoot }`);
+  if (typeof value.bucket !== "string" || !S3_BUCKET_NAME.test(value.bucket)) refuse(`${at}.bucket must be a plain S3 bucket name`);
+  if (value.bucket === transcriptsBucket) refuse(`${at}.bucket must not be the transcripts bucket`);
+  if (typeof value.keyRoot !== "string" || !LEDGER_KEY_ROOT.test(value.keyRoot)) refuse(`${at}.keyRoot must be one literal key segment (the tools' key root)`);
+  return value as unknown as BacklogOpsLedgerBucket;
+}
+
+/** Any s3:x-amz-server-side-encryption* key under any condition operator. */
+const hasSseCondition = (condition: unknown) =>
+  plain(condition) && Object.values(condition).some((block) => plain(block) && Object.keys(block).some((k) => k.toLowerCase().startsWith("s3:x-amz-server-side-encryption")));
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 /**
  * A backlog-ops role's pasted inline policies, held to what docs/backlog-ops-workflow.md ("IAM") says the roles may
@@ -101,6 +163,13 @@ export interface RolePolicyContext { accountId: string; region: string; bucketNa
  *                                 s3:x-amz-server-side-encryption-aws-kms-key-id = the transcripts key;
  *   kms:Decrypt, kms:GenerateDataKey (the latter writer only)  the transcripts key, with StringEquals
  *                                 kms:ViaService = s3.<region>.amazonaws.com.
+ * With `c.ledger` (backlogOpsRoles.ledgerBucket) also, and only, `backlogOpsLedgerStatements`' grants on the ledger
+ * bucket, each in a statement of its own bucket:
+ *   s3:GetObject                  `<ledger>/<root>/.admission-inbox/*\/ledger/*` and the ledger-home marker;
+ *   s3:ListBucket                 the ledger bucket itself, with exactly StringLike s3:prefix `<root>/.admission-inbox/*`;
+ *   s3:PutObject                  (writer only) `<ledger>/<root>/.admission-inbox/*\/ledger/*`, with no
+ *                                 s3:x-amz-server-side-encryption condition (the tools send no encryption header).
+ * No KMS action ever names the ledger bucket.
  * "The transcripts key" is its exact ARN when `keyArn` is given (the pre-apply diff and the capture, which resolve
  * the key's alias live), and otherwise a key ARN in this account and region (the stack's input check, before the
  * key's ARN is known). Deny statements may say anything: they only narrow.
@@ -118,6 +187,7 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
   const keyPattern = new RegExp(`^arn:aws:kms:${c.region}:${c.accountId}:key/[A-Za-z0-9-]{1,64}$`);
   const isKey = (r: unknown) => typeof r === "string" && (c.keyArn !== undefined ? r === c.keyArn : keyPattern.test(r));
   const allowed: readonly string[] = ROLE_ACTIONS[mode];
+  const ledger = c.ledger !== undefined ? backlogOpsLedgerResources(c.ledger) : undefined;
   for (const [name, doc] of Object.entries(policies)) {
     const p = `${at}.inlinePolicies[${JSON.stringify(name)}]`;
     if (!POLICY_NAME.test(name)) refuse(`${at}.inlinePolicies has an invalid policy name`);
@@ -136,7 +206,20 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
       for (const a of actions) if (typeof a !== "string" || !allowed.includes(a)) refuse(`${p}: the ${mode} role may be allowed only ${allowed.join(", ")}`);
       const equals = plain(s.Condition) && plain(s.Condition.StringEquals) ? (s.Condition.StringEquals as Record<string, unknown>) : {};
       for (const a of actions as string[]) {
-        if (a === "s3:ListBucket") {
+        // A statement naming the ledger bucket is judged by the ledger's rules alone (never mixed with the transcripts').
+        const onLedger = ledger !== undefined && resources.some((r) => typeof r === "string" && (r === ledger.bucketArn || r.startsWith(`${ledger.bucketArn}/`)));
+        if (ledger && onLedger && a === "s3:ListBucket") {
+          const prefix = plain(s.Condition) && plain(s.Condition.StringLike) ? (s.Condition.StringLike as Record<string, unknown>)["s3:prefix"] : undefined;
+          if (!resources.every((r) => r === ledger.bucketArn) || !plain(s.Condition) || Object.keys(s.Condition).length !== 1 ||
+              !plain(s.Condition.StringLike) || Object.keys(s.Condition.StringLike).length !== 1 ||
+              !(prefix === ledger.listPrefix || sameJson(prefix, [ledger.listPrefix])))
+            refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself, with exactly StringLike s3:prefix ${ledger.listPrefix}`);
+        } else if (ledger && onLedger && a === "s3:GetObject") {
+          if (!resources.every((r) => r === ledger.objects || r === ledger.home)) refuse(`${p}: s3:GetObject on the ledger bucket only on exactly ${ledger.objects} and ${ledger.home}`);
+        } else if (ledger && onLedger && a === "s3:PutObject") {
+          if (!resources.every((r) => r === ledger.objects)) refuse(`${p}: s3:PutObject on the ledger bucket only on exactly ${ledger.objects}`);
+          if (hasSseCondition(s.Condition)) refuse(`${p}: s3:PutObject on the ledger bucket takes no s3:x-amz-server-side-encryption condition (the tools send no encryption header)`);
+        } else if (a === "s3:ListBucket") {
           if (!resources.every((r) => r === bucketArn)) refuse(`${p}: s3:ListBucket only on the transcripts bucket itself`);
         } else if (a === "s3:GetObject" || a === "s3:PutObject") {
           if (!resources.every((r) => r === objects)) refuse(`${p}: ${a} only on exactly ${objects}`);
@@ -161,10 +244,13 @@ export function assertAdoptIdentitiesInputs(value: unknown, c: RolePolicyContext
     if (value[k] !== undefined && value[k] !== true) refuse(`transcriptStore.adoptIdentities.${k} must be true (omit for off)`);
   if (value.backlogOpsRoles !== undefined) {
     const roles = value.backlogOpsRoles;
-    if (!plain(roles) || Object.keys(roles).length !== 2 || !("read" in roles) || !("write" in roles))
-      refuse("transcriptStore.adoptIdentities.backlogOpsRoles must be exactly { read, write }");
-    assertAdoptedRolePolicies((roles as Record<string, unknown>).read, "read", c, refuse);
-    assertAdoptedRolePolicies((roles as Record<string, unknown>).write, "write", c, refuse);
+    if (!plain(roles) || !("read" in roles) || !("write" in roles) || Object.keys(roles).some((k) => k !== "read" && k !== "write" && k !== "ledgerBucket"))
+      refuse("transcriptStore.adoptIdentities.backlogOpsRoles must be exactly { read, write } (and optionally ledgerBucket)");
+    const r = roles as Record<string, unknown>;
+    const ledger = r.ledgerBucket === undefined ? undefined : assertBacklogOpsLedgerBucket(r.ledgerBucket, c.bucketName, refuse);
+    const rc: RolePolicyContext = ledger ? { ...c, ledger } : c;
+    assertAdoptedRolePolicies(r.read, "read", rc, refuse);
+    assertAdoptedRolePolicies(r.write, "write", rc, refuse);
   }
   return value as AdoptIdentitiesInputs;
 }

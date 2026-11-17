@@ -19,9 +19,11 @@
  * the edge's own variables and parser (src/session-ingest/ledger-tool-store.ts), name the ledger's bucket. The fences
  * then stay in --bucket and the ownership stubs and revision shards (ledger/**) go to the ledger bucket, with no
  * encryption header (its default, SSE-S3), under the same AWS credentials; an ownership or revision section first
- * requires the ledger bucket's ledger-home marker to name it (ledger_home_missing, ledger_home_moved). Unset, one
- * bucket as before; then INGEST_LEDGER_HOME_GUARD=on (always set by the backlog-ops workflow) refuses those sections
- * when --bucket's marker names another bucket (ledger_home_moved). A fences-only run reads no marker either way.
+ * requires --bucket's ledger-home marker to name the ledger bucket (ledger_home_mismatch) and the ledger bucket's own
+ * marker to name it (ledger_home_missing, ledger_home_moved). Unset, one bucket as before; then
+ * INGEST_LEDGER_HOME_GUARD=on (always set by the backlog-ops workflow) refuses those sections when --bucket's marker
+ * names another bucket (ledger_home_moved). A fences-only run reads no marker either way. The check runs before the
+ * first SQL read or S3 write, and again before a write once a minute has passed since the last (homeGuardedToolStore).
  *
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing fences and
  * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
@@ -48,9 +50,9 @@ import { readFileSync } from "node:fs";
 import pg from "pg";
 import type { createS3Store } from "../src/shared/vendor.ts";
 import { assertLedgerHomeGuardValid } from "../src/session-ingest/ledger-store.ts";
-import { assertToolLedgerHome, toolLedgerBucket, toolStores, type ToolStores } from "../src/session-ingest/ledger-tool-store.ts";
+import { assertToolLedgerHome, homeGuardedToolStore, toolLedgerBucket, toolStores, type ToolLedgerBucket, type ToolStores } from "../src/session-ingest/ledger-tool-store.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, SLOT_FETCH_ROWS_MAX, SLOT_FETCH_ROWS_MIN, SLOT_PACE_MAX_MS, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
+import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, SLOT_FETCH_ROWS_MAX, SLOT_FETCH_ROWS_MIN, SLOT_PACE_MAX_MS, backfillUploadFences, type BackfillSection, type BackfillSql, type BackfillSummary } from "../src/session-ingest/upload-fence-backfill.ts";
 
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
@@ -172,24 +174,58 @@ export const BACKFILL_KEY_ROOT = "96bulls";
  * run's writes are refused by the library itself (backfill_dry_run_write_refused), through either store.
  */
 export function backfillStores(args: Pick<BackfillArgs, "mode" | "bucket" | "region" | "kmsKeyArn">, env: Record<string, string | undefined>,
-  credentials: Parameters<typeof createS3Store>[0]["credentials"], create?: (config: Parameters<typeof createS3Store>[0]) => unknown): ToolStores {
+  credentials: Parameters<typeof createS3Store>[0]["credentials"], create?: (config: Parameters<typeof createS3Store>[0]) => unknown,
+  ledgerBucket?: ToolLedgerBucket | null): ToolStores {
   return toolStores({
     env, bucket: args.bucket, region: args.region, keyRoot: BACKFILL_KEY_ROOT, credentials,
     ...(args.mode === "execute" ? { kmsKeyArn: args.kmsKeyArn! } : {}),
     ...(create ? { create } : {}),
+    ...(ledgerBucket !== undefined ? { ledgerBucket } : {}),
   });
 }
 
+/** A run writes no ledger key only when it names sections and every one is `fences` (an empty list is never that). */
+export const backfillWritesNoLedger = (sections: readonly BackfillSection[]) => sections.length > 0 && sections.every((s) => s === "fences");
+
 /**
  * The fork guard before any write. Only the ownership and revision sections write ledger/** (the fences never move:
- * ledger-store.ts), so a fences-only run checks nothing and needs no ledger bucket. Otherwise: with a ledger bucket,
- * its marker must name it (`ledger_home_missing`, `ledger_home_moved`), always; without one, INGEST_LEDGER_HOME_GUARD=on
- * refuses when the Locker bucket's marker names another bucket (`ledger_home_moved`; the backlog-ops workflow always
- * sets it), and off reads nothing.
+ * ledger-store.ts), so a run whose sections are all `fences` checks nothing and needs no ledger bucket. Every other
+ * run, an empty section list included, checks: with a ledger bucket, the Locker bucket's marker must name it
+ * (`ledger_home_mismatch`) and its own marker must name it (`ledger_home_missing`, `ledger_home_moved`), always;
+ * without one, INGEST_LEDGER_HOME_GUARD=on refuses when the Locker bucket's marker names another bucket
+ * (`ledger_home_moved`; the backlog-ops workflow always sets it), and off reads nothing.
  */
 export async function assertBackfillLedgerHome(stores: ToolStores, args: Pick<BackfillArgs, "bucket" | "sections">, env: Record<string, string | undefined>): Promise<void> {
-  if (args.sections.every((s) => s === "fences")) return;
+  if (backfillWritesNoLedger(args.sections)) return;
   await assertToolLedgerHome(stores, BACKFILL_KEY_ROOT, args.bucket, env);
+}
+
+/**
+ * Everything the CLI does once it has its SQL connection and credentials, in order: the stores (the ledger bucket
+ * parsed once, by the caller's preflight), the fork guard BEFORE the first SQL read or S3 write, then the backfill
+ * through a store that re-runs the guard during the run (homeGuardedToolStore; not for a fences-only run, which
+ * writes no ledger key and reads no marker).
+ */
+export async function runBackfill(args: BackfillArgs, deps: {
+  sql: BackfillSql;
+  env: Record<string, string | undefined>;
+  credentials: Parameters<typeof createS3Store>[0]["credentials"];
+  ledgerBucket: ToolLedgerBucket | null;
+  create?: (config: Parameters<typeof createS3Store>[0]) => unknown;
+  recheck?: { intervalMs?: number; now?: () => number };
+}): Promise<BackfillSummary> {
+  const stores = backfillStores(args, deps.env, deps.credentials, deps.create, deps.ledgerBucket);
+  await assertBackfillLedgerHome(stores, args, deps.env);
+  const store = backfillWritesNoLedger(args.sections) ? stores.store : homeGuardedToolStore(stores, BACKFILL_KEY_ROOT, args.bucket, deps.env, deps.recheck);
+  return backfillUploadFences({
+    sql: deps.sql, store, keyRoot: BACKFILL_KEY_ROOT, dryRun: args.mode === "dry_run",
+    ...(args.orgs.length ? { orgs: args.orgs } : {}),
+    sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
+    ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
+    ...(args.slotsByOrg ? { slotsByOrg: true } : {}),
+    ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
+    ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
+  });
 }
 
 if (import.meta.main) {
@@ -207,8 +243,9 @@ if (import.meta.main) {
     if (!accessKeyId || !secretAccessKey) throw new Error("aws_credentials_required");
     // A bad INGEST_LEDGER_HOME_GUARD refuses before the database or stdin is touched (ledger_home_guard_invalid).
     assertLedgerHomeGuardValid();
-    // A bad INGEST_LEDGER_BUCKET / _REGION / _ENDPOINT refuses here too (ledger_bucket_invalid).
-    toolLedgerBucket(process.env, args);
+    // A bad INGEST_LEDGER_BUCKET / _REGION / _ENDPOINT refuses here too (ledger_bucket_invalid). Parsed once: the
+    // stores below are built from this result.
+    const ledgerBucket = toolLedgerBucket(process.env, args);
     const line = readFileSync(0, "utf8").split("\n")[0] ?? "";
     if (line.length > 64 * 1024) throw new Error("stdin_too_large");
     let parsed: unknown;
@@ -226,20 +263,11 @@ if (import.meta.main) {
     const beat = client;
     heartbeat = setInterval(() => { beat.query("SELECT 1").catch(() => {}); }, DB_HEARTBEAT_MS);
     heartbeat.unref?.();
-    const stores = backfillStores(args, process.env,
-      { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) });
-    await assertBackfillLedgerHome(stores, args, process.env);
-    const store = stores.store;
     const db = client;
-    const summary = await backfillUploadFences({
+    const summary = await runBackfill(args, {
       sql: { query: async (text, params) => ({ rows: (await db.query(text, params)).rows }) },
-      store, keyRoot: BACKFILL_KEY_ROOT, dryRun: args.mode === "dry_run",
-      ...(args.orgs.length ? { orgs: args.orgs } : {}),
-      sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
-      ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
-      ...(args.slotsByOrg ? { slotsByOrg: true } : {}),
-      ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
-      ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
+      env: process.env, ledgerBucket,
+      credentials: { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) },
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

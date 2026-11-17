@@ -282,17 +282,32 @@ variables on both environments: `BACKLOG_OPS_LEDGER_BUCKET` (the edge's `INGEST_
 The credential step hands them to the backfill and the drain as `INGEST_LEDGER_BUCKET` / `INGEST_LEDGER_REGION`. Those
 tools then write the ledger's own keys (ownership stubs, revision shards, re-arm markers) to that bucket. They send no
 encryption header there, so the bucket's SSE-S3 default applies. They keep the fences, the staged batches, their
-markers, the layout and the lease in `BACKLOG_OPS_BUCKET`. They refuse unless the ledger bucket's marker names it
-(`ledger_home_missing`, `ledger_home_moved`). The export touches no ledger key and does not take them.
+markers, the layout and the lease in `BACKLOG_OPS_BUCKET`. Before the first write they refuse unless
+`BACKLOG_OPS_BUCKET`'s marker names exactly that ledger bucket (`ledger_home_mismatch`: a variable pointing at another
+environment's ledger refuses here) and the ledger bucket's own marker names it (`ledger_home_missing`,
+`ledger_home_moved`), and they check again before a write once a minute has passed since the last good check. The
+export touches no ledger key and does not take them.
 
-Every S3 tool (all but `presence-dry`, which reads no S3) also runs with `INGEST_LEDGER_HOME_GUARD=on`, always. The workflow sets it on the step, and the credential
-step forces it into the tool's environment. So a backfill or drain dispatched before these variables are set, once the
+**Set them as environment variables only.** `vars.*` falls back to a repository or organisation variable of the same
+name when the environment has none, and the workflow cannot tell the scopes apart. So never define
+`BACKLOG_OPS_LEDGER_*` at repository or organisation scope: define them on both `session-schema-production` and
+`session-backlog-execute`. What still holds if one leaks in: one variable without the other refuses
+(`backlog_ops_target_ledger_*`); a bucket that is not the one `BACKLOG_OPS_BUCKET`'s marker names refuses
+(`ledger_home_mismatch`) before any write; and an execute refuses unless its bound dry run (and, for the drain, its
+bound backfills) recorded the same ledger target (`backlog_ops_bound_<kind>_ledger`).
+
+The backfill and the drain (and the export, which never reads the marker, so for it the variable does nothing) run with
+`INGEST_LEDGER_HOME_GUARD=on`, always: the credential step adds it to the tool's environment in code (the step's own
+environment never reaches the tool). So a backfill or drain dispatched before these variables are set, once the
 relocation has written "moved" into `BACKLOG_OPS_BUCKET`'s marker, refuses with `ledger_home_moved` instead of writing a
 stale copy. Every backfill mode runs the ownership section (a refresh runs fences and ownership), so every backfill
 and drain dispatch checks the marker.
 
 Receipts are counts only. Every leaf is a number, a boolean or a short lowercase code; any other string, such as an
-id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backlog-ops-receipt` artifact.
+id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backlog-ops-receipt` artifact. Each also
+records `ledger`: `none`, or `ledger_<32 hex>` (a hash of the ledger bucket and region a backfill or drain was given;
+never the name, since receipts are echoed to this public repository's logs). A backfill or drain execute refuses unless
+the backfill and drain receipts it binds recorded the same value (a receipt from before the field reads as `none`).
 
 ## Session presence (presence-dry)
 
@@ -419,15 +434,29 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
 
    Both are conditioned on `kms:ViaService` = `s3.us-east-1.amazonaws.com`.
 
-5. **The ledger bucket**, once the ledger is relocated (above). The roles use the same session for both buckets; the
-   ledger bucket is in another account and region, so its bucket policy must grant the two roles access (not part of
-   this repository). Under `<root>/.admission-inbox/*/ledger/*` the read role needs `s3:GetObject`, and the write role
-   `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption` condition, since the tools send no
-   encryption header there. Both need `s3:ListBucket` on the bucket for those prefixes (without it a missing shard
-   or stub reads as a 403, not a 404, and the run fails), and `s3:GetObject` on
-   `<root>/.ledger/fence-authority/.ledger-home.json`. No `DeleteObject`: neither tool deletes a ledger key. No KMS
-   grant: the bucket uses SSE-S3. Both roles also need `s3:GetObject` on the same marker key in the transcripts bucket
-   for the forced guard; `96bulls/*` already covers it.
+5. **The ledger bucket**, once the ledger is relocated (above). The roles use the same session for both buckets.
+   The ledger bucket is in another account, so access is cross-account, and cross-account access needs **both
+   sides**: the ledger bucket's bucket policy must grant the two roles, **and** each role's own identity policy must
+   allow the same actions on the ledger bucket. Either side alone gets `access_denied`.
+
+   - **Identity side (this repository).** The grants are exactly `backlogOpsLedgerStatements`
+     (`stacks/aws/adopt-identities.ts`). Under `<root>/.admission-inbox/*/ledger/*` the read role needs
+     `s3:GetObject`, and the write role `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption`
+     condition, since the tools send no encryption header there. Both need `s3:GetObject` on
+     `<root>/.ledger/fence-authority/.ledger-home.json`, and `s3:ListBucket` on the bucket with `StringLike`
+     `s3:prefix` = `<root>/.admission-inbox/*` (without it a missing shard or stub reads as a 403, not a 404, and
+     the run fails). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
+     with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
+     private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
+     every statement on it, exactly as before (docs/aws-stage.md "Adopt identities"). Order: add the grants to the
+     live roles (an IAM change: Khaliq's explicit OK), then paste the updated live policies and set the input, so
+     the live diff stays clean.
+   - **Resource side (not this repository).** The ledger bucket's policy granting the two role ARNs the same actions
+     on the same resources lives with that bucket's infrastructure, in its own repository.
+
+   Both roles also need `s3:GetObject` on the marker key in the transcripts bucket (the forced guard, and the
+   Locker-side marker check described above); `96bulls/*` already covers it.
 
 ### Still to apply (before the first execute)
 

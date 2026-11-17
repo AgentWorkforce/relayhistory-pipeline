@@ -21,10 +21,13 @@
  * gate's step output t (FULL's created_at minus the margin; backlogOpsRevisionsSince), passes it as
  * --revisions-since-ms, and refuses unless every bound catch-up receipt recorded the same t (it bound the same FULL).
  *
- * Every S3 tool child (not presence-dry) also gets INGEST_LEDGER_HOME_GUARD=on, always; the backfill and the drain also get INGEST_LEDGER_BUCKET /
+ * Every S3 tool child (not presence-dry) also gets INGEST_LEDGER_HOME_GUARD=on, always (the export never reads the marker,
+ * so it has no effect there); the backfill and the drain also get INGEST_LEDGER_BUCKET /
  * INGEST_LEDGER_REGION from the protected variables BACKLOG_OPS_LEDGER_BUCKET / BACKLOG_OPS_LEDGER_REGION when set
  * (backlogOpsLedgerEnv; docs/ledger-relocation.md): a relocated ledger is written in its own bucket, and a run without
- * those variables refuses (ledger_home_moved) rather than writing the Locker bucket's stale copy.
+ * those variables refuses (ledger_home_moved) rather than writing the Locker bucket's stale copy. The receipt records
+ * the ledger target as a hash (backlogOpsLedgerId, never the name), and a backfill or drain execute refuses unless the
+ * backfill / drain runs it binds recorded the same one (backlog_ops_bound_<kind>_ledger).
  *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
@@ -39,7 +42,9 @@ import {
   BACKLOG_OPS_SESSION_SECONDS,
   backlogOpsBindings,
   backlogOpsDispatch,
+  BACKLOG_OPS_LEDGER_TOOLS,
   backlogOpsLedgerEnv,
+  backlogOpsLedgerId,
   backlogOpsLedgerTarget,
   backlogOpsPresenceSession,
   backlogOpsReceipt,
@@ -54,6 +59,7 @@ import {
   checkStsExpiration,
   isCatchup,
   parseStsCredentials,
+  toolOf,
   refuseBacklogOps as refuse,
   type BacklogOpsDispatch,
 } from "../src/session-ingest/backlog-ops.ts";
@@ -116,6 +122,12 @@ export function backlogOpsChildSpawn(
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
   revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)) {
   const paths = backlogOpsPaths(env), scope = backlogOpsScope(env).id;
+  // The ledger target this run's tool gets (read only when a binding needs it): a backfill or drain must have it equal
+  // to the backfill / drain runs it binds (its dry run, the drain's BACKFILL and FULL).
+  const ledgerTool = BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode));
+  let ledgerId: string | undefined;
+  // (Only the Locker bucket's name is needed here; backlogOpsRun validates the whole target before this runs.)
+  const ledger = () => (ledgerId ??= backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, { bucket: env.BACKLOG_OPS_BUCKET ?? "" })));
   const raws: Partial<Record<string, string>> = {};
   const modes: Partial<Record<string, string>> = {};
   for (const b of backlogOpsBindings(d)) {
@@ -129,7 +141,8 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     if (b.altMode !== undefined) {
       try { if (JSON.parse(raw)?.mode === b.altMode) mode = b.altMode; } catch { /* checkBoundReceipt refuses it */ }
     }
-    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact });
+    const bindsLedger = ledgerTool && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(mode));
+    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}) });
     if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
       refuse(`backlog_ops_bound_${b.kind}_since`);
     raws[b.kind] = raw;
@@ -210,8 +223,8 @@ export async function backlogOpsRun(
   for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null);
-  // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region).
-  backlogOpsLedgerTarget(env, t);
+  // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region), and its receipt id.
+  const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
   checkBoundReceipts(env, d, undefined, since);
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
@@ -221,8 +234,8 @@ export async function backlogOpsRun(
   const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session);
   const { code, stdout } = await (deps.runChild ?? runChild)(child);
   let receipt;
-  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id); }
-  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id); }
+  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger); }
+  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id, ledger); }
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return receipt.exitCode === 0 && code === 0 ? 0 : 1;

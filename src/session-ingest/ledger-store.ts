@@ -197,8 +197,8 @@ function transientFailure(error: unknown): boolean {
 }
 
 /** The closed codes of `assertLedgerHomeHere`; the Error's message is exactly the code (safe to print). */
-export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_missing" | "ledger_home_invalid" | "access_denied" | "ledger_home_unavailable"
-  | "ledger_home_store_error" | "ledger_home_guard_invalid";
+export type LedgerHomeRefusal = "ledger_home_moved" | "ledger_home_missing" | "ledger_home_mismatch" | "ledger_home_invalid" | "access_denied"
+  | "ledger_home_unavailable" | "ledger_home_store_error" | "ledger_home_guard_invalid";
 export class LedgerHomeRefused extends Error {
   constructor(readonly code: LedgerHomeRefusal) { super(code); this.name = "LedgerHomeRefused"; }
 }
@@ -238,13 +238,28 @@ export async function assertLedgerHomeIn(store: ObjectStore, keyRoot: string, le
   await checkLedgerHome(store, keyRoot, ledgerBucket, true);
 }
 
+/**
+ * For a tool given a ledger bucket: the OLD location's marker (the Locker bucket's own, read from `lockerStore`, never
+ * through a routed store) must exist and name exactly `ledgerBucket`, the one the relocation moved the ledger to. Absent
+ * or naming any other bucket refuses `ledger_home_mismatch`, so a ledger-bucket setting that points at another
+ * environment's (or a stale) ledger refuses before any write, even when that bucket's own marker names itself. Read
+ * failures map as in `assertLedgerHomeHere`.
+ */
+export async function assertLedgerHomeMovedTo(lockerStore: ObjectStore, keyRoot: string, ledgerBucket: string): Promise<void> {
+  let home: LedgerHomeDoc | null;
+  try { home = await readLedgerHome(lockerStore, keyRoot); } catch (error) { throw homeReadRefusal(error); }
+  if (home === null || home.home !== ledgerBucket) throw new LedgerHomeRefused("ledger_home_mismatch");
+}
+
+function homeReadRefusal(error: unknown): LedgerHomeRefused {
+  if (error instanceof Error && error.message === "ledger_home_invalid") return new LedgerHomeRefused("ledger_home_invalid");
+  if (isObjectStoreError(error, "unauthorized")) return new LedgerHomeRefused("access_denied");
+  return new LedgerHomeRefused(transientFailure(error) ? "ledger_home_unavailable" : "ledger_home_store_error");
+}
+
 async function checkLedgerHome(store: ObjectStore, keyRoot: string, expect: string, required: boolean): Promise<void> {
   let home: LedgerHomeDoc | null;
-  try { home = await readLedgerHome(store, keyRoot); } catch (error) {
-    if (error instanceof Error && error.message === "ledger_home_invalid") throw new LedgerHomeRefused("ledger_home_invalid");
-    if (isObjectStoreError(error, "unauthorized")) throw new LedgerHomeRefused("access_denied");
-    throw new LedgerHomeRefused(transientFailure(error) ? "ledger_home_unavailable" : "ledger_home_store_error");
-  }
+  try { home = await readLedgerHome(store, keyRoot); } catch (error) { throw homeReadRefusal(error); }
   const verdict = ledgerHomeVerdict(home, expect, required);
   if (verdict !== "ok") throw new LedgerHomeRefused(verdict);
 }
