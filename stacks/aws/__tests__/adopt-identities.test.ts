@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, BACKLOG_OPS_OIDC_SUB_PREFIX, adoptedIdentities, adoptedIdentityDifferences,
-  assertAdoptIdentitiesInputs, inboxBridgeIdentityPolicy, type AdoptIdentitiesInputs, type LiveIdentity, type RenderedIdentity,
+  assertAdoptIdentitiesInputs, backlogOpsLedgerStatements, inboxBridgeIdentityPolicy, type AdoptIdentitiesInputs, type LiveIdentity, type RenderedIdentity,
 } from "../adopt-identities.ts";
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE, transcriptNames } from "../transcript-store.ts";
@@ -116,6 +116,95 @@ describe("adopt identities: input", () => {
     expect(() => check({ backlogOpsRoles: { ...all.backlogOpsRoles, read: { inlinePolicies: { p: { ...readPolicy, Version: "2008-10-17" } } } } })).toThrow(/IAM policy document/);
     expect(() => withRead(ok, { description: "" })).toThrow(/description/);
     expect(() => withRead(ok, { managedPolicyArns: [] })).toThrow(/managedPolicyArns is not a known setting/);
+  });
+
+  describe("backlogOpsRoles.ledgerBucket (the relocated upload ledger, cross-account)", () => {
+    const ledgerBucket = { bucket: "synthetic-ledger-bucket", keyRoot: "96bulls" };
+    const L = "arn:aws:s3:::synthetic-ledger-bucket";
+    const objects = `${L}/96bulls/.admission-inbox/*/ledger/*`, home = `${L}/96bulls/.ledger/fence-authority/.ledger-home.json`;
+    const listOk = { Effect: "Allow", Action: "s3:ListBucket", Resource: L, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" } } };
+    const roles = (read: Record<string, unknown>[], write: Record<string, unknown>[], ledger: unknown = ledgerBucket) => ({ backlogOpsRoles: {
+      read: { inlinePolicies: { "backlog-ops-read": readPolicy, ...(read.length ? { ledger: { Version: "2012-10-17", Statement: read } } : {}) } },
+      write: { inlinePolicies: { "backlog-ops-write": writePolicy, ...(write.length ? { ledger: { Version: "2012-10-17", Statement: write } } : {}) } },
+      ...(ledger !== null ? { ledgerBucket: ledger } : {}),
+    } });
+    const checkRoles = (v: unknown) => assertAdoptIdentitiesInputs(v, { accountId, region, bucketName, keyArn }, refuse);
+
+    it("renders exactly the documented grants: read Get + List, write also Put with no SSE condition; no Delete, no KMS", () => {
+      expect(backlogOpsLedgerStatements("read", ledgerBucket)).toEqual([
+        { Sid: "LedgerRead", Effect: "Allow", Action: "s3:GetObject", Resource: [objects, home] },
+        { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: L, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" } } },
+      ]);
+      const write = backlogOpsLedgerStatements("write", ledgerBucket);
+      expect(write.slice(0, 2)).toEqual(backlogOpsLedgerStatements("read", ledgerBucket));
+      expect(write[2]).toEqual({ Sid: "LedgerWrite", Effect: "Allow", Action: "s3:PutObject", Resource: objects });
+      expect(JSON.stringify(write)).not.toMatch(/Delete|kms:|server-side-encryption/);
+    });
+
+    it("set: both roles accept exactly those grants (also split or listed differently)", () => {
+      expect(checkRoles(roles(backlogOpsLedgerStatements("read", ledgerBucket), backlogOpsLedgerStatements("write", ledgerBucket)))).toBeDefined();
+      // The input alone (no ledger statements pasted yet) is fine too: the roles are simply as before.
+      expect(checkRoles(roles([], []))).toBeDefined();
+      expect(() => checkRoles(roles([{ Effect: "Allow", Action: ["s3:GetObject"], Resource: home }, { ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*"] } } }],
+        [{ Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [objects] }]))).not.toThrow();
+    });
+
+    it("unset: any ledger-bucket statement is refused for both roles, and the policies are judged exactly as before", () => {
+      for (const [mode, st] of [["read", backlogOpsLedgerStatements("read", ledgerBucket)], ["write", backlogOpsLedgerStatements("write", ledgerBucket)]] as const)
+        for (const one of st)
+          expect(() => checkRoles(roles(mode === "read" ? [one] : [], mode === "write" ? [one] : [], null))).toThrow(/only on (exactly|the transcripts bucket itself)/);
+      expect(checkRoles({ backlogOpsRoles: all.backlogOpsRoles })).toEqual({ backlogOpsRoles: all.backlogOpsRoles });
+    });
+
+    it("set: nothing broader than the grants, on either role", () => {
+      const bad: [Record<string, unknown>, RegExp, ("read" | "write")[]][] = [
+        [{ Effect: "Allow", Action: "s3:GetObject", Resource: `${L}/*` }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:GetObject", Resource: `${L}/96bulls/*` }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:GetObject", Resource: `${L}/96bulls/.ledger/fence-authority/*` }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:GetObject", Resource: [objects, `${bucketArn}/96bulls/*`] }, /GetObject on the ledger bucket only on exactly/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::another-ledger/96bulls/.admission-inbox/*/ledger/*" }, /only on exactly/, ["read", "write"]],
+        [{ ...listOk, Condition: undefined }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/*" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": ["96bulls/.admission-inbox/*", "*"] } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ ...listOk, Condition: { StringLike: { "s3:prefix": "96bulls/.admission-inbox/*" }, StringNotLike: { "s3:prefix": "x" } } }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ ...listOk, Resource: [L, bucketArn] }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ ...listOk, Resource: `${L}/*` }, /ListBucket on the ledger bucket only/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:PutObject", Resource: objects }, /read role may be allowed only/, ["read"]],
+        [{ Effect: "Allow", Action: "s3:PutObject", Resource: home }, /PutObject on the ledger bucket only on exactly/, ["write"]],
+        [{ Effect: "Allow", Action: "s3:PutObject", Resource: `${L}/*` }, /PutObject on the ledger bucket only on exactly/, ["write"]],
+        [{ Effect: "Allow", Action: "s3:PutObject", Resource: objects, Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "AES256" } } }, /no s3:x-amz-server-side-encryption condition/, ["write"]],
+        [{ Effect: "Allow", Action: "s3:PutObject", Resource: objects, Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArn } } }, /no s3:x-amz-server-side-encryption condition/, ["write"]],
+        [{ Effect: "Allow", Action: "s3:DeleteObject", Resource: objects }, /may be allowed only/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "s3:*", Resource: objects }, /may be allowed only/, ["read", "write"]],
+        [{ Effect: "Allow", Action: "kms:Decrypt", Resource: objects, Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } } }, /only on the transcripts key/, ["read", "write"]],
+      ];
+      for (const [statement, why, modes] of bad) for (const mode of modes)
+        expect(() => checkRoles(roles(mode === "read" ? [statement] : [], mode === "write" ? [statement] : []))).toThrow(why);
+    });
+
+    it("the input itself: exactly { bucket, keyRoot }, a plain bucket name other than the transcripts bucket, a literal key root", () => {
+      for (const [v, why] of [
+        [{ bucket: "synthetic-ledger-bucket" }, /exactly \{ bucket, keyRoot \}/],
+        [{ ...ledgerBucket, region: "us-east-1" }, /exactly \{ bucket, keyRoot \}/],
+        ["synthetic-ledger-bucket", /exactly \{ bucket, keyRoot \}/],
+        [{ bucket: "arn:aws:s3:::synthetic-ledger-bucket", keyRoot: "96bulls" }, /plain S3 bucket name/],
+        [{ bucket: "Bad_Bucket", keyRoot: "96bulls" }, /plain S3 bucket name/],
+        [{ bucket: bucketName, keyRoot: "96bulls" }, /not be the transcripts bucket/],
+        [{ bucket: "synthetic-ledger-bucket", keyRoot: "*" }, /literal key segment/],
+        [{ bucket: "synthetic-ledger-bucket", keyRoot: "96bulls/x" }, /literal key segment/],
+        [{ bucket: "synthetic-ledger-bucket", keyRoot: ".." }, /literal key segment/],
+        [{ bucket: "synthetic-ledger-bucket", keyRoot: "" }, /literal key segment/],
+      ] as const) expect(() => checkRoles(roles([], [], v))).toThrow(why);
+      expect(() => checkRoles({ backlogOpsRoles: { ...roles([], []).backlogOpsRoles, other: {} } })).toThrow(/exactly \{ read, write \}/);
+    });
+
+    it("rendering: the input adds no statement of its own; the roles carry exactly the pasted (live) policies", () => {
+      const pasted = roles(backlogOpsLedgerStatements("read", ledgerBucket), backlogOpsLedgerStatements("write", ledgerBucket)) as AdoptIdentitiesInputs;
+      const r = adoptedIdentities(pasted, ctx) as Extract<RenderedIdentity, { kind: "role" }>[];
+      expect(r.map((x) => x.inlinePolicies)).toEqual([pasted.backlogOpsRoles!.read.inlinePolicies, pasted.backlogOpsRoles!.write.inlinePolicies]);
+      // Unset vs set with no ledger statement pasted: byte-identical declarations.
+      expect(JSON.stringify(adoptedIdentities({ backlogOpsRoles: { ...all.backlogOpsRoles!, ledgerBucket } }, ctx))).toBe(JSON.stringify(adoptedIdentities({ backlogOpsRoles: all.backlogOpsRoles }, ctx)));
+    });
   });
 
   it("the stage validates it, and refuses the stack's own presigned issuer beside the adopted one", () => {

@@ -34,6 +34,7 @@ import {
   backlogOpsDispatch,
   backlogOpsEnvironment,
   backlogOpsLedgerEnv,
+  backlogOpsLedgerId,
   backlogOpsLedgerTarget,
   backlogOpsReceipt,
   backlogOpsRevisionsSince,
@@ -1123,14 +1124,82 @@ test("relocated ledger target: both or neither, shape-checked, never the Locker 
   expect(codeSync(() => backlogOpsLedgerTarget({ BACKLOG_OPS_LEDGER_BUCKET: t.bucket, BACKLOG_OPS_LEDGER_REGION: "us-west-2" }, t))).toBe("backlog_ops_target_ledger_bucket");
 });
 
-test("workflow: the tool step always sets INGEST_LEDGER_HOME_GUARD=on and passes the ledger bucket from protected variables", () => {
+test("workflow: the tool step passes the ledger bucket from protected variables; the guard comes from code, not the step", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const step = yml.slice(yml.indexOf("      - name: Run the backlog tool"), yml.indexOf("run: bun scripts/backlog-ops.ts"));
-  expect(step).toContain('          INGEST_LEDGER_HOME_GUARD: "on"\n');
+  // A step-level value would be decorative: the child's environment is rebuilt from an allowlist (backlogOpsChildSpawn).
+  expect(step).not.toMatch(/^\s+INGEST_LEDGER_HOME_GUARD:/mu);
   expect(step).toContain("          BACKLOG_OPS_LEDGER_BUCKET: ${{ vars.BACKLOG_OPS_LEDGER_BUCKET }}\n");
   expect(step).toContain("          BACKLOG_OPS_LEDGER_REGION: ${{ vars.BACKLOG_OPS_LEDGER_REGION }}\n");
   // Never a literal value, an input, or an endpoint; never a guard switched off anywhere.
   expect(yml).not.toMatch(/INGEST_LEDGER_HOME_GUARD: (?!"on")/u);
   expect(yml).not.toContain("INGEST_LEDGER_ENDPOINT");
   expect(yml).not.toMatch(/INGEST_LEDGER_BUCKET:/u);
+});
+
+test("receipts record the ledger target as a hash (never the name); a ledger tool's execute binds the same target", () => {
+  const L = { bucket: "example-ledger-bucket", region: "us-west-2" };
+  const ledgerVars = { BACKLOG_OPS_LEDGER_BUCKET: L.bucket, BACKLOG_OPS_LEDGER_REGION: L.region };
+  for (const mode of ["backfill-dry", "backfill-execute", "drain-dry", "drain-execute", "backfill-refresh-execute", "backfill-catchup-dry"] as BacklogOpsMode[]) {
+    const id = backlogOpsLedgerId({ mode }, L);
+    expect(id).toMatch(/^ledger_[0-9a-f]{32}$/u);
+    expect(backlogOpsLedgerId({ mode }, null)).toBe("none");
+  }
+  for (const mode of ["export-dry", "export-execute", "presence-dry"] as BacklogOpsMode[]) expect(backlogOpsLedgerId({ mode }, L)).toBe("none");
+  const id = backlogOpsLedgerId({ mode: "drain-dry" }, L);
+  expect(backlogOpsLedgerId({ mode: "drain-dry" }, { ...L, bucket: "example-other-ledger" })).not.toBe(id);
+  expect(backlogOpsLedgerId({ mode: "drain-dry" }, { ...L, region: "us-east-2" })).not.toBe(id);
+  expect(backlogOpsLedgerId({ mode: "backfill-dry" }, L)).toBe(id); // one id per target, whichever tool
+  const d = backlogOpsDispatch(dispatchEnv("drain-dry"));
+  const r = backlogOpsReceipt(d, "9", 0, JSON.stringify({ mode: "dry_run", listed: 1 }), "all", id);
+  expect(r.ledger).toBe(id);
+  expect(JSON.stringify(r)).not.toContain(L.bucket);
+  expect(backlogOpsReceipt(d, "9", 0, "{}").ledger).toBe("none");
+  expect(codeSync(() => backlogOpsReceipt(d, "9", 0, "{}", "all", L.bucket))).toBe("backlog_ops_ledger_id");
+
+  // The drain execute: its dry run, BACKFILL and (a ledger tool) must carry the same target; the export (no ledger) need not.
+  const env = { ...dispatchEnv("drain-execute"), ...target, ...ledgerVars, RUNNER_TEMP: "/tmp/rt" };
+  const withLedger = (raw: string, ledger?: string) => JSON.stringify({ ...JSON.parse(raw), ...(ledger !== undefined ? { ledger } : {}) });
+  const files = (dry?: string, backfill?: string, exp?: string): Record<string, string> => ({
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": withLedger(receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 }), dry),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": withLedger(receipt("backfill-execute", BACKFILL, backfillOk), backfill),
+    "/tmp/rt/backlog-ops-bound/export/backlog-ops-receipt.json": withLedger(receipt("export-execute", EXPORT, exportOk), exp),
+  });
+  const check = (e: Record<string, string>, f: Record<string, string>) => codeSync(() => checkBoundReceipts(e, backlogOpsDispatch(e, true), (p: string) => f[p]!));
+  const other = backlogOpsLedgerId({ mode: "drain-dry" }, { ...L, bucket: "example-other-ledger" });
+  expect(check(env, files(id, id, "none"))).toBeNull();
+  expect(check(env, files(other, id, "none"))).toBe("backlog_ops_bound_drain_ledger");
+  expect(check(env, files("none", id, "none"))).toBe("backlog_ops_bound_drain_ledger");
+  expect(check(env, files(undefined, id, "none"))).toBe("backlog_ops_bound_drain_ledger"); // an older receipt: none
+  expect(check(env, files(id, other, "none"))).toBe("backlog_ops_bound_backfill_ledger");
+  expect(check(env, files(id, id, other))).toBeNull(); // the export takes no ledger bucket: not compared
+  expect(check(env, files(id, id, "ledger_bad"))).toBeNull();
+  // The variables unset now: a dry run that had them refuses; older receipts (no field) bind as before.
+  const plain = { ...dispatchEnv("drain-execute"), ...target, RUNNER_TEMP: "/tmp/rt" };
+  expect(check(plain, files(undefined, undefined, undefined))).toBeNull();
+  expect(check(plain, files("none", "none", undefined))).toBeNull();
+  expect(check(plain, files(id, undefined, undefined))).toBe("backlog_ops_bound_drain_ledger");
+  // A backfill execute binds its own dry run the same way.
+  const bf = { ...dispatchEnv("backfill-execute"), ...target, ...ledgerVars, RUNNER_TEMP: "/tmp/rt" };
+  const bfFiles = (dry?: string) => ({ "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": withLedger(receipt("backfill-dry", DRY, { ...backfillOk, mode: "dry_run" }), dry) });
+  expect(check(bf, bfFiles(id))).toBeNull();
+  expect(check(bf, bfFiles(other))).toBe("backlog_ops_bound_backfill_ledger");
+  // An export execute ignores the ledger field of what it binds.
+  const ex = { ...dispatchEnv("export-execute"), ...target, ...ledgerVars, RUNNER_TEMP: "/tmp/rt" };
+  expect(check(ex, {
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": withLedger(receipt("export-dry", DRY, { ...exportOk, mode: "dry_run" }), "none"),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": withLedger(receipt("backfill-execute", BACKFILL, backfillOk), other),
+  })).toBeNull();
+});
+
+test("workflow: the proof runs on a change to the ledger-aware tools, and runs their store and guard tests", () => {
+  const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
+  for (const parent of ["  pull_request:\n", "  push:\n"]) {
+    const block = yml.slice(yml.indexOf(parent), yml.indexOf("\n\n", yml.indexOf(parent)));
+    const paths = block.slice(block.indexOf("    paths:\n")) + "\n";
+    for (const f of ["scripts/upload-fence-backfill.ts", "scripts/buffered-drain.ts", "src/session-ingest/ledger-tool-store.ts", "src/session-ingest/__tests__/ledger-tool-store*"])
+      expect(paths).toContain(`      - ${f}\n`);
+  }
+  const proof = yml.slice(yml.indexOf("  proof:\n"), yml.indexOf("  prerequisite-gate:"));
+  expect(proof).toMatch(/^ {8}run: bun test --timeout \d+ \.\/src\/session-ingest\/__tests__\/ledger-tool-store\.test\.ts$/mu);
 });

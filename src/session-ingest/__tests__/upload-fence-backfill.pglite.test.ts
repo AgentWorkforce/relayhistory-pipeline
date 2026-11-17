@@ -7,9 +7,10 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
-import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason } from "../../../scripts/upload-fence-backfill.ts";
+import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason, runBackfill } from "../../../scripts/upload-fence-backfill.ts";
+import { toolLedgerBucket } from "../ledger-tool-store.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
-import { isLedgerKey, ledgerRoutedStore } from "../ledger-store.ts";
+import { isLedgerKey, ledgerHomeKey, ledgerRoutedStore } from "../ledger-store.ts";
 import { scratchStore } from "./support.ts";
 
 setDefaultTimeout(60_000);
@@ -1372,6 +1373,37 @@ describe("a relocated ledger (INGEST_LEDGER_BUCKET, docs/ledger-relocation.md): 
     expect(await entryOf(locker, A, "origin-1", "rec-1")).toBeUndefined();
     expect(await fenceOf(locker, A)).not.toBeNull();
     expect(await fenceOf(ledger, A)).toBeNull();
+  });
+
+  test("the CLI entry (runBackfill) end to end: a stale Locker copy of an owner stub or revision shard is never read", async () => {
+    const { locker, ledger } = await setup();
+    const LOCKER = "example-locker-bucket", LEDGER = "example-ledger-bucket";
+    const marker = (bucket: string) => enc.encode(JSON.stringify({ v: 1, home: bucket, writtenAtMs: 1 }));
+    await locker.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    // Pre-relocation copies left in the Locker bucket: garbage that would refuse (unreadable) if anything read it.
+    const stale = [s3LedgerKeys(ROOT, A).owner("origin-1", "claude", "kept"), s3LedgerKeys(ROOT, A).revisions("origin-1", "rec-1")];
+    for (const k of stale) await locker.put(objectKey(k), enc.encode("stale pre-relocation copy"));
+    const reads: string[] = [];
+    const spy = (s: ObjectStore): ObjectStore => ({
+      ...s, backend: s.backend,
+      head: (k) => { reads.push(String(k)); return s.head(k); },
+      get: (k, r) => { reads.push(String(k)); return s.get(k, r); },
+      getObject: (k, r) => { reads.push(String(k)); return s.getObject(k, r); },
+      list: (p, c) => s.list(p, c), put: (k, b, o) => s.put(k, b, o), delete: (k) => s.delete(k), presignGet: (k, t) => s.presignGet(k, t),
+    });
+    const env = { INGEST_LEDGER_BUCKET: LEDGER, INGEST_LEDGER_REGION: "eu-west-1", INGEST_LEDGER_HOME_GUARD: "on" };
+    const args = parseBackfillArgs(["--execute", "--bucket", LOCKER, "--kms-key-arn", "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-4000-8000-000000000000"]);
+    const log: string[] = [];
+    const summary = await runBackfill(args, {
+      sql: recordingSql(log), env, credentials: { accessKeyId: "AKIAEXAMPLE", secretAccessKey: "secret" }, ledgerBucket: toolLedgerBucket(env, args),
+      create: (c) => (c.bucket === LOCKER ? spy(locker) : c.bucket === LEDGER ? ledger : (() => { throw new Error("unexpected_bucket"); })()),
+    });
+    expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+    expect(reads.filter((k) => isLedgerKey(ROOT, k))).toEqual([ledgerHomeKey(ROOT)]);
+    expect(await ownerOf(ledger, A, "origin-1", "claude", "kept")).toMatchObject({ sessionId: "kept" });
+    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toBeDefined();
+    for (const k of stale) expect(dec.decode(await readAll(await locker.get(objectKey(k))))).toBe("stale pre-relocation copy");
   });
 
   test("a fences-only run writes the Locker store alone", async () => {
