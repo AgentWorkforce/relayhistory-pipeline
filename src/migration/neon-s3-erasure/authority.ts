@@ -15,6 +15,11 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import {
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+  LEGACY_EXPORT_SWEEP_AUTHORITY_SETTING,
+} from "../../shared/legacy-export-generation.ts";
+import {
   activityPage,
   catalogPage,
   fencedGroups,
@@ -33,10 +38,29 @@ export interface ErasurePresence {
   groupExists(orgId: string, sessionId: string, includeLegacy: boolean): Promise<boolean>;
 }
 
+/**
+ * One legacy-exported scope whose privacy fence is still authoritative.  The
+ * user is the owner bound by the legacy exporter, not necessarily the member
+ * whose deletion created the fence; it derives the one `legacy:tables:v1`
+ * machine which may be erased without reaching another user's copy.
+ */
+export interface LegacyFencedGroup {
+  org_id: string;
+  workspace_id: string;
+  source: string;
+  session_id: string;
+  legacy_user_id: string;
+  legacy_machine_id: string;
+}
+
 export interface ErasureAuthority {
   readonly kind: ErasureAuthorityKind;
+  /** Capture authority identity once, before any work in this sweep. */
+  beginSweep?(): void;
   /** Refuses (throws) when this source is not the privacy authority right now. */
   ready(): Promise<void>;
+  /** Supabase only: durably attest a healthy non-dry-run sweep and mapping-RPC probe. */
+  recordSuccessfulSweep?(): Promise<void>;
   lockWaiters(): Promise<{ total: number; nonAdvisory: number }>;
   /** Neon only: the rollup/catalog presence sweep ("gone from Neon"). */
   readonly presence?: ErasurePresence;
@@ -44,6 +68,36 @@ export interface ErasureAuthority {
   fencedLivePage(after: LiveFencedGroup | null, limit?: number): Promise<LiveFencedGroup[]>;
   /** Re-read right before an erasure: false once the user re-enabled the session. */
   stillFenced(g: LiveFencedGroup): Promise<boolean>;
+  /**
+   * Legacy-export scope fences, already joined to their exporter-bound owner.
+   * Only the Supabase authority installs this production feed: it reads the
+   * durable row written before export. Neon has no copy of that row and must
+   * never re-derive an owner from mutable evidence.
+   */
+  legacyFencedPage?(after: LegacyFencedGroup | null, limit?: number): Promise<LegacyFencedGroup[]>;
+  /** Re-read the exact scope-level fence immediately before every delete page. */
+  stillLegacyFenced?(g: LegacyFencedGroup): Promise<boolean>;
+}
+
+/**
+ * Neon has no durable legacy-export owner mapping. A scope fence there can
+ * therefore never authorize a legacy-machine delete. Surface the condition
+ * loudly so an operator moves the sweep to the active Supabase authority;
+ * never derive an owner from mutable Neon rows.
+ */
+async function refuseNeonLegacyFences(db: Queryable): Promise<LegacyFencedGroup[]> {
+  const { rows } = await db.query(
+    `SELECT 1 WHERE
+       EXISTS(SELECT 1 FROM sessions.deleted_upload_sessions LIMIT 1)
+       OR EXISTS(SELECT 1 FROM sessions.conversation_turn_fences LIMIT 1)
+       LIMIT 1`,
+  );
+  if (rows.length > 0)
+    throw Object.assign(
+      new Error("legacy erasure requires the Supabase authority mapping"),
+      { code: "legacy_erasure_requires_supabase_authority" },
+    );
+  return [];
 }
 
 export function neonAuthority(db: Queryable): ErasureAuthority {
@@ -66,6 +120,10 @@ export function neonAuthority(db: Queryable): ErasureAuthority {
           [g.org_id, g.workspace_id, g.user_id, g.origin_id, g.source, g.session_id],
         )
       ).rows.length > 0,
+    legacyFencedPage: () => refuseNeonLegacyFences(db),
+    // The page above can never yield a target under Neon. Supplying the pair
+    // keeps the job's authority contract complete without authorizing a row.
+    stillLegacyFenced: async () => false,
   };
 }
 
@@ -81,7 +139,8 @@ export class AuthorityNotActive extends Error {
  * The Supabase authority's fenced set, through the least-privilege eraser RPCs (20261105041000): the deduplicated
  * UNION of the frozen-source deletions (Neon-era sessions) and the target's upload_deletions (every session the
  * ordered fence deleted, post-cutover uploads included). Each RPC refuses unless the authority is active. The
- * connection is expected to be bulls96_privacy_eraser (assertEraserIdentity), which can call nothing else.
+ * connection is expected to be bulls96_privacy_eraser (assertEraserIdentity), which can call nothing else beyond
+ * the eraser RPC surface (ordinary and legacy-scope pages plus their rechecks).
  */
 export function supabaseAuthority(db: Queryable): ErasureAuthority {
   const rpc = async <T>(sql: string, params: unknown[] = []): Promise<T> => {
@@ -89,13 +148,44 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
     if (!r) throw Object.assign(new Error("eraser rpc returned no row"), { code: "eraser_rpc_empty" });
     return r.r;
   };
+  let sweepAuthorityActivatedAt: string | undefined;
   const ready = async () => {
     const s = await rpc<{ active?: unknown }>("SELECT sessions.ingest_privacy_eraser_state() AS r");
     if (s?.active !== true) throw new AuthorityNotActive();
+    if (sweepAuthorityActivatedAt === undefined) {
+      const token = await rpc<unknown>("SELECT sessions.legacy_export_privacy_eraser_activation() AS r");
+      if (typeof token !== "string" || token.length === 0)
+        throw Object.assign(new Error("eraser activation rpc returned no token"), { code: "eraser_activation_empty" });
+      sweepAuthorityActivatedAt = token;
+    }
   };
   return {
     kind: "supabase",
+    beginSweep: () => { sweepAuthorityActivatedAt = undefined; },
     ready,
+    recordSuccessfulSweep: async () => {
+      // The dedicated authority connection is read-only by default. Open one
+      // explicit write transaction for this fixed eraser-only RPC; the role
+      // still has no direct table writes or any other write-capable function.
+      await db.query("BEGIN READ WRITE");
+      try {
+        await db.query("SELECT set_config($1,$2,true)", [
+          LEGACY_EXPORT_GENERATION_SETTING,
+          LEGACY_EXPORT_GENERATION,
+        ]);
+        if (!sweepAuthorityActivatedAt)
+          throw Object.assign(new Error("eraser sweep authority was not captured"), { code: "eraser_activation_missing" });
+        await db.query("SELECT set_config($1,$2,true)", [
+          LEGACY_EXPORT_SWEEP_AUTHORITY_SETTING,
+          sweepAuthorityActivatedAt,
+        ]);
+        await rpc("SELECT sessions.legacy_export_privacy_eraser_heartbeat() AS r");
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    },
     lockWaiters: () => lockWaiters(db),
     fencedGroups: async () => rpc<{ org_id: string; session_id: string }[]>("SELECT sessions.ingest_privacy_eraser_groups() AS r"),
     fencedLivePage: async (after, limit = LIVE_FENCE_PAGE) =>
@@ -107,6 +197,16 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
     stillFenced: async (g) =>
       (await rpc<boolean>("SELECT sessions.ingest_privacy_eraser_still_fenced($1::jsonb) AS r", [JSON.stringify({
         org_id: g.org_id, workspace_id: g.workspace_id, user_id: g.user_id, origin_id: g.origin_id, source: g.source, session_id: g.session_id,
+      })])) === true,
+    legacyFencedPage: async (after, limit = LIVE_FENCE_PAGE) =>
+      rpc<LegacyFencedGroup[]>("SELECT sessions.legacy_export_privacy_eraser_page($1::jsonb) AS r", [JSON.stringify({
+        after: after ? [after.org_id, after.workspace_id, after.source, after.session_id, after.legacy_user_id, after.legacy_machine_id] : null,
+        limit: Math.min(limit, 5000),
+      })]),
+    stillLegacyFenced: async (g) =>
+      (await rpc<boolean>("SELECT sessions.legacy_export_privacy_eraser_still_fenced($1::jsonb) AS r", [JSON.stringify({
+        org_id: g.org_id, workspace_id: g.workspace_id, source: g.source, session_id: g.session_id,
+        legacy_user_id: g.legacy_user_id, legacy_machine_id: g.legacy_machine_id,
       })])) === true,
   };
 }

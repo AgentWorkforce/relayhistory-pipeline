@@ -1,14 +1,22 @@
 // deps.large routing in the event consumer (SESSION_LARGE_READ_HANDOFF_ENABLED): real pointer
 // stage, real search index (PGlite + recorded ClickHouse transport), stubbed or real route.
 import {afterEach,expect,test} from "bun:test";
+import {PGlite} from "@electric-sql/pglite";
+import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
+import {createSearchIndexRegistry} from "@rhc/adapters/defaults.ts";
+import {TENANT_SETTINGS_SQL,type TenantSqlRunner} from "@rhc/search-index/postgres.ts";
 import {mkdtemp,rm} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {objectKey} from "../../../packages/object-store/src/index.ts";
 import {objectStoreManifestReader,prefixAllowed,prefixOrgResolver} from "../../shared/vendor.ts";
+import {legacyMachineId} from "../../shared/legacy-export-machine.ts";
+import {composeSearchService} from "../../shared/search-composition.ts";
 import {processBatch,type ConsumerDeps} from "../consumer.ts";
 import {droppedFanout} from "../pointer.ts";
 import {largeReadJobState,routeLargeRead} from "../large-read-worker.ts";
+import type {SearchProjectionState} from "../search-adapter.ts";
+import {SCOPE,T0,USER,direct,exportStreamScope,prefixFor as streamPrefixFor,type Line} from "../../session-read-api/__tests__/stream-fixture.ts";
 import {replayDatabase,exportReplayFixture,createFsStore} from "./replay-fixture.ts";
 import {recordingReplayClickHouse} from "./replay-clickhouse-fixture.ts";
 const cleanup:Array<()=>Promise<unknown>>=[];
@@ -153,4 +161,45 @@ test("a partial scope's warning names the reasons the indexer returned",async()=
  expect(r.failures).toEqual([]);
  expect(r.partials).toEqual([expect.objectContaining({level:"warn",stage:"search-index",reason:"scope_too_large"})]);
  expect(r.partials[0].stream).toBeUndefined(); // only a streamed reconcile reports what it read
+},60000);
+
+test("a complete streamed read warns once when forged legacy evidence is dropped",async()=>{
+ const x=await replayDatabase();cleanup.push(()=>x.pg.close());
+ const owned=legacyMachineId(SCOPE.workspaceId,USER);
+ const legacy=(machine:string,recordId:string,note:string):Line=>({
+  machine,userId:USER,record:{kind:"legacy_scope",origin_id:"legacy:scope",record_id:recordId,revision:"1",operation:"upsert",
+   received_at:new Date(T0).toISOString(),payload:{org_id:SCOPE.orgId,workspace_id:SCOPE.workspaceId,source:SCOPE.harness,session_id:SCOPE.sessionId,note}},
+ });
+ const exported=await exportStreamScope([
+  direct("machine:live","live-row",T0+1000,{type:"user",actor_role:"user",content:"live survives"}),
+  legacy(owned,"same-seat","trusted export"),
+  legacy("machine:forged","same-seat","different forged bytes"),
+ ],1200);
+ cleanup.push(exported.dispose);
+ const searchDb=new PGlite({extensions:{pg_trgm}});cleanup.push(()=>searchDb.close());await searchDb.exec("CREATE EXTENSION pg_trgm");
+ const tenant:TenantSqlRunner=(orgId,workspaceId,work)=>searchDb.transaction(async tx=>{await tx.query(TENANT_SETTINGS_SQL,[orgId,workspaceId]);return work(tx)});
+ const state:SearchProjectionState={fromMs:async()=>0,record:async()=>{},partials:async()=>({sessions:[],overflow:false})};
+ const adapter=composeSearchService({registry:createSearchIndexRegistry(),state:()=>state},{env:{SEARCH_INDEX_BACKEND:"postgres"},sql:searchDb},"writer",tenant);
+ await adapter.index.ensureSchema();
+ const deps:ConsumerDeps={
+  pointer:{db:{...x.db,pool:undefined,end:async()=>{}} as any,lock:async(_s:any,work:any)=>work(),reader:exported.reader,
+   exists:async(k:any)=>(await exported.store.head(objectKey(k)))!==undefined,orgs:prefixOrgResolver,
+   allowPrefix:(p:any,o:any)=>prefixAllowed(bindings,p,o),fanout:droppedFanout},
+  search:{transact:<T>(work:any)=>x.pg.transaction((tx:any)=>work({query:(sql:string,params?:unknown[])=>tx.query(sql,params)})) as Promise<T>,
+   reader:exported.reader,store:exported.store,adapter,prefixFor:streamPrefixFor,
+   writeEvents:async()=>({written:true} as never),writeCatalog:async()=>{},
+   limits:{maxScopeBytes:1,maxScopeEvents:1},stream:{maxReadBytes:1<<30,maxReadEvents:1<<24}},
+ };
+ const warnings:any[]=[],reconciled:any[]=[],out=process.stdout.write,err=process.stderr.write;
+ const tap=(w:any,stream:NodeJS.WriteStream)=>(chunk:any,...rest:any[])=>{for(const line of String(chunk).split("\n"))if(line.startsWith("{"))try{
+  const entry=JSON.parse(line);if(entry.message==="canonical legacy evidence dropped")warnings.push(entry);if(entry.message==="search index reconciled")reconciled.push(entry);
+ }catch{}return w.call(stream,chunk,...rest)};
+ process.stdout.write=tap(out,process.stdout) as any;process.stderr.write=tap(err,process.stderr) as any;
+ try{
+  const messages=exported.keys.map((key,i)=>({messageId:`legacy-${i}`,body:JSON.stringify({reconcile:{key}})}));
+  expect(await processBatch(messages,deps)).toEqual({batchItemFailures:[]});
+ }finally{process.stdout.write=out;process.stderr.write=err}
+ expect(warnings).toEqual([expect.objectContaining({level:"warn",stage:"search-index",reason:"legacy_provenance_invalid"})]);
+ expect(Object.keys(warnings[0]).sort()).toEqual(["deployment","deployment_id","level","message","reason","service","stage","ts"]);
+ expect(reconciled).toEqual([expect.objectContaining({ok:true,reason:"legacy_provenance_invalid"})]);
 },60000);

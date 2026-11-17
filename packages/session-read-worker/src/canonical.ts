@@ -1,4 +1,5 @@
 import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { isLegacySourceTable, sortLegacyRows } from "../../../src/session-read-api/canonical-legacy.ts";
 import {
   canonicalArtifactPage,
   type ArtifactReadDeps,
@@ -49,6 +50,21 @@ const tables = new Set([
   "session_timing",
   "session_directory_event_values",
 ]);
+
+/** Legacy ordering is opt-in per snapshot; live-only rows retain the exact
+ * projector order for both asc and desc, including existing offset cursors. */
+export function orderLegacySnapshotRows<
+  T extends { row: Record<string, unknown> },
+>(
+  table: string,
+  rows: T[],
+  order: "asc" | "desc",
+  legacyRowsMerged: boolean,
+): T[] {
+  return legacyRowsMerged && isLegacySourceTable(table)
+    ? sortLegacyRows(table, rows, order)
+    : rows;
+}
 async function boundedJson(
   response: Response,
   signal: AbortSignal,
@@ -397,6 +413,8 @@ export async function canonicalHandle(
     // Requested display values are optional on the raw path: their refusal omits those rows only.
     if ("displayOmitted" in snapshot && snapshot.displayOmitted && table === "session_directory_event_values")
       console.error(logLine("warn", "canonical display values omitted", { service: "96bulls-session-read-worker", stage: "canonical-read", org_id: identity.orgId, workspace_id: identity.workspaceId, harness: identity.source, session_id: identity.sessionId, reason: snapshot.displayOmitted }));
+    if ("legacyDroppedReason" in snapshot && snapshot.legacyDroppedReason)
+      console.error(logLine("warn", "canonical legacy evidence dropped", { service: "96bulls-session-read-worker", stage: "canonical-read", org_id: identity.orgId, workspace_id: identity.workspaceId, harness: identity.source, session_id: identity.sessionId, reason: snapshot.legacyDroppedReason }));
     if (
       expectedGeneration !== null &&
       expectedGeneration !== snapshot.generation
@@ -475,6 +493,9 @@ export async function canonicalHandle(
         (a, b) =>
           (order === "asc" ? 1 : -1) * compareArtifactEventRows(a.row, b.row),
       );
+    // Preserve the established live-only order and cursor contract byte-for-byte.
+    // Only a snapshot that actually merged legacy rows needs Neon's legacy key order.
+    orderLegacySnapshotRows(table, all, order, snapshot.legacyRowsMerged);
     if (offset > all.length) throw new CanonicalReadError("cursor", 400);
     const rows = [];
     let bytes = 0;

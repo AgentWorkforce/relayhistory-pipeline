@@ -93,6 +93,13 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     const files = readdirSync(join(REPO_ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort();
     expect([...POST_G4_MIGRATIONS]).toEqual(files.slice(files.indexOf(G4_LAST_MIGRATION) + 1));
     expect([...g4, ...POST_G4_MIGRATIONS]).toEqual(files);
+    // Registry order: the legacy authority reads the user-erasure ledger, so
+    // 062030 must remain after 058010 even as later post-G4 slots are added.
+    const operatorErase = files.indexOf("20261105058010_operator_user_erase.sql");
+    const legacyAuthority = files.indexOf("20261105062030_legacy_export_scope_authority.sql");
+    expect(operatorErase).toBeGreaterThanOrEqual(0);
+    expect(legacyAuthority).toBeGreaterThanOrEqual(0);
+    expect(legacyAuthority).toBeGreaterThan(operatorErase);
     // Drift alarm: a migration landing on main after G4 fails here, so its G4 impact is reviewed (the
     // absence checks and the function-body scan below already include it through the derived list).
     expect([...POST_G4_MIGRATIONS]).toEqual([
@@ -181,6 +188,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Relay turns forward gates: new owner-only fence/writer tables and independently gated ingest/read entry
       // points. The G4 Worker never calls the new names, and the body scan below covers their dependencies.
       "20261105062020_turns_forward_gates.sql",
+      // Legacy-export owner authority tables and narrowly granted exporter/eraser RPCs. They only read the
+      // erasure ledgers and are never called by a G4 ingest path; the absence/body checks below review that impact.
+      "20261105062030_legacy_export_scope_authority.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
