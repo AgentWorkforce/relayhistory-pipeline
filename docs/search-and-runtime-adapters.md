@@ -62,11 +62,22 @@ interface SearchIndexAdapter {
   deleteEvents(tenant, positions);                  // exact stale rows (reconcile)
   eraseScope({ orgId, workspaceId, source, sessionIds });  // erasure, any ts
   scanFingerprints(scope, { fromMs, limit });       // reconcile scan; truncated => never delete
+  scanFingerprintsPage?(scope, { fromMs, limit, after? }); // optional keyset page -> { rows, next? }
   query({ tenant, sessionId?, source?, kind?, projectId?, q?, sinceMs?, untilMs?,
           order, cursor?, limit, maxContentChars? }); // -> { hits, next? }
   health();
 }
 ```
+
+`scanFingerprintsPage` is optional, except that the self-host consumer refuses to start with
+`SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` on an index without it (the Postgres and OpenSearch adapters
+have it). One call returns at most `limit` rows (`limit` is 1..5000, `MAX_SCAN_PAGE`) of the rows
+`scanFingerprints` would return, in the same page order, strictly after `after` and strictly increasing.
+`next` is present only when another page may exist, and is then exactly the position of the last row
+returned (pass it back as `after`); an empty page has no `next`. The consumer refuses a page that breaks
+any of this (too many rows, out of order or repeated, `next` not the last row, an empty page with `next`)
+before it writes or deletes anything. A row written or deleted between pages may or may not be seen; no
+row present for the whole walk is skipped or returned twice.
 
 Every adapter must reproduce these semantics. The conformance suite checks
 each one against the reference oracle (`matchesQuery`):
