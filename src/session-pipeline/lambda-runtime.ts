@@ -6,7 +6,7 @@ import type { BatchResponse } from "./consumer.ts";
 
 export interface PipelineLambdaEvent {
   Records?: { messageId: string; body: string; eventSource?: string; attributes?: Record<string, string> }[];
-  reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown; bufferedErasureDelete?: unknown;
+  reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown; bufferedErasureDelete?: unknown; briefDocuments?: unknown;
   schedule?: string; analysisCursor?: unknown; cursor?: string; since?: string; link?: number;
 }
 export interface LambdaRuntimeBinding {

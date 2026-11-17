@@ -42,6 +42,8 @@ export function coordinationOverlapsEnabled(raw: unknown): boolean {
 export const READ_API_BRIEF_SUMMARY_ENABLED = "READ_API_BRIEF_SUMMARY_ENABLED";
 /** GET /v1/sessions: serve the opt-in includeShortSummary=recorded list extension. */
 export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_ENABLED";
+/** GET /v1/sessions/summaries/search: ClickHouse summary search (clickhouse/summary-search-query.ts). Default off. */
+export const READ_API_SUMMARY_SEARCH_ENABLED = "READ_API_SUMMARY_SEARCH_ENABLED";
 
 /** READ_API_BRIEF_SUMMARY_ENABLED / READ_API_LIST_SHORT_SUMMARY_ENABLED: only the exact string "true" enables, as coordinationOverlapsEnabled. */
 export function exactTrueFlag(raw: unknown): boolean {

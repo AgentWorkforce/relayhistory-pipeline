@@ -76,6 +76,7 @@ test("actual staged publisher preserves exact epoch and Unicode fold before sour
     claimed: 1,
     published: 1,
     backfilled: 1,
+    drained: false,
   });
   expect(d.writes[0]![0]).toMatchObject({
     epoch: "9007199254740993",
@@ -95,6 +96,7 @@ test("empty workspace remains a valid canonical identity", async () => {
     claimed: 1,
     published: 1,
     backfilled: 1,
+    drained: false,
   });
   expect(d.writes[0]![0]).toMatchObject({ workspace_id: "" });
   expect(JSON.parse(d.calls.at(-1)!.params![1] as string)[0].workspaceId)

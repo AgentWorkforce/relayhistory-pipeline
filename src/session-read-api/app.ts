@@ -35,6 +35,9 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
  *                                   brief-summary.ts, migration 20261105056000)
+ *   GET /v1/sessions/summaries/search  sessions whose title or scrubbed short summary contains q:
+ *                                   ClickHouse session_brief_documents candidates, hydrated from the
+ *                                   directory (READ_API_SUMMARY_SEARCH_ENABLED=true; otherwise 501)
  *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
@@ -96,6 +99,15 @@ import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type 
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
+import {
+  SUMMARY_SCHEMA_MISSING_CODES,
+  SUMMARY_SEARCH_DEFAULT_LIMIT,
+  SUMMARY_SEARCH_MAX_LIMIT,
+  SUMMARY_SEARCH_MIN_CHARS,
+  buildSummarySearchQuery,
+  summaryMatches,
+  type SummaryCandidateRow,
+} from "./clickhouse/summary-search-query.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
 import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
@@ -233,6 +245,14 @@ export interface ReadApiDeps {
    * 501 `param_includeShortSummary`; without the param the list shape is unchanged either way.
    */
   listShortSummary?: boolean;
+  /**
+   * READ_API_SUMMARY_SEARCH_ENABLED=true (exactly "true"): GET /v1/sessions/summaries/search finds
+   * sessions whose title or scrubbed short summary contains `q`, with ClickHouse
+   * `session_brief_documents` as candidate discovery and the directory as the authority
+   * (clickhouse/summary-search-query.ts). Needs the ClickHouse binding and the directory. Not
+   * true = 501 `summary_search_not_configured`; nothing else changes.
+   */
+  summarySearch?: boolean;
   /**
    * MESSAGE_ORIGIN_LABELS_ENABLED=true (exactly "true"): GET /v1/events serves `origin=`
    * (who wrote the event, message-origin.ts). Not true = 501 `param_origin`. A served
@@ -1383,6 +1403,66 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: c.get("correlationId") }, 503);
       }
       return fail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/summaries/search?workspace=&q=&limit=: READ_API_SUMMARY_SEARCH_ENABLED=true only
+   * (deps.summarySearch). Sessions whose title or scrubbed short summary contains `q` (case-folded
+   * substring, at least SUMMARY_SEARCH_MIN_CHARS), newest activity first, at most `limit` (1..50,
+   * default 20). ClickHouse `session_brief_documents` finds candidates; each is hydrated from the
+   * directory (the authority, tombstoned rows excluded) and re-checked there, so text the directory
+   * no longer holds is never served. Same workspace attestation and canary as the directory
+   * routes. No cursor: `truncated` says more candidates existed. Answers
+   * `{ sessions: [<the /v1/sessions shape with shortSummary, shortSummaryGeneratedAt>], truncated }`.
+   * 501 `summary_search_not_configured` (flag off, or no ClickHouse binding),
+   * `summary_search_schema_missing` (the owner-applied DDL is absent), `q_with_buffered` (an
+   * owner-buffered workspace: buffered sessions have no search document).
+   */
+  app.get("/v1/sessions/summaries/search", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      if (deps.summarySearch !== true || !deps.ch) throw unsupported("summary_search_not_configured");
+      const directory = directoryFor(identity);
+      for (const name of Object.keys(c.req.query())) if (!["workspace", "q", "limit"].includes(name)) throw unsupported(`param_${name}`);
+      const q = (single(c, "q") ?? "").trim();
+      const chars = [...q].length;
+      if (chars < SUMMARY_SEARCH_MIN_CHARS) throw bad(`q must be at least ${SUMMARY_SEARCH_MIN_CHARS} characters`);
+      if (chars > MAX_Q_CHARS) throw bad(`q must be ${MAX_Q_CHARS} characters or fewer`);
+      // Buffered rows have no search document: a q read never drops them silently (as GET /v1/sessions?q=).
+      if (ownerBufferedFor(identity) !== undefined) throw unsupported("q_with_buffered");
+      const limit = clampLimit(single(c, "limit"), SUMMARY_SEARCH_DEFAULT_LIMIT, SUMMARY_SEARCH_MAX_LIMIT);
+      const built = buildSummarySearchQuery(deps.ch.database, { orgId: identity.orgId, workspaceId: identity.workspaceId, q, limit });
+      let candidates: SummaryCandidateRow[];
+      try {
+        candidates = await deps.ch.select<SummaryCandidateRow>(built.query, { params: built.params, settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 });
+      } catch (error) {
+        // The table is owner-applied DDL: missing is a 501, not a 503.
+        if (error instanceof ClickHouseError && error.code !== null && SUMMARY_SCHEMA_MISSING_CODES.has(error.code)) throw unsupported("summary_search_schema_missing");
+        throw error;
+      }
+      if (candidates.length > limit + 1 || candidates.some((r) => typeof r?.source !== "string" || typeof r.session_id !== "string" || !r.source || !r.session_id))
+        throw new Error("summary search candidate out of contract");
+      const truncated = candidates.length > limit;
+      const keys = candidates.slice(0, limit).map((r) => ({ harness: r.source, sessionId: r.session_id }));
+      const keyOf = (harness: string, sessionId: string) => `${harness}\u0000${sessionId}`;
+      const rank = new Map(keys.map((k, i) => [keyOf(k.harness, k.sessionId), i] as const));
+      let sessions: ReturnType<typeof sessionFromDirectoryRow>[] = [];
+      if (keys.length > 0) {
+        const rows = await directory.list(identity.orgId, identity.workspaceId, { sessionKeys: keys, limit: keys.length });
+        if (rows === null) throw unsupported("directory_not_migrated");
+        for (const row of rows) if (row.org_id !== identity.orgId || row.workspace_id !== identity.workspaceId) throw new DirectoryError("tenant_mismatch");
+        sessions = rows
+          .filter((row) => rank.has(keyOf(row.harness, row.session_id)) && summaryMatches(row, q))
+          .sort((a, b) => rank.get(keyOf(a.harness, a.session_id))! - rank.get(keyOf(b.harness, b.session_id))!)
+          .map((row) => sessionFromDirectoryRow(row, { includeShortSummary: "recorded" }));
+      }
+      // Counts only: never the query, a session id or summary text.
+      log({ route: c.req.routePath, reason: "summary_search_served", listed: keys.length, count: sessions.length, status: 200, correlation_id: c.get("correlationId") });
+      return c.json({ sessions, truncated, correlationId: c.get("correlationId") });
+    } catch (error) {
+      return directoryFail(c, error);
     }
   });
 

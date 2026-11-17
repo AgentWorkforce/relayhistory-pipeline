@@ -10,6 +10,7 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  *   EventBridge schedule {"brief": true}          -> one session-brief tick (src/session-brief)
  *   schedule {"bufferedSearchFeed": true}         -> one bounded buffered-stage feed run (default off)
  *   schedule {"bufferedErasureDelete": true}      -> one bounded later-erasure delete pass over buffered rows (default off)
+ *   invoke {"briefDocuments": true}               -> one bounded session_brief_documents publication run (default off)
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_PIPELINE_SECRET_ARN`), read once per
@@ -88,6 +89,7 @@ import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.
 import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
 import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import { BriefDocumentError, publishBriefDocumentsTick } from "./brief-documents.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
@@ -867,6 +869,29 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { ok: true };
     } catch (error) {
       log.error("buffered erasure delete failed", { stage: "buffered-erasure-delete", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.briefDocuments === true) {
+    // SESSION_BRIEF_DOCUMENTS_PUBLISH=1 only (the literal "1"; default off), checked before any
+    // secret lookup, pool or ClickHouse access. Publishes the migration 20261105024000 outbox
+    // (directory title + scrubbed short_summary documents and their tombstones) into ClickHouse
+    // session_brief_documents (brief-documents.ts). Needs: the owner-applied
+    // briefDocumentSchemaStatements() DDL, SEARCH_INDEX_ENABLED=1 on the ClickHouse binding, and
+    // the owner's sessions.set_session_brief_documents_live(true); until then the backfill RPC
+    // refuses and the run reports ok=false, publishing nothing.
+    if (process.env.SESSION_BRIEF_DOCUMENTS_PUBLISH !== "1") return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      const ch = rt.deps.search?.ch;
+      if (!ch) throw new Error("brief documents: no ClickHouse binding");
+      const s = await publishBriefDocumentsTick({ db: rt.deps.pointer.db, ch });
+      log.info("brief documents run", { stage: "brief-documents", claimed: s.claimed, acked: s.published, enqueued: s.backfilled, attempt: s.rounds,
+        ok: true, state: s.caughtUp ? "caught_up" : "continuation", duration_ms: Date.now() - started });
+      return { ok: true };
+    } catch (error) {
+      log.error("brief documents run failed", { stage: "brief-documents", ...errorFields(error), reason: error instanceof BriefDocumentError ? error.reason : undefined, duration_ms: Date.now() - started });
       return { ok: false };
     }
   }
