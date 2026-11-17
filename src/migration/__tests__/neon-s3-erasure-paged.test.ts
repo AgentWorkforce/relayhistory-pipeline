@@ -95,8 +95,37 @@ describe("E3 job on the shared paged eraser", () => {
     await j.sweep();
     expect(j.counters.legacyFenceFailed).toBe(1);
     expect(logs).toContainEqual(expect.objectContaining({
+      message: "legacy fence sweep failed",
+      error_code: "legacy_rpc_broken",
+      "@metric": "legacy_fence_sweep_failed_total",
+      value: 1,
+      legacyFenceFailed: 1,
+      alarm_route: "on-call",
+    }));
+    expect(logs).toContainEqual(expect.objectContaining({
       message: "erasure sweep",
       legacy_fence_failed: 1,
+    }));
+    const neonAlarmLogs: Record<string, unknown>[] = [];
+    const neonMappingMissing = authority({
+      ...base,
+      legacyFencedPage: async () => {
+        throw Object.assign(new Error("mapping unavailable"), { code: "legacy_erasure_requires_supabase_authority" });
+      },
+    });
+    await new ErasureJob(
+      neonMappingMissing,
+      st,
+      s.eraser(),
+      (line) => neonAlarmLogs.push(line),
+      SETTLED_CFG,
+      () => NOW,
+      async () => {},
+    ).sweep();
+    expect(neonAlarmLogs).toContainEqual(expect.objectContaining({
+      error_code: "legacy_erasure_requires_supabase_authority",
+      "@metric": "legacy_fence_sweep_failed_total",
+      alarm_route: "on-call",
     }));
     expect(heartbeats).toBe(1);
     st.close();

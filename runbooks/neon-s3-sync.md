@@ -115,6 +115,24 @@ holds only the eraser key ("sessions-prod transcript eraser").
     no S3 call. Earlier steps of the same sweep may still have deleted: live
     erasure runs first, and a later page follows earlier pages' deletes. Fix
     the authority, never the inventory checks.
+  - **Required legacy-erasure paging alarms (activation blocker).** Both alarm
+    rules route immediately to the sessions on-call pager; a dashboard, email
+    or log-only notification is not a substitute. They must be installed and
+    canary-delivery proven before the legacy exporter is activated:
+    1. `legacy-erasure-requires-supabase-authority`: page on any structured
+       `service="neon-s3-erasure"` line with
+       `error_code="legacy_erasure_requires_supabase_authority"`.
+    2. `legacy-fence-sweep-failed`: page on any structured
+       `service="neon-s3-erasure"` metric line with
+       `@metric="legacy_fence_sweep_failed_total"` and `value>0`. The same
+       line carries the cumulative `legacyFenceFailed` counter and
+       `alarm_route="on-call"`; this covers feed failures and per-scope legacy
+       erasure failures, including codes other than the authority mismatch.
+
+    The alarms are edge-triggered from each failure event, not only from the
+    periodic progress line, so a process exit cannot lose the page. Keep both:
+    the exact-code alarm makes a rollback to Neon immediately identifiable,
+    while the counter alarm covers every failure in the legacy deletion lane.
   - **Either kind:** a refusal never stops the job. The oldest queued item's
     age drives `erasure SLA at risk` after 24 h.
   - **Operator action** (the lead's ruling, verbatim): "retain the
