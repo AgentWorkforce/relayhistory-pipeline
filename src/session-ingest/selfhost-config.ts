@@ -117,6 +117,7 @@
  *                                    in LOCKER_BUCKET. Same provider, endpoint and credentials as the Locker
  *                                    store. Needs INGEST_LEDGER=s3. Claims then also need the ledger-home marker in that
  *                                    bucket naming it (docs/ledger-relocation.md). Proven for conditional writes at startup.
+ *                                    Refused with LOCKER_PROVIDER=fs (the fs store ignores bucket names).
  *   INGEST_LEDGER_REGION             the ledger bucket's signing region; default LOCKER_REGION. Only with INGEST_LEDGER_BUCKET.
  *   INGEST_LEDGER_ENDPOINT           the ledger bucket's endpoint origin; default LOCKER_ENDPOINT, but only when the regions
  *                                    match. The cross-region refusal applies only when LOCKER_ENDPOINT is set: then a
@@ -239,6 +240,10 @@ export function selfhostLedgerStore(env: NodeJS.ProcessEnv, ledger: "s3" | undef
     return undefined;
   }
   if (ledger !== "s3") throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} needs ${INGEST_LEDGER_VAR}=s3`);
+  // The fs Locker ignores the bucket name: a "separate" ledger would share LOCKER_FS_ROOT and the home guard
+  // would compare labels only. With fs the ledger stays in the Locker.
+  if (env.LOCKER_PROVIDER?.trim() === "fs")
+    throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} is not supported with LOCKER_PROVIDER=fs (unset it; the ledger stays in LOCKER_FS_ROOT)`);
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must be a bucket name`);
   if (bucket === env.LOCKER_BUCKET?.trim()) throw new Error(`96bulls: ${INGEST_LEDGER_BUCKET_VAR} must differ from LOCKER_BUCKET (unset it to keep the ledger there)`);
   const lockerRegion = env.LOCKER_REGION?.trim() || "us-east-1";

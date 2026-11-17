@@ -45,10 +45,20 @@ export function tenantEnv() {
  * `RELAYAUTH_*`). Map ours onto them once so one `LOCKER_*` block configures
  * both our services and the vendored routes.
  */
-export function vendorBindings(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+export function vendorBindings(
+  extra: Record<string, string | undefined> = {},
+  options: { ownLocker?: boolean } = {},
+): Record<string, string | undefined> {
   assertLockerSelection();
   const locker = lockerEnv();
   const provider = lockerProvider();
+  // rawStoreFromEnv (shared with the Workers) builds s3/r2/gcs only; fail here, not as "not configured".
+  // `ownLocker`: the caller reads the Locker only through buildLockerStore and nothing it runs calls
+  // rawStoreFromEnv (the self-host pipeline consumer); it gets no PIPELINE_RAW_* at all, so a stray
+  // rawStoreFromEnv sees "not configured" instead of a store under the wrong provider.
+  const selfhostOnly = provider === "fs" || provider === "azure";
+  if (selfhostOnly && !options.ownLocker)
+    throw new Error(`96bulls: LOCKER_PROVIDER=${provider} is not available to the vendored pipeline routes; use s3 or gcs`);
   // Org-derived key prefixes (`<PIPELINE_KEY_PREFIX>/<org>/v1/...`): the org
   // comes from each object's prefix, so no static PIPELINE_ORG_ID may be set
   // (it would win in orgResolverFromEnv and pin every object to one org).
@@ -56,8 +66,7 @@ export function vendorBindings(extra: Record<string, string | undefined> = {}): 
   const tenant = orgFromPrefix ? undefined : tenantEnv();
   return {
     ENVIRONMENT: optional("ENVIRONMENT", "local"),
-    PIPELINE_RAW_PROVIDER: provider,
-    PIPELINE_RAW_S3_BUCKET: locker.bucket,
+    ...(selfhostOnly ? {} : { PIPELINE_RAW_PROVIDER: provider, PIPELINE_RAW_S3_BUCKET: locker.bucket }),
     // S3 and R2 still consume these names. GCS must not receive HMAC keys;
     // rawStoreFromEnv builds the GCS adapter from the bucket and a metadata token.
     ...(provider === "s3"

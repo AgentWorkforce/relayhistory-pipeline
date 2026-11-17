@@ -43,7 +43,7 @@ describe("locker provider selection", () => {
   });
 
   test("refuses an unknown provider without echoing the value", () => {
-    expect(() => lockerProvider({ LOCKER_PROVIDER: "azure" })).toThrow("must be s3 or gcs");
+    expect(() => lockerProvider({ LOCKER_PROVIDER: "minio" })).toThrow("must be s3 or gcs");
   });
 
   test("refuses to point the S3 client at the GCS API", () => {

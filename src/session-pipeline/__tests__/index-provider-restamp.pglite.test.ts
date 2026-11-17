@@ -153,7 +153,7 @@ describe("runRestampMain gates (nothing touched unless the Locker is GCS)", () =
   const cases: [string, NodeJS.ProcessEnv, string][] = [
     ["unset provider (S3 install)", { LOCKER_BUCKET: BUCKET }, "locker_provider_not_gcs"],
     ["s3 provider", { LOCKER_PROVIDER: "s3", LOCKER_BUCKET: BUCKET }, "locker_provider_not_gcs"],
-    ["unsupported provider (no Azure Locker)", { LOCKER_PROVIDER: "azure", LOCKER_BUCKET: BUCKET }, "locker_provider_invalid"],
+    ["unsupported provider", { LOCKER_PROVIDER: "minio", LOCKER_BUCKET: BUCKET }, "locker_provider_invalid"],
     ["gcs with HMAC keys", { ...GCS_ENV, LOCKER_ACCESS_KEY_ID: "k", LOCKER_SECRET_ACCESS_KEY: "s" }, "locker_selection_invalid"],
     ["gcs without a bucket", { LOCKER_PROVIDER: "gcs" }, "locker_bucket_missing"],
   ];

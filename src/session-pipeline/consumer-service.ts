@@ -39,7 +39,7 @@ import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../s
 import { integer } from "../shared/env.ts";
 import { inTransaction, type HoopDb } from "../shared/db.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
-import { runWorker } from "../shared/worker.ts";
+import { runWorker, type WorkerOptions } from "../shared/worker.ts";
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import {
   objectKey,
@@ -1101,6 +1101,19 @@ export function refuseStartupOptions(url: string): void {
 }
 
 /**
+ * The consumer's runWorker shape. It claims no stage and reads the Locker only through its own
+ * buildLockerStore (lockerStore() below), never the vendored rawStoreFromEnv, so `ownLocker` admits
+ * LOCKER_PROVIDER=fs|azure on self-host (worker.ts workerBindings). Exported for tests.
+ */
+export const CONSUMER_WORKER: Pick<WorkerOptions, "service" | "searchBackends" | "stages" | "ownLocker"> = {
+  service: "session-pipeline-consumer",
+  // consumerServiceConfig admits exactly these two for the writer.
+  searchBackends: ["postgres", "opensearch"],
+  stages: [],
+  ownLocker: true,
+};
+
+/**
  * The environment half of startup-option smuggling lives with pool creation
  * (refuseEnvOptions in lambda.ts): serve() calls it here so a set PGOPTIONS
  * fails loudly at startup, while the pool pin shadows the environment
@@ -1227,10 +1240,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   let exitCode = 0;
   try {
     await runWorker({
-      service: "session-pipeline-consumer",
-      // consumerServiceConfig admits exactly these two for the writer.
-      searchBackends: ["postgres", "opensearch"],
-      stages: [],
+      ...CONSUMER_WORKER,
       handlers: () => ({}),
       // runWorker exits the process itself after a SIGTERM drain, so the flush rides its cleanup.
       onShutdown: () => analytics.shutdown(),
