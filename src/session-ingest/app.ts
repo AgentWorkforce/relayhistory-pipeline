@@ -456,6 +456,7 @@ export function parseSelection(body: unknown): { account_id: string; expected_us
   if (expectedUser && !identifier(b.expected_user_id)) invalid("Invalid expected upload user");
   if (!identifier(b.origin_id) || typeof b.enabled !== "boolean" || !Array.isArray(b.sessions) || b.sessions.length < 1 || b.sessions.length > 2048)
     invalid("Invalid upload selection");
+  if (b.origin_id === TURN_ORIGIN_ID) invalid("Upload selection origin is reserved for relay turns");
   for (const x of b.sessions as unknown[]) {
     if (!isObject(x)) invalid("Invalid session identity");
     exactKeys(x as Record<string, unknown>, ["source", "session_id"]);

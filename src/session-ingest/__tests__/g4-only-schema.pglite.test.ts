@@ -178,13 +178,16 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Per-origin claim fence: an owner-only mark table, two owner-only helpers and three SECURITY DEFINER origin-scoped
       // entry points; replaces ingest_lock_fences (FOR SHARE only under a mark). A G4 Worker never calls the new names.
       "20261105062010_ingest_origin_claim_fence.sql",
+      // Relay-turn selection hardening: replaces the post-G4 selection helper with a shared privacy
+      // lock and reserved-origin guard. A G4 Worker retains the prior helper body.
+      "20261105062015_turns_selection_hardening.sql",
       // Relay turns forward gates: new owner-only fence/writer tables and independently gated ingest/read entry
       // points. The G4 Worker never calls the new names, and the body scan below covers their dependencies.
       "20261105062020_turns_forward_gates.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_source_control_begin"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_apply_selection", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_source_control_begin"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

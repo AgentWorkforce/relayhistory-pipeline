@@ -465,6 +465,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_origin_claim_marks, the origin-scoped buffered entry points and the mark check in sessions.ingest_lock_fences",
     sql: "SELECT to_regclass('sessions.ingest_origin_claim_marks') IS NOT NULL AND to_regprocedure('sessions.ingest_origin_claim_buffered_batch(jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%ingest_origin_claim_marks%') AS applied",
   },
+  "upstream:20261105062015_turns_selection_hardening.sql": {
+    evidence: "replacement: ingest_apply_selection takes the shared global privacy lock and rejects the reserved turns origin",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_apply_selection(text,text,text,text,jsonb,boolean)') AND NOT prosecdef AND prosrc LIKE '%pg_advisory_xact_lock_shared(961996,50000)%' AND prosrc LIKE '%turns origin is reserved%') AS applied",
+  },
   "upstream:20261105062020_turns_forward_gates.sql": {
     evidence: "table sessions.turn_session_fences and turns capability/registration RPCs",
     sql: "SELECT to_regclass('sessions.turn_session_fences') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_capability(jsonb)') IS NOT NULL AND to_regprocedure('sessions.ingest_turn_register(jsonb)') IS NOT NULL AS applied",

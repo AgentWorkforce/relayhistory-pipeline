@@ -1,0 +1,34 @@
+\set ON_ERROR_STOP on
+-- Canonical operator wrapper for the frozen 062020 down migration. Do not run
+-- 20261105062020_turns_forward_gates.down.sql directly.
+--
+-- The migration lock orders this rollback against every schema apply. The global
+-- privacy lock orders it against 062015's ordinary selection/erasure path. Pre-lock
+-- the live ledgers before the turn tables so the frozen down file's later repeated
+-- LOCK statements are re-entrant instead of participating in the old cycle.
+BEGIN;
+SET LOCAL statement_timeout='120s';
+SET LOCAL lock_timeout='5s';
+SELECT pg_advisory_xact_lock(961996,1);
+DO $operator_guard$
+DECLARE v_sha text;
+BEGIN
+  SELECT sha256 INTO v_sha
+    FROM sessions.__96bulls_migrations
+   WHERE name = 'upstream:20261105062020_turns_forward_gates.sql';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'turns forward gates: migration ledger entry missing'
+      USING ERRCODE = '55000';
+  END IF;
+  IF v_sha IS DISTINCT FROM '63ca3c75bd1b09ec32369e761446da6a592e57fd90aca6640e9fb6a5dbd8ff5a' THEN
+    RAISE EXCEPTION 'turns forward gates: applied checksum mismatch'
+      USING ERRCODE = '55000';
+  END IF;
+END
+$operator_guard$;
+SELECT pg_advisory_xact_lock(961996,50000);
+LOCK TABLE sessions.upload_deletions,sessions.operator_user_erasures
+ IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE sessions.turn_session_fences,sessions.turn_writers
+ IN SHARE ROW EXCLUSIVE MODE;
+\ir 20261105062020_turns_forward_gates.down.sql
