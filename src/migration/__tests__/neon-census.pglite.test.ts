@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   DIGEST_SQL,
   LOAD_LOCK_SQL,
+  SOURCE_STATE_SQL,
   NULL_WORKSPACE,
   censusDigest,
   censusLine,
@@ -55,8 +56,18 @@ async function target(): Promise<PGlite> {
   return pg;
 }
 
-/** PGlite is not Supabase and not in recovery; pg_current_wal_lsn() is its "server" LSN. */
-const NEON: SourceClaim = { lsn: "0/0", ref: "test-branch", seal: null, urlSupabaseRef: null };
+/** Synthetic LSNs only (the repo is public). */
+const NEON: SourceClaim = { lsn: "1/0", ref: "test-branch", seal: null, urlSupabaseRef: null };
+
+/** PGlite is never in recovery; stand in a hot standby replayed to `replay` by answering SOURCE_STATE_SQL. */
+function standby(db: PGlite, replay = "2/0", target = false): Queryable {
+  return {
+    query: (sql: string, params?: unknown[]) =>
+      sql === SOURCE_STATE_SQL
+        ? (Promise.resolve({ rows: [{ rec: true, lsn: replay, target }] }) as never)
+        : (db.query(sql, params) as never),
+  };
+}
 
 describe("neon session census", () => {
   test("covers base tables with org_id + session_id; views are reported, not read", async () => {
@@ -65,7 +76,7 @@ describe("neon session census", () => {
   });
 
   test("produce: distinct union, C-ordered, NULL/absent workspace kept, unkeyed counted; JS digest == SQL digest after load", async () => {
-    const { rows, manifest } = await produceCensus(await source(), NEON);
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     expect(rows).toEqual([
       { org_id: "O1", workspace_id: "w1", session_id: "s1" },
       { org_id: "o1", workspace_id: "w1", session_id: "s2" },
@@ -79,43 +90,59 @@ describe("neon session census", () => {
     expect(s.tables).toEqual({ convergence_events: 4, delivery_records: 4, no_ws: 1, session_timing_cache: 1 });
     expect(s.unkeyed_rows).toEqual({ delivery_records: 1 });
     expect(s.ignored_relations).toEqual({ v_sessions: "view" });
-    expect(s.lsn_evidence).toBe("neon-server");
+    expect(s.in_recovery).toBe(true);
+    expect(s.replayed_lsn).toBe("2/0");
     const tgt = await target();
     const readback = await loadCensus(tgt, rows, manifest, 2);
     expect(readback.census_rows).toBe(7);
     expect((await tgt.query<{ sha: string }>(DIGEST_SQL)).rows[0]!.sha).toBe(manifest.census_sha256);
   });
 
-  test("P2-1a: a Supabase source is refused unless named, and then needs a legacy_copy.seal at or after the claimed LSN", async () => {
+  test("P2-1: only a hot standby at or after the claimed cut is accepted; Supabase, a pipeline target and 0/0 are refused", async () => {
     const pg = await source();
-    await expect(produceCensus(pg, { ...NEON, urlSupabaseRef: "abcdefghijklmnopqrst" })).rejects.toThrow("Supabase URL");
-    await expect(produceCensus(pg, { ...NEON, urlSupabaseRef: "abcdefghijklmnopqrst", allowSupabaseRef: "zzzzzzzzzzzzzzzzzzzz" })).rejects.toThrow("Supabase URL");
-    await expect(produceCensus(pg, { ...NEON, urlSupabaseRef: "abcdefghijklmnopqrst", allowSupabaseRef: "abcdefghijklmnopqrst" })).rejects.toThrow("no legacy_copy.seal");
-    await pg.exec(`CREATE SCHEMA legacy_copy; CREATE TABLE legacy_copy.seal(sealed_at timestamptz DEFAULT now(), manifest jsonb);
-      INSERT INTO legacy_copy.seal(manifest) VALUES ('{"source":{"cut_lsn":"36B/9D2C2D8"}}');`);
-    const ok = await produceCensus(pg, { ...NEON, lsn: "36B/9D2C2D8", urlSupabaseRef: "abcdefghijklmnopqrst", allowSupabaseRef: "abcdefghijklmnopqrst" });
-    expect(ok.manifest.neon_snapshot.lsn_evidence).toBe("legacy-copy-seal");
-    expect(ok.manifest.neon_snapshot.verified_lsn).toBe("36B/9D2C2D8");
-    await expect(produceCensus(pg, { ...NEON, lsn: "36B/A0000000", urlSupabaseRef: "abcdefghijklmnopqrst", allowSupabaseRef: "abcdefghijklmnopqrst" }))
-      .rejects.toThrow("cut BEFORE");
+    await expect(produceCensus(pg, NEON)).rejects.toThrow("not a hot standby"); // real PGlite: not in recovery
+    await expect(produceCensus(standby(pg, "1/0"), { ...NEON, lsn: "2/0" })).rejects.toThrow("cut BEFORE");
+    await expect(produceCensus(standby(pg), { ...NEON, urlSupabaseRef: "abcdefghijklmnopqrst" })).rejects.toThrow("Supabase URL");
+    await expect(produceCensus(standby(pg, "2/0", true), NEON)).rejects.toThrow("pipeline target");
+    await expect(produceCensus(standby(pg), { ...NEON, lsn: "0/0" })).rejects.toThrow("above 0/0");
+    const ok = await produceCensus(standby(pg, "3/0"), NEON);
+    expect(ok.manifest.neon_snapshot.replayed_lsn).toBe("3/0");
+    expect(ok.manifest.neon_snapshot.in_recovery).toBe(true);
+    expect(lsnCompare("1/FFFFFFFF", "2/0")).toBe(-1);
+    expect(lsnCompare("10/0", "F/FFFFFFFF")).toBe(1);
   });
 
-  test("P2-1b: a source whose server LSN is below the claimed cut is refused", async () => {
-    await expect(produceCensus(await source(), { ...NEON, lsn: "FFFFFFFF/FFFFFFFF" })).rejects.toThrow("cut BEFORE");
-    expect(lsnCompare("36B/9D2C2D8", "36B/9D43108")).toBe(-1);
-    expect(lsnCompare("36C/0", "36B/FFFFFFFF")).toBe(1);
+  test("P2-1: the source state is the snapshot's first statement after BEGIN and row_security = off", async () => {
+    const seen: string[] = [];
+    const inner = standby(await source());
+    const spy: Queryable = { query: (sql, params) => { seen.push(sql); return inner.query(sql, params) as never; } };
+    await produceCensus(spy, NEON);
+    expect(seen.slice(0, 3)).toEqual(["BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", "SET LOCAL row_security = off", SOURCE_STATE_SQL]);
   });
 
-  test("P2-1c: a census table still writable by a non-owner role is refused", async () => {
+  test("P2-1: an RLS-filtered read by a non-owner role errors instead of shrinking the census", async () => {
     const pg = await source();
-    await pg.exec("CREATE ROLE app_writer; GRANT INSERT ON sessions.convergence_events TO app_writer;");
-    await expect(produceCensus(pg, NEON)).rejects.toThrow("still writable by a non-owner role");
+    await pg.exec(`CREATE ROLE census_reader; GRANT USAGE ON SCHEMA sessions TO census_reader;
+      GRANT SELECT ON ALL TABLES IN SCHEMA sessions TO census_reader;
+      ALTER TABLE sessions.convergence_events ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY only_o1 ON sessions.convergence_events FOR SELECT TO census_reader USING (org_id = 'o1');
+      SET ROLE census_reader;`);
+    await expect(produceCensus(standby(pg), NEON)).rejects.toThrow(/row-level security/i);
+  });
+
+  test("P3-7: a sessions partition whose parent is outside sessions is refused", async () => {
+    const pg = await source();
+    await pg.exec(`CREATE SCHEMA other; CREATE TABLE other.parent (org_id text, workspace_id text, session_id text) PARTITION BY LIST (org_id);
+      CREATE TABLE sessions.child PARTITION OF other.parent FOR VALUES IN ('o7');`);
+    await expect(produceCensus(standby(pg), NEON)).rejects.toThrow("parent outside sessions");
   });
 
   test("P3-3: a sessions foreign table with census keys is refused (checked via the discovery query)", async () => {
     const fake: Queryable = {
       async query<T>(sql: string) {
-        if (sql.startsWith("BEGIN") || sql.startsWith("ROLLBACK")) return { rows: [] as T[] };
+        if (sql.startsWith("BEGIN") || sql.startsWith("ROLLBACK") || sql.startsWith("SET LOCAL")) return { rows: [] as T[] };
+        if (sql === SOURCE_STATE_SQL) return { rows: [{ rec: true, lsn: "2/0", target: false }] as T[] };
+        if (sql.includes("pg_inherits")) return { rows: [] as T[] };
         return { rows: [{ relname: "remote_events", relkind: "f", relispartition: false, ws: true }] as T[] };
       },
     };
@@ -129,7 +156,7 @@ describe("neon session census", () => {
     const seen: string[] = [];
     const tgt = await target();
     const spy: Queryable = { query: (sql, params) => { seen.push(sql); return tgt.query(sql, params) as never; } };
-    const { rows, manifest } = await produceCensus(await source(), NEON);
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     await loadCensus(spy, rows, manifest);
     expect(seen.slice(0, 3)).toEqual(["BEGIN", ...LOAD_LOCK_SQL]);
   });
@@ -139,7 +166,7 @@ describe("neon session census", () => {
     await pg.exec("CREATE SCHEMA sessions; CREATE TABLE sessions.t (org_id text, workspace_id text, session_id text);");
     // U+FF61 sorts after U+1F600 in UTF-16 (0xFF61 > 0xD83D) but before it in UTF-8 (EF.. < F0..).
     await pg.query("INSERT INTO sessions.t VALUES ($1,'w','s1'),($2,'w','s2'),('o\\\\x','w''q','s\"3')", ["\u{1F600}", "｡"]);
-    const { rows, manifest } = await produceCensus(pg, NEON);
+    const { rows, manifest } = await produceCensus(standby(pg), NEON);
     expect(rows.map((r) => r.org_id)).toEqual(["o\\\\x", "｡", "\u{1F600}"]);
     const tgt = await target();
     await loadCensus(tgt, rows, manifest);
@@ -147,17 +174,17 @@ describe("neon session census", () => {
   });
 
   test("the file round-trips and an empty census seals with sha256('')", async () => {
-    const { rows, manifest } = await produceCensus(await source(), NEON);
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     expect(() => verifyCensus(parseCensusFile(rows.map(censusLine).join("")), manifest)).not.toThrow();
     const empty = new PGlite();
     await empty.exec("CREATE SCHEMA sessions; CREATE TABLE sessions.t (org_id text, workspace_id text, session_id text);");
-    const e = await produceCensus(empty, NEON);
+    const e = await produceCensus(standby(empty), NEON);
     expect(e.manifest.census_sha256).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     expect((await loadCensus(await target(), e.rows, e.manifest)).census_rows).toBe(0);
   });
 
   test("load refuses an existing seal or rows and writes nothing; tampering is refused before any write", async () => {
-    const { rows, manifest } = await produceCensus(await source(), NEON);
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     const tgt = await target();
     await loadCensus(tgt, rows, manifest);
     await expect(loadCensus(tgt, rows, manifest)).rejects.toThrow("seal already exists");
@@ -170,6 +197,31 @@ describe("neon session census", () => {
     expect((await tgt2.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.session_neon_census_seal")).rows[0]!.n).toBe(0);
   });
 
+  test("P3-8: a readback mismatch or failure after COMMIT says COMMITTED and never suggests a retry", async () => {
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
+    const tgt = await target();
+    let committed = false;
+    const lying: Queryable = {
+      query: (sql: string, params?: unknown[]) => {
+        if (sql === "COMMIT") committed = true;
+        if (committed && sql.includes("FROM sessions.session_neon_census_seal WHERE singleton"))
+          return Promise.resolve({ rows: [{ census_rows: "1", census_sha256: "0".repeat(64), sealed_at: "x" }] }) as never;
+        return tgt.query(sql, params) as never;
+      },
+    };
+    await expect(loadCensus(lying, rows, manifest)).rejects.toThrow("COMMITTED; readback mismatch");
+    const tgt2 = await target();
+    let done = false;
+    const failing: Queryable = {
+      query: (sql: string, params?: unknown[]) => {
+        if (sql === "COMMIT") done = true;
+        if (done && sql.includes("WHERE singleton")) return Promise.reject(new Error("connection lost")) as never;
+        return tgt2.query(sql, params) as never;
+      },
+    };
+    await expect(loadCensus(failing, rows, manifest)).rejects.toThrow("COMMITTED; readback failed");
+  });
+
   test("keys with a tab or newline are refused", () => {
     const bad: CensusRow = { org_id: "o\t1", workspace_id: "w", session_id: "s" };
     expect(() => censusLine(bad)).toThrow("tab or newline");
@@ -177,7 +229,7 @@ describe("neon session census", () => {
   });
 
   test("CLI: load without --execute never connects; --execute without --expect-supabase-ref is refused", async () => {
-    const { rows, manifest } = await produceCensus(await source(), NEON);
+    const { rows, manifest } = await produceCensus(standby(await source()), NEON);
     const dir = mkdtempSync(join(tmpdir(), "neon-census-"));
     const file = join(dir, "c.tsv");
     writeFileSync(file, rows.map(censusLine).join(""));
@@ -191,5 +243,9 @@ describe("neon session census", () => {
     const refused = Bun.spawnSync(["bun", "run", script, "load", `--in=${file}`, "--execute"], { env });
     expect(refused.exitCode).toBe(1);
     expect(refused.stderr.toString()).toContain("--expect-supabase-ref");
+    const produce = Bun.spawnSync(["bun", "run", script, "produce", `--out=${file}`, "--source-lsn=1/0", "--source-ref=t"],
+      { env: { ...process.env, CENSUS_SOURCE_URL: "postgresql://u:p@127.0.0.1:1/db" } });
+    expect(produce.exitCode).toBe(1);
+    expect(produce.stderr.toString()).toContain("already exists");
   });
 });
