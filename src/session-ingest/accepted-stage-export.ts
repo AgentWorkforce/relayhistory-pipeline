@@ -174,6 +174,17 @@ export const CANDIDATES_IN = `
 SELECT s.stage_key${CANDIDATE_FROM}
      AND s.stage_key = ANY($1::text[])`;
 
+/**
+ * A scoped run's text (as the backfill's scopedSql): the "$1 IS NULL OR ..." form cannot use an org index in a generic
+ * plan, so a scoped export sends plain `org_id = ANY($1)` / `o.org_id = ANY($1)`. Unscoped text is unchanged.
+ */
+export function scopedExportSql(query: string, scoped: boolean): string {
+  return scoped
+    ? query.split("($1::text[] IS NULL OR org_id = ANY($1::text[]))").join("org_id = ANY($1::text[])")
+        .split("($1::text[] IS NULL OR o.org_id = ANY($1::text[]))").join("o.org_id = ANY($1::text[])")
+    : query;
+}
+
 /** Orgs with any stage at all, so an org whose stages were all refused still completes (with 0). */
 const ORGS = `
 SELECT DISTINCT org_id FROM sessions.ingest_stage_intents
@@ -451,6 +462,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
       if (ro !== "on") throw new Error("export_not_read_only");
       await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+      if (orgScope) await sql.query("SET LOCAL plan_cache_mode = force_custom_plan");
       return await work();
     } finally {
       await sql.query("ROLLBACK").catch(() => {});
@@ -473,7 +485,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       // Finding 5: with the v2 claim-sessions reader gate off, the reader answers from 047010's fallback, which this
       // export does not transcribe. Refuse before any write rather than claim equivalence.
       if ((await sql.query(CLAIM_SESSIONS_GATE)).rows[0]?.v2 !== true) throw new ExportError("export_claim_sessions_gate_off");
-      return (await sql.query(ORGS, [orgScope])).rows;
+      return (await sql.query(scopedExportSql(ORGS, orgScope !== null), [orgScope])).rows;
     });
     for (const r of orgRows)
       if (typeof r.org_id === "string") perOrg.set(r.org_id, { stages: 0, bad: !ORG.test(r.org_id) });
@@ -508,7 +520,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       })());
       return fences.get(k)!;
     };
-    const candidates = (await readOnly(() => sql.query(CANDIDATE_KEYS, [orgScope]))).rows;
+    const candidates = (await readOnly(() => sql.query(scopedExportSql(CANDIDATE_KEYS, orgScope !== null), [orgScope]))).rows;
     for (let at = 0; at < candidates.length; at += pageSize) {
       // Finding 6: the page's users and their S3 fences FIRST, then SQL's verdict over exactly these keys. A control
       // landing after the fence read moves the fence past what the sidecar records, so the drain refuses
@@ -523,7 +535,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         preRead.add(userKey(r));
         await fenceOf(r.org_id, r.workspace_id, r.user_id);
       });
-      const rows = (await readOnly(() => sql.query(VERDICT_PAGE, [orgScope, page.map((r) => String(r.stage_key))]))).rows;
+      const rows = (await readOnly(() => sql.query(scopedExportSql(VERDICT_PAGE, orgScope !== null), [orgScope, page.map((r) => String(r.stage_key))]))).rows;
       // The v2 gate turned off mid-export: stop before writing this page.
       if (rows.some((r) => r.v2 !== true)) throw new ExportError("export_claim_sessions_gate_off");
       await mapLimit(rows, concurrency, async (r) => {
