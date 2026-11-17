@@ -15,6 +15,7 @@ import { MAX_REPLICA_MESSAGE_BYTES, type NeonReplicaMessage, type ReplicaSink } 
 import { DeliveryError, MAX_DELIVERY_BYTES } from "../vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
+import { TURN_ORIGIN_ID } from "../turns.ts";
 import { LIVE_OWNER, NO_SESSION_HARNESS, liveMachineId } from "../writer.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 
@@ -675,6 +676,10 @@ describe("deletion fences written by relayhistory (review High 2 / Medium: fence
     const unknown = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, expected_user_id: identity.userId, origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false, unexpected: true });
     expect(unknown.res.status).toBe(400);
     expect(unknown.ledger.selections).toEqual([]);
+    const reserved = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, origin_id: TURN_ORIGIN_ID, sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    expect(reserved.res.status).toBe(400);
+    expect(reserved.ledger.selections).toEqual([]);
+    expect(reserved.ledger.deleted.size).toBe(0);
   });
   test.each(["relayhistory", "frozen-supabase"] as const)("selection: expected user is checked before ordered control or custody on %s", async (custodySource) => {
     const { deps, ledger } = setup();
