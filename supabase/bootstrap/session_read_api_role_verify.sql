@@ -128,6 +128,8 @@ BEGIN
          'sessions.coordination_advisories_pending_for_v1(text,text,text,text)',
          'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
+         'sessions.decision_records_list_v1(text,text,text,timestamp with time zone,uuid,integer)',
+         'sessions.decision_records_topics_v1(text,text)',
          'sessions.digest_narrative_read(text,date,text,text)',
          'sessions.ingest_operator_runtime_erased(text,text,text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',

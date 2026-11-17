@@ -194,6 +194,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Coordination advisor worker readers: four SECURITY DEFINER read-only entry points for service_role; no
       // table, and no G4 function names them.
       "20261105062070_coordination_advisor_readers.sql",
+      // Memory documents: two new owner-only tables and four SECURITY DEFINER entry points (worker insert/supersede,
+      // read-API topics/list). No G4 function names them, and no G4 ingest path calls them.
+      "20261105062080_memory_documents.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
