@@ -5,6 +5,7 @@ import {
   censusDigest,
   censusLine,
   censusTables,
+  NULL_WORKSPACE,
   loadCensus,
   parseCensusFile,
   produceCensus,
@@ -36,7 +37,10 @@ async function source(): Promise<PGlite> {
     CREATE TABLE sessions.machines (org_id text, machine_id text);
     INSERT INTO sessions.convergence_events VALUES ('o2','w1','s9','e1'),('o1','w1','s2','e2'),('o1','w1','s2','e3'),('O1','w1','s1','e4');
     INSERT INTO sessions.delivery_records VALUES ('o1','w1','s2','b'),('o1','w2','s2','b'),('o3','w1','é','b');
-    INSERT INTO sessions.machines VALUES ('o9','m1');`);
+    INSERT INTO sessions.machines VALUES ('o9','m1');
+    CREATE TABLE sessions.session_timing_cache (org_id text NOT NULL, workspace_id text, session_id text NOT NULL);
+    INSERT INTO sessions.session_timing_cache VALUES ('o4', NULL, 's4');
+    INSERT INTO sessions.delivery_records VALUES ('o5','w1',NULL,'b');`);
   return pg;
 }
 
@@ -51,7 +55,7 @@ const SRC = { lsn: "36B/9D2C2D8", ref: "test-branch", seal: null };
 describe("neon session census", () => {
   test("covers exactly the sessions tables with all three key columns", async () => {
     const pg = await source();
-    expect(await censusTables(pg)).toEqual(["convergence_events", "delivery_records"]);
+    expect(await censusTables(pg)).toEqual(["convergence_events", "delivery_records", "session_timing_cache"]);
   });
 
   test("produce: distinct union, C-ordered, per-table counts, and the JS digest equals the SQL digest after load", async () => {
@@ -63,14 +67,16 @@ describe("neon session census", () => {
       { org_id: "o1", workspace_id: "w2", session_id: "s2" },
       { org_id: "o2", workspace_id: "w1", session_id: "s9" },
       { org_id: "o3", workspace_id: "w1", session_id: "é" },
+      { org_id: "o4", workspace_id: NULL_WORKSPACE, session_id: "s4" },
     ]);
-    expect(manifest.census_rows).toBe(5);
-    expect(manifest.neon_snapshot.tables).toEqual({ convergence_events: 4, delivery_records: 3 });
+    expect(manifest.census_rows).toBe(6);
+    expect(manifest.neon_snapshot.tables).toEqual({ convergence_events: 4, delivery_records: 4, session_timing_cache: 1 });
+    expect(manifest.neon_snapshot.unkeyed_rows).toEqual({ delivery_records: 1 });
     expect(manifest.census_sha256).toBe(censusDigest(rows));
 
     const tgt = await target();
     const readback = await loadCensus(tgt, rows, manifest, 2);
-    expect(readback.census_rows).toBe(5);
+    expect(readback.census_rows).toBe(6);
     expect(readback.census_sha256).toBe(manifest.census_sha256);
     const sql = await tgt.query<{ sha: string }>(DIGEST_SQL);
     expect(sql.rows[0]!.sha).toBe(manifest.census_sha256);
