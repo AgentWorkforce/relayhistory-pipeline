@@ -95,8 +95,11 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
   toward the dead-letter attempts, unchanged. On, each is a deferral, like the tenant-limit deferral: the
   attempt does not count, so the object is never dead-lettered for it. The org's other entries wait
   `AUTHORITY_WAIT_MS` (60 s) without starting. After the window, one probe claim per org runs (the others
-  wait for its answer), so a waiting org costs one claim per minute however large its backlog, holds no
-  other slot, and never delays another org. Use it while an org's desktops already upload direct and its
+  wait for its answer), so a waiting org costs about one claim per minute per replica however large its
+  backlog, and never delays another org. Two limits: the first pass, before the first answer, can start up to
+  `SELFHOST_ADMISSION_CONCURRENCY` of its entries (each fails fast, none counted); and when a probe answers a
+  code that is not an authority code (a transient ledger error, a claim lock wait, the tenant limit), no window
+  is set, so on the next pump up to that many of its siblings may start, as for any other org. Use it while an org's desktops already upload direct and its
   marker is still being prepared (wave rollouts: the stop, the backfill, then the marker). A waiting org
   shows as `backlog` / `oldestAgeMs` in the status line and as `outcome=deferred` lines with the code,
   never as dead letters. Dead letters written before the flag was turned on stay parked until they
@@ -237,6 +240,7 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_CONCURRENCY` | 1..32 | 4 |
 | `SELFHOST_ADMISSION_SCAN_MS` | 1000..600000 | 15000 |
 | `SELFHOST_ADMISSION_MAX_ATTEMPTS` | 1..100 | 20 |
+| `SELFHOST_ADMISSION_AWAIT_AUTHORITY` (`async`/`drain` with `INGEST_LEDGER=s3`; a silent no-op with `sql`, which never answers these codes) | `on`, `off`; anything else refuses startup | off |
 | `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |
