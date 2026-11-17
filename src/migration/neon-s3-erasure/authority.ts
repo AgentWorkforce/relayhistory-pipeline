@@ -15,6 +15,11 @@
  */
 import type { Queryable } from "../relayhistory-export.ts";
 import {
+  LEGACY_EXPORT_GENERATION,
+  LEGACY_EXPORT_GENERATION_SETTING,
+  LEGACY_EXPORT_SWEEP_AUTHORITY_SETTING,
+} from "../../shared/legacy-export-generation.ts";
+import {
   activityPage,
   catalogPage,
   fencedGroups,
@@ -50,8 +55,12 @@ export interface LegacyFencedGroup {
 
 export interface ErasureAuthority {
   readonly kind: ErasureAuthorityKind;
+  /** Capture authority identity once, before any work in this sweep. */
+  beginSweep?(): void;
   /** Refuses (throws) when this source is not the privacy authority right now. */
   ready(): Promise<void>;
+  /** Supabase only: durably attest a healthy non-dry-run sweep and mapping-RPC probe. */
+  recordSuccessfulSweep?(): Promise<void>;
   lockWaiters(): Promise<{ total: number; nonAdvisory: number }>;
   /** Neon only: the rollup/catalog presence sweep ("gone from Neon"). */
   readonly presence?: ErasurePresence;
@@ -139,13 +148,44 @@ export function supabaseAuthority(db: Queryable): ErasureAuthority {
     if (!r) throw Object.assign(new Error("eraser rpc returned no row"), { code: "eraser_rpc_empty" });
     return r.r;
   };
+  let sweepAuthorityActivatedAt: string | undefined;
   const ready = async () => {
     const s = await rpc<{ active?: unknown }>("SELECT sessions.ingest_privacy_eraser_state() AS r");
     if (s?.active !== true) throw new AuthorityNotActive();
+    if (sweepAuthorityActivatedAt === undefined) {
+      const token = await rpc<unknown>("SELECT sessions.legacy_export_privacy_eraser_activation() AS r");
+      if (typeof token !== "string" || token.length === 0)
+        throw Object.assign(new Error("eraser activation rpc returned no token"), { code: "eraser_activation_empty" });
+      sweepAuthorityActivatedAt = token;
+    }
   };
   return {
     kind: "supabase",
+    beginSweep: () => { sweepAuthorityActivatedAt = undefined; },
     ready,
+    recordSuccessfulSweep: async () => {
+      // The dedicated authority connection is read-only by default. Open one
+      // explicit write transaction for this fixed eraser-only RPC; the role
+      // still has no direct table writes or any other write-capable function.
+      await db.query("BEGIN READ WRITE");
+      try {
+        await db.query("SELECT set_config($1,$2,true)", [
+          LEGACY_EXPORT_GENERATION_SETTING,
+          LEGACY_EXPORT_GENERATION,
+        ]);
+        if (!sweepAuthorityActivatedAt)
+          throw Object.assign(new Error("eraser sweep authority was not captured"), { code: "eraser_activation_missing" });
+        await db.query("SELECT set_config($1,$2,true)", [
+          LEGACY_EXPORT_SWEEP_AUTHORITY_SETTING,
+          sweepAuthorityActivatedAt,
+        ]);
+        await rpc("SELECT sessions.legacy_export_privacy_eraser_heartbeat() AS r");
+        await db.query("COMMIT");
+      } catch (error) {
+        await db.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      }
+    },
     lockWaiters: () => lockWaiters(db),
     fencedGroups: async () => rpc<{ org_id: string; session_id: string }[]>("SELECT sessions.ingest_privacy_eraser_groups() AS r"),
     fencedLivePage: async (after, limit = LIVE_FENCE_PAGE) =>
