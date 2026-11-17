@@ -84,13 +84,13 @@ export async function publishBriefDocumentsOnce(deps: {
   ch: ClickHouseClient;
   batch?: number;
   signal?: AbortSignal;
-}): Promise<{ claimed: number; published: number; backfilled: number }> {
+}): Promise<{ claimed: number; published: number; backfilled: number; drained: boolean }> {
   const batch = deps.batch ?? 100;
   if (!Number.isInteger(batch) || batch < 1 || batch > 200)
     return fail("batch_invalid");
-  if (deps.signal?.aborted) return { claimed: 0, published: 0, backfilled: 0 };
+  if (deps.signal?.aborted) return { claimed: 0, published: 0, backfilled: 0, drained: false };
   const backfill = (
-    await deps.db.query<{ r: { processed: number } }>(
+    await deps.db.query<{ r: { processed: number; complete?: unknown; orgId?: unknown } }>(
       "SELECT sessions.backfill_session_brief_documents($1) r",
       [batch],
     )
@@ -102,6 +102,8 @@ export async function publishBriefDocumentsOnce(deps: {
     backfill.processed > batch
   )
     return fail("backfill_invalid");
+  // Every scope initialized: the backfill RPC's terminal answer names no scope.
+  const drained = backfill.complete === true && backfill.orgId === undefined;
   const nonce = randomUUID(),
     raw = (
       await deps.db.query<{ r: unknown }>(
@@ -111,7 +113,7 @@ export async function publishBriefDocumentsOnce(deps: {
     ).rows[0]?.r;
   if (!Array.isArray(raw) || raw.length > batch) return fail("claim_invalid");
   if (!raw.length)
-    return { claimed: 0, published: 0, backfilled: backfill.processed };
+    return { claimed: 0, published: 0, backfilled: backfill.processed, drained };
   try {
     const claims = raw.map((v) => checked(v, nonce)),
       keys = new Set<string>();
@@ -184,6 +186,7 @@ export async function publishBriefDocumentsOnce(deps: {
       claimed: claims.length,
       published: n!,
       backfilled: backfill.processed,
+      drained,
     };
   } catch {
     await deps.db.query(
@@ -192,4 +195,41 @@ export async function publishBriefDocumentsOnce(deps: {
     );
     throw new BriefDocumentError("publication_failed");
   }
+}
+
+export interface BriefDocumentsTickStats {
+  rounds: number;
+  claimed: number;
+  published: number;
+  backfilled: number;
+  /** The last round found every scope initialized and claimed nothing: backfill and outbox are drained. */
+  caughtUp: boolean;
+}
+
+/**
+ * One scheduled run (SESSION_BRIEF_DOCUMENTS_PUBLISH=1, session-pipeline/lambda.ts): bounded
+ * rounds of publishBriefDocumentsOnce until a round finds every scope initialized and nothing
+ * to claim, the round cap, or the time budget. A failing round throws (its claims were released for retry
+ * by publishBriefDocumentsOnce); earlier rounds stay published and acknowledged.
+ */
+export async function publishBriefDocumentsTick(
+  deps: { db: SqlExecutor; ch: ClickHouseClient; batch?: number },
+  limits: { maxRounds?: number; budgetMs?: number; now?: () => number } = {},
+): Promise<BriefDocumentsTickStats> {
+  const now = limits.now ?? Date.now;
+  const maxRounds = limits.maxRounds ?? 20;
+  const deadline = now() + (limits.budgetMs ?? 40_000);
+  const stats: BriefDocumentsTickStats = { rounds: 0, claimed: 0, published: 0, backfilled: 0, caughtUp: false };
+  while (stats.rounds < maxRounds && now() < deadline) {
+    const r = await publishBriefDocumentsOnce({ db: deps.db, ch: deps.ch, ...(deps.batch === undefined ? {} : { batch: deps.batch }) });
+    stats.rounds += 1;
+    stats.claimed += r.claimed;
+    stats.published += r.published;
+    stats.backfilled += r.backfilled;
+    if (r.claimed === 0 && r.drained) {
+      stats.caughtUp = true;
+      break;
+    }
+  }
+  return stats;
 }

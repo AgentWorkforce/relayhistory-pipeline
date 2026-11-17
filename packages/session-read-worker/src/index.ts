@@ -29,6 +29,9 @@
  * brief-summary SQL, as the hosted Lambda; every other value = 501 summary_not_configured),
  * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true": the GET /v1/sessions
  * includeShortSummary=recorded extension; every other value = 501 param_includeShortSummary),
+ * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true": GET /v1/sessions/summaries/search over the
+ * owner-applied ClickHouse session_brief_documents; every other value = 501
+ * summary_search_not_configured; unset in wrangler.jsonc),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -146,6 +149,7 @@ export interface Env extends CanonicalEnv {
   READ_API_BRIEF_SUMMARY_ENABLED?: string;
   /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
   READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
+  READ_API_SUMMARY_SEARCH_ENABLED?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
   MESSAGE_ORIGIN_LABELS_ENABLED?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
@@ -464,6 +468,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
+    ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),

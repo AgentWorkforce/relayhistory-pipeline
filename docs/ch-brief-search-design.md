@@ -23,3 +23,32 @@ Reader candidate discovery is exclusively CH. Supabase RPCs only check aggregate
 Only the existing keyword pools are claimed. No embedding/vector pool is implemented or enabled here. Existing typed unsupported organization/project/event-window/kind/task/tag/agent filters remain unsupported until their semantics have separate proof.
 
 Activation requires reviewed Supabase migrations/ACLs, CH DDL and reader/publisher table grants, bounded backfill + zero dirty coverage, runtime tick wiring, immutable build/deploy evidence and all migration gates. Default configuration remains dormant; no Neon fallback is introduced for selected CH search.
+
+## Runtime wiring (default off)
+
+Two default-off switches now drive this lane; neither creates a resource, grant or schedule.
+
+- Publisher: the session pipeline Lambda invocation `{"briefDocuments": true}` runs
+  `publishBriefDocumentsTick` (bounded rounds of `publishBriefDocumentsOnce`, 20 rounds or
+  40 s) only when `SESSION_BRIEF_DOCUMENTS_PUBLISH=1`, checked before any secret, pool or
+  ClickHouse access. It uses the consumer's Supabase pool and its ClickHouse search binding
+  (`SEARCH_INDEX_ENABLED=1`). Until the owner calls
+  `sessions.set_session_brief_documents_live(true)` the backfill RPC refuses and the run
+  reports `ok=false`, publishing nothing. No EventBridge rule invokes it yet.
+- Reader: `READ_API_SUMMARY_SEARCH_ENABLED=true` (exactly) serves
+  `GET /v1/sessions/summaries/search?workspace=&q=&limit=` on the Worker and the hosted
+  Lambda (`src/session-read-api/clickhouse/summary-search-query.ts`). ClickHouse finds
+  candidate keys whose newest document is live and whose folded title or summary contains
+  `q`; every candidate is hydrated through the existing exact-key directory list and
+  re-checked against the directory's current title/short_summary before it is served, so a
+  clear or erasure that ClickHouse has not received yet is never served. Same workspace
+  attestation and directory canary as the directory routes; no cursor (`truncated`).
+  The read-only ClickHouse user needs SELECT on `session_brief_documents`.
+
+Activation order (each a production step that needs Khaliq's explicit OK): apply
+`briefDocumentSchemaStatements()` in the ClickHouse database and grant the reader SELECT;
+confirm migration `20261105024000` is applied; owner `set_session_brief_documents_live(true)`;
+schedule `{"briefDocuments": true}` with `SESSION_BRIEF_DOCUMENTS_PUBLISH=1` until the
+backfill and outbox are drained; then deploy the reader flag. While capture is live, the
+operator erase runtime (`20261105050020`) refuses with "independent artifact writer requires
+a drain protocol"; that drain protocol is not implemented.
