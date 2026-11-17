@@ -14,6 +14,8 @@ import type { SqlQuery } from "../../session-read-api/liveness.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
 import { AdvisorLimits } from "../rubric.ts";
 import { advisorTick, scanOnce, sqlAdvisorStore } from "../scan.ts";
+import { postgresAdvisorBackend, productionIo } from "../main.ts";
+import { advisorConfig } from "../config.ts";
 
 setDefaultTimeout(300_000);
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
@@ -108,6 +110,58 @@ describe("coordination advisor tick (pglite)", () => {
       "INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) VALUES ('org','ws1','claude','p',$1,$1)", [child]);
     expect(await scanOnce({ store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW)).toMatchObject({ written: 0 });
     expect(await rows()).toEqual([]);
+  });
+
+  test("a restart keeps the cooldown and the cap: fresh limits are seeded from recent_v1 (062070)", async () => {
+    // recent_v1 counts against the database clock, so this test runs on the real clock.
+    const now = new Date();
+    const rel = (min: number) => new Date(now.getTime() + min * 60_000).toISOString();
+    for (const s of ["a", "b"]) await db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, project_id)
+       VALUES ('org','ws1','claude',$1,$2,$3,'proj')`, [s, rel(-120), rel(-10)]);
+    const live = ["a", "b"].map((id, i) => ({ ...lane(id, []), startedAt: rel(-90), lastActionAt: rel(-5),
+      writes: [{ path: "src/x/shared.ts", ts: rel(-40 + i * 20), eventId: `${id}-w`, kind: "tool", branch: `b/${id}` }] }));
+    const store = sqlAdvisorStore(asService(db));
+    const first = await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, now);
+    expect(first).toMatchObject({ written: 2 });
+    // "Restart": new in-memory limits, same database.
+    const later = new Date(now.getTime() + 1_000);
+    expect(await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, later))
+      .toMatchObject({ cooldown: 1, written: 0, existing: 0 });
+    expect(await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 1 }) }, later))
+      .toMatchObject({ capped: 2, written: 0, existing: 0 });
+    // Another tenant's rows never seed this one.
+    expect(await store.recent("org", "ws2", new Date(now.getTime() - 86_400_000))).toEqual([]);
+  });
+
+  test("postgres facts backend: a tick reads facts through the 062070 readers as service_role, tenant-scoped", async () => {
+    const now = new Date();
+    const rel = (min: number) => new Date(now.getTime() + min * 60_000).toISOString();
+    await db.exec("DELETE FROM sessions.session_event_facts");
+    for (const s of ["a", "b"]) await db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, project_id)
+       VALUES ('org','ws1','claude',$1,$2,$3,'proj')`, [s, rel(-120), rel(-10)]);
+    const fact = (org: string, session: string, min: number, row: string) => db.query(
+      `INSERT INTO sessions.session_event_facts (org_id,workspace_id,ts,session_id,source,machine_id,kind,event_id,project_id,branch,
+         input_tokens,output_tokens,reasoning_tokens,cache_read_tokens,cache_create_tokens,files_touched,row_id,fingerprint,source_version)
+       VALUES ($1,'ws1',$2,$3,'claude','m','tool',$4,'proj','b/' || $3,0,0,0,0,0,ARRAY['src/x/shared.ts'],$5,'f',1)`,
+      [org, rel(min), session, `${session}-${min}`, row.repeat(64)]);
+    await fact("org", "a", -40, "1");
+    await fact("org", "b", -20, "2");
+    await fact("other-org", "a", -30, "3");
+    const be = postgresAdvisorBackend(asService(db));
+    expect(be.kind).toBe("postgres");
+    const facts = await be.readFacts(sqlAdvisorStore(asService(db)).directory(),
+      { orgId: "org", workspaceId: "ws1", since: new Date(now.getTime() - 2 * 3_600_000), until: now });
+    expect(facts.lanes.map((l) => [l.sessionId, l.writes.map((w) => w.eventId)]).sort()).toEqual([["a", ["a--40"]], ["b", ["b--20"]]]);
+    const sender = new InMemoryRelaySender();
+    const stats = await scanOnce({ store: sqlAdvisorStore(asService(db)), backend: be, limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 }), sender }, now);
+    expect(stats).toMatchObject({ written: 2, failed: 0 });
+    expect((await rows()).map((r) => [r.session_id, r.urgency, r.status])).toEqual([["a", "high", "delivered"], ["b", "high", "delivered"]]);
+    await expect(be.windowReadiness("org", "ws1", now, now)).rejects.toThrow(/not used by the worker/);
+    // productionIo selects it for COORDINATION_ADVISOR_FACTS_BACKEND=postgres without ClickHouse configuration.
+    const cfg = advisorConfig({ COORDINATION_ADVISOR_ENABLED: "true", COORDINATION_ADVISOR_FACTS_BACKEND: "postgres" });
+    expect(productionIo.backend(cfg, {})(asService(db)).kind).toBe("postgres");
   });
 
   test("no downgrade: a LOW upsert over an existing HIGH row leaves it high", async () => {

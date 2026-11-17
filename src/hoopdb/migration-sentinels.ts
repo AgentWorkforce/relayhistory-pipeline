@@ -562,6 +562,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "tables sessions.legacy_export_scope_authority/readiness and their register/readiness/heartbeat/page/still-fenced RPCs",
     sql: "SELECT to_regclass('sessions.legacy_export_scope_authority') IS NOT NULL AND to_regclass('sessions.legacy_export_privacy_eraser_readiness') IS NOT NULL AND to_regprocedure('sessions.ingest_legacy_export_scope_authority_register(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_authority_ready()') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_heartbeat()') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_page(jsonb)') IS NOT NULL AND to_regprocedure('sessions.legacy_export_privacy_eraser_still_fenced(jsonb)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062070_coordination_advisor_readers.sql": {
+    evidence: "functions sessions.coordination_advisor_write_facts_v1 and sessions.coordination_advisories_recent_v1",
+    sql: "SELECT to_regprocedure('sessions.coordination_advisor_write_facts_v1(text,text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_recent_v1(text,text,timestamptz)') IS NOT NULL AS applied",
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */

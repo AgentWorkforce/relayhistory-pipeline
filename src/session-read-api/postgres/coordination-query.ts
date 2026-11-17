@@ -23,6 +23,24 @@ export const COORDINATION_USAGE_SQL = `SELECT ${ts("e.ts")} AS ts, e.session_id,
   FROM sessions.output_facts_events_for($1, $2::timestamptz, $3::timestamptz, $4::text, $5::integer) AS e
  ORDER BY e.row_id`;
 
+/**
+ * The coordination advisor worker's readers (20261105062070): the same columns from the
+ * service_role-only mirrors, which take the org explicitly as $1.
+ */
+const ADVISOR_ARGS = "($1, $2, $3::timestamptz, $4::timestamptz, $5::text, $6::integer)";
+export const ADVISOR_COORDINATION_SQL: CoordinationFactsSql = {
+  orgArg: true,
+  writes: COORDINATION_WRITES_SQL.replace(/sessions\.coordination_write_facts_for\([^)]*\)/, `sessions.coordination_advisor_write_facts_v1${ADVISOR_ARGS}`),
+  outputs: COORDINATION_OUTPUTS_SQL.replace(/sessions\.coordination_output_facts_for\([^)]*\)/, `sessions.coordination_advisor_output_facts_v1${ADVISOR_ARGS}`),
+  usage: COORDINATION_USAGE_SQL.replace(/sessions\.output_facts_events_for\([^)]*\)/, `sessions.coordination_advisor_usage_facts_v1${ADVISOR_ARGS}`),
+};
+
+/** Which readers the backend calls. `orgArg`: the readers take the org as their first argument. */
+export interface CoordinationFactsSql { writes: string; outputs: string; usage: string; orgArg: boolean }
+const READ_API_COORDINATION_SQL: CoordinationFactsSql = {
+  orgArg: false, writes: COORDINATION_WRITES_SQL, outputs: COORDINATION_OUTPUTS_SQL, usage: COORDINATION_USAGE_SQL,
+};
+
 async function capped<R extends { row_id: string }>(
   q: { query<T>(sql: string, args?: unknown[]): Promise<{ rows: T[] }> }, sql: string, args: unknown[], cap: number,
   deadline: number, now: () => number,
@@ -40,7 +58,7 @@ async function capped<R extends { row_id: string }>(
   return rows;
 }
 
-export function postgresCoordinationBackend(deps: PostgresFactsDeps): CoordinationBackend {
+export function postgresCoordinationBackend(deps: PostgresFactsDeps, sql: CoordinationFactsSql = READ_API_COORDINATION_SQL): CoordinationBackend {
   return {
     kind: "postgres",
     windowReadiness: (orgId, workspaceId, since, until, opts = {}) => postgresWindowReadiness(deps, orgId, workspaceId, since, until, opts),
@@ -49,14 +67,15 @@ export function postgresCoordinationBackend(deps: PostgresFactsDeps): Coordinati
       const cap = Math.max(1, Math.min(COORDINATION_FACTS_ROW_CAP, Math.trunc(p.rowCap ?? COORDINATION_FACTS_ROW_CAP)));
       const outputCap = Math.max(1, Math.min(COORDINATION_OUTPUT_ROW_CAP, Math.trunc(p.rowCap ?? COORDINATION_OUTPUT_ROW_CAP)));
       const evidenceSince = new Date(p.since.getTime() - COORDINATION_EVIDENCE_LOOKBACK_MS);
-      const evidenceArgs = [p.workspaceId, microsText(dateMicros(evidenceSince)), microsText(dateMicros(p.until))];
-      const usageArgs = [p.workspaceId, microsText(dateMicros(p.since)), microsText(dateMicros(p.until))];
+      const tenant = sql.orgArg ? [p.orgId, p.workspaceId] : [p.workspaceId];
+      const evidenceArgs = [...tenant, microsText(dateMicros(evidenceSince)), microsText(dateMicros(p.until))];
+      const usageArgs = [...tenant, microsText(dateMicros(p.since)), microsText(dateMicros(p.until))];
       const now = deps.now ?? Date.now;
       const deadline = deadlineOf(deps, opts.timeoutMs);
       const raw = await deps.run(p.orgId, p.workspaceId, async (q) => ({
-        evidence: await capped<CoordinationEventRow>(q, COORDINATION_WRITES_SQL, evidenceArgs, cap, deadline, now),
-        outputs: await capped<CoordinationOutputRow>(q, COORDINATION_OUTPUTS_SQL, evidenceArgs, outputCap, deadline, now),
-        usage: await capped<CoordinationEventRow>(q, COORDINATION_USAGE_SQL, usageArgs, cap, deadline, now),
+        evidence: await capped<CoordinationEventRow>(q, sql.writes, evidenceArgs, cap, deadline, now),
+        outputs: await capped<CoordinationOutputRow>(q, sql.outputs, evidenceArgs, outputCap, deadline, now),
+        usage: await capped<CoordinationEventRow>(q, sql.usage, usageArgs, cap, deadline, now),
       }));
       const evidence = await dropErased(deps.liveness, p.orgId, p.workspaceId, raw.evidence.slice(0, cap), (r) => ({ source: r.source, sessionId: r.session_id }));
       const outputs = await dropErased(deps.liveness, p.orgId, p.workspaceId, raw.outputs.slice(0, outputCap), (r) => ({ source: r.scope_source, sessionId: r.session_id }));

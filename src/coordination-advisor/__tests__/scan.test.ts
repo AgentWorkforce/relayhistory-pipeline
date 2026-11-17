@@ -5,7 +5,7 @@ import type { CoordinationBackend, CoordinationFacts } from "../../session-read-
 import type { Directory } from "../../session-read-api/directory.ts";
 import { advisorMain, type AdvisorIo } from "../main.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
-import { AdvisorLimits, type CandidateLane, type SessionRef } from "../rubric.ts";
+import { AdvisorLimits, type CandidateLane, type RecentAdvisory, type SessionRef } from "../rubric.ts";
 import { advisorTick, scanOnce, type AdvisorStore, type AdvisoryRowInput, type UpsertResult } from "../scan.ts";
 
 const NOW = new Date(Date.UTC(2026, 10, 17, 12));
@@ -45,6 +45,13 @@ class FakeStore implements AdvisorStore {
     return false;
   }
   async sweep() { this.calls.push("sweep"); return { expired: 0, deleted: 0 }; }
+  recentRows: RecentAdvisory[] = [];
+  recentError: unknown = undefined;
+  async recent(): Promise<RecentAdvisory[]> {
+    this.calls.push("recent");
+    if (this.recentError) throw this.recentError;
+    return this.recentRows;
+  }
 }
 const backend = (lanes: LaneFacts[], over: Partial<CoordinationFacts> = {}): CoordinationBackend => ({
   kind: "clickhouse",
@@ -96,6 +103,31 @@ describe("scanOnce", () => {
     expect((await scanOnce({ store, backend: backend(shared), limits: l }, NOW)).cooldown).toBe(1);
     const capped = await scanOnce({ store: new FakeStore([cand("a"), cand("b")]), backend: backend(shared), limits: limits({ sessionHourlyCap: 0 }) }, NOW);
     expect(capped).toMatchObject({ written: 0, capped: 2 });
+  });
+
+  test("durable state seeds the limits before writing: a restart keeps the cooldown and the cap", async () => {
+    const A = { harness: "claude", sessionId: "a" }, B = { harness: "claude", sessionId: "b" };
+    const cooled = new FakeStore([cand("a"), cand("b")]);
+    cooled.recentRows = [{ kind: "pair", recipient: A, peer: B, latestAt: NOW.getTime() - 60_000 }];
+    expect(await scanOnce({ store: cooled, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ cooldown: 1, written: 0 });
+    expect(cooled.calls).toEqual(["candidates", "recent"]);
+    const full = new FakeStore([cand("a"), cand("b")]);
+    full.recentRows = [{ kind: "recipient", recipient: A, latestAt: NOW.getTime() - 60_000, sentLastHour: 3 }];
+    expect(await scanOnce({ store: full, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ capped: 1, written: 1 });
+    // No findings: no durable read.
+    const quiet = new FakeStore([cand("a"), cand("b")]);
+    await scanOnce({ store: quiet, backend: backend([]), limits: limits() }, NOW);
+    expect(quiet.calls).toEqual(["candidates"]);
+  });
+
+  test("durable state: 062070 not applied (42883) keeps in-memory limits; any other error fails the workspace unwritten", async () => {
+    const missing = new FakeStore([cand("a"), cand("b")]);
+    missing.recentError = Object.assign(new Error("function does not exist"), { code: "42883" });
+    expect(await scanOnce({ store: missing, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 2, failed: 0 });
+    const broken = new FakeStore([cand("a"), cand("b")]);
+    broken.recentError = Object.assign(new Error("permission denied"), { code: "42501" });
+    expect(await scanOnce({ store: broken, backend: backend(shared), limits: limits() }, NOW)).toMatchObject({ written: 0, failed: 1 });
+    expect(broken.calls).not.toContain("upsert");
   });
 
   test("planned fleet, another project, or a single-session project: no rows", async () => {
