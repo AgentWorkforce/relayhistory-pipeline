@@ -11,8 +11,8 @@
 -- filter every row on org_id AND workspace_id. Columns, window and page rules match the originals exactly.
 --
 -- coordination_advisories_recent_v1 makes the cooldown and the hourly cap durable. For one tenant it returns:
---   'pair' rows: each (recipient, peer) with the latest created_at at or after p_pair_since (clamped to the
---   7-day retention);
+--   'pair' rows: each (recipient, peer, urgency) with the latest created_at at or after p_pair_since (clamped
+--   to the 7-day retention), so the worker keeps its cooldown per urgency;
 --   'recipient' rows: each recipient's advisory count and latest created_at in the last hour.
 -- Every status counts: an acked or expired row was still sent.
 --
@@ -122,7 +122,7 @@ $coordination_advisor_usage$;
 -- newest first.
 CREATE FUNCTION sessions.coordination_advisories_recent_v1(p_org_id text, p_workspace_id text, p_pair_since timestamptz)
 RETURNS TABLE (
-  row_kind text, harness text, session_id text, peer_harness text, peer_session_id text,
+  row_kind text, harness text, session_id text, peer_harness text, peer_session_id text, urgency text,
   latest_at timestamptz, sent_last_hour integer
 )
 LANGUAGE plpgsql STABLE SECURITY DEFINER
@@ -138,14 +138,16 @@ BEGIN
   END IF;
   v_since := greatest(p_pair_since, now() - interval '7 days');
   RETURN QUERY
-    (SELECT 'pair'::text, a.harness, a.session_id, a.peer_harness, a.peer_session_id, max(a.created_at), NULL::integer
+    (SELECT 'pair'::text, a.harness, a.session_id, a.peer_harness, a.peer_session_id, a.urgency, max(a.created_at),
+            NULL::integer
        FROM sessions.coordination_advisories AS a
       WHERE a.org_id = p_org_id AND a.workspace_id = p_workspace_id AND a.created_at >= v_since
-      GROUP BY a.harness, a.session_id, a.peer_harness, a.peer_session_id
+      GROUP BY a.harness, a.session_id, a.peer_harness, a.peer_session_id, a.urgency
       ORDER BY max(a.created_at) DESC
       LIMIT 10000)
     UNION ALL
-    (SELECT 'recipient'::text, a.harness, a.session_id, NULL::text, NULL::text, max(a.created_at), count(*)::integer
+    (SELECT 'recipient'::text, a.harness, a.session_id, NULL::text, NULL::text, NULL::text, max(a.created_at),
+            count(*)::integer
        FROM sessions.coordination_advisories AS a
       WHERE a.org_id = p_org_id AND a.workspace_id = p_workspace_id AND a.created_at >= now() - interval '1 hour'
       GROUP BY a.harness, a.session_id

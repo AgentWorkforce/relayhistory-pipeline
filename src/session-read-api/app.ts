@@ -287,7 +287,8 @@ export interface ReadApiDeps {
   /**
    * READ_API_COORDINATION_ADVISORIES_ENABLED=true (coordination-advisories.ts): GET
    * /v1/coordination/advisories and POST /v1/coordination/advisories/:advisoryId/ack. Absent or not
-   * enabled: both answer 501 `advisories_disabled` and nothing is read or written.
+   * enabled: both answer the standard 501 `unsupported_by_backend` envelope with reason
+   * `advisories_disabled`, and nothing is read or written.
    */
   coordinationAdvisories?: { enabled: boolean; source: AdvisoriesSource };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
@@ -1996,7 +1997,7 @@ export function createReadApi(deps: ReadApiDeps) {
    * comes from the verified identity; `source` and `sessionId` select the recipient's rows. The GET
    * serves pending or delivered rows (oldest first, at most 10); the ack is the only write.
    */
-  const advisoriesDisabled = (c: Context) => c.json({ error: "advisories_disabled" }, 501);
+  const advisoriesDisabled = (c: Context) => fail(c, unsupported("advisories_disabled"));
   const recipientOf = (identity: VerifiedIdentity, source: unknown, sessionId: unknown) => {
     if (typeof source !== "string" || source === "" || source.length > 64) throw bad("source must be given exactly once");
     if (typeof sessionId !== "string" || sessionId === "" || sessionId.length > 256) throw bad("sessionId must be given exactly once");

@@ -195,32 +195,39 @@ export function orderAdvisories(advisories: Advisory[]): Advisory[] {
     || textCompare(a.alertAt, b.alertAt) || textCompare(a.advisoryId, b.advisoryId));
 }
 
-/**
- * Per-pair cooldown and per-recipient hourly cap. In memory: a restart resets both, and the
- * upsert (never re-inserts an existing row, never touches an acked one) keeps a DM from repeating.
- * `seed` loads durable state when a reader for it exists.
- */
 /** One row of 062070 coordination_advisories_recent_v1, times in epoch ms. */
 export type RecentAdvisory =
-  | { kind: "pair"; recipient: SessionRef; peer: SessionRef; latestAt: number }
+  | { kind: "pair"; recipient: SessionRef; peer: SessionRef; urgency: Urgency; latestAt: number }
   | { kind: "recipient"; recipient: SessionRef; latestAt: number; sentLastHour: number };
 
+const levelKey = (pair: string, urgency: Urgency) => `${urgency}\u0002${pair}`;
+
+/**
+ * Per-pair cooldown, per urgency, and per-recipient hourly cap. A HIGH write starts the HIGH cooldown and
+ * a LOW write the LOW one; a HIGH advisory waits only on the HIGH cooldown, so a LOW never holds back a
+ * HIGH, while a LOW waits on either. In memory, merged with durable state by `seed` when a reader for it
+ * exists; the upsert (never re-inserts an existing row, never touches an acked one) keeps a DM from repeating.
+ */
 export class AdvisorLimits {
   private readonly pairs = new Map<string, number>();
   private readonly sent = new Map<string, number[]>();
   constructor(private readonly cfg: { pairCooldownMs: number; sessionHourlyCap: number }) {}
   get pairCooldownMs(): number { return this.cfg.pairCooldownMs; }
 
-  inCooldown(pair: string, now: number): boolean {
-    const at = this.pairs.get(pair);
-    return at !== undefined && now - at < this.cfg.pairCooldownMs;
+  inCooldown(pair: string, urgency: Urgency, now: number): boolean {
+    const cooling = (u: Urgency) => {
+      const at = this.pairs.get(levelKey(pair, u));
+      return at !== undefined && now - at < this.cfg.pairCooldownMs;
+    };
+    return cooling("high") || (urgency === "low" && cooling("low"));
   }
   underCap(recipient: SessionRef, now: number): boolean {
     return this.recent(refKey(recipient), now).length < this.cfg.sessionHourlyCap;
   }
   /** Any write attempt for the pair (inserted, upgraded or skipped) starts or re-seeds its cooldown. */
-  touchPair(pair: string, at: number): void {
-    this.pairs.set(pair, Math.max(at, this.pairs.get(pair) ?? at));
+  touchPair(pair: string, urgency: Urgency, at: number): void {
+    const k = levelKey(pair, urgency);
+    this.pairs.set(k, Math.max(at, this.pairs.get(k) ?? at));
   }
   /** One advisory written for the recipient (inserted or upgraded). */
   recordSent(recipient: SessionRef, at: number): void {
@@ -229,12 +236,12 @@ export class AdvisorLimits {
   }
   /**
    * Merges durable state (062070 coordination_advisories_recent_v1) so a restart keeps the cooldown and the
-   * cap. A pair keeps its later time. A recipient with fewer in-memory sends than the durable last-hour count
+   * cap. A pair keeps its later time per urgency. A recipient with fewer in-memory sends than the durable last-hour count
    * gets the difference at the durable latest time, which ages out no earlier than the real sends.
    */
   seed(rows: RecentAdvisory[], now: number): void {
     for (const r of rows) {
-      if (r.kind === "pair") { this.touchPair(pairKey(r.recipient, r.peer), r.latestAt); continue; }
+      if (r.kind === "pair") { this.touchPair(pairKey(r.recipient, r.peer), r.urgency, r.latestAt); continue; }
       const k = refKey(r.recipient);
       const have = this.recent(k, now);
       if (have.length < r.sentLastHour) this.sent.set(k, [...have, ...Array<number>(r.sentLastHour - have.length).fill(r.latestAt)]);

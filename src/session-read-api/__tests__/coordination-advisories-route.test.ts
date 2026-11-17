@@ -64,16 +64,22 @@ const post = (app: ReturnType<typeof api>, path = ackPath(), body: string = ackB
   app.request(path, { method: "POST", body, headers: { ...headers, "content-type": "application/json" } });
 
 describe("GET /v1/coordination/advisories", () => {
-  test("off (absent, not enabled) is 501 advisories_disabled for both routes and nothing is read", async () => {
+  test("off (absent, not enabled) is the standard 501 unsupported_by_backend envelope, reason advisories_disabled, for both routes, and nothing is read", async () => {
+    const disabled = (body: unknown) => {
+      const { error, correlationId } = body as { error: Record<string, unknown>; correlationId: unknown };
+      expect(error).toEqual({ code: "unsupported_by_backend", message: "not served by this backend: advisories_disabled", reason: "advisories_disabled" });
+      expect(typeof correlationId).toBe("string");
+      expect(String(correlationId).length).toBeGreaterThan(0);
+    };
     for (const enabled of [undefined, false]) {
       const mem = memorySource();
       const app = api(enabled, mem.source);
       const get = await app.request(base, { headers: auth });
       expect(get.status).toBe(501);
-      expect(await get.json()).toEqual({ error: "advisories_disabled" });
+      disabled(await get.json());
       const ack = await post(app);
       expect(ack.status).toBe(501);
-      expect(await ack.json()).toEqual({ error: "advisories_disabled" });
+      disabled(await ack.json());
       expect(mem.calls).toEqual([]);
     }
     // Auth stays first, as on every /v1 read.

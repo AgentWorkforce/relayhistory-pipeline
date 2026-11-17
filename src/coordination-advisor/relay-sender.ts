@@ -5,6 +5,9 @@
 import { ADVISORY_MESSAGE_MAX, ADVISORY_SENDER } from "./template.ts";
 
 export interface RelayDm {
+  /** The recipient's tenant: a session id alone is not unique across workspaces. */
+  orgId: string;
+  workspaceId: string;
   to: { harness: string; sessionId: string };
   text: string;
   advisoryId: string;
@@ -28,9 +31,11 @@ const loopback = (host: string) => host === "localhost" || host === "127.0.0.1" 
 
 /**
  * UNVERIFIED: a minimal HTTP sender. It POSTs one JSON DM to COORDINATION_ADVISOR_RELAY_URL with the
- * bearer token. The Relay endpoint and payload shape have not been verified against a live relay;
- * keep COORDINATION_ADVISOR_RELAY_DM_ENABLED off until they are. https is required except on loopback.
- * The token is never logged or put in an error message.
+ * bearer token. The payload names the recipient's org and workspace with the session. The Relay
+ * endpoint and payload shape have not been verified against a live relay; keep
+ * COORDINATION_ADVISOR_RELAY_DM_ENABLED off until they are. https is required except on loopback, and a
+ * redirect is an error, so the bearer never follows one. The token is never logged or put in an error
+ * message, and the response body is discarded unread.
  */
 export function httpRelaySender(opts: { url: string; token: string; fetch?: typeof fetch; timeoutMs?: number }): RelaySender {
   const url = new URL(opts.url);
@@ -43,9 +48,13 @@ export function httpRelaySender(opts: { url: string; token: string; fetch?: type
       const res = await doFetch(url, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${opts.token}` },
-        body: JSON.stringify({ from: ADVISORY_SENDER, to: dm.to, text: dm.text, advisoryId: dm.advisoryId }),
+        body: JSON.stringify({
+          from: ADVISORY_SENDER, orgId: dm.orgId, workspaceId: dm.workspaceId, to: dm.to, text: dm.text, advisoryId: dm.advisoryId,
+        }),
+        redirect: "error",
         signal: AbortSignal.timeout(opts.timeoutMs ?? 10_000),
       });
+      await res.body?.cancel().catch(() => {});
       if (!res.ok) throw new Error(`coordination advisor: relay send answered ${res.status}`);
     },
   };

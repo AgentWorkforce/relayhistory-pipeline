@@ -26,9 +26,10 @@
  * READ_API_COORDINATION_OVERLAPS_ENABLED (exactly "true": GET /v1/coordination/overlaps from
  * the existing ClickHouse facts; every other value = 404),
  * READ_API_COORDINATION_ADVISORIES_ENABLED (exactly "true": GET /v1/coordination/advisories
- * through the 20261105062000 read functions; every other value = 501 advisories_disabled. The
- * POST ack is never served here: this Worker is GET-only and its tenant transactions are READ
- * ONLY, so the ack is a 405 and is served by the self-host service),
+ * through the 20261105062000 read functions; every other value = 501 unsupported_by_backend,
+ * reason advisories_disabled). The POST ack is never served here: this Worker is GET-only and
+ * its tenant transactions are READ ONLY, so the ack is a 405 and is served by the self-host
+ * service),
  * READ_API_BRIEF_SUMMARY_ENABLED (exactly "true": GET /v1/sessions/:id/summary through the
  * brief-summary SQL, as the hosted Lambda; every other value = 501 summary_not_configured),
  * READ_API_SUMMARY_FALLBACK_ENABLED (exactly "true", with READ_API_BRIEF_SUMMARY_ENABLED: the

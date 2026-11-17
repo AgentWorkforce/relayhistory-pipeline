@@ -20,6 +20,11 @@ import { advisoryMessage } from "./template.ts";
 
 /** Directory rows read per scan; more is logged and the newest are kept. */
 export const CANDIDATE_LIMIT = 2_000;
+/** Directory rows read per workspace per scan, so one busy tenant cannot starve the others. */
+export const CANDIDATES_PER_WORKSPACE = 200;
+/** The 062000 table's bounds: artifact 1..512 characters, evidence::text at most 4096. */
+export const ARTIFACT_MAX_CHARS = 512;
+export const EVIDENCE_TEXT_MAX = 4_096;
 export const FACTS_TIMEOUT_MS = 30_000;
 export const DETECTOR_LIMIT = 500;
 export const SWEEP_EVERY_MS = 60 * 60 * 1_000;
@@ -30,11 +35,19 @@ const PARENTS_SQL = `ARRAY(SELECT DISTINCT r.parent_session_id
             AND r.child_session_id = d.session_id
           ORDER BY 1 LIMIT 64)`;
 
-/** Live (not deleted) directory sessions active since $1, with a project. Newest first; $2 = limit. */
+/**
+ * Live (not deleted) directory sessions active since $1, with a project, in the allowed workspaces ($3: an
+ * array of workspace ids, or NULL for "*"). At most $4 per workspace, newest first; $2 = overall limit.
+ */
 export const CANDIDATES_SQL = `SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.project_id, d.git_repo,
        d.short_summary, d.last_activity_at, ${PARENTS_SQL} AS parent_session_ids
-  FROM sessions.session_directory AS d
- WHERE d.deleted_at IS NULL AND d.project_id IS NOT NULL AND d.last_activity_at >= $1
+  FROM (SELECT s.org_id, s.workspace_id, s.harness, s.session_id, s.project_id, s.git_repo, s.short_summary, s.last_activity_at,
+               row_number() OVER (PARTITION BY s.org_id, s.workspace_id
+                                  ORDER BY s.last_activity_at DESC, s.harness, s.session_id) AS rn
+          FROM sessions.session_directory AS s
+         WHERE s.deleted_at IS NULL AND s.project_id IS NOT NULL AND s.last_activity_at >= $1
+           AND ($3::text[] IS NULL OR s.workspace_id = ANY ($3::text[]))) AS d
+ WHERE d.rn <= $4
  ORDER BY d.last_activity_at DESC, d.org_id, d.workspace_id, d.harness, d.session_id
  LIMIT $2`;
 
@@ -48,7 +61,7 @@ export const DIRECTORY_KEYS_SQL = `SELECT d.org_id, d.workspace_id, d.harness, d
 export const UPSERT_SQL = "SELECT inserted, upgraded, skipped FROM sessions.coordination_advisories_upsert_v1($1, $2, $3::jsonb)";
 export const MARK_DELIVERED_SQL = "SELECT sessions.coordination_advisories_mark_delivered_v1($1, $2, $3, $4, $5) AS matched";
 export const SWEEP_SQL = "SELECT expired, deleted FROM sessions.coordination_advisories_sweep_v1()";
-export const RECENT_SQL = `SELECT row_kind, harness, session_id, peer_harness, peer_session_id, latest_at, sent_last_hour
+export const RECENT_SQL = `SELECT row_kind, harness, session_id, peer_harness, peer_session_id, urgency, latest_at, sent_last_hour
   FROM sessions.coordination_advisories_recent_v1($1, $2, $3)`;
 
 const iso = (v: Date | string) => v instanceof Date ? v.toISOString() : new Date(v).toISOString();
@@ -87,7 +100,8 @@ export interface AdvisoryRowInput {
 
 /** Everything the scan reads from and writes to Postgres. */
 export interface AdvisorStore {
-  candidates(since: Date, limit: number): Promise<CandidateLane[]>;
+  /** `workspaces` null: every workspace ("*"). */
+  candidates(since: Date, limit: number, workspaces: string[] | null): Promise<CandidateLane[]>;
   directory(): Directory;
   upsert(orgId: string, workspaceId: string, row: AdvisoryRowInput): Promise<UpsertResult>;
   markDelivered(orgId: string, workspaceId: string, advisoryId: string, recipient: SessionRef): Promise<boolean>;
@@ -98,8 +112,8 @@ export interface AdvisorStore {
 
 export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
   return {
-    async candidates(since, limit) {
-      const { rows } = await db.query<Record<string, unknown>>(CANDIDATES_SQL, [since, limit]);
+    async candidates(since, limit, workspaces) {
+      const { rows } = await db.query<Record<string, unknown>>(CANDIDATES_SQL, [since, limit, workspaces, CANDIDATES_PER_WORKSPACE]);
       return rows.map((r) => ({
         orgId: r.org_id as string, workspaceId: r.workspace_id as string, harness: r.harness as string,
         sessionId: r.session_id as string, projectId: (r.project_id as string | null) ?? null,
@@ -129,7 +143,8 @@ export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
       return rows.map((r): RecentAdvisory => {
         const recipient = { harness: String(r.harness), sessionId: String(r.session_id) };
         return r.row_kind === "pair"
-          ? { kind: "pair", recipient, peer: { harness: String(r.peer_harness), sessionId: String(r.peer_session_id) }, latestAt: ms(r.latest_at) }
+          ? { kind: "pair", recipient, peer: { harness: String(r.peer_harness), sessionId: String(r.peer_session_id) },
+              urgency: r.urgency === "high" ? "high" : "low", latestAt: ms(r.latest_at) }
           : { kind: "recipient", recipient, latestAt: ms(r.latest_at), sentLastHour: Number(r.sent_last_hour ?? 0) };
       });
     },
@@ -140,6 +155,8 @@ export interface ScanDeps {
   store: AdvisorStore;
   backend: CoordinationBackend;
   limits: AdvisorLimits;
+  /** The routes' canary allowlist (READ_API_DIRECTORY_WORKSPACES): only these workspaces are scanned. */
+  workspaces: ReadonlySet<string> | "*";
   /** Absent: DMs are off; HIGH rows stay pending for the pull path. */
   sender?: RelaySender;
 }
@@ -147,18 +164,41 @@ export interface ScanDeps {
 export interface ScanStats {
   candidates: number; workspaces: number; findings: number; written: number; existing: number;
   cooldown: number; capped: number; dmSent: number; dmFailed: number; truncated: number; failed: number;
+  /** Rows the database refused (a data or constraint error); the scan goes on with the next row. */
+  rejected: number;
 }
 
 const emptyStats = (): ScanStats => ({
   candidates: 0, workspaces: 0, findings: 0, written: 0, existing: 0,
-  cooldown: 0, capped: 0, dmSent: 0, dmFailed: 0, truncated: 0, failed: 0,
+  cooldown: 0, capped: 0, dmSent: 0, dmFailed: 0, truncated: 0, failed: 0, rejected: 0,
 });
+
+/** The artifact clipped to the column's 512 characters, by code point (never splitting a surrogate pair). */
+export function boundedArtifact(artifact: string): string {
+  const chars = Array.from(artifact);
+  return chars.length <= ARTIFACT_MAX_CHARS ? artifact : chars.slice(0, ARTIFACT_MAX_CHARS).join("");
+}
+
+/**
+ * The longest evidence prefix whose jsonb text fits the column's 4096 characters. jsonb prints ": " and ", ",
+ * one character more per key and per separator than JSON.stringify: at most 8 per four-key entry. JS string
+ * length counts UTF-16 units, never fewer than PostgreSQL's characters, so the estimate is an upper bound.
+ */
+export function boundedEvidence(evidence: Advisory["evidence"]): Advisory["evidence"] {
+  const fits = (list: Advisory["evidence"]) => JSON.stringify(list).length + 8 * list.length <= EVIDENCE_TEXT_MAX;
+  let n = evidence.length;
+  while (n > 0 && !fits(evidence.slice(0, n))) n--;
+  return evidence.slice(0, n);
+}
+
+/** A data exception (class 22) or an integrity violation (class 23): this row is bad, not the database. */
+const rowRejected = (err: unknown) => /^2[23]/.test(String((err as { code?: unknown } | null)?.code ?? ""));
 
 function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryRowInput {
   return {
     advisory_id: a.advisoryId, harness: recipient.harness, session_id: recipient.sessionId,
     peer_harness: peer.harness, peer_session_id: peer.sessionId, urgency: a.urgency, kind: a.kind,
-    artifact: a.artifact, evidence: a.evidence,
+    artifact: boundedArtifact(a.artifact), evidence: boundedEvidence(a.evidence),
   };
 }
 
@@ -166,12 +206,22 @@ function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryR
 async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Advisory[], now: number, stats: ScanStats) {
   for (const a of orderAdvisories(advisories)) {
     const pair = pairKey(a.lanes[0], a.lanes[1]);
-    if (deps.limits.inCooldown(pair, now)) { stats.cooldown++; continue; }
+    if (deps.limits.inCooldown(pair, a.urgency, now)) { stats.cooldown++; continue; }
     let attempted = false;
     for (const [recipient, peer] of [[a.lanes[0], a.lanes[1]], [a.lanes[1], a.lanes[0]]] as const) {
       if (!deps.limits.underCap(recipient, now)) { stats.capped++; continue; }
       attempted = true;
-      const result = await deps.store.upsert(orgId, workspaceId, rowFor(a, recipient, peer));
+      let result: UpsertResult;
+      try {
+        result = await deps.store.upsert(orgId, workspaceId, rowFor(a, recipient, peer));
+      } catch (err) {
+        // One bad row must not block the workspace: it is skipped, and the pair cooldown below stops a retry
+        // every tick. Any other error still fails the workspace.
+        if (!rowRejected(err)) throw err;
+        stats.rejected++;
+        log.warn("coordination advisor row rejected", { org_id: orgId, workspace_id: workspaceId, kind: a.kind, ...errorFields(err) });
+        continue;
+      }
       if (result.inserted + result.upgraded === 0) { stats.existing++; continue; }
       stats.written++;
       deps.limits.recordSent(recipient, now);
@@ -182,7 +232,7 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
         firstSeen: a.evidence.map((e) => e.ts).sort()[0] ?? new Date(now).toISOString(),
       });
       try {
-        await deps.sender.send({ to: recipient, text, advisoryId: a.advisoryId });
+        await deps.sender.send({ orgId, workspaceId, to: recipient, text, advisoryId: a.advisoryId });
       } catch (err) {
         // Not delivered: the row stays pending and the pull path still serves it.
         stats.dmFailed++;
@@ -192,7 +242,7 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
       stats.dmSent++;
       await deps.store.markDelivered(orgId, workspaceId, a.advisoryId, recipient);
     }
-    if (attempted) deps.limits.touchPair(pair, now);
+    if (attempted) deps.limits.touchPair(pair, a.urgency, now);
   }
 }
 
@@ -215,8 +265,12 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
   const stats = emptyStats();
   const nowMs = now.getTime();
   deps.limits.prune(nowMs);
+  // No workspace enabled: nothing is read.
+  if (deps.workspaces !== "*" && deps.workspaces.size === 0) return stats;
   const since = new Date(nowMs - CANDIDATE_WINDOW_MS);
-  const rows = await deps.store.candidates(since, CANDIDATE_LIMIT + 1);
+  const allowed = deps.workspaces === "*" ? null : [...deps.workspaces].sort();
+  const rows = (await deps.store.candidates(since, CANDIDATE_LIMIT + 1, allowed))
+    .filter((r) => deps.workspaces === "*" || deps.workspaces.has(r.workspaceId));
   if (rows.length > CANDIDATE_LIMIT) log.warn("coordination advisor candidates truncated", { count: CANDIDATE_LIMIT });
   const byWorkspace = new Map<string, CandidateLane[]>();
   for (const row of rows.slice(0, CANDIDATE_LIMIT)) {

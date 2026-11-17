@@ -13,7 +13,7 @@ import type { CoordinationBackend, CoordinationFacts } from "../../session-read-
 import type { SqlQuery } from "../../session-read-api/liveness.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
 import { AdvisorLimits } from "../rubric.ts";
-import { advisorTick, scanOnce, sqlAdvisorStore } from "../scan.ts";
+import { advisorTick, CANDIDATES_PER_WORKSPACE, scanOnce, sqlAdvisorStore } from "../scan.ts";
 import { postgresAdvisorBackend, productionIo } from "../main.ts";
 import { advisorConfig } from "../config.ts";
 
@@ -78,7 +78,7 @@ describe("coordination advisor tick (pglite)", () => {
     const be = backend({ ws1: shared });
     const sender = new InMemoryRelaySender();
     const limits = new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 });
-    const tick = advisorTick((q) => ({ store: sqlAdvisorStore(q), backend: be, limits, sender }), { intervalMs: 1 });
+    const tick = advisorTick((q) => ({ workspaces: "*", store: sqlAdvisorStore(q), backend: be, limits, sender }), { intervalMs: 1 });
     await tick(asService(db), NOW);
     expect(be.reads).toEqual(["org/ws1"]);
     expect(await rows()).toEqual([
@@ -97,10 +97,10 @@ describe("coordination advisor tick (pglite)", () => {
     const store = sqlAdvisorStore(asService(db));
     const sender = new InMemoryRelaySender();
     const limits = () => new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 });
-    await scanOnce({ store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
+    await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
     await db.exec("UPDATE sessions.coordination_advisories SET status='acked', acked_at=now()");
     sender.sent.length = 0;
-    const again = await scanOnce({ store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
+    const again = await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
     expect(again).toMatchObject({ written: 0, existing: 2, dmSent: 0 });
     expect((await rows()).every((r) => r.status === "acked")).toBe(true);
 
@@ -108,7 +108,7 @@ describe("coordination advisor tick (pglite)", () => {
     await dir("org", "ws1", "p", "proj", -200);
     for (const child of ["a", "b"]) await db.query(
       "INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) VALUES ('org','ws1','claude','p',$1,$1)", [child]);
-    expect(await scanOnce({ store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW)).toMatchObject({ written: 0 });
+    expect(await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW)).toMatchObject({ written: 0 });
     expect(await rows()).toEqual([]);
   });
 
@@ -122,13 +122,13 @@ describe("coordination advisor tick (pglite)", () => {
     const live = ["a", "b"].map((id, i) => ({ ...lane(id, []), startedAt: rel(-90), lastActionAt: rel(-5),
       writes: [{ path: "src/x/shared.ts", ts: rel(-40 + i * 20), eventId: `${id}-w`, kind: "tool", branch: `b/${id}` }] }));
     const store = sqlAdvisorStore(asService(db));
-    const first = await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, now);
+    const first = await scanOnce({ workspaces: "*", store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, now);
     expect(first).toMatchObject({ written: 2 });
     // "Restart": new in-memory limits, same database.
     const later = new Date(now.getTime() + 1_000);
-    expect(await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, later))
+    expect(await scanOnce({ workspaces: "*", store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 }) }, later))
       .toMatchObject({ cooldown: 1, written: 0, existing: 0 });
-    expect(await scanOnce({ store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 1 }) }, later))
+    expect(await scanOnce({ workspaces: "*", store, backend: backend({ ws1: live }), limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 1 }) }, later))
       .toMatchObject({ capped: 2, written: 0, existing: 0 });
     // Another tenant's rows never seed this one.
     expect(await store.recent("org", "ws2", new Date(now.getTime() - 86_400_000))).toEqual([]);
@@ -155,13 +155,30 @@ describe("coordination advisor tick (pglite)", () => {
       { orgId: "org", workspaceId: "ws1", since: new Date(now.getTime() - 2 * 3_600_000), until: now });
     expect(facts.lanes.map((l) => [l.sessionId, l.writes.map((w) => w.eventId)]).sort()).toEqual([["a", ["a--40"]], ["b", ["b--20"]]]);
     const sender = new InMemoryRelaySender();
-    const stats = await scanOnce({ store: sqlAdvisorStore(asService(db)), backend: be, limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 }), sender }, now);
+    const stats = await scanOnce({ workspaces: "*", store: sqlAdvisorStore(asService(db)), backend: be, limits: new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 }), sender }, now);
     expect(stats).toMatchObject({ written: 2, failed: 0 });
     expect((await rows()).map((r) => [r.session_id, r.urgency, r.status])).toEqual([["a", "high", "delivered"], ["b", "high", "delivered"]]);
     await expect(be.windowReadiness("org", "ws1", now, now)).rejects.toThrow(/not used by the worker/);
     // productionIo selects it for COORDINATION_ADVISOR_FACTS_BACKEND=postgres without ClickHouse configuration.
     const cfg = advisorConfig({ COORDINATION_ADVISOR_ENABLED: "true", COORDINATION_ADVISOR_FACTS_BACKEND: "postgres" });
     expect(productionIo.backend(cfg, {})(asService(db)).kind).toBe("postgres");
+  });
+
+  test("candidates: the workspace allowlist and the per-workspace cap apply in SQL", async () => {
+    await db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, project_id)
+       SELECT 'org', 'ws1', 'claude', 's' || g, $1, $2::timestamptz - make_interval(secs => g), 'proj' FROM generate_series(1, $3::int) g`,
+      [at(-120), at(-1), CANDIDATES_PER_WORKSPACE + 5]);
+    await dir("org", "ws2", "only", "proj", -3);
+    await dir("org", "ws3", "other", "proj", -2);
+    const store = sqlAdvisorStore(asService(db));
+    const since = new Date(NOW.getTime() - 2 * 3_600_000);
+    const all = await store.candidates(since, 10_000, null);
+    expect(all.filter((r) => r.workspaceId === "ws1")).toHaveLength(CANDIDATES_PER_WORKSPACE);
+    expect(all.filter((r) => r.workspaceId === "ws1").at(-1)!.sessionId).toBe(`s${CANDIDATES_PER_WORKSPACE}`);
+    expect(all.filter((r) => r.workspaceId !== "ws1").map((r) => r.sessionId).sort()).toEqual(["only", "other"]);
+    expect((await store.candidates(since, 10_000, ["ws2"])).map((r) => r.sessionId)).toEqual(["only"]);
+    expect(await store.candidates(since, 10_000, [])).toEqual([]);
   });
 
   test("no downgrade: a LOW upsert over an existing HIGH row leaves it high", async () => {

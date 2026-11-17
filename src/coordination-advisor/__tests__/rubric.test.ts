@@ -112,26 +112,40 @@ describe("limits", () => {
   test("pair cooldown holds for the configured time and is order-independent", () => {
     const l = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 });
     expect(pairKey(A, B)).toBe(pairKey(B, A));
-    l.touchPair(pairKey(A, B), T0);
-    expect(l.inCooldown(pairKey(B, A), T0 + 6 * 3_600_000 - 1)).toBe(true);
-    expect(l.inCooldown(pairKey(A, B), T0 + 6 * 3_600_000)).toBe(false);
+    l.touchPair(pairKey(A, B), "high", T0);
+    expect(l.inCooldown(pairKey(B, A), "high", T0 + 6 * 3_600_000 - 1)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + 6 * 3_600_000)).toBe(false);
+  });
+  test("cooldown per urgency: a LOW never holds back a HIGH; a HIGH holds back both", () => {
+    const l = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 });
+    l.touchPair(pairKey(A, B), "low", T0);
+    expect(l.inCooldown(pairKey(A, B), "low", T0 + 1)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + 1)).toBe(false);
+    l.touchPair(pairKey(A, B), "high", T0 + 2);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + 3)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "low", T0 + 6 * 3_600_000 + 1)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "low", T0 + 6 * 3_600_000 + 2)).toBe(false);
   });
   test("seed: durable pair times start the cooldown; durable last-hour counts fill the cap, never lower it", () => {
     const l = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 3 });
     l.recordSent(A, T0);
     l.seed([
-      { kind: "pair", recipient: A, peer: B, latestAt: T0 - 3_600_000 },
+      { kind: "pair", recipient: A, peer: B, urgency: "high", latestAt: T0 - 3_600_000 },
+      { kind: "pair", recipient: A, peer: { harness: "codex", sessionId: "c" }, urgency: "low", latestAt: T0 - 60_000 },
       { kind: "recipient", recipient: A, latestAt: T0 - 60_000, sentLastHour: 3 },
       { kind: "recipient", recipient: B, latestAt: T0 - 60_000, sentLastHour: 1 },
     ], T0);
-    expect(l.inCooldown(pairKey(B, A), T0 + 5 * 3_600_000 - 1)).toBe(true);
-    expect(l.inCooldown(pairKey(A, B), T0 + 5 * 3_600_000)).toBe(false);
+    expect(l.inCooldown(pairKey(B, A), "low", T0 + 5 * 3_600_000 - 1)).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + 5 * 3_600_000)).toBe(false);
+    // A durable LOW seeds only the LOW cooldown.
+    expect(l.inCooldown(pairKey(A, { harness: "codex", sessionId: "c" }), "low", T0)).toBe(true);
+    expect(l.inCooldown(pairKey(A, { harness: "codex", sessionId: "c" }), "high", T0)).toBe(false);
     expect(l.underCap(A, T0)).toBe(false);
     expect(l.underCap(B, T0)).toBe(true);
     // A later in-memory pair time wins; a smaller durable count does not drop in-memory sends.
-    l.touchPair(pairKey(A, B), T0);
-    l.seed([{ kind: "pair", recipient: A, peer: B, latestAt: T0 - 7_200_000 }, { kind: "recipient", recipient: A, latestAt: T0, sentLastHour: 1 }], T0);
-    expect(l.inCooldown(pairKey(A, B), T0 + 6 * 3_600_000 - 1)).toBe(true);
+    l.touchPair(pairKey(A, B), "high", T0);
+    l.seed([{ kind: "pair", recipient: A, peer: B, urgency: "high", latestAt: T0 - 7_200_000 }, { kind: "recipient", recipient: A, latestAt: T0, sentLastHour: 1 }], T0);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + 6 * 3_600_000 - 1)).toBe(true);
     expect(l.underCap(A, T0)).toBe(false);
   });
   test("per-recipient hourly cap, rolling", () => {
@@ -182,7 +196,20 @@ describe("config and sender", () => {
     expect(advisorEnabled({ COORDINATION_ADVISOR_ENABLED: "true" })).toBe(true);
   });
   test("defaults", () => {
-    expect(advisorConfig({})).toEqual({ intervalMs: 120_000, pairCooldownMs: 21_600_000, sessionHourlyCap: 3, factsBackend: "clickhouse", relayDm: { enabled: false } });
+    expect(advisorConfig({})).toEqual({ intervalMs: 120_000, pairCooldownMs: 21_600_000, sessionHourlyCap: 3, factsBackend: "clickhouse", relayDm: { enabled: false }, workspaces: new Set() });
+  });
+  test("workspaces: the routes' canary allowlist; absent or empty scans none", () => {
+    expect(advisorConfig({ READ_API_DIRECTORY_WORKSPACES: "*" }).workspaces).toBe("*");
+    expect([...(advisorConfig({ READ_API_DIRECTORY_WORKSPACES: " w1, w2 ,," }).workspaces as Set<string>)].sort()).toEqual(["w1", "w2"]);
+    expect((advisorConfig({ READ_API_DIRECTORY_WORKSPACES: "" }).workspaces as Set<string>).size).toBe(0);
+  });
+  test("relay URL validated at config time, value never echoed", () => {
+    const dm = (url: string) => () => advisorConfig({ COORDINATION_ADVISOR_RELAY_DM_ENABLED: "true", COORDINATION_ADVISOR_RELAY_TOKEN: "t", COORDINATION_ADVISOR_RELAY_URL: url });
+    for (const [url, msg] of [["not a url secretpart", /not a valid URL/], ["http://relay.example/secretpart", /must be https/], ["https://u:secretpart@relay.example/", /credentials/]] as const) {
+      expect(dm(url)).toThrow(msg);
+      try { dm(url)(); } catch (e) { expect(String((e as Error).message)).not.toContain("secretpart"); }
+    }
+    expect(advisorConfig({ COORDINATION_ADVISOR_RELAY_DM_ENABLED: "true", COORDINATION_ADVISOR_RELAY_TOKEN: "t", COORDINATION_ADVISOR_RELAY_URL: "http://127.0.0.1:9/dm" }).relayDm.enabled).toBe(true);
   });
   test("refuses to start: DM on without token or URL; malformed numbers; unknown backend", () => {
     expect(() => advisorConfig({ COORDINATION_ADVISOR_RELAY_DM_ENABLED: "true", COORDINATION_ADVISOR_RELAY_URL: "https://r.example" }))
@@ -195,22 +222,36 @@ describe("config and sender", () => {
     // DM flag not exactly "true": no token needed.
     expect(advisorConfig({ COORDINATION_ADVISOR_RELAY_DM_ENABLED: "1" }).relayDm).toEqual({ enabled: false });
   });
-  test("http sender: https only off loopback; bearer; throws on non-ok and over-bound text; token never in errors", async () => {
+  test("http sender: https only off loopback; bearer; tenant in the payload; no redirects; body discarded; throws on non-ok and over-bound text; token never in errors", async () => {
     expect(() => httpRelaySender({ url: "http://relay.example/dm", token: "secret-token" })).toThrow(/https/);
     const calls: { url: string; init: RequestInit }[] = [];
+    const cancelled: number[] = [];
     let status = 200;
-    const fake = (async (url: URL, init: RequestInit) => { calls.push({ url: String(url), init }); return new Response(null, { status }); }) as unknown as typeof fetch;
+    const fake = (async (url: URL, init: RequestInit) => {
+      calls.push({ url: String(url), init });
+      const body = new ReadableStream({ cancel() { cancelled.push(status); } });
+      return new Response(body, { status });
+    }) as unknown as typeof fetch;
     const s = httpRelaySender({ url: "http://127.0.0.1:9/dm", token: "secret-token", fetch: fake });
-    await s.send({ to: { harness: "claude", sessionId: "a" }, text: "hi", advisoryId: "id" });
+    const dm = (text: string) => ({ orgId: "org-1", workspaceId: "ws-1", to: { harness: "claude", sessionId: "a" }, text, advisoryId: "id" });
+    await s.send(dm("hi"));
     expect((calls[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer secret-token");
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ from: "relayhistory-coordination", to: { harness: "claude", sessionId: "a" }, text: "hi", advisoryId: "id" });
+    expect(calls[0]!.init.redirect).toBe("error");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      from: "relayhistory-coordination", orgId: "org-1", workspaceId: "ws-1", to: { harness: "claude", sessionId: "a" }, text: "hi", advisoryId: "id",
+    });
     status = 503;
-    const err = await s.send({ to: { harness: "claude", sessionId: "a" }, text: "hi", advisoryId: "id" }).catch((e: Error) => e);
+    const err = await s.send(dm("hi")).catch((e: Error) => e);
     expect(String(err)).toContain("503");
     expect(String(err)).not.toContain("secret-token");
-    await expect(s.send({ to: { harness: "claude", sessionId: "a" }, text: "x".repeat(601), advisoryId: "id" })).rejects.toThrow(/bound/);
+    expect(cancelled).toEqual([200, 503]);
+    await expect(s.send(dm("x".repeat(601)))).rejects.toThrow(/bound/);
+    // A redirect answer (what fetch's redirect "error" raises) is a failed send, never followed.
+    const redirecting = httpRelaySender({ url: "https://relay.example/dm", token: "secret-token",
+      fetch: (async () => { throw new TypeError("unexpected redirect"); }) as unknown as typeof fetch });
+    await expect(redirecting.send(dm("hi"))).rejects.toThrow(/redirect/);
     const mem = new InMemoryRelaySender();
     mem.fail = true;
-    await expect(mem.send({ to: { harness: "c", sessionId: "s" }, text: "t", advisoryId: "i" })).rejects.toThrow();
+    await expect(mem.send({ orgId: "o", workspaceId: "w", to: { harness: "c", sessionId: "s" }, text: "t", advisoryId: "i" })).rejects.toThrow();
   });
 });

@@ -53,15 +53,15 @@ describe("20261105062070 coordination advisor readers", () => {
   const facts = (fn: string, org: string, ws: string, from = "2026-11-01", to = "2026-12-01", limit = 100) =>
     as("service_role", async (tx) => (await tx.query<{ session_id: string; row_id: string }>(
       `SELECT session_id, row_id FROM ${fn.slice(0, fn.indexOf("("))}($1,$2,$3::timestamptz,$4::timestamptz,NULL,$5)`, [org, ws, from, to, limit])).rows);
-  type Recent = { row_kind: string; harness: string; session_id: string; peer_harness: string | null; peer_session_id: string | null; latest_at: Date; sent_last_hour: number | null };
+  type Recent = { row_kind: string; harness: string; session_id: string; peer_harness: string | null; peer_session_id: string | null; urgency: string | null; latest_at: Date; sent_last_hour: number | null };
   const recent = (org: string, ws: string, since: string) =>
     as("service_role", async (tx) => (await tx.query<Recent>(
-      "SELECT * FROM sessions.coordination_advisories_recent_v1($1,$2,$3::timestamptz) ORDER BY row_kind, harness, session_id, peer_session_id", [org, ws, since])).rows);
+      "SELECT * FROM sessions.coordination_advisories_recent_v1($1,$2,$3::timestamptz) ORDER BY row_kind, harness, session_id, peer_session_id, urgency", [org, ws, since])).rows);
   const upsert = (org: string, ws: string, list: unknown[]) =>
     as("service_role", (tx) => tx.query("SELECT * FROM sessions.coordination_advisories_upsert_v1($1,$2,$3::jsonb)", [org, ws, JSON.stringify(list)]));
-  const adv = (id: number, session: string, peer: string) => ({
+  const adv = (id: number, session: string, peer: string, urgency = "high") => ({
     advisory_id: hex(id), harness: "claude", session_id: session, peer_harness: "codex", peer_session_id: peer,
-    urgency: "high", kind: "concurrent_edit", artifact: "src/a.ts", evidence: [],
+    urgency, kind: "concurrent_edit", artifact: "src/a.ts", evidence: [],
   });
 
   beforeAll(async () => {
@@ -139,9 +139,9 @@ describe("20261105062070 coordination advisor readers", () => {
     await db.exec(`UPDATE sessions.coordination_advisories SET created_at = now() - interval '8 days' WHERE org_id='org-a' AND advisory_id='${hex(3)}'`);
     const rows = await recent("org-a", "ws-a", new Date(Date.now() - 30 * 86_400_000).toISOString());
     // s1->s3 is older than the 7-day clamp, so even a 30-day window does not return it.
-    expect(rows.map((r) => [r.row_kind, r.session_id, r.peer_session_id, r.sent_last_hour])).toEqual([
-      ["pair", "s1", "s2", null],
-      ["recipient", "s1", null, 1],
+    expect(rows.map((r) => [r.row_kind, r.session_id, r.peer_session_id, r.urgency, r.sent_last_hour])).toEqual([
+      ["pair", "s1", "s2", "high", null],
+      ["recipient", "s1", null, null, 1],
     ]);
     const latest = (await db.query<{ t: Date }>(`SELECT created_at t FROM sessions.coordination_advisories WHERE org_id='org-a' AND advisory_id='${hex(1)}'`)).rows[0]!.t;
     expect(new Date(rows[0]!.latest_at).getTime()).toBe(new Date(latest).getTime());
@@ -150,6 +150,13 @@ describe("20261105062070 coordination advisor readers", () => {
     // The other tenant's identical pair is its own.
     expect((await recent("org-b", "ws-a", "2026-01-01")).map((r) => [r.row_kind, r.sent_last_hour])).toEqual([["pair", null], ["recipient", 1]]);
     expect(await recent("org-c", "ws-a", "2026-01-01")).toEqual([]);
+    // One pair with both urgencies keeps one row per urgency, so a LOW cooldown never hides a HIGH.
+    await upsert("org-d", "ws-a", [adv(5, "s1", "s2", "high"), adv(6, "s1", "s2", "low")]);
+    expect((await recent("org-d", "ws-a", "2026-01-01")).map((r) => [r.row_kind, r.peer_session_id, r.urgency, r.sent_last_hour])).toEqual([
+      ["pair", "s2", "high", null],
+      ["pair", "s2", "low", null],
+      ["recipient", null, null, 2],
+    ]);
     expect(await code(recent("", "ws-a", "2026-01-01"))).toBe("22023");
     expect(await code(as("service_role", (tx) => tx.query("SELECT * FROM sessions.coordination_advisories_recent_v1('org-a','ws-a',NULL)")))).toBe("22023");
   });
