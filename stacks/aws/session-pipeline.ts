@@ -140,6 +140,12 @@ export interface SessionPipelineInputs {
    */
   neonExit?: true;
   /**
+   * Relayfacts extractor (src/session-analysis/decision-records.ts, docs/relayfacts.md). `true` renders
+   * SUMMARY_DECISION_RECORDS_ENABLED="true"; it records decisions only when analysis jobs run and needs
+   * migrations 062080 and 062090. Absent or `false`: no var rendered, env byte-identical to before.
+   */
+  relayfacts?: boolean;
+  /**
    * Which optional schedule groups this stage declares at all (EventBridge rule plus its invoke permission).
    * Each key is its own reviewed deploy phase (transcript-store.ts), so a stage adds them one at a time:
    * a group that is not listed renders no resources, and its lane cannot be enabled. Absent: none declared.
@@ -267,13 +273,14 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
   if(v.legacyReadSource!==undefined&&v.legacyReadSource!=="frozen-supabase")refuse('transcriptStore.sessionPipeline.legacyReadSource must be "frozen-supabase" (omit for legacy)');
   // Mirrors lambda.ts lambdaEnv: Neon exit admits readers only with explicit frozen-copy provenance.
   // Before the analysisCache grant refusal below, so a missing source is refused by name.
+  if (v.relayfacts !== undefined && typeof v.relayfacts !== "boolean") refuse("transcriptStore.sessionPipeline.relayfacts must be a boolean");
   if (v.neonExit !== undefined) {
     if (v.neonExit !== true) refuse("transcriptStore.sessionPipeline.neonExit must be true (omit for off)");
     if (v.analysisCache === true && v.legacyReadSource !== "frozen-supabase") refuse('transcriptStore.sessionPipeline.neonExit with analysisCache: true requires legacyReadSource: "frozen-supabase"');
@@ -598,6 +605,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
     ...(i.p.briefs?.sweepSeconds !== undefined ? { SESSION_BRIEF_SWEEP_SECONDS: String(i.p.briefs.sweepSeconds) } : {}),
     ...(i.p.neonExit === true ? { SESSIONS_NEON_EXIT: "true" } : {}),
+    // Only when armed, so a default deploy leaves the relayfacts extractor at its source default of off.
+    ...(i.p.relayfacts === true ? { SUMMARY_DECISION_RECORDS_ENABLED: "true" } : {}),
   };
 }
 

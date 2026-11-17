@@ -59,6 +59,12 @@ export interface SessionReadApiInputs {
    * absent, the param stays 501 `param_includeShortSummary` and the list shape is unchanged either way.
    */
   listShortSummary?: boolean;
+  /**
+   * Serve GET /v1/relayfacts and GET /v1/relayfacts/:topic (READ_API_RELAYFACTS_ENABLED=true; docs/relayfacts.md).
+   * Default off: absent, the env is unchanged and both routes stay 501 `relayfacts_disabled`. Needs 062080 and
+   * 062090 applied, and each workspace still needs the `relayfacts` canary.
+   */
+  relayfacts?: boolean;
 }
 
 export const SESSION_READ_API_RESOURCES = [
@@ -87,7 +93,7 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket" && k !== "briefSummary" && k !== "listShortSummary")
+    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket" && k !== "briefSummary" && k !== "listShortSummary" && k !== "relayfacts")
       refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
   if (typeof v.completeSince !== "string" || (v.completeSince !== "epoch" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v.completeSince)))
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
@@ -95,7 +101,7 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi.origin must be this function's us-east-1 Function URL origin (no path)");
   if (v.analysisBucket !== undefined && typeof v.analysisBucket !== "boolean")
     refuse("transcriptStore.sessionReadApi.analysisBucket must be a boolean");
-  for (const k of ["briefSummary", "listShortSummary"] as const)
+  for (const k of ["briefSummary", "listShortSummary", "relayfacts"] as const)
     if (v[k] !== undefined && typeof v[k] !== "boolean") refuse(`transcriptStore.sessionReadApi.${k} must be a boolean`);
   if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
     refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
@@ -153,6 +159,7 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     // deploys see no env change; switching either on is a "session read api update" phase on its own.
     ...(i.p.briefSummary === true ? { READ_API_BRIEF_SUMMARY_ENABLED: "true" } : {}),
     ...(i.p.listShortSummary === true ? { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" } : {}),
+    ...(i.p.relayfacts === true ? { READ_API_RELAYFACTS_ENABLED: "true" } : {}),
     NODE_OPTIONS: "--enable-source-maps",
   };
 }

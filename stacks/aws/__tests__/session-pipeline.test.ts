@@ -916,6 +916,34 @@ describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
   });
 });
 
+describe("session pipeline: SUMMARY_DECISION_RECORDS_ENABLED (relayfacts, default off)", () => {
+  const withPipeline = (sessionPipeline: unknown) =>
+    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
+  const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
+  const env = (sp: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: sp }) as Record<string, string>;
+
+  it("absent or false: no SUMMARY_DECISION_RECORDS_ENABLED key; the env is byte-identical to a stack without the input", () => {
+    for (const sp of [{}, { searchIndex: true }, { analysisJobs: { enabled: true } }, { neonExit: true }] as SessionPipelineInputs[]) {
+      expect(Object.hasOwn(env(sp), "SUMMARY_DECISION_RECORDS_ENABLED")).toBe(false);
+      expect(JSON.stringify(env({ ...sp, relayfacts: false }))).toBe(JSON.stringify(env(sp)));
+      expect(JSON.stringify(env({ ...sp, relayfacts: undefined }))).toBe(JSON.stringify(env(sp)));
+    }
+  });
+
+  it("true: exactly one more var, SUMMARY_DECISION_RECORDS_ENABLED \"true\", and the validator accepts it", () => {
+    for (const sp of [{}, { searchIndex: true }, { neonExit: true }] as SessionPipelineInputs[]) {
+      expect(() => validate(withPipeline({ ...sp, relayfacts: true }))).not.toThrow(/sessionPipeline/);
+      expect(() => validate(withPipeline({ ...sp, relayfacts: false }))).not.toThrow(/sessionPipeline/);
+      expect(env({ ...sp, relayfacts: true })).toEqual({ ...env(sp), SUMMARY_DECISION_RECORDS_ENABLED: "true" });
+    }
+  });
+
+  it("refuses a non-boolean", () => {
+    for (const bad of ["true", 1, null, {}, "on"])
+      expect(() => validate(withPipeline({ relayfacts: bad }))).toThrow("transcriptStore.sessionPipeline.relayfacts must be a boolean");
+  });
+});
+
 describe("session pipeline: streamed ClickHouse reconcile (issue 610 L3 D1)", () => {
   const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
   const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };

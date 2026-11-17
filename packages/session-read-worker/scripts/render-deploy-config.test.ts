@@ -460,6 +460,15 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).toContain('${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"}');
     expect(TEMPLATE).not.toContain("READ_API_SUMMARY_SEARCH_ENABLED");
   });
+
+  test("relayfacts: default off; on adds only the exact \"true\" --var, never the template", () => {
+    expect(WORKFLOW).toMatch(/relayfacts:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("RELAYFACTS: ${{ inputs.relayfacts }}");
+    expect(WORKFLOW).toContain(`case "$RELAYFACTS" in off|on) ;; *) fail 'relayfacts must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain('relayfacts=""; if [ "$RELAYFACTS" = "on" ]; then relayfacts=true; fi');
+    expect(WORKFLOW).toContain('${relayfacts:+--var "READ_API_RELAYFACTS_ENABLED:$relayfacts"}');
+    expect(TEMPLATE).not.toContain("READ_API_RELAYFACTS_ENABLED");
+  });
 });
 
 

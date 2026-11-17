@@ -167,6 +167,23 @@ describe("session read api: inputs, grants and env", () => {
       for (const k of ["briefSummary", "listShortSummary"])
         expect(() => assertSessionReadApiInputs({ completeSince: "epoch", [k]: bad }, refuse)).toThrow(new RegExp(`${k} must be a boolean`));
   });
+
+  it("relayfacts: env present only when switched on, exactly \"true\"; the input is a boolean", () => {
+    const names = sessionReadApiNames(STAGE);
+    const base = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch" } }) as Record<string, string>;
+    expect("READ_API_RELAYFACTS_ENABLED" in base).toBe(false);
+    const off = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", relayfacts: false } }) as Record<string, string>;
+    expect(JSON.stringify(off)).toBe(JSON.stringify(base));
+    const on = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", relayfacts: true } }) as Record<string, string>;
+    expect(on).toEqual({ ...base, READ_API_RELAYFACTS_ENABLED: "true" });
+    const summaries = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", briefSummary: true } }) as Record<string, string>;
+    expect("READ_API_RELAYFACTS_ENABLED" in summaries).toBe(false);
+    const refuse = (why: string): never => { throw new Error(why); };
+    assertSessionReadApiInputs({ completeSince: "epoch", relayfacts: true }, refuse);
+    assertSessionReadApiInputs({ completeSince: "epoch", relayfacts: false }, refuse);
+    for (const bad of ["true", 1, null, "on"])
+      expect(() => assertSessionReadApiInputs({ completeSince: "epoch", relayfacts: bad }, refuse)).toThrow(/relayfacts must be a boolean/);
+  });
 });
 
 describe("session read api: reserved concurrency and alarms", () => {
