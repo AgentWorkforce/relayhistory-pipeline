@@ -243,6 +243,7 @@ describe("session read api: Function URL (public by design, application auth)", 
       "/v1/sessions/activity",
       "/v1/sessions/output",
       "/v1/sessions/summaries/activity",
+      "/v1/sessions/summaries/search",
       "/v1/sessions/titles",
       "/v1/sessions/users",
     ]);
