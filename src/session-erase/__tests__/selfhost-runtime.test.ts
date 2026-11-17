@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildSelfhostEraseRuntime, eraseStoreIdentity } from "../selfhost-runtime.ts";
+import { buildSelfhostEraseRuntime, decisionRecordsErasePort, eraseStoreIdentity } from "../selfhost-runtime.ts";
 test("dormant composition opens no pool, reads no credentials and invokes no SQL", async () => {
  let sql = 0;
  expect(await buildSelfhostEraseRuntime({ env: new Proxy({}, { get() { throw Error("dormant env read"); } }), keyRoot: "96bulls", api: { enabled: false, reason: "flag_off" },
@@ -27,4 +27,20 @@ test("enforcement refuses startup without installed narrow SQL capabilities", as
 test("automatic deletion refuses a one-connection pool before external I/O", async () => {
  await expect(buildSelfhostEraseRuntime({env:{LOCKER_BUCKET:"bucket"},keyRoot:"root",api:{enabled:false,reason:"flag_off"},enforced:true,bytesEnabled:true,
  run:async()=>({rows:[{ready:true}]}),pool:{} as never,metadata:{max:1}})).rejects.toThrow(/at least two/);
+});
+
+test("decision records erase is wired only when SUMMARY_DECISION_RECORDS_ENABLED is exactly true, and then its function is a startup requirement", async () => {
+ const run = async () => { throw Error("SQL forbidden"); };
+ for (const value of [undefined, "", "1", "TRUE", "yes", " true"])
+  expect(decisionRecordsErasePort(value === undefined ? {} : { SUMMARY_DECISION_RECORDS_ENABLED: value }, run)).toBeUndefined();
+ expect(decisionRecordsErasePort({ SUMMARY_DECISION_RECORDS_ENABLED: "true" }, run)).toBeDefined();
+ const required = async (env: NodeJS.ProcessEnv) => {
+  let fns: string[] = [];
+  await buildSelfhostEraseRuntime({ env, keyRoot: "root", api: { enabled: false, reason: "flag_off" }, enforced: true,
+   run: async (_text, values) => { fns = (values?.[0] ?? []) as string[]; return { rows: [{ ready: false }] }; }, pool: {} as never, metadata: {} }).catch(() => {});
+  return fns;
+ };
+ const off = await required({}), on = await required({ SUMMARY_DECISION_RECORDS_ENABLED: "true" });
+ expect(off.some(fn => fn.includes("decision_evidence"))).toBe(false);
+ expect(on).toEqual([...off, "sessions.decision_evidence_erase_session_v1(text,text,text,text,uuid)"]);
 });

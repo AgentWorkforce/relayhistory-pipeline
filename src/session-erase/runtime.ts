@@ -22,6 +22,7 @@ const fn = {
   begin: "ingest_operator_runtime_begin", read: "ingest_operator_erase_receipt", next: "ingest_operator_runtime_next",
   authorize: "ingest_operator_runtime_authorize", release: "ingest_operator_runtime_release", purge: "ingest_operator_runtime_purge",
   step: "ingest_operator_runtime_step", writeBegin: "ingest_operator_runtime_write_begin", writeFinish: "ingest_operator_runtime_write_finish", writeFailed: "ingest_operator_runtime_write_failed",
+  decisionEvidenceErase: "decision_evidence_erase_session_v1",
 } as const;
 async function call(run: SqlRun, name: typeof fn[keyof typeof fn], values: unknown[]): Promise<unknown> {
   try {
@@ -104,14 +105,30 @@ export interface EraseSearchPort {
   /** Return only after a synchronous, tenant-scoped delete and its verification. */
   erase(key: EraseKey, sessionIds: readonly string[]): Promise<void>;
 }
+/** Memory documents (20261105062090): deletes the erased sessions' decision evidence and the records
+ * it leaves empty. Wired only while SUMMARY_DECISION_RECORDS_ENABLED is "true". */
+export interface EraseDecisionRecordsPort {
+  erase(work: EraseWork, lease: string): Promise<void>;
+}
+export function sqlDecisionRecordsErase(run: SqlRun): EraseDecisionRecordsPort {
+  return {
+    async erase(work, lease) {
+      const value = await call(run, fn.decisionEvidenceErase, [...params(work), lease]);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new SessionEraseServiceError();
+    },
+  };
+}
 export interface EraseWorkerOptions {
   ledger: EraseLedger; identity: EraseStoreIdentity; bytes: EraseBytesPort; search: EraseSearchPort;
+  /** Absent unless decision records are enabled. Present, it runs before purge and its failure fails the pass. */
+  decisionRecords?: EraseDecisionRecordsPort;
   /** Same metadata-DB search advisory locks the consumer uses, held across external erasure. */
   searchLock<T>(work: EraseWork, run: () => Promise<T>): Promise<T>;
   log?: (fields: Record<string, unknown>) => void;
   intervalMs?: number;
 }
 class ErasePending extends Error {}
+class DecisionRecordsEraseFailed extends Error {}
 
 export function sessionEraseWorker(options: EraseWorkerOptions) {
   const { ledger, identity } = options;
@@ -144,6 +161,13 @@ export function sessionEraseWorker(options: EraseWorkerOptions) {
       await options.searchLock(work, async () => {
         await authorize();
         await options.search.erase(work, work.sessionIds);
+        if (options.decisionRecords) {
+          await authorize();
+          // Before purge: purge marks every artifact done, so a record erase after it could fail
+          // behind a verified receipt. A failure here leaves the receipt retryable.
+          try { await options.decisionRecords.erase(work, lease); }
+          catch { throw new DecisionRecordsEraseFailed(); }
+        }
         await authorize();
         // Purge verifies metadata and records its counts in one transaction. The search lock
         // drains a pre-fence indexer and prevents it from restoring documents behind our delete.
@@ -157,7 +181,8 @@ export function sessionEraseWorker(options: EraseWorkerOptions) {
       return true;
     } catch (error) {
       if (error instanceof ErasePending) { log({ event: "operator_session_erase_pass", outcome: "writes_pending" }); return true; }
-      const code = error instanceof SessionEraseServiceError && error.code === "unsupported_storage" ? "unsupported_storage" : "erase_step_failed";
+      const code = error instanceof DecisionRecordsEraseFailed ? "decision_records_erase_failed"
+        : error instanceof SessionEraseServiceError && error.code === "unsupported_storage" ? "unsupported_storage" : "erase_step_failed";
       await ledger.step(work, lease, artifact, "failed_retryable", 0, code).catch(() => {});
       log({ event: "operator_session_erase_pass", outcome: "failed", step: artifact, code });
       return true;
