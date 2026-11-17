@@ -61,7 +61,7 @@ import {
 
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../..");
-function operatorTurnsRollbackSql(): string {
+function operatorTurnsRollbackSql(paused = true): string {
   const wrapper = readFileSync(
     join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql"),
     "utf8",
@@ -70,10 +70,13 @@ function operatorTurnsRollbackSql(): string {
     join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"),
     "utf8",
   );
+  const setting = "SELECT set_config('turns.intake_paused', :'turns_intake_paused', false);";
+  if (!wrapper.includes(setting)) throw new Error("turns rollback wrapper intake setting missing");
   return wrapper
     .replace("\\ir 20261105062020_turns_forward_gates.down.sql", down)
+    .replace(setting, `SELECT set_config('turns.intake_paused','${paused ? "on" : "off"}',false);`)
     .replace(/^\\.*$/gm, "")
-    .replaceAll(":'turns_intake_paused'", "'on'");
+    .trim();
 }
 /** What supabase/bootstrap/hoopdb_function_default_revoke.sql does for the PGlite owner (postgres). */
 const OWNER_FN_DEFAULT_REVOKE =
@@ -1509,7 +1512,14 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     const db = await fresh();
     const tg = "upstream:20261105062020_turns_forward_gates.sql";
     const down = readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.down.sql"), "utf8");
+    const operatorWrapper = readFileSync(join(root, "supabase/rollbacks/20261105062020_turns_forward_gates.operator.psql"), "utf8");
     const operatorDown = operatorTurnsRollbackSql();
+    const intakeGuard = operatorWrapper.match(/DO \$intake_guard\$[\s\S]*?END \$intake_guard\$;/)?.[0];
+    expect(operatorWrapper).toContain("\\if :{?turns_intake_paused}");
+    expect(operatorWrapper).toContain("\\set turns_intake_paused false");
+    expect(operatorWrapper).toContain("SELECT set_config('turns.intake_paused', :'turns_intake_paused', false);");
+    expect(intakeGuard).toContain("current_setting('turns.intake_paused',true)");
+    expect(intakeGuard).not.toContain(":'turns_intake_paused'");
     const privacyLock = down.indexOf("SELECT pg_advisory_xact_lock(961996,50000)");
     const privacyGuard = down.indexOf("DO $rollback_privacy_guard$");
     expect(privacyLock).toBeGreaterThan(0);
@@ -1533,6 +1543,11 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     // 062060 replaces the public and self-host selection boundaries after the turns gates. Restore it first so
     // this test exercises 062020's privacy refusals rather than its later-migration guard.
     await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql"), "utf8"));
+    expect((await failure(db.exec(operatorTurnsRollbackSql(false))))?.code).toBe("55000");
+    await db.exec("ROLLBACK");
+    expect((await db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062020_turns_forward_gates.sql'",
+    )).rows).toEqual([{ n: 1 }]);
     // A gated registration witness is intentionally not reversible even while its ordinary
     // upload_deletions witness still exists: dropping it would reveal a later projector retry.
     await db.exec("UPDATE sessions.turn_session_fences SET registered_writer_seen=true WHERE org_id='historical-org'");
