@@ -18,6 +18,12 @@
  *            rows, recomputes the digest in SQL, and inserts the singleton seal. Then it reads it back.
  *            Without --execute it is a dry run: it verifies the file, and nothing else.
  *
+ * NULL keys (measured on the frozen copy: ~128k rows with NULL workspace_id in session_revision_events and
+ * session_timing_cache, 235 delivery_records with NULL session_id). session_analysis_neon_free() matches the
+ * census on org_id and session_id only, so a NULL workspace must NOT drop the session (that would fail open):
+ * it is kept with workspace_id = NULL_WORKSPACE. A row with a NULL org_id or session_id cannot be keyed to any
+ * session; it is excluded and counted per table in neon_snapshot.unkeyed_rows so reviewers see it.
+ *
  * Canonical digest: sha256 over the concatenation, in (org_id, workspace_id, session_id) order
  * COLLATE "C", of `org_id \t workspace_id \t session_id \n` encoded UTF-8. Any key holding a tab
  * or newline is refused (it would make the encoding ambiguous).
@@ -52,10 +58,16 @@ export interface CensusManifest {
     source_seal: string | null;
     snapshot_at: string;
     tables: Record<string, number>;
+    /** Per table: rows excluded because org_id or session_id is NULL (they cannot be keyed to a session). */
+    unkeyed_rows: Record<string, number>;
+    null_workspace: string;
   };
 }
 
 const quoteIdent = (value: string) => `"${value.replaceAll('"', '""')}"`;
+
+/** Stand-in for a NULL workspace_id. neon_free() ignores workspace_id, so only org + session must be exact. */
+export const NULL_WORKSPACE = "~neon-census:null-workspace~";
 
 /** Tables in `sessions` that carry all three key columns, as text. Sorted for a stable plan. */
 export async function censusTables(db: Queryable): Promise<string[]> {
@@ -112,12 +124,19 @@ export async function produceCensus(
     const tables = await censusTables(db);
     if (tables.length === 0) throw new Error("no sessions table carries org_id/workspace_id/session_id");
     const counts: Record<string, number> = {};
+    const unkeyed: Record<string, number> = {};
     for (const table of tables) {
-      const { rows } = await db.query<{ n: string }>(`SELECT count(*)::text AS n FROM sessions.${quoteIdent(table)}`);
+      const { rows } = await db.query<{ n: string; u: string }>(
+        `SELECT count(*)::text AS n, count(*) FILTER (WHERE org_id IS NULL OR session_id IS NULL)::text AS u
+           FROM sessions.${quoteIdent(table)}`,
+      );
       counts[table] = Number(rows[0]!.n);
+      if (rows[0]!.u !== "0") unkeyed[table] = Number(rows[0]!.u);
     }
+    const nullWorkspace = NULL_WORKSPACE.replaceAll("'", "''");
     const union = tables
-      .map((table) => `SELECT org_id::text, workspace_id::text, session_id::text FROM sessions.${quoteIdent(table)}`)
+      .map((table) => `SELECT org_id::text AS org_id, coalesce(workspace_id::text, '${nullWorkspace}') AS workspace_id, session_id::text AS session_id
+         FROM sessions.${quoteIdent(table)} WHERE org_id IS NOT NULL AND session_id IS NOT NULL`)
       .join(" UNION ");
     const { rows } = await db.query<CensusRow>(
       `SELECT org_id, workspace_id, session_id FROM (${union}) u
@@ -132,7 +151,10 @@ export async function produceCensus(
         version: 1,
         census_rows: sorted.length,
         census_sha256: censusDigest(sorted),
-        neon_snapshot: { source_lsn: source.lsn, source_ref: source.ref, source_seal: source.seal, snapshot_at: at[0]!.t, tables: counts },
+        neon_snapshot: {
+          source_lsn: source.lsn, source_ref: source.ref, source_seal: source.seal, snapshot_at: at[0]!.t,
+          tables: counts, unkeyed_rows: unkeyed, null_workspace: NULL_WORKSPACE,
+        },
       },
     };
   } catch (error) {
@@ -225,7 +247,7 @@ export async function main() {
       const { rows, manifest } = await produceCensus(client, { lsn, ref, seal: arg("source-seal") ?? null });
       await writeFile(out, rows.map(censusLine).join(""), { encoding: "utf8", mode: 0o600, flag: "wx" });
       await writeFile(`${out}.manifest.json`, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      process.stdout.write(`${JSON.stringify({ mode, census_rows: manifest.census_rows, census_sha256: manifest.census_sha256, tables: Object.keys(manifest.neon_snapshot.tables).length })}\n`);
+      process.stdout.write(`${JSON.stringify({ mode, census_rows: manifest.census_rows, census_sha256: manifest.census_sha256, tables: Object.keys(manifest.neon_snapshot.tables).length, unkeyed_rows: manifest.neon_snapshot.unkeyed_rows })}\n`);
     } finally {
       await client.end();
     }
