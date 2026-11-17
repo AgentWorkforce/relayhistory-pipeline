@@ -1494,14 +1494,23 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
     }
   });
 
-  test("SQL EDGES: heartbeat() refuses and writes nothing with no active authority; ready()/heartbeat() refuse outside READ COMMITTED; an unrelated authority-column UPDATE keeps readiness", async () => {
+  test("SQL EDGES: heartbeat() refuses and writes nothing with no active authority or an empty/unset sweep activation; ready()/heartbeat() refuse outside READ COMMITTED; an unrelated authority-column UPDATE keeps readiness", async () => {
     const w = await world();
     try {
       const gen = (await import("../../shared/legacy-export-generation.ts")) as { LEGACY_EXPORT_GENERATION: string; LEGACY_EXPORT_GENERATION_SETTING: string };
-      const heartbeatSql = async (iso?: string) => {
+      // The sweep-activation token, as the shipped eraser captures it at sweep start ("current" = ask the head's
+      // eraser_activation() RPC; "empty" = set to ''; "unset" = never set). Heads without the token RPC fall back to unset.
+      const SWEEP_SETTING = "s3x.legacy_export_sweep_authority_activated_at";
+      const hasToken = ((await w.f.db.query("SELECT to_regprocedure('sessions.legacy_export_privacy_eraser_activation()') IS NOT NULL AS ok")).rows[0] as { ok: boolean }).ok;
+      const heartbeatSql = async (iso?: string, sweep: "current" | "empty" | "unset" = "current") => {
         await w.f.db.exec(iso ? `BEGIN ISOLATION LEVEL ${iso}` : "BEGIN");
         try {
           await w.f.db.query("SELECT set_config($1,$2,true)", [gen.LEGACY_EXPORT_GENERATION_SETTING, gen.LEGACY_EXPORT_GENERATION]);
+          if (sweep === "empty") await w.f.db.query("SELECT set_config($1,'',true)", [SWEEP_SETTING]);
+          if (sweep === "current" && hasToken) {
+            const tok = (await w.f.db.query("SELECT sessions.legacy_export_privacy_eraser_activation() AS t")).rows[0] as { t: string };
+            await w.f.db.query("SELECT set_config($1,$2,true)", [SWEEP_SETTING, tok.t]);
+          }
           await w.f.db.query("SELECT sessions.legacy_export_privacy_eraser_heartbeat()");
           await w.f.db.exec("COMMIT");
           return "wrote";
@@ -1510,10 +1519,18 @@ describe.skipIf(GATE_TARGET !== "activation" && GATE_TARGET !== "landing")("(g) 
           return String((e as Error).message);
         }
       };
-      // Control: under the active authority the RPC itself writes the row.
+      // Control: under the active authority, with the sweep's captured activation, the RPC itself writes the row.
       expect(await heartbeatSql()).toBe("wrote");
       expect(await heartbeatRows(w.f)).toBe(1);
       expect(await w.readyAs()).toBe("ready");
+      // F3 (lead ruling): an EMPTY or UNSET sweep-activation value must refuse and write nothing (no fail-open).
+      await w.f.db.exec(`DELETE FROM ${HEARTBEAT.table}`);
+      for (const sweep of ["empty", "unset"] as const) {
+        expect({ sweep, r: await heartbeatSql(undefined, sweep) }).not.toEqual({ sweep, r: "wrote" });
+        expect({ sweep, rows: await heartbeatRows(w.f) }).toEqual({ sweep, rows: 0 });
+      }
+      expect(await heartbeatSql()).toBe("wrote"); // and the captured value still writes
+      expect(await heartbeatRows(w.f)).toBe(1);
       // An UPDATE of a column outside the authority identity must not flap readiness (statement trigger is column-scoped).
       await w.f.db.exec("UPDATE sessions.ingest_privacy_authority SET fenced_at=fenced_at");
       expect(await heartbeatRows(w.f)).toBe(1);
