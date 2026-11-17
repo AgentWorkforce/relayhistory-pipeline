@@ -70,14 +70,29 @@ export function logKeys(keyRoot: string, tenant: LedgerTenant, originId: string)
 
 /** Every log stream of one (org, workspace, user) lives under this prefix (one `o=<hash>` directory per origin). */
 export const logUserRoot = (keyRoot: string, tenant: LedgerTenant) => `${admissionUserDir(keyRoot, tenant)}/ledger/log/`;
+/**
+ * The user's stream INDEX: one small object `o=<hash>.json` per log stream of the user, in a flat directory next to the
+ * streams (not inside them), so finding a user's streams lists only this directory: one page per 1000 streams, never
+ * the streams' entries, markers or payloads (`list` is recursive on every backend and the ObjectStore has no
+ * delimiter). Written create-if-absent BEFORE entry 0 (enableLogMode) and again by every registration
+ * (registerLogStream, which admission runs before the take that precedes its first payload), so every stream that can
+ * hold a payload is indexed. A hash only: no id inside. Under `<dir>/ledger/`, so it routes and relocates with the log.
+ */
+export const logUserIndex = (keyRoot: string, tenant: LedgerTenant) => `${admissionUserDir(keyRoot, tenant)}/ledger/log-index/`;
+const INDEXED_ROOT = /^(.*\/ledger)\/log\/(o=[0-9a-f]{32})$/;
 
 /**
- * The keys of the stream rooted at `root` (a `logKeys(...).root`). For a caller that found the root by listing the
- * user's log directory (ledger-log-erase.ts) and so has only the origin's hash, never the origin id.
+ * The keys of the stream rooted at `root` (a `logKeys(...).root`). For a caller that found the root in the user's
+ * stream index (ledger-log-erase.ts) and so has only the origin's hash, never the origin id. Any other shape of root
+ * is refused (LogCorrupt log_root_invalid).
  */
 export function logKeysAt(root: string) {
+  const indexed = INDEXED_ROOT.exec(root);
+  if (!indexed) throw new LogCorrupt("log_root_invalid");
   return {
     root,
+    /** This stream's object in its user's stream index (logUserIndex). */
+    index: `${indexed[1]}/log-index/${indexed[2]}.json`,
     entry: (seq: number) => { const p = pad(seq); return `${root}/e/${p.slice(0, BUCKET_DIGITS)}/${p}.json`; },
     /** The directory holding `seq` (a list prefix). */
     entryDir: (seq: number) => `${root}/e/${pad(seq).slice(0, BUCKET_DIGITS)}`,
@@ -227,6 +242,25 @@ const equalBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.
 const transient = (error: unknown) => isObjectStoreError(error) && error.code === "transient";
 /** A create found a different object at the key ("already_exists"; some backends answer a 412 for it). */
 const taken = (error: unknown) => isObjectStoreError(error) && (error.code === "already_exists" || error.code === "precondition_failed");
+
+const INDEX_BODY = new TextEncoder().encode(JSON.stringify({ v: 1 }));
+/** Name the stream in its user's stream index (logUserIndex). Idempotent: the same bytes every time. */
+export async function writeLogIndex(store: ObjectStore, keys: LogKeys): Promise<void> {
+  try { await store.put(objectKey(keys.index), INDEX_BODY, { ifNoneMatch: true, contentType: "application/json" }); }
+  catch (error) { if (!taken(error)) throw error; }
+}
+
+/** Every key under `prefix` (ending in `/`), all pages. Recursive, as the store's `list` is: only for a bounded prefix. */
+export async function listKeysUnder(store: ObjectStore, prefix: string): Promise<string[]> {
+  const out: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+    for (const item of page.items) { const k = String(item.key); if (k.startsWith(prefix)) out.push(k); }
+    cursor = page.nextCursor;
+  } while (cursor);
+  return out;
+}
 
 /** Write `bytes` at a content-addressed payload key. Idempotent: the same bytes always succeed. */
 export async function putPayload(store: ObjectStore, keys: LogKeys, bytes: Uint8Array): Promise<LogPayloadRef> {
@@ -477,6 +511,8 @@ const deps = (d: WriteDeps) => ({ now: d.now ?? Date.now, sleep: d.sleep ?? ((ms
  */
 export async function enableLogMode(store: ObjectStore, keys: LogKeys, legacyCutover: string | null, d: WriteDeps): Promise<LogState> {
   const { now, sleep } = deps(d);
+  // The user's stream index first (logUserIndex): a stream in log mode is always found by its user's reset erase.
+  await writeLogIndex(store, keys);
   const existing = await openStream(store, keys);
   if (existing) {
     if (existing.legacyCutover !== legacyCutover) throw new LogFenced("log_open_other_cutover", 0);

@@ -48,7 +48,7 @@ import { assertNoLaterPrivacyControl, INBOX_NAMESPACE, inboxConsentCap, outcomeK
 import { deliverPrepared, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment, IngestWriteError } from "./writer.ts";
 import { LedgerUnavailableError, type LedgerTenant } from "./ledger.ts";
-import { LogCorrupt, logKeys, logModeMarker, readEntries, type LogEntry, type LogKeys } from "./ledger-log.ts";
+import { listKeysUnder, LogCorrupt, logKeys, logModeMarker, readEntries, writeLogIndex, type LogEntry, type LogKeys } from "./ledger-log.ts";
 import { admissionFenceView, fenceEpoch, hasPendingReset, s3LedgerObjects, sessionKeyHash } from "./ledger-s3.ts";
 import { checkUploadConsent, UploadConsentRequired, type OperatorSharingCap, type UploadConsentConfig } from "./upload-consent.ts";
 import { DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
@@ -76,10 +76,13 @@ async function putOnce(store: ObjectStore, key: string, doc: unknown) {
 /**
  * Name a stream in the registry. Idempotent (create-if-absent of identical bytes). The identity doc (inside the user's
  * directory) is written FIRST, so a registry pointer never names a stream whose identity was not yet written; a
- * pointer left behind by an erasure only reads as gone.
+ * pointer left behind by an erasure only reads as gone. Before both, the stream's entry in its user's stream index
+ * (ledger-log.ts logUserIndex), which a reset's erase lists: so a stream switched before the index existed is indexed
+ * at its next take (admission registers before it takes, and takes before its first payload).
  */
 export async function registerLogStream(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, originId: string): Promise<void> {
   const keys = logKeys(keyRoot, tenant, originId);
+  await writeLogIndex(store, keys);
   await putOnce(store, keys.identity, { v: 1, orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId });
   await putOnce(store, logStreamRegistryKey(keyRoot, tenant, originId), { v: 2, root: keys.root });
 }
@@ -204,25 +207,35 @@ async function readJson(store: ObjectStore, key: string): Promise<unknown | unde
   catch (error) { if (isObjectStoreError(error) && error.code === "not_found") return undefined; throw error; }
 }
 
-async function listKeys(store: ObjectStore, prefix: string): Promise<string[]> {
-  const out: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
-    for (const item of page.items) { const k = String(item.key); if (k.startsWith(prefix)) out.push(k); }
-    cursor = page.nextCursor;
-  } while (cursor);
-  return out;
-}
-
-/** The highest applied entry seq of a stream, or -1. */
+/** The highest applied entry seq of a stream, or -1. Lists `m/`: one page per 1000 applied entries (until compaction). */
 export async function materializedThrough(store: ObjectStore, keys: LogKeys): Promise<number> {
   let max = -1;
-  for (const k of await listKeys(store, keys.markers)) {
+  for (const k of await listKeysUnder(store, keys.markers)) {
     const m = /\/m\/(\d{20})\.json$/.exec(k);
     if (m) max = Math.max(max, Number(m[1]));
   }
   return max;
+}
+
+/**
+ * A LOWER BOUND on materializedThrough without listing `m/`: O(log n) marker HEADs (a galloping search, then a
+ * binary search). Markers are written in seq order from 0 (`#mark` after every entry, each only once all before it are
+ * applied), so their seqs are a dense prefix 0..through. The answer is always a seq whose marker exists (or -1), so it
+ * never exceeds the true cursor, whatever the store holds: a gap (a future compaction removing old markers) only makes
+ * it lower, and a caller that starts reading there reads more entries, never fewer.
+ */
+export async function materializedAtLeast(store: ObjectStore, keys: LogKeys): Promise<number> {
+  const marked = async (seq: number) => (await store.head(objectKey(keys.marker(seq)))) !== undefined;
+  if (!(await marked(0))) return -1;
+  let lo = 0, hi = 1; // marked(lo); hi: the first probe not known marked
+  for (;;) {
+    if (!Number.isSafeInteger(hi)) return lo;
+    if (!(await marked(hi))) break;
+    lo = hi;
+    hi = hi * 2 + 1;
+  }
+  while (hi - lo > 1) { const mid = lo + Math.floor((hi - lo) / 2); if (await marked(mid)) lo = mid; else hi = mid; }
+  return lo;
 }
 
 /**
@@ -275,6 +288,12 @@ export interface LogMaterializerDeps {
   uploadConsent?: UploadConsentConfig;
   nowMs?: () => number;
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * INGEST_LEDGER_LOG_ERASE=on: a reset deletes the payloads it superseded (ledger-log-erase.ts), so a batch whose payload
+   * is gone reads the fence once more and answers `delivery_privacy_superseded` when a reset passed its snapshot (the
+   * answer the snapshot rule gives without the erase). Unset: `payload_erased`, no fence read, as before.
+   */
+  logErase?: boolean;
 }
 
 export interface MaterializeResult { applied: number; through: number; outcomes: MaterializedOutcome[] }
@@ -378,8 +397,9 @@ export class LogMaterializer {
       let p: unknown;
       try { p = await readJson(store, ref.key); } catch (error) { if (error instanceof SyntaxError) return "skipped:payload_invalid"; throw error; }
       // Gone before its entry was applied: erased (ledger-log-erase.ts). Never written. A batch a reset superseded (the
-      // reset's own erase took its payload) answers as the snapshot rule below would: privacy superseded.
-      if (p === undefined) return (await this.#superseded(tenant, b)) ? "skipped:delivery_privacy_superseded" : "skipped:payload_erased";
+      // reset's own erase took its payload) answers as the snapshot rule below would: privacy superseded. Only with the
+      // reset's erase on (deps.logErase); off, no fence read and the answer is payload_erased, as before.
+      if (p === undefined) return this.deps.logErase && (await this.#superseded(tenant, b)) ? "skipped:delivery_privacy_superseded" : "skipped:payload_erased";
       if (!validPayload(p)) return "skipped:payload_invalid";
       const cap = payloadConsentCap(p);
       if (cap === null) return "skipped:payload_invalid";

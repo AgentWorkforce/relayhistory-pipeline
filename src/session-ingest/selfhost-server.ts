@@ -227,7 +227,11 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
-export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter, opts: { logModeGuard?: boolean; logErase?: boolean } = {}): Ledger {
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store" | "ledgerHome">, limiter?: TenantLimiter,
+  opts: { logModeGuard?: boolean; logErase?: boolean; logger?: Pick<typeof log, "error"> } = {}): Ledger {
+  // A failed reset erase is an error line (route ingest.ledger_log_erase, outcome ledger_log_erase_failed): the reset
+  // answers 503 and stays in flight until it is retried and the erase succeeds (docs/design/s3-ledger-log-commit.md).
+  const eraseLog = (fields: Record<string, unknown>) => (opts.logger ?? log).error("ledger log erase failed", fields);
   // The log materializer's ledger passes logModeGuard false: it is the one legacy writer allowed on a log-mode stream.
   // Callers pass the parsed mode (selfhostIngestRuntime); the env read is only for a direct caller that does not.
   const guard = opts.logModeGuard ?? selfhostLedgerLogCommit(process.env) === "on";
@@ -240,7 +244,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
       ...(guard ? { logModeGuard: true } : {}), ...(parts.ledgerHome ? { ledgerHome: parts.ledgerHome } : {}),
       // INGEST_LEDGER_LOG_ERASE=on: a reset deletes the log payloads it superseded before it completes or answers
       // (ledger-log-erase.ts). The log lives in this ledger's (routed) store, as LogStreams writes it.
-      ...(opts.logErase ? { resetLogErase: (tenant: LedgerTenant, resets: number) => eraseSupersededLogPayloads(parts.store, keyRoot, tenant, resets) } : {}) }),
+      ...(opts.logErase ? { resetLogErase: (tenant: LedgerTenant, resets: number) => eraseSupersededLogPayloads(parts.store, keyRoot, tenant, resets, { log: eraseLog }) } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
@@ -275,7 +279,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   if (eraseFence && logCommit) throw new Error("96bulls: INGEST_S3_ERASE_FENCE=on refuses INGEST_LEDGER_LOG_COMMIT=on");
   // INGEST_LEDGER_LOG_ERASE=on (parsed at config, refused there without s3 + log commit): refused again here.
   if (settings.ledgerLogErase && !logCommit) throw new Error("96bulls: INGEST_LEDGER_LOG_ERASE=on needs INGEST_LEDGER=s3 and INGEST_LEDGER_LOG_COMMIT=on");
-  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit, logErase: settings.ledgerLogErase === true }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit, logErase: settings.ledgerLogErase === true, logger: options.log ?? log }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
     ...(withSessionWrites ? { withSessionWrites } : {}),
@@ -361,6 +365,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
             budget: (records, receivedAt) => assertWithinBudget(deliver, records, receivedAt) }),
           logMaterializer: new LogMaterializer({ store: parts.store, keyRoot: settings.keyRoot, ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...uploadConsent,
             deliver: { ...withoutSlots(deliver), ledger: selfhostS3Ledger(settings.keyRoot, parts, undefined, { logModeGuard: false }) },
+            // INGEST_LEDGER_LOG_ERASE=on: a gone payload of a batch a reset superseded answers privacy superseded.
+            ...(settings.ledgerLogErase === true ? { logErase: true } : {}),
             log: (fields) => log.info("session ingest", fields) }) }
       : {}),
   });
