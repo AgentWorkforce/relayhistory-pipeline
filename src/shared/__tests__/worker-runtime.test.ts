@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { runWorkerLoop, workerTick } from "../worker.ts";
+import { handlerBeat, healthVerdict, runWorkerLoop, workerTick } from "../worker.ts";
 import { createWorkerRuntime, type WorkSource } from "@rhc/runtime/workers.ts";
 
 describe("stage worker orchestration", () => {
@@ -91,5 +91,35 @@ describe("workerAdapterEntry", () => {
     const env = { SEARCH_INDEX_BACKEND: "opensearch" };
     expect(() => validateAdapterEnv(env, workerAdapterEntry({}))).toThrow();
     expect(validateAdapterEnv(env, workerAdapterEntry({ searchBackends: ["postgres", "opensearch"] })).search).toBe("opensearch");
+  });
+});
+
+describe("handlerBeat", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const opts = { maxFailures: 5, maxTickAgeMs: 50 };
+
+  test("a long message stays live while it runs, within its cap", async () => {
+    const h = { lastTickAt: 0, consecutiveDbFailures: 0, ready: true };
+    const stop = handlerBeat(h, 1_000, 10);
+    await sleep(120);
+    expect(healthVerdict(h, Date.now(), opts).ok).toBe(true);
+    stop();
+  });
+
+  test("a handler hung past its cap is still reported loop_stalled", async () => {
+    const h = { lastTickAt: 0, consecutiveDbFailures: 0, ready: true };
+    const stop = handlerBeat(h, 30, 10);
+    await sleep(150);
+    expect(healthVerdict(h, Date.now(), opts)).toEqual({ ok: false, reason: "loop_stalled" });
+    stop();
+  });
+
+  test("stop ends the beat", async () => {
+    const h = { lastTickAt: 0 };
+    const stop = handlerBeat(h, 10_000, 10);
+    stop();
+    const at = h.lastTickAt;
+    await sleep(60);
+    expect(h.lastTickAt).toBe(at);
   });
 });

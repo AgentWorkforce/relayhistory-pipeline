@@ -229,6 +229,28 @@ export async function gateOpen(
   return open;
 }
 
+/**
+ * Progress beat for one handled message: marks progress now and every `everyMs` while the
+ * handler runs, for at most `capMs`. After the cap the clock stops moving, so a handler that
+ * hangs past its lease is still reported loop_stalled by healthVerdict. Returns the stop function.
+ */
+export function handlerBeat(
+  h: Pick<WorkerHealth, "lastTickAt">,
+  capMs: number,
+  everyMs = 10_000,
+  now: () => number = Date.now,
+): () => void {
+  const start = now();
+  h.lastTickAt = start;
+  const timer = setInterval(() => {
+    const t = now();
+    if (t - start > capMs) return clearInterval(timer);
+    h.lastTickAt = t;
+  }, everyMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 /** Readiness: the schema is complete and HoopDb is answering now. */
 export function readyVerdict(h: WorkerHealth, opts: { maxFailures: number }) {
   return h.ready && h.consecutiveDbFailures < opts.maxFailures;
@@ -396,14 +418,18 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   });
   // Every handler, ours or vendored, runs in a span on the message's trace, and
   // the message in flight is tracked so fan-out continues that trace.
+  const leaseSeconds = integer("WORKER_LEASE_SECONDS", 300);
   for (const stage of Object.keys(deps.handlers) as QueuedStage[]) {
     const h = traced(stage, deps.handlers[stage]!);
     deps.handlers[stage] = async (message, recorder, attempt) => {
       current = message;
-      health.lastTickAt = Date.now(); // progress inside a batch
+      // A long message (e.g. a summary of a very large session) is progress: beat while it runs,
+      // but only for one lease, so a handler hung past its lease still trips loop_stalled.
+      const stopBeat = handlerBeat(health, leaseSeconds * 1000);
       try {
         return await h(message, recorder, attempt);
       } finally {
+        stopBeat();
         current = undefined;
         health.lastTickAt = Date.now();
       }
@@ -412,7 +438,6 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   await attestReaders(opts.attests ?? [], db);
   const idleMs = integer("WORKER_IDLE_MS", 1_000);
   const batchSize = integer("WORKER_BATCH_SIZE", 10);
-  const leaseSeconds = integer("WORKER_LEASE_SECONDS", 300);
   log.info("worker started", { count: opts.stages.length });
   const stageBindings = new Map(opts.stages.map(stage => {
     const consumer = postgresStageConsumer({ sql: db, stage, deps, batchSize, leaseSeconds });
