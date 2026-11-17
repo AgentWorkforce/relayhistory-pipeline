@@ -62,7 +62,7 @@ function faulty(base: ObjectStore) {
   return { store, setFault: (f: typeof fault) => { fault = f; } };
 }
 
-function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async") {
+function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async", opts: { logErase?: boolean } = {}) {
   const s = scratchStore();
   cleanups.push(s.done);
   const f = faulty(s.store);
@@ -72,7 +72,7 @@ function edge(logCommit: "on" | "off", admission: "async" | "sync" = "async") {
   process.env.INGEST_LEDGER_LOG_COMMIT = logCommit;
   try {
     const runtime = selfhostIngestRuntime({
-      keyRoot: ROOT, maxPerUser: 4, maxPerOrg: 32, ledger: "s3",
+      keyRoot: ROOT, maxPerUser: 4, maxPerOrg: 32, ledger: "s3", ...(opts.logErase ? { ledgerLogErase: true as const } : {}),
       ...(admission === "async" ? { admission: { mode: "async" as const, concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 20 },
         uploadDirect: { config: DIRECT, witnessKey: WITNESS_KEY, scanBatch: 16 } } : {}),
     }, { run: (async () => { throw new Error("SQL runner called on the S3 ledger path"); }) as never, store: f.store,
@@ -136,7 +136,7 @@ async function readSide(store: ObjectStore): Promise<Map<string, string>> {
     const page = await store.list(objectKey(ROOT), cursor);
     for (const item of page.items) {
       const k = String(item.key);
-      if (k.includes("/ledger/log/") || k.includes("/.ledger/log-streams/") || k.includes("/.upload-inbox/") || k.includes("/.admission-dlq/")) continue;
+      if (k.includes("/ledger/log/") || k.includes("/ledger/log-index/") || k.includes("/.ledger/log-streams/") || k.includes("/.upload-inbox/") || k.includes("/.admission-dlq/")) continue;
       // In the admission inbox only the user's ledger directory and fence are read-side state.
       if (k.includes("/.admission-inbox/") && !k.includes("/ledger/") && !k.endsWith("/upload-fences.json")) continue;
       const bytes = Buffer.from(await readAll((await store.getObject(objectKey(k))).body));
@@ -198,9 +198,9 @@ describe("equivalence: log mode plus materialization against legacy admission", 
       // The log entries, payloads, inbox and status objects are left alone: admission is slice 2's subject.
       const failed = new Set<string>();
       const log = await scenario("log", (e) => e.setFault((key) => {
-        // The registry and the stream identity doc are admission's writes (registerLogStream, before the take), as is
+        // The registry, the stream identity doc and the stream index are admission's writes (registerLogStream, before the take), as is
         // every log entry and payload: left alone, so admission's timing (and so received_at) matches legacy.
-        if (key.includes("/ledger/log/e/") || key.includes("/ledger/log/o=") && (key.includes("/p/") || key.endsWith("/stream.json")) || key.includes("/.upload-inbox/") || key.includes("/log-streams/")) return "ok";
+        if (key.includes("/ledger/log/e/") || key.includes("/ledger/log/o=") && (key.includes("/p/") || key.endsWith("/stream.json")) || key.includes("/ledger/log-index/") || key.includes("/.upload-inbox/") || key.includes("/log-streams/")) return "ok";
         if (key.includes("/.admission-inbox/") && !key.includes("/ledger/")) return "ok";
         if (failed.has(key)) return "ok";
         failed.add(key);
@@ -291,10 +291,11 @@ describe("the materializer", () => {
     expect(await keysUnder(e.base, keys.payloads)).toEqual([]);
   });
 
-  test("a reset with the log erase on (INGEST_LEDGER_LOG_ERASE): the admitted, unapplied payload is gone before the reset answers, never written, refused as superseded", async () => {
+  for (const logErase of [true, false])
+  test(`a reset whose erase took an admitted, unapplied payload: never written; answered ${logErase ? "superseded (INGEST_LEDGER_LOG_ERASE=on)" : "payload_erased with the materializer's flag off, as before"}`, async () => {
     const { eraseSupersededLogPayloads } = await import("../ledger-log-erase.ts");
     const { s3Ledger } = await import("../ledger-s3.ts");
-    const e = edge("on");
+    const e = edge("on", "async", { logErase });
     await writeAuthority(e.base);
     await enable(e.base);
     e.setFault((key) => (key.includes("/ledger/batches/") ? "before" : "ok"));
@@ -312,8 +313,10 @@ describe("the materializer", () => {
     e.setFault(undefined);
     await rounds(e, 2);
     expect([...(await readSide(e.base)).keys()].some((k) => k.includes("/s=sess-secret/"))).toBe(false);
-    // The client-visible answer is the reset's (as the snapshot rule gives without the erase), not a bare erasure.
-    expect(await status(e.base, k1)).toMatchObject({ state: "refused", code: "delivery_privacy_superseded" });
+    // On: the client-visible answer is the reset's (as the snapshot rule gives without the erase), not a bare erasure.
+    // Off (the materializer's deps.logErase unset): a bare erasure, payload_erased (answered as admission_failed), with
+    // no fence read on that path, exactly as before the erase existed.
+    expect(await status(e.base, k1)).toMatchObject({ state: "refused", code: logErase ? "delivery_privacy_superseded" : "admission_failed" });
     expect((await keysUnder(e.base, keys.markers)).length).toBe((await entries(e.base)).length);
   });
 

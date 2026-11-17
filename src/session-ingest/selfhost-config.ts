@@ -479,8 +479,11 @@ export function selfhostLedgerLogCommit(env: NodeJS.ProcessEnv): "off" | "on" {
  * INGEST_LEDGER_LOG_ERASE (ledger-log-erase.ts, docs/design/s3-ledger-log-commit.md Remaining 3): off (unset, the
  * default) is today, byte for byte. `on` needs INGEST_LEDGER=s3 and INGEST_LEDGER_LOG_COMMIT=on (refused otherwise):
  * every reset through the S3 ledger deletes the user's unapplied log payloads that reset superseded BEFORE it completes
- * or answers, and a failure fails the reset (503, retryable). Costs one LIST of the user's log directory per reset,
- * plus a read of each stream's unapplied entries.
+ * or answers, and a failure fails the reset (503, retryable) and logs `ledger_log_erase_failed`. Cost per reset: one
+ * LIST page per 1000 of the user's streams (their stream index, not their log directory), then per stream one LIST of
+ * its payloads still present (`p/`: unapplied, in flight or orphaned; never the applied history). A stream with
+ * none costs nothing more; otherwise O(log n) marker HEADs (never a LIST of `m/`), a read of its unapplied entries
+ * from the nearest checkpoint (up to 64 more), and one DELETE and one HEAD per superseded payload.
  */
 export function selfhostLedgerLogErase(env: NodeJS.ProcessEnv, ledger: "s3" | undefined, logCommit: "off" | "on"): true | undefined {
   let mode;

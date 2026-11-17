@@ -1,8 +1,8 @@
 # S3 ledger: numbered-log-entry commit
 
 Status: proposed. Slices 1 (writer and reader), 2 (admission wiring), 3 (materializer, operator tool), 4 and 5 (review
-fixes), 6 (the before-production items of Remaining) and 7 (a reset erases the payloads it superseded, behind its own
-default-off `INGEST_LEDGER_LOG_ERASE`) are implemented behind `INGEST_LEDGER_LOG_COMMIT` (default
+fixes), 6 (the before-production items of Remaining), 7 (a reset erases the payloads it superseded, behind its own
+default-off `INGEST_LEDGER_LOG_ERASE`) and 8 (slice 7's review fixes: a bounded reset erase, its alert) are implemented behind `INGEST_LEDGER_LOG_COMMIT` (default
 off). With `on`, only a stream whose entry 0 exists is admitted through its log; entry 0 is written only by the
 operator tool (`scripts/ledger-log-stream.ts switch`). Production still needs: the review of slice 6, the
 `OnlyTheEraserDeletes` carve-out and the operator role's grants (Remaining 10), lifting the hosted and stack refusals
@@ -477,9 +477,10 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
 `INGEST_LEDGER=s3` and `INGEST_LEDGER_LOG_COMMIT=on`, and again in `selfhostIngestRuntime` for a direct caller).
 
 - `ledger-log-erase.ts`:
-  - Both erasures find a user's streams by listing that user's own log directory (`logUserRoot`, the hashed admission
-    directory), never the deployment-wide registry: a stream with no registry pointer or a corrupt identity doc is still
-    found, and no other user's stream is read. `logKeysAt(root)` gives the keys of a stream known only by its root.
+  - Both erasures find a user's streams inside that user's own hashed admission directory, never the deployment-wide
+    registry: a stream with no registry pointer or a corrupt identity doc is still found, and no other user's stream
+    is read. `logKeysAt(root)` gives the keys of a stream known only by its root. (As first written, both listed the
+    user's whole log directory, `logUserRoot`; slice 8 moved the reset's erase to the user's stream index.)
   - `eraseLogPayloads(store, keyRoot, tenant)` (moved here from the materializer): every payload of the user, then a
     fresh listing; a payload still listed (a write that raced the erase) fails it with `ledger_log_erase_unverified`.
   - `eraseSupersededLogPayloads(store, keyRoot, tenant, resets)`: the payloads of every UNAPPLIED batch (entries after the
@@ -512,6 +513,67 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
   self-host edge, an admitted, unapplied upload's payload is gone after a reset with the erase, never written, and
   answered `delivery_privacy_superseded`.
 
+## Slice 8: slice 7's review fixes (a bounded reset erase, its alert, the materializer gate)
+
+- A bounded reset. The ObjectStore's `list` is recursive on every backend and has no delimiter, so listing a user's log
+  directory listed every entry, checkpoint, marker and payload of every stream (unbounded until compaction), and the
+  erase then listed `m/` again per stream: a heavy uploader's reset could time out and stay in flight.
+  - The user's STREAM INDEX (`ledger-log.ts` `logUserIndex`): `<dir>/ledger/log-index/o=<origin hash>.json`, one
+    small object per stream (`{"v":1}`, no id), in a flat directory beside the streams. Written create-if-absent by
+    `enableLogMode` BEFORE entry 0 (the operator switch is the only way a stream enters log mode) and by every
+    `registerLogStream` (admission registers before the take that precedes its first payload; the registry migration
+    calls it too). So every stream that can hold a payload is indexed, and a stream switched before the index existed
+    is indexed at its next take. Under `<dir>/ledger/`, so it routes and relocates with the log (`ledger-store.ts`).
+    Written with `INGEST_LEDGER_LOG_COMMIT=on` whatever `INGEST_LEDGER_LOG_ERASE` says, so turning the erase on later
+    finds every stream: one more create-if-absent PUT per switch and per first take in a process.
+  - `eraseSupersededLogPayloads` lists the index (one page per 1000 of the user's streams), rebuilds each root under
+    the user's own log root (anything not `o=<32 hex>.json` names nothing; the root shape is rechecked), then per
+    stream lists `p/` first (the payloads still present: unapplied, in flight or orphaned, never the applied history)
+    and stops there when it is empty. Otherwise `materializedAtLeast` finds a lower bound on the materializer's cursor
+    with O(log n) marker HEADs (galloping, then binary search: markers are a dense prefix from 0; a gap only lowers
+    the answer, which only means reading more entries), `readEntries` reads from the nearest verified checkpoint, and
+    only payloads that the listing found are deleted (one written after it is slice 7's "Ordering" window).
+  - `eraseLogPayloads` (the whole-user erase, not on a request path) uses the index AND a listing of the user's log
+    directory, so an unindexed stream is still erased: it must be complete, and it is rare.
+  - Residual: a stream switched before this slice and never taken since is not in the index until its next take, so
+    a reset does not erase its unapplied payloads (as with the erase off: the materializer never writes them and
+    deletes them at apply). Log mode is cleared for non-production buckets only, so no production stream predates it.
+- The alert. Every failure of either erase emits ONE error line before it throws: `message: "ledger log erase
+  failed"`, `route: "ingest.ledger_log_erase"`, `outcome: "ledger_log_erase_failed"`, `kind` (`store`,
+  `log_corrupt`, `log_unavailable`, `unverified`, `ledger`, `other`), `error_code` (a closed code, e.g. `transient`,
+  `log_entry_chain`), and `key_sha256` = sha256 of the failing stream's root (absent when the index listing itself
+  failed). Never an org, workspace, user or origin id, nor a key (allowlisted fields of `shared/log.ts`, tested).
+- The materializer gate. The fence read for a batch whose payload is gone (answering `delivery_privacy_superseded`
+  rather than `payload_erased`) now runs only with `LogMaterializerDeps.logErase` (set by `selfhostIngestRuntime` from
+  `INGEST_LEDGER_LOG_ERASE=on`); off, that path is byte-identical to before slice 7.
+- `listKeysUnder` (ledger-log.ts) is the one paged prefix listing the erase and the materializer share.
+- Tests (`ledger-log-erase.test.ts`): the index (malformed entries ignored, an unindexed stream is the whole-user
+  erase's until a registration indexes it); a 150-entry stream's reset LISTs only the index, `p/` and entry
+  directories (at most 5 LISTs, never the log directory or `m/`), with marker HEADs within 2·log2(n)+2, and a stream
+  with no payloads costs exactly two LISTs; `materializedAtLeast` exact on dense markers and never above the cursor
+  with a gap; the failure line's fields (store fault, corrupt stream, index fault) pass the log allowlist and carry
+  no id; an append landing inside the erase never loses a post-reset batch; an ordered reset's applied, stale and
+  replay answers all erase first (and a stale or replay whose erase fails is not answered). `ledger-log-materialize`:
+  the gone-payload answer with the flag on (superseded) and off (`payload_erased`).
+
+### Runbook: a reset that keeps failing its erase
+
+- Detect: error lines with `"outcome":"ledger_log_erase_failed"` (route `ingest.ledger_log_erase`) on the session
+  ingest, together with 503 answers on that user's reset route and, while the reset stays in flight, that user's
+  log-mode admissions retrying with `ledger_reset_in_flight` (nothing of theirs is admitted). One `key_sha256` repeating across retries is one stream
+  that cannot be read; `kind: "store"` with `error_code: "transient"` that stops on its own was a store blip.
+- Identify the stream: for the user whose reset fails, compute `sha256(logKeys(keyRoot, tenant, origin).root)` for
+  each of their origins and match `key_sha256`; `scripts/ledger-log-stream.ts status` on that stream fails the same way
+  (`LogCorrupt` with the same code) when it is corrupt.
+- Repair: a corrupt stream (`kind: "log_corrupt"`) blocks its materializer too. Restore the damaged entry from the
+  bucket's object versions if it is versioned (entries are written once, so the first version holds the right bytes),
+  then retry the reset;
+  the erase and the materializer then proceed. If it cannot be restored the same day, set `INGEST_LEDGER_LOG_ERASE`
+  off on every ingest process and restart: the reset then completes without the erase, the user's uploads resume,
+  and the superseded payloads stay (never written: the snapshot rule) until the stream is repaired and applied.
+  `kind: "unverified"` (a payload still there after its DELETE) means the store or a bucket policy refuses deletes
+  under the log prefix: fix the grant (the ingest role needs DeleteObject on `…/ledger/log/*/p/*`).
+
 ## Remaining
 
 1. Closed in slice 6: the payload carries the inbox `consentCap`, and the materializer re-runs the consent gate at apply
@@ -541,7 +603,8 @@ Behind `INGEST_LEDGER_LOG_ERASE` (self-host; default off, byte-identical; `on` r
      and appended after the erase listed the stream lives until the materializer reaches it (never written).
    - Deletes remove the current version only, as the materializer's own payload drop does; a versioned ledger bucket
      keeps noncurrent versions until its lifecycle expires them.
-   - A stream that reads corrupt fails every reset of its user (fail closed) until an operator repairs or erases it.
+   - A stream that reads corrupt and still holds a payload fails every reset of its user (fail closed) until an operator
+     repairs or erases it; each failure logs `ledger_log_erase_failed` (slice 8 and its runbook).
 4. The GCS protocol run on a backend that honours generation preconditions (real GCS or a newer emulator). The local
    fake-gcs-server 1.52.2 also answered the adapter's create with `400 invalid uploadType`, so the GCS case did not run
    here.
