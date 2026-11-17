@@ -1142,6 +1142,24 @@ describe("slotsByOrg pacing and the slots fingerprint from the cursor pass", () 
     expect(after).toEqual((await run(scratch(), { orgs, dryRun: true }, [])).fingerprint);
   });
 
+  test("an invalid cursor fingerprint refuses right after that org's read, before its slot rows reach S3", async () => {
+    await slots(A, "ia", 20);
+    await slots(C, "ic", 20);
+    const store = scratch();
+    // org-b's rows come back with a negative revision: its running revision sum is no longer a non-negative integer.
+    const inner = recordingSql([]);
+    const sql: BackfillSql = { async query(text, params) {
+      const out = await inner.query(text, params);
+      if (text.startsWith("FETCH FORWARD")) for (const r of out.rows) if (r.org_id === "org-b" && r.current_owner !== null) r.current_revision = "-1000000";
+      return out;
+    } };
+    await expect(backfillUploadFences({ sql, store, keyRoot: ROOT, dryRun: false, orgs: ["org-a", "org-b"], slotsByOrg: true, sleep: async () => {} }))
+      .rejects.toThrow("backfill_fingerprint_invalid");
+    // org-a's slot sessions were registered (its slot pass ran); nothing of org-b's was written.
+    expect(await ownerOf(store, A, "origin-1", "claude", "sess-1")).toBeDefined();
+    expect(await ownerOf(store, C, "origin-1", "claude", "sess-1")).toBeUndefined();
+  });
+
   test("pacing values out of range, or without slotsByOrg, are refused before any read", async () => {
     const store = scratch();
     for (const over of [{ slotPaceMs: -1 }, { slotPaceMs: 5001 }, { slotPaceMs: 1.5 }, { slotFetchRows: 99 }, { slotFetchRows: 50_001 }, { slotFetchRows: 1000.5 }]) {
@@ -1173,7 +1191,15 @@ describe("slotsByOrg pacing and the slots fingerprint from the cursor pass", () 
     expect(await entryOf(timedStore, A, "origin-1", "ta0001")).toBeUndefined();
     const firstDeclare = log.findIndex((l) => l.includes("DECLARE backfill_slots"));
     expect(log.slice(firstDeclare).filter((l) => l.startsWith("FETCH FORWARD")).length).toBeGreaterThanOrEqual(3);
-    expect(log.slice(firstDeclare).find((l) => l === "ROLLBACK")).toBeDefined();
+    // org-a's own read transaction (its DECLARE up to the next BEGIN): its four fetches, then ROLLBACK, nothing else.
+    const BEGIN = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+    const nextBegin = log.indexOf(BEGIN, firstDeclare);
+    expect(nextBegin).toBeGreaterThan(firstDeclare);
+    const orgATx = log.slice(firstDeclare + 1, nextBegin);
+    expect(orgATx).toEqual([...Array(4).fill("FETCH FORWARD 100 FROM backfill_slots"), "ROLLBACK"]);
+    expect(log.slice(log.lastIndexOf(BEGIN, firstDeclare), firstDeclare).includes("ROLLBACK")).toBe(false);
+    // The next transaction is org-b's cursor read.
+    expect(log.slice(nextBegin, log.indexOf("ROLLBACK", nextBegin)).some((l) => l.includes("DECLARE backfill_slots"))).toBe(true);
     // Unpaced reads are not bounded by it (unchanged behaviour), whatever the clock says.
     const unpaced = await run(scratch(), { orgs: ["org-a", "org-b"], slotsByOrg: true, now: () => (t += 60 * 60_000) });
     expect(unpaced.sections).toMatchObject({ ownership: "complete", revisions: "complete" });

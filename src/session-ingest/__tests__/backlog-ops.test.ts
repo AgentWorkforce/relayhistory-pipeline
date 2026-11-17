@@ -172,6 +172,18 @@ test("slot_pace_ms: backfill modes with slots_read=org only, digits 0..5000; emp
   }
 });
 
+test("backfill argv: literal, recorded from the code before slot_pace_ms (default and slots_read=org unchanged)", () => {
+  const t = backlogOpsTarget(target), scope = { orgs: ["org-a", "org-b"], id: "x" };
+  const base = ["--dry-run", "--bucket", "96bulls-aws-sessions-prod-transcripts-000000000000", "--region", "us-east-1",
+    "--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000", "--concurrency", "8"];
+  const spec = (extra: Record<string, string>) => backlogOpsToolArgs(backlogOpsDispatch(dispatchEnv("backfill-dry", extra), true), t, scope);
+  expect(spec({})).toEqual({ script: "scripts/upload-fence-backfill.ts", args: [...base, "--org", "org-a", "--org", "org-b"], needsDb: true });
+  expect(spec({ BACKLOG_OPS_SLOTS_READ: "org" }).args).toEqual([...base, "--slots-by-org", "--org", "org-a", "--org", "org-b"]);
+  expect(spec({ BACKLOG_OPS_SLOTS_READ: "org", BACKLOG_OPS_SLOT_PACE_MS: "0" }).args).toEqual([...base, "--slots-by-org", "--org", "org-a", "--org", "org-b"]);
+  expect(spec({ BACKLOG_OPS_SLOTS_READ: "org", BACKLOG_OPS_SLOT_PACE_MS: "500" }).args)
+    .toEqual([...base, "--slots-by-org", "--slot-pace-ms", "500", "--org", "org-a", "--org", "org-b"]);
+});
+
 // ---- target and argv ----
 
 test("target variables are shape-checked: key in region, roles in the key's account and distinct", () => {
