@@ -1,4 +1,3 @@
-!.env.example
 *.log
 .96bulls/
 .alchemy/
@@ -10,6 +9,8 @@ flows/.claude/
 .rehearsal-tooling/
 .env
 .env.*
+# Templates hold placeholders only (deploy/selfhost-local/.env.example); this must follow .env.*.
+!.env.example
 dist/
 # No trailing slash: also matches node_modules symlinks (a trailing slash matches directories only).
 node_modules

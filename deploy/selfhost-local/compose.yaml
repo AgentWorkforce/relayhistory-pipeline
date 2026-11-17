@@ -1,0 +1,230 @@
+# Local-only, single-user relayhistory-pipeline (relay#2204 S4; docs/selfhost-local.md).
+# Postgres with TLS (S1), the fs Locker (S3), the single-user control service
+# (S2), session-ingest, the pipeline consumer and the read API, behind one nginx
+# edge that terminates TLS on 127.0.0.1 and routes per docs/selfhost-composition.md
+# section 2 (nginx.conf). No pgvector, no MinIO, no relaycontrol.
+#
+# Every secret is a ${VAR:?} reference: values come from the shell environment
+# (for example `op run --env-file deploy/selfhost-local/.env -- docker compose ...`)
+# or a gitignored env file. Nothing secret is written here or into an image.
+name: relayhistory-local
+x-services-image: &services-image
+  image: ${RH_SERVICES_IMAGE:-relayhistory-services:local}
+  pull_policy: never
+x-pg-tls-env: &pg-tls-env
+  SESSION_POSTGRES_TLS_PROFILE: custom-ca
+  SESSION_POSTGRES_CA_FILE: /certs/ca.crt
+  SESSION_POSTGRES_CA_SHA256: ${RH_PG_CA_SHA256:?printed by scripts/selfhost-local-ca.ts}
+x-common-env: &common-env
+  <<: *pg-tls-env
+  ALLOW_IN_CLUSTER_HTTP: "true"
+  LOCKER_PROVIDER: fs
+  LOCKER_FS_ROOT: /locker
+  LOCKER_BUCKET: transcripts
+  READ_API_COMPLETE_SINCE: epoch
+  SEARCH_INDEX_BACKEND: postgres
+  SEARCH_INDEX_POSTGRES_BACKEND_ID: local-postgres
+  PIPELINE_KEY_PREFIX: 96bulls
+  PIPELINE_ORG_FROM_PREFIX: "true"
+x-control-env: &control-env
+  RELAYCONTROL_INTROSPECT_URL: http://control.local.svc:8090
+  RELAYCONTROL_INTROSPECT_SECRET: ${RH_INTROSPECT_SECRET:?}
+x-pg-ca: &pg-ca ${RH_PG_TLS_DIR:?}/ca.crt:/certs/ca.crt:ro
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: ${RH_PG_PASSWORD:?}
+    # Postgres refuses a key it does not own: install it as the postgres user first.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        install -o postgres -g postgres -m 0600 /pg-tls/server.key /var/lib/postgresql/server.key &&
+        install -o postgres -g postgres -m 0644 /pg-tls/server.crt /var/lib/postgresql/server.crt &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ${RH_PG_TLS_DIR:?}:/pg-tls:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+  # Root one-shot: the services run as uid 1000 and nginx as uid 101, so give
+  # each the files it must own (the fs Locker directory, the edge key).
+  local-init:
+    image: alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+    user: "0"
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        chown 1000:1000 /locker && chmod 0700 /locker &&
+        install -o 101 -g 101 -m 0644 /edge-in/server.crt /edge/server.crt &&
+        install -o 101 -g 101 -m 0600 /edge-in/server.key /edge/server.key
+    volumes:
+      - locker:/locker
+      - edge-tls:/edge
+      - ${RH_EDGE_TLS_DIR:?}:/edge-in:ro
+    restart: "no"
+  migrate:
+    <<: *services-image
+    environment:
+      <<: *pg-tls-env
+      SERVICE: hoopdb-migrate
+      HOOPDB_DB_MODE: local
+      HOOPDB_SUPABASE_SHIM: "true"
+      HOOPDB_RUNTIME_ROLE: postgres
+      HOOPDB_URL: postgresql://postgres:${RH_PG_PASSWORD:?}@db:5432/postgres
+    volumes:
+      - *pg-ca
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+  consumer-bootstrap:
+    <<: *services-image
+    environment:
+      <<: *common-env
+      SERVICE: session-pipeline-consumer-bootstrap
+      RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER: "true"
+      HOOPDB_URL: postgresql://postgres:${RH_PG_PASSWORD:?}@db:5432/postgres
+      RELAYHISTORY_PIPELINE_CONSUMER_SECRET: '{"hoopdb_url":"postgresql://postgres:${RH_PG_PASSWORD:?}@db:5432/postgres"}'
+    volumes:
+      - *pg-ca
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: "no"
+  # Service logins (docs/selfhost-composition.md section 4): roles.sh.
+  roles:
+    image: postgres:17
+    entrypoint: ["sh", "/deploy/roles.sh"]
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGPASSWORD: ${RH_PG_PASSWORD:?}
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /certs/ca.crt
+      RH_READ_PASSWORD: ${RH_READ_PASSWORD:?}
+      RH_INGEST_PASSWORD: ${RH_INGEST_PASSWORD:?}
+      RH_CONSUMER_PASSWORD: ${RH_CONSUMER_PASSWORD:?}
+    volumes:
+      - ./roles.sh:/deploy/roles.sh:ro
+      - ../../supabase/bootstrap:/bootstrap:ro
+      - *pg-ca
+    depends_on:
+      consumer-bootstrap: { condition: service_completed_successfully }
+    restart: "no"
+  # The single-user control service (S2): answers token introspection for one
+  # user. control-tokens.ts writes its tokens file (0600, owned by uid 1000)
+  # into a tmpfs from the environment, so the token never lands on disk here.
+  selfhost-control:
+    <<: *services-image
+    entrypoint:
+      - sh
+      - -c
+      - bun /deploy/control-tokens.ts && exec env -u RH_CONTROL_TOKEN /entrypoint.sh
+    environment:
+      SERVICE: selfhost-control
+      RELAYHISTORY_SELFHOST_CONTROL: "true"
+      SELFHOST_CONTROL_INTROSPECT_SECRET: ${RH_INTROSPECT_SECRET:?}
+      SELFHOST_CONTROL_TOKENS_FILE: /run/selfhost-control/tokens.json
+      SELFHOST_CONTROL_LISTEN: 0.0.0.0:8090
+      RH_USER_SUB: ${RH_USER_SUB:?}
+      RH_USER_ORG: ${RH_USER_ORG:?}
+      RH_WORKSPACE: ${RH_WORKSPACE:?}
+      RH_CONTROL_TOKEN: ${RH_CONTROL_TOKEN:?}
+    tmpfs:
+      - /run/selfhost-control:uid=1000,gid=1000,mode=0700
+    volumes:
+      - ./control-tokens.ts:/deploy/control-tokens.ts:ro
+    networks:
+      default:
+        aliases: [control.local.svc]
+    restart: unless-stopped
+  # The only Locker writer: keep exactly one replica (the fs driver serializes writes per process).
+  session-ingest:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *control-env]
+      SERVICE: session-ingest
+      RELAYHISTORY_SELFHOST_INGEST: "true"
+      RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true"
+      RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "true"
+      RELAYHISTORY_INGEST_PORT: "8081"
+      RELAYHISTORY_INGEST_ORIGIN: ${RH_ORIGIN:?}
+      RELAYHISTORY_INGEST_DATABASE_URL: postgresql://bulls96_session_ingest:${RH_INGEST_PASSWORD:?}@db:5432/postgres
+    volumes:
+      - *pg-ca
+      - locker:/locker
+    deploy:
+      replicas: 1
+    depends_on:
+      local-init: { condition: service_completed_successfully }
+      roles: { condition: service_completed_successfully }
+      selfhost-control: { condition: service_started }
+    restart: unless-stopped
+  session-pipeline-consumer:
+    <<: *services-image
+    environment:
+      <<: *common-env
+      SERVICE: session-pipeline-consumer
+      RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER: "true"
+      RELAYHISTORY_PIPELINE_CONSUMER_SECRET: '{"hoopdb_url":"postgresql://search_consumer_runtime:${RH_CONSUMER_PASSWORD:?}@db:5432/postgres"}'
+      CONSUMER_RECONCILE_EVERY_MINUTES: "1"
+      PIPELINE_RECONCILE_LOOKBACK_MINUTES: "30"
+      WORKER_HEALTH_PORT: "8081"
+    volumes:
+      - *pg-ca
+      - locker:/locker:ro
+    depends_on:
+      local-init: { condition: service_completed_successfully }
+      roles: { condition: service_completed_successfully }
+    restart: unless-stopped
+  session-read-api:
+    <<: *services-image
+    environment:
+      <<: [*common-env, *control-env]
+      SERVICE: session-read-api
+      RELAYHISTORY_SELFHOST_READ_API: "true"
+      RELAYHISTORY_READ_API_PORT: "8080"
+      RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true"
+      READ_API_AUTH_MODE: relaycontrol_only
+      READ_API_ORIGIN: ${RH_ORIGIN:?}
+      READ_API_DIRECTORY_WORKSPACES: "*"
+      READ_API_TIMING_ASSUME_NO_TURNS: "true"
+      READ_API_TURNS_ASSUME_NO_LEGACY: "true"
+      # Self-host default (code default off): serve the indexed generation while the pointer lags an
+      # async-admitted append; see docs/selfhost-async-admission.md "Reads right after an async upload".
+      READ_API_CANONICAL_PIN_LAGGING_POINTER: "true"
+      READ_API_INTROSPECT_POSITIVE_TTL_MS: "0"
+      RELAYHISTORY_READ_API_SECRET: '{"supabase_url":"postgresql://bulls96_read_api:${RH_READ_PASSWORD:?}@db:5432/postgres"}'
+    volumes:
+      - *pg-ca
+      - locker:/locker:ro
+    depends_on:
+      local-init: { condition: service_completed_successfully }
+      roles: { condition: service_completed_successfully }
+      selfhost-control: { condition: service_started }
+    restart: unless-stopped
+  # The one published port: TLS on loopback, routed per nginx.conf.
+  proxy:
+    image: nginxinc/nginx-unprivileged:1.29.3-alpine@sha256:5aea7cc516b419e3526f47dd1531be31a56a046cfe44754d94f9383e13e2ee99
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - edge-tls:/etc/nginx/tls:ro
+    ports:
+      - 127.0.0.1:${RH_HTTPS_PORT:-8443}:8443
+    depends_on:
+      local-init: { condition: service_completed_successfully }
+      session-ingest: { condition: service_started }
+      session-read-api: { condition: service_started }
+    restart: unless-stopped
+volumes:
+  pgdata:
+  locker:
+  edge-tls:
