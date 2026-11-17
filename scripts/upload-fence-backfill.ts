@@ -33,7 +33,8 @@
  * completion (`sections.fences|ownership|revisions`: complete | incomplete | not_run), which the
  * fence-authority marker's `fenceBackfill` / `ownershipBackfill` / `revisionBackfill` record, and the run's input
  * `fingerprint` (counts and content hashes of the revision, ownership and owned-slot rows, read first in one
- * read-only snapshot; BackfillFingerprint), which the backlog-ops drain compares between a full run and a refresh.
+ * read-only snapshot; with --slots-by-org on a scoped run with a slot pass, the owned-slot values are summed from each
+ * org's slot cursor, in that cursor's snapshot; BackfillFingerprint), which the backlog-ops drain compares between a full run and a refresh.
  */
 import { readFileSync } from "node:fs";
 import pg from "pg";

@@ -179,7 +179,7 @@ the sorted list).
   sequences, and set it on both environments to the same value.
 - An unscoped backfill reads `ingest_lazy_native_slots` in heap block windows (one sequential pass) instead of walking
   the primary key, which fetched every slot at random. With `slots_read=org` (opt-in, default off) a scoped one reads each
-  org once through the `org_id` index (`SLOTS_ORG_CURSOR`); an org above `SLOTS_ORG_READ_MAX_ROWS` (2M slots, bounded memory) falls back to the windows. A slot rewritten during the pass can be
+  org once through the `org_id` index (`SLOTS_ORG_CURSOR`); an org above `SLOTS_ORG_READ_MAX_ROWS` (4M slots, a memory guard: buffered rows times ~350 B) falls back to the windows. A slot rewritten during the pass can be
   missed, so run a scoped backfill-execute after the scope's HTTP admission stop (decision 0005's cutover order).
 - **Pacing and the slots fingerprint (`slots_read=org`).** A scoped `slots_read=org` run reads each org's owned slots
   once: the run-start fingerprint transaction then reads only the revision and ownership values, and the three slots
@@ -201,7 +201,10 @@ the sorted list).
   30 minutes (`SLOTS_ORG_PACED_READ_MAX_MS`) is rolled back and fails closed (`failed_codes.slot_read_too_long`,
   ownership and revisions incomplete, so the receipt binds nothing; it is never retried through the heap windows).
   Choose the pace so the largest org fits: about 2.9M slots at 2000 rows a fetch is ~1450 fetches, so 500 ms is
-  ~12 min of pauses plus the reads. Unpaced reads are not bounded by it.
+  ~12 min of pauses plus the reads. Unpaced reads are not bounded by it. The 30-minute bound is per org; the job
+  (`backlog-ops.yml`, `timeout-minutes: 355`) must fit the SUM over the scope's orgs of each paced read plus the
+  revisions pass and the S3 work, so size the pace for the whole scope, not just the largest org (six orgs of ~2.9M
+  slots at 500 ms is over an hour of pauses alone).
 - An unscoped backfill run while orgs still admit (a pre-warm) certifies no org that was not stopped before it
   began. Each org's cutover takes its own scoped backfill-execute after its stop.
 - A scoped drain-execute WITHOUT `full_backfill_run` binds its backfill with the 3 h freshness check only: no

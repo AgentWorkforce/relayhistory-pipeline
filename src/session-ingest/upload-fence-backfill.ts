@@ -146,7 +146,10 @@ export interface BackfillSummary {
     failed_codes: Record<string, number>;
   };
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
-  /** The run's input fingerprint, read before any section (BackfillFingerprint). */
+  /**
+   * The run's input fingerprint (BackfillFingerprint): read before any section, except that a scoped slotsByOrg run with a
+   * slot pass sums its three slots values from that pass (each org checked before its slot writes).
+   */
   fingerprint: BackfillFingerprint;
   /** A catch-up's `revisionsSinceMs` (an epoch ms, not identifying); absent on a full run. */
   revisions_since_ms?: number;
@@ -422,6 +425,13 @@ export class SlotFingerprint {
     const rev = this.revisionSum % BigInt(SLOTS_REVISION_SUM_MODULUS), m = BigInt(FINGERPRINT_HASH_MODULUS);
     return { n: String(this.count), rev_sum: String(rev), h: String(((this.hashSum % m) + m) % m) };
   }
+}
+/** A SlotFingerprint's three values, each a non-negative safe integer (int()), or backfill_fingerprint_invalid. */
+function checkedSlotsFingerprint(fp: SlotFingerprint): [number, number, number] {
+  const r = fp.result();
+  const values = [int(r.n), int(r.rev_sum), int(r.h)];
+  if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
+  return values as [number, number, number];
 }
 const bigIntOf = (v: unknown): bigint => {
   if (typeof v === "bigint") return v;
@@ -732,7 +742,11 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     return cache.get(uk)!;
   }
 
-  // ---- input fingerprint: before any section, one snapshot, every value a safe integer or the run refuses ----
+  // ---- input fingerprint: before any section, one snapshot, every value a safe integer or the run refuses. On the
+  // cursor path (slotsFromCursor) this holds for the revisions and ownership values only; the three slots values are
+  // summed in the slot pass, and the running per-org total is checked the same way right after each org's cursor read,
+  // so an invalid one refuses (backfill_fingerprint_invalid) before that org's slot rows reach S3 (the fences and
+  // ownership sections, and earlier orgs' slots, have run by then). ----
   {
     const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]],
       // From the slot pass instead (slotsFromCursor): placeholders here, replaced after it.
@@ -1002,6 +1016,9 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
           continue;
         }
         slotsFingerprint.merge(read.fingerprint);
+        // The running total checked as the run-start values are (int(): a non-negative safe integer), before this
+        // org's rows are handed to slotRows (any S3 write).
+        if (slotsFromCursor) checkedSlotsFingerprint(slotsFingerprint);
         let rows = read.rows;
         if (rows === null) { walkOrgs.push(org); continue; }
         // Slices are handed on and dropped as they go, so the org's rows are freed while the buffers fill.
@@ -1022,10 +1039,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     await flush(slotBuf);
     if (slotsFromCursor) {
       // FINGERPRINT_SLOTS's values from the pass (an org that failed contributes nothing, but its sections are incomplete).
-      const fp = slotsFingerprint.result();
-      const values = [int(fp.n), int(fp.rev_sum), int(fp.h)];
-      if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
-      [summary.fingerprint.slots_owned_count, summary.fingerprint.slots_revision_sum, summary.fingerprint.slots_hash] = values as number[];
+      [summary.fingerprint.slots_owned_count, summary.fingerprint.slots_revision_sum, summary.fingerprint.slots_hash] = checkedSlotsFingerprint(slotsFingerprint);
     }
     if (sections.has("revisions")) {
       const v = summary.revisions;
