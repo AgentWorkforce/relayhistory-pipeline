@@ -35,7 +35,8 @@
 -- extends the lease. Expiry only opens the run to a takeover: claim replaces the nonce once
 -- lease_expires_at has passed, so the holder keeps the run through a long source read unless
 -- someone took it over. A stale lease (taken over, finished, abandoned or erased) is SQLSTATE
--- RH062. Cursors only move forward within a phase.
+-- RH062. Cursors only move forward within a phase and are never cleared mid-phase. A claim never
+-- waits on a run row another transaction holds: it answers busy (no row).
 --
 -- Roles: never created or altered here; search_consumer_runtime (session_consumer_roles.sql) is
 -- provisioned before migrate and checked here, fail closed (42704 absent, 55000 elevated).
@@ -157,7 +158,8 @@ RETURNS TABLE (
   write_wanted bigint, write_done bigint, attempts integer, restarted boolean
 )
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
-SET search_path = pg_catalog, sessions, pg_temp AS $claim$
+SET search_path = pg_catalog, sessions, pg_temp
+SET lock_timeout = '2s' AS $claim$
 #variable_conflict use_column
 DECLARE
   r sessions.search_reconcile_runs_v1%ROWTYPE;
@@ -171,17 +173,33 @@ BEGIN
      OR p_lease_ms IS NULL OR p_lease_ms NOT BETWEEN 1000 AND 3600000 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid claim';
   END IF;
-  -- A run finished or erased between the insert and the lock: insert again (bounded).
+  -- A claim never waits behind the run's holder: a run row another transaction holds (a pass 4
+  -- write, the final step, a finish or erase in flight) is skipped and the claim answers busy, so
+  -- redelivered ticks of a hot scope do not each park a pool connection on the row lock.
   FOR v_try IN 1..3 LOOP
-    INSERT INTO sessions.search_reconcile_runs_v1 AS t
-      (org_id, workspace_id, harness, session_id, canonical_id, pointer_epoch, manifest_fingerprint, lease_ms, lease_expires_at)
-    VALUES (p_org_id, p_workspace_id, p_harness, p_session_id, p_canonical_id, p_pointer_epoch, p_manifest_fingerprint,
-            p_lease_ms, '-infinity')
-    ON CONFLICT (org_id, workspace_id, harness, session_id) DO NOTHING;
     SELECT * INTO r FROM sessions.search_reconcile_runs_v1 AS t
      WHERE t.org_id = p_org_id AND t.workspace_id = p_workspace_id AND t.harness = p_harness AND t.session_id = p_session_id
-     FOR UPDATE;
+     FOR UPDATE SKIP LOCKED;
     EXIT WHEN FOUND;
+    -- Visible but skipped: held by another transaction; busy, no row.
+    IF EXISTS (SELECT 1 FROM sessions.search_reconcile_runs_v1 AS t
+                WHERE t.org_id = p_org_id AND t.workspace_id = p_workspace_id AND t.harness = p_harness AND t.session_id = p_session_id) THEN
+      RETURN;
+    END IF;
+    -- No run: create it, then lock it on the next pass. Against another claim's uncommitted insert
+    -- of the same scope, INSERT ... ON CONFLICT DO NOTHING waits for that transaction to end
+    -- (speculative insertion waits on the conflicting in-progress row) and then inserts nothing if
+    -- it committed. Only a claim inserts a run and the module commits each claim on its own, so the
+    -- wait is one short claim; this function's lock_timeout bounds it, and a timeout is busy.
+    BEGIN
+      INSERT INTO sessions.search_reconcile_runs_v1 AS t
+        (org_id, workspace_id, harness, session_id, canonical_id, pointer_epoch, manifest_fingerprint, lease_ms, lease_expires_at)
+      VALUES (p_org_id, p_workspace_id, p_harness, p_session_id, p_canonical_id, p_pointer_epoch, p_manifest_fingerprint,
+              p_lease_ms, '-infinity')
+      ON CONFLICT (org_id, workspace_id, harness, session_id) DO NOTHING;
+    EXCEPTION WHEN lock_not_available THEN
+      RETURN;
+    END;
   END LOOP;
   -- Still gone after three tries: a concurrent finish or erase keeps winning; busy, no row.
   IF r.run_id IS NULL THEN
@@ -230,7 +248,8 @@ BEGIN
      OR jsonb_array_length(p_entries) > 10000 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid batch';
   END IF;
-  IF p_cursor IS NOT NULL AND r.chunk_cursor IS NOT NULL AND p_cursor < r.chunk_cursor COLLATE "C" THEN
+  -- Within a phase a cursor never moves back and, once set, is never cleared (only a phase change resets it).
+  IF r.chunk_cursor IS NOT NULL AND (p_cursor IS NULL OR p_cursor < r.chunk_cursor COLLATE "C") THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search reconcile: cursor moved backwards';
   END IF;
   IF EXISTS (SELECT 1 FROM jsonb_to_recordset(p_entries) AS e(k text, o text, t bigint, f text)
@@ -268,7 +287,7 @@ BEGIN
          OR array_position(p_regenerable_kinds, NULL) IS NOT NULL)) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'search reconcile: invalid advance';
   END IF;
-  IF p_phase = r.phase AND p_cursor IS NOT NULL AND r.chunk_cursor IS NOT NULL AND p_cursor < r.chunk_cursor COLLATE "C" THEN
+  IF p_phase = r.phase AND r.chunk_cursor IS NOT NULL AND (p_cursor IS NULL OR p_cursor < r.chunk_cursor COLLATE "C") THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'search reconcile: cursor moved backwards';
   END IF;
   UPDATE sessions.search_reconcile_runs_v1 AS t

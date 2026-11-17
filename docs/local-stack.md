@@ -487,12 +487,15 @@ wiring is a later change, so applying the migration changes no runtime path.
 - **Rollback.** `supabase/rollbacks/20261105062110_search_reconcile_staging.down.sql` drops only in-progress runs,
   which then start over. It refuses while any run holds a live lease.
 
-Preconditions before the flag may be turned on anywhere (1-3 and 5 open, tracked for slice 2b):
+Preconditions before the flag may be turned on anywhere (1-3, 5 and 6 open, tracked for slice 2b):
 
 1. **Erasure.** Session erasure must call `search_reconcile_erase_scope_v1` (`eraseStagedReconcileRuns`). Until it
    does, the staged rows of an erased session outlive the erase. Those rows hold index identities (machine, session
-   and event ids, timestamps, fingerprints) but no content. A run left behind by a session that never comes back also
-   has no sweep.
+   and event ids, timestamps, fingerprints) but no content. Calling it is not enough on its own: a tick that read its
+   stamp before the erase can claim afterwards, re-creating the run and staging that session's identities again. Its
+   final step then abandons the run, which drops the stage rows but keeps the `search_reconcile_runs_v1` row (org,
+   workspace, session and canonical ids). So the erase must run under the scope lock or a fence the claim checks, and
+   a sweep must delete abandoned runs and runs of sessions that never come back.
 2. **Final transaction.** The final transaction is not bounded and has no keepalive. Its deletes, the directory write
    and (for a run resumed at that step) the source read all run in one transaction under the advisory locks.
 3. **Fast-changing sessions.** A session whose source stamp changes faster than one run completes never finishes.
@@ -501,7 +504,18 @@ Preconditions before the flag may be turned on anywhere (1-3 and 5 open, tracked
    sessions-function gate accepts them for the consumer login only) and in the `session_consumer_role_verify.sql`
    allowlist; the boundary lane is `search-reconcile-staging`. Keep both lists in step with any new writer.
 5. **Passes 1-3 are not staged** (the stage table reserves the `fold` and `directory_seen` sides). A resumed run reads
-   the source again whenever it still needs the read.
+   the source again whenever it still needs the read. When slice 2b stages them, note that those sides share the run's
+   single `chunk_cursor` with `want`: they need their own cursor or a strict order within the `want` phase.
+6. **Lease during the read.** The lease is not renewed while `readSource` runs. With one consumer that is harmless (an
+   expired lease nobody takes over stays the holder's). With a second tick arriving after `leaseMs` but before a read
+   longer than `leaseMs` ends, the second tick takes the run over, the first gets `RH062` at its next call, and the
+   second re-reads and can be taken over the same way: repeated full reads, never wrong data. Before the flag is on
+   with more than one consumer, add a heartbeat during the read or size `leaseMs` from the measured read time.
+
+A claim never waits on a run row another transaction holds (a pass 4 write, the final step, a finish or erase in
+flight): it answers busy, so redelivered ticks of a hot scope do not each hold a pool connection. Against another
+claim's uncommitted first insert of the same scope it waits at most 2 s (`lock_timeout` on the function), then
+answers busy. `staged-reconcile-claim.postgres.test.ts` proves both on real PostgreSQL in pg-proof.
 
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 
