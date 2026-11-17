@@ -1540,9 +1540,8 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     expect((await db.query<{ basis: string }>(
       "SELECT fence_basis AS basis FROM sessions.turn_session_fences WHERE org_id='historical-org' AND workspace_id='historical-ws' AND source='claude' AND session_id='historical-session'",
     )).rows).toEqual([{ basis: "live" }]);
-    // 062060 replaces the public and self-host selection boundaries after the turns gates. Restore it first so
-    // this test exercises 062020's privacy refusals rather than its later-migration guard.
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql"), "utf8"));
+    // The fixture stops at 062020 so this exercises its privacy refusals rather
+    // than a later migration's ordering guard.
     expect((await failure(db.exec(operatorTurnsRollbackSql(false))))?.code).toBe("55000");
     await db.exec("ROLLBACK");
     expect((await db.query<{ n: number }>(
