@@ -816,7 +816,9 @@ What `s3` requires and changes:
   stream that an operator switched to log mode (`scripts/ledger-log-stream.ts switch`, non-production buckets only)
   through its append-only log, and runs the log materializer; every other stream stays on the legacy claim and
   commit. The switch and each process's first write to a stream also create the stream's index object under
-  `…/m=srv_<user>/ledger/log-index/` (create-if-absent, no id inside), which the reset erase below lists.
+  `…/m=srv_<user>/ledger/log-index/` (create-if-absent, no id inside), which the reset erase below lists. So the
+  ingest process and the operator need PutObject (and GetObject) under `…/ledger/log-index/` as well as `…/ledger/log/`,
+  with the bucket key's GenerateDataKey for that prefix; a grant on `…/ledger/log/*` alone refuses the first write.
   Exactly `on` or `off`; anything else refuses startup. Refuses `INGEST_S3_ERASE_FENCE=on`. Not cleared for
   production: the hosted runtime and the stack input refuse it.
 - **`INGEST_LEDGER_LOG_ERASE`** (`on`; default off; needs `s3` and `INGEST_LEDGER_LOG_COMMIT=on`, refused at startup
@@ -825,8 +827,8 @@ What `s3` requires and changes:
   retryable, the reset stays in flight) and logs `ledger_log_erase_failed`; the design doc's slice 8 has the
   runbook. Cost per reset: a LIST of the user's stream index, a LIST of each stream's remaining payloads, and only
   for a stream that still holds some, O(log n) marker HEADs, its unapplied entries, and a DELETE plus a HEAD per
-  superseded payload. Needs ListBucket, GetObject and DeleteObject under `…/m=srv_<user>/ledger/log/` and
-  `…/ledger/log-index/`. Set it on every ingest process of the deployment: the materializer answers a batch whose
+  superseded payload. Needs ListBucket, GetObject and DeleteObject under `…/m=srv_<user>/ledger/log/`, and ListBucket
+  under `…/ledger/log-index/` (it only lists the index; the index writes are LOG_COMMIT's, above). Set it on every ingest process of the deployment: the materializer answers a batch whose
   payload a reset erased as `delivery_privacy_superseded` only where the flag is on (`payload_erased` elsewhere).
   Off: a reset touches nothing in the log, bytes unchanged.
 - **No admission for an org until a fence-authority marker covers it.** Until then, every claim for that org is a retry (in the async consumer with `SELFHOST_ADMISSION_AWAIT_AUTHORITY=on`, a deferral that never dead-letters; see `docs/selfhost-async-admission.md`). On the synchronous path that means its uploads answer 503; nothing of that org is admitted on any path. There are two forms:
