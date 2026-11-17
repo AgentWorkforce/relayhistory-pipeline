@@ -1197,9 +1197,12 @@ test("workflow: the proof runs on a change to the ledger-aware tools, and runs t
   for (const parent of ["  pull_request:\n", "  push:\n"]) {
     const block = yml.slice(yml.indexOf(parent), yml.indexOf("\n\n", yml.indexOf(parent)));
     const paths = block.slice(block.indexOf("    paths:\n")) + "\n";
-    for (const f of ["scripts/upload-fence-backfill.ts", "scripts/buffered-drain.ts", "src/session-ingest/ledger-tool-store.ts", "src/session-ingest/__tests__/ledger-tool-store*"])
+    for (const f of ["scripts/upload-fence-backfill.ts", "scripts/buffered-drain.ts", "src/session-ingest/ledger-tool-store.ts", "src/session-ingest/__tests__/ledger-tool-store*",
+      "src/session-ingest/ledger-store.ts", "src/session-ingest/__tests__/buffered-drain.test.ts", "src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts"])
       expect(paths).toContain(`      - ${f}\n`);
   }
   const proof = yml.slice(yml.indexOf("  proof:\n"), yml.indexOf("  prerequisite-gate:"));
   expect(proof).toMatch(/^ {8}run: bun test --timeout \d+ \.\/src\/session-ingest\/__tests__\/ledger-tool-store\.test\.ts$/mu);
+  for (const f of ["buffered-drain.test.ts", "upload-fence-backfill.pglite.test.ts"])
+    expect(proof).toContain(`          bun test --timeout 300000 ./src/session-ingest/__tests__/${f}\n`);
 });

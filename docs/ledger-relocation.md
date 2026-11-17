@@ -71,8 +71,11 @@ marker, and the result is cached with it for 60 s per org:
     bucket's marker must name it: `ledger_home_missing` or
     `ledger_home_moved`, as the edge does.
   - During a run they re-check, as the edge does about once a minute: before
-    any write made a minute or more after the last good check, the same check
-    runs again, and a refusal stops every later write.
+    any ledger-key write made a minute or more after the last good check, the
+    same check runs again. A refusal blocks every later ledger-key write; the
+    tool stops at its next boundary (the drain at its next batch group, after
+    releasing its lease, a Locker write the check never blocks) and exits 1
+    with the code.
   - Unset, they behave as the other single-bucket tools below.
   - The backfill checks the markers unless every section it runs is
     `fences` (an empty section list is checked too). A fences-only run needs

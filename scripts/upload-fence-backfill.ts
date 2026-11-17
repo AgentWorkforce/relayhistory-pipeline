@@ -22,8 +22,10 @@
  * requires --bucket's ledger-home marker to name the ledger bucket (ledger_home_mismatch) and the ledger bucket's own
  * marker to name it (ledger_home_missing, ledger_home_moved). Unset, one bucket as before; then
  * INGEST_LEDGER_HOME_GUARD=on (always set by the backlog-ops workflow) refuses those sections when --bucket's marker
- * names another bucket (ledger_home_moved). A fences-only run reads no marker either way. The check runs before the
- * first SQL read or S3 write, and again before a write once a minute has passed since the last (homeGuardedToolStore).
+ * names another bucket (ledger_home_moved). A fences-only run reads no marker either way. The check runs after the
+ * database connection is open (its keepalive SELECT 1 may already have run) but before the backfill's first data
+ * read and its first S3 write, and again before a ledger write once a minute has passed since the last
+ * (homeGuardedToolStore); a refusal then fails the run with its code.
  *
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing fences and
  * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
@@ -202,7 +204,8 @@ export async function assertBackfillLedgerHome(stores: ToolStores, args: Pick<Ba
 
 /**
  * Everything the CLI does once it has its SQL connection and credentials, in order: the stores (the ledger bucket
- * parsed once, by the caller's preflight), the fork guard BEFORE the first SQL read or S3 write, then the backfill
+ * parsed once, by the caller's preflight), the fork guard BEFORE the backfill's first data read or S3 write (the CLI
+ * has already connected, and its keepalive SELECT 1 may have run), then the backfill
  * through a store that re-runs the guard during the run (homeGuardedToolStore; not for a fences-only run, which
  * writes no ledger key and reads no marker).
  */
@@ -216,9 +219,9 @@ export async function runBackfill(args: BackfillArgs, deps: {
 }): Promise<BackfillSummary> {
   const stores = backfillStores(args, deps.env, deps.credentials, deps.create, deps.ledgerBucket);
   await assertBackfillLedgerHome(stores, args, deps.env);
-  const store = backfillWritesNoLedger(args.sections) ? stores.store : homeGuardedToolStore(stores, BACKFILL_KEY_ROOT, args.bucket, deps.env, deps.recheck);
-  return backfillUploadFences({
-    sql: deps.sql, store, keyRoot: BACKFILL_KEY_ROOT, dryRun: args.mode === "dry_run",
+  const guarded = backfillWritesNoLedger(args.sections) ? null : homeGuardedToolStore(stores, BACKFILL_KEY_ROOT, args.bucket, deps.env, deps.recheck);
+  const summary = await backfillUploadFences({
+    sql: deps.sql, store: guarded ?? stores.store, keyRoot: BACKFILL_KEY_ROOT, dryRun: args.mode === "dry_run",
     ...(args.orgs.length ? { orgs: args.orgs } : {}),
     sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
     ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
@@ -226,6 +229,10 @@ export async function runBackfill(args: BackfillArgs, deps: {
     ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
     ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
   });
+  // A refusal mid-run left the remaining ledger writes failed: the run fails with the closed code, not a summary.
+  const refused = guarded?.homeRefusal();
+  if (refused !== undefined) throw refused;
+  return summary;
 }
 
 if (import.meta.main) {
