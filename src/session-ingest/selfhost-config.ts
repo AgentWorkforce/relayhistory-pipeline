@@ -67,6 +67,16 @@
  *   SELFHOST_ADMISSION_AWAIT_AUTHORITY  on | off (default off). on: an org with no fence-authority marker yet (or the
  *                                    deployment-wide stop) is a deferral, never dead-lettered (selfhost-admission.ts
  *                                    AWAIT_AUTHORITY_CODES); off: an ordinary retry, unchanged
+ *   SELFHOST_ADMISSION_SPREAD        on | off (default off: strict oldest-first, unchanged). on: for running more than
+ *                                    one replica. Each process orders its due work by a per-process random salt
+ *                                    hashed with the machine directory (admission) or upload origin (promotion), so
+ *                                    replicas start on different users' work instead of racing on the same oldest
+ *                                    entries; work older than the grace still goes first, oldest first, so nothing
+ *                                    starves and no replica count, index or lease is needed (selfhost-admission.ts
+ *                                    spread). An efficiency hint only: every replica still sees and may admit everything
+ *   SELFHOST_ADMISSION_SPREAD_GRACE_MS  with SPREAD=on only (set otherwise: refused): 1000..86400000, default
+ *                                    max(120000, 4 x SELFHOST_ADMISSION_SCAN_MS). The bound on how long spread may
+ *                                    delay an entry before it is taken oldest-first by every replica
  *
  *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
  *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
@@ -192,6 +202,8 @@ export interface SelfhostAdmissionSettings {
   maxAttempts: number;
   /** SELFHOST_ADMISSION_AWAIT_AUTHORITY=on only; absent when off (byte-identical to before). */
   awaitAuthority?: true;
+  /** SELFHOST_ADMISSION_SPREAD=on only (selfhost-admission.ts spread): the grace in ms. Absent when off (unchanged). */
+  spread?: { graceMs: number };
 }
 
 export interface SelfhostIngestSettings {
@@ -406,15 +418,45 @@ function need(env: NodeJS.ProcessEnv, name: string): string {
 /** SELFHOST_INGEST_ADMISSION: exactly sync (or unset / empty), async or drain; anything else refuses startup. */
 export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmissionSettings | undefined {
   const raw = env[SELFHOST_INGEST_ADMISSION_VAR];
-  if (raw === undefined || raw === "" || raw === "sync") return undefined;
+  if (raw === undefined || raw === "" || raw === "sync") {
+    // The spread orders the async consumer's work: without one it would silently do nothing.
+    for (const name of [SELFHOST_ADMISSION_SPREAD_VAR, SELFHOST_ADMISSION_SPREAD_GRACE_VAR]) {
+      const v = env[name]?.trim();
+      if (v && v !== "off") throw new Error(`96bulls: ${name} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
+    }
+    return undefined;
+  }
   if (raw !== "async" && raw !== "drain") throw new Error(`96bulls: ${SELFHOST_INGEST_ADMISSION_VAR} must be sync, async or drain`);
+  const scanIntervalMs = bounded(env, "SELFHOST_ADMISSION_SCAN_MS", 15_000, 1_000, 600_000);
   return {
     mode: raw,
     concurrency: bounded(env, "SELFHOST_ADMISSION_CONCURRENCY", 4, 1, 32),
-    scanIntervalMs: bounded(env, "SELFHOST_ADMISSION_SCAN_MS", 15_000, 1_000, 600_000),
+    scanIntervalMs,
     maxAttempts: bounded(env, "SELFHOST_ADMISSION_MAX_ATTEMPTS", 20, 1, 100),
     ...(awaitAuthorityFlag(env) ? { awaitAuthority: true as const } : {}),
+    ...spreadSettings(env, scanIntervalMs),
   };
+}
+
+export const SELFHOST_ADMISSION_SPREAD_VAR = "SELFHOST_ADMISSION_SPREAD";
+export const SELFHOST_ADMISSION_SPREAD_GRACE_VAR = "SELFHOST_ADMISSION_SPREAD_GRACE_MS";
+/** Default grace: 8 scan intervals at the default 15 s, and never under 4 of the configured interval. */
+export const defaultSpreadGraceMs = (scanIntervalMs: number) => Math.max(120_000, 4 * scanIntervalMs);
+
+/**
+ * SELFHOST_ADMISSION_SPREAD: on or off (unset / empty = off); anything else refuses startup. With on,
+ * SELFHOST_ADMISSION_SPREAD_GRACE_MS 1000..86400000 (default defaultSpreadGraceMs); set with spread off: refused,
+ * so a grace never silently does nothing.
+ */
+function spreadSettings(env: NodeJS.ProcessEnv, scanIntervalMs: number): { spread?: { graceMs: number } } {
+  const raw = env[SELFHOST_ADMISSION_SPREAD_VAR];
+  const graceSet = (env[SELFHOST_ADMISSION_SPREAD_GRACE_VAR]?.trim() ?? "") !== "";
+  if (raw === undefined || raw === "" || raw === "off") {
+    if (graceSet) throw new Error(`96bulls: ${SELFHOST_ADMISSION_SPREAD_GRACE_VAR} needs ${SELFHOST_ADMISSION_SPREAD_VAR}=on`);
+    return {};
+  }
+  if (raw !== "on") throw new Error(`96bulls: ${SELFHOST_ADMISSION_SPREAD_VAR} must be on or off`);
+  return { spread: { graceMs: bounded(env, SELFHOST_ADMISSION_SPREAD_GRACE_VAR, defaultSpreadGraceMs(scanIntervalMs), 1_000, 86_400_000) } };
 }
 
 /** SELFHOST_ADMISSION_AWAIT_AUTHORITY: on or off (unset / empty = off); anything else refuses startup. */
