@@ -1038,6 +1038,132 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(() => parseBackfillArgs([...base, "--section", "fences", "--section", "ownership", "--revisions-since-ms", "5"])).toThrow("needs the revisions section");
     expect(() => parseBackfillArgs([...base, "--revisions-since-ms", "5", "--revisions-since-ms", "6"])).toThrow("given twice");
   });
+
+  test("CLI: --slot-pace-ms 0..5000 and --slot-fetch-rows 100..50000, only with --slots-by-org; absent unless given", () => {
+    const base = ["--dry-run", "--bucket", "my-bucket", "--org", "o1"];
+    const parsed = parseBackfillArgs([...base, "--slots-by-org"]);
+    expect("slotPaceMs" in parsed || "slotFetchRows" in parsed).toBe(false);
+    expect(parseBackfillArgs([...base, "--slots-by-org", "--slot-pace-ms", "250", "--slot-fetch-rows", "1000"])).toMatchObject({ slotsByOrg: true, slotPaceMs: 250, slotFetchRows: 1000 });
+    expect(parseBackfillArgs([...base, "--slots-by-org", "--slot-pace-ms", "0"]).slotPaceMs).toBe(0);
+    for (const bad of ["-1", "5001", "1.5", "abc", "1e3"]) expect(() => parseBackfillArgs([...base, "--slots-by-org", "--slot-pace-ms", bad])).toThrow("--slot-pace-ms");
+    for (const bad of ["99", "50001", "0"]) expect(() => parseBackfillArgs([...base, "--slots-by-org", "--slot-fetch-rows", bad])).toThrow("--slot-fetch-rows");
+    expect(() => parseBackfillArgs([...base, "--slot-pace-ms", "100"])).toThrow("need --slots-by-org");
+    expect(() => parseBackfillArgs([...base, "--slot-fetch-rows", "1000"])).toThrow("need --slots-by-org");
+  });
+});
+
+describe("slotsByOrg pacing and the slots fingerprint from the cursor pass", () => {
+  /** n owned slots of `t` (and every 7th cleared), records prefixed `p`. */
+  async function slots(t: T, p: string, n: number) {
+    for (let i = 0; i < n; i++) {
+      const cleared = i % 7 === 6;
+      await slot(t, "origin-1", `${p}${String(i).padStart(4, "0")}`, cleared ? null : t.userId, cleared ? null : "claude",
+        cleared ? null : i % 5 === 0 ? null : `sess-${i % 11}`, cleared ? null : i + 1, cleared ? null : hex(String(i % 10)));
+    }
+  }
+  const fetches = (log: string[]) => log.filter((l) => l.startsWith("FETCH FORWARD"));
+
+  test("a paced read sleeps between FETCHes (never before the first or after the last); results identical to unpaced", async () => {
+    await slots(A, "pa", 250);
+    await slots(C, "pc", 30);
+    const unpacedStore = scratch(), unpacedLog: string[] = [];
+    const unpaced = await run(unpacedStore, { orgs: ["org-a", "org-b"], slotsByOrg: true }, unpacedLog);
+    expect(fetches(unpacedLog).every((l) => l === "FETCH FORWARD 5000 FROM backfill_slots")).toBe(true);
+
+    const pacedStore = scratch(), pacedLog: string[] = [], sleeps: number[] = [];
+    const paced = await backfillUploadFences({ sql: recordingSql(pacedLog), store: pacedStore, keyRoot: ROOT, dryRun: false,
+      orgs: ["org-a", "org-b"], slotsByOrg: true, slotPaceMs: 40, slotFetchRows: 100,
+      sleep: async (ms) => { sleeps.push(ms); pacedLog.push(`sleep ${ms}`); } });
+    // org-a: 100, 100, 50, then the empty fetch: three pauses. org-b: 30, then empty: one pause.
+    expect(fetches(pacedLog).length).toBe(4 + 2);
+    expect(fetches(pacedLog).every((l) => l === "FETCH FORWARD 100 FROM backfill_slots")).toBe(true);
+    expect(sleeps).toEqual([40, 40, 40, 40]);
+    for (let i = 0; i < pacedLog.length; i++) if (pacedLog[i]!.startsWith("sleep")) {
+      expect(pacedLog[i - 1]!.startsWith("FETCH FORWARD")).toBe(true);
+      expect(pacedLog[i + 1]!.startsWith("FETCH FORWARD")).toBe(true);
+    }
+    // The pause happens inside the org's one read-only transaction, all rows read before any S3 work.
+    const declares = pacedLog.flatMap((l, i) => (l.includes("DECLARE backfill_slots") ? [i] : []));
+    expect(declares.length).toBe(2);
+    expect(paced).toEqual(unpaced);
+    expect(paced.revisions).toMatchObject({ slot_rows: 280, failed: 0, invalid: 0 });
+    for (const [t, p, n] of [[A, "pa", 250], [C, "pc", 30]] as [T, string, number][])
+      for (let i = 0; i < n; i++) expect(await entryOf(pacedStore, t, "origin-1", `${p}${String(i).padStart(4, "0")}`)).toEqual(await entryOf(unpacedStore, t, "origin-1", `${p}${String(i).padStart(4, "0")}`));
+    // A paced read with the default fetch size uses SLOT_FETCH_ROWS_PACED (2000).
+    const log: string[] = [];
+    await run(scratch(), { orgs: ["org-b"], slotsByOrg: true, slotPaceMs: 1, dryRun: true }, log);
+    expect(fetches(log)[0]).toBe("FETCH FORWARD 2000 FROM backfill_slots");
+  });
+
+  test("the slots fingerprint summed from the cursor equals FINGERPRINT_SLOTS on the same rows: NULLs, cleared rows, negative hashes, the 2^53 wrap, over-cap orgs", async () => {
+    await slots(A, "fa", 120);
+    await slots(C, "fc", 45);
+    await slots({ ...C, orgId: "org-x", workspaceId: "ws-x" }, "fx", 10); // out of scope
+    // Revisions large enough that the sum wraps 2^53 (the rows are invalid for S3, the fingerprint still counts them).
+    await db.exec(`UPDATE sessions.ingest_lazy_native_slots SET current_revision = 4611686018427387904 + length(record_id) WHERE record_id IN ('fa0001', 'fa0002', 'fc0003')`);
+    const check = (await db.query<{ neg: boolean; big: boolean }>(`SELECT bool_or(hashtext(key_sha256) < 0) AS neg, sum(current_revision) > 9007199254740992 AS big
+      FROM sessions.ingest_lazy_native_slots WHERE org_id IN ('org-a', 'org-b') AND current_owner IS NOT NULL`)).rows[0]!;
+    expect(check).toEqual({ neg: true, big: true });
+    const orgs = ["org-a", "org-b", "org-empty"];
+    const sqlLog: string[] = [];
+    const bySql = (await run(scratch(), { orgs, dryRun: true }, sqlLog)).fingerprint;
+    expect(sqlLog.some((l) => l.includes("sum(current_revision)"))).toBe(true);
+    expect(bySql.slots_owned_count).toBe(120 - 17 + 45 - 6);
+    for (const over of [{}, { slotPaceMs: 5, slotFetchRows: 100 }, { slotOrgReadMaxRows: 50 }, { sections: ["fences", "ownership"] as const }]) {
+      const log: string[] = [];
+      const fp = (await run(scratch(), { orgs, dryRun: true, slotsByOrg: true, ...over, sections: over.sections ? [...over.sections] : undefined }, log)).fingerprint;
+      expect(fp).toEqual(bySql);
+      // Each org's slots read once: no FINGERPRINT_SLOTS read beside the cursor.
+      expect(log.some((l) => l.includes("sum(current_revision)"))).toBe(false);
+      expect(log.filter((l) => l.includes("DECLARE backfill_slots")).length).toBe(3);
+    }
+    // A fences-only run has no slot pass: it keeps FINGERPRINT_SLOTS, same values.
+    const fencesLog: string[] = [];
+    expect((await run(scratch(), { orgs, dryRun: true, slotsByOrg: true, sections: ["fences"] }, fencesLog)).fingerprint).toEqual(bySql);
+    expect(fencesLog.some((l) => l.includes("sum(current_revision)"))).toBe(true);
+    // A change to an owned slot moves the cursor-summed hash as it moves the SQL one.
+    await db.exec(`UPDATE sessions.ingest_lazy_native_slots SET current_digest = '${hex("f")}' WHERE record_id = 'fa0003'`);
+    const after = (await run(scratch(), { orgs, dryRun: true, slotsByOrg: true }, [])).fingerprint;
+    expect(after.slots_hash).not.toBe(bySql.slots_hash);
+    expect(after).toEqual((await run(scratch(), { orgs, dryRun: true }, [])).fingerprint);
+  });
+
+  test("pacing values out of range, or without slotsByOrg, are refused before any read", async () => {
+    const store = scratch();
+    for (const over of [{ slotPaceMs: -1 }, { slotPaceMs: 5001 }, { slotPaceMs: 1.5 }, { slotFetchRows: 99 }, { slotFetchRows: 50_001 }, { slotFetchRows: 1000.5 }]) {
+      const log: string[] = [];
+      await expect(run(store, { orgs: ["org-a"], slotsByOrg: true, ...over }, log)).rejects.toThrow("backfill_slot_pace_invalid");
+      expect(log).toEqual([]);
+    }
+    await expect(run(store, { orgs: ["org-a"], slotPaceMs: 100 })).rejects.toThrow("backfill_slot_pace_invalid");
+    await expect(run(store, { slotFetchRows: 1000 })).rejects.toThrow("backfill_slot_pace_invalid");
+    await expect(run(store, { orgs: ["org-a"], slotsByOrg: true, slotPaceMs: 0, slotFetchRows: 100 })).resolves.toBeDefined();
+    await expect(run(store, { orgs: ["org-a"], slotsByOrg: true, slotPaceMs: 5000, slotFetchRows: 50_000 })).resolves.toBeDefined();
+  });
+
+  test("a paced org read that would outlive the max duration fails closed: rolled back, counted failed, not walked; other orgs proceed", async () => {
+    await slots(A, "ta", 250);
+    await slots(C, "tc", 20);
+    let t = 0;
+    const log: string[] = [], timedStore = scratch();
+    // Each pause also stands for 11 min of slow fetches: org-a's read passes 30 min before its last (empty) fetch.
+    const summary = await backfillUploadFences({ sql: recordingSql(log), store: timedStore, keyRoot: ROOT, dryRun: false,
+      orgs: ["org-a", "org-b"], slotsByOrg: true, slotPaceMs: 10, slotFetchRows: 100, slotWindowBlocks: 1,
+      now: () => t, sleep: async (ms) => { t += ms + 11 * 60_000; } });
+    expect(summary.revisions.failed_codes).toEqual({ slot_read_too_long: 1 });
+    expect(summary.ownership.failed_codes).toEqual({ slot_read_too_long: 1 });
+    expect(summary.sections).toMatchObject({ ownership: "incomplete", revisions: "incomplete" });
+    // org-a: nothing processed, and no block walk to make up for it; org-b's 20 slots (17 owned, 3 cleared) are.
+    expect(summary.revisions.slot_rows).toBe(20);
+    expect(log.some((l) => l.includes("ctid >= $2::tid"))).toBe(false);
+    expect(await entryOf(timedStore, A, "origin-1", "ta0001")).toBeUndefined();
+    const firstDeclare = log.findIndex((l) => l.includes("DECLARE backfill_slots"));
+    expect(log.slice(firstDeclare).filter((l) => l.startsWith("FETCH FORWARD")).length).toBeGreaterThanOrEqual(3);
+    expect(log.slice(firstDeclare).find((l) => l === "ROLLBACK")).toBeDefined();
+    // Unpaced reads are not bounded by it (unchanged behaviour), whatever the clock says.
+    const unpaced = await run(scratch(), { orgs: ["org-a", "org-b"], slotsByOrg: true, now: () => (t += 60 * 60_000) });
+    expect(unpaced.sections).toMatchObject({ ownership: "complete", revisions: "complete" });
+  });
 });
 
 describe("catch-up (--revisions-since-ms): two-phase cutover", () => {

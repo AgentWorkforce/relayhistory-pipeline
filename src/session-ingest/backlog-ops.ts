@@ -133,6 +133,8 @@ export const backlogOpsEnvironment = (mode: BacklogOpsMode) =>
 /** A role session must outlive the job (355 min timeout) with this margin, or the run refuses before the tool starts. */
 export const BACKLOG_OPS_MIN_SESSION_REMAINING_MS = 5 * 60 * 60 * 1000;
 export const BACKLOG_OPS_MAX_OBJECTS_CEILING = 1_000_000;
+/** slot_pace_ms's ceiling (ms): upload-fence-backfill.ts SLOT_PACE_MAX_MS. */
+export const BACKLOG_OPS_SLOT_PACE_MAX_MS = 5_000;
 
 const SHA40 = /^[0-9a-f]{40}$/u;
 const RUN_ID = /^[1-9][0-9]{0,19}$/u;
@@ -188,6 +190,12 @@ export interface BacklogOpsDispatch {
    * block windows, byte-identical to before.
    */
   slotsRead: "heap" | "org";
+  /**
+   * Backfill modes with slotsRead "org" only (BACKLOG_OPS_SLOT_PACE_MS, input slot_pace_ms): the pause in ms between
+   * the org slot cursor's FETCHes (upload-fence-backfill.ts --slot-pace-ms). Null (empty input, or "0") is unpaced and
+   * passes no flag, so the argv is byte-identical to before.
+   */
+  slotPaceMs: number | null;
   confirmation: string;
 }
 
@@ -210,7 +218,7 @@ export function backlogOpsDispatch(
   const dryRun = env.BACKLOG_OPS_DRY_RUN ?? "", backfillRun = env.BACKLOG_OPS_BACKFILL_RUN ?? "",
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
     fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "",
-    slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "";
+    slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "", slotPaceRaw = env.BACKLOG_OPS_SLOT_PACE_MS ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
@@ -230,10 +238,14 @@ export function backlogOpsDispatch(
   }
   if (!(slotsReadRaw === "" || slotsReadRaw === "heap" || (slotsReadRaw === "org" && tool === "backfill"))) refuse("backlog_ops_slots_read");
   const slotsRead: "heap" | "org" = slotsReadRaw === "org" ? "org" : "heap";
+  // Digits only (no sign, space, exponent or leading zero), 0..BACKLOG_OPS_SLOT_PACE_MAX_MS, and only beside slots_read=org.
+  if (slotPaceRaw !== "" && (slotsRead !== "org" || !/^(0|[1-9][0-9]{0,3})$/u.test(slotPaceRaw) || Number(slotPaceRaw) > BACKLOG_OPS_SLOT_PACE_MAX_MS))
+    refuse("backlog_ops_slot_pace_ms");
+  const slotPaceMs = slotPaceRaw === "" || slotPaceRaw === "0" ? null : Number(slotPaceRaw);
   const runs = [dryRun, backfillRun, exportRun, fullBackfillRun].filter((r) => r !== "");
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
   const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill ? backfillRun : null,
-    exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun, maxObjects: budget, slotsRead, confirmation };
+    exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun, maxObjects: budget, slotsRead, slotPaceMs, confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
@@ -341,6 +353,8 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
     ...(isCatchup(d.mode) ? ["--section", "fences", "--section", "ownership", "--section", "revisions", "--revisions-since-ms", String(revisionsSinceMs)] : []),
     // Opt-in (slots_read=org), default off: the per-org index read of the owned slots.
     ...(tool === "backfill" && d.slotsRead === "org" ? ["--slots-by-org"] : []),
+    // Opt-in (slot_pace_ms, with slots_read=org only): the paced org slot read.
+    ...(tool === "backfill" && d.slotsRead === "org" && d.slotPaceMs !== null ? ["--slot-pace-ms", String(d.slotPaceMs)] : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
     ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
   return { script, args, needsDb: tool !== "drain" };
