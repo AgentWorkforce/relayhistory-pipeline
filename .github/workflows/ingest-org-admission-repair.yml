@@ -1,0 +1,170 @@
+name: ingest org admission repair
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('ingest org admission repair {0} {1}', inputs.mode, inputs.sha) || format('ingest org admission repair proof {0}', github.sha) }}
+
+# Dormant, CI-only operator that admits an explicit org list into buffered ingest: one
+# sessions.ingest_buffer_admission row per org at the live custody policy's identity and expiry, in ONE owner
+# transaction, only for orgs whose sole prior rows are in sessions.ingest_seed_source_epochs
+# (src/hoopdb/ingest-org-admission-repair-operator.ts; docs/design/zero-503-schema-windows.md "Org admission repair";
+# runbooks/history-620-operations.md). No migration. While ORG_ADMISSION_REPAIR_ENABLED is false in
+# src/hoopdb/org-admission-repair-contract.ts, plan and admit refuse; readback is always allowed.
+# Org ids are dispatch inputs only: the scripts read them from the event payload (GITHUB_EVENT_PATH), never from
+# env (GitHub prints step env in the public log) or the run name, and mask each id before printing anything.
+# Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [readback, plan, admit]
+        default: readback
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      orgs:
+        description: Comma-separated org ids (1..50; deduplicated and sorted). Plan and admit must use the same list
+        type: string
+        required: true
+      plan_run:
+        description: Admit only - the successful plan run id of this workflow at the same sha (under 24h old); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'Admit: ADMIT-ORGS <project> <sha> GENERATION <g> VALID_UNTIL <v> ORGS <d> COUNT <n> PLAN <plan_run>, from the plan artifact. Plan and readback: empty'
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/ingest-org-admission-repair.yml
+      - scripts/ingest-org-admission-repair*.ts
+      - src/hoopdb/org-admission-repair-contract.ts
+      - src/hoopdb/ingest-org-admission-repair-operator.ts
+      - src/hoopdb/ingest-admission-renewal-operator.ts
+      - src/hoopdb/__tests__/ingest-org-admission-repair-*.ts
+      - supabase/migrations/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ingest-org-admission-repair.yml
+      - scripts/ingest-org-admission-repair*.ts
+      - src/hoopdb/org-admission-repair-contract.ts
+      - src/hoopdb/ingest-org-admission-repair-operator.ts
+      - src/hoopdb/ingest-admission-renewal-operator.ts
+      - src/hoopdb/__tests__/ingest-org-admission-repair-*.ts
+      - supabase/migrations/**
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Dispatches serialize with the guarded schema release, the overlap operator and admission renewal on the same
+# database. Proof runs get their own per-sha group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('ingest-org-admission-repair-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  ORG_REPAIR_MODE: ${{ inputs.mode }}
+  ORG_REPAIR_SHA: ${{ inputs.sha }}
+  ORG_REPAIR_PLAN_RUN: ${{ inputs.plan_run }}
+  ORG_REPAIR_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Synthetic PGlite org admission repair proof over every migration
+        run: bun scripts/ingest-org-admission-repair-ci.ts
+      - name: Operator and gate tests
+        run: |
+          bun test --timeout 300000 ./src/hoopdb/__tests__/ingest-org-admission-repair-operator.pglite.test.ts
+          bun test --timeout 300000 ./src/hoopdb/__tests__/ingest-org-admission-repair-gate.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, org list, exact main, dispatch identity, green CI and the plan run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/ingest-org-admission-repair-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and any recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/ingest-org-admission-repair-github.ts --approved
+      - name: Download the plan artifact (admit only)
+        if: inputs.mode == 'admit'
+        uses: actions/download-artifact@v4
+        with:
+          name: ingest-org-admission-repair-plan
+          path: release-plan
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ github.token }}
+      - name: Plan, admit or read back org admission (only step with the database secret)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/ingest-org-admission-repair.ts
+      - name: Publish the plan artifact (plan only)
+        if: inputs.mode == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-org-admission-repair-plan
+          path: release-plan/ingest-org-admission-repair-plan.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish the sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-org-admission-repair
+          path: release-receipt/ingest-org-admission-repair.json
+          if-no-files-found: ignore
+          retention-days: 30

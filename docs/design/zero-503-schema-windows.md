@@ -363,6 +363,36 @@ synthetic PGlite proof.
 Any refusal or postcondition failure rolls the transaction back; that rollback is the only inverse. Emergency
 fail-closed expiry is a separate typed operation outside this workflow.
 
+### 3.4 Org admission repair (dormant, CI-only)
+
+`ingest_lazy_begin` (041000) admits an org on its first claim only when no other `sessions.ingest_%`/`upload_%`
+table with an `org_id` column has rows for it. Otherwise it refuses 55000 (`org_prior_authority_unbound`) on every
+claim. An org whose only prior rows are in `sessions.ingest_seed_source_epochs` (040000's per-session change
+counter, written by a trigger on `sessions.session_index`) can never self-admit.
+`.github/workflows/ingest-org-admission-repair.yml` (operator `src/hoopdb/ingest-org-admission-repair-operator.ts`)
+admits an explicit org list (a dispatch input only, 1 to 50 ids, deduplicated and C-sorted). It writes one admission
+row per org, copying the live policy's privacy baseline, retention contract, generation, expiry and control epoch,
+in one owner transaction. It is dormant like renewal (`ORG_ADMISSION_REPAIR_ENABLED` in
+`src/hoopdb/org-admission-repair-contract.ts`). The gate, environment and dispatcher are the same, and so are the
+ledger proof, the canonical timestamps, the 24 h plan artifact and the byte-equal confirmation.
+
+- **Scan identity.** The operator selects tables with 041000's loop query verbatim. Every mode proves the live
+  `ingest_lazy_begin` body still contains that loop; plan and admit refuse otherwise
+  (`org_admission_repair_scan_drift`).
+- **plan** refuses an org that is already admitted, one with rows in any scanned table other than
+  `ingest_seed_source_epochs` (`org_admission_repair_unbound_authority <table> org#<i>`), and one with no scanned
+  rows at all (`org_admission_repair_nothing_to_repair`, which catches typos). It also refuses unless the marker is
+  PASS, the policy is at its generation and the policy is unexpired. The plan binds the roster digest, the per-org
+  scan digests, the scanned-table digest and a descriptor over every policy field, including `updated_at`.
+- **admit** needs `ADMIT-ORGS <project> <sha> GENERATION <g> VALID_UNTIL <v> ORGS <d> COUNT <n> PLAN <run>`. It locks
+  in renewal's order: the advisory lock, the marker `FOR SHARE`, the policy `FOR SHARE`, then the admission table
+  `SHARE ROW EXCLUSIVE`. It re-checks every plan value under those locks, with one code per change. It then runs a
+  plain `INSERT` per org (a conflict rolls back), re-reads the postconditions and runs `ingest_lazy_guard` per org
+  before `COMMIT`. Receipts carry org indexes, never ids.
+
+The class fix is a separate forward migration that drops `ingest_seed_source_epochs` from the scan. Once it lands,
+this operator refuses as `org_admission_repair_scan_drift`.
+
 ## 4. Limits and residual risks
 
 - **Compatibility is a precondition, not a guarantee.** While the window is open, a G Worker runs against
