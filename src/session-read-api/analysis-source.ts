@@ -17,6 +17,14 @@ import type { AdmitRpc, ReadRpc } from "../session-analysis/read.ts";
 
 export const ANALYSIS_READ_SQL = "SELECT sessions.analysis_read_v1($1, $2) AS r";
 export const ANALYSIS_ADMIT_SQL = "SELECT sessions.analysis_request_v1($1, $2, $3, $4) AS r";
+/**
+ * Bounds of one admission transaction, set LOCAL right after BEGIN so they hold on any pool
+ * (the Worker's Hyperdrive client has no startup options): analysis_request_v1 takes a per-org
+ * advisory transaction lock before its throttle check, so a stuck holder must not hold this
+ * request (or its connection) longer than the read API's own 2 s statement bound.
+ */
+export const ANALYSIS_ADMIT_BOUNDS_SQL =
+  "SELECT set_config('statement_timeout', '2000', true), set_config('lock_timeout', '1500', true)";
 
 interface AdmitClient {
   query<R = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: R[] }>;
@@ -26,12 +34,13 @@ export interface AdmitPool {
   connect(): Promise<AdmitClient>;
 }
 
-/** One admission as the admission principal: BEGIN, bind the tenant, call, COMMIT. */
+/** One admission as the admission principal: BEGIN, bound it, bind the tenant, call, COMMIT. */
 export function sqlAnalysisAdmit(pool: AdmitPool): NonNullable<AnalysisDeps["admit"]> {
   return async (identity, sessionId) => {
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query(ANALYSIS_ADMIT_BOUNDS_SQL);
       await client.query(TENANT_SETTINGS_SQL, [identity.orgId, identity.workspaceId]);
       const { rows } = await client.query<{ r: AdmitRpc }>(ANALYSIS_ADMIT_SQL, [identity.orgId, identity.workspaceId, identity.userId, sessionId]);
       await client.query("COMMIT");

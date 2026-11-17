@@ -62,8 +62,9 @@
  * when set, adds a second Hyperdrive binding ANALYSIS_ADMIT -> that config (the
  * bulls96_analysis_admit role, caching disabled; the workflow checks the live config with
  * check-hyperdrive-config.ts HYPERDRIVE_ROLE=analysis_admit before rendering). It composes with
- * every mode above. Unset or empty (the default) changes nothing: every render is byte-identical to
- * the render before this input existed. Refused: anything but 32 hex, all zeros, the read role's
+ * every mode above, independent of the analysis flag (a flag-off Worker ignores the binding). Only
+ * with the variable unset or empty (the default) is every render byte-identical to the render
+ * before this input existed; the analysis flag being off does not make it so. Refused: anything but 32 hex, all zeros, the read role's
  * own SESSION_READ_HYPERDRIVE_ID (the admission principal never shares the read role's config),
  * and a template that already declares an ANALYSIS_ADMIT binding (in every mode). The flag that
  * uses it, READ_API_ANALYSIS_ENABLED, is a deploy-command --var (the workflow's `analysis` input),

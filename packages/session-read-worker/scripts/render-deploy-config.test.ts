@@ -521,9 +521,11 @@ describe("deploy workflow wiring, analysis", () => {
   const step = (name: string) => { const i = WORKFLOW.indexOf(`      - name: ${name}`); expect(i, name).toBeGreaterThan(0); return i; };
 
   test("analysis: default off; on adds only the exact \"true\" --var, never the template", () => {
-    expect(WORKFLOW).toMatch(/analysis:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toMatch(/analysis:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on", "disable"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("ANALYSIS: ${{ inputs.analysis }}");
-    expect(WORKFLOW).toContain(`case "$ANALYSIS" in off|on) ;; *) fail 'analysis must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain(`case "$ANALYSIS" in off|on|disable) ;; *) fail 'analysis must be "off", "on" or "disable"' ;; esac`);
+    // Only "on" renders the var; disable is the removal, not a value.
+    expect(WORKFLOW).toContain('analysis=""; if [ "$ANALYSIS" = "on" ]; then analysis=true; fi');
     expect(WORKFLOW).toContain('analysis=""; if [ "$ANALYSIS" = "on" ]; then analysis=true; fi');
     expect(WORKFLOW).toContain('${analysis:+--var "READ_API_ANALYSIS_ENABLED:$analysis"}');
     expect(TEMPLATE).not.toContain("READ_API_ANALYSIS_ENABLED");

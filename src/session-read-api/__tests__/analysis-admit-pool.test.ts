@@ -4,7 +4,7 @@
  * one transaction, COMMIT on success, ROLLBACK on any failure, and every client is closed.
  */
 import { describe, expect, test } from "bun:test";
-import { ANALYSIS_ADMIT_SQL, perRequestAdmitPool, sqlAnalysisAdmit } from "../analysis-source.ts";
+import { ANALYSIS_ADMIT_BOUNDS_SQL, ANALYSIS_ADMIT_SQL, perRequestAdmitPool, sqlAnalysisAdmit } from "../analysis-source.ts";
 import { TENANT_SETTINGS_SQL } from "../liveness.ts";
 
 const identity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read", "rth:sync"] } as never;
@@ -31,11 +31,26 @@ describe("perRequestAdmitPool + sqlAnalysisAdmit", () => {
     const admit = perRequestAdmitPool(async () => f.client, f.end);
     const out = await sqlAnalysisAdmit(admit.pool)(identity, "s-1");
     expect(out).toEqual(accepted as never);
-    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
-    expect(f.seen[1]!.params).toEqual(["org-a", "ws-a"]);
-    expect(f.seen[2]!.params).toEqual(["org-a", "ws-a", "u-1", "s-1"]);
+    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "COMMIT"]);
+    expect(f.seen[2]!.params).toEqual(["org-a", "ws-a"]);
+    expect(f.seen[3]!.params).toEqual(["org-a", "ws-a", "u-1", "s-1"]);
     await admit.close();
     expect(f.ended()).toBe(1);
+  });
+
+  test("the statement and lock timeouts are set LOCAL in the transaction before the tenant binding and the admission call", async () => {
+    const f = fakeClient((text) => (text === ANALYSIS_ADMIT_SQL ? [{ r: accepted }] : []));
+    const admit = perRequestAdmitPool(async () => f.client, f.end);
+    await sqlAnalysisAdmit(admit.pool)(identity, "s-1");
+    const texts = f.seen.map((q) => q.text);
+    const bounds = texts.indexOf(ANALYSIS_ADMIT_BOUNDS_SQL);
+    expect(bounds).toBe(1);
+    expect(bounds).toBeGreaterThan(texts.indexOf("BEGIN"));
+    expect(bounds).toBeLessThan(texts.indexOf(ANALYSIS_ADMIT_SQL));
+    // LOCAL (is_local = true): the bounds end with the transaction and never leak to a pooled session.
+    expect(ANALYSIS_ADMIT_BOUNDS_SQL).toMatch(/set_config\('statement_timeout', '2000', true\)/);
+    expect(ANALYSIS_ADMIT_BOUNDS_SQL).toMatch(/set_config\('lock_timeout', '1500', true\)/);
+    await admit.close();
   });
 
   test("a failing admission statement rolls back, rethrows, and still closes the client", async () => {
@@ -43,7 +58,7 @@ describe("perRequestAdmitPool + sqlAnalysisAdmit", () => {
     const f = fakeClient((text) => (text === ANALYSIS_ADMIT_SQL ? boom : []));
     const admit = perRequestAdmitPool(async () => f.client, f.end);
     await expect(sqlAnalysisAdmit(admit.pool)(identity, "s-1")).rejects.toBe(boom);
-    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "ROLLBACK"]);
+    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, ANALYSIS_ADMIT_SQL, "ROLLBACK"]);
     expect(f.seen.some((q) => q.text === "COMMIT")).toBe(false);
     await admit.close();
     expect(f.ended()).toBe(1);
@@ -53,7 +68,7 @@ describe("perRequestAdmitPool + sqlAnalysisAdmit", () => {
     const f = fakeClient((text) => (text === TENANT_SETTINGS_SQL ? new Error("no") : []));
     const admit = perRequestAdmitPool(async () => f.client, f.end);
     await expect(sqlAnalysisAdmit(admit.pool)(identity, "s-1")).rejects.toThrow("no");
-    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", TENANT_SETTINGS_SQL, "ROLLBACK"]);
+    expect(f.seen.map((q) => q.text)).toEqual(["BEGIN", ANALYSIS_ADMIT_BOUNDS_SQL, TENANT_SETTINGS_SQL, "ROLLBACK"]);
     await admit.close();
     expect(f.ended()).toBe(1);
   });

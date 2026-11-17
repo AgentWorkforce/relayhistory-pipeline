@@ -58,8 +58,8 @@ describe("preserve the deployed Reader profile", () => {
     expect(resolved.OWNER_BUFFERED).toBe("off");
     expect(ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...env, ...resolved }))).config.services).toBeUndefined();
   });
-  test("explicit off disables without fetching live metadata", async () => {
-    const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, async () => { throw Error("must not call"); });
+  test("explicit off disables without preserving live settings (live is read only for the analysis guard, no pin)", async () => {
+    const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, get());
     expect(resolved).toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
   });
   test("explicit buffered on/off cannot erase the directory just because its environment variable is unset", async () => {
@@ -74,8 +74,9 @@ describe("preserve the deployed Reader profile", () => {
     await expect(resolveProfile({ ...env, DIRECTORY_WORKSPACES_INPUT: "off" }, template, get())).rejects.toThrow(/differs from live/);
   });
   test("an explicit configuration change can narrow the directory and owner lists", async () => {
-    const narrowed = await resolveProfile({ ...env, OWNER_BUFFERED: "on", DIRECTORY_WORKSPACES_INPUT: "fixture-workspace", OWNER_BUFFERED_WORKSPACES: "fixture-workspace", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION }, template, async () => { throw Error("must not call"); });
+    const narrowed = await resolveProfile({ ...env, OWNER_BUFFERED: "on", DIRECTORY_WORKSPACES_INPUT: "fixture-workspace", OWNER_BUFFERED_WORKSPACES: "fixture-workspace", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION }, template, get());
     expect(narrowed.DIRECTORY_WORKSPACES).toBe("fixture-workspace");
+    expect(narrowed.PRESERVED_READER_VERSION).toBeUndefined();
   });
   test.each(["READ_API_REPEATABLE_READ", "READ_API_OUTPUT_ENABLED", "READ_API_DIGEST_ENABLED", "RELAYCONTROL_ORIGIN"])("default deploy refuses dropping unrelated live setting %s", async name => {
     await expect(resolveProfile(env, template, get(version({ ...values, [name]: "enabled-fixture" })))).rejects.toThrow(/change or drop live setting/);
@@ -106,7 +107,7 @@ describe("preserve the deployed Reader profile", () => {
       await expect(resolveProfile({ ...env, [key]: "on" }, template, live)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
       for (const flag of [undefined, "off"]) await expect(resolveProfile({ ...env, [key]: flag }, template, live), `${key}=${flag}`).rejects.toThrow(new RegExp(`change or drop live setting ${name}`));
       // Only off/on are inputs; nothing else is passed through as a value.
-      for (const bad of ["true", "1", "ON", " on", "yes"]) await expect(resolveProfile({ ...env, [key]: bad }, template, get()), `${key}=${bad}`).rejects.toThrow(/must be off or on/);
+      for (const bad of ["true", "1", "ON", " on", "yes"]) await expect(resolveProfile({ ...env, [key]: bad }, template, get()), `${key}=${bad}`).rejects.toThrow(key === "ANALYSIS" ? /must be off, on or disable/ : /must be off or on/);
     }
   });
   test("the ANALYSIS_ADMIT Hyperdrive binding: added with SESSION_READ_ANALYSIS_HYPERDRIVE_ID, kept when repeated, never silently dropped or changed", async () => {
@@ -123,6 +124,30 @@ describe("preserve the deployed Reader profile", () => {
     // The render's own validation applies: the read role's config is refused.
     await expect(resolveProfile({ ...env, ANALYSIS_HYPERDRIVE_ID: env.HYPERDRIVE_ID }, template, get())).rejects.toThrow(/read role's Hyperdrive config/);
     expect(profileInputs({ ...env, ANALYSIS_HYPERDRIVE_ID: AD }).analysisHyperdriveId).toBe(AD);
+  });
+  test("explicit owner_buffered=on/off never silently drops a live analysis flag or ANALYSIS_ADMIT binding; analysis=disable removes them", async () => {
+    const AD = "fedcba9876543210fedcba9876543210";
+    const live = (extra: Record<string, string>[]) => { const v = version({ ...values, READ_API_ANALYSIS_ENABLED: "true" }); (v.resources.bindings as Array<Record<string, string>>).push(...extra); return get(v); };
+    const on = { ...env, OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION };
+    const off = { ...env, OWNER_BUFFERED: "off" };
+    const binding = { name: "ANALYSIS_ADMIT", type: "hyperdrive", id: AD };
+    for (const explicit of [on, off, { ...off, DIRECTORY_WORKSPACES_INPUT: "off" }, { ...on, DIRECTORY_WORKSPACES_INPUT: "*" }]) {
+      // analysis left at its default: refused, whether or not the directory comes from live.
+      for (const analysis of [undefined, "", "off"]) {
+        await expect(resolveProfile({ ...explicit, ANALYSIS: analysis, ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding])), String(analysis)).rejects.toThrow(/drop live setting READ_API_ANALYSIS_ENABLED/);
+      }
+      // Repeating it (flag and binding) passes; dropping or changing only the binding is refused.
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "on", ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", explicit.OWNER_BUFFERED);
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "on" }, template, live([binding]))).rejects.toThrow(/drop live Hyperdrive binding ANALYSIS_ADMIT/);
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "on", ANALYSIS_HYPERDRIVE_ID: "abcdefabcdefabcdefabcdefabcdefab" }, template, live([binding]))).rejects.toThrow(/drop live Hyperdrive binding ANALYSIS_ADMIT/);
+      // The explicit removal.
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "disable" }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", explicit.OWNER_BUFFERED);
+      // Live metadata unreadable: refused (the guard cannot be skipped).
+      await expect(resolveProfile({ ...explicit, ANALYSIS: "on" }, template, async () => { throw Error("unavailable"); })).rejects.toThrow();
+    }
+    // profile/preserve: analysis=disable also lets the dispatch drop both.
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, live([binding]))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, ANALYSIS: "off", ANALYSIS_HYPERDRIVE_ID: AD }, template, live([binding]))).rejects.toThrow(/drop live setting READ_API_ANALYSIS_ENABLED/);
   });
   test("default deploy accepts unchanged unrelated variables and checks the real CLI overrides", async () => {
     const base = ts.parseConfigFileTextToJson("base.jsonc", template).config;
@@ -230,7 +255,7 @@ describe("committed production profile (DEPLOY_TARGET=production)", () => {
     expect(render(overridden, on).vars.READ_API_OWNER_BUFFERED_EVENTS).toBeUndefined();
     expect((await resolveProfile({ ...on, OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off" }, template, get())).OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("off");
     // Explicit off ignores the profile entirely.
-    expect(await resolveProfile({ ...prod, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, async () => { throw Error("must not call"); }))
+    expect(await resolveProfile({ ...prod, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, get()))
       .toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
   });
   test("a non-production target ignores the profile: profile means preserve, explicit on renders only its inputs", async () => {
