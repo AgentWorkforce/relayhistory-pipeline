@@ -12,7 +12,15 @@
  *     batch, after the claim and before any canonical write, and refuses with the SQL guard's own answer, 409
  *     `operator_session_erased`. Every S3-ledger admission path goes through deliver: the synchronous POST, the
  *     async consumer (a 409 is terminal there) and upload-inbox promotion. A store error other than not-found
- *     fails closed (503, retried).
+ *     fails closed (503, retried). (INGEST_LEDGER_LOG_COMMIT=on appends bypass deliver's guard, so the flag
+ *     refuses log commit; the log path is not covered.)
+ *   - too_many_owners: the SQL begin keeps the session fence and a failed receipt when the owner cap is exceeded
+ *     (docs/operator-session-erase-contract.md section 7, "future uploads stay refused"), so the tombstones are
+ *     written on that error too before it is rethrown (a tombstone write failure there is a 503 `unavailable`).
+ *
+ * Every ingest process on the same store must run with the flag on: a process started without it (an async
+ * consumer, promotion) does not read the tombstones and fails open. The runtime logs a warning at startup when
+ * INGEST_LEDGER=s3 and the flag is off; enforcing it across processes is a follow-up.
  *
  * Tombstones are never deleted by this code (an operator un-erase is out of scope), and they live in the Locker
  * bucket: `<keyRoot>/.ledger/session-erase/...` is not a ledger key (ledger-store.ts ledgerKeyMatcher).
@@ -71,12 +79,19 @@ export async function writeSessionEraseTombstones(store: ObjectStore, keyRoot: s
   }
 }
 
-/** The SQL erase service, plus the tombstones before the receipt is returned. `receipt` is unchanged. */
+/** The SQL erase service, plus the tombstones before the receipt (or the too_many_owners error) is returned. `receipt` is unchanged. */
 export function withS3EraseTombstones(service: SessionEraseService, store: ObjectStore, keyRoot: string, nowMs: () => number = Date.now): SessionEraseService {
   return {
     ...service,
     async erase(key, request) {
-      const receipt = await service.erase(key, request);
+      let receipt;
+      try { receipt = await service.erase(key, request); }
+      catch (error) {
+        // The owner cap: the SQL fence is kept (contract section 7), so the S3 fence must exist too.
+        if (error instanceof SessionEraseServiceError && error.code === "too_many_owners")
+          await writeSessionEraseTombstones(store, keyRoot, key, nowMs());
+        throw error;
+      }
       await writeSessionEraseTombstones(store, keyRoot, key, nowMs());
       return receipt;
     },

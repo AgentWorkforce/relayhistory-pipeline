@@ -255,6 +255,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   if (eraseFence && !s3) throw new Error("96bulls: INGEST_S3_ERASE_FENCE=on needs INGEST_LEDGER=s3");
   if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || !eraseFence && (parts.withSessionWrites || parts.sessionEraseService)))
     throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
+  // Every process on the store must check the tombstones; one without the flag fails open (s3-erase-fence.ts).
+  if (s3 && !eraseFence) (options.log ?? log).warn("S3 erase fence off: operator erase tombstones are not checked by this process", { ledger: "s3", s3_erase_fence: "off" });
   // Flag off: exactly the parts as given (no guard, no tombstone write).
   const withSessionWrites = eraseFence ? composeSessionWriteGuards(s3EraseFenceGuard(parts.store, settings.keyRoot), parts.withSessionWrites) : parts.withSessionWrites;
   const sessionEraseService = eraseFence && parts.sessionEraseService
