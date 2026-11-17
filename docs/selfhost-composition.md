@@ -10,6 +10,8 @@ Worker. History is served by the `sessions-*` services in this repository. The
 user's relaycontrol (Control) is the only identity authority: it issues the
 `sh_at_` user tokens and answers introspection.
 
+For a local-only, single-user install of this composition (docker compose behind an nginx TLS edge), see [selfhost-local.md](selfhost-local.md).
+
 ## 1. The image and its SERVICEs
 
 There is one image (`docker/services.Dockerfile`), and `SERVICE=` picks the

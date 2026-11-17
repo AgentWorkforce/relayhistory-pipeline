@@ -5,6 +5,8 @@ containers on one machine, from `alchemy.run.ts` (Alchemy v2, Docker
 provider). It is the proving ground for the hosted and self-hosted stacks: same
 services, same env contract, same migrations.
 
+To run the self-host services for yourself on one machine (fs Locker, single-user control, TLS edge), see [selfhost-local.md](selfhost-local.md).
+
 ## What runs
 
 | Container | Image | Role |
