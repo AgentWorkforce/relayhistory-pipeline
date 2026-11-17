@@ -79,7 +79,8 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
-import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
+import { initScrubEngine, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
+import { sealPoolDeps } from "./seal-pool.ts";
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import { ledgerRoutedStore } from "./ledger-store.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
@@ -280,12 +281,15 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   // INGEST_LEDGER_LOG_ERASE=on (parsed at config, refused there without s3 + log commit): refused again here.
   if (settings.ledgerLogErase && !logCommit) throw new Error("96bulls: INGEST_LEDGER_LOG_ERASE=on needs INGEST_LEDGER=s3 and INGEST_LEDGER_LOG_COMMIT=on");
   const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined, { logModeGuard: logCommit, logErase: settings.ledgerLogErase === true, logger: options.log ?? log }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  // INGEST_SEAL_WORKERS (seal-pool.ts, default 0): the raw-chunk seal on worker threads, same bytes.
+  // Off: exactly routedRawChunkSealerDeps() (SCRUB_ENGINE=wasm-bindgen's bound sealer, or {}).
+  const { sealPool: _sealPool, ...sealerDeps } = sealPoolDeps(process.env);
   const deliver: DeliverDeps = {
     ledger,
     ...(withSessionWrites ? { withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
-    target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps(), ...(options.nowMs ? { now: () => new Date(options.nowMs!()) } : {}) },
+    target: { store: parts.store, keyRoot: settings.keyRoot, ...sealerDeps, ...(options.nowMs ? { now: () => new Date(options.nowMs!()) } : {}) },
     // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
     slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
     // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).
