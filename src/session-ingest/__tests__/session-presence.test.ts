@@ -62,7 +62,7 @@ test("dispatch: presence-dry is accepted while executes are dormant; it is dry, 
   expect((BACKLOG_OPS_MODES as readonly string[]).includes("presence-dry")).toBe(true);
   expect((BACKLOG_OPS_MODES as readonly string[]).includes("presence-execute")).toBe(false);
   const d = backlogOpsDispatch(presence());
-  expect(d).toEqual({ mode: "presence-dry", sha, dryRun: null, backfillRun: null, exportRun: null, fullBackfillRun: null, maxObjects: null, confirmation: "" });
+  expect(d).toEqual({ mode: "presence-dry", sha, dryRun: null, backfillRun: null, exportRun: null, fullBackfillRun: null, maxObjects: null, slotsRead: "heap", confirmation: "" });
   expect(codeSync(() => backlogOpsDispatch(presence({ BACKLOG_OPS_FULL_BACKFILL_RUN: "444" }), true))).toBe("backlog_ops_full_backfill_run");
   expect(backlogOpsEnvironment("presence-dry")).toBe(BACKLOG_OPS_DRY_ENVIRONMENT);
   expect(backlogOpsBindings(d)).toEqual([]);
