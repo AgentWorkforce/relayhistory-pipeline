@@ -9,7 +9,7 @@
  *     --ingest-url https://<ingest origin> --org <test org> --workspace <test workspace> \
  *     --user <userId>:<TOKEN_ENV> --user <userId>:<TOKEN_ENV> [--user ...] \
  *     --bucket <canonical bucket> --region <region> [--ledger-bucket <b> --ledger-region <r>] [--sse-kms-key-id <arn>] \
- *     (--replicas-confirmed | --kube-namespace <ns> --kube-deployment <name> [--kube-context <ctx>]) \
+ *     (--replicas-confirmed | --kube-namespace <ns> --kube-deployment <name> --kube-context <ctx>) \
  *     [--control-url https://<relay-control origin>]   # adds the presigned direct-upload path
  *
  * What it drives, reusing the pipeline e2e's Desktop-shaped batch (e2e/pipeline/fixtures.ts deliveryBatch):
@@ -19,10 +19,13 @@
  *   - every other revision sent as N concurrent copies of the SAME batch (a retry storm racing both replicas);
  *   - mid-burst, an S3-ledger reset of the first user (ledger-s3.ts resetUploadedSessions, as the e2e's
  *     controls.s3 step: self-host serves no reset route under INGEST_LEDGER=s3), raced by in-flight uploads,
- *     then re-uploads of the reset sessions (must not land) and new sessions (must land).
+ *     then re-uploads of the reset sessions (must not land) and new "after" sessions (must land).
  * Then, after quiescence, it reads the S3 ledger and canonical objects back and asserts exactly-once admission
- * (evaluate() below). Output: one JSON receipt with counts only (no tokens, keys, tenant ids or bodies) and a
- * PASS/FAIL verdict; exit 0 PASS, 1 FAIL, 2 refused before any upload.
+ * (evaluate() below), and finally tombstones its own after sessions (a second reset, applied only if nothing else
+ * of user 0's is live), so the next run with the same synthetic user 0 starts from nothing live.
+ * Output: one JSON receipt with counts only (no tokens, keys, tenant ids or bodies) and a verdict. Exit codes:
+ * 0 PASS or PASS_UNATTRIBUTED (no per-replica evidence: not a two-replica proof), 1 FAIL, 2 refused before any
+ * upload (a static or runtime preflight refusal).
  *
  * Storage credentials (read-back, and the reset's fence write): `--credentials keys` (default) reads
  * AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN]; `podIdentity` uses EKS Pod Identity (the same
@@ -164,6 +167,25 @@ function targetRefusals(what: string, name: string, exempt = false): string[] {
 }
 
 /**
+ * The presigned PUT URL relay-control answers for the direct path: the same target checks as every other target
+ * (https, or plain http to loopback only; no production token; a non-production marker unless loopback). A presigned
+ * URL carries its signature in the query, so only credentials and a fragment are refused there. The name checked is
+ * the host and, for a path-style URL, the bucket (the first path segment), so either may carry the marker; the
+ * deny-list applies to both.
+ */
+export function uploadUrlRefusals(u: string): string[] {
+  let url: URL;
+  try { url = new URL(u); } catch { return ["upload_url_invalid"]; }
+  if (url.username || url.password || url.hash) return ["upload_url_invalid"];
+  const loopback = isLoopback(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return [url.protocol === "http:" ? "upload_url_plain_http_not_loopback" : "upload_url_invalid"];
+  const bucket = decodeURIComponent(url.pathname.split("/")[1] ?? "");
+  if (PROD.test(url.hostname) || PROD.test(bucket)) return ["upload_url_looks_like_production"];
+  if (!loopback && !NON_PROD.test(url.hostname) && !NON_PROD.test(bucket)) return ["upload_url_not_marked_non_production"];
+  return [];
+}
+
+/**
  * Every reason not to run, as fixed codes (never a value). Empty = go. `env` supplies the token variables, which
  * are only checked for presence and shape. `planOnly` skips the token and replica checks (no request is sent).
  */
@@ -219,6 +241,13 @@ export function preflightRefusals(c: ProofConfig, env: Record<string, string | u
   }
   for (const [what, k] of [["kube_namespace", c.kubeNamespace], ["kube_deployment", c.kubeDeployment], ["kube_context", c.kubeContext]] as const)
     if (k !== undefined) r.push(...targetRefusals(what, k));
+  // kubectl evidence (and the read-only kubectl calls) only against an explicitly named, checked context: never the
+  // operator's current context, which could be any cluster.
+  if ((c.kubeNamespace !== undefined || c.kubeDeployment !== undefined) && c.kubeContext === undefined) r.push("kube_context_required_with_kubectl");
+  // The vendored S3 client reads no environment: it ignores AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 and, without
+  // --endpoint, always talks to AWS S3. Refuse them without --endpoint, so an operator who set one for another store
+  // is not silently sent elsewhere; the only object-store endpoint is the checked --endpoint.
+  if (c.endpoint === undefined && (env.AWS_ENDPOINT_URL || env.AWS_ENDPOINT_URL_S3)) r.push("aws_endpoint_env_without_endpoint_flag");
   // The reset is user-wide (resetUploadedSessions tombstones every session user 0 owns): only on a declared synthetic user.
   if (!c.resetUserIsSynthetic) r.push("reset_user_not_declared_synthetic");
   const range = (n: number, lo: number, hi: number) => Number.isInteger(n) && n >= lo && n <= hi;
@@ -342,9 +371,15 @@ export interface Observation {
   records: RecordObservation[];
   sessions: SessionObservation[];
   storage: { inboxPending: number; uploadInboxPending: number; deadLetters: number };
-  http: { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number };
+  /** `targetRefusals`: direct-path PUT URLs refused by uploadUrlRefusals (never sent to), by code. */
+  http: { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number; targetRefusals?: Record<string, number> };
   /** `refused`: the reset was not applied because user 0 owned sessions outside the run (resetOwnershipCheck). */
   reset: { count: number | null; replay: number | null; resetSessions: number; fenceResets: number | null; refused?: "foreign_sessions" | "owners_unreadable" };
+  /**
+   * The end-of-run reset of the run's own after sessions (resetAfterSessions), so a rerun with the same synthetic
+   * user 0 starts from nothing live. `live`: the after sessions user 0 owned live just before it.
+   */
+  cleanup: AfterReset;
   replicas: { by: "kubectl" | "operator_flag" | "local_compose"; ready: number | null; env?: Record<string, string | null> };
   logs?: Record<string, LogTally>;
   quiesced: boolean;
@@ -426,8 +461,14 @@ export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly stri
   fail("upload_inbox_left_unpromoted", o.storage.uploadInboxPending);
   fail("dead_lettered", o.storage.deadLetters);
   fail("unexpected_http_answer", o.http.unexpected);
+  for (const [code, n] of Object.entries(o.http.targetRefusals ?? {})) fail(code, n);
   const allowed = new Set([...EXPECTED_RETRY_CODES, ...(opts.allowRetryCodes ?? [])]);
   for (const [code, n] of Object.entries(o.http.retryCodes)) if (!allowed.has(code)) fail("unexpected_retry_code", n);
+
+  // The after sessions must be tombstoned, or the next run with this user 0 refuses before any upload.
+  if (o.cleanup.refused) fail(`cleanup_reset_refused_${o.cleanup.refused}`);
+  else if (o.cleanup.count === null) fail("cleanup_reset_not_run");
+  else if (o.cleanup.count !== o.cleanup.live) fail("cleanup_count_not_equal_live_after_sessions");
 
   if (o.reset.refused) fail(`reset_refused_${o.reset.refused}`);
   else if (o.reset.count === null) fail("reset_not_run");
@@ -477,7 +518,7 @@ export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly stri
       batch_records: tally(o.batches, (b) => b.record),
       refusals_by_code: tally(o.batches.filter((b) => b.terminal === "refused"), (b) => b.refusedCode ?? "none"),
       records_checked: o.records.length, sessions_checked: o.sessions.length,
-      storage: o.storage, http: o.http, reset: o.reset,
+      storage: o.storage, http: o.http, reset: o.reset, cleanup: o.cleanup,
       replicas: { by: o.replicas.by, ready: o.replicas.ready, pods_with_work: o.logs ? podsServing : null },
       ...(o.logs ? { log_codes: logCodes, logs_by_pod: Object.values(o.logs) } : {}),
     },
@@ -545,7 +586,7 @@ function semaphore(n: number) {
   };
 }
 
-interface Http { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number }
+interface Http { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number; targetRefusals: Record<string, number> }
 const bump = (m: Record<string, number>, k: string) => { m[k] = (m[k] ?? 0) + 1; };
 const retryAfterMs = (res: Response) => Math.min(15_000, Math.max(1_000, Number(res.headers.get("retry-after") ?? "2") * 1000 || 2_000));
 const errorCode = (json: any): string => {
@@ -560,7 +601,7 @@ const errorCode = (json: any): string => {
 export type DirectPut = (user: number, originId: string, body: { batch: { batch_id: string } }, bytes: Uint8Array, copies: number) => Promise<{ uploadKey: string } | { code: string }>;
 
 class Run {
-  readonly http: Http = { statuses: {}, retryCodes: {}, unexpected: 0 };
+  readonly http: Http = { statuses: {}, retryCodes: {}, unexpected: 0, targetRefusals: {} };
   /** Requests sent per ingest URL (index into ingestUrls): proof the client spread its load. */
   readonly byTarget: number[];
   readonly limit: ReturnType<typeof semaphore>;
@@ -658,6 +699,9 @@ class Run {
     }
     if (!creds) return { terminal: "unsent", code: "credentials_unavailable" };
     const target = creds.urls[0]!;
+    // The PUT target is relay-control's answer, not an operator flag: check it like every other target before sending.
+    const refusedUrl = uploadUrlRefusals(target.url);
+    if (refusedUrl.length) { for (const code of refusedUrl) bump(this.http.targetRefusals, code); return { terminal: "unsent", code: refusedUrl[0]! }; }
     const headers: Record<string, string> = {
       "if-none-match": "*", "content-type": "application/json", "content-encoding": "zstd", "x-amz-checksum-sha256": checksum,
       [UPLOAD_WITNESS_METADATA_HEADER]: creds.witness,
@@ -726,7 +770,9 @@ async function readJson(store: ObjectStore, key: string): Promise<any | null> {
 }
 
 function kubectl(c: ProofConfig, args: string[]): string | null {
-  const r = spawnSync("kubectl", [...(c.kubeContext ? ["--context", c.kubeContext] : []), "-n", c.kubeNamespace!, ...args], { encoding: "utf8", timeout: 60_000, maxBuffer: 256 * 1024 * 1024 });
+  // preflightRefusals requires --kube-context with kubectl: never the operator's current context.
+  if (!c.kubeContext || !c.kubeNamespace) return null;
+  const r = spawnSync("kubectl", ["--context", c.kubeContext, "-n", c.kubeNamespace, ...args], { encoding: "utf8", timeout: 60_000, maxBuffer: 256 * 1024 * 1024 });
   return r.status === 0 ? r.stdout : null;
 }
 
@@ -760,10 +806,7 @@ async function main(argv: string[]): Promise<number> {
     const covered = org !== null ? validOrgFenceAuthority(org) && org.orgId === c.org : validFenceAuthority(await readJson(store, fenceAuthorityKey(c.keyRoot)));
     if (!covered) pre.push("org_not_covered_by_fence_authority_marker");
   } catch { pre.push("store_unreadable"); }
-  // The reset user must own no live session yet: everything the mid-run reset tombstones is then this run's.
-  const own = await ownershipCheck(store, c.keyRoot, { orgId: c.org, workspaceId: c.workspace, userId: c.users[0]!.userId }, new Set());
-  if (own === null) pre.push("reset_user_owners_unreadable");
-  else if (own.foreign > 0) pre.push("reset_user_owns_sessions_outside_the_run");
+  pre.push(...(await resetUserPrerunRefusals(store, c)));
   let replicas: Observation["replicas"] = { by: "operator_flag", ready: null };
   let selector: string | undefined;
   if (c.kubeNamespace && c.kubeDeployment) {
@@ -811,6 +854,36 @@ export async function ownershipCheck(store: ObjectStore, keyRoot: string, tenant
     const [owners, fence] = await Promise.all([io.listOwners(keys), io.readFence(keys.fence)]);
     return resetOwnershipCheck(owners, fence.state === "present" ? fence.fence : null, runSessions);
   } catch { return null; }
+}
+
+/**
+ * Before any upload: the reset user must own no live session yet, so everything the mid-run reset tombstones is this
+ * run's. A previous run's sessions are not live: its mid-run reset tombstoned the reset sessions and its end-of-run
+ * reset (resetAfterSessions) the after sessions. A run that stopped before that leaves live stubs: this refuses then.
+ */
+export async function resetUserPrerunRefusals(store: ObjectStore, c: Pick<ProofConfig, "keyRoot" | "org" | "workspace" | "users">): Promise<string[]> {
+  const own = await ownershipCheck(store, c.keyRoot, { orgId: c.org, workspaceId: c.workspace, userId: c.users[0]!.userId }, new Set());
+  if (own === null) return ["reset_user_owners_unreadable"];
+  return own.foreign > 0 ? ["reset_user_owns_sessions_outside_the_run"] : [];
+}
+
+export interface AfterReset { count: number | null; live: number | null; refused?: "foreign_sessions" | "owners_unreadable" }
+
+/**
+ * The end-of-run reset: the run's after sessions (created after the mid-run reset, so still live) are tombstoned by a
+ * second user-wide reset of user 0, applied ONLY if the live sessions user 0 owns are a subset of `afterSessions`
+ * (`originId\nsessionId`; the same read-only check as the mid-run reset). It never reaches further than the mid-run
+ * reset could: anything else live refuses it. An after session that never landed has no stub and is simply not live.
+ */
+export async function resetAfterSessions(
+  ledger: Pick<ReturnType<typeof s3Ledger>, "resetUploadedSessions">, store: ObjectStore, keyRoot: string, tenant: LedgerTenant,
+  afterSessions: ReadonlySet<string>, requestId: string,
+): Promise<AfterReset> {
+  const own = await ownershipCheck(store, keyRoot, tenant, afterSessions);
+  if (own === null) return { count: null, live: null, refused: "owners_unreadable" };
+  if (own.foreign > 0) return { count: null, live: own.live, refused: "foreign_sessions" };
+  try { return { count: await ledger.resetUploadedSessions(tenant, requestId), live: own.live }; }
+  catch { return { count: null, live: own.live }; }
 }
 
 /** What a run needs besides its config: the stores, the tokens, where to send, and how to read each replica's log. */
@@ -933,12 +1006,16 @@ export async function runProof(c: ProofConfig, ctx: ProofContext) {
     reset.fenceResets = fence.state === "present" ? fence.fence.resets : 0;
   } catch { reset.fenceResets = null; }
 
+  // ---- end-of-run reset of the run's own after sessions (all read back above), so a rerun with this user 0 can start ----
+  const afterSessions = new Set(chains.filter((ch) => ch.role === "after").map((ch) => `${ch.originId}\n${ch.sessionId}`));
+  const cleanup = await resetAfterSessions(ledger, store, c.keyRoot, run.ledgerTenant(0), afterSessions, `mrp-cleanup-${runId}`);
+
   // ---- per-replica logs: evidence that both replicas did the work, and their retry codes ----
   const logs = ctx.collectLogs ? await ctx.collectLogs(startedMs) : undefined;
 
   const obs: Observation = {
     batches: sent.map((s, i) => ({ expect: s.batch.expect, path: s.chain.path, terminal: s.terminal, ...(s.code ? { refusedCode: s.code } : {}), ...records[i]!, ...(s.diverged ? { receiptsDiverged: true } : {}) })),
-    records: recordObs, sessions: sessionObs, storage, http: run.http, reset, replicas: ctx.replicas, ...(logs ? { logs } : {}), quiesced,
+    records: recordObs, sessions: sessionObs, storage, http: run.http, reset, cleanup, replicas: ctx.replicas, ...(logs ? { logs } : {}), quiesced,
   };
   // Batches planned but never sent (a chain stopped at a non-admitted revision) are failures too.
   const planned = planCounts(chains).unique_batches;

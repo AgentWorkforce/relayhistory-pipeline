@@ -19,18 +19,32 @@ anything. It refuses production-looking targets before it sends a single request
      - **Loopback exemptions:** a loopback ingest or control host, and the buckets behind a loopback
        `--endpoint` (the local mode), are exempt from the marker but never from the deny-list.
      - **`--endpoint` scheme:** it must be https, or plain http to `localhost` / `127.0.0.1` / `[::1]` only.
+     - **The direct-upload PUT target** (the presigned URL relay-control answers) passes the same checks before
+       any PUT: https or loopback, no production token in the host or the path-style bucket, and a marker in one
+       of them. A refused URL is never sent to; the run fails with its `upload_url_*` code.
+     - **`AWS_ENDPOINT_URL` / `AWS_ENDPOINT_URL_S3`.** The script's S3 client reads no environment, so these are
+       ignored: without `--endpoint` it always talks to AWS S3. The run refuses if either is set without
+       `--endpoint`; use `--endpoint`, which is checked.
+
+     > **Warning:** loopback means a stack running on this machine (the local mode). Never reach a remote
+     > deployment through a `kubectl port-forward`, an ssh tunnel or any other forward to a loopback port: that
+     > skips the marker check on a host and bucket the script cannot see, and plain http then carries the tokens.
+     > Point the script at the deployment's own https names instead.
 
      The fence-authority marker is not the only guard.
    - `--reset-user-is-synthetic` is set. The mid-run reset is **user-wide**: `resetUploadedSessions` tombstones
      every session user 0 owns, not only the run's. User 0 must be a dedicated synthetic user.
-   - User 0 owns no live session yet (a read-only list of its ownership stubs against its fence). Sessions a
-     previous run's reset already tombstoned do not count.
+   - User 0 owns no live session yet (a read-only list of its ownership stubs against its fence). A previous
+     complete run leaves nothing live: its mid-run reset tombstoned its reset sessions, and its end-of-run reset
+     (after the read-back, step 4) its after sessions. So a rerun with the same synthetic user 0 is allowed. A run that stopped before
+     its end-of-run reset (killed, or the reset refused) leaves live stubs, and the next run refuses
+     `reset_user_owns_sessions_outside_the_run`: use a fresh synthetic user 0 then.
    - At least two distinct synthetic users are named, and each token variable holds an `sh_at_` token.
    - The org is covered by a valid fence-authority marker, and no `.stop.json` kill switch is present.
    - Two or more replicas are confirmed, one of two ways:
-     - with `--kube-namespace` and `--kube-deployment`, the script itself runs read-only `kubectl get`
-       and `kubectl logs`. It requires `readyReplicas >= 2`, `INGEST_LEDGER=s3`, and
-       `INGEST_LEDGER_LOG_COMMIT` unset or `off`;
+     - with `--kube-namespace`, `--kube-deployment` and `--kube-context` (required: the script never uses the
+       current kubectl context), the script itself runs read-only `kubectl get` and `kubectl logs`. It requires
+       `readyReplicas >= 2`, `INGEST_LEDGER=s3`, and `INGEST_LEDGER_LOG_COMMIT` unset or `off`;
      - or, if the operator has checked by hand (below), with `--replicas-confirmed`.
 
    It prints the config it sees (target, shape and, with kubectl, the deployment's ledger, admission and
@@ -60,6 +74,11 @@ anything. It refuses production-looking targets before it sends a single request
    - every batch record is out of `pending`.
 
    `--quiesce-timeout-s` (default 600) bounds the whole run, and the read-back gets 120 s more.
+   After the read-back, the **end-of-run reset** tombstones the run's after sessions with a second user-wide
+   reset of user 0 (request id `mrp-cleanup-<run_id>`). It runs only if the live sessions user 0 owns are a
+   subset of the run's after sessions (the same read-only check as the mid-run reset), so it never reaches
+   further than the mid-run reset could. It fails `cleanup_reset_refused_*`, `cleanup_reset_not_run` or
+   `cleanup_count_not_equal_live_after_sessions` otherwise.
 5. **Assertions** (`evaluate()`). Each failure is a fixed code in the receipt.
    - Every batch is terminal. The only refusals allowed are `delivery_privacy_superseded`, and only on a race or blocked batch.
    - Every sent batch has exactly one S3 ledger batch record, `committed`, whose `receiptId` is the one the
@@ -174,7 +193,7 @@ bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env 
   --user <user id 1>:PROOF_TOKEN_1 --user <user id 2>:PROOF_TOKEN_2 --user <user id 3>:PROOF_TOKEN_3 \
   --bucket <canonical bucket> --region <region> [--ledger-bucket <ledger bucket> --ledger-region <region>] \
   [--sse-kms-key-id <key arn, if the bucket policy requires it on PUT>] \
-  --kube-namespace <namespace> --kube-deployment <release>-ingest-edge [--kube-context <dev context>] \
+  --kube-namespace <namespace> --kube-deployment <release>-ingest-edge --kube-context <dev context> \
   [--control-url https://<dev relay-control origin>] \
   --receipt-out ~/.agent-tmp/<you>/ingest-edge-multireplica-receipt.json
 ```
@@ -197,8 +216,13 @@ to the S3 ledger, the async consumer or upload promotion.
 ```sh
 docker build -f docker/services.Dockerfile -t 96bulls/services:mrp-local .     # or omit --image: the script builds and removes its own
 bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp-local \
-  [--sessions-per-origin 12]  [--revisions 4] [--retry-copies 4] [--concurrency 12] [--receipt-out ~/.agent-tmp/<you>/local-receipt.json]
+  [--sessions-per-origin 12]  [--revisions 4] [--retry-copies 4] [--concurrency 12] [--receipt-out ~/.agent-tmp/<you>/local-receipt.json] \
+  [--runs 2]
 ```
+
+`--runs N` (1 to 3) runs the whole proof N times back to back on the same stack, users and user 0, each run
+after the dev mode's pre-run check. Run 2 passing proves a rerun with the same synthetic user 0 works. Each
+run's log tally covers only its own window. With `--receipt-out`, run 2's receipt goes to `<file>.run2`.
 
 - **Stack.** A fresh compose project, `e2e/selfhost/compose.yaml` with `e2e/multireplica/compose.yaml` layered
   over it: Postgres (the ingest's startup role check needs it; no upload accounting touches it), MinIO, the
@@ -226,7 +250,7 @@ bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp
   - neither process restarted.
 - **Cleanup.** The compose project, its volumes and network, the per-run certificate directory and (without
   `--image`) the image are removed on exit. `--keep` leaves the project up and prints how to remove it.
-- **Exit codes.** 0 PASS, 1 FAIL, 2 the stack did not come up.
+- **Exit codes.** 0 every run PASS, 1 any FAIL, 2 the stack did not come up or a run's pre-run check refused.
 - On a host with `umask 077`, build the image from a tree that is world-readable (`chmod -R a+rX` the checkout,
   excluding `node_modules`). Otherwise the image's `/entrypoint.sh` and sources are unreadable to its `bun` user.
 
@@ -238,7 +262,12 @@ bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp
 | `revision_regressed_or_lost`, `revision_ahead_of_any_admitted` | The revision-index merge (`mergeIndex`, the 4096 shards) lost or reordered a write under contention. Look for `ledger_revision_contended` retries that exhausted their attempts. |
 | `reset_superseded_revision_admitted`, `reset_superseded_write_landed` | A claim admitted after the reset without seeing the fence. Check `ledger_fence_contended` and `ledger_control_pending` in the logs, and the user's `upload-fences.json` (`resets`, `resetsCompleted`). **Stop the rollout.** |
 | `manifest_missing`, `admitted_batch_not_written`, `more_than_one_manifest_for_session`, `revision_missing_from_index` | An admission answered admitted but the canonical write or index merge is missing. Check `admission_objects_ms` / `admission_commit_ms` on the pods and the session's prefix under `<root>/<org>/v1/ws=<ws>/m=srv_*/`. |
-| `reset_*` (not run, replay differs, fewer sessions, not in fence) | The operator credential's write access to `upload-fences.json` and the `ledger/owners/` listing; the SSE-KMS key on PUT. |
+| `reset_not_run`, `reset_replay_answered_differently`, `reset_not_recorded_in_fence` | The operator credential's write access to `upload-fences.json` and the `ledger/owners/` listing; the SSE-KMS key on PUT. |
+| `reset_count_not_equal_run_sessions` | The mid-run reset tombstoned a different number of sessions than the run's reset sessions: fewer is a missed tombstone (a run session's owner stub missing or unreadable), more means it reached a session outside the run. **Treat more as a safety failure**: check what user 0 owned. |
+| `reset_refused_foreign_sessions` | The mid-run reset was not applied: user 0 owned a live session outside the run when it was due. Something else used user 0 during the run. It must be a dedicated synthetic user; use a fresh one. |
+| `reset_refused_owners_unreadable` | The mid-run reset was not applied: the read-only listing of user 0's `ledger/owners/` or its fence failed. The operator credential's list and read access there. |
+| `cleanup_reset_refused_foreign_sessions`, `cleanup_reset_refused_owners_unreadable`, `cleanup_reset_not_run`, `cleanup_count_not_equal_live_after_sessions` | The end-of-run reset of the after sessions did not run or did not cover them. The same causes as the mid-run reset's. The run's after sessions stay live, so the next run with this user 0 refuses: use a fresh synthetic user 0. |
+| `upload_url_looks_like_production`, `upload_url_not_marked_non_production`, `upload_url_plain_http_not_loopback`, `upload_url_invalid` | relay-control answered a presigned PUT URL that fails the target checks; nothing was PUT. Check which upload bucket the `--control-url` deployment presigns for. **Stop: that control plane may not be the dev one.** |
 | `inbox_left_unprocessed`, `upload_inbox_left_unpromoted`, `not_quiesced_within_timeout`, `batch_never_terminal` | The consumers on both pods: `/readyz` `consumer.backlog`, `ingest.admission` lines with `outcome: deferred` (`tenant_limit`: are the caps too low?) or `retry`. Rerun with a longer `--quiesce-timeout-s` before calling it a bug. |
 | `dead_lettered`, `dead_lettered_in_logs` | `<root>/.admission-dlq/<org>/…` for the run's machines; the `error_code` on the `dead_lettered` log line. |
 | `unexpected_retry_code`, `unexpected_log_error_code` | `counts.http.retryCodes` and `counts.log_codes`. `ledger_fence_authority_*` means the test org's marker is missing or invalid. `ledger_store_error` means S3 throttling or permissions. |
@@ -246,6 +275,16 @@ bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp
 | `replica_admitted_nothing`, `replica_restarted` (local) | One process never committed a batch (it only replayed), or crashed. The local proof says nothing about two writers then. Check `--- ingest-r*` on stderr. |
 | `more_first_writes_than_admitted_batches` (local) | Two processes both committed one batch. **Exactly-once is broken**, as `duplicate_admission_manifest_written_twice` is. |
 | `admitted_batches_without_a_logged_commit` (local) | An admitted batch shows no `accepted` or `replay_fast` line on either process: a logging or attribution gap. Compare the ledger's batch records with `claimToken: null` (fast commits) against the logs. |
+| **Refused before any upload (exit 2)** | |
+| `missing_i_know_this_is_dev`, `target_env_not_dev_or_stage`, `reset_user_not_declared_synthetic` | Flags the operator must set: `--i-know-this-is-dev`, `--target-env dev\|stage\|sandbox`, and `--reset-user-is-synthetic` (only after making sure user 0 is a dedicated synthetic user). |
+| `<target>_looks_like_production` (`deployment`, `ingest_url`, `control_url`, `endpoint`, `bucket`, `ledger_bucket`, `kube_namespace`, `kube_deployment`, `kube_context`) | A target name carries `prod`, `production`, `prd` or `live`. **Do not work around it.** Check you are pointing at the dev or stage deployment. |
+| `<target>_not_marked_non_production` (same targets) | A target name carries no `dev`, `development`, `stage`, `staging`, `sandbox` or `test` token. Use the deployment's marked names, not an alias. |
+| `ingest_url_invalid`, `control_url_invalid`, `endpoint_invalid`, `endpoint_plain_http_not_loopback` | A URL that is not https (plain http is for a loopback host only: a stack on this machine, never a tunnel), or that carries credentials, a query or a fragment. |
+| `kube_context_required_with_kubectl`, `kube_namespace_and_deployment_both_required`, `replicas_unconfirmed` | kubectl evidence needs `--kube-namespace`, `--kube-deployment` and `--kube-context` together; otherwise `--replicas-confirmed`. |
+| `aws_endpoint_env_without_endpoint_flag` | `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` is set but `--endpoint` is not. Unset them or pass the store with `--endpoint`. |
+| `reset_user_owns_sessions_outside_the_run`, `reset_user_owners_unreadable` | User 0 already owns a live session (a run that stopped before its end-of-run reset, or the user is not dedicated), or its owners listing is unreadable. Use a fresh synthetic user 0; never reset by hand to clear it. |
+| `fence_authority_stop_present`, `org_not_covered_by_fence_authority_marker`, `store_unreadable` | The `.stop.json` kill switch is set, the test org has no valid fence-authority marker, or the operator credential cannot read the ledger. |
+| `kubectl_deployment_unreadable`, `fewer_than_two_ready_replicas`, `ingest_ledger_not_s3`, `ledger_log_commit_not_off` | The kubectl preflight: the context, namespace and deployment, and the deployment's replicas and ledger env. |
 | `unexpected_http_answer`, `batch_not_sent` | `counts.http.statuses`. A 401 or 403 is a token or scope problem; a 422 `delivery_account_mismatch` means `--org` / `--workspace` is not the tokens' tenant; a 404 `history_upload_direct_off` from control means direct upload is off for the test org (drop `--control-url` or allowlist the org). |
 
 ## Cleanup
@@ -257,14 +296,16 @@ Everything the run writes is under the test org and workspace you passed in, key
   objects, and, under each user's admission directory, that user's `ledger/` prefix: its batch records
   (`ledger/batches/`), revision shards (`ledger/revisions/`) and owner stubs (`ledger/owners/`), as
   docs/selfhost-composition.md section 5 lays out (in the ledger bucket instead when it is split);
-- user 0's fence (`upload-fences.json`), which now records one reset;
+- user 0's fence (`upload-fences.json`), which now records two more resets (the mid-run reset and the
+  end-of-run reset of the after sessions);
 - the canonical objects under `<root>/<org>/v1/ws=<ws>/m=srv_*/`;
 - the search and directory rows the consumers index from them.
 
 **What the run destroys.** The script deletes no object, but it is not harmless:
 - The mid-run reset is a privacy control on user 0. It **tombstones every live session user 0 owns** in
   user 0's S3 upload fence. Those sessions' later uploads are never admitted, and this script cannot undo that. The reset is
-  user-wide, not run-scoped. That is why the run refuses unless `--reset-user-is-synthetic` is set, refuses
+  user-wide, not run-scoped. The end-of-run reset is user-wide too, and runs only if what user 0 owns live is
+  a subset of the run's after sessions. That is why the run refuses unless `--reset-user-is-synthetic` is set, refuses
   before any upload if user 0 already owns a live session, and refuses the reset itself if user 0 owns any
   session outside the run.
 - **Never** name a real person's account as the first `--user`.
@@ -276,7 +317,10 @@ Everything the run writes is under the test org and workspace you passed in, key
 - To remove a run's sessions, use the normal per-session erase path for the test workspace, or the
   canonical erase tooling scoped to that workspace prefix. Never use a prefix wider than the test org and
   workspace, and never touch another tenant's data.
-- The users' S3 ledger objects can stay: they are small. A rerun uses a new `run_id`, so it never collides with them.
+- The users' S3 ledger objects can stay: they are small. A rerun uses a new `run_id`, so its origins, sessions
+  and batch ids never collide with them. A rerun with the same user 0 is allowed only because the previous run's
+  end-of-run reset left user 0 owning nothing live; if that reset did not run (the receipt shows a `cleanup_*`
+  failure, or the run was killed), the rerun refuses before any upload and needs a fresh synthetic user 0.
 
 ## What it does not cover
 
@@ -297,5 +341,6 @@ Everything the run writes is under the test org and workspace you passed in, key
 - **Local mode** runs on one host and one MinIO: no network partitions, no real S3 consistency or throttling, no
   KMS, and no load balancer, so it does not test session affinity. It does not cover the kubectl preflight.
   Postgres is there only for the ingest's startup role check.
-- **Coverage so far.** It has been unit-tested (the preflight, the plan, the assertions and the kubectl parsing)
-  and run end to end in local mode. It has not yet been run against a live dev stack.
+- **Coverage so far.** It has been unit-tested (the preflight, the plan, the assertions, the kubectl parsing, and
+  a rerun with the same user 0 over a scratch store) and run end to end in local mode, including two consecutive
+  runs on one stack (`--runs 2`). It has not yet been run against a live dev stack.

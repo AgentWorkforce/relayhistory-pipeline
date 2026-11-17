@@ -9,15 +9,19 @@
  * exactly-once assertions, and additionally requires each process's log to show admissions of its own.
  *
  *   bun scripts/proof-ingest-edge-multireplica-local.ts [--image <tag>] [--users 3] [--sessions-per-origin 4]
- *     [--revisions 4] [--retry-copies 4] [--concurrency 12] [--quiesce-timeout-s 600] [--receipt-out <file>] [--keep]
+ *     [--revisions 4] [--retry-copies 4] [--concurrency 12] [--quiesce-timeout-s 600] [--receipt-out <file>] [--keep] [--runs 1]
  *
  * Without --image it builds docker/services.Dockerfile as 96bulls/services:mrp-<project> and removes it after.
  * Synthetic everything: per-run sh_at_ tokens (the stub's table), a per-run witness key, one test org/workspace,
  * the fence-authority marker for that org written into the local bucket (as e2e/pipeline upload.s3_ledger does).
  * The direct path stands in for relay-control: the script reads the user's privacy-journal seq, signs the witness
  * with the run's key and does the create-only PUT into the upload inbox itself (no presigned URL).
- * Receipt (counts only) on stdout; exit 0 PASS, 1 FAIL, 2 the stack did not come up. The compose project, its
- * volumes, the per-run certificate directory and (unless --image) the image are removed on exit (--keep: left up).
+ * --runs N (1..3) runs the whole proof N times back to back on the SAME stack, the same synthetic users and the same
+ * user 0: each run's end-of-run reset must leave user 0 owning nothing live, so the next run's pre-run check (the
+ * dev mode's resetUserPrerunRefusals) admits it. Each run's log tally covers only its own window (`logs --since`).
+ * Receipt (counts only) on stdout, one per run; exit 0 every run PASS, 1 any FAIL, 2 the stack did not come up or a
+ * run's pre-run check refused. The compose project, its volumes, the per-run certificate directory and (unless
+ * --image) the image are removed on exit (--keep: left up).
  */
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -31,7 +35,7 @@ import {
   encodeUploadWitness, parseUploadWitnessKey, uploadKeyPrefix, uploadObjectKey, uploadObjectSha256Hex,
 } from "../src/session-ingest/upload-inbox-contract.ts";
 import { createS3Store, isObjectStoreError, objectKey, type ObjectStore } from "../src/shared/vendor.ts";
-import { planBurst, preflightRefusals, runProof, tallyLog, type DirectPut, type ProofConfig } from "./proof-ingest-edge-multireplica.ts";
+import { planBurst, preflightRefusals, resetUserPrerunRefusals, runProof, tallyLog, type DirectPut, type ProofConfig } from "./proof-ingest-edge-multireplica.ts";
 
 const KEY_ROOT = "96bulls";
 const BUCKET = "transcripts";
@@ -45,6 +49,7 @@ const { values: v } = parseArgs({
     image: { type: "string" }, users: { type: "string", default: "3" }, "sessions-per-origin": { type: "string", default: "4" },
     revisions: { type: "string", default: "4" }, "retry-copies": { type: "string", default: "4" }, concurrency: { type: "string", default: "12" },
     "quiesce-timeout-s": { type: "string", default: "600" }, "receipt-out": { type: "string" }, keep: { type: "boolean", default: false },
+    runs: { type: "string", default: "1" },
   },
 });
 const int = (s: string | undefined) => (s !== undefined && /^[0-9]{1,6}$/.test(s) ? Number(s) : NaN);
@@ -89,7 +94,9 @@ const ready = async (url: string) => {
   }
   throw new Error(`not ready within 240s: ${new URL(url).host}${new URL(url).pathname}`);
 };
-const replicaLog = (service: string) => stackSession?.compose(["logs", "--no-color", "--no-log-prefix", service], { quiet: true, allowFail: true }).stdout ?? "";
+/** A service's log, since `sinceMs` when given (a run's own window, so an earlier run's lines are not counted). */
+const replicaLog = (service: string, sinceMs?: number) => stackSession?.compose(["logs", "--no-color", "--no-log-prefix",
+  ...(sinceMs !== undefined ? ["--since", new Date(sinceMs - 2_000).toISOString()] : []), service], { quiet: true, allowFail: true }).stdout ?? "";
 /** relay-control's credential mint and the desktop's create-only PUT, for one batch object. */
 function localDirectPut(store: ObjectStore): DirectPut {
   return async (u, originId, body, bytes, copies) => {
@@ -119,6 +126,8 @@ async function main(): Promise<number> {
   };
   // The proof's own shape checks (ranges, users); the tokens only ever live in this process.
   const refusals = preflightRefusals(c, Object.fromEntries(users.map((u, i) => [`MRP_LOCAL_TOKEN_${i}`, u.token])));
+  const runs = int(v.runs);
+  if (!(runs >= 1 && runs <= 3)) refusals.push("runs_out_of_range");
   if (refusals.length) { process.stdout.write(JSON.stringify({ refused: refusals }) + "\n"); return 2; }
 
   const stack = stackSession = createStack({
@@ -144,11 +153,23 @@ async function main(): Promise<number> {
   }
   log("both replicas ready (async admission); fence-authority marker written; burst starting");
 
+  let worst = 0;
+  for (let n = 1; n <= runs; n++) {
+    // The dev mode's pre-run check: user 0 owns nothing live (on run 2+, the previous run's end-of-run reset did that).
+    const pre = await resetUserPrerunRefusals(store, c);
+    if (pre.length) { process.stdout.write(JSON.stringify({ run: n, refused: pre }) + "\n"); return 2; }
+    if (runs > 1) log(`run ${n} of ${runs}: pre-run check passed (user 0 owns nothing live)`);
+    worst = Math.max(worst, await oneRun(c, n, store, ingestUrls, stack));
+  }
+  return worst;
+}
+
+async function oneRun(c: ProofConfig, n: number, store: ObjectStore, ingestUrls: string[], stack: StackSession): Promise<number> {
   const runId = randomBytes(5).toString("hex");
   const chains = planBurst(runId, users.length, { sessionsPerOrigin: c.sessionsPerOrigin, revisions: c.revisions, retryCopies: c.retryCopies, direct: true });
   const { receipt } = await runProof(c, {
     runId, chains, store, tokens: users.map((u) => u.token), ingestUrls, replicas: { by: "local_compose", ready: REPLICAS.length },
-    collectLogs: async () => Object.fromEntries(REPLICAS.map((r) => [r, tallyLog(replicaLog(r))])),
+    collectLogs: async (startedMs) => Object.fromEntries(REPLICAS.map((r) => [r, tallyLog(replicaLog(r, startedMs))])),
     directPut: localDirectPut(store), requireAdmissionsPerReplica: true,
   });
   const restarts = Object.fromEntries(REPLICAS.map((r) => {
@@ -157,14 +178,14 @@ async function main(): Promise<number> {
     return [r, /^\d+$/.test(out) ? Number(out) : null];
   }));
   const full = {
-    ...receipt, mode: "local",
+    ...receipt, mode: "local", run: n,
     local: { replicas: REPLICAS.length, replica_restarts: restarts, env: { INGEST_LEDGER: "s3", SELFHOST_INGEST_ADMISSION: "async", INGEST_S3_TENANT_LIMIT: "on", INGEST_LEDGER_LOG_COMMIT: "off", HISTORY_UPLOAD_DIRECT: "on",
       SELFHOST_ADMISSION_CONCURRENCY: stack.env.E2E_MRP_CONCURRENCY ?? "8", INGEST_ASYNC_MAX_PER_ORG: stack.env.E2E_MRP_ASYNC_MAX_PER_ORG ?? "2", INGEST_MAX_PER_USER: stack.env.E2E_MRP_MAX_PER_USER ?? "2", SELFHOST_ADMISSION_SCAN_MS: stack.env.E2E_MRP_SCAN_MS ?? "2000" } },
   };
-  if (Object.values(restarts).some((n) => n !== 0)) { (full as any).verdict = "FAIL"; (full as any).failures = { ...(full as any).failures, replica_restarted: 1 }; }
+  if (Object.values(restarts).some((k) => k !== 0)) { (full as any).verdict = "FAIL"; (full as any).failures = { ...(full as any).failures, replica_restarted: 1 }; }
   const text = JSON.stringify(full, null, 2);
   process.stdout.write(text + "\n");
-  if (v["receipt-out"]) writeFileSync(v["receipt-out"], text + "\n");
+  if (v["receipt-out"]) writeFileSync(n === 1 ? v["receipt-out"] : `${v["receipt-out"]}.run${n}`, text + "\n");
   if (full.verdict !== "PASS") for (const r of REPLICAS) process.stderr.write(`--- ${r} (last 40 lines)\n${replicaLog(r).split("\n").slice(-40).join("\n")}\n`);
   return full.verdict === "PASS" ? 0 : 1;
 }

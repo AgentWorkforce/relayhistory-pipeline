@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
-  BLOCKED_REVISION, evaluate, parseDeployment, parseProofArgs, planBurst, planCounts, ownershipCheck, preflightRefusals, resetOwnershipCheck, tallyLog,
+  BLOCKED_REVISION, evaluate, parseDeployment, parseProofArgs, planBurst, planCounts, ownershipCheck, preflightRefusals, resetAfterSessions, resetOwnershipCheck,
+  resetUserPrerunRefusals, tallyLog, uploadUrlRefusals,
   type BatchObservation, type Observation, type ProofConfig,
 } from "../../../scripts/proof-ingest-edge-multireplica.ts";
 import { s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash as sessionKey, type FenceDoc, type OwnerDoc } from "../ledger-s3.ts";
+import { createS3Store, objectKey } from "../../shared/vendor.ts";
 import { scratchStore } from "./support.ts";
 
 const ARGS = [
@@ -70,7 +72,19 @@ describe("preflightRefusals", () => {
     const c = cfg([], ["--replicas-confirmed"]);
     expect(preflightRefusals(c, ENV)).toContain("replicas_unconfirmed");
     expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev" }), ENV)).toContain("kube_namespace_and_deployment_both_required");
-    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge" }), ENV)).toEqual([]);
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge", kubeContext: "dev-cluster" }), ENV)).toEqual([]);
+  });
+  test("kubectl evidence needs an explicit, checked --kube-context (never the current context)", () => {
+    const c = cfg([], ["--replicas-confirmed"]);
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge" }), ENV)).toEqual(["kube_context_required_with_kubectl"]);
+    expect(preflightRefusals(with_(cfg(["--plan-only"]), { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge" }), {})).toContain("kube_context_required_with_kubectl");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge", kubeContext: "prod" }), ENV)).toContain("kube_context_looks_like_production");
+  });
+  test("AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 without --endpoint refuse; with the checked --endpoint they are irrelevant", () => {
+    const c = cfg();
+    expect(preflightRefusals(c, { ...ENV, AWS_ENDPOINT_URL: "https://s3.example.com" })).toEqual(["aws_endpoint_env_without_endpoint_flag"]);
+    expect(preflightRefusals(c, { ...ENV, AWS_ENDPOINT_URL_S3: "http://127.0.0.1:9000" })).toEqual(["aws_endpoint_env_without_endpoint_flag"]);
+    expect(preflightRefusals(with_(c, { endpoint: "https://s3.dev.example.test" }), { ...ENV, AWS_ENDPOINT_URL_S3: "https://s3.example.com" })).toEqual([]);
   });
   test("every target name needs a non-production marker, not just the absence of a production one", () => {
     const c = cfg();
@@ -156,6 +170,7 @@ function clean(): Observation {
       { role: "reset", min: 4, max: 5, absentOk: true, indexRevision: 5 },
       { role: "reset", min: 4, max: 4, absentOk: true, indexRevision: null },
     ],
+    cleanup: { count: 2, live: 2 },
     sessions: [{ role: "main", min: 8, max: 8, manifestRevision: 8, manifests: 1 }, { role: "reset", min: 4, max: 5, manifestRevision: 4, manifests: 1 }],
     storage: { inboxPending: 0, uploadInboxPending: 0, deadLetters: 0 },
     http: { statuses: { "200": 10, "429": 1 }, retryCodes: { delivery_busy: 1 }, unexpected: 0 },
@@ -234,6 +249,14 @@ describe("evaluate", () => {
     failsWith((o) => { o.reset.count = null; o.reset.replay = null; o.reset.refused = "foreign_sessions"; }, "reset_refused_foreign_sessions");
     failsWith((o) => { o.reset.fenceResets = 0; }, "reset_not_recorded_in_fence");
   });
+  test("the end-of-run reset of the after sessions must run and tombstone exactly the live ones", () => {
+    failsWith((o) => { o.cleanup = { count: null, live: 2 }; }, "cleanup_reset_not_run");
+    failsWith((o) => { o.cleanup = { count: 1, live: 2 }; }, "cleanup_count_not_equal_live_after_sessions");
+    failsWith((o) => { o.cleanup = { count: null, live: 3, refused: "foreign_sessions" }; }, "cleanup_reset_refused_foreign_sessions");
+    failsWith((o) => { o.cleanup = { count: null, live: null, refused: "owners_unreadable" }; }, "cleanup_reset_refused_owners_unreadable");
+  });
+  test("a refused direct-upload PUT target fails with its code", () =>
+    failsWith((o) => { o.http.targetRefusals = { upload_url_looks_like_production: 2 }; }, "upload_url_looks_like_production"));
   test("retry codes: contention codes pass, anything else fails unless allowed", () => {
     failsWith((o) => { o.http.retryCodes.ledger_fence_authority_missing = 1; }, "unexpected_retry_code");
     failsWith((o) => { o.logs!.pod_1!.codes.ledger_batch_record_invalid = 2; }, "unexpected_log_error_code");
@@ -342,5 +365,110 @@ describe("ownershipCheck over a store (read-only, before the reset)", () => {
       await s3Ledger(store, ROOT, { acceptanceMode: "canonical" }).resetUploadedSessions(tenant, "r1");
       expect(await ownershipCheck(store, ROOT, tenant, new Set())).toEqual({ live: 0, foreign: 0, missing: 0 });
     } finally { done(); }
+  });
+});
+
+describe("the end-of-run reset: a rerun with the same synthetic user 0 (P2-N1)", () => {
+  const ROOT = "96bulls";
+  const tenant = { orgId: "org_proof", workspaceId: "ws_proof", userId: "user_zero" };
+  const stub = (originId: string, sessionId: string, resets = 0): OwnerDoc => ({ v: 1, originId, source: "claude", sessionId, epoch: 0, resets });
+  const c = { keyRoot: ROOT, org: tenant.orgId, workspace: tenant.workspaceId, users: [{ userId: tenant.userId, tokenEnv: "T" }] };
+  /** One run's ledger effect on user 0, as runProof does it: reset sessions, the mid-run reset, after sessions, the end-of-run reset. */
+  async function oneRun(store: ReturnType<typeof scratchStore>["store"], runId: string) {
+    const io = s3LedgerObjects(store, ROOT);
+    const keys = s3LedgerKeys(ROOT, tenant);
+    const ledger = s3Ledger(store, ROOT, { acceptanceMode: "canonical" });
+    expect(await resetUserPrerunRefusals(store, c)).toEqual([]);
+    for (const side of ["a", "b"]) await io.registerOwner(keys.owner(`mrp-${runId}-u0-${side}`, "claude", `s-${runId}-${side}`), stub(`mrp-${runId}-u0-${side}`, `s-${runId}-${side}`));
+    const fenceBefore = (await io.readFence(keys.fence));
+    const resets = fenceBefore.state === "present" ? fenceBefore.fence.resets : 0;
+    expect(await ledger.resetUploadedSessions(tenant, `mrp-reset-${runId}`)).toBe(2);
+    // The after sessions land after the mid-run reset: live stubs of the new reset generation.
+    const after = new Set<string>();
+    for (const side of ["a", "b"]) {
+      const o = `mrp-${runId}-u0-${side}`, s = `after-${runId}-${side}`;
+      await io.registerOwner(keys.owner(o, "claude", s), stub(o, s, resets + 1));
+      after.add(`${o}\n${s}`);
+    }
+    // Without the end-of-run reset, the next run's pre-run check would refuse (the defect).
+    expect(await resetUserPrerunRefusals(store, c)).toEqual(["reset_user_owns_sessions_outside_the_run"]);
+    return { after, ledger };
+  }
+  test("the after sessions are tombstoned at the end, so a second and third run with the same user 0 are allowed", async () => {
+    const { store, done } = scratchStore();
+    try {
+      for (const runId of ["r1", "r2", "r3"]) {
+        const { after, ledger } = await oneRun(store, runId);
+        expect(await resetAfterSessions(ledger, store, ROOT, tenant, after, `mrp-cleanup-${runId}`)).toEqual({ count: 2, live: 2 });
+        expect(await resetUserPrerunRefusals(store, c)).toEqual([]);
+      }
+    } finally { done(); }
+  });
+  test("a truly foreign live session refuses the end-of-run reset (nothing is tombstoned) and the next run", async () => {
+    const { store, done } = scratchStore();
+    try {
+      const { after, ledger } = await oneRun(store, "r1");
+      const io = s3LedgerObjects(store, ROOT);
+      const keys = s3LedgerKeys(ROOT, tenant);
+      const fence = await io.readFence(keys.fence);
+      const resets = fence.state === "present" ? fence.fence.resets : 0;
+      await io.registerOwner(keys.owner("o-real", "claude", "foreign"), stub("o-real", "foreign", resets));
+      expect(await resetAfterSessions(ledger, store, ROOT, tenant, after, "mrp-cleanup-r1")).toEqual({ count: null, live: 3, refused: "foreign_sessions" });
+      // Refused before any write: the fence did not move, so the foreign session (and the after sessions) are still live.
+      const again = await io.readFence(keys.fence);
+      expect(again.state === "present" ? again.fence.resets : -1).toBe(resets);
+      expect((await ownershipCheck(store, ROOT, tenant, new Set()))!.live).toBe(3);
+      expect(await resetUserPrerunRefusals(store, c)).toEqual(["reset_user_owns_sessions_outside_the_run"]);
+    } finally { done(); }
+  });
+  test("an after session that never landed (no stub) is simply not live; the reset covers the ones that did", async () => {
+    const { store, done } = scratchStore();
+    try {
+      const { after, ledger } = await oneRun(store, "r1");
+      after.add("mrp-r1-u0-a\nnever-landed");
+      expect(await resetAfterSessions(ledger, store, ROOT, tenant, after, "mrp-cleanup-r1")).toEqual({ count: 2, live: 2 });
+      expect(await resetUserPrerunRefusals(store, c)).toEqual([]);
+    } finally { done(); }
+  });
+});
+
+describe("uploadUrlRefusals (the direct path's presigned PUT target)", () => {
+  test("https to a non-production bucket host or path-style bucket, with the signature query, passes", () => {
+    expect(uploadUrlRefusals("https://proof-inbox-dev.s3.us-east-1.amazonaws.com/96bulls/k.json.zst?X-Amz-Signature=abc&X-Amz-Expires=300")).toEqual([]);
+    expect(uploadUrlRefusals("https://s3.us-east-1.amazonaws.com/proof-inbox-dev/96bulls/k.json.zst?X-Amz-Signature=abc")).toEqual([]);
+    expect(uploadUrlRefusals("http://127.0.0.1:9000/transcripts/k?X-Amz-Signature=abc")).toEqual([]);
+  });
+  test("production words, no marker, plain http off loopback, credentials or a fragment refuse", () => {
+    expect(uploadUrlRefusals("https://inbox-prod.s3.us-east-1.amazonaws.com/k?sig=1")).toEqual(["upload_url_looks_like_production"]);
+    expect(uploadUrlRefusals("https://s3.us-east-1.amazonaws.com/inbox-dev-production/k")).toEqual(["upload_url_looks_like_production"]);
+    expect(uploadUrlRefusals("https://inbox.s3.us-east-1.amazonaws.com/k?sig=1")).toEqual(["upload_url_not_marked_non_production"]);
+    expect(uploadUrlRefusals("http://inbox-dev.s3.us-east-1.amazonaws.com/k")).toEqual(["upload_url_plain_http_not_loopback"]);
+    expect(uploadUrlRefusals("http://localhost:9000/transcripts-prod/k")).toEqual(["upload_url_looks_like_production"]);
+    expect(uploadUrlRefusals("https://u:p@inbox-dev.example.test/k")).toEqual(["upload_url_invalid"]);
+    expect(uploadUrlRefusals("https://inbox-dev.example.test/k#x")).toEqual(["upload_url_invalid"]);
+    expect(uploadUrlRefusals("not a url")).toEqual(["upload_url_invalid"]);
+  });
+});
+
+describe("the vendored S3 client and AWS_ENDPOINT_URL* (P3-N5)", () => {
+  test("createS3Store ignores AWS_ENDPOINT_URL and AWS_ENDPOINT_URL_S3: without endpoint it always addresses AWS S3", async () => {
+    const saved = { a: process.env.AWS_ENDPOINT_URL, b: process.env.AWS_ENDPOINT_URL_S3 };
+    process.env.AWS_ENDPOINT_URL = "http://127.0.0.1:1/elsewhere";
+    process.env.AWS_ENDPOINT_URL_S3 = "http://127.0.0.1:2/elsewhere";
+    const hosts: string[] = [];
+    try {
+      const fetchStub = (async (input: RequestInfo | URL) => {
+        hosts.push(new URL(String(input instanceof Request ? input.url : input)).host);
+        return new Response("<Error><Code>NoSuchKey</Code></Error>", { status: 404 });
+      }) as typeof fetch;
+      const store = createS3Store({ bucket: "proof-dev-bucket", region: "us-east-1", credentials: { accessKeyId: "AKIDEXAMPLE", secretAccessKey: "x" }, fetch: fetchStub });
+      await store.head(objectKey("some/key")).catch(() => undefined);
+      await store.getObject(objectKey("some/key")).catch(() => undefined);
+    } finally {
+      if (saved.a === undefined) delete process.env.AWS_ENDPOINT_URL; else process.env.AWS_ENDPOINT_URL = saved.a;
+      if (saved.b === undefined) delete process.env.AWS_ENDPOINT_URL_S3; else process.env.AWS_ENDPOINT_URL_S3 = saved.b;
+    }
+    expect(hosts.length).toBeGreaterThan(0);
+    expect(new Set(hosts)).toEqual(new Set(["proof-dev-bucket.s3.us-east-1.amazonaws.com"]));
   });
 });
