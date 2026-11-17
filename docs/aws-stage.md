@@ -971,9 +971,14 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   policies), so unset or set without the grants, every declaration is byte-identical. It is the identity side only:
   the ledger bucket's own policy, in its own repository, must grant the roles too, its `s3:ListBucket` unconditioned
   as well (cross-account, S3 needs the List from both sides before a missing key reads as 404; check the live bucket
-  policy before the first real run). A Deny that could cover `s3:ListBucket` (by Action pattern, or any `NotAction`) on the
-  ledger bucket (by Resource pattern, or any `NotResource`) is refused whatever its condition; other Denies pass. With the unconditioned List both roles can enumerate every key name in the ledger bucket (Get and Put stay
-  key-scoped), acceptable only because that bucket is dedicated to the ledger. That bucket must also have S3 Object
+  policy before the first real run). A Deny that could cover `s3:ListBucket` on the ledger bucket is refused
+  whatever its condition: an Action pattern such as `s3:ListBucket`, `s3:List*`, `s3:*` or `*`, or a `NotAction`
+  that does not name it; on a Resource pattern such as `*`, `arn:aws:s3:::*` or one with a policy variable, or any
+  `NotResource`. Other Denies pass, and a malformed one is refused. The usual `Deny s3:*` on `Resource: "*"` with
+  `aws:SecureTransport` = `false` is one of them: re-scope its Resource to exclude the ledger bucket (list the other
+  buckets and object ARNs it should cover), rather than removing it. With the unconditioned List both roles can
+  enumerate every key name in the ledger bucket (Get and Put stay key-scoped), acceptable only because that bucket
+  is dedicated to the ledger. That bucket must also have S3 Object
   Ownership `BucketOwnerEnforced` (ACLs disabled): the writer puts cross-account with no ACL, so otherwise its objects
   may be unreadable to the edge in the bucket's own account.
 - `"uploadPresignIssuer": true`: the user `96bulls-<stage>-upload-presign-issuer` at `/96bulls/` and its managed

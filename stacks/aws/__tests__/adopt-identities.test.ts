@@ -201,14 +201,55 @@ describe("adopt identities: input", () => {
         { Effect: "Deny", Action: "s3:ListBucketVersions", Resource: L },
       ]) expect(() => checkRoles(roles([...grants, deny], []))).not.toThrow();
       expect(() => checkRoles(roles([{ Effect: "Deny", Action: "s3:*", Resource: L }], [], null))).not.toThrow();
-      // Pattern matching: long runs of * collapse (no catastrophic backtracking), and policy variables stay literal.
-      const started = Date.now();
-      expect(() => checkRoles(roles([...grants, { Effect: "Deny", Action: "s3:ListBucket", Resource: `arn:aws:s3:::${"*".repeat(5000)}x` }], []))).not.toThrow();
-      expect(() => checkRoles(roles([...grants, { Effect: "Deny", Action: "s3:ListBucket", Resource: `arn:aws:s3:::a${"*a".repeat(40)}x` }], []))).not.toThrow();
-      expect(Date.now() - started).toBeLessThan(2_000);
-      expect(() => checkRoles(roles([...grants, { Effect: "Deny", Action: "s3:ListBucket", Resource: "arn:aws:s3:::${aws:username}" }], []))).not.toThrow();
-      expect(() => checkRoles(roles([...grants, { Effect: "Deny", Action: "s3:ListBucket", Resource: "arn:aws:s3:::synthetic-${aws:username}*" }], []))).not.toThrow();
-      expect(() => checkRoles(roles([...grants, { Effect: "Deny", Action: "s3:ListBucket", Resource: "arn:aws:s3:::synthetic-ledger-${*}*" }], []))).not.toThrow();
+      // Pattern matching is a linear two-pointer match: long or alternating wildcard runs stay fast.
+      const deny = (Resource: string) => ({ Effect: "Deny", Action: "s3:ListBucket", Resource });
+      let started = performance.now();
+      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::${"*?".repeat(12)}x`)], []))).not.toThrow();
+      expect(performance.now() - started).toBeLessThan(50);
+      started = performance.now();
+      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::${"*".repeat(5000)}x`)], []))).not.toThrow();
+      expect(() => checkRoles(roles([...grants, deny(`arn:aws:s3:::a${"*a".repeat(40)}x`)], []))).not.toThrow();
+      expect(performance.now() - started).toBeLessThan(50);
+      // ...and still exact: ? is one character, * any run (including none).
+      expect(() => checkRoles(roles([...grants, deny("arn:aws:s3:::synthetic-ledger-bucke?")], []))).toThrow(refused);
+      expect(() => checkRoles(roles([...grants, deny("arn:aws:s3:::synthetic-ledger-bucket?")], []))).not.toThrow();
+      expect(() => checkRoles(roles([...grants, deny("arn:aws:s3:::*synthetic-ledger-bucket*")], []))).toThrow(refused);
+      // Policy variables are unknown at validation time, so they match like *; ${*}, ${?} and ${$} are literals.
+      for (const r of ["arn:aws:s3:::${aws:PrincipalTag/b}", "arn:aws:s3:::${aws:username}", "arn:aws:s3:::synthetic-${aws:username}*", "arn:aws:s3:::synthetic-${x}-bucket"])
+        expect(() => checkRoles(roles([...grants, deny(r)], []))).toThrow(refused);
+      for (const r of ["arn:aws:s3:::synthetic-ledger-${*}*", "arn:aws:s3:::synthetic-ledger-bucke${?}", "arn:aws:s3:::${$}synthetic-ledger-bucket"])
+        expect(() => checkRoles(roles([...grants, deny(r)], []))).not.toThrow();
+    });
+
+    it("set: a NotAction Deny is refused only when none of its entries covers s3:ListBucket", () => {
+      const grants = backlogOpsLedgerStatements("read", ledgerBucket);
+      const refused = /a Deny that could cover s3:ListBucket on the ledger bucket is refused/;
+      // Naming ListBucket (or a pattern covering it) in NotAction exempts it: such a Deny can never deny the List.
+      for (const NotAction of ["s3:ListBucket", ["s3:GetObject", "s3:ListBucket"], "s3:List*", ["s3:*"], "*", "S3:LISTBUCKET"])
+        expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction, Resource: "*" }], []))).not.toThrow();
+      for (const NotAction of ["s3:GetObject", ["s3:GetObject", "s3:PutObject"], "s3:ListBucketVersions", "s3:Get*"])
+        expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction, Resource: "*" }], []))).toThrow(refused);
+      // NotAction on an object ARN only: a bucket List is not on it.
+      expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction: "s3:GetObject", Resource: `${L}/*` }], []))).not.toThrow();
+      expect(() => checkRoles(roles([...grants, { Effect: "Deny", NotAction: "s3:GetObject", Resource: objects }], []))).not.toThrow();
+    });
+
+    it("set: a malformed Deny is refused (it cannot be judged)", () => {
+      const grants = backlogOpsLedgerStatements("read", ledgerBucket);
+      const malformed = /a Deny must name exactly one of Action \/ NotAction and one of Resource \/ NotResource/;
+      for (const deny of [
+        { Effect: "Deny", Resource: "*" },
+        { Effect: "Deny", Action: "s3:GetObject" },
+        { Effect: "Deny", Action: "s3:GetObject", NotAction: "s3:PutObject", Resource: "*" },
+        { Effect: "Deny", Action: "s3:GetObject", Resource: "*", NotResource: L },
+        { Effect: "Deny", Action: [], Resource: "*" },
+        { Effect: "Deny", NotAction: [], Resource: "*" },
+        { Effect: "Deny", Action: "s3:GetObject", Resource: [] },
+        { Effect: "Deny", Action: ["s3:GetObject", 7], Resource: "*" },
+        { Effect: "Deny", Action: "s3:GetObject", Resource: [null] },
+        { Effect: "Deny", Action: "", Resource: "*" },
+        { Effect: "Deny", Action: { a: 1 }, Resource: "*" },
+      ]) expect(() => checkRoles(roles([...grants, deny], []))).toThrow(malformed);
     });
 
     it("set: a ledger Get with the List granted only on another ARN is refused (the List must be on the ledger bucket)", () => {

@@ -469,11 +469,14 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      answers a `GetObject` or `HeadObject` of a missing key with 404 only when the caller holds `s3:ListBucket` for
      that very request, and such a request carries no `s3:prefix`, so a prefix-conditioned List never applies there:
      every missing shard, owner stub or marker would read as a 403 (`access_denied`) and every real run would fail.
-     The stack refuses any condition on this List, requires it whenever a ledger `GetObject` or `PutObject` is
-     granted, and refuses, whatever its condition, any Deny whose Action could cover `s3:ListBucket`
-     (`s3:ListBucket`, `s3:List*`, `s3:*`, `*`, or any `NotAction`) and whose Resource could cover the ledger bucket
-     (a pattern such as `*` or `arn:aws:s3:::*`, or any `NotResource`). Other Denies, such as a protective
-     `s3:DeleteObject` on the ledger keys, pass. No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     The stack refuses any condition on this List and requires it whenever a ledger `GetObject` or `PutObject` is
+     granted. It refuses, whatever its condition, any Deny that could cover `s3:ListBucket` (an Action pattern such
+     as `s3:ListBucket`, `s3:List*`, `s3:*` or `*`, or a `NotAction` that does not name it) on the ledger bucket (a
+     Resource pattern such as `*`, `arn:aws:s3:::*` or one with a policy variable, or any `NotResource`), and any
+     malformed Deny. Other Denies, such as a protective `s3:DeleteObject` on the ledger keys, pass. The usual
+     `Deny s3:*` on `Resource: "*"` with `aws:SecureTransport` = `false` is caught by this: re-scope its Resource to
+     exclude the ledger bucket (name the buckets and object ARNs it should cover) rather than removing it. No
+     `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
