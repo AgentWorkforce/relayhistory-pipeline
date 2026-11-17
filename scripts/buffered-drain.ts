@@ -38,8 +38,9 @@
  * ledger's own keys (the revision index, re-arm markers, ownership stubs) route to that bucket with no encryption
  * header, under the same credentials, and both modes first require --bucket's marker to name it (ledger_home_mismatch)
  * and ITS marker to name it (ledger_home_missing | ledger_home_moved), whatever the guard says; the fences, staged
- * batches, drained markers and layout stay in --bucket. The check runs again before a write once a minute has passed
- * since the last good one (homeGuardedToolStore); a refusal stops every later write.
+ * batches, drained markers and layout stay in --bucket. The check runs again before a ledger write once a minute has
+ * passed since the last good one (homeGuardedToolStore); a refusal blocks every later ledger write, stops the run at
+ * its next batch group, releases the lease and exits 1 with {"refused": "<code>"}.
  * --execute writes the canonical layout, the 0005 revision index, re-arm markers and the drained markers, and needs the
  * owner's explicit OK.
  *
@@ -177,7 +178,7 @@ const progressLine = (s: DrainSummary) =>
  * Everything the CLI does after building its store: the checkpoint (read, validated, resumed from, rewritten
  * atomically after every group), the drain and its progress. The process entry below only builds the S3 store.
  */
-export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs: () => Promise<string[]>; stderr?: (line: string) => void }): Promise<DrainSummary> {
+export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs: () => Promise<string[]>; stderr?: (line: string) => void; halt?: () => unknown }): Promise<DrainSummary> {
   const startAfter = args.startAfter;
   // The checkpoint file holds a DrainCheckpoint: the watermark and the export generation of every org up to it. The
   // drain uses it only under the same generations (else it restarts from the beginning: summary.resume).
@@ -191,6 +192,7 @@ export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs
   let lastProgress = 0;
   return drainBufferedBatches({
     store: deps.store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
+    ...(deps.halt ? { halt: deps.halt } : {}),
     ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),
     ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),
     decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
@@ -233,7 +235,7 @@ export function drainStores(args: Pick<DrainArgs, "mode" | "bucket" | "region" |
 /**
  * The drain's process entry after its preflight, in order: the stores (INGEST_LEDGER_* parsed once), the fork guard
  * (assertToolLedgerHome) BEFORE the first listing or write, then runDrain through a store that re-runs the guard
- * before a write once a minute has passed since the last good check (homeGuardedToolStore).
+ * before a ledger write once a minute has passed since the last good check (homeGuardedToolStore), halting on a refusal.
  */
 export async function runDrainTool(args: DrainArgs, deps: {
   env: Record<string, string | undefined>;
@@ -246,7 +248,9 @@ export async function runDrainTool(args: DrainArgs, deps: {
   const stores = drainStores(args, deps.env, deps.credentials, deps.create, toolLedgerBucket(deps.env, args));
   await assertToolLedgerHome(stores, KEY_ROOT, args.bucket, deps.env);
   const store = homeGuardedToolStore(stores, KEY_ROOT, args.bucket, deps.env, deps.recheck);
-  return runDrain(args, { store, orgs: deps.orgs, ...(deps.stderr ? { stderr: deps.stderr } : {}) });
+  // A sticky refusal mid-run stops the drain at its next batch group, releases the lease (a Locker write the guard lets
+  // through) and fails the run with the closed code, never a green summary with write_failed counts.
+  return runDrain(args, { store, orgs: deps.orgs, halt: () => store.homeRefusal(), ...(deps.stderr ? { stderr: deps.stderr } : {}) });
 }
 
 if (import.meta.main) {

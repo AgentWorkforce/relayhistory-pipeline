@@ -79,6 +79,9 @@ on:
       - scripts/buffered-drain.ts
       - src/session-ingest/ledger-tool-store.ts
       - src/session-ingest/__tests__/ledger-tool-store*
+      - src/session-ingest/ledger-store.ts
+      - src/session-ingest/__tests__/buffered-drain.test.ts
+      - src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts
   push:
     branches: [main]
     paths:
@@ -93,6 +96,9 @@ on:
       - scripts/buffered-drain.ts
       - src/session-ingest/ledger-tool-store.ts
       - src/session-ingest/__tests__/ledger-tool-store*
+      - src/session-ingest/ledger-store.ts
+      - src/session-ingest/__tests__/buffered-drain.test.ts
+      - src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts
 
 permissions:
   contents: read
@@ -139,6 +145,10 @@ jobs:
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-ops.test.ts
       - name: Relocated-ledger stores and fork guard of the backfill and the drain (in-process fake buckets, no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/ledger-tool-store.test.ts
+      - name: The drain and the backfill end to end, routed and single-bucket (scratch stores, in-process PGlite, no credentials)
+        run: |
+          bun test --timeout 300000 ./src/session-ingest/__tests__/buffered-drain.test.ts
+          bun test --timeout 300000 ./src/session-ingest/__tests__/upload-fence-backfill.pglite.test.ts
       - name: Session presence counts and no-id-leak tests (in-process PGlite, no credentials)
         run: |
           bun test --timeout 300000 ./src/session-ingest/__tests__/session-presence.test.ts

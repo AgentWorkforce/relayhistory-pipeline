@@ -285,6 +285,25 @@ describe("homeRecheckingStore: the home check re-run during a long run", () => {
     expect(await has(inner, `${ROOT}/a.json`)).toBe(false);
   });
 
+  test("with keyRoot: only ledger-key writes are guarded; the Locker's own objects (the drain's lease) still go through", async () => {
+    let t = 0, checks = 0;
+    const inner = scratch();
+    const s = homeRecheckingStore(inner, async () => { checks++; throw new LedgerHomeRefused("ledger_home_moved"); }, { now: () => t, keyRoot: ROOT });
+    t = TOOL_HOME_RECHECK_MS;
+    // A Locker write never triggers the re-check, before or after a refusal.
+    await put(s, `${ROOT}/.drain/lock.json`);
+    expect(checks).toBe(0);
+    expect(s.homeRefusal()).toBeUndefined();
+    expect(await refusal(put(s, keys.owner("o1", "claude", "s1")))).toBe("ledger_home_moved");
+    expect(s.homeRefusal()?.code).toBe("ledger_home_moved");
+    expect(await refusal(put(s, keys.revisions("o1", "rec-1")))).toBe("ledger_home_moved");
+    expect(await refusal(put(s, ledgerHomeKey(ROOT)))).toBe("ledger_home_moved");
+    expect(await refusal(put(s, `${ROOT}/.drain/lock.json`))).toBeNull();
+    expect(await refusal(put(s, keys.fence))).toBeNull();
+    expect(checks).toBe(1);
+    expect(await has(inner, keys.owner("o1", "claude", "s1"))).toBe(false);
+  });
+
   test("the drain stops writing once the Locker marker is moved away mid-run", async () => {
     const s3 = fakeS3();
     await home(s3.bucket(LOCKER), LEDGER);

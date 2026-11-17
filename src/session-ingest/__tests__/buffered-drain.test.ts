@@ -22,6 +22,7 @@ import {
 } from "../buffered-drain.ts";
 import { parseDrainArgs, runDrain, runDrainTool, validResumeKey } from "../../../scripts/buffered-drain.ts";
 import { isLedgerKey, ledgerHomeKey } from "../ledger-store.ts";
+import { TOOL_HOME_RECHECK_MS } from "../ledger-tool-store.ts";
 import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as writeFileSyncFs } from "node:fs";
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
@@ -856,6 +857,59 @@ describe("buffered backlog drain (0005)", () => {
     // The fence stays in the Locker bucket.
     expect(await exists(locker, uploadFenceKey())).toBe(true);
     expect(await exists(ledger, uploadFenceKey())).toBe(false);
+  });
+
+  test("CLI entry: the Locker marker flips mid-run: the drain stops with the code, writes no ledger key after, and releases its lease", async () => {
+    const locker = await scratch();
+    const l = scratchStore();
+    cleanup.push(l.done);
+    const ledger = l.store;
+    const LOCKER = "example-locker-bucket", LEDGER = "example-ledger-bucket";
+    const marker = (bucket: string) => enc.encode(JSON.stringify({ v: 1, home: bucket, writtenAtMs: 1 }));
+    await locker.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    await ledger.put(objectKey(ledgerHomeKey(ROOT)), marker(LEDGER));
+    const keys = [];
+    for (let i = 0; i < 3; i++) keys.push(await stage(locker, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]));
+    await refreshVerdicts(locker);
+    let t = 0, flipped = false;
+    const ledgerWritesAfterFlip: string[] = [];
+    // The ledger bucket as the tool sees it: records every write that reaches it after the flip.
+    const ledgerSeen: ObjectStore = { ...ledger, backend: ledger.backend,
+      head: (k) => ledger.head(k), get: (k, r) => ledger.get(k, r), getObject: (k, r) => ledger.getObject(k, r), list: (p, c) => ledger.list(p, c), presignGet: (k, x) => ledger.presignGet(k, x),
+      put: (k, b, o) => { if (flipped) ledgerWritesAfterFlip.push(String(k)); return ledger.put(k, b, o); },
+      delete: (k) => { if (flipped) ledgerWritesAfterFlip.push(String(k)); return ledger.delete(k); } };
+    // The Locker bucket: once the first batch is marked drained, a relocation elsewhere rewrites its marker, and a
+    // minute passes on the re-check's clock.
+    const lockerSeen: ObjectStore = { ...locker, backend: locker.backend,
+      head: (k) => locker.head(k), get: (k, r) => locker.get(k, r), getObject: (k, r) => locker.getObject(k, r), list: (p, c) => locker.list(p, c), presignGet: (k, x) => locker.presignGet(k, x),
+      delete: (k) => locker.delete(k),
+      put: async (k, b, o) => {
+        const ack = await locker.put(k, b, o);
+        if (!flipped && String(k).endsWith(DRAINED_SUFFIX)) {
+          await locker.put(objectKey(ledgerHomeKey(ROOT)), marker("example-other-env-ledger"));
+          flipped = true;
+          t += TOOL_HOME_RECHECK_MS;
+        }
+        return ack;
+      } };
+    const kms = `arn:aws:kms:us-east-1:000000000000:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`;
+    const args = parseDrainArgs(["--execute", "--bucket", LOCKER, "--kms-key-arn", kms, "--org", TENANT.orgId, "--concurrency", "1"]);
+    const env = { INGEST_LEDGER_BUCKET: LEDGER, INGEST_LEDGER_REGION: "eu-west-1", INGEST_LEDGER_HOME_GUARD: "on" };
+    const run = runDrainTool(args, {
+      env, credentials: { accessKeyId: "AKIAEXAMPLE", secretAccessKey: "secret" }, orgs: async () => [TENANT.orgId], stderr: () => {},
+      create: (c) => (c.bucket === LOCKER ? lockerSeen : c.bucket === LEDGER ? ledgerSeen : (() => { throw new Error("unexpected_bucket"); })()),
+      recheck: { now: () => t },
+    });
+    // Not a summary with write_failed counts: the run fails with the closed code (the CLI prints {"refused": code}, exit 1).
+    await expect(run).rejects.toThrow(/^ledger_home_mismatch$/);
+    expect(flipped).toBe(true);
+    expect(ledgerWritesAfterFlip).toEqual([]);
+    // Exactly the first batch was drained; the run stopped before starting the third.
+    const drained = [];
+    for (const k of keys) if (await exists(locker, k + DRAINED_SUFFIX)) drained.push(k);
+    expect(drained.length).toBe(1);
+    // The lease is released (expired in place), not left for its TTL: a following drain or export may start at once.
+    expect((await readJson(locker, drainLockKey(ROOT))).expiresAtMs).toBe(0);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {

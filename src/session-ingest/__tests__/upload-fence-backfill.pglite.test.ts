@@ -1369,7 +1369,7 @@ describe("a relocated ledger (INGEST_LEDGER_BUCKET, docs/ledger-relocation.md): 
     // Read back through each bucket alone: the ledger's objects only in the ledger bucket.
     expect(await ownerOf(ledger, A, "origin-1", "claude", "kept")).toMatchObject({ sessionId: "kept" });
     expect(await ownerOf(locker, A, "origin-1", "claude", "kept")).toBeUndefined();
-    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toBeDefined();
+    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toEqual([1, "rec-1:r1", hex("a"), sessionKeyHash("claude", "kept"), expect.any(Number), expect.any(Number)]);
     expect(await entryOf(locker, A, "origin-1", "rec-1")).toBeUndefined();
     expect(await fenceOf(locker, A)).not.toBeNull();
     expect(await fenceOf(ledger, A)).toBeNull();
@@ -1402,7 +1402,7 @@ describe("a relocated ledger (INGEST_LEDGER_BUCKET, docs/ledger-relocation.md): 
     expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
     expect(reads.filter((k) => isLedgerKey(ROOT, k))).toEqual([ledgerHomeKey(ROOT)]);
     expect(await ownerOf(ledger, A, "origin-1", "claude", "kept")).toMatchObject({ sessionId: "kept" });
-    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toBeDefined();
+    expect(await entryOf(ledger, A, "origin-1", "rec-1")).toEqual([1, "rec-1:r1", hex("a"), sessionKeyHash("claude", "kept"), expect.any(Number), expect.any(Number)]);
     for (const k of stale) expect(dec.decode(await readAll(await locker.get(objectKey(k))))).toBe("stale pre-relocation copy");
   });
 

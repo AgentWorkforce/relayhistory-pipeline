@@ -116,16 +116,19 @@ export function backlogOpsLedgerResources(l: BacklogOpsLedgerBucket) {
     objects: `${bucketArn}/${l.keyRoot}/.admission-inbox/*/ledger/*`,
     /** The ledger-home marker (ledger-store.ts ledgerHomeKey). */
     home: `${bucketArn}/${l.keyRoot}/.ledger/fence-authority/.ledger-home.json`,
-    /** The one s3:prefix the roles may list under. */
-    listPrefix: `${l.keyRoot}/.admission-inbox/*`,
+    /**
+     * The s3:prefix values the roles may list under: the ledger keys' tree, and the marker's exact key (so a missing
+     * marker reads as a 404, `ledger_home_missing`, rather than a 403, `access_denied`).
+     */
+    listPrefixes: [`${l.keyRoot}/.admission-inbox/*`, `${l.keyRoot}/.ledger/fence-authority/.ledger-home.json`] as const,
   };
 }
 
 /**
  * The identity-side statements a backlog-ops role needs on the ledger bucket, exactly (what the validator accepts,
  * and what an operator adds to the live role before pasting it back). Read: s3:GetObject on the ledger keys and the
- * marker, s3:ListBucket on the bucket under `<root>/.admission-inbox/*` (without it a missing shard or stub is a 403,
- * not a 404). Write: also s3:PutObject on the ledger keys, with NO s3:x-amz-server-side-encryption condition: the
+ * marker, s3:ListBucket on the bucket under `<root>/.admission-inbox/*` and the marker's own key (without it a missing
+ * shard, stub or marker is a 403, not a 404). Write: also s3:PutObject on the ledger keys, with NO s3:x-amz-server-side-encryption condition: the
  * tools send no encryption header there (the bucket's SSE-S3 default applies). No delete, no KMS. Cross-account, the
  * ledger bucket's own policy must grant the same to the role (kept with that bucket's infrastructure, not here).
  */
@@ -133,7 +136,7 @@ export function backlogOpsLedgerStatements(mode: "read" | "write", l: BacklogOps
   const r = backlogOpsLedgerResources(l);
   return [
     { Sid: "LedgerRead", Effect: "Allow", Action: "s3:GetObject", Resource: [r.objects, r.home] },
-    { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: r.bucketArn, Condition: { StringLike: { "s3:prefix": r.listPrefix } } },
+    { Sid: "LedgerList", Effect: "Allow", Action: "s3:ListBucket", Resource: r.bucketArn, Condition: { StringLike: { "s3:prefix": [...r.listPrefixes] } } },
     ...(mode === "write" ? [{ Sid: "LedgerWrite", Effect: "Allow", Action: "s3:PutObject", Resource: r.objects }] : []),
   ];
 }
@@ -151,7 +154,11 @@ export function assertBacklogOpsLedgerBucket(value: unknown, transcriptsBucket: 
 /** Any s3:x-amz-server-side-encryption* key under any condition operator. */
 const hasSseCondition = (condition: unknown) =>
   plain(condition) && Object.values(condition).some((block) => plain(block) && Object.keys(block).some((k) => k.toLowerCase().startsWith("s3:x-amz-server-side-encryption")));
-const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+/** An s3:prefix condition value naming only allowed prefixes (a string or a non-empty list of distinct ones). */
+const listPrefixesOk = (value: unknown, allowed: readonly string[]) => {
+  const values = Array.isArray(value) ? value : [value];
+  return values.length > 0 && new Set(values).size === values.length && values.every((v) => typeof v === "string" && allowed.includes(v));
+};
 
 /**
  * A backlog-ops role's pasted inline policies, held to what docs/backlog-ops-workflow.md ("IAM") says the roles may
@@ -166,7 +173,8 @@ const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringif
  * With `c.ledger` (backlogOpsRoles.ledgerBucket) also, and only, `backlogOpsLedgerStatements`' grants on the ledger
  * bucket, each in a statement of its own bucket:
  *   s3:GetObject                  `<ledger>/<root>/.admission-inbox/*\/ledger/*` and the ledger-home marker;
- *   s3:ListBucket                 the ledger bucket itself, with exactly StringLike s3:prefix `<root>/.admission-inbox/*`;
+ *   s3:ListBucket                 the ledger bucket itself, with StringLike s3:prefix exactly one or both of
+ *                                 `<root>/.admission-inbox/*` and `<root>/.ledger/fence-authority/.ledger-home.json`;
  *   s3:PutObject                  (writer only) `<ledger>/<root>/.admission-inbox/*\/ledger/*`, with no
  *                                 s3:x-amz-server-side-encryption condition (the tools send no encryption header).
  * No KMS action ever names the ledger bucket.
@@ -212,8 +220,8 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
           const prefix = plain(s.Condition) && plain(s.Condition.StringLike) ? (s.Condition.StringLike as Record<string, unknown>)["s3:prefix"] : undefined;
           if (!resources.every((r) => r === ledger.bucketArn) || !plain(s.Condition) || Object.keys(s.Condition).length !== 1 ||
               !plain(s.Condition.StringLike) || Object.keys(s.Condition.StringLike).length !== 1 ||
-              !(prefix === ledger.listPrefix || sameJson(prefix, [ledger.listPrefix])))
-            refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself, with exactly StringLike s3:prefix ${ledger.listPrefix}`);
+              !listPrefixesOk(prefix, ledger.listPrefixes))
+            refuse(`${p}: s3:ListBucket on the ledger bucket only on the bucket itself, with exactly StringLike s3:prefix one or both of ${ledger.listPrefixes.join(", ")}`);
         } else if (ledger && onLedger && a === "s3:GetObject") {
           if (!resources.every((r) => r === ledger.objects || r === ledger.home)) refuse(`${p}: s3:GetObject on the ledger bucket only on exactly ${ledger.objects} and ${ledger.home}`);
         } else if (ledger && onLedger && a === "s3:PutObject") {

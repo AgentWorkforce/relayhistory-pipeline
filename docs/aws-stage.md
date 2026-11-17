@@ -963,11 +963,14 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   "keyRoot": "96bulls" }` beside `read` and `write` (the relocated upload ledger, docs/backlog-ops-workflow.md "IAM"
   item 5) also admits exactly `backlogOpsLedgerStatements` on that bucket, each in a statement of its own: both roles
   `s3:GetObject` on `<root>/.admission-inbox/*/ledger/*` and on `<root>/.ledger/fence-authority/.ledger-home.json`
-  and `s3:ListBucket` on the bucket with exactly `StringLike` `s3:prefix` = `<root>/.admission-inbox/*`; the writer
+  and `s3:ListBucket` on the bucket with `StringLike` `s3:prefix` exactly one or both of `<root>/.admission-inbox/*`
+  and `<root>/.ledger/fence-authority/.ledger-home.json`; the writer
   also `s3:PutObject` on `<root>/.admission-inbox/*/ledger/*` with no `s3:x-amz-server-side-encryption` condition. No
   delete and no KMS action on it. The input renders nothing itself (the roles carry exactly the pasted live
   policies), so unset or set without the grants, every declaration is byte-identical. It is the identity side only:
-  the ledger bucket's own policy, in its own repository, must grant the roles too.
+  the ledger bucket's own policy, in its own repository, must grant the roles too, and that bucket must have S3 Object
+  Ownership `BucketOwnerEnforced` (ACLs disabled): the writer puts cross-account with no ACL, so otherwise its objects
+  may be unreadable to the edge in the bucket's own account.
 - `"uploadPresignIssuer": true`: the user `96bulls-<stage>-upload-presign-issuer` at `/96bulls/` and its managed
   policy of the same name at `/` (`uploadPresignIssuerPolicy`). Identity only: the wall entry and key statements
   naming it are a separate input. Refused together with `transcriptStore.uploadPresignIssuer` (the same user).

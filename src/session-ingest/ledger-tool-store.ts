@@ -7,7 +7,7 @@
  * (selfhost-config.ts selfhostLedgerStore, with the tool's --bucket / --region standing in for LOCKER_BUCKET /
  * LOCKER_REGION):
  *
- *   INGEST_LEDGER_BUCKET    unset | "" (default: one store, the Locker bucket, exactly as before) | the ledger's own
+ *   INGEST_LEDGER_BUCKET    unset | "" (default: one store, the Locker bucket, as before) | the ledger's own
  *                           bucket, which must differ from --bucket
  *   INGEST_LEDGER_REGION    its signing region; default --region. Only with INGEST_LEDGER_BUCKET.
  *   INGEST_LEDGER_ENDPOINT  its endpoint (bare origin); default AWS S3. Only with INGEST_LEDGER_BUCKET.
@@ -25,11 +25,16 @@
  * Without one, the existing single-bucket check (`assertLedgerHomeHere`: with INGEST_LEDGER_HOME_GUARD=on,
  * `ledger_home_moved` when the Locker bucket's marker names another bucket; off, no request).
  *
- * Long runs re-check (`homeRecheckingStore`): every write after TOOL_HOME_RECHECK_MS (60 s, the edge's cadence) since
- * the last good check first runs the same check again; a refusal stops every later write with that code.
+ * Not byte-identical to before even unset: with INGEST_LEDGER_HOME_GUARD=on the single-bucket check is also re-run
+ * during the run (one marker GET before a ledger write at most once a minute).
+ *
+ * Long runs re-check (`homeRecheckingStore`): every ledger-key write after TOOL_HOME_RECHECK_MS (60 s, the edge's
+ * cadence) since the last good check first runs the same check again; a refusal blocks every later ledger-key write
+ * with that code, and the tools stop at their next boundary and exit with it (Locker writes such as the drain's lease
+ * release still go through).
  */
 import { createS3Store, type ObjectStore } from "../shared/vendor.ts";
-import { assertLedgerHomeHere, assertLedgerHomeIn, assertLedgerHomeMovedTo, LedgerHomeRefused, ledgerRoutedStore } from "./ledger-store.ts";
+import { assertLedgerHomeHere, assertLedgerHomeIn, assertLedgerHomeMovedTo, LedgerHomeRefused, ledgerKeyMatcher, ledgerRoutedStore } from "./ledger-store.ts";
 import { selfhostLedgerStore, type SelfhostLedgerStoreSettings } from "./selfhost-config.ts";
 
 export type ToolLedgerBucket = SelfhostLedgerStoreSettings;
@@ -90,19 +95,28 @@ export async function assertToolLedgerHome(stores: ToolStores, keyRoot: string, 
 /** The edge re-reads the ledger-home marker about every minute; the tools do the same before a write. */
 export const TOOL_HOME_RECHECK_MS = 60_000;
 
+/** A store with the home check re-run during the run; `homeRefusal()` is the sticky refusal once there is one. */
+export type HomeGuardedStore = ObjectStore & { homeRefusal(): LedgerHomeRefused | undefined };
+
 /**
- * `store` with the home check re-run before a write (put or delete) once `intervalMs` has passed since the last good
- * check (the caller ran the first one: the clock starts at creation). A refusal is sticky: every later write throws
- * it without another request, except `ledger_home_unavailable` (transient), which the next write retries. Reads pass
- * through unchecked (they change nothing). Concurrent writes share one re-check.
+ * `store` with the home check re-run before a guarded write (put or delete) once `intervalMs` has passed since the
+ * last good check (the caller ran the first one: the clock starts at creation). With `keyRoot`, only writes of ledger
+ * keys (ledger-store.ts isLedgerKey: ledger/** and the marker) are guarded: the Locker bucket's own objects (the
+ * fences, staged batches, drained markers, the layout, the drain's lease) pass straight through, so a run that is
+ * refused can still release its lease. Without `keyRoot`, every write is guarded. A refusal is sticky: every later
+ * guarded write throws it without another request (and `homeRefusal()` returns it, so a caller can stop at its next
+ * boundary), except `ledger_home_unavailable` (transient), which the next guarded write retries. Reads pass through
+ * unchecked. Concurrent writes share one re-check.
  */
 export function homeRecheckingStore(store: ObjectStore, recheck: () => Promise<void>,
-  opts: { intervalMs?: number; now?: () => number } = {}): ObjectStore {
+  opts: { intervalMs?: number; now?: () => number; keyRoot?: string } = {}): HomeGuardedStore {
   const interval = opts.intervalMs ?? TOOL_HOME_RECHECK_MS, now = opts.now ?? Date.now;
+  const guarded = opts.keyRoot === undefined ? () => true : ledgerKeyMatcher(opts.keyRoot);
   let checkedAt = now();
   let refused: unknown;
   let inflight: Promise<void> | null = null;
-  const gate = async () => {
+  const gate = async (key: unknown) => {
+    if (!guarded(String(key))) return;
     if (refused !== undefined) throw refused;
     if (now() - checkedAt < interval) return;
     inflight ??= recheck().then(
@@ -118,13 +132,15 @@ export function homeRecheckingStore(store: ObjectStore, recheck: () => Promise<v
     getObject: (key, range) => store.getObject(key, range),
     list: (prefix, cursor) => store.list(prefix, cursor),
     presignGet: (key, ttl) => store.presignGet(key, ttl),
-    put: async (key, body, putOpts) => { await gate(); return store.put(key, body, putOpts); },
-    delete: async (key) => { await gate(); return store.delete(key); },
+    put: async (key, body, putOpts) => { await gate(key); return store.put(key, body, putOpts); },
+    delete: async (key) => { await gate(key); return store.delete(key); },
+    homeRefusal: () => (refused instanceof LedgerHomeRefused ? refused : refused === undefined ? undefined : new LedgerHomeRefused("ledger_home_store_error")),
   };
 }
 
 /** The tool's store with its home check re-run during a long run (assertToolLedgerHome, homeRecheckingStore). */
 export function homeGuardedToolStore(stores: ToolStores, keyRoot: string, lockerBucket: string,
-  env: Record<string, string | undefined> = process.env, opts: { intervalMs?: number; now?: () => number } = {}): ObjectStore {
-  return homeRecheckingStore(stores.store, () => assertToolLedgerHome(stores, keyRoot, lockerBucket, env), opts);
+  env: Record<string, string | undefined> = process.env, opts: { intervalMs?: number; now?: () => number } = {}): HomeGuardedStore {
+  // Only the ledger's own keys are blocked by a refusal; the Locker's objects (the lease included) are not.
+  return homeRecheckingStore(stores.store, () => assertToolLedgerHome(stores, keyRoot, lockerBucket, env), { ...opts, keyRoot });
 }

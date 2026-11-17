@@ -795,6 +795,13 @@ export interface DrainOptions {
   resume?: DrainCheckpoint;
   /** Called after each batch group with the running summary (counts only). */
   onProgress?: (summary: DrainSummary) => void;
+  /**
+   * A stop the caller raises mid-run (scripts/buffered-drain.ts: the ledger-home re-check's sticky refusal): checked
+   * before each batch group like a lost lease. Once it returns an error, no new group starts, in-flight groups finish
+   * (their ledger writes already refuse), the lease is released, and the run throws that error instead of returning
+   * a summary.
+   */
+  halt?: () => unknown;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -1049,7 +1056,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       for (;;) {
-        if (fatal || checkpointError !== undefined || lockLost !== undefined || stopPulling) return;
+        if (fatal || checkpointError !== undefined || lockLost !== undefined || stopPulling || opts.halt?.() !== undefined) return;
         if (opts.maxObjects !== undefined && objects >= opts.maxObjects) {
           summary.stopped = "max_objects";
           return;
@@ -1083,6 +1090,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     if (renewTimer) clearInterval(renewTimer);
     if (lockLost === undefined) await lease?.release();
   }
+  // A caller's stop outranks what it caused (refused writes, a listing that failed after it).
+  const halted = opts.halt?.();
+  if (halted !== undefined) throw halted;
   if (fatal) throw fatal.error;
   if (checkpointError !== undefined) throw checkpointError;
   if (lockLost !== undefined) throw lockLost;

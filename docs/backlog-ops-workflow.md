@@ -285,7 +285,8 @@ encryption header there, so the bucket's SSE-S3 default applies. They keep the f
 markers, the layout and the lease in `BACKLOG_OPS_BUCKET`. Before the first write they refuse unless
 `BACKLOG_OPS_BUCKET`'s marker names exactly that ledger bucket (`ledger_home_mismatch`: a variable pointing at another
 environment's ledger refuses here) and the ledger bucket's own marker names it (`ledger_home_missing`,
-`ledger_home_moved`), and they check again before a write once a minute has passed since the last good check. The
+`ledger_home_moved`), and they check again before a ledger write once a minute has passed since the last good check
+(a refusal then stops the run at its next boundary with that code, a failed receipt; the drain still releases its lease). The
 export touches no ledger key and does not take them.
 
 **Set them as environment variables only.** `vars.*` falls back to a repository or organisation variable of the same
@@ -307,7 +308,15 @@ Receipts are counts only. Every leaf is a number, a boolean or a short lowercase
 id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backlog-ops-receipt` artifact. Each also
 records `ledger`: `none`, or `ledger_<32 hex>` (a hash of the ledger bucket and region a backfill or drain was given;
 never the name, since receipts are echoed to this public repository's logs). A backfill or drain execute refuses unless
-the backfill and drain receipts it binds recorded the same value (a receipt from before the field reads as `none`).
+the backfill and drain receipts it binds recorded the same value. A receipt from before the field reads as `none`, so
+a dry run (or backfill) made before this check existed binds only an execute with no ledger bucket: once
+`BACKLOG_OPS_LEDGER_*` are set, re-run the dry runs and backfills an execute will bind. The field also changes every
+receipt with the variables unset (`"ledger": "none"`), and with the guard on the tools also re-read the marker during
+a run, so the unset path is not byte-identical to before; it behaves the same.
+The hash is a plain SHA-256 of a fixed tag, the bucket name and the region, truncated, and deliberately unsalted (a
+salt would be one more secret to hold and rotate). It hides the name from a casual reader of the logs but does not
+protect it from anyone who can guess it: a guessed name and region can be confirmed against a receipt. Treat the
+ledger bucket's name as discoverable, as bucket names are generally; nothing relies on it being secret.
 
 ## Session presence (presence-dry)
 
@@ -444,8 +453,9 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      `s3:GetObject`, and the write role `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption`
      condition, since the tools send no encryption header there. Both need `s3:GetObject` on
      `<root>/.ledger/fence-authority/.ledger-home.json`, and `s3:ListBucket` on the bucket with `StringLike`
-     `s3:prefix` = `<root>/.admission-inbox/*` (without it a missing shard or stub reads as a 403, not a 404, and
-     the run fails). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
+     `s3:prefix` = `<root>/.admission-inbox/*` and `<root>/.ledger/fence-authority/.ledger-home.json` (without it
+     a missing shard or stub reads as a 403, not a 404, and the run fails; a missing marker would read as
+     `access_denied` rather than `ledger_home_missing`, a refusal either way). No `DeleteObject`: neither tool deletes a ledger key. No KMS grant: the bucket uses SSE-S3. The
      adopted roles' pasted policies (`transcriptStore.adoptIdentities.backlogOpsRoles`) may carry these grants only
      with `backlogOpsRoles.ledgerBucket` = `{ "bucket": "<ledger bucket>", "keyRoot": "96bulls" }` set in the
      private stage inputs; the stack refuses any other statement on that bucket, and without the input it refuses
@@ -454,6 +464,10 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
      the live diff stays clean.
    - **Resource side (not this repository).** The ledger bucket's policy granting the two role ARNs the same actions
      on the same resources lives with that bucket's infrastructure, in its own repository.
+   - **Precondition: Object Ownership = `BucketOwnerEnforced` (ACLs disabled) on the ledger bucket.** The write role
+     puts objects cross-account with no ACL. Under any other ownership setting those objects are owned by the
+     roles' account, and the edge, in the bucket's own account, may be unable to read them. Check it before the
+     first execute against the ledger bucket (it is also that bucket's infrastructure, not this repository's).
 
    Both roles also need `s3:GetObject` on the marker key in the transcripts bucket (the forced guard, and the
    Locker-side marker check described above); `96bulls/*` already covers it.
