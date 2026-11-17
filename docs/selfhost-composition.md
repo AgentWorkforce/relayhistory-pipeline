@@ -80,6 +80,21 @@ dormant; any other value fails startup.
   default, `--apply` to write, refused unless the Locker is GCS, and it
   re-stamps only rows in `LOCKER_BUCKET` whose manifest the GCS Locker holds.
   Its header lists the env, the owner login it needs and the exit codes.
+  Local-only installs may instead name `LOCKER_PROVIDER=fs` or `azure` (never
+  selected when unset; `src/shared/locker-selection.ts`). `fs` stores objects
+  under `LOCKER_FS_ROOT` (an absolute, normalized path other than `/`;
+  `LOCKER_BUCKET` is still required as the name stamped on rows). It is refused
+  unless the process sets one of `RELAYHISTORY_SELFHOST_INGEST`, `_READ_API` or
+  `_PIPELINE_CONSUMER` to `true`, and on Lambda. Writes are serialized per
+  process only, so run one session-ingest replica (the only Locker writer), and
+  the ledger stays in `LOCKER_FS_ROOT`: `INGEST_LEDGER_BUCKET` is refused.
+  `azure` takes `LOCKER_AZURE_ACCOUNT`, `LOCKER_AZURE_ACCOUNT_KEY` (secret
+  store), the container in `LOCKER_BUCKET` and an optional `LOCKER_ENDPOINT`
+  (https, or http to loopback only). With either, drop the `locker-init` Job
+  (`src/locker/init.ts` signs S3 only). Session ingest, the read API and the
+  pipeline consumer work; the publisher, operator erase, the restamp tool, the
+  vendored pipeline routes and stage workers, the hoopdb indexer and alleyoop
+  refuse them at startup.
   Sessions an older consumer projected with 1970-01-01 event times (a Claude
   record with `ts_ms` 0) are marked for re-projection by
   `src/session-pipeline/epoch-event-time-repair.ts` (plan by default,

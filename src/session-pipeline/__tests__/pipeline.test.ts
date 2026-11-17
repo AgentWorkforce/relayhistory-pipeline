@@ -995,8 +995,8 @@ describe("consumer events carry the Locker's provider into session_index (GCS se
     expect(rt.deps.pointer.reader.provider).toBe("s3");
   });
 
-  test("no Azure Locker exists: LOCKER_PROVIDER=azure is refused, never stamped", () => {
-    expect(() => lockerProvider({ LOCKER_PROVIDER: "azure" })).toThrow("LOCKER_PROVIDER must be s3 or gcs");
+  test("an unknown LOCKER_PROVIDER is refused, never stamped", () => {
+    expect(() => lockerProvider({ LOCKER_PROVIDER: "minio" })).toThrow("LOCKER_PROVIDER must be s3 or gcs");
   });
 });
 

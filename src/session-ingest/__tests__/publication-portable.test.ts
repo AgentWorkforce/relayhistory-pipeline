@@ -98,6 +98,15 @@ test("portable config: provider follows the read API's Locker selection (LOCKER_
   for (const v of ["GCS", "azure", "r2", "fs"]) expect(codeOf(() => portablePublicationConfig({ ...GOOD, LOCKER_PROVIDER: v }))).toBe("publication_target_invalid");
 });
 
+test("portable config: a valid fs or azure Locker is refused (the publication RPCs admit s3 and gcs only)", () => {
+  // lockerProvider accepts both names, so the refusal is the publisher's own guard, not an unknown provider.
+  const fsLocker = { LOCKER_PROVIDER: "fs", LOCKER_BUCKET: "local", LOCKER_FS_ROOT: "/srv/locker", RELAYHISTORY_SELFHOST_INGEST: "true" };
+  const azureLocker = { LOCKER_PROVIDER: "azure", LOCKER_BUCKET: "sessions", LOCKER_AZURE_ACCOUNT: "devstoreaccount1", LOCKER_AZURE_ACCOUNT_KEY: "YWJjZA==" };
+  for (const locker of [fsLocker, azureLocker, { ...fsLocker, LOCKER_PROVIDER: " fs " }]) {
+    expect([locker.LOCKER_PROVIDER, codeOf(() => portablePublicationConfig({ ...GOOD, ...locker }))]).toEqual([locker.LOCKER_PROVIDER, "publication_target_invalid"]);
+  }
+});
+
 test("portable secret sources: exactly one of value or absolute *_FILE", () => {
   for (const k of ["INGEST_PUBLISH_S3_ACCESS_KEY_ID", "INGEST_PUBLISH_S3_SECRET_ACCESS_KEY", "INGEST_PUBLISH_DATABASE_URL"]) {
     expect(codeOf(() => portablePublicationConfig({ ...GOOD, [k + "_FILE"]: "/run/secrets/x" }))).toBe("publication_secret_source_ambiguous");

@@ -10,11 +10,16 @@
  *
  * LOCKER_PROVIDER=gcs uses the GCS adapter and a GKE metadata-server token.
  * HMAC keys are refused. Production AWS S3 does not set LOCKER_PROVIDER.
+ *
+ * LOCKER_PROVIDER=fs (LOCKER_FS_ROOT) and LOCKER_PROVIDER=azure (Shared Key) are self-host
+ * options, only when named; see locker-selection.ts for their rules.
  */
 import { readFile } from "node:fs/promises";
 import { createGcsStore, createS3Store, isObjectStoreError, objectKey, objectStoreManifestReader, readAll, type ManifestReader, type ObjectStore, type RawStore } from "./vendor.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import type { GcsToken } from "../../packages/object-store/src/gcs.ts";
+import { createAzureBlobStore } from "../../packages/object-store/src/azure.ts";
+import { createFsStore } from "../../packages/object-store/src/fs.ts";
 import { optional, required } from "./env.ts";
 import { assertLockerSelection, gcsTokenUri, lockerProvider, trustedGcsTokenUri } from "./locker-selection.ts";
 
@@ -127,6 +132,22 @@ export function buildLockerStore(env: NodeJS.ProcessEnv = process.env, options: 
         bucket,
         ...(env.LOCKER_ENDPOINT ? { baseUrl: env.LOCKER_ENDPOINT } : {}),
         token: options.gcsToken ?? (() => gcsMetadataToken(env)),
+        ...(options.fetch ? { fetch: options.fetch } : {}),
+      }),
+    };
+  }
+  if (provider === "fs") {
+    return { provider: "fs", bucket, store: createFsStore({ root: env.LOCKER_FS_ROOT!.trim() }) };
+  }
+  if (provider === "azure") {
+    return {
+      provider: "azure",
+      bucket,
+      store: createAzureBlobStore({
+        account: env.LOCKER_AZURE_ACCOUNT!.trim(),
+        container: bucket,
+        ...(env.LOCKER_ENDPOINT ? { endpoint: env.LOCKER_ENDPOINT } : {}),
+        auth: { kind: "sharedKey", accountKey: env.LOCKER_AZURE_ACCOUNT_KEY!.trim() },
         ...(options.fetch ? { fetch: options.fetch } : {}),
       }),
     };

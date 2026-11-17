@@ -205,6 +205,20 @@ describe("configuration", () => {
     expect(() => selfhostLedgerStore({ ...base, INGEST_LEDGER_BUCKET: "ledger-b", INGEST_LEDGER_REGION: "us west" }, "s3")).toThrow("region");
   });
 
+  test("an fs Locker refuses INGEST_LEDGER_BUCKET (the fs store ignores bucket names), naming only the variable", () => {
+    const fs = { ...base, LOCKER_PROVIDER: "fs", LOCKER_FS_ROOT: "/srv/locker" };
+    const refusal = "96bulls: INGEST_LEDGER_BUCKET is not supported with LOCKER_PROVIDER=fs (unset it; the ledger stays in LOCKER_FS_ROOT)";
+    for (const env of [{ ...fs, INGEST_LEDGER_BUCKET: "ledger-b" }, { ...fs, LOCKER_PROVIDER: " fs ", INGEST_LEDGER_BUCKET: "ledger-b", INGEST_LEDGER_REGION: "us-west-2" }]) {
+      let message = "";
+      try { selfhostLedgerStore(env, "s3"); } catch (e) { message = (e as Error).message; }
+      expect(message).toBe(refusal);
+    }
+    // Unset keeps the ledger in the Locker, unchanged; s3 and azure still accept a separate bucket.
+    expect(selfhostLedgerStore(fs, "s3")).toBeUndefined();
+    expect(selfhostLedgerStore({ ...base, LOCKER_PROVIDER: "s3", INGEST_LEDGER_BUCKET: "ledger-b" }, "s3")).toEqual({ bucket: "ledger-b", region: "us-east-1" });
+    expect(selfhostLedgerStore({ ...base, LOCKER_PROVIDER: "azure", INGEST_LEDGER_BUCKET: "ledger-b" }, "s3")).toEqual({ bucket: "ledger-b", region: "us-east-1" });
+  });
+
   test("selfhostStores: one store and an optional home check by default; routed with a required home check when set", () => {
     const built: Record<string, string | undefined>[] = [];
     const build = ((env: NodeJS.ProcessEnv) => { built.push({ bucket: env.LOCKER_BUCKET, region: env.LOCKER_REGION }); return { provider: "s3", bucket: env.LOCKER_BUCKET, store: fsStore() }; }) as never;

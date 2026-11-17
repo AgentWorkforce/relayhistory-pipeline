@@ -14,6 +14,7 @@
  *   LOCKER_BUCKET             unset or blank: nothing is wired, and the routes keep their 501
  *                             `*_not_configured` (exactly as before this file)
  *   LOCKER_PROVIDER           s3 (default; MinIO, AWS S3) | gcs (Workload Identity, no HMAC keys)
+ *                             | fs | azure (self-host, only when named; locker-selection.ts)
  *   LOCKER_ENDPOINT           s3: e.g. http://minio:9000 (path-style); gcs: the official API or a loopback emulator
  *   LOCKER_REGION             s3: default us-east-1
  *   LOCKER_ACCESS_KEY_ID / LOCKER_SECRET_ACCESS_KEY   s3 static keys (MinIO), from the secret store; unset:
@@ -191,15 +192,20 @@ export async function serviceCanonicalDeps(
     throw new Error("session read api: LOCKER_BUCKET needs PIPELINE_ORG_FROM_PREFIX=true (the org-prefix layout binds each object to its org)");
   // Loaded only here, so the hosted Lambda (which never calls this) never evaluates the Locker client.
   const { buildLockerStore, credentialSource, gcsMetadataToken, lockerCredentials, trustedCredentialsUri } = await import("../shared/locker.ts");
-  const { lockerProvider } = await import("../shared/locker-selection.ts");
+  const { assertLockerSelection, lockerProvider } = await import("../shared/locker-selection.ts");
   // Startup validation: provider selection and endpoint/token-URI trust (assertLockerSelection), and
   // for S3 a credentials source (static keys, or Pod Identity whose token goes only to a trusted host).
-  buildLockerStore(env);
-  const gcs = lockerProvider(env) === "gcs";
-  if (!gcs && credentialSource(env) === "pod-identity" && !trustedCredentialsUri(env.AWS_CONTAINER_CREDENTIALS_FULL_URI!))
+  // fs: assertLockerSelection is its whole validation; building the store here would create LOCKER_FS_ROOT.
+  const provider = lockerProvider(env);
+  if (provider === "fs") assertLockerSelection(env);
+  else buildLockerStore(env);
+  const gcs = provider === "gcs";
+  // fs and azure carry their own settings; only S3 needs a credentials source.
+  const s3 = provider === "s3";
+  if (s3 && credentialSource(env) === "pod-identity" && !trustedCredentialsUri(env.AWS_CONTAINER_CREDENTIALS_FULL_URI!))
     throw new Error("session read api: AWS_CONTAINER_CREDENTIALS_FULL_URI is not a trusted credentials endpoint");
   // One process-wide credentials provider (or GCS token source), cached and refreshed before expiry.
-  const credentials = gcs ? undefined : cachedProvider(lockerCredentials(env));
+  const credentials = s3 ? cachedProvider(lockerCredentials(env)) : undefined;
   const gcsToken = gcs ? cachedProvider(() => gcsMetadataToken(env)) : undefined;
   const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: "true" };
   const pointers = sqlCanonicalPointers(run);

@@ -68,6 +68,20 @@ export interface WorkerOptions {
   tick?: (db: HoopDb, now: Date) => Promise<void>;
   /** Bounded best-effort flushes (product analytics) run with the telemetry shutdown, before the exit. */
   onShutdown?: () => Promise<void>;
+  /**
+   * The process reads the Locker only through its own buildLockerStore (the self-host pipeline
+   * consumer) and runs no stage: LOCKER_PROVIDER=fs|azure is then admitted (vendorBindings `ownLocker`).
+   */
+  ownLocker?: true;
+}
+
+/**
+ * The vendored bindings runWorker builds its queue deps from. `ownLocker` is honoured only for a worker
+ * that claims no stage, so no vendored stage handler can run against bindings without a raw store.
+ */
+export function workerBindings(opts: Pick<WorkerOptions, "ownLocker" | "stages">): Record<string, string | undefined> {
+  if (opts.ownLocker && opts.stages.length) throw new Error("96bulls: worker ownLocker is only for a worker that claims no stage");
+  return vendorBindings({}, opts.ownLocker ? { ownLocker: true } : {});
 }
 
 /**
@@ -387,7 +401,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   clearInterval(startupBeat);
   health.ready = true;
   health.lastTickAt = Date.now();
-  const env = vendorBindings() as Parameters<typeof pipelineQueueDeps>[0];
+  const env = workerBindings(opts) as Parameters<typeof pipelineQueueDeps>[0];
   const rawQueue = postgresPipelineQueue(db);
   let current: StageMessage | undefined;
   const currentRef = () => current;

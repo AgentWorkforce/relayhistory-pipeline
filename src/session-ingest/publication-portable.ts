@@ -88,6 +88,8 @@ export function portablePublicationConfig(env:NodeJS.ProcessEnv):PortablePublica
  try{endpoint=assertDestinationUrl('INGEST_PUBLISH_S3_ENDPOINT',rawEndpoint,destinationPolicy(env),{allowPath:false});}catch{return no('target_invalid');}
  let provider:LockerProvider;
  try{provider=lockerProvider(env);}catch{return no('target_invalid');}
+ // The publication RPCs accept s3 and gcs only (migration 059000); fs and azure cannot be published.
+ if(provider!=='s3'&&provider!=='gcs')no('target_invalid');
  const sseRaw=env.INGEST_PUBLISH_S3_SSE;
  if(sseRaw!==undefined&&sseRaw!=='none'&&sseRaw!=='AES256')no('target_invalid');
  // Validated now so a bad trust profile fails startup; re-read when the pool is built.
