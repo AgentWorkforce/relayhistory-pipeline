@@ -20,7 +20,11 @@
  * stubs, revision shard merges) and needs the owner's explicit OK. Rerunning is a no-op for what is there.
  *
  * --slots-by-org (backlog-ops slots_read=org, any backfill mode): a scoped run reads each org's owned slots once through the org index
- * instead of the heap block windows (upload-fence-backfill.ts SLOTS_ORG_CURSOR).
+ * instead of the heap block windows (upload-fence-backfill.ts SLOTS_ORG_CURSOR), and takes the owned-slot fingerprint from
+ * that read instead of a separate FINGERPRINT_SLOTS read.
+ * --slot-pace-ms (0..5000, default 0) and --slot-fetch-rows (100..50000; default 5000, or 2000 when paced), only with
+ * --slots-by-org: pause between the org cursor's FETCHes and their size; a paced org read held open past 30 min fails
+ * closed for that org (slot_read_too_long, its sections incomplete). backlog-ops passes --slot-pace-ms for slot_pace_ms.
  * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
  * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full
  * (src/session-ingest/upload-fence-backfill.ts header). The summary records it as `revisions_since_ms`.
@@ -36,7 +40,7 @@ import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { assertLedgerHomeGuardValid, assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
+import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, SLOT_FETCH_ROWS_MAX, SLOT_FETCH_ROWS_MIN, SLOT_PACE_MAX_MS, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
 
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
@@ -56,9 +60,11 @@ export interface BackfillArgs {
   kmsKeyArn?: string;
   revisionsSinceMs?: number;
   slotsByOrg?: boolean;
+  slotPaceMs?: number;
+  slotFetchRows?: number;
 }
 
-const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn", "--revisions-since-ms"]);
+const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn", "--revisions-since-ms", "--slot-pace-ms", "--slot-fetch-rows"]);
 const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--slots-by-org"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
@@ -108,11 +114,17 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
     if (!chosen.includes("revisions")) throw new Error("--revisions-since-ms needs the revisions section");
     revisionsSinceMs = Number(sinceRaw);
   }
+  // Range-checked here and again by the library (backfill_slot_pace_invalid); a "0" pace is accepted and means unpaced.
+  const slotPaceMs = int("--slot-pace-ms", 0, SLOT_PACE_MAX_MS);
+  const slotFetchRows = int("--slot-fetch-rows", SLOT_FETCH_ROWS_MIN, SLOT_FETCH_ROWS_MAX);
+  if ((slotPaceMs !== undefined || slotFetchRows !== undefined) && !bools.has("--slots-by-org")) throw new Error("--slot-pace-ms and --slot-fetch-rows need --slots-by-org");
   return {
     mode, bucket, region, orgs, sections: chosen, pageSize, rowPageSize, concurrency, statementTimeoutMs,
     ...(kmsKeyArn !== undefined ? { kmsKeyArn } : {}),
     ...(revisionsSinceMs !== undefined ? { revisionsSinceMs } : {}),
     ...(bools.has("--slots-by-org") ? { slotsByOrg: true } : {}),
+    ...(slotPaceMs !== undefined ? { slotPaceMs } : {}),
+    ...(slotFetchRows !== undefined ? { slotFetchRows } : {}),
   };
 }
 
@@ -145,7 +157,7 @@ if (import.meta.main) {
   try {
     args = parseBackfillArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms] [--slots-by-org]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms] [--slots-by-org [--slot-pace-ms n] [--slot-fetch-rows n]]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -189,6 +201,8 @@ if (import.meta.main) {
       sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
       ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
       ...(args.slotsByOrg ? { slotsByOrg: true } : {}),
+      ...(args.slotPaceMs !== undefined ? { slotPaceMs: args.slotPaceMs } : {}),
+      ...(args.slotFetchRows !== undefined ? { slotFetchRows: args.slotFetchRows } : {}),
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

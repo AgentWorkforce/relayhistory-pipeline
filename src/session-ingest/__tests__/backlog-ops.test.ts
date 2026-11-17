@@ -142,6 +142,36 @@ test("slots_read: backfill modes only, empty or heap (default, unchanged argv) o
   }
 });
 
+test("slot_pace_ms: backfill modes with slots_read=org only, digits 0..5000; empty or 0 leaves the argv unchanged", () => {
+  const t = backlogOpsTarget(target);
+  const on = (mode: BacklogOpsMode, extra: Record<string, string>) => codeSync(() => backlogOpsDispatch(dispatchEnv(mode, extra), true));
+  for (const mode of BACKLOG_OPS_MODES.filter((m) => m.startsWith("backfill-"))) {
+    const org = { BACKLOG_OPS_SLOTS_READ: "org" };
+    for (const v of ["", "0", "1", "250", "5000"]) expect(on(mode, { ...org, BACKLOG_OPS_SLOT_PACE_MS: v })).toBeNull();
+    for (const v of ["5001", "-1", "+5", "05", "1.5", "1e3", " 5", "5 ", "abc", "10000"]) expect(on(mode, { ...org, BACKLOG_OPS_SLOT_PACE_MS: v })).toBe("backlog_ops_slot_pace_ms");
+    // Never without slots_read=org (empty or heap).
+    for (const slots of ["", "heap"]) for (const v of ["0", "100"]) expect(on(mode, { BACKLOG_OPS_SLOTS_READ: slots, BACKLOG_OPS_SLOT_PACE_MS: v })).toBe("backlog_ops_slot_pace_ms");
+    const since = mode.startsWith("backfill-catchup-") ? SINCE : null;
+    const args = (extra: Record<string, string>) => backlogOpsToolArgs(backlogOpsDispatch(dispatchEnv(mode, extra), true), t, undefined, since).args;
+    const base = args(org);
+    expect(backlogOpsDispatch(dispatchEnv(mode, org), true).slotPaceMs).toBeNull();
+    expect(args({ ...org, BACKLOG_OPS_SLOT_PACE_MS: "" })).toEqual(base);
+    expect(args({ ...org, BACKLOG_OPS_SLOT_PACE_MS: "0" })).toEqual(base);
+    expect(base).not.toContain("--slot-pace-ms");
+    const paced = args({ ...org, BACKLOG_OPS_SLOT_PACE_MS: "250" });
+    const at = paced.indexOf("--slot-pace-ms");
+    expect(paced.slice(at, at + 2)).toEqual(["--slot-pace-ms", "250"]);
+    expect(paced.filter((a) => a === "--slot-pace-ms").length).toBe(1);
+    expect([...paced.slice(0, at), ...paced.slice(at + 2)]).toEqual(base);
+    // Default argv (no slots input at all) byte-identical and without either flag.
+    expect(args({})).not.toContain("--slot-pace-ms");
+  }
+  for (const mode of ["export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry"] as BacklogOpsMode[]) {
+    expect(on(mode, { BACKLOG_OPS_SLOT_PACE_MS: "100" })).toBe("backlog_ops_slot_pace_ms");
+    expect(on(mode, { BACKLOG_OPS_SLOT_PACE_MS: "" })).toBeNull();
+  }
+});
+
 // ---- target and argv ----
 
 test("target variables are shape-checked: key in region, roles in the key's account and distinct", () => {
@@ -186,6 +216,7 @@ test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry 
     expect(section >= 0).toBe(mode.startsWith("backfill-refresh-") || mode.startsWith("backfill-catchup-"));
     expect(spec.args.includes("--revisions-since-ms")).toBe(mode.startsWith("backfill-catchup-"));
     expect(spec.args.includes("--slots-by-org")).toBe(false); // opt-in only (slots_read=org)
+    expect(spec.args.includes("--slot-pace-ms")).toBe(false); // opt-in only (slot_pace_ms)
     if (mode.startsWith("backfill-catchup-")) {
       expect(spec.args.slice(section, section + 8)).toEqual(["--section", "fences", "--section", "ownership", "--section", "revisions", "--revisions-since-ms", String(SINCE)]);
       expect(spec.script).toBe("scripts/upload-fence-backfill.ts");
@@ -570,6 +601,9 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute, backfill-catchup-dry, backfill-catchup-execute]");
   // The FULL binding: an input, its env, and its receipt downloaded (drain-execute with FULL, a catch-up) before the tool step.
   expect(yml).toContain("BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}");
+  expect(yml).toContain("BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}");
+  expect(yml).toContain("BACKLOG_OPS_SLOT_PACE_MS: ${{ inputs.slot_pace_ms }}");
+  expect(yml).toMatch(/\n      slot_pace_ms:\n        description: [^\n]+\n        type: string\n        default: ""\n/u);
   expect(yml).toContain("if: (inputs.mode == 'drain-execute' || startsWith(inputs.mode, 'backfill-catchup-')) && inputs.full_backfill_run != ''");
   // The catch-up's t: the recheck gate step's output, handed only to the tool step; never a dispatch input.
   expect(yml).toContain("        id: recheck\n");
