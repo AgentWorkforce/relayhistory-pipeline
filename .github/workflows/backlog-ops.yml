@@ -54,6 +54,10 @@ on:
         description: Drain modes only - per-run object budget (empty = unbounded)
         type: string
         default: ""
+      slots_read:
+        description: 'Backfill modes only - "org" reads a scoped run''s owned slots once per org through the org index; empty or "heap" (default) keeps the heap block windows'
+        type: string
+        default: ""
       confirmation:
         description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>] (catch-up: BACKFILL-CATCHUP-EXECUTE <sha> DRY <dry_run> FULL <full_backfill_run>). Dry modes: empty'
         type: string
@@ -99,6 +103,7 @@ env:
   BACKLOG_OPS_EXPORT_RUN: ${{ inputs.export_run }}
   BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}
   BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
+  BACKLOG_OPS_SLOTS_READ: ${{ inputs.slots_read }}
   BACKLOG_OPS_CONFIRMATION: ${{ inputs.confirmation }}
 
 jobs:

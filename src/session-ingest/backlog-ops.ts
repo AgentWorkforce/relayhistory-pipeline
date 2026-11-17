@@ -182,6 +182,12 @@ export interface BacklogOpsDispatch {
   fullBackfillRun: string | null;
   /** Drain modes only: the per-run object budget (empty = unbounded). */
   maxObjects: number | null;
+  /**
+   * Backfill modes only (BACKLOG_OPS_SLOTS_READ, input slots_read): "org" reads a scoped run's owned slots once per org
+   * through the org index (upload-fence-backfill.ts --slots-by-org); "heap" (the default, empty input) keeps the heap
+   * block windows, byte-identical to before.
+   */
+  slotsRead: "heap" | "org";
   confirmation: string;
 }
 
@@ -203,7 +209,8 @@ export function backlogOpsDispatch(
   if (BACKLOG_OPS_DRY_ONLY_TOOLS.some((t) => mode === `${t}-execute`)) refuse("backlog_ops_presence_dry_only");
   const dryRun = env.BACKLOG_OPS_DRY_RUN ?? "", backfillRun = env.BACKLOG_OPS_BACKFILL_RUN ?? "",
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
-    fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "";
+    fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "",
+    slotsReadRaw = env.BACKLOG_OPS_SLOTS_READ ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
@@ -221,10 +228,12 @@ export function backlogOpsDispatch(
       refuse("backlog_ops_max_objects");
     budget = Number(maxObjects);
   }
+  if (!(slotsReadRaw === "" || slotsReadRaw === "heap" || (slotsReadRaw === "org" && tool === "backfill"))) refuse("backlog_ops_slots_read");
+  const slotsRead: "heap" | "org" = slotsReadRaw === "org" ? "org" : "heap";
   const runs = [dryRun, backfillRun, exportRun, fullBackfillRun].filter((r) => r !== "");
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
   const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill ? backfillRun : null,
-    exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun, maxObjects: budget, confirmation };
+    exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun, maxObjects: budget, slotsRead, confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
@@ -330,6 +339,8 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
     ...(isRefresh(d.mode) ? ["--section", "fences", "--section", "ownership"] : []),
     // A catch-up: all three sections, the revisions only those updated since t.
     ...(isCatchup(d.mode) ? ["--section", "fences", "--section", "ownership", "--section", "revisions", "--revisions-since-ms", String(revisionsSinceMs)] : []),
+    // Opt-in (slots_read=org), default off: the per-org index read of the owned slots.
+    ...(tool === "backfill" && d.slotsRead === "org" ? ["--slots-by-org"] : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
     ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
   return { script, args, needsDb: tool !== "drain" };

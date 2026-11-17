@@ -19,6 +19,8 @@
  * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
  * stubs, revision shard merges) and needs the owner's explicit OK. Rerunning is a no-op for what is there.
  *
+ * --slots-by-org (the catch-up modes only): a scoped run reads each org's owned slots once through the org index
+ * instead of the heap block windows (upload-fence-backfill.ts SLOTS_ORG_CURSOR).
  * --revisions-since-ms (a catch-up after a full run; needs the revisions section): only the ingest_record_revisions
  * rows updated at or after that epoch ms are applied; owned lazy slots, fences and ownership are read in full
  * (src/session-ingest/upload-fence-backfill.ts header). The summary records it as `revisions_since_ms`.
@@ -53,10 +55,11 @@ export interface BackfillArgs {
   statementTimeoutMs: number;
   kmsKeyArn?: string;
   revisionsSinceMs?: number;
+  slotsByOrg?: boolean;
 }
 
 const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn", "--revisions-since-ms"]);
-const BOOL_FLAGS = new Set(["--dry-run", "--execute"]);
+const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--slots-by-org"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
 export function parseBackfillArgs(argv: string[]): BackfillArgs {
@@ -109,6 +112,7 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
     mode, bucket, region, orgs, sections: chosen, pageSize, rowPageSize, concurrency, statementTimeoutMs,
     ...(kmsKeyArn !== undefined ? { kmsKeyArn } : {}),
     ...(revisionsSinceMs !== undefined ? { revisionsSinceMs } : {}),
+    ...(bools.has("--slots-by-org") ? { slotsByOrg: true } : {}),
   };
 }
 
@@ -141,7 +145,7 @@ if (import.meta.main) {
   try {
     args = parseBackfillArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n] [--revisions-since-ms ms] [--slots-by-org]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -184,6 +188,7 @@ if (import.meta.main) {
       ...(args.orgs.length ? { orgs: args.orgs } : {}),
       sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
       ...(args.revisionsSinceMs !== undefined ? { revisionsSinceMs: args.revisionsSinceMs } : {}),
+      ...(args.slotsByOrg ? { slotsByOrg: true } : {}),
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

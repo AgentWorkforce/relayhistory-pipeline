@@ -32,7 +32,8 @@
  *
  * SQL (finding 8): no long snapshot, and only small per-run sets in memory (one entry per user, one per owned
  * session). Every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked
- * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order (the lazy slots: heap block windows), optionally scoped to orgs. Fences are read from S3 per page.
+ * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order (the lazy slots: heap block windows, or with `slotsByOrg` one org-index cursor per
+ * org read to the end in one short transaction), optionally scoped to orgs. Fences are read from S3 per page.
  *
  * Catch-up (`revisionsSinceMs`, decision 0005's two-phase cutover, docs/backlog-ops-workflow.md): the
  * ingest_record_revisions pages keep their keyset order over the primary key but return only the rows whose
@@ -85,9 +86,14 @@ export interface BackfillOptions {
   rowPageSize?: number;
   concurrency?: number;
   statementTimeoutMs?: number;
-  /** Heap blocks per slot window, scoped or not (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
+  /** Heap blocks per slot window (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
   slotWindowBlocks?: number;
-  /** A scoped run's per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the block walk. */
+  /**
+   * Read a scoped run's owned slots once per org through the org_id index (SLOTS_ORG_CURSOR) instead of the heap block
+   * windows. Off by default: only the catch-up modes pass it (`--slots-by-org`), so the existing modes are unchanged.
+   */
+  slotsByOrg?: boolean;
+  /** With slotsByOrg, the per-org slot read cap (default SLOTS_ORG_READ_MAX_ROWS); above it the org uses the windows. */
   slotOrgReadMaxRows?: number;
   /**
    * Revision entries buffered across pages and windows before one merge pass (default MERGE_BUFFER_ENTRIES): each
@@ -839,12 +845,14 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     // hundred thousand slots, where the block walk reads the whole multi-GB heap. An org above SLOTS_ORG_READ_MAX_ROWS,
     // or the all-orgs scope, uses the block walk below.
     let walkOrgs: string[] | null = orgs ?? null;
-    if (orgs && orgs.length > 0) {
+    if (opts.slotsByOrg === true && orgs && orgs.length > 0) {
       walkOrgs = [];
       for (const org of orgs) {
-        const rows = await readOnlySlotsOfOrg(org);
+        let rows = await readOnlySlotsOfOrg(org);
         if (rows === null) { walkOrgs.push(org); continue; }
-        for (let i = 0; i < rows.length; i += 5000) await slotRows(rows.slice(i, i + 5000));
+        // Slices are handed on and dropped as they go, so the org's rows are freed while the buffers fill.
+        while (rows.length > 0) await slotRows(rows.splice(0, 5000));
+        rows = null;
       }
     }
     // Block windows (SLOTS_WINDOW): a TID range reads the heap in order, where keyset paging on key_sha256 cost about
