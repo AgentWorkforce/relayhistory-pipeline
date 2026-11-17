@@ -19,7 +19,14 @@ import { advisorConfig } from "../config.ts";
 
 setDefaultTimeout(300_000);
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
-const NOW = new Date(Date.UTC(2026, 10, 17, 12));
+/**
+ * The scan clock, re-pinned before each test a few minutes ahead of the real clock. Advisory rows get their
+ * created_at from the database's now() and recent_v1 seeds the limits from it, so a fixed calendar NOW would
+ * see those rows written "after" the scan once the real clock passes it (CI run 44079273862, 2026-11-17 12:00Z):
+ * with pairCooldownMs 0 a future latestAt reads as in cooldown. NOW must stay at or after every row a test writes.
+ */
+const CLOCK_MARGIN_MS = 10 * 60_000;
+let NOW = new Date(Date.now() + CLOCK_MARGIN_MS);
 const at = (min: number) => new Date(NOW.getTime() + min * 60_000).toISOString();
 
 function client(db: PGlite): MigrationClient {
@@ -59,7 +66,7 @@ describe("coordination advisor tick (pglite)", () => {
      VALUES ($1,$2,'claude',$3,$4,$5,$6)`, [org, ws, session, at(-120), at(lastMin), project]);
   const rows = async () => (await db.query<{ workspace_id: string; session_id: string; urgency: string; status: string; kind: string }>(
     "SELECT workspace_id, session_id, urgency, status, kind FROM sessions.coordination_advisories ORDER BY workspace_id, session_id, kind")).rows;
-  const shared = [lane("a", [["src/x/shared.ts", -40]]), lane("b", [["src/x/shared.ts", -20]])];
+  const shared = () => [lane("a", [["src/x/shared.ts", -40]]), lane("b", [["src/x/shared.ts", -20]])];
 
   beforeAll(async () => {
     db = new PGlite({ extensions: { btree_gin, pg_trgm } });
@@ -67,6 +74,7 @@ describe("coordination advisor tick (pglite)", () => {
   });
   afterAll(async () => { await db?.close(); });
   beforeEach(async () => {
+    NOW = new Date(Date.now() + CLOCK_MARGIN_MS);
     await db.exec("DELETE FROM sessions.coordination_advisories; DELETE FROM sessions.session_directory_relationships; DELETE FROM sessions.session_directory");
   });
 
@@ -75,7 +83,7 @@ describe("coordination advisor tick (pglite)", () => {
     await dir("org", "ws1", "b", "proj", -10);
     await dir("org", "ws2", "a", "proj", -10);           // alone in its workspace: no read at all
     await dir("org", "ws1", "old", "proj", -180);         // outside the 2h window
-    const be = backend({ ws1: shared });
+    const be = backend({ ws1: shared() });
     const sender = new InMemoryRelaySender();
     const limits = new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 });
     const tick = advisorTick((q) => ({ workspaces: "*", store: sqlAdvisorStore(q), backend: be, limits, sender }), { intervalMs: 1 });
@@ -97,18 +105,19 @@ describe("coordination advisor tick (pglite)", () => {
     const store = sqlAdvisorStore(asService(db));
     const sender = new InMemoryRelaySender();
     const limits = () => new AdvisorLimits({ pairCooldownMs: 0, sessionHourlyCap: 3 });
-    await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
+    await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared() }), limits: limits(), sender }, NOW);
     await db.exec("UPDATE sessions.coordination_advisories SET status='acked', acked_at=now()");
     sender.sent.length = 0;
-    const again = await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW);
-    expect(again).toMatchObject({ written: 0, existing: 2, dmSent: 0 });
+    const again = await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared() }), limits: limits(), sender }, NOW);
+    // Through the upsert's existing path, not the pair cooldown (pairCooldownMs is 0).
+    expect(again).toMatchObject({ written: 0, existing: 2, cooldown: 0, dmSent: 0 });
     expect((await rows()).every((r) => r.status === "acked")).toBe(true);
 
     await db.exec("DELETE FROM sessions.coordination_advisories");
     await dir("org", "ws1", "p", "proj", -200);
     for (const child of ["a", "b"]) await db.query(
       "INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) VALUES ('org','ws1','claude','p',$1,$1)", [child]);
-    expect(await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared }), limits: limits(), sender }, NOW)).toMatchObject({ written: 0 });
+    expect(await scanOnce({ workspaces: "*", store, backend: backend({ ws1: shared() }), limits: limits(), sender }, NOW)).toMatchObject({ written: 0 });
     expect(await rows()).toEqual([]);
   });
 
