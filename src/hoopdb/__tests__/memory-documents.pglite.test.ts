@@ -263,7 +263,8 @@ describe("20261105062080 memory documents", () => {
     expect(await sink({ orgId: "org-a", workspaceId: "ws-a" }, records)).toEqual({ inserted: 2, merged: 0, evidence_added: 3 });
     // The same analysis again merges and adds nothing.
     expect(await recordDecisions(sink, { orgId: "org-a", workspaceId: "ws-a" }, snapshot)).toBe(2);
-    const rows = await list("org-a", "ws-a", "src-session-read-api");
+    // Both rows share created_at (one transaction), so the uuid tiebreak orders them randomly: sort first.
+    const rows = (await list("org-a", "ws-a", "src-session-read-api")).sort((a, b) => b.title.length - a.title.length);
     expect(rows.map((r) => [r.title.length, r.evidence.map((e) => [e.source, e.session_id, e.turn_start, e.turn_end, e.ref])])).toEqual([
       [200, [["claude", "sess-1", 0, 1, "https://github.com/o/r/pull/12"], ["codex", "sess-2", 0, 0, "https://github.com/o/r/pull/12"]]],
       [26, [["claude", "sess-1", 1, 1, null]]],
