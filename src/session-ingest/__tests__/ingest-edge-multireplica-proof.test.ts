@@ -1,21 +1,23 @@
 import { describe, expect, test } from "bun:test";
 import {
-  BLOCKED_REVISION, evaluate, parseDeployment, parseProofArgs, planBurst, planCounts, preflightRefusals, tallyLog,
+  BLOCKED_REVISION, evaluate, parseDeployment, parseProofArgs, planBurst, planCounts, ownershipCheck, preflightRefusals, resetOwnershipCheck, tallyLog,
   type BatchObservation, type Observation, type ProofConfig,
 } from "../../../scripts/proof-ingest-edge-multireplica.ts";
+import { s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash as sessionKey, type FenceDoc, type OwnerDoc } from "../ledger-s3.ts";
+import { scratchStore } from "./support.ts";
 
 const ARGS = [
   "--i-know-this-is-dev", "--target-env", "dev", "--deployment", "agentrelay-dev",
   "--ingest-url", "https://ingest.dev.example.test", "--org", "org_proof", "--workspace", "ws_proof",
   "--user", "user-one:PROOF_TOKEN_1", "--user", "user:two:PROOF_TOKEN_2",
-  "--bucket", "proof-canonical-bucket", "--region", "us-east-1", "--replicas-confirmed",
+  "--bucket", "proof-canonical-dev-bucket", "--region", "us-east-1", "--replicas-confirmed", "--reset-user-is-synthetic",
 ];
 const ENV = { PROOF_TOKEN_1: "sh_at_one", PROOF_TOKEN_2: "sh_at_two" };
 const cfg = (extra: string[] = [], drop: string[] = []): ProofConfig => {
   const args = [...ARGS];
   for (const d of drop) {
     const i = args.indexOf(d);
-    const isBool = d === "--i-know-this-is-dev" || d === "--replicas-confirmed";
+    const isBool = d === "--i-know-this-is-dev" || d === "--replicas-confirmed" || d === "--reset-user-is-synthetic";
     args.splice(i, isBool ? 1 : 2);
   }
   return parseProofArgs([...args, ...extra]);
@@ -51,7 +53,7 @@ describe("preflightRefusals", () => {
     expect(preflightRefusals(with_(c, { ingestUrl: "http://ingest.dev.example.test" }), ENV)).toContain("ingest_url_invalid");
     expect(preflightRefusals(with_(c, { bucket: "sessions-prod" }), ENV)).toContain("bucket_looks_like_production");
     expect(preflightRefusals(with_(c, { controlUrl: "https://control.production.example.test" }), ENV)).toContain("control_url_looks_like_production");
-    expect(preflightRefusals(with_(c, { kubeNamespace: "prod", kubeDeployment: "x-ingest-edge" }), ENV)).toContain("kube_target_looks_like_production");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "prod", kubeDeployment: "x-dev-ingest-edge" }), ENV)).toContain("kube_namespace_looks_like_production");
   });
   test("a non-production word inside a longer token is not production", () => {
     expect(preflightRefusals(with_(cfg(), { deployment: "agentrelay-dev", bucket: "productive-dev-bucket" }), ENV)).toEqual([]);
@@ -68,7 +70,34 @@ describe("preflightRefusals", () => {
     const c = cfg([], ["--replicas-confirmed"]);
     expect(preflightRefusals(c, ENV)).toContain("replicas_unconfirmed");
     expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev" }), ENV)).toContain("kube_namespace_and_deployment_both_required");
-    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-ingest-edge" }), ENV)).toEqual([]);
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge" }), ENV)).toEqual([]);
+  });
+  test("every target name needs a non-production marker, not just the absence of a production one", () => {
+    const c = cfg();
+    expect(preflightRefusals(with_(c, { bucket: "proof-canonical-bucket" }), ENV)).toContain("bucket_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { ledgerBucket: "proof-ledger-bucket" }), ENV)).toContain("ledger_bucket_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { ledgerBucket: "proof-ledger-prod" }), ENV)).toContain("ledger_bucket_looks_like_production");
+    expect(preflightRefusals(with_(c, { ingestUrl: "https://ingest.example.com" }), ENV)).toContain("ingest_url_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { controlUrl: "https://control.example.com" }), ENV)).toContain("control_url_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions", kubeDeployment: "sp-dev-ingest-edge" }), ENV)).toContain("kube_namespace_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-ingest-edge" }), ENV)).toContain("kube_deployment_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge", kubeContext: "prd-cluster" }), ENV)).toContain("kube_context_looks_like_production");
+    expect(preflightRefusals(with_(c, { kubeNamespace: "sessions-dev", kubeDeployment: "sp-dev-ingest-edge", kubeContext: "shared-cluster" }), ENV)).toContain("kube_context_not_marked_non_production");
+  });
+  test("the endpoint is checked: https to a non-production host, plain http to loopback only", () => {
+    const c = cfg();
+    expect(preflightRefusals(with_(c, { endpoint: "https://s3.dev.example.test" }), ENV)).toEqual([]);
+    expect(preflightRefusals(with_(c, { endpoint: "https://s3.prod.example.test" }), ENV)).toContain("endpoint_looks_like_production");
+    expect(preflightRefusals(with_(c, { endpoint: "https://s3.us-east-1.example.com" }), ENV)).toContain("endpoint_not_marked_non_production");
+    expect(preflightRefusals(with_(c, { endpoint: "http://minio.dev.example.test:9000" }), ENV)).toContain("endpoint_plain_http_not_loopback");
+    expect(preflightRefusals(with_(c, { endpoint: "ftp://x" }), ENV)).toContain("endpoint_invalid");
+    // A loopback object store (the local mode) exempts the bucket names from the marker, never from the deny-list.
+    expect(preflightRefusals(with_(c, { endpoint: "http://127.0.0.1:9000", bucket: "transcripts" }), ENV)).toEqual([]);
+    expect(preflightRefusals(with_(c, { endpoint: "http://localhost:9000", bucket: "transcripts-prod" }), ENV)).toContain("bucket_looks_like_production");
+  });
+  test("the user-wide reset needs user 0 declared a dedicated synthetic user", () => {
+    expect(preflightRefusals(cfg([], ["--reset-user-is-synthetic"]), ENV)).toContain("reset_user_not_declared_synthetic");
+    expect(preflightRefusals(cfg(["--plan-only"], ["--reset-user-is-synthetic"]), {})).toContain("reset_user_not_declared_synthetic");
   });
   test("plan-only needs neither tokens nor replicas", () => {
     expect(preflightRefusals(cfg(["--plan-only"], ["--replicas-confirmed"]), {})).toEqual([]);
@@ -79,7 +108,7 @@ describe("preflightRefusals", () => {
     expect(preflightRefusals(cfg(["--allow-retry-code", "Bad Code"]), ENV)).toContain("allow_retry_code_invalid");
   });
   test("a split ledger bucket must differ from the canonical bucket", () => {
-    expect(preflightRefusals(with_(cfg(), { ledgerBucket: "proof-canonical-bucket" }), ENV)).toContain("ledger_bucket_invalid");
+    expect(preflightRefusals(with_(cfg(), { ledgerBucket: "proof-canonical-dev-bucket" }), ENV)).toContain("ledger_bucket_invalid");
     expect(preflightRefusals(with_(cfg(), { ledgerRegion: "us-west-2" }), ENV)).toContain("ledger_region_without_ledger_bucket");
   });
 });
@@ -199,7 +228,10 @@ describe("evaluate", () => {
   test("the reset must run, replay its first count, cover every owned session and be in the fence", () => {
     failsWith((o) => { o.reset.count = null; }, "reset_not_run");
     failsWith((o) => { o.reset.replay = 7; }, "reset_replay_answered_differently");
-    failsWith((o) => { o.reset.count = 3; o.reset.replay = 3; }, "reset_tombstoned_fewer_sessions_than_owned");
+    failsWith((o) => { o.reset.count = 3; o.reset.replay = 3; }, "reset_count_not_equal_run_sessions");
+    // More than the run's sessions: the reset reached a session outside the run.
+    failsWith((o) => { o.reset.count = 9; o.reset.replay = 9; }, "reset_count_not_equal_run_sessions");
+    failsWith((o) => { o.reset.count = null; o.reset.replay = null; o.reset.refused = "foreign_sessions"; }, "reset_refused_foreign_sessions");
     failsWith((o) => { o.reset.fenceResets = 0; }, "reset_not_recorded_in_fence");
   });
   test("retry codes: contention codes pass, anything else fails unless allowed", () => {
@@ -229,11 +261,13 @@ describe("evaluate", () => {
     // The reset refusal is an expected log code too.
     expect(local((o) => { o.logs!.pod_0!.codes.delivery_privacy_superseded = 2; }).verdict).toBe("PASS");
   });
-  test("with the operator flag instead of kubectl, no replica or log check runs", () => {
+  test("with the operator flag instead of kubectl, no replica or log check runs, and the verdict is PASS_UNATTRIBUTED", () => {
     const o = clean();
     o.replicas = { by: "operator_flag", ready: null };
     delete o.logs;
-    expect(evaluate(o).verdict).toBe("PASS");
+    expect(evaluate(o).verdict).toBe("PASS_UNATTRIBUTED");
+    o.storage.deadLetters = 1;
+    expect(evaluate(o).verdict).toBe("FAIL");
   });
 });
 
@@ -262,5 +296,51 @@ describe("kubectl parsing", () => {
       "plain text", "{ not json",
     ].join("\n"));
     expect(t).toEqual({ lines: 8, admitted: 3, refused: 0, retry: 1, deferred: 1, deadLettered: 1, uploads: 1, promoted: 3, firstWrites: 1, replayFast: 1, codes: { ledger_batch_contended: 1, tenant_limit: 1, admission_failed: 1 } });
+  });
+});
+
+describe("resetOwnershipCheck (what the user-wide reset would tombstone)", () => {
+  const owner = (originId: string, sessionId: string, epoch = 0): OwnerDoc => ({ v: 1, originId, source: "claude", sessionId, epoch, resets: 0 });
+  // A minimal fence: only the fields fenceEpoch / isDeleted read.
+  const fence = (patch: Partial<FenceDoc> = {}): FenceDoc => ({ v: 1, instance: "i", version: 1, resets: 0, resetsCompleted: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {}, ...patch } as unknown as FenceDoc);
+  const run = new Set(["o-a\ns1", "o-b\ns2"]);
+  test("exactly the run's sessions: no foreign, none missing", () => {
+    expect(resetOwnershipCheck([owner("o-a", "s1"), owner("o-b", "s2")], fence(), run)).toEqual({ live: 2, foreign: 0, missing: 0 });
+    expect(resetOwnershipCheck([owner("o-a", "s1"), owner("o-b", "s2")], null, run)).toEqual({ live: 2, foreign: 0, missing: 0 });
+  });
+  test("a live session outside the run is foreign (the reset is refused)", () => {
+    expect(resetOwnershipCheck([owner("o-a", "s1"), owner("o-b", "s2"), owner("o-x", "other")], fence(), run).foreign).toBe(1);
+    // Before the burst: the reset user must own nothing live.
+    expect(resetOwnershipCheck([owner("o-x", "other")], null, new Set()).foreign).toBe(1);
+  });
+  test("an already deleted or re-epoched session is not live, so not foreign", () => {
+    const f = fence({ deleted: { "o-x": [["claude", "other"]] } } as Partial<FenceDoc>);
+    expect(resetOwnershipCheck([owner("o-a", "s1"), owner("o-b", "s2"), owner("o-x", "other")], f, run)).toEqual({ live: 2, foreign: 0, missing: 0 });
+    expect(resetOwnershipCheck([owner("o-a", "s1"), owner("o-b", "s2"), owner("o-y", "old", 0)], fence({ epochs: { "o-y": { [sessionKey("claude", "old")]: 1 } } } as Partial<FenceDoc>), run).foreign).toBe(0);
+  });
+  test("a run session without a stub is missing", () => {
+    expect(resetOwnershipCheck([owner("o-a", "s1")], fence(), run)).toEqual({ live: 1, foreign: 0, missing: 1 });
+  });
+});
+
+describe("ownershipCheck over a store (read-only, before the reset)", () => {
+  const ROOT = "96bulls";
+  const tenant = { orgId: "org_proof", workspaceId: "ws_proof", userId: "user_zero" };
+  test("refuses (foreign) when the reset user owns a session outside the run; counts the run's own; reads nothing it writes", async () => {
+    const { store, done } = scratchStore();
+    try {
+      const io = s3LedgerObjects(store, ROOT);
+      const keys = s3LedgerKeys(ROOT, tenant);
+      const stub = (originId: string, sessionId: string): OwnerDoc => ({ v: 1, originId, source: "claude", sessionId, epoch: 0, resets: 0 });
+      expect(await ownershipCheck(store, ROOT, tenant, new Set())).toEqual({ live: 0, foreign: 0, missing: 0 });
+      await io.registerOwner(keys.owner("o-a", "claude", "s1"), stub("o-a", "s1"));
+      expect(await ownershipCheck(store, ROOT, tenant, new Set(["o-a\ns1"]))).toEqual({ live: 1, foreign: 0, missing: 0 });
+      await io.registerOwner(keys.owner("o-x", "claude", "foreign"), stub("o-x", "foreign"));
+      expect((await ownershipCheck(store, ROOT, tenant, new Set(["o-a\ns1"])))!.foreign).toBe(1);
+      expect((await ownershipCheck(store, ROOT, tenant, new Set()))!.foreign).toBe(2);
+      // After a reset tombstoned them, nothing is live: a rerun with the same synthetic user is allowed.
+      await s3Ledger(store, ROOT, { acceptanceMode: "canonical" }).resetUploadedSessions(tenant, "r1");
+      expect(await ownershipCheck(store, ROOT, tenant, new Set())).toEqual({ live: 0, foreign: 0, missing: 0 });
+    } finally { done(); }
   });
 });

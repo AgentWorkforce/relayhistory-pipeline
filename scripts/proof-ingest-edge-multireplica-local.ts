@@ -24,7 +24,7 @@ import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { FENCE_AUTHORITY } from "../e2e/pipeline/fixtures.ts";
-import { buildImage, createStack } from "../e2e/selfhost/stack.ts";
+import { buildImage, createStack, type StackSession } from "../e2e/selfhost/stack.ts";
 import { witnessPrivacyJournal } from "../src/session-ingest/async-admission.ts";
 import { orgFenceAuthorityKey } from "../src/session-ingest/ledger-s3.ts";
 import {
@@ -57,15 +57,17 @@ const tokenTable = Object.fromEntries(users.map((u) => [u.token, { sub: u.userId
 const witnessKeyText = randomBytes(32).toString("base64url");
 const witnessKey = parseUploadWitnessKey(witnessKeyText);
 
-const stack = createStack({
-  files: [new URL("../e2e/multireplica/compose.yaml", import.meta.url).pathname],
-  project,
-  extraEnv: { E2E_IMAGE: image, E2E_TOKENS: JSON.stringify(tokenTable), E2E_UPLOAD_WITNESS_KEY: witnessKeyText },
-});
+// Created only after the preflight passed (createStack writes the per-run certificate directory).
+let stackSession: StackSession | undefined;
+const stackOf = () => {
+  if (!stackSession) throw new Error("stack not created");
+  return stackSession;
+};
 let downDone = false;
 const down = () => {
-  if (downDone) return;
+  if (downDone || !stackSession) return;
   downDone = true;
+  const stack = stackSession;
   if (v.keep) return log(`--keep: compose project ${project} left up (image ${image}). Remove it with: docker rm -f $(docker ps -aq --filter label=com.docker.compose.project=${project}); docker volume rm ${project}_pgdata ${project}_miniodata; docker network rm ${project}_default; and its .96bulls/e2e-* certificate directory`);
   stack.compose(["down", "-v", "--remove-orphans"], { quiet: true, allowFail: true });
   stack.cleanup();
@@ -75,7 +77,7 @@ process.on("SIGINT", () => { down(); process.exit(130); });
 process.on("SIGTERM", () => { down(); process.exit(143); });
 
 const hostUrl = (service: string, port: string) => {
-  const out = stack.compose(["port", service, port], { quiet: true, allowFail: true }).stdout.trim();
+  const out = stackOf().compose(["port", service, port], { quiet: true, allowFail: true }).stdout.trim();
   const value = out.slice(out.lastIndexOf(":") + 1);
   if (!/^[1-9]\d*$/u.test(value)) throw new Error(`no host port for ${service}:${port} (is it running?)`);
   return `http://127.0.0.1:${value}`;
@@ -87,8 +89,7 @@ const ready = async (url: string) => {
   }
   throw new Error(`not ready within 240s: ${new URL(url).host}${new URL(url).pathname}`);
 };
-const replicaLog = (service: string) => stack.compose(["logs", "--no-color", "--no-log-prefix", service], { quiet: true, allowFail: true }).stdout;
-
+const replicaLog = (service: string) => stackSession?.compose(["logs", "--no-color", "--no-log-prefix", service], { quiet: true, allowFail: true }).stdout ?? "";
 /** relay-control's credential mint and the desktop's create-only PUT, for one batch object. */
 function localDirectPut(store: ObjectStore): DirectPut {
   return async (u, originId, body, bytes, copies) => {
@@ -108,7 +109,10 @@ function localDirectPut(store: ObjectStore): DirectPut {
 
 async function main(): Promise<number> {
   const c: ProofConfig = {
-    targetEnv: "sandbox", deployment: "local-test", iKnowThisIsDev: true, ingestUrl: "http://127.0.0.1", org: LOCAL_ORG, workspace: LOCAL_WORKSPACE,
+    // Loopback declarations for the preflight (the real ports are known only once the stack is up): the ingest
+    // processes and the object store are on this host, which is what exempts the fixed local bucket name.
+    targetEnv: "sandbox", deployment: "local-test", iKnowThisIsDev: true, ingestUrl: "http://127.0.0.1", endpoint: "http://127.0.0.1",
+    org: LOCAL_ORG, workspace: LOCAL_WORKSPACE, resetUserIsSynthetic: true,
     users: users.map((u, i) => ({ userId: u.userId, tokenEnv: `MRP_LOCAL_TOKEN_${i}` })), keyRoot: KEY_ROOT, bucket: BUCKET, region: "us-east-1",
     credentials: "keys", replicasConfirmed: true, sessionsPerOrigin: int(v["sessions-per-origin"]), revisions: int(v.revisions),
     retryCopies: int(v["retry-copies"]), concurrency: int(v.concurrency), quiesceTimeoutS: int(v["quiesce-timeout-s"]), allowRetryCodes: [], planOnly: false,
@@ -117,6 +121,11 @@ async function main(): Promise<number> {
   const refusals = preflightRefusals(c, Object.fromEntries(users.map((u, i) => [`MRP_LOCAL_TOKEN_${i}`, u.token])));
   if (refusals.length) { process.stdout.write(JSON.stringify({ refused: refusals }) + "\n"); return 2; }
 
+  const stack = stackSession = createStack({
+    files: [new URL("../e2e/multireplica/compose.yaml", import.meta.url).pathname],
+    project,
+    extraEnv: { E2E_IMAGE: image, E2E_TOKENS: JSON.stringify(tokenTable), E2E_UPLOAD_WITNESS_KEY: witnessKeyText },
+  });
   if (!v.image) { log(`building ${image} ...`); buildImage(image); }
   log(`starting compose project ${project}: ${REPLICAS.join(", ")} (+ db, minio, migrate, roles, control-stub)`);
   stack.compose(["down", "-v", "--remove-orphans"], { quiet: true, allowFail: true });

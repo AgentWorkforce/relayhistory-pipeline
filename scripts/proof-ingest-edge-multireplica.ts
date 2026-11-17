@@ -34,17 +34,18 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { zstdCompressSync } from "node:zlib";
 import { deliveryBatch } from "../e2e/pipeline/fixtures.ts";
-import { INBOX_MIN_BYTES } from "../src/session-ingest/async-admission.ts";
+import { INBOX_MIN_BYTES, INBOX_NAMESPACE, originInboxDir } from "../src/session-ingest/async-admission.ts";
 import {
-  fenceAuthorityKey, fenceAuthorityStopKey, orgFenceAuthorityKey, s3Ledger, s3LedgerKeys, s3LedgerObjects,
-  validFenceAuthority, validOrgFenceAuthority,
+  fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, isDeleted, orgFenceAuthorityKey, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash,
+  validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type OwnerDoc,
 } from "../src/session-ingest/ledger-s3.ts";
 import { ledgerRoutedStore } from "../src/session-ingest/ledger-store.ts";
 import type { LedgerTenant } from "../src/session-ingest/ledger.ts";
 import {
-  batchSegment, parseUploadAdmissionStatus, parseUploadCredentialsResponse, uploadChecksumSha256, uploadObjectSha256Hex,
-  userSegment, UPLOAD_WITNESS_METADATA_HEADER,
+  batchSegment, parseUploadAdmissionStatus, parseUploadCredentialsResponse, uploadChecksumSha256, uploadKeyPrefix, uploadObjectSha256Hex,
+  UPLOAD_WITNESS_METADATA_HEADER,
 } from "../src/session-ingest/upload-inbox-contract.ts";
+import { DEAD_LETTER_NAMESPACE } from "../src/session-ingest/selfhost-admission.ts";
 import { liveMachineId } from "../src/session-ingest/writer.ts";
 import { layoutComponent } from "../src/shared/layout-component.ts";
 import { createS3Store, isObjectStoreError, objectKey, readAll, type ObjectStore } from "../src/shared/vendor.ts";
@@ -94,6 +95,8 @@ export interface ProofConfig {
   concurrency: number;
   quiesceTimeoutS: number;
   allowRetryCodes: string[];
+  /** The operator declares user 0 a dedicated synthetic user: the mid-run reset tombstones EVERY session it owns. */
+  resetUserIsSynthetic: boolean;
   planOnly: boolean;
   receiptOut?: string;
 }
@@ -110,6 +113,7 @@ const OPTIONS = {
   "retry-copies": { type: "string", default: "4" }, concurrency: { type: "string", default: "12" },
   "quiesce-timeout-s": { type: "string", default: "600" }, "allow-retry-code": { type: "string", multiple: true },
   "plan-only": { type: "boolean", default: false }, "receipt-out": { type: "string" },
+  "reset-user-is-synthetic": { type: "boolean", default: false },
 } as const;
 
 /** Parse argv into a config. Throws only on unknown flags; every semantic check is preflightRefusals'. */
@@ -132,18 +136,31 @@ export function parseProofArgs(argv: string[]): ProofConfig {
     ...(v["kube-context"] ? { kubeContext: v["kube-context"] } : {}),
     sessionsPerOrigin: int(v["sessions-per-origin"]), revisions: int(v.revisions), retryCopies: int(v["retry-copies"]),
     concurrency: int(v.concurrency), quiesceTimeoutS: int(v["quiesce-timeout-s"]), allowRetryCodes: v["allow-retry-code"] ?? [],
+    resetUserIsSynthetic: v["reset-user-is-synthetic"] === true,
     planOnly: v["plan-only"] === true, ...(v["receipt-out"] ? { receiptOut: v["receipt-out"] } : {}),
   };
 }
 
+const isLoopback = (host: string) => host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+
+/** An https URL, or plain http to a loopback host only (the local mode); no credentials, query or fragment. */
 function urlHost(u: string): string | null {
   try {
     const url = new URL(u);
     if (url.username || url.password || url.search || url.hash) return null;
-    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) return null;
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) return null;
     return url.hostname;
   } catch { return null; }
+}
+
+/**
+ * The deny-list AND the positive marker, for one target name: a production token anywhere refuses, and the name must
+ * carry a non-production marker unless `exempt` (a loopback host, or a bucket on a loopback object store).
+ */
+function targetRefusals(what: string, name: string, exempt = false): string[] {
+  if (PROD.test(name)) return [`${what}_looks_like_production`];
+  if (!exempt && !NON_PROD.test(name)) return [`${what}_not_marked_non_production`];
+  return [];
 }
 
 /**
@@ -155,28 +172,31 @@ export function preflightRefusals(c: ProofConfig, env: Record<string, string | u
   if (!c.iKnowThisIsDev) r.push("missing_i_know_this_is_dev");
   if (!(TARGET_ENVS as readonly string[]).includes(c.targetEnv)) r.push("target_env_not_dev_or_stage");
   if (!c.deployment) r.push("deployment_missing");
-  else {
-    if (PROD.test(c.deployment)) r.push("deployment_looks_like_production");
-    if (!NON_PROD.test(c.deployment)) r.push("deployment_not_marked_non_production");
-  }
+  else r.push(...targetRefusals("deployment", c.deployment));
   const ingestHost = urlHost(c.ingestUrl);
   if (!ingestHost) r.push("ingest_url_invalid");
-  else if (PROD.test(ingestHost)) r.push("ingest_url_looks_like_production");
+  else r.push(...targetRefusals("ingest_url", ingestHost, isLoopback(ingestHost)));
   if (c.controlUrl !== undefined) {
     const h = urlHost(c.controlUrl);
     if (!h) r.push("control_url_invalid");
-    else if (PROD.test(h)) r.push("control_url_looks_like_production");
+    else r.push(...targetRefusals("control_url", h, isLoopback(h)));
   }
-  if (c.endpoint !== undefined && !urlHost(c.endpoint) && !/^http:\/\/[a-z0-9.-]+(:[0-9]+)?$/.test(c.endpoint)) r.push("endpoint_invalid");
+  // The object store endpoint: https to a non-production host, or plain http to loopback only (the local mode).
+  let localStore = false;
+  if (c.endpoint !== undefined) {
+    const h = urlHost(c.endpoint);
+    if (!h) r.push(/^http:/i.test(c.endpoint) ? "endpoint_plain_http_not_loopback" : "endpoint_invalid");
+    else { localStore = isLoopback(h); r.push(...targetRefusals("endpoint", h, localStore)); }
+  }
   if (!SEGMENT.test(c.org)) r.push("org_invalid");
   if (!SEGMENT.test(c.workspace)) r.push("workspace_invalid");
   if (!KEY_ROOT.test(c.keyRoot)) r.push("key_root_invalid");
   if (!BUCKET.test(c.bucket)) r.push("bucket_invalid");
-  else if (PROD.test(c.bucket)) r.push("bucket_looks_like_production");
+  else r.push(...targetRefusals("bucket", c.bucket, localStore));
   if (!REGION.test(c.region)) r.push("region_invalid");
   if (c.ledgerBucket !== undefined) {
     if (!BUCKET.test(c.ledgerBucket) || c.ledgerBucket === c.bucket) r.push("ledger_bucket_invalid");
-    else if (PROD.test(c.ledgerBucket)) r.push("ledger_bucket_looks_like_production");
+    else r.push(...targetRefusals("ledger_bucket", c.ledgerBucket, localStore));
     if (c.ledgerRegion !== undefined && !REGION.test(c.ledgerRegion)) r.push("ledger_region_invalid");
   } else if (c.ledgerRegion !== undefined) r.push("ledger_region_without_ledger_bucket");
   if (c.credentials !== "keys" && c.credentials !== "podIdentity") r.push("credentials_mode_invalid");
@@ -197,7 +217,10 @@ export function preflightRefusals(c: ProofConfig, env: Record<string, string | u
     if (kube && !(c.kubeNamespace && c.kubeDeployment)) r.push("kube_namespace_and_deployment_both_required");
     if (!c.replicasConfirmed && !kube) r.push("replicas_unconfirmed");
   }
-  for (const k of [c.kubeNamespace, c.kubeDeployment, c.kubeContext]) if (k !== undefined && PROD.test(k)) { r.push("kube_target_looks_like_production"); break; }
+  for (const [what, k] of [["kube_namespace", c.kubeNamespace], ["kube_deployment", c.kubeDeployment], ["kube_context", c.kubeContext]] as const)
+    if (k !== undefined) r.push(...targetRefusals(what, k));
+  // The reset is user-wide (resetUploadedSessions tombstones every session user 0 owns): only on a declared synthetic user.
+  if (!c.resetUserIsSynthetic) r.push("reset_user_not_declared_synthetic");
   const range = (n: number, lo: number, hi: number) => Number.isInteger(n) && n >= lo && n <= hi;
   if (!range(c.sessionsPerOrigin, 1, 16)) r.push("sessions_per_origin_out_of_range");
   if (!range(c.revisions, 2, 32)) r.push("revisions_out_of_range");
@@ -211,7 +234,7 @@ export function preflightRefusals(c: ProofConfig, env: Record<string, string | u
 /** What the run prints before it starts: the target and shape only (no token, no user id). */
 export function configSummary(c: ProofConfig) {
   return {
-    target_env: c.targetEnv, deployment: c.deployment, ingest_host: urlHost(c.ingestUrl), direct_upload: c.controlUrl !== undefined,
+    target_env: c.targetEnv, ingest_loopback: isLoopback(urlHost(c.ingestUrl) ?? ""), direct_upload: c.controlUrl !== undefined,
     key_root: c.keyRoot, ledger_bucket_split: c.ledgerBucket !== undefined, sse_kms: c.sseKmsKeyId !== undefined, credentials: c.credentials,
     users: c.users.length, sessions_per_origin: c.sessionsPerOrigin, revisions: c.revisions, retry_copies: c.retryCopies,
     concurrency: c.concurrency, quiesce_timeout_s: c.quiesceTimeoutS,
@@ -320,7 +343,8 @@ export interface Observation {
   sessions: SessionObservation[];
   storage: { inboxPending: number; uploadInboxPending: number; deadLetters: number };
   http: { statuses: Record<string, number>; retryCodes: Record<string, number>; unexpected: number };
-  reset: { count: number | null; replay: number | null; resetSessions: number; fenceResets: number | null };
+  /** `refused`: the reset was not applied because user 0 owned sessions outside the run (resetOwnershipCheck). */
+  reset: { count: number | null; replay: number | null; resetSessions: number; fenceResets: number | null; refused?: "foreign_sessions" | "owners_unreadable" };
   replicas: { by: "kubectl" | "operator_flag" | "local_compose"; ready: number | null; env?: Record<string, string | null> };
   logs?: Record<string, LogTally>;
   quiesced: boolean;
@@ -335,7 +359,30 @@ export const EXPECTED_RETRY_CODES = new Set([
 /** Refusals allowed only on a batch that races the reset or is superseded by it. */
 export const RESET_REFUSAL_CODES = new Set(["delivery_privacy_superseded"]);
 
-export interface Verdict { verdict: "PASS" | "FAIL"; failures: Record<string, number>; counts: Record<string, unknown> }
+/**
+ * PASS_UNATTRIBUTED: every storage assertion held, but there is no per-replica evidence (no logs: --replicas-confirmed
+ * without kubectl), so nothing shows a second replica did any of the work. Exit 0, but it is not a two-replica proof.
+ */
+export interface Verdict { verdict: "PASS" | "PASS_UNATTRIBUTED" | "FAIL"; failures: Record<string, number>; counts: Record<string, unknown> }
+
+/**
+ * The read-only check before the user-wide reset: the sessions user 0 owns that the reset would tombstone (an owner
+ * stub of the current generation, not deleted: ledger-s3.ts finishResets' rule) must be exactly `runSessions`
+ * (`originId\nsessionId`). Before the burst, pass an empty set: a dedicated synthetic user owns nothing live yet.
+ * An absent fence (`null`) means no control ever ran: every stub is live.
+ */
+export function resetOwnershipCheck(owners: readonly OwnerDoc[], fence: FenceDoc | null, runSessions: ReadonlySet<string>): { live: number; foreign: number; missing: number } {
+  const live = new Set<string>();
+  for (const d of owners) {
+    if (fence && (isDeleted(fence, d.originId, d.source, d.sessionId) || fenceEpoch(fence, d.originId, sessionKeyHash(d.source, d.sessionId)) !== d.epoch)) continue;
+    live.add(`${d.originId}\n${d.sessionId}`);
+  }
+  let foreign = 0;
+  for (const k of live) if (!runSessions.has(k)) foreign++;
+  let missing = 0;
+  for (const k of runSessions) if (!live.has(k)) missing++;
+  return { live: live.size, foreign, missing };
+}
 
 /**
  * `requireAdmissionsPerReplica`: every replica's log must show at least one admission of its own (the local mode,
@@ -382,10 +429,12 @@ export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly stri
   const allowed = new Set([...EXPECTED_RETRY_CODES, ...(opts.allowRetryCodes ?? [])]);
   for (const [code, n] of Object.entries(o.http.retryCodes)) if (!allowed.has(code)) fail("unexpected_retry_code", n);
 
-  if (o.reset.count === null) fail("reset_not_run");
+  if (o.reset.refused) fail(`reset_refused_${o.reset.refused}`);
+  else if (o.reset.count === null) fail("reset_not_run");
   else {
     if (o.reset.replay !== o.reset.count) fail("reset_replay_answered_differently");
-    if (o.reset.count < o.reset.resetSessions) fail("reset_tombstoned_fewer_sessions_than_owned");
+    // Exactly the run's sessions: fewer is a missed tombstone, more means the reset reached a session outside the run.
+    if (o.reset.count !== o.reset.resetSessions) fail("reset_count_not_equal_run_sessions");
     if (o.reset.fenceResets === null || o.reset.fenceResets < 1) fail("reset_not_recorded_in_fence");
   }
 
@@ -419,7 +468,7 @@ export function evaluate(o: Observation, opts: { allowRetryCodes?: readonly stri
 
   const tally = <T>(xs: T[], key: (x: T) => string) => xs.reduce<Record<string, number>>((m, x) => ((m[key(x)] = (m[key(x)] ?? 0) + 1), m), {});
   return {
-    verdict: Object.keys(f).length === 0 ? "PASS" : "FAIL",
+    verdict: Object.keys(f).length > 0 ? "FAIL" : o.logs ? "PASS" : "PASS_UNATTRIBUTED",
     failures: f,
     counts: {
       batches: o.batches.length,
@@ -700,7 +749,7 @@ async function main(argv: string[]): Promise<number> {
   const sse = c.sseKmsKeyId ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: c.sseKmsKeyId } : {};
   const mainStore = createS3Store({ bucket: c.bucket, region: c.region, ...(c.endpoint ? { endpoint: c.endpoint } : {}), credentials, ...sse }) as unknown as ObjectStore;
   const store = c.ledgerBucket
-    ? ledgerRoutedStore(mainStore, createS3Store({ bucket: c.ledgerBucket, region: c.ledgerRegion ?? c.region, credentials, ...sse }) as unknown as ObjectStore, c.keyRoot)
+    ? ledgerRoutedStore(mainStore, createS3Store({ bucket: c.ledgerBucket, region: c.ledgerRegion ?? c.region, ...(c.endpoint ? { endpoint: c.endpoint } : {}), credentials, ...sse }) as unknown as ObjectStore, c.keyRoot)
     : mainStore;
 
   // ---- runtime preflight: fence authority for the org, kill switch, replicas ----
@@ -711,6 +760,10 @@ async function main(argv: string[]): Promise<number> {
     const covered = org !== null ? validOrgFenceAuthority(org) && org.orgId === c.org : validFenceAuthority(await readJson(store, fenceAuthorityKey(c.keyRoot)));
     if (!covered) pre.push("org_not_covered_by_fence_authority_marker");
   } catch { pre.push("store_unreadable"); }
+  // The reset user must own no live session yet: everything the mid-run reset tombstones is then this run's.
+  const own = await ownershipCheck(store, c.keyRoot, { orgId: c.org, workspaceId: c.workspace, userId: c.users[0]!.userId }, new Set());
+  if (own === null) pre.push("reset_user_owners_unreadable");
+  else if (own.foreign > 0) pre.push("reset_user_owns_sessions_outside_the_run");
   let replicas: Observation["replicas"] = { by: "operator_flag", ready: null };
   let selector: string | undefined;
   if (c.kubeNamespace && c.kubeDeployment) {
@@ -747,7 +800,17 @@ async function main(argv: string[]): Promise<number> {
   const text = JSON.stringify(receipt, null, 2);
   process.stdout.write(text + "\n");
   if (c.receiptOut) writeFileSync(c.receiptOut, text + "\n");
-  return receipt.verdict === "PASS" ? 0 : 1;
+  return receipt.verdict === "FAIL" ? 1 : 0;
+}
+
+/** resetOwnershipCheck over the store (read-only: one owners LIST + GETs and the fence). null: unreadable. */
+export async function ownershipCheck(store: ObjectStore, keyRoot: string, tenant: LedgerTenant, runSessions: ReadonlySet<string>) {
+  try {
+    const io = s3LedgerObjects(store, keyRoot);
+    const keys = s3LedgerKeys(keyRoot, tenant);
+    const [owners, fence] = await Promise.all([io.listOwners(keys), io.readFence(keys.fence)]);
+    return resetOwnershipCheck(owners, fence.state === "present" ? fence.fence : null, runSessions);
+  } catch { return null; }
 }
 
 /** What a run needs besides its config: the stores, the tokens, where to send, and how to read each replica's log. */
@@ -781,14 +844,20 @@ export async function runProof(c: ProofConfig, ctx: ProofContext) {
   await Promise.all(resetChains.map((ch) => runChain(run, ch, sent)));
 
   // ---- mid-burst reset of user 0, raced by in-flight uploads of its sessions ----
+  const reset: Observation["reset"] = { count: null, replay: null, resetSessions: resetChains.length, fenceResets: null };
+  // The reset is user-wide: apply it only if what user 0 owns is exactly this run's sessions (read-only check).
+  const own = await ownershipCheck(store, c.keyRoot, run.ledgerTenant(0), new Set(resetChains.map((ch) => `${ch.originId}\n${ch.sessionId}`)));
+  if (own === null) reset.refused = "owners_unreadable";
+  else if (own.foreign > 0) reset.refused = "foreign_sessions";
   const races = resetChains.map((ch) => send(run, ch, ch.race!));
   const ledger = s3Ledger(store, c.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false });
   const requestId = `mrp-reset-${runId}`;
-  const reset: Observation["reset"] = { count: null, replay: null, resetSessions: resetChains.length, fenceResets: null };
-  try {
-    reset.count = await ledger.resetUploadedSessions(run.ledgerTenant(0), requestId);
-    reset.replay = await ledger.resetUploadedSessions(run.ledgerTenant(0), requestId);
-  } catch { /* reset_not_run */ }
+  if (!reset.refused) {
+    try {
+      reset.count = await ledger.resetUploadedSessions(run.ledgerTenant(0), requestId);
+      reset.replay = await ledger.resetUploadedSessions(run.ledgerTenant(0), requestId);
+    } catch { /* reset_not_run */ }
+  }
   sent.push(...(await Promise.all(races)));
   // After the reset returned: re-uploads of the reset sessions must not land; new sessions must.
   const after = await Promise.all([
@@ -805,10 +874,12 @@ export async function runProof(c: ProofConfig, ctx: ProofContext) {
   const scanStorage = async () => {
     let inboxPending = 0, deadLetters = 0, uploadInboxPending = 0;
     for (const ch of origins) {
-      const machine = liveMachineId(c.workspace, ch.originId, c.users[ch.user]!.userId);
-      inboxPending += (await listAll(store, `${c.keyRoot}/.admission-inbox/${c.org}/v1/ws=${wsPath}/m=${machine}/`)).filter((i) => INBOX_ATTEMPT.test(i.key) && i.size >= INBOX_MIN_BYTES).length;
-      deadLetters += (await listAll(store, `${c.keyRoot}/.admission-dlq/${c.org}/v1/ws=${wsPath}/m=${machine}/`)).length;
-      if (ch.path === "direct") uploadInboxPending += (await listAll(store, `${c.keyRoot}/.upload-inbox/${c.org}/v1/ws=${c.workspace}/u=${userSegment(c.workspace, c.users[ch.user]!.userId)}/o=${ch.originId}/`)).length;
+      const tenant = run.ledgerTenant(ch.user);
+      const inbox = originInboxDir(c.keyRoot, tenant, ch.originId);
+      inboxPending += (await listAll(store, `${inbox}/`)).filter((i) => INBOX_ATTEMPT.test(i.key) && i.size >= INBOX_MIN_BYTES).length;
+      // The dead-letter marker sits at the inbox path under the DLQ namespace (selfhost-admission.ts deadLetterKey).
+      deadLetters += (await listAll(store, `${c.keyRoot}/${DEAD_LETTER_NAMESPACE}/${inbox.slice(`${c.keyRoot}/${INBOX_NAMESPACE}/`.length)}/`)).length;
+      if (ch.path === "direct") uploadInboxPending += (await listAll(store, `${uploadKeyPrefix({ keyRoot: c.keyRoot, ...tenant })}o=${ch.originId}/`)).length;
     }
     return { inboxPending, uploadInboxPending, deadLetters };
   };

@@ -121,6 +121,9 @@ export function inboxKey(keyRoot: string, tenant: LedgerTenant, originId: string
   if (!/^[0-9a-f]{16}$/.test(nonce) || !Number.isSafeInteger(receivedAtMs) || receivedAtMs < 0) throw new Error("admission_key_invalid");
   return `${receiptDir(keyRoot, tenant, originId, receiptId)}/a=${String(receivedAtMs).padStart(15, "0")}-${nonce}.ndjson.zst`;
 }
+/** One origin's inbox directory for a tenant (`…/m=<liveMachineId>`, no trailing slash): every receipt dir under it. */
+export const originInboxDir = (keyRoot: string, tenant: LedgerTenant, originId: string) =>
+  inboxDir(keyRoot, tenant, liveMachineId(tenant.workspaceId, originId, tenant.userId));
 export const outcomeKey = (dir: string, outcome: "admitted" | "refused") => `${dir}/outcome-${outcome}.json`;
 /**
  * Per (org, workspace, user): the admission directory that holds the privacy journal and, under decision

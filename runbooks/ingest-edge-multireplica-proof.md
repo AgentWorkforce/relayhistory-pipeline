@@ -11,9 +11,20 @@ anything. It refuses production-looking targets before it sends a single request
 1. **Preflight.** The run stops (exit 2, `{"refused":[codes]}`) unless every one of these holds:
    - `--i-know-this-is-dev` is set.
    - `--target-env` is `dev`, `stage` or `sandbox`.
-   - The `--deployment` name carries a non-production marker (`dev`, `stage`, `staging`, `sandbox`, `test`).
-     No target name (deployment, ingest host, control host, buckets, kube namespace, deployment or context)
-     may contain a `prod`, `production`, `prd` or `live` token.
+   - **Every target name passes two checks.** The targets are the deployment, the ingest host, the control
+     host, the `--endpoint` host, the canonical and ledger buckets, and the kube namespace, deployment and context.
+     - **Deny-list:** no target name may contain a `prod`, `production`, `prd` or `live` token.
+     - **Positive marker:** each must carry a non-production marker (`dev`, `development`, `stage`, `staging`,
+       `sandbox` or `test`).
+     - **Loopback exemptions:** a loopback ingest or control host, and the buckets behind a loopback
+       `--endpoint` (the local mode), are exempt from the marker but never from the deny-list.
+     - **`--endpoint` scheme:** it must be https, or plain http to `localhost` / `127.0.0.1` / `[::1]` only.
+
+     The fence-authority marker is not the only guard.
+   - `--reset-user-is-synthetic` is set. The mid-run reset is **user-wide**: `resetUploadedSessions` tombstones
+     every session user 0 owns, not only the run's. User 0 must be a dedicated synthetic user.
+   - User 0 owns no live session yet (a read-only list of its ownership stubs against its fence). Sessions a
+     previous run's reset already tombstoned do not count.
    - At least two distinct synthetic users are named, and each token variable holds an `sh_at_` token.
    - The org is covered by a valid fence-authority marker, and no `.stop.json` kill switch is present.
    - Two or more replicas are confirmed, one of two ways:
@@ -37,6 +48,8 @@ anything. It refuses production-looking targets before it sends a single request
 3. **Reset mid-burst.** Once user 0's sessions are admitted, while the other users are still uploading:
    - The script fires one more revision for each of user 0's sessions (the race batches: they may or may
      not land).
+   - First, a read-only check: the live sessions user 0 owns must be exactly the run's reset sessions. If there
+     is any other, the reset is **not** applied and the run fails `reset_refused_foreign_sessions`.
    - It resets user 0 through `ledger-s3.ts` `resetUploadedSessions`, then replays the reset with the same
      request id. The e2e's `controls.s3` does the same: self-host under `INGEST_LEDGER=s3` serves no reset route.
    - It then re-uploads user 0's reset sessions at revision 1000. These must never land.
@@ -58,8 +71,9 @@ anything. It refuses production-looking targets before it sends a single request
      once more and fails as `duplicate_admission_manifest_written_twice`. There is exactly one manifest per session.
    - **Reset honoured.** No index entry at or above revision 1000 exists for a reset session, and the manifest
      moved at most once past its pre-reset value (only the race batch, if it was claimed first).
-   - The reset tombstoned at least the user's owned sessions, the replay answered the same count, and the
-     fence records the reset.
+   - The reset tombstoned **exactly** the run's sessions for user 0 (`reset_count_not_equal_run_sessions`
+     otherwise: fewer is a missed tombstone, more means it reached a session outside the run). The replay
+     answered the same count, and the fence records the reset.
    - Nothing is in the dead-letter prefix. No client retry code falls outside the contention set
      (`EXPECTED_RETRY_CODES`, for example `ledger_*_contended`, `ledger_attempt_superseded`, `tenant_limit`,
      `delivery_busy`; extend it with `--allow-retry-code`).
@@ -70,7 +84,15 @@ anything. It refuses production-looking targets before it sends a single request
 
    The logs carry no tenant, so other dev traffic in the window counts too.
 6. **Receipt.** One JSON receipt on stdout, also written to `--receipt-out` if given. It holds counts only,
-   plus `verdict: PASS | FAIL` and `failures: {code: count}`. Exit 0 on PASS, 1 on FAIL.
+   plus `verdict` and `failures: {code: count}`. The target names (deployment, hosts) are not in the receipt
+   or on stderr. The verdict is one of:
+   - `PASS`: every assertion held, and the per-replica logs (kubectl, or the local mode) show the work spread.
+   - `PASS_UNATTRIBUTED`: every storage assertion held, but there is no per-replica evidence
+     (`--replicas-confirmed` without kubectl), so nothing shows a second replica did any of it. **It is not a
+     two-replica proof.**
+   - `FAIL`.
+
+   Exit codes: 0 on `PASS` or `PASS_UNATTRIBUTED`, 1 on `FAIL`, 2 refused.
 
 ## Run it
 
@@ -78,11 +100,23 @@ Prerequisites, all by the operator: a dedicated test org and workspace on the de
 synthetic users in it with `rth:sync`, and a relay-control access token (`sh_at_`) for each; read
 access to the canonical bucket (and to the ledger bucket, if split); and write access to the users'
 `upload-fences.json` and `ledger/owners/` (needed by the reset). Use the same grants as the operator role in section 5.
+User 0 (the first `--user`) must be a dedicated synthetic user that is used for nothing else.
+
+> **Needs Khaliq's own OK first** (AGENTS.md "What still needs Khaliq's explicit OK"): deploys, cloud
+> resources and IAM changes need Khaliq's separate, explicit OK in his own words. A request relayed by
+> another agent is not that OK. This covers changing dev values, scaling with kubectl, pausing the
+> reconciler and granting write access.
+
 
 ### 1. Scale dev to two replicas with the halved caps
 
 The chart pins `replicas: 1` (`charts/sessions-pipeline/templates/ingest-edge.yaml`, `strategy: Recreate`) and
 renders no `INGEST_LEDGER_LOG_COMMIT` (so it is off). For the proof:
+
+   > **Needs Khaliq's own OK first** (AGENTS.md "What still needs Khaliq's explicit OK"): deploys, cloud
+   > resources and IAM changes need Khaliq's separate, explicit OK in his own words. A request relayed by
+   > another agent is not that OK. This covers changing dev values, scaling with kubectl, pausing the
+   > reconciler and granting write access.
 
 1. Halve the per-replica caps. The S3 tenant limits are per replica, so two replicas at half caps bound a
    tenant like one replica at full caps (docs/selfhost-composition.md section 5, "The caps are per replica").
@@ -119,7 +153,7 @@ renders no `INGEST_LEDGER_LOG_COMMIT` (so it is off). For the proof:
 ### 2. Dry run (no network)
 
 ```sh
-bun scripts/proof-ingest-edge-multireplica.ts --plan-only --i-know-this-is-dev --target-env dev \
+bun scripts/proof-ingest-edge-multireplica.ts --plan-only --i-know-this-is-dev --target-env dev --reset-user-is-synthetic \
   --deployment <dev deployment name> --ingest-url https://<dev ingest origin> --org <test org> --workspace <test workspace> \
   --user <user id 1>:PROOF_TOKEN_1 --user <user id 2>:PROOF_TOKEN_2 --user <user id 3>:PROOF_TOKEN_3 \
   --bucket <canonical bucket> --region <region>
@@ -130,9 +164,12 @@ bun scripts/proof-ingest-edge-multireplica.ts --plan-only --i-know-this-is-dev -
 Supply the tokens and the AWS credentials from the secret store through the environment only (for
 example `op run --`). Never put them on the command line or in a file.
 
+For example, with a `proof.env` that maps each variable to a secret reference (`PROOF_TOKEN_1=op://…`,
+`AWS_ACCESS_KEY_ID=op://…`, and so on; references only, never values):
+
 ```sh
-PROOF_TOKEN_1=... PROOF_TOKEN_2=... PROOF_TOKEN_3=... AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=... \
-bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env dev \
+op run --env-file proof.env -- \
+bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env dev --reset-user-is-synthetic \
   --deployment <dev deployment name> --ingest-url https://<dev ingest origin> --org <test org> --workspace <test workspace> \
   --user <user id 1>:PROOF_TOKEN_1 --user <user id 2>:PROOF_TOKEN_2 --user <user id 3>:PROOF_TOKEN_3 \
   --bucket <canonical bucket> --region <region> [--ledger-bucket <ledger bucket> --ledger-region <region>] \
@@ -148,7 +185,8 @@ bun scripts/proof-ingest-edge-multireplica.ts --i-know-this-is-dev --target-env 
 - Knobs: `--sessions-per-origin` (4), `--revisions` (4; the non-reset users send twice as many),
   `--retry-copies` (4), `--concurrency` (12 requests in flight), `--quiesce-timeout-s` (600).
 
-Afterwards, scale back to one replica, restore the caps, and resume the reconciler.
+Afterwards, scale back to one replica, restore the caps, and resume the reconciler. Like the scale-up, these
+are dev infrastructure changes and need Khaliq's own OK (above).
 
 ## Local mode (no cloud, no credentials)
 
@@ -215,13 +253,24 @@ bun scripts/proof-ingest-edge-multireplica-local.ts --image 96bulls/services:mrp
 Everything the run writes is under the test org and workspace you passed in, keyed by its `run_id`:
 - origins `mrp-<run_id>-u<n>-<a|b>`;
 - sessions and project paths with `mrproof<run_id>`;
-- under `<root>/.admission-inbox/<org>/v1/ws=<ws>/`: the inbox and outcome objects, and the ledger's
-  batch records, revision shards and owner stubs;
-- user 0's fence, which now records one reset;
+- under `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_*/`: the per-origin inbox attempts and outcome
+  objects, and, under each user's admission directory, that user's `ledger/` prefix: its batch records
+  (`ledger/batches/`), revision shards (`ledger/revisions/`) and owner stubs (`ledger/owners/`), as
+  docs/selfhost-composition.md section 5 lays out (in the ledger bucket instead when it is split);
+- user 0's fence (`upload-fences.json`), which now records one reset;
 - the canonical objects under `<root>/<org>/v1/ws=<ws>/m=srv_*/`;
 - the search and directory rows the consumers index from them.
 
-The script deletes nothing. The S3 ledger is never deleted from, by design.
+**What the run destroys.** The script deletes no object, but it is not harmless:
+- The mid-run reset is a privacy control on user 0. It **tombstones every live session user 0 owns** in
+  user 0's S3 upload fence. Those sessions' later uploads are never admitted, and this script cannot undo that. The reset is
+  user-wide, not run-scoped. That is why the run refuses unless `--reset-user-is-synthetic` is set, refuses
+  before any upload if user 0 already owns a live session, and refuses the reset itself if user 0 owns any
+  session outside the run.
+- **Never** name a real person's account as the first `--user`.
+- The S3 ledger is never deleted from, by design. The reset's tombstones and the fence's reset count stay.
+
+> **Warning:** pointing the first `--user` at a real user would destroy that user's uploaded history.
 
 - Prefer a throwaway test workspace that is retired as a whole after the proof.
 - To remove a run's sessions, use the normal per-session erase path for the test workspace, or the
