@@ -13,9 +13,10 @@
  *      key and got rows back (not a refusal): the tenant scope
  *      (session_directory_read_api_scope), the single-physical-alias and canonical-mapping
  *      checks and the managed-history refusal all passed.
- *   2. The session's live pointer rows are read as the read role inside the request's
- *      READ ONLY, tenant-bound transaction (the same table and RLS the timing and turns
- *      routes read the transcript through), `deleted_at IS NULL` only. No live row (erased,
+ *   2. The session's live pointer rows are read as the read role in their own READ ONLY,
+ *      tenant-bound transaction (a second one after step 1's, on the request's client; the
+ *      same table and RLS the timing and turns routes read the transcript through),
+ *      `deleted_at IS NULL` only. No live row (erased,
  *      tombstoned or unknown) = no summary. More than one live physical row (one session
  *      uploaded from several machines) = no summary: each machine's summary covers only its
  *      own raw, and none is presented as the whole session.
@@ -28,7 +29,8 @@
  *      another key or another workspace is not served (it fails the AES-GCM tag). Its
  *      recorded source_content_sha256 must equal the pointer's content_sha256 (revisions
  *      restart on a re-upload). A text-free record (opt-out, quarantine, empty) is not
- *      served either.
+ *      served either. An object whose metadata names exactly this revision, kind and key id
+ *      but fails the tag is `decrypt_failed` (a key or integrity failure), never empty.
  *
  * Nothing here logs; errors carry reason codes only, never ids, keys, paths or text.
  */
@@ -36,7 +38,7 @@ import type { SummaryKind, SummaryRecord, WorkspaceKeyring } from "../bob-costas
 import { readSummaryObjectAt, summaryObjectKey } from "../bob-costas/summary-objects.ts";
 import { prefixAllowed } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { isManifestRest } from "../../packages/object-store/src/index.ts";
-import { parseSessionKey, type ObjectStore } from "../shared/vendor.ts";
+import { parseSessionKey, PipelineError, type ObjectStore } from "../shared/vendor.ts";
 import type { TenantRunner } from "./liveness.ts";
 
 export type SummaryFallbackReason =
@@ -44,7 +46,9 @@ export type SummaryFallbackReason =
   | "tenant_mismatch"
   | "pointer_invalid"
   | "parse"
-  | "unavailable";
+  | "unavailable"
+  /** The object claims this exact kind, revision and key id but fails the AES-GCM tag. */
+  | "decrypt_failed";
 
 export class SummaryFallbackError extends Error {
   constructor(readonly reason: SummaryFallbackReason) {
@@ -267,7 +271,12 @@ export function pointerSummaryFallback(deps: SummaryFallbackDeps): SummaryFallba
           kind,
           revision,
         });
-      } catch {
+      } catch (error) {
+        // A key id this deployment holds with other bytes than the writer's, or tampered bytes
+        // (readSummaryObjectAt: the object's metadata claims this exact revision): a distinct
+        // failure, never an empty summary.
+        if (error instanceof PipelineError && error.code === "summary_decrypt_failed")
+          throw new SummaryFallbackError("decrypt_failed");
         // A store, deadline or keyring failure (e.g. a key id this deployment does not hold).
         throw new SummaryFallbackError("unavailable");
       }

@@ -16,9 +16,19 @@ in the same transaction. No runtime role can call it.
 
 Once explicitly enabled, every relevant directory change creates a per-canonical-identity document epoch and dirty outbox record, including a blank-text tombstone for deletion or the old identity on alias/source/workspace changes. Per-tenant watermark locking precedes epoch allocation, so metadata commit order cannot leave an unchanged high-water mark across a late older transaction. Immutable CH ordering is org/workspace/source/session; mutable text/project/activity are applied only after newest-version collapse. Higher-epoch tombstones prevent late older writes from resurrecting data.
 
-A controlled backend backfill keeps its cursor in SQL, never trusting a caller-supplied starting cursor; it exhausts every directory row in bounded pages. The publisher claims bounded document batches with a nonce/deadline, sends the actual CH HTTP codec, then CAS-acknowledges exactly the captured epoch/hash/lease. A newer mutation invalidates the claim. Uninitialized/dirty metadata blocks the brief pool, including scopes that would otherwise return zero candidates.
+A controlled backend backfill keeps its cursor in SQL, never trusting a caller-supplied starting cursor; it exhausts every directory row in bounded pages. The publisher claims bounded document batches with a nonce/deadline, sends the actual CH HTTP codec, then CAS-acknowledges exactly the captured epoch/hash/lease. A newer mutation invalidates the claim.
 
-Reader candidate discovery is exclusively CH. Supabase RPCs only check aggregate metadata currentness and hydrate exact paired source/session tuples under existing signed workspace claim policy. A tenant watermark recheck rejects changes during discovery/hydration. No title/summary query or broad directory candidate scan runs in Supabase. Existing rank fusion, deterministic recency ties, brief snippet priority and frozen-rank cursor semantics remain; a source-version fingerprint invalidates pre-index cursors.
+The migration also defines `sessions.session_brief_document_authority`, which reports a scope's
+watermark and whether its metadata is `initialized` and `complete` (no dirty outbox row). It is
+granted only to `session_directory_search_worker`. A reader built on it could block
+uninitialized or dirty scopes and recheck the watermark across discovery and hydration; **the
+read API route described under "Runtime wiring" does not**: the read role
+(`bulls96_read_api`) holds no grant on that function or on the scope/outbox tables, so the
+route does not check currentness and its results are best-effort (below).
+
+Reader candidate discovery is exclusively CH; Supabase only hydrates exact paired
+source/session tuples under the existing signed workspace claim policy. No title/summary query
+or broad directory candidate scan runs in Supabase. Existing rank fusion, deterministic recency ties, brief snippet priority and frozen-rank cursor semantics remain; a source-version fingerprint invalidates pre-index cursors.
 
 Only the existing keyword pools are claimed. No embedding/vector pool is implemented or enabled here. Existing typed unsupported organization/project/event-window/kind/task/tag/agent filters remain unsupported until their semantics have separate proof.
 
@@ -44,6 +54,16 @@ Two default-off switches now drive this lane; neither creates a resource, grant 
   clear or erasure that ClickHouse has not received yet is never served. Same workspace
   attestation and directory canary as the directory routes; no cursor (`truncated`).
   The read-only ClickHouse user needs SELECT on `session_brief_documents`.
+  **Results are best-effort.** The route does not read the scope's authority (above): while a
+  scope is uninitialized, mid-backfill or has unpublished outbox rows, a session whose current
+  directory text matches `q` but whose document ClickHouse does not hold yet is missing from an
+  otherwise normal 200, and `truncated` counts only what ClickHouse returned. What it never does
+  is serve text the directory no longer holds (every hit is re-checked against the directory).
+  A completeness marker would need the read role granted `session_brief_document_authority`
+  (a reviewed migration and an owner apply); until then, enable the flag only after the
+  backfill and outbox are drained (the activation order below).
+  Deploy (Worker): the `summary_search` input of `deploy-session-read-worker.yml` (default off;
+  not preserved from live, like the other summary inputs).
 
 Activation order (each a production step that needs Khaliq's explicit OK): apply
 `briefDocumentSchemaStatements()` in the ClickHouse database and grant the reader SELECT;

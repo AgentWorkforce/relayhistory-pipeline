@@ -138,6 +138,7 @@ const MESSAGES = {
   summary_store_rejected: "the object store refused the summary object",
   summary_contended: "the summary object kept changing under the writer",
   summary_store_timeout: "the object store did not answer in time",
+  summary_decrypt_failed: "the summary object did not open under its recorded key",
 } as const;
 
 export type SummaryObjectErrorCode = keyof typeof MESSAGES;
@@ -394,7 +395,12 @@ export async function readSummaryObject(args: {
  * index pointer instead. Authenticity is the AES-GCM tag over the same associated data
  * (`key`, `kind`, `revision`), so an object written for another key, kind or revision,
  * under another workspace's key, or tampered with, never opens: null, as for a missing
- * or oversized object. Throws only for a store or keyring failure. Nothing is logged.
+ * or oversized object. One exception: an object whose plaintext metadata (written with it by
+ * writeSummaryObject) claims exactly this kind, revision and the envelope's key id, yet fails
+ * the tag, is not a stale object but a key or integrity failure (a key id held with the wrong
+ * bytes, or tampered bytes): that throws `summary_decrypt_failed`, so the read API answers a
+ * failure, never an empty summary. Throws otherwise only for a store or keyring failure.
+ * Nothing is logged.
  */
 export async function readSummaryObjectAt(args: {
   store: ObjectStore;
@@ -405,8 +411,10 @@ export async function readSummaryObjectAt(args: {
   revision: number;
 }): Promise<SummaryRecord | null> {
   let body: Uint8Array;
+  let metadata: Record<string, string | undefined>;
   try {
     const object = await args.store.getObject(objectKey(args.key));
+    metadata = object.meta.metadata ?? {};
     if (object.meta.size > MAX_SUMMARY_OBJECT_BYTES) {
       await object.body.cancel().catch(() => undefined);
       return null;
@@ -428,6 +436,13 @@ export async function readSummaryObjectAt(args: {
       : fail("keyring_unavailable", true);
   }
   const record = await open(key, envelope, args.key, args.kind, args.revision);
+  if (
+    !record &&
+    metadata[META_SUMMARY_REVISION] === String(args.revision) &&
+    metadata[META_SUMMARY_KIND] === args.kind &&
+    metadata[META_SUMMARY_KEY_ID] === envelope.key_id
+  )
+    throw fail("summary_decrypt_failed", false);
   return record &&
     record.v === SUMMARY_ENVELOPE_VERSION &&
     record.kind === args.kind &&

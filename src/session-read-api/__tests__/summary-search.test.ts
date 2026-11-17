@@ -8,7 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type ReadApiDeps, type VerifiedIdentity } from "../app.ts";
 import type { Directory, DirectoryListArgs, DirectoryListRow } from "../directory.ts";
 import { ClickHouseError, type ClickHouseClient, type QueryParams } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
-import { buildSummarySearchQuery, foldSummaryText, summaryMatches } from "../clickhouse/summary-search-query.ts";
+import { buildSummarySearchQuery, foldSummaryText, SUMMARY_SEARCH_MAX_CANDIDATES, summaryMatches } from "../clickhouse/summary-search-query.ts";
 import { memoryLiveness } from "./support.ts";
 
 const ID: VerifiedIdentity = { userId: "user-s1", orgId: "org-s", workspaceId: "ws-s", scopes: ["rth:read"] };
@@ -76,7 +76,7 @@ const path = (q: string, extra = "") => `/v1/sessions/summaries/search?workspace
 describe("buildSummarySearchQuery", () => {
   test("tenant ids and the folded q are bound parameters; limit + 1 tells truncation", () => {
     const b = buildSummarySearchQuery("relay_search", { orgId: "org'x", workspaceId: "ws", q: "ClickHouse İ", limit: 20 });
-    expect(b.params).toEqual({ org: "org'x", ws: "ws", qf: "ClickHouse İ".toLowerCase(), n: 21 });
+    expect(b.params).toEqual({ org: "org'x", ws: "ws", qf: "ClickHouse İ".toLowerCase(), n: 21, cap: SUMMARY_SEARCH_MAX_CANDIDATES });
     expect(b.query).not.toContain("org'x");
     expect(b.query).not.toContain("clickhouse");
     expect(b.query).toContain("`relay_search`.`session_brief_documents`");
@@ -94,6 +94,12 @@ describe("buildSummarySearchQuery", () => {
     expect(collapse).toBeGreaterThan(0);
     expect(outer).toBeGreaterThan(collapse);
     expect(query).toMatch(/ORDER BY last_activity_at DESC, source DESC, session_id DESC\nLIMIT \{n:UInt32\}$/);
+  });
+
+  test("each candidate branch is bounded (newest activity first), so the IN set never grows unbounded", () => {
+    const { query } = buildSummarySearchQuery("relay_search", { orgId: "o", workspaceId: "w", q: "abc", limit: 5 });
+    expect(query.match(/> 0 ORDER BY last_activity_at DESC LIMIT \{cap:UInt32\}\)/g)).toHaveLength(2);
+    expect(SUMMARY_SEARCH_MAX_CANDIDATES).toBeGreaterThan(51);
   });
 
   test("a database name that is not an identifier is refused", () => {
@@ -121,6 +127,29 @@ describe("flag off or unconfigured: 501, nothing read", () => {
       expect(lists).toHaveLength(0);
     });
   }
+
+  test("flag off: the not-configured 501 comes before workspace attestation (a foreign or missing workspace too)", async () => {
+    const { ch, selects } = fakeCh(async () => []);
+    for (const flag of [undefined, false] as const) {
+      const get = api({ ch, ...(flag === undefined ? {} : { summarySearch: flag }) });
+      for (const p of ["/v1/sessions/summaries/search?workspace=ws-other&q=erasure", "/v1/sessions/summaries/search?q=erasure", "/v1/sessions/summaries/search"]) {
+        const r = await get(p);
+        expect(r.status, p).toBe(501);
+        expect((await json(r)).error, p).toMatchObject({ code: "unsupported_by_backend", reason: "summary_search_not_configured" });
+      }
+    }
+    expect(selects).toHaveLength(0);
+  });
+
+  test("owner-buffered workspace: 501 q_with_buffered before ClickHouse or the directory", async () => {
+    const { ch, selects } = fakeCh(async () => [{ source: "codex", session_id: "s1" }]);
+    const { directory, lists } = fakeDirectory([row()]);
+    const r = await api({ summarySearch: true, ch, directory, ownerBuffered: { enabled: true, workspaces: "*" } as never })(path("erasure"));
+    expect(r.status).toBe(501);
+    expect((await json(r)).error.reason).toBe("q_with_buffered");
+    expect(selects).toHaveLength(0);
+    expect(lists).toHaveLength(0);
+  });
 
   test("a workspace off the directory canary is 501 before ClickHouse", async () => {
     const { ch, selects } = fakeCh(async () => []);
@@ -160,7 +189,7 @@ describe("flag on", () => {
     expect(b.sessions[1]).toMatchObject({ shortSummary: "Fixed the ClickHouse erasure race", shortSummaryGeneratedAt: "2026-10-02T04:00:00.000Z" });
     // One ClickHouse read with the verified tenant and the trimmed q, bounded settings.
     expect(selects).toHaveLength(1);
-    expect(selects[0]!.params).toEqual({ org: "org-s", ws: "ws-s", qf: "erasure", n: 11 });
+    expect(selects[0]!.params).toEqual({ org: "org-s", ws: "ws-s", qf: "erasure", n: 11, cap: SUMMARY_SEARCH_MAX_CANDIDATES });
     expect(selects[0]!.settings).toMatchObject({ max_execution_time: 2, result_overflow_mode: "throw" });
     // One exact-key directory read.
     expect(lists).toEqual([{ sessionKeys: [

@@ -438,6 +438,28 @@ describe("deploy workflow wiring", () => {
     expect(TEMPLATE).not.toContain("READ_API_SUMMARY_FALLBACK_ENABLED");
     expect(TEMPLATE).not.toContain("SUMMARY_MASTER_KEYS");
   });
+
+  test("summary_fallback=on: the secret check runs before wrangler deploy, so nothing goes live without SUMMARY_MASTER_KEYS", () => {
+    const step = (name: string) => { const i = WORKFLOW.indexOf(`      - name: ${name}`); expect(i, name).toBeGreaterThan(0); return i; };
+    const check = step("Check the summary-fallback Worker secrets exist before deploying (names only; summary_fallback=on only)");
+    const deploy = step("Deploy");
+    const secrets = WORKFLOW.indexOf("for n in SUMMARY_MASTER_KEYS PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do");
+    expect(WORKFLOW.indexOf("for n in SUMMARY_MASTER_KEYS")).toBe(WORKFLOW.lastIndexOf("for n in SUMMARY_MASTER_KEYS"));
+    expect(check).toBeLessThan(secrets);
+    expect(secrets).toBeLessThan(deploy);
+    expect(deploy).toBeLessThan(WORKFLOW.indexOf("bunx wrangler deploy"));
+    expect(WORKFLOW.slice(check, deploy)).toContain("if: env.SUMMARY_FALLBACK == 'on'");
+    expect(WORKFLOW.slice(check, deploy)).toContain("exit 1");
+  });
+
+  test("summary_search: default off; on adds only the exact \"true\" --var, never the template", () => {
+    expect(WORKFLOW).toMatch(/summary_search:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("SUMMARY_SEARCH: ${{ inputs.summary_search }}");
+    expect(WORKFLOW).toContain(`case "$SUMMARY_SEARCH" in off|on) ;; *) fail 'summary_search must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain('summary_search=""; if [ "$SUMMARY_SEARCH" = "on" ]; then summary_search=true; fi');
+    expect(WORKFLOW).toContain('${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"}');
+    expect(TEMPLATE).not.toContain("READ_API_SUMMARY_SEARCH_ENABLED");
+  });
 });
 
 

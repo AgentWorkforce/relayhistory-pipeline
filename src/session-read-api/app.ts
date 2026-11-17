@@ -1412,8 +1412,10 @@ export function createReadApi(deps: ReadApiDeps) {
    * substring, at least SUMMARY_SEARCH_MIN_CHARS), newest activity first, at most `limit` (1..50,
    * default 20). ClickHouse `session_brief_documents` finds candidates; each is hydrated from the
    * directory (the authority, tombstoned rows excluded) and re-checked there, so text the directory
-   * no longer holds is never served. Same workspace attestation and canary as the directory
-   * routes. No cursor: `truncated` says more candidates existed. Answers
+   * no longer holds is never served. Best-effort, not complete: currentness of the scope's
+   * documents is not checked (docs/ch-brief-search-design.md), so a session whose document is not
+   * published yet is missing from a normal 200. Same workspace attestation and canary as the
+   * directory routes (after the flag check). No cursor: `truncated` says more candidates existed. Answers
    * `{ sessions: [<the /v1/sessions shape with shortSummary, shortSummaryGeneratedAt>], truncated }`.
    * 501 `summary_search_not_configured` (flag off, or no ClickHouse binding),
    * `summary_search_schema_missing` (the owner-applied DDL is absent), `q_with_buffered` (an
@@ -1422,8 +1424,9 @@ export function createReadApi(deps: ReadApiDeps) {
   app.get("/v1/sessions/summaries/search", async (c) => {
     try {
       const identity = c.get("identity");
-      attestWorkspace(c, identity);
+      // Flag first: flag off answers exactly the not-configured 501, whatever the query says.
       if (deps.summarySearch !== true || !deps.ch) throw unsupported("summary_search_not_configured");
+      attestWorkspace(c, identity);
       const directory = directoryFor(identity);
       for (const name of Object.keys(c.req.query())) if (!["workspace", "q", "limit"].includes(name)) throw unsupported(`param_${name}`);
       const q = (single(c, "q") ?? "").trim();
@@ -1678,7 +1681,11 @@ export function createReadApi(deps: ReadApiDeps) {
       if(error instanceof SummaryFallbackError) {
         if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
         if(error.reason==="not_configured")return fail(c,unsupported("summary_fallback_not_configured"));
-        return c.json({error:{code:"backend_unavailable",message:"read backend unavailable"},correlationId:c.get("correlationId")},503);
+        // One line, reason code only (no ids beyond the request line's, no key material).
+        const correlationId=c.get("correlationId") as string;
+        const reason=error.reason==="decrypt_failed"?"summary_decrypt_failed":`summary_fallback_${error.reason}`;
+        log({route:c.req.routePath,reason,status:503,correlation_id:correlationId});
+        return c.json({error:{code:"backend_unavailable",message:"read backend unavailable",...(error.reason==="decrypt_failed"?{reason}:{})},correlationId},503);
       }
       if(error instanceof BriefSummaryError) {
         if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
