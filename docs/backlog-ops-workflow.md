@@ -273,6 +273,24 @@ Both environments' protected variables pin the target (set the same five on each
 `BACKLOG_OPS_KMS_KEY_ARN` (a key ARN, `key/<uuid>` or `key/mrk-<id>`, not an alias), `BACKLOG_OPS_DRY_ROLE_ARN` and `BACKLOG_OPS_EXECUTE_ROLE_ARN`.
 They are shape-checked: the key must be in the region, and both roles must be in the key's account and distinct.
 
+### The relocated upload ledger
+
+After the ledger moves to its own bucket ([ledger-relocation.md](ledger-relocation.md)), set two more protected
+variables on both environments: `BACKLOG_OPS_LEDGER_BUCKET` (the edge's `INGEST_LEDGER_BUCKET`) and
+`BACKLOG_OPS_LEDGER_REGION` (its region). Set both or neither: one alone refuses (`backlog_ops_target_ledger_bucket`,
+`backlog_ops_target_ledger_region`) before any credential, and so does a ledger bucket equal to `BACKLOG_OPS_BUCKET`.
+The credential step hands them to the backfill and the drain as `INGEST_LEDGER_BUCKET` / `INGEST_LEDGER_REGION`. Those
+tools then write the ledger's own keys (ownership stubs, revision shards, re-arm markers) to that bucket. They send no
+encryption header there, so the bucket's SSE-S3 default applies. They keep the fences, the staged batches, their
+markers, the layout and the lease in `BACKLOG_OPS_BUCKET`. They refuse unless the ledger bucket's marker names it
+(`ledger_home_missing`, `ledger_home_moved`). The export touches no ledger key and does not take them.
+
+Every S3 tool (all but `presence-dry`, which reads no S3) also runs with `INGEST_LEDGER_HOME_GUARD=on`, always. The workflow sets it on the step, and the credential
+step forces it into the tool's environment. So a backfill or drain dispatched before these variables are set, once the
+relocation has written "moved" into `BACKLOG_OPS_BUCKET`'s marker, refuses with `ledger_home_moved` instead of writing a
+stale copy. Every backfill mode runs the ownership section (a refresh runs fences and ownership), so every backfill
+and drain dispatch checks the marker.
+
 Receipts are counts only. Every leaf is a number, a boolean or a short lowercase code; any other string, such as an
 id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backlog-ops-receipt` artifact.
 
@@ -400,6 +418,16 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
    - `BacklogOpsWriteEncryptsViaS3`: `kms:GenerateDataKey` and `kms:Decrypt`.
 
    Both are conditioned on `kms:ViaService` = `s3.us-east-1.amazonaws.com`.
+
+5. **The ledger bucket**, once the ledger is relocated (above). The roles use the same session for both buckets; the
+   ledger bucket is in another account and region, so its bucket policy must grant the two roles access (not part of
+   this repository). Under `<root>/.admission-inbox/*/ledger/*` the read role needs `s3:GetObject`, and the write role
+   `s3:GetObject` and `s3:PutObject` with no `s3:x-amz-server-side-encryption` condition, since the tools send no
+   encryption header there. Both need `s3:ListBucket` on the bucket for those prefixes (without it a missing shard
+   or stub reads as a 403, not a 404, and the run fails), and `s3:GetObject` on
+   `<root>/.ledger/fence-authority/.ledger-home.json`. No `DeleteObject`: neither tool deletes a ledger key. No KMS
+   grant: the bucket uses SSE-S3. Both roles also need `s3:GetObject` on the same marker key in the transcripts bucket
+   for the forced guard; `96bulls/*` already covers it.
 
 ### Still to apply (before the first execute)
 

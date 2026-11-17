@@ -33,8 +33,13 @@
  * (and kms:Decrypt); every put/delete is refused in code as well. With INGEST_LEDGER_HOME_GUARD=on (default off) both
  * modes first GET `96bulls/.ledger/fence-authority/.ledger-home.json` and refuse a relocated ledger (ledger-store.ts
  * assertLedgerHomeHere: ledger_home_moved | ledger_home_invalid | access_denied | ledger_home_unavailable |
- * ledger_home_store_error | ledger_home_guard_invalid). --execute writes the canonical layout,
- * the 0005 revision index, re-arm markers and the drained markers, and needs the owner's explicit OK.
+ * ledger_home_store_error | ledger_home_guard_invalid). With INGEST_LEDGER_BUCKET [/ INGEST_LEDGER_REGION /
+ * INGEST_LEDGER_ENDPOINT] (the edge's variables, docs/ledger-relocation.md; invalid: ledger_bucket_invalid) the
+ * ledger's own keys (the revision index, re-arm markers, ownership stubs) route to that bucket with no encryption
+ * header, under the same credentials, and both modes first require ITS marker to name it (ledger_home_missing |
+ * ledger_home_moved), whatever the guard says; the fences, staged batches, drained markers and layout stay in --bucket.
+ * --execute writes the canonical layout, the 0005 revision index, re-arm markers and the drained markers, and needs the
+ * owner's explicit OK.
  *
  * Without --org, orgs are discovered with one delimiter listing of `96bulls/` (S3 ListObjectsV2,
  * read-only). Output: one JSON summary line on stdout, and counts-only progress on stderr. Never a key,
@@ -47,8 +52,9 @@
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
-import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
-import { assertLedgerHomeHere } from "../src/session-ingest/ledger-store.ts";
+import type { createS3Store, ObjectStore } from "../src/shared/vendor.ts";
+import { assertLedgerHomeGuardValid } from "../src/session-ingest/ledger-store.ts";
+import { assertToolLedgerHome, toolStores, type ToolStores } from "../src/session-ingest/ledger-tool-store.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
@@ -204,6 +210,22 @@ export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs
   });
 }
 
+/**
+ * The drain's stores (ledger-tool-store.ts): the Locker bucket (--bucket, SSE-KMS on --execute) and, with
+ * INGEST_LEDGER_BUCKET (docs/ledger-relocation.md), the ledger bucket routed under it: the revision index, the re-arm
+ * markers and the ownership stubs (ledger/**) go to the ledger bucket; the fences, the staged batches and their
+ * drained markers, the canonical layout and the lease stay in --bucket. Makes no request. A dry run's writes are
+ * refused by the library itself (drain_dry_run_write_refused), through either store.
+ */
+export function drainStores(args: Pick<DrainArgs, "mode" | "bucket" | "region" | "kmsKeyArn">, env: Record<string, string | undefined>,
+  credentials: Parameters<typeof createS3Store>[0]["credentials"], create?: (config: Parameters<typeof createS3Store>[0]) => unknown): ToolStores {
+  return toolStores({
+    env, bucket: args.bucket, region: args.region, keyRoot: KEY_ROOT, credentials,
+    ...(args.mode === "execute" ? { kmsKeyArn: args.kmsKeyArn! } : {}),
+    ...(create ? { create } : {}),
+  });
+}
+
 if (import.meta.main) {
   let args: DrainArgs;
   try {
@@ -219,13 +241,10 @@ if (import.meta.main) {
   }
   const credentials: AwsCredentials = { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) };
   try {
-    const store = createS3Store({
-      bucket: args.bucket, region: args.region, credentials,
-      ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
-    }) as unknown as ObjectStore;
-    // INGEST_LEDGER_HOME_GUARD=on (docs/ledger-relocation.md step 0; default off, no request): a relocated ledger's
-    // marker names another bucket, so this bucket's ledger/** objects are stale copies: refuse (a closed code).
-    await assertLedgerHomeHere(store, KEY_ROOT, args.bucket);
+    assertLedgerHomeGuardValid();
+    const stores = drainStores(args, process.env, credentials);
+    await assertToolLedgerHome(stores, KEY_ROOT, args.bucket, process.env);
+    const store = stores.store;
     const summary = await runDrain(args, { store, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {

@@ -21,6 +21,11 @@
  * gate's step output t (FULL's created_at minus the margin; backlogOpsRevisionsSince), passes it as
  * --revisions-since-ms, and refuses unless every bound catch-up receipt recorded the same t (it bound the same FULL).
  *
+ * Every S3 tool child (not presence-dry) also gets INGEST_LEDGER_HOME_GUARD=on, always; the backfill and the drain also get INGEST_LEDGER_BUCKET /
+ * INGEST_LEDGER_REGION from the protected variables BACKLOG_OPS_LEDGER_BUCKET / BACKLOG_OPS_LEDGER_REGION when set
+ * (backlogOpsLedgerEnv; docs/ledger-relocation.md): a relocated ledger is written in its own bucket, and a run without
+ * those variables refuses (ledger_home_moved) rather than writing the Locker bucket's stale copy.
+ *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
@@ -34,6 +39,8 @@ import {
   BACKLOG_OPS_SESSION_SECONDS,
   backlogOpsBindings,
   backlogOpsDispatch,
+  backlogOpsLedgerEnv,
+  backlogOpsLedgerTarget,
   backlogOpsPresenceSession,
   backlogOpsReceipt,
   backlogOpsRevisionsSince,
@@ -86,6 +93,9 @@ export function backlogOpsChildSpawn(
   if ((d.mode === "presence-dry") !== (session !== null) || (session !== null && dbUrl === null)) refuse("backlog_ops_session_binding");
   const childEnv: Record<string, string> = {};
   for (const key of BACKLOG_OPS_CHILD_ENV) if (typeof env[key] === "string") childEnv[key] = env[key]!;
+  // INGEST_LEDGER_HOME_GUARD=on for every S3 tool, and the ledger bucket for the ledger tools (backlogOpsLedgerEnv):
+  // set here, not inherited, so neither the workflow file nor the allowlist can drop the guard.
+  Object.assign(childEnv, backlogOpsLedgerEnv(d, backlogOpsLedgerTarget(env, t)));
   childEnv.AWS_ACCESS_KEY_ID = aws.accessKeyId;
   childEnv.AWS_SECRET_ACCESS_KEY = aws.secretAccessKey;
   childEnv.AWS_SESSION_TOKEN = aws.sessionToken;
@@ -200,6 +210,8 @@ export async function backlogOpsRun(
   for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null);
+  // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region).
+  backlogOpsLedgerTarget(env, t);
   checkBoundReceipts(env, d, undefined, since);
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
