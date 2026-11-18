@@ -207,22 +207,31 @@ enablement ships with all of the following:
   - Each worker is its own service.
   - Read routes answer the standard `501` when off.
   - The claims pass runs after the summary and never in its transaction.
-- **A staged rollout:** stage 0 is our own workspace (`READ_API_DIRECTORY_WORKSPACES` allowlist),
-  then all hosted tenants.
+- **A staged rollout:** stage 0 is our own workspace, then all hosted tenants.
+  - The advisor and the read routes are already scoped by the `READ_API_DIRECTORY_WORKSPACES`
+    allowlist.
+  - Summary regen, session analysis and the claims pass have no workspace scope today. For them,
+    stage 0 is scoped by the M3-1 control row, which holds a per-feature workspace allowlist and
+    denies by default: a workspace not listed, or a failed read, means off.
+  - Until M3-1 exists, rows 1 to 5 can only be enabled for all tenants at once, so they wait for
+    M3-1.
 - **A soak before each widening:** 48 h at stage 0, with metrics checked: alert volume vs budget,
   model spend, worker tick failures, read-API p95 and error rate, ingest lag unchanged, and
   dashboard-adjudicated precision.
 
-**Flags, in enablement order.** Hosted stack and Helm values flip to `true`; self-host defaults stay
-off.
+**Flags, in enablement order.** Every flag's code default and stack input default stays off, and with
+the flag off the code is byte-identical to today. "Default on in hosted" is a per-stage value set in
+that stage's gated deploy, not a changed default. Any change to a default in code or in a stack input
+lands only with that stage's confirmation; otherwise an unrelated deploy would turn a feature on.
+Self-host defaults stay off.
 
 | # | Flag | Turns on | Precondition | Rollback |
 |---|---|---|---|---|
 | 1 | `SUMMARY_REGEN_TURNS_ENABLED` | Summaries refreshed on turns and idle | The summary model budget is set | Set false. Summaries freeze at the last version |
 | 2 | `READ_API_LIST_SHORT_SUMMARY_ENABLED`, `READ_API_SUMMARY_SEARCH_ENABLED` | Live summaries in lists and search | 1 soaked | Set false. Fields are omitted |
 | 3 | `SESSION_ANALYSIS_ENABLED` | The analysis runner | Model key present; completeness gate unchanged | Set false. Jobs stay queued |
-| 4 | `SUMMARY_DECISION_RECORDS_ENABLED` | Relayfacts writes | 062080 applied (real-DB migration: Khaliq OK) | Set false. Rows stay; reads unaffected |
-| 5 | `SESSION_INTEL_CLAIMS_ENABLED` (new, M1) | The incremental claims pass plus claim facts | M1 migration applied; claims budget set | Kill switch, then the flag. Claims stay; detectors see none |
+| 4 | `SUMMARY_DECISION_RECORDS_ENABLED` | Relayfacts writes | 062080, 062090 and 062100 applied, with both erase lanes (per session and per user) working; see [relayfacts.md](../relayfacts.md), Retention. Real-DB migrations: Khaliq OK | Set false. Rows stay; reads unaffected |
+| 5 | `SESSION_INTEL_CLAIMS_ENABLED` (new, M1) | The incremental claims pass plus claim facts | Everything row 4 needs, plus the M1 migration (062150) applied, its erase coverage proven, and the claims budget set | Kill switch, then the flag. Claims stay; detectors see none |
 | 6 | `COORDINATION_ADVISOR_ENABLED` | Advisor scan and writes (collision and overlap) | 062000 and 062070 applied; M0 replay meets the bars per row; rows that miss are SILENT | Kill switch, then the flag. Rows expire in 7 days |
 | 7 | `SESSION_INTEL_CONFLICTS_ENABLED` (new, M2) | Intent and constraint classification in the advisor scan | M2 replay meets the bars | Kill switch. The scan falls back to the collision and overlap rows |
 | 8 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | The pull and ack routes (turn-end advisories) | 6 soaked | Set false. Routes answer 501; the desktop hook treats that as "none" |
@@ -252,7 +261,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 
 | Ticket | Owner | Acceptance | Gate |
 |---|---|---|---|
-| M1-1 Claims schema: extend relayfacts with `kind` (`decision`, `intent`, `constraint`), `scope` (`session`, `project`, `repo`) and `observed_at`, behind SECURITY DEFINER functions, with a slot from the registry | M1 builder | Migration plus rollback, role and tenant tests, pg-proof 15/16/17 | **Applying to a real DB: Khaliq OK** |
+| M1-1 Claims schema: extend relayfacts with `kind` (`decision`, `intent`, `constraint`), `scope` (`session`, `project`, `repo`) and `observed_at`, behind SECURITY DEFINER functions, in slot 062150 (assigned by the lander) | M1 builder | Migration plus rollback, role and tenant tests, pg-proof 15/16/17. The erase lanes reach the new kinds and the v2 writer: the 062090 per-session erase with its RH016 late-insert fence, and the 062100 per-user erase. `relayfacts_list_v1`, `GET /v1/relayfacts`, the relayfacts MCP tools and the GitHub push module keep returning decisions only. The down file states what happens to intent and constraint rows | **Applying to a real DB: Khaliq OK** |
 | M1-2 Extractor: map analysis `intents`, `constraints` and `decisions` into claims, with scope classification (default `session`), scrub-clean only (existing rule), and supersession via `supersede_v1` when the same human revises a claim | M1 builder | Table-driven tests including scope and supersession; no transcript text stored beyond scrub-clean claim text | none |
 | M1-3 Incremental claims pass: triggered on the regen cadence at a lower threshold, a delta-only prompt, a per-workspace hourly token budget, fail-open from summaries | M1 builder | Latency p95 ≤ 10 min on the replayed snapshot; budget tests; a failure never fails a summary | none |
 | M1-4 Repository policy constraint pack: parse the instruction files seen in session evidence into `repo`-scope constraints; customer policy upload format | M1 builder | Parser tests over fixture AGENTS.md files | none |
@@ -271,7 +280,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 
 | Ticket | Owner | Acceptance | Gate |
 |---|---|---|---|
-| M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM); fail-closed for alerting | sessions-intel-lead | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
+| M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM), with a per-feature workspace allowlist that denies by default; fail-closed for alerting; its slot comes from the lander | sessions-intel-lead | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
 | M3-2 Per-workspace DM cap and model budget, durable | sessions-intel-lead | Tests; metrics emitted | none |
 | M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-desktop owner (to be confirmed with Khaliq) | Hook treats 501 as none; never blocks a turn | none |
 | M3-4 Dashboard "Session intelligence" view, with adjudication buttons | relay-webapp owner (to be confirmed) | Behind a setting; no transcript text | none |
