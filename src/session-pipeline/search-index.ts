@@ -189,7 +189,7 @@ export interface StagedReconcile {
   /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
   keyedRecordsCap: number;
   /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
-  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary">>;
+  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks">>;
 }
 
 /**
@@ -743,6 +743,9 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
     },
     wanted: (r) => [...r.wanted].map(([key, w]) => ({ key, ...r.owners[w.owner]!, tsMs: w.tsMs, fingerprint: w.fingerprint })),
     regenerableKinds: (r) => [...S3_ACTIVITY_KINDS, ...r.kinds],
+    // The facts pass (output-facts hooks only): the whole read's facts input, chunked, from one more pass.
+    factsPass: (r, chunk, emit) => r.facts(chunk, emit),
+    sourceComplete: (r) => r.complete,
     async scanPage(_tx, after, limit) {
       const at = decodeScanCursor(after);
       const page = await adapterScanPage(binding, scope, canonicalId, h.fromMs, limit, at.after);

@@ -280,6 +280,14 @@ export interface StreamedScope {
    * unreadable source.
    */
   regenerate(keys: ReadonlySet<string>, batch: number, write: (rows: IndexRow[]) => Promise<void>): Promise<void>;
+  /**
+   * The staged reconcile's facts pass (only on a complete read): one more pass handing the whole read's
+   * facts input to `emit` in chunks of about `chunk` items, in source order: the catalog rows first, then
+   * every post-fold record and every convergence_events row the whole read produces (in and out of the
+   * window, shadowed direct rows excluded), as readCanonicalScope's `records` and `projectionRows`.
+   * Throws as `regenerate` does on a changed or unreadable source.
+   */
+  facts(chunk: number, emit: (events: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[] }) => Promise<void>): Promise<void>;
 }
 
 /** The fold's summary of one record copy: no payload. */
@@ -336,6 +344,9 @@ export async function streamCanonicalScope(
     meter,
     regenerate: async () => {
       throw new PipelineError("stream_incomplete", "an incomplete streamed read has nothing to write", false);
+    },
+    facts: async () => {
+      throw new PipelineError("stream_incomplete", "an incomplete streamed read has no facts input", false);
     },
     ...fields,
   });
@@ -722,9 +733,10 @@ export async function streamCanonicalScope(
     | { rank: number; mapError: unknown };
   // Only a loop failure (before settling) leaves the activity group nothing to settle.
   const activityLoopFailed = () => (projErr.get(D)?.at ?? Infinity) < W;
-  async function* projected(): AsyncGenerator<Projected> {
+  async function* projected(onRecord?: (record: RelayhistoryStreamRecord) => Promise<void>): AsyncGenerator<Projected> {
     let added = 0;
     for await (const { pos, rank, record } of kept()) {
+      if (onRecord) await onRecord(record);
       let row: Json;
       let slot: number;
       let shadowed = false;
@@ -890,6 +902,38 @@ export async function streamCanonicalScope(
       }
       if (found !== keys.size) throw new PipelineError(STREAM_SOURCE_CHANGED, "the streamed source changed", false);
       if (rows.length) await write(rows);
+    },
+    async facts(chunk, emit) {
+      // The whole read's catalog rows come first (readCanonicalScope: catalogRows, then convergence_events).
+      let projectionRows: Array<{ table: string; row: Json }> = (projErr.has(D) ? [] : catalogRows).map((r) => ({ table: r.table, row: r.row as Json }));
+      let records: RelayhistoryStreamRecord[] = [];
+      const flush = async (force: boolean) => {
+        if (!force && projectionRows.length + records.length < chunk) return;
+        if (!projectionRows.length && !records.length) return;
+        const out = { projectionRows, records };
+        projectionRows = [];
+        records = [];
+        // A hook error is the caller's, not the source's.
+        await emit(out).catch((error: unknown) => { throw new CallerFailed(error); });
+      };
+      try {
+        await pass(async () => {
+          const onRecord = async (record: RelayhistoryStreamRecord) => {
+            records.push(record);
+            await flush(false);
+          };
+          for await (const p of projected(onRecord)) {
+            if ("mapError" in p) throw new StreamStop(STREAM_SOURCE_CHANGED);
+            if (p.shadowed) continue;
+            projectionRows.push({ table: "convergence_events", row: p.row });
+            await flush(false);
+          }
+        });
+      } catch (error) {
+        if (error instanceof StreamStop) throw new PipelineError(error.code, "the streamed source changed or could not be read", false);
+        throw error;
+      }
+      await flush(true);
     },
   });
 }
