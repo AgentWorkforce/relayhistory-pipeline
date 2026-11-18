@@ -220,6 +220,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Staged output facts: new tables and functions and a reset trigger on the 062110 run table; no G4 function
       // names them, no ingest path calls them.
       "20261105062140_staged_output_facts.sql",
+      // Relayfacts claims: two new tables, four functions, three triggers and the two replaced relayfacts erase
+      // functions; no G4 function names them, no ingest path calls them.
+      "20261105062150_relayfacts_claims.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

@@ -1335,6 +1335,21 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.relayfacts_claims_fence_guard_v1()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.relayfacts_claims_insert_v1(text,text,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.relayfacts_claims_supersede_v1(text,text,uuid,uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.relayfacts_claims_v1(text,text,text,text,timestamp with time zone,integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
