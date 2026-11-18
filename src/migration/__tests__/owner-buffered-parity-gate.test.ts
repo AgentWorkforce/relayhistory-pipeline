@@ -315,6 +315,10 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect(workflow).toContain("options: [frozen-supabase, neon]");
   expect(workflow).toContain("default: census\n");
   expect(workflow).toContain("default: frozen-supabase\n");
+  // The written_at refresh opt-in: a choice input, default off, handed to the job as OWNER_PARITY_REFRESH_WRITTEN_AT.
+  expect(workflow).toContain('      refresh_written_at:\n');
+  expect(workflow).toContain('        options: ["off", "on"]\n        default: "off"\n');
+  expect(workflow).toContain("OWNER_PARITY_REFRESH_WRITTEN_AT: ${{ inputs.refresh_written_at }}");
   expect(workflow).toContain("group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production'");
   expect(workflow).toContain("format('owner-buffered-parity-proof-{0}', github.sha)");
   expect(workflow).toContain("permissions:\n  contents: read\n  actions: read\n  deployments: read\n");

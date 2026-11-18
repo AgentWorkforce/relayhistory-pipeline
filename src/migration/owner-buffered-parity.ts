@@ -259,6 +259,22 @@ WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3
   AND ($6::bigint > coalesce($16::bigint,0) OR $13 IS DISTINCT FROM $21)
 RETURNING written_at`;
 
+/**
+ * The refresh of an UNCHANGED proof (opt-in, default off: writeProofRowCas `refreshUnchangedWrittenAt`). It moves
+ * written_at only, and only while the stored row is still exactly the proof just re-proven: the whole tuple (cutover
+ * epoch, head, no_head, baseline, generation and the three digests) is the CAS guard, so a row any other writer moved
+ * since the read is never touched (no row: proof_refresh_cas_conflict). written_at is audit only for the reader
+ * (owner_buffered_read_scope never reads it); the accepted-stage export's Path B reads it as the census time.
+ */
+export const REFRESH_OWNER_BUFFERED_PARITY_CAS_SQL = `
+UPDATE sessions.owner_buffered_parity SET written_at=clock_timestamp()
+WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3
+  AND (cutover_epoch,head_epoch,head_version,head_digest,head_kind,no_head,deletion_set_digest,reset_set_digest,
+       target_lineage_digest,target_generation,privacy_baseline_sha256)
+      IS NOT DISTINCT FROM
+      ($4,$5,$6::bigint,$7,$8,$9,$10,$11,$12,$13,$14)
+RETURNING written_at`;
+
 export const READ_OWNER_BUFFERED_PARITY_SQL = `
 SELECT cutover_epoch,head_epoch,head_version::text AS head_version,head_digest,head_kind,no_head,
        deletion_set_digest,reset_set_digest,target_lineage_digest,target_generation,privacy_baseline_sha256
@@ -300,14 +316,27 @@ export function planProofWrite(
   throw new ParityCensusRefusal("proof_not_advanced");
 }
 
+/**
+ * Writer options. `refreshUnchangedWrittenAt` (default off; off is byte-identical to before): an "unchanged" plan
+ * also refreshes written_at under the full-tuple CAS (REFRESH_OWNER_BUFFERED_PARITY_CAS_SQL), so a stable user's
+ * proof shows when it was last re-proven. The outcome stays "unchanged"; `refreshed: true` says the row was touched.
+ */
+export interface ProofWriteOptions { refreshUnchangedWrittenAt?: boolean }
+
 /** Execute the already-planned mutation inside the caller's open target transaction. */
 export async function writeProofRowCas(
   target: Queryable,
   prior: OwnerBufferedParityProof | null,
   next: OwnerBufferedParityProof,
-): Promise<{ outcome: ProofWritePlan; writtenAt: unknown | null }> {
+  options: ProofWriteOptions = {},
+): Promise<{ outcome: ProofWritePlan; writtenAt: unknown | null; refreshed?: true }> {
   const outcome = planProofWrite(prior, next);
-  if (outcome === "unchanged") return { outcome, writtenAt: null };
+  if (outcome === "unchanged") {
+    if (options.refreshUnchangedWrittenAt !== true) return { outcome, writtenAt: null };
+    const row = (await target.query<{ written_at: unknown }>(REFRESH_OWNER_BUFFERED_PARITY_CAS_SQL, proofParams(next))).rows[0];
+    if (!row) throw new ParityCensusRefusal("proof_refresh_cas_conflict");
+    return { outcome, writtenAt: row.written_at, refreshed: true };
+  }
   if (outcome === "insert") {
     const row = (await target.query<{ written_at: unknown }>(INSERT_OWNER_BUFFERED_PARITY_SQL, proofParams(next))).rows[0];
     if (!row) throw new ParityCensusRefusal("proof_insert_conflict");
@@ -560,7 +589,8 @@ export async function writeCurrentParityProof(
   tenant: ParityTenant,
   expectedTargetGeneration?: string,
   censusSource: ParityCensusSource = "neon",
-): Promise<{ census: ParityCensusReceipt; outcome: ProofWritePlan; writtenAt: unknown | null }> {
+  writeOptions: ProofWriteOptions = {},
+): Promise<{ census: ParityCensusReceipt; outcome: ProofWritePlan; writtenAt: unknown | null; refreshed?: true }> {
   const spec = censusSourceSpec(censusSource);
   if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
@@ -579,7 +609,7 @@ export async function writeCurrentParityProof(
     if (!census.equal || !census.proof) throw new ParityCensusRefusal(`parity_mismatch:${census.mismatches.join(",")}`);
     if (expectedTargetGeneration !== undefined && census.proof.targetGeneration !== expectedTargetGeneration)
       throw new ParityCensusRefusal("target_generation_mismatch");
-    const result = await writeProofRowCas(targetOwner, prior, census.proof);
+    const result = await writeProofRowCas(targetOwner, prior, census.proof, writeOptions);
     await targetOwner.query("COMMIT");
     return { census, ...result };
   } catch (error) {

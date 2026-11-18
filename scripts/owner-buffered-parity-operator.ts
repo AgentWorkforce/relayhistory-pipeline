@@ -22,6 +22,11 @@
  *     --expect-source-sha <merged-main-sha> --expect-target-generation <hex64> \
  *     --batch-size 25 --confirm-write owner-buffered-parity-bulk/v1
  *
+ * Bulk write may add `--refresh-written-at on` (default off; off is byte-identical): a tenant whose proof is
+ * unchanged has its written_at refreshed under the full-tuple CAS (owner-buffered-parity.ts
+ * REFRESH_OWNER_BUFFERED_PARITY_CAS_SQL), counted as `refreshed` (a field present only when on). The accepted-stage
+ * export's Path B reads written_at as the census time.
+ *
  * Bulk enumeration is a read-only repeatable-read cursor. Only one bounded
  * page is held in process memory. A stopped run is resumed by rerunning the
  * same pinned command: completed tenants are idempotently reported unchanged,
@@ -119,6 +124,8 @@ export interface SingleOperatorArgs extends OperatorBaseArgs {
 export interface BulkOperatorArgs extends OperatorBaseArgs {
   mode: "bulk";
   batchSize: number;
+  /** --refresh-written-at on (default off): present only when on. */
+  refreshWrittenAt?: true;
 }
 
 export type OperatorArgs = SingleOperatorArgs | BulkOperatorArgs;
@@ -129,6 +136,7 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
     throw new OwnerBufferedOperatorRefusal("usage");
   const allowed = new Set([
     "--expect-source-sha", "--expect-target-generation", "--confirm-write", "--batch-size", "--census-source",
+    "--refresh-written-at",
   ]);
   const values = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
@@ -155,8 +163,11 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
   if (!(PARITY_CENSUS_SOURCES as readonly string[]).includes(sourceText))
     throw new OwnerBufferedOperatorRefusal("census_source_invalid");
   const censusSource = sourceText as ParityCensusSource;
+  const refreshText = values.get("--refresh-written-at");
+  if (refreshText !== undefined && (mode !== "bulk" || (refreshText !== "on" && refreshText !== "off")))
+    throw new OwnerBufferedOperatorRefusal("usage");
   return mode === "bulk"
-    ? { mode, expectedSourceSha, expectedTargetGeneration, censusSource, batchSize }
+    ? { mode, expectedSourceSha, expectedTargetGeneration, censusSource, batchSize, ...(refreshText === "on" ? { refreshWrittenAt: true as const } : {}) }
     : { mode, expectedSourceSha, expectedTargetGeneration, censusSource };
 }
 
@@ -324,6 +335,8 @@ export interface BulkParityCounts {
   missing: number;
   stale: number;
   verified: number;
+  /** Unchanged proofs whose written_at was refreshed: present only when the refresh is on. */
+  refreshed?: number;
 }
 
 export type BulkParityOperation = "plan" | "write" | "readback";
@@ -410,11 +423,14 @@ export async function runBulkParity(
   dependencies: BulkParityDependencies = {},
   censusSource: ParityCensusSource = "neon",
   operation: BulkParityOperation = "write",
+  writeOptions: { refreshUnchangedWrittenAt?: boolean } = {},
 ): Promise<BulkParityCounts> {
   if (!HEX64.test(expectedTargetGeneration) || !Number.isSafeInteger(batchSize) ||
       batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
     throw new OwnerBufferedOperatorRefusal("bulk_arguments_invalid");
   const counts = emptyBulkCounts();
+  const refresh = operation === "write" && writeOptions.refreshUnchangedWrittenAt === true;
+  if (refresh) counts.refreshed = 0;
   const readCensus = dependencies.readCensus ?? readParityCensus;
   const writeProof = dependencies.writeProof ?? writeCurrentParityProof;
   const readStored = dependencies.readStoredProof ?? readStoredProof;
@@ -450,12 +466,15 @@ export async function runBulkParity(
                   throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
                 counts.g1Equal++;
                 if (operation === "write") {
-                  const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource);
+                  const result = refresh
+                    ? await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource, { refreshUnchangedWrittenAt: true })
+                    : await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource);
                   if (!generationMatches(result.census, expectedTargetGeneration))
                     throw new BulkParityFatal("target_generation_postcondition_failed", counts);
                   if (result.outcome === "insert") counts.inserted++;
                   else if (result.outcome === "update") counts.updated++;
                   else counts.unchanged++;
+                  if (refresh && result.refreshed === true) counts.refreshed!++;
                   // Unit tests that replace the writer must also opt into the storage seam to exercise readback.
                   // Production supplies neither seam and always re-reads the committed target row.
                   const stored = dependencies.writeProof !== undefined && dependencies.readStoredProof === undefined
@@ -549,9 +568,13 @@ async function main(): Promise<number> {
         // Await inside this try so owner-route failures are sanitized and Neon stays open until cleanup.
         return await withBulkParityOwnerSessions(enumerator, targetOwner, async (fencedEnumerator, fencedTargetOwner) => {
           try {
-            const counts = await runBulkParity(
-              neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize, {}, args.censusSource,
-            );
+            // Off (the default): the call is exactly as before.
+            const counts = args.refreshWrittenAt
+              ? await runBulkParity(neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize, {},
+                args.censusSource, "write", { refreshUnchangedWrittenAt: true })
+              : await runBulkParity(
+                neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize, {}, args.censusSource,
+              );
             const status = bulkCompletionStatus(counts);
             emit({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
               targetGeneration: args.expectedTargetGeneration, counts });

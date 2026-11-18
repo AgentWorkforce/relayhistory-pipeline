@@ -88,6 +88,11 @@ export interface OwnerParityDispatch {
   /** write only: the census run id; null otherwise. */
   censusRun: string | null;
   confirmation: string;
+  /**
+   * bulk-write only (OWNER_PARITY_REFRESH_WRITTEN_AT=on, input refresh_written_at; default off): refresh written_at
+   * of unchanged proofs under the full-tuple CAS. Present only when on, so an off dispatch is byte-identical.
+   */
+  refreshWrittenAt?: true;
 }
 
 /**
@@ -102,7 +107,7 @@ export function ownerParityDispatch(
 ): OwnerParityDispatch {
   const mode = env.OWNER_PARITY_MODE ?? "", sha = env.OWNER_PARITY_SHA ?? "",
     censusSource = env.OWNER_PARITY_CENSUS_SOURCE ?? "", censusRun = env.OWNER_PARITY_CENSUS_RUN ?? "",
-    confirmation = env.OWNER_PARITY_CONFIRMATION ?? "";
+    confirmation = env.OWNER_PARITY_CONFIRMATION ?? "", refresh = env.OWNER_PARITY_REFRESH_WRITTEN_AT ?? "";
   if (!(OWNER_PARITY_MODES as readonly string[]).includes(mode) || !SHA40.test(sha))
     refuseOwnerParity("owner_parity_inputs");
   if (!(OWNER_PARITY_CENSUS_SOURCES as readonly string[]).includes(censusSource))
@@ -115,9 +120,12 @@ export function ownerParityDispatch(
   if (mode === "write" ? !confirmation.startsWith("WRITE-OWNER-PARITY ")
     : mode === "bulk-write" ? !confirmation.startsWith("WRITE-OWNER-PARITY-BULK ") : confirmation !== "")
     refuseOwnerParity("owner_parity_confirmation");
+  // "" or "off": off. "on": bulk-write only.
+  if (!(refresh === "" || refresh === "off" || (refresh === "on" && mode === "bulk-write")))
+    refuseOwnerParity("owner_parity_refresh_written_at");
   return {
     mode: mode as OwnerParityMode, sha, censusSource: censusSource as OwnerParityCensusSource,
-    censusRun: plannedWrite ? censusRun : null, confirmation,
+    censusRun: plannedWrite ? censusRun : null, confirmation, ...(refresh === "on" ? { refreshWrittenAt: true as const } : {}),
   };
 }
 

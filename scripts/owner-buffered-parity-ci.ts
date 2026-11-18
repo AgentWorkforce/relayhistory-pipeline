@@ -125,7 +125,7 @@ export const OWNER_PARITY_NEON_SECRET_ENV = "OWNER_PARITY_NEON_READONLY_URL";
 export const OWNER_PARITY_CHILD_ENV = [
   "PATH", "HOME", "LANG", "TMPDIR", "RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_SHA",
   "OWNER_PARITY_MODE", "OWNER_PARITY_SHA", "OWNER_PARITY_CENSUS_SOURCE", "OWNER_PARITY_CENSUS_RUN",
-  "OWNER_PARITY_CONFIRMATION",
+  "OWNER_PARITY_CONFIRMATION", "OWNER_PARITY_REFRESH_WRITTEN_AT",
 ] as const;
 const CHILD_FLAG = "--operator-stdin";
 const SUMMARY_FLAG = "--discovery-summary";
@@ -163,6 +163,8 @@ export type OwnerParityTenantStatus =
   | "equal" | "mismatch" | "stale" | "missing" | "inserted" | "updated" | "unchanged" | "refused" | "not_attempted";
 
 export interface OwnerParityCounts {
+  /** bulk-write with refresh_written_at=on only: unchanged proofs whose written_at was refreshed. */
+  refreshed?: number;
   roster: number;
   found: number;
   equal: number;
@@ -573,9 +575,14 @@ export async function runOwnerParityBulk(
         generation, 25, options.deps, "neon", "plan");
       if (canonicalJson(bulkPlanCounts(currentPlan)) !== canonicalJson(pre.bulkPlan!.counts))
         refuseOwnerParity("owner_parity_bulk_plan_drift");
-      const written = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
-        generation, 25, options.deps, "neon", "write");
+      // refresh_written_at=on only: unchanged proofs get written_at refreshed under the full-tuple CAS.
+      const written = dispatch.refreshWrittenAt
+        ? await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+          generation, 25, options.deps, "neon", "write", { refreshUnchangedWrittenAt: true })
+        : await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+          generation, 25, options.deps, "neon", "write");
       applyBulkCounts(counts, written);
+      if (written.refreshed !== undefined) counts.refreshed = written.refreshed;
       if (bulkCompletionStatus(written, "write") !== "complete")
         return { receipt: receipt("refused", "owner_parity_bulk_write_partial"), census: null, exitCode: 1 };
       const checked = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,

@@ -39,6 +39,11 @@ on:
         options: [frozen-supabase, neon]
         default: frozen-supabase
         required: true
+      refresh_written_at:
+        description: bulk-write only - "on" also refreshes written_at of unchanged proofs under the full-tuple CAS (for the export's Path B parity age); "off" (default) leaves them as before
+        type: choice
+        options: ["off", "on"]
+        default: "off"
   pull_request:
     paths:
       - .github/workflows/owner-buffered-parity.yml
@@ -78,6 +83,7 @@ env:
   OWNER_PARITY_CENSUS_RUN: ${{ inputs.census_run }}
   OWNER_PARITY_CONFIRMATION: ${{ inputs.confirmation }}
   OWNER_PARITY_CENSUS_SOURCE: ${{ inputs.census_source }}
+  OWNER_PARITY_REFRESH_WRITTEN_AT: ${{ inputs.refresh_written_at }}
 
 jobs:
   proof:

@@ -178,6 +178,31 @@ describe("pipeline-lead G2 write ruling", () => {
     expect(calls[1]!.params).toHaveLength(24);
   });
 
+  test("refresh (opt-in): unchanged issues no SQL when off; when on, one full-tuple CAS touching written_at only", async () => {
+    const calls: { sql: string; params?: unknown[] }[] = [];
+    const db: Queryable = { async query<T>(sql: string, params?: unknown[]) {
+      calls.push({ sql, params }); return { rows: [{ written_at: "now" }] as T[] };
+    } };
+    const proof = next();
+    expect(await writeProofRowCas(db, clone(proof), proof)).toEqual({ outcome: "unchanged", writtenAt: null });
+    expect(await writeProofRowCas(db, clone(proof), proof, {})).toEqual({ outcome: "unchanged", writtenAt: null });
+    expect(calls).toHaveLength(0);
+    expect(await writeProofRowCas(db, clone(proof), proof, { refreshUnchangedWrittenAt: true })).toEqual({ outcome: "unchanged", writtenAt: "now", refreshed: true });
+    expect(calls).toHaveLength(1);
+    const sql = calls[0]!.sql;
+    expect(sql).toMatch(/^\s*UPDATE sessions\.owner_buffered_parity SET written_at=clock_timestamp\(\)\s*\n/u);
+    for (const column of ["cutover_epoch", "head_epoch", "head_version", "head_digest", "head_kind", "no_head", "deletion_set_digest",
+      "reset_set_digest", "target_lineage_digest", "target_generation", "privacy_baseline_sha256"]) expect(sql).toContain(column);
+    expect(sql).toContain("IS NOT DISTINCT FROM");
+    expect(calls[0]!.params).toHaveLength(14);
+    // Never for an insert or an update plan: those keep their own SQL.
+    const advanced = next(); advanced.head!.version = "8";
+    await writeProofRowCas(db, proof, advanced, { refreshUnchangedWrittenAt: true });
+    expect(calls[1]!.params).toHaveLength(24);
+    const none: Queryable = { async query<T>() { return { rows: [] as T[] }; } };
+    await expect(writeProofRowCas(none, clone(proof), proof, { refreshUnchangedWrittenAt: true })).rejects.toThrow("proof_refresh_cas_conflict");
+  });
+
   test("0 affected rows refuses insert races and CAS races", async () => {
     const db: Queryable = { async query<T>() { return { rows: [] as T[] }; } };
     const prior = next(), advanced = next(); advanced.head!.version = "8";
@@ -304,6 +329,42 @@ describe("pipeline-lead G2 write ruling", () => {
       expect(await readParityCensus(n, t, BASE.tenant)).toMatchObject({ equal: true, proof: { head: { version: "7" } } });
       expect(await writeCurrentParityProof(n, t, BASE.tenant)).toMatchObject({ outcome: "insert" });
       expect(await writeCurrentParityProof(n, t, BASE.tenant)).toMatchObject({ outcome: "unchanged" });
+
+      // written_at refresh (default off). Off: an unchanged rerun touches nothing (no refreshed key, same written_at).
+      const row = async () => (await target.query<Record<string, unknown>>(
+        "SELECT *, written_at::text AS w FROM sessions.owner_buffered_parity")).rows;
+      const before = await row();
+      expect(before).toHaveLength(1);
+      await new Promise((r) => setTimeout(r, 5));
+      const off = await writeCurrentParityProof(n, t, BASE.tenant);
+      expect(off.outcome).toBe("unchanged");
+      expect(off.writtenAt).toBeNull();
+      expect("refreshed" in off).toBe(false);
+      expect(await row()).toEqual(before);
+      // On: the identical tuple has only written_at moved.
+      await new Promise((r) => setTimeout(r, 5));
+      const on = await writeCurrentParityProof(n, t, BASE.tenant, undefined, "neon", { refreshUnchangedWrittenAt: true });
+      expect(on).toMatchObject({ outcome: "unchanged", refreshed: true });
+      const after = await row();
+      expect(after[0]!.w).not.toBe(before[0]!.w);
+      const strip = (r: Record<string, unknown>) => { const { written_at: _a, w: _b, ...rest } = r; return rest; };
+      expect(strip(after[0]!)).toEqual(strip(before[0]!));
+      // A concurrent change between the read and the refresh (another writer moved the row): the CAS refuses, no write.
+      const proof = (await readParityCensus(n, t, BASE.tenant)).proof!;
+      await target.query("UPDATE sessions.owner_buffered_parity SET reset_set_digest = $1", [H("e")]);
+      const moved = await row();
+      await target.exec("BEGIN");
+      await expect(writeProofRowCas(t, proof, proof, { refreshUnchangedWrittenAt: true })).rejects.toThrow("proof_refresh_cas_conflict");
+      await target.exec("ROLLBACK");
+      expect(await row()).toEqual(moved);
+      // Off, the same call never issues SQL at all.
+      expect(await writeProofRowCas(t, proof, proof)).toEqual({ outcome: "unchanged", writtenAt: null });
+      expect(await row()).toEqual(moved);
+      await target.query("UPDATE sessions.owner_buffered_parity SET reset_set_digest = $1", [before[0]!.reset_set_digest]);
+      // The reader's gate never reads written_at: a refresh cannot open or close it.
+      const reader = (await target.query<{ src: string }>("SELECT prosrc AS src FROM pg_proc WHERE proname = 'owner_buffered_read_scope'")).rows;
+      expect(reader.length).toBeGreaterThan(0);
+      for (const r of reader) expect(r.src).not.toContain("written_at");
 
       await target.exec(`INSERT INTO sessions.ingest_control_receipts(org_id,workspace_id,user_id,epoch,version,digest,kind,result,schema_generation)
         VALUES('fixture-org','fixture-workspace','fixture-user','${H("1")}',8,'${H("9")}','reset','{}'::jsonb,'${H("4")}')`);

@@ -474,3 +474,44 @@ test("parent process: dormant write and the empty committed roster refuse before
     rmSync(temp, { recursive: true, force: true });
   }
 });
+
+test("refresh_written_at: bulk-write only; off is byte-identical; on refreshes unchanged proofs and counts them", async () => {
+  // Dispatch: "" / "off" off (no field), "on" only for bulk-write, anything else refused.
+  const plan = bulkPlanArtifact();
+  const env = bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun, OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
+  const plain = ownerParityDispatch(env, true, true);
+  expect("refreshWrittenAt" in plain).toBe(false);
+  expect(ownerParityDispatch({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "off" }, true, true)).toEqual(plain);
+  expect(ownerParityDispatch({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on" }, true, true)).toEqual({ ...plain, refreshWrittenAt: true });
+  const refused = (e: Record<string, string>) => { try { ownerParityDispatch(e, true, true); return null; } catch (error) { return (error as { code?: string }).code; } };
+  expect(refused({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "yes" })).toBe("owner_parity_refresh_written_at");
+  for (const mode of ["bulk-plan", "bulk-readback"] as const) expect(refused({ ...bulkEnv(mode), OWNER_PARITY_REFRESH_WRITTEN_AT: "on" })).toBe("owner_parity_refresh_written_at");
+  expect(refused({ ...base, OWNER_PARITY_MODE: "census", OWNER_PARITY_REFRESH_WRITTEN_AT: "on" })).toBe("owner_parity_refresh_written_at");
+  expect(OWNER_PARITY_CHILD_ENV).toContain("OWNER_PARITY_REFRESH_WRITTEN_AT");
+
+  // The run: a second bulk-write over stored proofs is all unchanged. Off: no options reach the writer, no refreshed
+  // count. On: every unchanged proof is refreshed and counted.
+  const seen: unknown[] = [];
+  const x = world();
+  const inner = x.deps.writeProof as unknown as (...a: unknown[]) => Promise<Record<string, unknown>>;
+  x.deps.writeProof = (async (...a: unknown[]) => {
+    seen.push(a[5]);
+    const out = await inner(...a);
+    return (a[5] as { refreshUnchangedWrittenAt?: boolean } | undefined)?.refreshUnchangedWrittenAt && out.outcome === "unchanged"
+      ? { ...out, writtenAt: "now", refreshed: true } : out;
+  }) as never;
+  const opts = { roster: {}, census: plan, runId: "402", now: () => T0 + 1, bulkWriteEnabled: true, deps: x.deps };
+  expect((await runOwnerParityBulk(env, x.sessions, opts)).exitCode).toBe(0); // first write: all inserts
+  seen.length = 0;
+  const off = await runOwnerParityBulk(env, x.sessions, opts);
+  expect(off.exitCode).toBe(0);
+  expect(off.receipt.counts).toMatchObject({ unchanged: 9, inserted: 0 });
+  expect("refreshed" in off.receipt.counts).toBe(false);
+  expect(seen.every((o) => o === undefined)).toBe(true);
+  seen.length = 0;
+  const on = await runOwnerParityBulk({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on" }, x.sessions, opts);
+  expect(on.exitCode).toBe(0);
+  expect(on.receipt.counts).toMatchObject({ unchanged: 9, refreshed: 9 });
+  expect(seen).toHaveLength(9);
+  expect(seen.every((o) => JSON.stringify(o) === JSON.stringify({ refreshUnchangedWrittenAt: true }))).toBe(true);
+});

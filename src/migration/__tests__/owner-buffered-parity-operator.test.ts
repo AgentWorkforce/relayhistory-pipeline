@@ -425,3 +425,46 @@ test("public mismatch receipt remains diagnostic without exposing the tenant", (
   expect(serialized).toContain("reset_set_mismatch");
   expect(serialized).not.toContain("private-");
 });
+
+describe("owner-buffered parity bulk: written_at refresh (opt-in, default off)", () => {
+  const BULK = ["bulk", "--confirm-write", "owner-buffered-parity-bulk/v1", "--expect-target-generation", GENERATION, "--expect-source-sha", SHA];
+  test("--refresh-written-at: bulk only, on/off; off (or absent) parses exactly as before", () => {
+    const plain = parseOperatorArgs(BULK);
+    expect(plain).toEqual({ mode: "bulk", expectedSourceSha: SHA, expectedTargetGeneration: GENERATION, censusSource: "neon", batchSize: 25 });
+    expect(parseOperatorArgs([...BULK, "--refresh-written-at", "off"])).toEqual(plain);
+    expect(parseOperatorArgs([...BULK, "--refresh-written-at", "on"])).toEqual({ ...plain, refreshWrittenAt: true });
+    for (const argv of [[...BULK, "--refresh-written-at", "yes"],
+      ["write", "--confirm-write", "owner-buffered-parity/v1", "--expect-target-generation", GENERATION, "--expect-source-sha", SHA, "--refresh-written-at", "on"],
+      ["census", "--expect-source-sha", SHA, "--expect-target-generation", GENERATION, "--refresh-written-at", "on"]])
+      expect(() => parseOperatorArgs(argv)).toThrow(OwnerBufferedOperatorRefusal);
+  });
+
+  test("off: the writer gets no options and the counts have no refreshed field; on: unchanged proofs are refreshed and counted", async () => {
+    const outcomes = new Map([["private-user-1", "insert"], ["private-user-2", "unchanged"], ["private-user-3", "unchanged"]] as const);
+    const run = async (opts: Parameters<typeof runBulkParity>[8] | undefined) => {
+      const seenOptions: unknown[] = [];
+      const deps = {
+        readCensus: async (_n: Queryable, _t: Queryable, candidate: ParityTenant) => equalReceipt(candidate),
+        writeProof: async (_n: Queryable, _t: Queryable, candidate: ParityTenant, ...rest: unknown[]) => {
+          seenOptions.push(rest[2]);
+          const outcome = outcomes.get(candidate.userId)!;
+          const refreshed = (rest[2] as { refreshUnchangedWrittenAt?: boolean } | undefined)?.refreshUnchangedWrittenAt === true && outcome === "unchanged";
+          return { census: equalReceipt(candidate), outcome, writtenAt: refreshed ? "now" : null, ...(refreshed ? { refreshed: true as const } : {}) };
+        },
+      };
+      const counts = opts === undefined
+        ? await runBulkParity({ query: async <T>() => ({ rows: [] as T[] }) }, enumerator([[row(1), row(2), row(3)], []], []), targetOwner(), GENERATION, 3, deps)
+        : await runBulkParity({ query: async <T>() => ({ rows: [] as T[] }) }, enumerator([[row(1), row(2), row(3)], []], []), targetOwner(), GENERATION, 3, deps,
+          "neon", "write", opts);
+      return { counts, seenOptions };
+    };
+    const off = await run(undefined);
+    expect(off.counts).toEqual({ batches: 1, candidates: 3, g1Equal: 3, g1Mismatch: 0, tenantRefused: 0, inserted: 1, updated: 0, unchanged: 2, missing: 0, stale: 0, verified: 3 });
+    expect(off.seenOptions).toEqual([undefined, undefined, undefined]);
+    expect((await run({})).counts).toEqual(off.counts);
+    const on = await run({ refreshUnchangedWrittenAt: true });
+    expect(on.counts).toEqual({ ...off.counts, refreshed: 2 });
+    expect(on.seenOptions).toEqual([{ refreshUnchangedWrittenAt: true }, { refreshUnchangedWrittenAt: true }, { refreshUnchangedWrittenAt: true }]);
+    expect(bulkCompletionStatus(on.counts)).toBe("complete");
+  });
+});

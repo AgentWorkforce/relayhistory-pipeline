@@ -122,8 +122,10 @@ one-time **fence backfill**:
    **Path B (no-head parity, per org, default off).** The export applies the SQL reader's per-user gate. For a user
    with no mirrored control head it normally also requires the privacy authority to be ACTIVE on the policy's
    control epoch, so while Neon is the authority, every such user's buffered stages stay unpublished. Path B
-   relaxes only that requirement, and only for orgs on an explicit allow-list (`--no-head-parity-org`; in the
-   workflow the secret `BACKLOG_OPS_NO_HEAD_PARITY_ORGS`, see docs/backlog-ops-workflow.md). An absent head
+   relaxes only that requirement, and only for orgs on an explicit allow-list. Both ways to give the list exist:
+   the export CLI's repeatable `--no-head-parity-org` flag (local or self-hosted runs), and, in the backlog-ops
+   workflow, the secret `BACKLOG_OPS_NO_HEAD_PARITY_ORGS`, which reaches the export only on its stdin pipe as
+   `"noHeadParityOrgs"` (never argv or a log; see docs/backlog-ops-workflow.md). An absent head
    counts as version 0 without the authority when all of these hold, which is exactly the SQL reader's own no-head
    branch (`owner_buffered_read_scope`, 20261105043700):
    - the user has no control receipt on any epoch;
@@ -140,8 +142,15 @@ one-time **fence backfill**:
    **Residual risk, stated plainly:** a Neon-only deletion in the census-to-drain window is readable until the
    eraser removes it. Concretely, a deletion that reached Neon only (never the Worker) between the parity census
    and the drain is published and readable until the Neon-mode eraser removes it (10 min nominal, 48 h SLA).
+   The proof records add nothing readable: they sit under a dot segment (`.drain/`), which the eraser skips as it
+   skips the other export objects. What they hold is the org id in the key, plus the stage's sha256 and the max
+   age, the same class of data as the existing sidecars.
    Preconditions for each allow-listed org, all required:
-   - a fresh bulk parity right before each export;
+   - a fresh bulk parity right before each export, run with the written_at refresh on (owner-buffered-parity
+     `bulk-write` with `refresh_written_at=on`, or the operator's `--refresh-written-at on`). The census never
+     rewrites an unchanged proof row, so without the refresh a stable user's `written_at` stays at its first
+     census and Path B refuses it as `head_unproven_parity_stale`. The refresh moves `written_at` only, under the
+     row's full-tuple CAS. The SQL reader never reads `written_at`;
    - `INGEST_S3_FENCE_MIRROR=on`;
    - the Neon-mode eraser running;
    - the drain's target bucket and key root equal to the running Neon eraser's (otherwise drained objects are
