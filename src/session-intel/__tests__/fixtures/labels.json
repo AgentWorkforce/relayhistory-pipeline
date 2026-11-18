@@ -2,7 +2,8 @@
   "incidents": [
     { "id": "inc-migrate", "pair": ["claude:sess-a", "codex:sess-b"], "kind": "duplicate_work", "harmAt": "2026-11-01T10:30:00.000Z", "split": "dev", "workstream": "migrations" },
     { "id": "inc-billing", "pair": ["claude:sess-d", "claude:sess-c"], "kind": "overlap", "harmAt": "2026-11-01T10:30:00.000Z", "split": "heldout", "workstream": "billing" },
-    { "id": "inc-retry", "pair": ["codex:sess-h", "claude:sess-g"], "kind": "overlap", "harmAt": "2026-11-01T13:00:00.000Z", "split": "dev", "workstream": "retry" }
+    { "id": "inc-retry", "pair": ["codex:sess-h", "claude:sess-g"], "kind": "overlap", "harmAt": "2026-11-01T13:00:00.000Z", "split": "dev", "workstream": "retry" },
+    { "id": "inc-api", "pair": ["claude:sess-k", "codex:sess-l"], "kind": "intent_conflict", "harmAt": "2026-11-01T11:00:00.000Z", "split": "dev", "workstream": "api" }
   ],
   "hardNegatives": [
     { "pair": ["claude:sess-fleet-1", "claude:sess-fleet-2"], "reason": "planned_fleet" },

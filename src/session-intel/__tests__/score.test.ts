@@ -58,18 +58,18 @@ describe("scoreReplay", () => {
     ]), labels, { split: "dev", labelsSha256: H2 });
     const d = r.detectors[0]!;
     expect(r.incidents).toBe(3);
-    expect(d.total).toMatchObject({
+    expect(d.pairMatch.total).toMatchObject({
       alerts: 6, outOfScope: 0, truePositives: 3, falsePositives: 3, hardNegativeHits: 1, unlabeled: 2, precision: 0.5,
       incidents: 3, detected: 2, recall: 2 / 3, beforeHarm: 1, afterHarm: 1, leadTimesMs: [-20 * 60_000, 30 * 60_000], medianLeadMs: 5 * 60_000,
       alertsPer100Sessions: 6,
     });
-    const row = (u: string, k: string) => d.rows.find((x) => x.urgency === u && x.kind === k)!;
-    expect(d.rows.map((x) => `${x.urgency}/${x.kind}`)).toEqual(["high/concurrent_edit", "high/duplicate_work", "low/nearby_work"]);
+    const row = (u: string, k: string) => d.pairMatch.rows.find((x) => x.urgency === u && x.kind === k)!;
+    expect(d.pairMatch.rows.map((x) => `${x.urgency}/${x.kind}`)).toEqual(["high/concurrent_edit", "high/duplicate_work", "low/nearby_work"]);
     expect(row("high", "concurrent_edit")).toMatchObject({ alerts: 3, truePositives: 2, precision: 2 / 3, detected: 1, recall: 1 / 3, leadTimesMs: [30 * 60_000], outOfScope: 0 });
     expect(row("high", "duplicate_work")).toMatchObject({ truePositives: 1, beforeHarm: 0, afterHarm: 1, medianLeadMs: -20 * 60_000 });
     expect(row("low", "nearby_work")).toMatchObject({ alerts: 2, truePositives: 0, precision: 0, recall: 0, medianLeadMs: null });
     // Budget 5 per 100 sessions on 100 sessions: K = 5, HIGH first then earliest.
-    expect(d.topK).toMatchObject({ k: 5, alerts: 5, truePositives: 3, detected: 2, beforeHarm: 1 });
+    expect(d.pairMatch.topK).toMatchObject({ k: 5, alerts: 5, truePositives: 3, detected: 2, beforeHarm: 1 });
   });
 
   test("a dev score is the same with or without the held-out labels (nothing about them leaks)", () => {
@@ -90,14 +90,14 @@ describe("scoreReplay", () => {
       alert(["c:1", "c:2"], at("10:59")),
       alert(["c:1", "c:5"], at("10:00")),
     ], 20), labels, { split: "dev", labelsSha256: H2 });
-    expect(r.detectors[0]!.topK).toMatchObject({ k: 1, alerts: 1, truePositives: 0, precision: 0 });
+    expect(r.detectors[0]!.pairMatch.topK).toMatchObject({ k: 1, alerts: 1, truePositives: 0, precision: 0 });
     const r2 = scoreReplay(result([alert(["c:1", "c:2"], at("10:59")), alert(["c:1", "c:5"], at("11:00"))], 20), labels, { split: "dev", labelsSha256: H2 });
-    expect(r2.detectors[0]!.topK).toMatchObject({ k: 1, truePositives: 1, beforeHarm: 1 });
+    expect(r2.detectors[0]!.pairMatch.topK).toMatchObject({ k: 1, truePositives: 1, beforeHarm: 1 });
   });
 
   test("empty and edge cases: no alerts gives null precision, zero recall; the budget is validated", () => {
     const r = scoreReplay(result([]), labels, { split: "heldout", labelsSha256: H2 });
-    expect(r.detectors[0]!.total).toMatchObject({ alerts: 0, precision: null, recall: 0, medianLeadMs: null });
+    expect(r.detectors[0]!.pairMatch.total).toMatchObject({ alerts: 0, precision: null, recall: 0, medianLeadMs: null });
     expect(() => scoreReplay(result([]), labels, { split: "dev", labelsSha256: H2, budgetPer100: 0 })).toThrow("budget");
     expect([budgetK(0, 5), budgetK(1, 5), budgetK(100, 5), budgetK(101, 5), budgetK(5_008, 5)]).toEqual([0, 1, 5, 6, 251]);
   });
