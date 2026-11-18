@@ -976,8 +976,11 @@ function stagedOutputFactsHooks(
       await sealOutputFactsWant(tx, run);
     },
     async onFinish(tx, run, pass) {
-      // The whole-set path builds from the read's completeness and the pass's (truncation, stale write).
-      const r = await finishStagedOutputFacts(tx, run, fScope, { sourceComplete: pass.sourceComplete && pass.complete, sourceVersion, at: h.at });
+      // The whole-set path builds from the read's completeness, the pass's (truncation, stale write) and the
+      // directory write's (directory_event_sources_changed): any of them false inserts what was read and deletes nothing.
+      const r = await finishStagedOutputFacts(tx, run, fScope, {
+        sourceComplete: pass.sourceComplete && pass.complete && pass.committedComplete, sourceVersion, at: h.at,
+      });
       done({ inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons });
     },
   };

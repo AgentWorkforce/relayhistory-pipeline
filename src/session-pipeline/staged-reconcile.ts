@@ -198,12 +198,15 @@ export interface StagedReconcileHooks<W = StagedFactsEvents, R = unknown> {
    * Once, in the final transaction, after `commit` and before the run is finished (its stage rows
    * dropped). `complete` is the pass's own verdict (false: a refused write, nothing deleted);
    * `sourceComplete` is the source read's own completeness (ScopeRead.complete, what
-   * outputFactsFromScope takes as `complete`). They can differ.
+   * outputFactsFromScope takes as `complete`). They can differ. `committedComplete` is what `commit`
+   * returned as `complete` (false when the directory write was refused, directory_event_sources_changed,
+   * while `complete` stays true); the run still finishes then, so a hook must not send it round again
+   * for that alone.
    */
   onFinish?(
     tx: SqlExecutor,
     run: StagedRunRef,
-    pass: { complete: boolean; sourceComplete: boolean; inserted: number; deleted: number; wanted: number },
+    pass: { complete: boolean; sourceComplete: boolean; committedComplete: boolean; inserted: number; deleted: number; wanted: number },
   ): Promise<void>;
 }
 
@@ -598,7 +601,9 @@ export async function runStagedReconcile<R>(
       await boundary("final:removed");
       const committed = await ops.commit(tx, r, { complete, inserted: done, deleted, wanted });
       if (deps.hooks?.onFinish)
-        await deps.hooks.onFinish(tx, { runId: lease.runId, nonce: lease.nonce }, { complete, sourceComplete: ops.sourceComplete?.(r) ?? true, inserted: done, deleted, wanted });
+        await deps.hooks.onFinish(tx, { runId: lease.runId, nonce: lease.nonce }, {
+          complete, sourceComplete: ops.sourceComplete?.(r) ?? true, committedComplete: committed.complete, inserted: done, deleted, wanted,
+        });
       await boundary("final:committed");
       await tx.query("SELECT sessions.search_reconcile_finish_v1($1::bigint,$2::uuid)", [lease.runId, lease.nonce]);
       return {

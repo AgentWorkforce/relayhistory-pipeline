@@ -195,6 +195,32 @@ describe("staged output facts through the consumer wiring", () => {
     expect(await r.facts()).toEqual(ref);
   }, 180_000);
 
+  test("a refused directory write (directory_event_sources_changed): the staged facts insert what was read and delete nothing, as the whole-set path does; no restart, the run finishes", async () => {
+    const refuse = { writeEvents: async () => ({ written: false }) } as unknown as Partial<SearchIndexDeps>;
+    // A fact row the source does not carry: a pass that may delete removes it; this one must not.
+    const gone = `INSERT INTO sessions.session_output_facts
+      SELECT org_id, workspace_id, fact_kind, ts, scope_source, source, session_id, 'gone', origin, 'gone', added, removed, reverted, retention_days, repeat('f', 64), fingerprint, source_version
+        FROM sessions.session_output_facts LIMIT 1`;
+    // The whole-set path, same refusal (unlimited limits, no staged run).
+    const w = await withFacts();
+    await w.hoop.pg.exec(gone);
+    const whole = await w.pass({ ...FACTS, ...refuse });
+    expect(whole).toMatchObject({ complete: false });
+    expect(whole.reasons).toContain("directory_event_sources_changed");
+    expect(whole.outputFacts).toMatchObject({ complete: false, deleted: 0 });
+    // The staged run.
+    const r = await withFacts();
+    await r.hoop.pg.exec(gone);
+    const out = await r.pass({ ...FACTS, ...refuse, limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
+    expect(out).toMatchObject({ complete: false });
+    expect(out.reasons).toContain("directory_event_sources_changed");
+    expect(out.reasons).not.toContain("output_facts_stage_incomplete");
+    expect(out.outputFacts).toMatchObject({ complete: false, deleted: 0 });
+    expect([await r.count("search_reconcile_runs_v1"), await r.count("staged_facts_runs_v1"), await r.count("staged_facts_v1")]).toEqual([0, 0, 0]);
+    expect(await r.facts()).toEqual(await w.facts());
+    expect((await r.facts()).facts.some((f) => JSON.parse(f).fact_key === "gone")).toBe(true);
+  }, 180_000);
+
   test("a chunk that cannot be staged: the run abandons as output_facts_chunk_unstageable and writes no facts; with room again it converges", async () => {
     const r = await withFacts();
     stagedFactsSendLimit.bytes = 64; // every chunk is over it
