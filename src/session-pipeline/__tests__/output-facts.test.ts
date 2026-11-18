@@ -300,3 +300,30 @@ suite("output facts on ClickHouse: reconcile and query", () => {
     expect(await count(OUTPUT_FACTS_TABLE)).toBe(0);
   }, 60_000);
 });
+
+describe("outputFactsBatchStep: items per input are bounded (a facts chunk always fits one staged call)", () => {
+  test("no input yields more than OUTPUT_FACTS_MAX_ITEMS_PER_INPUT items, the bound is reached, and the wiring's default chunk fits", async () => {
+    const { outputFactsBatchStep, OUTPUT_FACTS_MAX_ITEMS_PER_INPUT } = await import("../output-facts.ts");
+    const { MAX_CHUNK_ITEMS, MAX_FACTS_CHUNK_INPUTS } = await import("../output-facts-store.ts");
+    const scope = { orgId: "org-f4", workspaceId: "ws-f4", harness: "codex", canonicalId: "s1-canonical" };
+    const fx = outputFixture();
+    const base = fx.projectionRows.find((r) => r.table === "convergence_events")!.row;
+    const payload = (p: Record<string, unknown>) => ({ deliveryRecordId: "r", payload: p });
+    // The widest shapes: an assistant message that is also a parent session event; a commit tool result that is
+    // also a parent; a malformed time (a note instead of the event) on a parent.
+    const crafted = [
+      { table: "convergence_events", row: { ...base, kind: "session_event", actor_role: "assistant", content: "hi", record: payload({ kind: "text", message_id: "m-1" }) } },
+      { table: "convergence_events", row: { ...base, kind: "session_event", actor_role: "tool_result", content: "[main abc1234] x\n 1 file changed", record: payload({ tool_use_id: "tu", message_id: "m-2" }) } },
+      { table: "convergence_events", row: { ...base, kind: "session_event", ts: "not a time", record: payload({ message_id: "m-3" }) } },
+      { table: "session_commit_links", row: { commit_sha: null } },
+      { table: "catalog_rows", row: {} },
+    ];
+    const counts = [...fx.projectionRows, ...crafted].map((r) => outputFactsBatchStep(scope, { projectionRows: [r], records: [] }, 1).length);
+    for (const r of fx.records) counts.push(outputFactsBatchStep(scope, { projectionRows: [], records: [r] }, 1).length);
+    expect(Math.max(...counts)).toBe(OUTPUT_FACTS_MAX_ITEMS_PER_INPUT);
+    expect(OUTPUT_FACTS_MAX_ITEMS_PER_INPUT).toBe(4);
+    expect(MAX_FACTS_CHUNK_INPUTS * OUTPUT_FACTS_MAX_ITEMS_PER_INPUT).toBeLessThanOrEqual(MAX_CHUNK_ITEMS);
+    // staged-reconcile.ts deps.factsChunk defaults to 5000 inputs.
+    expect(MAX_FACTS_CHUNK_INPUTS).toBeGreaterThanOrEqual(5000);
+  });
+});
