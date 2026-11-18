@@ -217,6 +217,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105062120_analysis_org_s3_cutover.sql",
       // The source revision binds the cutover proof (a replaced 046000 function; no G4 function names it).
       "20261105062130_analysis_cutover_source_revision.sql",
+      // Staged output facts: a new table and functions only (its foreign key adds PostgreSQL's internal
+      // referential triggers to the 062110 stage table); no G4 function names them, no ingest path calls them.
+      "20261105062140_staged_output_facts.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

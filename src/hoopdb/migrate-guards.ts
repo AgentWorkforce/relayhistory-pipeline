@@ -452,8 +452,8 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
 ] as const;
 
 /**
- * Self-host output-facts writers (migration 045040) and the staged search reconcile writers
- * (migration 062110) granted EXECUTE to the consumer login
+ * Self-host output-facts writers (migration 045040), the staged search reconcile writers
+ * (migration 062110) and the staged output facts writers (migration 062140) granted EXECUTE to the consumer login
  * `search_consumer_runtime` only. The live sessions-function gate (db.ts
  * SESSIONS_FUNCTION_GATE_SQL) accepts them when, and only when, current_user is that role.
  * Deliberately NOT part of RUNTIME_APPLICATION_FUNCTIONS: that list feeds
@@ -475,6 +475,12 @@ export const CONSUMER_RUNTIME_FUNCTIONS = [
   "sessions.search_reconcile_erase_scope_v1(text,text,text,text[])",
   "sessions.search_reconcile_finish_v1(bigint,uuid)",
   "sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)",
+  // Staged output facts writers (migration 062140), same contract.
+  "sessions.staged_facts_read_v1(bigint,uuid,text,text,text[],bigint,integer)",
+  "sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)",
+  "sessions.staged_facts_seal_v1(bigint,uuid)",
+  "sessions.staged_facts_stage_v1(bigint,uuid,jsonb,integer,boolean)",
+  "sessions.staged_facts_status_v1(bigint,uuid)",
 ] as const;
 
 /**
@@ -1662,7 +1668,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "90485d1f72932158b9d112f4badcf7478c1b9d7712c39afd4b745b9c8c5f09b8";
+  "c884d537bb4f72b785f5c97680fbeb60b54202b7d25d11aae070b6ac82c00054";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

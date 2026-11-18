@@ -2648,6 +2648,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SRS = "upstream:20261105062110_search_reconcile_staging.sql";
     const OSC = "upstream:20261105062120_analysis_org_s3_cutover.sql";
     const OSR = "upstream:20261105062130_analysis_cutover_source_revision.sql";
+    const SOF = "upstream:20261105062140_staged_output_facts.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2658,7 +2659,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR, SOF]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2709,6 +2710,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062140 is newest: 062130's down refuses (55000) while it is applied; its checksum-pinned down drops its
+    // table, its seven functions, the fold-side anchors it left in the 062110 stage table and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(SOF);
+    expect((await failure(rollback("20261105062130_analysis_cutover_source_revision.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(OSR);
+    await rollback("20261105062140_staged_output_facts.down.sql");
+    expect(await names()).not.toContain(SOF);
+    expect(await relation("sessions.staged_facts_v1")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'staged\\_facts\\_%'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062140_staged_output_facts.down.sql")))?.code).toBe("55000");
     // 20261105062130 is newest: 062120's down refuses (55000) while it is applied; its checksum-pinned down
     // restores 046000's revision body exactly and drops its ledger row, and refuses on a rerun.
     const revSrc = async () => (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_analysis_source_revision(text,text,text)'::regprocedure")).rows[0]!.s;
