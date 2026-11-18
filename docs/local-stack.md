@@ -455,7 +455,10 @@ With it on:
   That is the same key memory as the default streaming budgets already need (about 0.5 GB), so the pod sizing
   above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
 - **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
-  1` at most every 20 seconds), on the whole-read path as on the streamed one.
+  1` at most every 20 seconds) on the whole-read path. A streamed scope no longer runs in that transaction: it runs
+  as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
+  in docs/local-stack.md, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
+  `staged_lease_lost`, `output_facts_stage_incomplete`).
 
 What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
 reads no more index rows than the bounded scan did; only the reason code past that point changes. A
@@ -483,24 +486,41 @@ How a staged run differs from the in-transaction stream it replaces:
 
 - **No long transaction.** The index transaction that found the scope too large commits without a write and hands the
   scope to the staged run. Passes 1-3 and pass 4 read the source outside any transaction; the wanted keys and the index
-  scan are staged in committed batches; only the final step holds the scope and canonical advisory locks.
+  scan are staged in committed batches. Every pass 4 write page and the final step take the scope advisory lock and
+  re-read the source stamp before writing to the index, so they are exclusive with a whole read and the erase pass of
+  the scope; the final step also takes the canonical lock. During a long source read the run renews its lease on a
+  timer, so another consumer's tick does not take it over mid-read.
+- **The session reads as incomplete for the whole run.** The claim records the scope owing a pass (partial, 0 rows)
+  before any work, so readers treat it as not current until the final step records it complete.
 - **Resume on the reconcile tick.** A successful claim records the scope as owing a pass (search state incomplete) in
   the claim's own transaction, so an interrupted run is listed by the next tick and resumes at its committed cursor
-  once its lease expires. No staged outcome answers `busy`: the queue's requeue, backoff and dead-letter path is never
-  used for a staged scope.
+  once its lease expires (a crash) or at once (an error: the lease is released). Every outcome after a successful claim
+  that is not done leaves the scope owing (directory events invalidated, state incomplete), so the next tick always
+  takes it again. No staged outcome answers `busy`: the queue's requeue, backoff and dead-letter path is never used
+  for a staged scope.
 - **Outcome reasons** (all incomplete, none `busy`): `staged_run_leased` (another consumer holds the run's live
   lease; nothing written), `scope_busy` / `canonical_scope_busy` (a lock was held at the final step; the lease is
   released), `stream_source_changed` (the source stamp moved; the run was abandoned and restarts on the tick),
   `staged_lease_lost` (the run was taken over or erased under this consumer), `staged_run_interrupted` (a step failed
-  after the claim; partial, resumed on the tick). A spent read budget or the keyed-records cap stays partial with
+  after the claim; logged as `search index staged run interrupted` with the error class and code, never its text;
+  the lease is released; partial, resumed on the tick; a cap on the attempts of a permanently failing run is slice 3),
+  `output_facts_stage_incomplete` (an output-facts hook sent the run round again). A spent read budget or the keyed-records cap stays partial with
   `scope_too_large` and its code, as before.
 - **A second consumer** that reaches the same scope while a run holds a live lease gets `staged_run_leased` at the
   claim, before any work. The whole-read path itself does not look at the run table (the runtime role has no grant on
   it and 062110 has no reader for it): for a scope with a live run it either refuses the scope as too large and reaches
   the claim (the same source), or completes because the source shrank, which moves the stamp, so the run abandons at
   its final check.
-- **Erasure.** The erase pass (no live pointer left) also drops the scope's staged runs and stage rows
-  (`search_reconcile_erase_scope_v1`), in the erase transaction under the scope lock.
+- **Erasure.** The erase pass (no live pointer left) drops the scope's staged runs and stage rows
+  (`search_reconcile_erase_scope_v1`) before it erases the index, in the erase transaction under the scope lock; a
+  write page that would follow finds its run gone (`staged_lease_lost`) and writes nothing.
+- **Deletes on OpenSearch.** As on the in-transaction streamed path, index deletes on a non-Postgres index commit on
+  their own: if the final transaction then rolls back, the deletes stay, and the next attempt deletes nothing more
+  (idempotent).
+- **The facts pass (output facts hooks only).** With output-facts hooks, the end of the want phase makes one more
+  source pass that hands the whole read's facts input to the hook in chunks, under the same read budgets and deadline
+  as passes 1-3. It is not resumable: every attempt that is in the want phase pays passes 1-3 plus the facts pass.
+  With output facts off there is no extra pass and no extra query.
 - **Startup.** With the flag on the consumer refuses to start unless every 062110 writer exists, naming the migration.
 
 - **Tables.** `sessions.search_reconcile_runs_v1` holds one run per scope: the source stamp it started from

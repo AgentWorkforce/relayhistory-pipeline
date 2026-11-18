@@ -206,17 +206,19 @@ describe("staged reconcile through the consumer wiring", () => {
           throw new Kill(p);
         }
       };
-      const first = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ boundary: kill }) });
+      // A crash: the lease is kept (releaseOnError off), so only its expiry frees the run.
+      const first = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ boundary: kill, releaseOnError: false }) });
       expect(killed).toBe(true);
       if (point === "finished") {
-        // Past the final commit: the run is done and the state complete; the tick finds nothing to do.
+        // Past the final commit: the run is done; the interruption still leaves the scope owing, and
+        // the tick finds nothing to write.
         expect(first.reasons).toEqual(["staged_run_interrupted"]);
-        expect(r.recorded.at(-1)?.complete).toBe(true);
+        expect(r.recorded.at(-1)?.complete).toBe(false);
         expect(await r.runs()).toBe(0);
       } else {
         // Interrupted after the claim: no throw (no queue retry), the scope stays owing a pass for the tick.
         expect(first).toMatchObject({ complete: false, partial: true, reasons: ["staged_run_interrupted"] });
-        expect(r.recorded.some((s) => !s.complete)).toBe(true);
+        expect(r.recorded.at(-1)?.complete).toBe(false);
         // A second consumer before the lease expires: answered without the queue's busy path.
         const second = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
         expect(second).toMatchObject({ complete: false, reasons: ["staged_run_leased"] });
@@ -247,6 +249,7 @@ describe("staged reconcile through the consumer wiring", () => {
     });
     expect(out).toMatchObject({ complete: false, reasons: ["stream_source_changed"] });
     expect(await r.staged()).toBe(0);
+    expect(r.recorded.at(-1)?.complete).toBe(false); // restart leaves the scope owing
     const again = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
     expect(again).toMatchObject({ complete: true });
     expect(await r.scan()).toEqual(ref.scan);
@@ -269,7 +272,103 @@ describe("staged reconcile through the consumer wiring", () => {
     });
     expect(out).toMatchObject({ complete: false, reasons: ["staged_lease_lost"] });
     expect([await r.runs(), await r.staged()]).toEqual([0, 0]);
+    // Nothing written back after the erase; the lost lease leaves the scope owing (the next tick's
+    // erase pass records it complete again).
     expect(await r.scan()).toEqual([]);
+    expect(r.recorded.at(-1)?.complete).toBe(false);
+    expect(await r.pass({ staged: stagedOn() })).toMatchObject({ complete: true, reasons: ["erased"] });
+  }, 120_000);
+
+  test("T1: a whole read completing between two write pages: the next page abandons, no stale row comes back, the scope ends owing", async () => {
+    const r = await seeded(x);
+    let pages = 0;
+    const out = await r.pass({
+      limits: STAGED_LIMITS, stream: UNLIMITED,
+      staged: stagedOn({
+        boundary: async (p) => {
+          if (p !== "write:page" || pages++ > 0) return;
+          // The source moves (epoch) and a whole read of the new source reconciles the scope and records it current.
+          await r.hoop.pg.exec("UPDATE sessions.session_directory SET event_projection_epoch = event_projection_epoch + 1");
+          expect(await r.pass({ staged: stagedOn() })).toMatchObject({ complete: true });
+        },
+      }),
+    });
+    expect(pages).toBe(1); // the second page never wrote
+    expect(out).toMatchObject({ complete: false, reasons: ["stream_source_changed"] });
+    expect(await r.scan()).toEqual(ref.scan);
+    expect(r.recorded.at(-1)?.complete).toBe(false);
+    expect(await r.staged()).toBe(0);
+  }, 120_000);
+
+  test("T3: an interrupted run is logged (class and code, no content) and releases its lease: the next pass resumes at once", async () => {
+    const r = await seeded(x);
+    const index = r.adapter.index as SearchIndexAdapter;
+    const page = index.scanFingerprintsPage!.bind(index);
+    let once = true;
+    index.scanFingerprintsPage = (async (...a: Parameters<typeof page>) => {
+      const got = await page(...a);
+      if (!once) return got;
+      once = false;
+      return { ...got, rows: [...got.rows].reverse() };
+    }) as typeof page;
+    const lines: string[] = [];
+    const stdout = process.stdout.write, stderr = process.stderr.write;
+    const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
+      ((chunk: unknown, ...rest: unknown[]) => {
+        lines.push(String(chunk));
+        return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
+      }) as typeof process.stdout.write;
+    process.stdout.write = tap(stdout, process.stdout);
+    process.stderr.write = tap(stderr, process.stderr);
+    let out: SearchIndexResult;
+    try {
+      out = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
+    } finally {
+      process.stdout.write = stdout;
+      process.stderr.write = stderr;
+    }
+    expect(out).toMatchObject({ complete: false, partial: true, reasons: ["staged_run_interrupted"] });
+    const logged = lines.flatMap((l) => l.split("\n")).filter((l) => l.includes("search index staged run interrupted")).map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(logged.length).toBe(1);
+    expect(logged[0]).toMatchObject({ level: "warn", stage: "search-index", org_id: SCOPE.orgId, error_name: "Error" });
+    expect(typeof logged[0]!.error_code).toBe("string");
+    expect(JSON.stringify(logged[0])).not.toContain("search scan order invalid"); // no message text
+    expect(r.recorded.at(-1)?.complete).toBe(false);
+    // Released: no expiry needed; the next pass takes the run and finishes it.
+    expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() })).toMatchObject({ complete: true });
+    expect(await r.scan()).toEqual(ref.scan);
+  }, 120_000);
+
+  test("T4: a source read longer than the lease keeps the run: the heartbeat renews it, a second consumer is leased out", async () => {
+    const r = await seeded(x);
+    const slow = { ...x.store, getObject: async (...a: Parameters<typeof x.store.getObject>) => {
+      await new Promise((resolve) => setTimeout(resolve, 50)); // about 5 s for passes 1-3 here
+      return x.store.getObject(...a);
+    } } as typeof x.store;
+    const first = r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store: slow, staged: stagedOn({ leaseMs: 1000 }) });
+    await new Promise((resolve) => setTimeout(resolve, 2500)); // well past the 1 s lease, mid-read
+    const second = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ leaseMs: 1000 }) });
+    expect(second).toMatchObject({ complete: false, reasons: ["staged_run_leased"] });
+    expect(await first).toMatchObject({ complete: true });
+    expect(await r.scan()).toEqual(ref.scan);
+  }, 120_000);
+
+  test("A1: a deadline spent inside the facts pass: partial with scope_too_large and stream_deadline, onFinish never runs", async () => {
+    const r = await seeded(x);
+    const deadline = { at: Number.MAX_SAFE_INTEGER };
+    let finished = 0;
+    const hooks = {
+      async onBatch(_tx: SqlExecutor, _run: unknown, batch: { phase: string; chunk?: { seq: number } }) {
+        if (batch.phase === "facts" && batch.chunk!.seq === 0) deadline.at = 0; // spent from here on
+      },
+      async onFinish() {
+        finished += 1;
+      },
+    };
+    const out = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, streamDeadline: deadline, staged: stagedOn({ factsChunk: 4, hooks: hooks as never }) });
+    expect(out).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large", "stream_deadline"] });
+    expect(finished).toBe(0);
+    expect(r.recorded.at(-1)?.complete).toBe(false);
   }, 120_000);
 
   test("slice 1 kept: the index is walked in keyset pages, never one bounded read", async () => {

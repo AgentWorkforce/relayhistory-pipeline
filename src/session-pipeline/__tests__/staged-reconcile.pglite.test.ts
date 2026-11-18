@@ -606,7 +606,7 @@ describe("20261105062110 search reconcile staging", () => {
     expect(await staged_()).toBe(0);
   });
 
-  test("a held scope lock at the final step releases the lease: busy now, resumed at final on the next tick", async () => {
+  test("a held scope lock at the first locked step (a write page) releases the lease: busy now, resumed there on the next tick", async () => {
     const f = fixture();
     const expected = memoryReconcile(f);
     await reset(f);
@@ -620,7 +620,7 @@ describe("20261105062110 search reconcile staging", () => {
     });
     expect(out).toEqual({ status: "busy", reason: "scope_busy" });
     const next = await runStagedReconcile(SCOPE, stamp, ops(), deps());
-    expect(next).toMatchObject({ status: "done", complete: true, attempts: 2, resumedFrom: { phase: "final", cursor: null } });
+    expect(next).toMatchObject({ status: "done", complete: true, attempts: 2, resumedFrom: { phase: "write", cursor: null } });
     expect(await indexRows()).toEqual(expected);
   });
 
