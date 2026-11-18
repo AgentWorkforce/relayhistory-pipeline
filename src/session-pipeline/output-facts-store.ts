@@ -14,7 +14,7 @@
 import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
-import { StagedRunRestart, type StagedFactsEvents, type StagedRunRef } from "./staged-reconcile.ts";
+import { StagedRunRestart, type StagedFactsChunk, type StagedFactsEvents, type StagedRunRef } from "./staged-reconcile.ts";
 import {
   callMessageIds,
   OUTPUT_FACTS_MAX_ITEMS_PER_INPUT,
@@ -226,11 +226,6 @@ function stageEntry(item: OutputFactsStagedItem): StageEntry {
   }
 }
 
-/** A chunk of the facts pass: its number within the attempt (from 0) and whether it is the last. */
-export interface StagedFactsChunk {
-  seq: number;
-  last: boolean;
-}
 
 async function stageEntries(tx: SqlExecutor, run: StagedRunRef, entries: StageEntry[], chunk: StagedFactsChunk | null): Promise<number> {
   const call = async (batch: StageEntry[], seq: number | null, last: boolean | null) => {

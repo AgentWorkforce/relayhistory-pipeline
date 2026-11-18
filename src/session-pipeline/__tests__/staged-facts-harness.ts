@@ -1,7 +1,7 @@
 /**
  * Test harness for the staged output facts (migration 20261105062140): a PGlite database with every
  * migration, a staged run driven through the 062110 writers exactly as staged-reconcile.ts drives
- * one (claim, want batches with their cursors, the want -> have advance with the seal, have, write,
+ * one (claim, want batches, the facts pass in numbered chunks, the want -> have advance with the seal, have, write,
  * the final transaction), with the facts hooks called where the wiring calls them, and the whole-set
  * path (postgresOutputFactsStore) as indexSearchScope's Postgres branch runs it.
  */
@@ -16,11 +16,10 @@ import {
   postgresOutputFactsStore,
   sealOutputFactsWant,
   stageOutputFactsChunk,
-  type StagedFactsChunk,
   type StagedOutputFactsResult,
   type StagedOutputFactsScope,
 } from "../output-facts-store.ts";
-import type { StagedFactsEvents, StagedRunRef } from "../staged-reconcile.ts";
+import type { StagedFactsChunk, StagedFactsEvents, StagedRunRef } from "../staged-reconcile.ts";
 import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 
 export const RUNTIME = "search_consumer_runtime";
