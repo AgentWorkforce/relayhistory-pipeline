@@ -1743,6 +1743,9 @@
       "<owner>:EXECUTE",
       "search_consumer_runtime:EXECUTE"
     ],
+    "sessions.staged_facts_reset_v1()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.staged_facts_run_v1(bigint,uuid,text[])": [
       "<owner>:EXECUTE"
     ],

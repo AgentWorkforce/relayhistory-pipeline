@@ -181,6 +181,7 @@ export async function clearFacts(db: PGlite) {
 }
 
 export const stagedRows = async (db: PGlite) => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.staged_facts_v1")).rows[0]!.n;
-export const anchor = async (db: PGlite) =>
-  (await db.query<{ p: { whole: boolean; seq: number | null; done: boolean; sealed: boolean } }>(
-    "SELECT payload p FROM sessions.search_reconcile_stage_v1 WHERE side = 'fold' AND key_hash = '~output_facts'")).rows.map((r) => r.p);
+/** The runs' facts chains (sessions.staged_facts_runs_v1). */
+export const chain = async (db: PGlite) =>
+  (await db.query<{ whole: boolean; seq: number | null; done: boolean; sealed: boolean }>(
+    "SELECT whole, seq, done, sealed FROM sessions.staged_facts_runs_v1 ORDER BY run_id")).rows.map((r) => ({ ...r }));
