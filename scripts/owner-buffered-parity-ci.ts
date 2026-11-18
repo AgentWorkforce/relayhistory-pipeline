@@ -528,6 +528,8 @@ function applyBulkCounts(target: OwnerParityCounts, source: import("./owner-buff
   target.missing = source.missing;
   target.stale = source.stale;
   target.verified = source.verified;
+  // Present only on a write with the refresh on (also when the run ended fatally part way).
+  if (source.refreshed !== undefined) target.refreshed = source.refreshed;
 }
 
 /** Aggregate-only all-buffered-owner recovery. No tenant tuple or digest reaches the receipt or plan artifact. */
@@ -582,7 +584,6 @@ export async function runOwnerParityBulk(
         : await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
           generation, 25, options.deps, "neon", "write");
       applyBulkCounts(counts, written);
-      if (written.refreshed !== undefined) counts.refreshed = written.refreshed;
       if (bulkCompletionStatus(written, "write") !== "complete")
         return { receipt: receipt("refused", "owner_parity_bulk_write_partial"), census: null, exitCode: 1 };
       const checked = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,

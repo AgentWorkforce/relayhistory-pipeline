@@ -30,7 +30,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Write uses WRITE-OWNER-PARITY ... CENSUS <run>; bulk-write uses WRITE-OWNER-PARITY-BULK ... PLAN <run>. Read-only modes: empty'
+        description: 'Write uses WRITE-OWNER-PARITY ... CENSUS <run>; bulk-write uses WRITE-OWNER-PARITY-BULK ... PLAN <run> (with refresh_written_at=on, followed by exactly " REFRESH written_at"). Read-only modes: empty'
         type: string
         default: ""
       census_source:

@@ -482,7 +482,9 @@ test("refresh_written_at: bulk-write only; off is byte-identical; on refreshes u
   const plain = ownerParityDispatch(env, true, true);
   expect("refreshWrittenAt" in plain).toBe(false);
   expect(ownerParityDispatch({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "off" }, true, true)).toEqual(plain);
-  expect(ownerParityDispatch({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on" }, true, true)).toEqual({ ...plain, refreshWrittenAt: true });
+  const onPhrase = ownerParityBulkConfirmation(plan, true);
+  expect(ownerParityDispatch({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on", OWNER_PARITY_CONFIRMATION: onPhrase }, true, true))
+    .toEqual({ ...plain, confirmation: onPhrase, refreshWrittenAt: true });
   const refused = (e: Record<string, string>) => { try { ownerParityDispatch(e, true, true); return null; } catch (error) { return (error as { code?: string }).code; } };
   expect(refused({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "yes" })).toBe("owner_parity_refresh_written_at");
   for (const mode of ["bulk-plan", "bulk-readback"] as const) expect(refused({ ...bulkEnv(mode), OWNER_PARITY_REFRESH_WRITTEN_AT: "on" })).toBe("owner_parity_refresh_written_at");
@@ -509,9 +511,47 @@ test("refresh_written_at: bulk-write only; off is byte-identical; on refreshes u
   expect("refreshed" in off.receipt.counts).toBe(false);
   expect(seen.every((o) => o === undefined)).toBe(true);
   seen.length = 0;
-  const on = await runOwnerParityBulk({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on" }, x.sessions, opts);
+  const onEnv = { ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on", OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan, true) };
+  // The off phrase with refresh on is refused before any write.
+  expect((await runOwnerParityBulk({ ...env, OWNER_PARITY_REFRESH_WRITTEN_AT: "on" }, x.sessions, opts)).receipt.code).toBe("owner_parity_confirmation");
+  const on = await runOwnerParityBulk(onEnv, x.sessions, opts);
   expect(on.exitCode).toBe(0);
   expect(on.receipt.counts).toMatchObject({ unchanged: 9, refreshed: 9 });
   expect(seen).toHaveLength(9);
   expect(seen.every((o) => JSON.stringify(o) === JSON.stringify({ refreshUnchangedWrittenAt: true }))).toBe(true);
+});
+
+test("a refresh run: a concurrent change counts as a refused tenant (partial, no readback); a fatal stop keeps refreshed in the receipt", async () => {
+  const plan = bulkPlanArtifact();
+  const onEnv = bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun, OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan, true),
+    OWNER_PARITY_REFRESH_WRITTEN_AT: "on" });
+  const refreshing = (x: ReturnType<typeof world>, casConflictAt?: number) => {
+    const inner = x.deps.writeProof as unknown as (...a: unknown[]) => Promise<Record<string, unknown>>;
+    x.deps.writeProof = (async (...a: unknown[]) => {
+      if (casConflictAt !== undefined && key(a[2] as ParityTenant) === key(tenants[casConflictAt]!)) throw new ParityCensusRefusal("proof_refresh_cas_conflict");
+      const out = await inner(...a);
+      return out.outcome === "unchanged" ? { ...out, writtenAt: "now", refreshed: true } : out;
+    }) as never;
+  };
+  // Per-tenant refusal: counted, the run continues, ends partial (owner_parity_bulk_write_partial) without the readback.
+  const x = world();
+  const opts = (w: ReturnType<typeof world>) => ({ roster: {}, census: plan, runId: "402", now: () => T0 + 1, bulkWriteEnabled: true, deps: w.deps });
+  expect((await runOwnerParityBulk(bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) }), x.sessions, opts(x))).exitCode).toBe(0);
+  refreshing(x, 4);
+  const partial = await runOwnerParityBulk(onEnv, x.sessions, opts(x));
+  expect(partial.exitCode).toBe(1);
+  expect(partial.receipt.code).toBe("owner_parity_bulk_write_partial");
+  expect(partial.receipt.counts).toMatchObject({ found: 9, mismatch: 1, unchanged: 8, refreshed: 8 });
+  // Fatal mid-run (the generation moves after a tenant): the refusal receipt still carries refreshed.
+  const y = world();
+  expect((await runOwnerParityBulk(bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) }), y.sessions, opts(y))).exitCode).toBe(0);
+  refreshing(y);
+  y.w.generationAfterTenant = 2;
+  const fatal = await runOwnerParityBulk(onEnv, y.sessions, opts(y));
+  expect(fatal.exitCode).toBe(1);
+  expect(fatal.receipt.status).toBe("refused");
+  expect(fatal.receipt.counts.refreshed).toBe(fatal.receipt.counts.unchanged);
+  expect(fatal.receipt.counts.refreshed).toBeGreaterThan(0);
 });

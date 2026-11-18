@@ -142,15 +142,17 @@ one-time **fence backfill**:
    **Residual risk, stated plainly:** a Neon-only deletion in the census-to-drain window is readable until the
    eraser removes it. Concretely, a deletion that reached Neon only (never the Worker) between the parity census
    and the drain is published and readable until the Neon-mode eraser removes it (10 min nominal, 48 h SLA).
-   The proof records add nothing readable: they sit under a dot segment (`.drain/`), which the eraser skips as it
-   skips the other export objects. What they hold is the org id in the key, plus the stage's sha256 and the max
-   age, the same class of data as the existing sidecars.
+   The proof records add nothing readable. They live under `<keyRoot>/.drain/`, which the eraser never targets:
+   its erase prefixes are under the org's `v1/` tree, and its dot-segment check only refuses `.` and `..`
+   segments. So, like the sidecars, the proof records outlive a user erase. Each one holds the org id in its key,
+   plus the stage's sha256 and the max age, the same class of data as the existing sidecars.
    Preconditions for each allow-listed org, all required:
-   - a fresh bulk parity right before each export, run with the written_at refresh on (owner-buffered-parity
-     `bulk-write` with `refresh_written_at=on`, or the operator's `--refresh-written-at on`). The census never
-     rewrites an unchanged proof row, so without the refresh a stable user's `written_at` stays at its first
-     census and Path B refuses it as `head_unproven_parity_stale`. The refresh moves `written_at` only, under the
-     row's full-tuple CAS. The SQL reader never reads `written_at`;
+   - a fresh bulk parity right before each export, run with the written_at refresh on. That is the
+     owner-buffered-parity `bulk-write` with `refresh_written_at=on`, its typed phrase ending in exactly
+     ` REFRESH written_at`, or the operator's `--refresh-written-at on` (Neon census source only). The bulk write
+     never rewrites an unchanged proof row (the census itself is read-only), so without the refresh a stable user's
+     `written_at` stays at its first write and Path B refuses it as `head_unproven_parity_stale`. The refresh
+     moves `written_at` only, under the row's full-tuple CAS. The SQL reader never reads `written_at`;
    - `INGEST_S3_FENCE_MIRROR=on`;
    - the Neon-mode eraser running;
    - the drain's target bucket and key root equal to the running Neon eraser's (otherwise drained objects are

@@ -468,3 +468,26 @@ describe("owner-buffered parity bulk: written_at refresh (opt-in, default off)",
     expect(bulkCompletionStatus(on.counts)).toBe("complete");
   });
 });
+
+test("--refresh-written-at on refuses with any census source but neon (Path B reads written_at as the last Neon check)", () => {
+  const BULK = ["bulk", "--confirm-write", "owner-buffered-parity-bulk/v1", "--expect-target-generation", GENERATION, "--expect-source-sha", SHA];
+  expect(() => parseOperatorArgs([...BULK, "--census-source", "frozen-supabase", "--refresh-written-at", "on"])).toThrow("usage");
+  expect(parseOperatorArgs([...BULK, "--census-source", "neon", "--refresh-written-at", "on"])).toMatchObject({ refreshWrittenAt: true, censusSource: "neon" });
+  expect(parseOperatorArgs([...BULK, "--census-source", "frozen-supabase", "--refresh-written-at", "off"]))
+    .toEqual(parseOperatorArgs([...BULK, "--census-source", "frozen-supabase"]));
+});
+
+test("a concurrent change during a refresh run: that tenant is refused and counted (tenantRefused), the others continue, the run is partial", async () => {
+  const seen: string[] = [];
+  const counts = await runBulkParity({ query: async <T>() => ({ rows: [] as T[] }) }, enumerator([[row(1), row(2), row(3)], []], []), targetOwner(), GENERATION, 3, {
+    readCensus: async (_n, _t, candidate) => equalReceipt(candidate),
+    writeProof: async (_n, _t, candidate) => {
+      seen.push(candidate.userId);
+      if (candidate.userId === "private-user-2") throw new ParityCensusRefusal("proof_refresh_cas_conflict");
+      return { census: equalReceipt(candidate), outcome: "unchanged", writtenAt: "now", refreshed: true };
+    },
+  }, "neon", "write", { refreshUnchangedWrittenAt: true });
+  expect(seen).toEqual(["private-user-1", "private-user-2", "private-user-3"]);
+  expect(counts).toMatchObject({ candidates: 3, tenantRefused: 1, unchanged: 2, refreshed: 2, verified: 2 });
+  expect(bulkCompletionStatus(counts)).toBe("partial");
+});

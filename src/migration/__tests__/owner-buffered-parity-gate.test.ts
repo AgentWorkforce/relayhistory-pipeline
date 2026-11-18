@@ -352,3 +352,41 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect(step).not.toMatch(/\$SUPABASE|\$\{SUPABASE|echo/u);
   for (const forbidden of ["supabase login", "SET ROLE", "neonUrl", P.project]) expect(workflow).not.toContain(forbidden);
 });
+
+test("refresh_written_at is bound into the bulk-write phrase (phrase-only): exact trailing token when on, none when off", async () => {
+  const now = Date.parse("2026-11-13T01:00:00.000Z");
+  const plan = parseOwnerParityBulkPlan(bulkPlan());
+  const offPhrase = ownerParityBulkConfirmation(plan), onPhrase = ownerParityBulkConfirmation(plan, true);
+  // The off phrase is byte-identical to before; the on phrase is it plus exactly " REFRESH written_at".
+  expect(offPhrase).toBe(`WRITE-OWNER-PARITY-BULK ${sha} GENERATION ${G} SOURCE neon DESCRIPTOR ${plan.descriptorSha256} PLAN ${censusRun}`);
+  expect(ownerParityBulkConfirmation(plan, false)).toBe(offPhrase);
+  expect(onPhrase).toBe(offPhrase + " REFRESH written_at");
+  const bulkEnv = (confirmation: string, refresh?: string) => env("bulk-write", {
+    OWNER_PARITY_CENSUS_SOURCE: "neon", OWNER_PARITY_CENSUS_RUN: censusRun, OWNER_PARITY_CONFIRMATION: confirmation,
+    ...(refresh === undefined ? {} : { OWNER_PARITY_REFRESH_WRITTEN_AT: refresh }) });
+  const dispatchCode = (e: Record<string, string>) => {
+    try { ownerParityDispatch(e, false, true); return null; } catch (error) { return (error as { code?: string }).code; }
+  };
+  // Matching pairs pass the dispatch, the exact plan comparison and the gate step.
+  for (const [phraseText, refresh] of [[offPhrase, undefined], [offPhrase, "off"], [onPhrase, "on"]] as const) {
+    const e = bulkEnv(phraseText, refresh);
+    expect(dispatchCode(e)).toBeNull();
+    expect(() => verifyOwnerParityBulkWriteInputs(ownerParityDispatch(e, false, true), plan, now)).not.toThrow();
+    expect(await gate(e, githubFixture(), false, undefined, true)).toBeNull();
+  }
+  // Mismatched pairs refuse with owner_parity_confirmation, at the dispatch (so the gate step too).
+  for (const [phraseText, refresh] of [[offPhrase, "on"], [onPhrase, "off"], [onPhrase, undefined],
+    [offPhrase + " refresh written_at", "on"], [offPhrase + "  REFRESH written_at", "on"], [offPhrase + " REFRESH written_at ", "on"],
+    [offPhrase + " REFRESH WRITTEN_AT", "on"], [offPhrase + " REFRESH  written_at", "on"]] as const) {
+    const e = bulkEnv(phraseText, refresh);
+    expect([phraseText.slice(offPhrase.length), refresh, dispatchCode(e)]).toEqual([phraseText.slice(offPhrase.length), refresh, "owner_parity_confirmation"]);
+    expect(await gate(e, githubFixture(), false, undefined, true)).toBe("owner_parity_confirmation");
+  }
+  // The exact comparison: a malformed token that the dispatch's suffix check lets through is refused against the plan.
+  const sloppy = offPhrase.replace(" SOURCE neon", "  SOURCE neon") + " REFRESH written_at";
+  expect(() => verifyOwnerParityBulkWriteInputs(ownerParityDispatch(bulkEnv(sloppy, "on"), false, true), plan, now)).toThrow("owner_parity_confirmation");
+  // The token must follow this run's PLAN exactly (dispatch, and so the gate step).
+  const otherPlan = offPhrase.replace(` PLAN ${censusRun}`, " PLAN 999") + " REFRESH written_at";
+  expect(dispatchCode(bulkEnv(otherPlan, "on"))).toBe("owner_parity_confirmation");
+  expect(await gate(bulkEnv(otherPlan, "on"), githubFixture(), false, undefined, true)).toBe("owner_parity_confirmation");
+});

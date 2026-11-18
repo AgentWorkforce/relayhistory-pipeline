@@ -253,9 +253,10 @@ the drain are unchanged.
 **Residual risk, stated plainly:** a Neon-only deletion in the census-to-drain window is readable until the eraser
 removes it. Concretely, a deletion that reached Neon only (never the Worker) between the parity census and the drain
 is published and readable until the Neon-mode eraser removes it (10 min nominal, 48 h SLA). The proof records
-add nothing readable: they sit under a dot segment (`.drain/`), which the eraser skips as it skips the other export
-objects. What they hold is the org id in the key, plus the stage's sha256 and the max age, the same class of data as
-the existing sidecars.
+add nothing readable. They live under `<keyRoot>/.drain/`, which the eraser never targets: its erase prefixes are
+under the org's `v1/` tree, and its dot-segment check only refuses `.` and `..` segments. So, like the sidecars, the
+proof records outlive a user erase. Each one holds the org id in its key, plus the stage's sha256 and the max age,
+the same class of data as the existing sidecars.
 
 **Per-org procedure.** Every step is required, one org at a time.
 1. Once, for the allow-listed orgs, compare Neon's control heads with Supabase's receipts. Any user with a Neon
@@ -263,15 +264,26 @@ the existing sidecars.
 2. Confirm that `INGEST_S3_FENCE_MIRROR=on` and that the Neon-mode eraser is running.
 3. Confirm that the drain's target bucket and key root equal those of the running Neon eraser. If they differ,
    drained objects are outside erasure coverage. Do not proceed.
-4. Immediately before each export, run a fresh bulk parity with the written_at refresh ON. That is the
-   owner-buffered-parity workflow's `bulk-write` with the input `refresh_written_at=on` (default `off`), or the
-   operator's `--refresh-written-at on`. The census never rewrites an unchanged proof row, so only with the refresh
-   do the rows of a stable backlog get a current `written_at`. Without it they keep their first census time and
-   Path B refuses them as `head_unproven_parity_stale`. The refresh touches `written_at` only, under the row's
-   full-tuple CAS: a row that another writer moved is refused (`proof_refresh_cas_conflict`), not refreshed. The
-   bulk receipt counts the rows it refreshed (`refreshed`, a field present only when the refresh is on). Run the
-   export soon enough that every row is inside the maximum age at the dry run and again at the execute. The
-   execute re-checks the age itself.
+4. Immediately before each export, run a fresh bulk parity with the written_at refresh ON.
+   - **Prerequisites:** a fresh `bulk-plan` run in which every buffered owner is g1-equal, and the typed phrase.
+     A real run with the refresh on is an operator step and needs the owner's explicit OK to the lane that runs it.
+   - **How:** the owner-buffered-parity workflow's `bulk-write` with the input `refresh_written_at=on` (default
+     `off`). Its typed phrase must be the plan's phrase followed by exactly ` REFRESH written_at`, and must have no
+     token when the input is off. A mismatch either way refuses with `owner_parity_confirmation`. Outside the
+     workflow, use the operator's `--refresh-written-at on`, which is refused (`usage`) with any census source
+     but Neon.
+   - **Why it is needed:** the bulk write never rewrites an unchanged proof row (the census is read-only). So only
+     with the refresh do the rows of a stable backlog get a current `written_at`. Without it they keep their first
+     write time and Path B refuses them as `head_unproven_parity_stale`.
+   - **What the refresh does:** it touches `written_at` only, under the row's full-tuple CAS. The bulk receipt
+     counts the rows it refreshed (`refreshed`, a field present only when the refresh is on, kept in a refused
+     receipt too).
+   - **A concurrent change during the run:** a row that another writer moved since its census is refused for that
+     tenant only (`proof_refresh_cas_conflict`) and counted (`tenantRefused`, shown in the receipt's `mismatch`).
+     The run carries on with the other tenants, then ends refused with `owner_parity_bulk_write_partial`, exit 1,
+     and skips the readback. Rerun it after a fresh `bulk-plan`.
+   - **Timing:** run the export soon enough that every row is inside the maximum age at the dry run, and again at
+     the execute. The execute re-checks the age itself.
 5. Run `export-dry`, then `export-execute` (the same list and age), then `drain-dry` and `drain-execute`, as in
    [Modes and order](#modes-and-order).
 6. After the org's drain, run a Neon re-census. Check the list it produces against both the object store and the

@@ -16,6 +16,7 @@ import {
   OWNER_PARITY_WORKFLOW,
   OWNER_PARITY_WRITE_ENABLED,
   OWNER_PARITY_BULK_WRITE_ENABLED,
+  OWNER_PARITY_REFRESH_TOKEN,
   ownerParityDispatch,
   refuseOwnerParity as refuse,
 } from "../src/migration/owner-buffered-parity-ci-contract.ts";
@@ -58,7 +59,7 @@ export async function ownerParityGithubGate(
   if (input.mode === "bulk-write" &&
       !(input.confirmation.startsWith(`WRITE-OWNER-PARITY-BULK ${input.sha} GENERATION `) &&
         input.confirmation.includes(" SOURCE neon DESCRIPTOR ") &&
-        input.confirmation.endsWith(` PLAN ${input.censusRun}`)))
+        input.confirmation.endsWith(` PLAN ${input.censusRun}${input.refreshWrittenAt ? OWNER_PARITY_REFRESH_TOKEN : ""}`)))
     refuse("owner_parity_confirmation");
   const base = `/repos/${S.repository}`;
   if ((await get(base + "/git/ref/heads/main")).object?.sha !== input.sha) refuse("owner_parity_gate_main_moved");

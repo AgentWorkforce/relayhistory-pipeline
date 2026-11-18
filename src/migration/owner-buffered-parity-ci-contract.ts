@@ -117,12 +117,17 @@ export function ownerParityDispatch(
     refuseOwnerParity("owner_parity_bulk_write_dormant");
   const plannedWrite = mode === "write" || mode === "bulk-write";
   if (plannedWrite ? !RUN_ID.test(censusRun) : censusRun !== "") refuseOwnerParity("owner_parity_census_run");
-  if (mode === "write" ? !confirmation.startsWith("WRITE-OWNER-PARITY ")
-    : mode === "bulk-write" ? !confirmation.startsWith("WRITE-OWNER-PARITY-BULK ") : confirmation !== "")
-    refuseOwnerParity("owner_parity_confirmation");
   // "" or "off": off. "on": bulk-write only.
   if (!(refresh === "" || refresh === "off" || (refresh === "on" && mode === "bulk-write")))
     refuseOwnerParity("owner_parity_refresh_written_at");
+  // The refresh is bound into the typed phrase (phrase-only binding): a bulk-write phrase ends with
+  // " PLAN <run>" followed by exactly OWNER_PARITY_REFRESH_TOKEN when refresh_written_at=on, and by nothing when off
+  // (the off phrase is unchanged). The exact phrase is compared again against the plan (verifyOwnerParityBulkWriteInputs).
+  if (mode === "write" ? !confirmation.startsWith("WRITE-OWNER-PARITY ")
+    : mode === "bulk-write" ? !confirmation.startsWith("WRITE-OWNER-PARITY-BULK ") ||
+      !confirmation.endsWith(` PLAN ${censusRun}${refresh === "on" ? OWNER_PARITY_REFRESH_TOKEN : ""}`)
+    : confirmation !== "")
+    refuseOwnerParity("owner_parity_confirmation");
   return {
     mode: mode as OwnerParityMode, sha, censusSource: censusSource as OwnerParityCensusSource,
     censusRun: plannedWrite ? censusRun : null, confirmation, ...(refresh === "on" ? { refreshWrittenAt: true as const } : {}),
@@ -147,9 +152,13 @@ export function ownerParityBulkPlanDescriptor(body: OwnerParityBulkPlanBody): st
     .update(canonicalJson(rest)).digest("hex");
 }
 
-export function ownerParityBulkConfirmation(plan: OwnerParityBulkPlanArtifact): string {
+/** The exact trailing token of a bulk-write phrase with refresh_written_at=on (no other spelling is accepted). */
+export const OWNER_PARITY_REFRESH_TOKEN = " REFRESH written_at";
+
+/** The bulk-write phrase; with `refresh` (refresh_written_at=on) it ends with OWNER_PARITY_REFRESH_TOKEN. Off: unchanged. */
+export function ownerParityBulkConfirmation(plan: OwnerParityBulkPlanArtifact, refresh = false): string {
   return `WRITE-OWNER-PARITY-BULK ${plan.sourceSha} GENERATION ${plan.generation} SOURCE neon ` +
-    `DESCRIPTOR ${plan.descriptorSha256} PLAN ${plan.censusRun}`;
+    `DESCRIPTOR ${plan.descriptorSha256} PLAN ${plan.censusRun}` + (refresh ? OWNER_PARITY_REFRESH_TOKEN : "");
 }
 
 export function parseOwnerParityBulkPlan(value: unknown): OwnerParityBulkPlanArtifact {
@@ -188,7 +197,8 @@ export function verifyOwnerParityBulkWriteInputs(
   const captured = canonicalMs(plan.capturedAt)!;
   if (captured > now || now - captured >= OWNER_PARITY_CENSUS_MAX_AGE_MS)
     refuseOwnerParity("owner_parity_bulk_plan_stale");
-  if (dispatch.confirmation !== ownerParityBulkConfirmation(plan)) refuseOwnerParity("owner_parity_confirmation");
+  if (dispatch.confirmation !== ownerParityBulkConfirmation(plan, dispatch.refreshWrittenAt === true))
+    refuseOwnerParity("owner_parity_confirmation");
 }
 
 /**

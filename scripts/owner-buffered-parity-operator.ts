@@ -164,7 +164,9 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
     throw new OwnerBufferedOperatorRefusal("census_source_invalid");
   const censusSource = sourceText as ParityCensusSource;
   const refreshText = values.get("--refresh-written-at");
-  if (refreshText !== undefined && (mode !== "bulk" || (refreshText !== "on" && refreshText !== "off")))
+  // Neon only: Path B reads written_at as the time of the last check against Neon.
+  if (refreshText !== undefined && (mode !== "bulk" || (refreshText !== "on" && refreshText !== "off") ||
+      (refreshText === "on" && censusSource !== "neon")))
     throw new OwnerBufferedOperatorRefusal("usage");
   return mode === "bulk"
     ? { mode, expectedSourceSha, expectedTargetGeneration, censusSource, batchSize, ...(refreshText === "on" ? { refreshWrittenAt: true as const } : {}) }
