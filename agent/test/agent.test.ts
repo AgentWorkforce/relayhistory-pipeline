@@ -133,7 +133,7 @@ test("new-issue watch: both repos, to khaliq-gant, generated and kept out of use
   assert.ok(!script.includes(`cat > /opt/agent-host/${ISSUE_WATCH_FILE}`), "the watch never rides in user data");
 });
 
-test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor with --model claude-fable-5-1", () => {
+test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor with --model claude-fable-5-2", () => {
   // The model is the kit's (lead-run.sh, which the lead unit starts), not a
   // per-agent setting; implementation goes to sonnet or opus subagents per
   // the routing block. Since kit 0.1.12 the unit runs lead-run.sh in the
@@ -145,10 +145,10 @@ test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.s
   assert.equal(launch[0], "ExecStart=/opt/agent-host/lead-run.sh /opt/agent-host/lead-prompt.md");
   assert.doesNotMatch(script, /ExecStart=.*tmux|ExecStop=.*tmux/);
   assert.match(script, /ConditionPathExists=\/opt\/agent-host\/headless.py/);
-  assert.match(script, /--harness claude --model claude-fable-5-1 --prompt-file "\$state\/system.md"/);
+  assert.match(script, /--harness claude --model claude-fable-5-2 --prompt-file "\$state\/system.md"/);
   // Every hard-coded model id is Fable. (The worker launcher passes its model
   // through "$model", which defaults to the lead's Fable; it is not a literal.)
-  assert.deepEqual([...new Set([...script.matchAll(/claude --model ([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-1"]);
+  assert.deepEqual([...new Set([...script.matchAll(/claude --model ([a-z0-9][\w.-]*)/g)].map((m) => m[1]))], ["claude-fable-5-2"]);
 });
 
 test("the env file sources cleanly in bash, with both repos and the relay identity", () => {
