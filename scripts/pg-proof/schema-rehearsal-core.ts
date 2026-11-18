@@ -862,9 +862,15 @@ export function removeAnchorRefs(x: AnchorGit, refs: readonly { branch: string; 
  * release/schema-<slot> branch for the target does not exist there (no such branch is
  * ever created on the remote). Off the main commit `base` (whose lane steps are all
  * prefix steps at the release bytes):
- *  - the first commit carries the SESSION_BOOTSTRAP_FILES at the release sha's bytes; it is
- *    its own anchor (the branch of base's newest target-lane step, when that slot is
- *    unique) or, when that slot cannot anchor, folds into the next commit;
+ *  - the first commit carries the SESSION_BOOTSTRAP_FILES and every `fixedFiles` path (the
+ *    release checkout's RELEASE_ANCHOR_FIXED_PATHS: the seven phase 2 verifiers, the
+ *    function-boundary generator inputs and outputs, the migration sentinels and the
+ *    bootstrap contract modules) at the release sha's bytes, as the operator's anchor
+ *    does (runbooks/guarded-session-schema-release.md, "Release anchor"). So the target
+ *    commit's verifiers, and with them the bound generation, are the release's own, never
+ *    an older base's that predate a prefix step's grants. It is its own anchor (the
+ *    branch of base's newest target-lane step, when that slot is unique) or, when that
+ *    slot cannot anchor, folds into the next commit;
  *  - then one commit per missing target-lane prefix step with a unique anchor slot, up to
  *    the target, each adding the missing prefix steps up to it and their release
  *    rollbacks at the release bytes; the remaining missing steps (other lanes) land in the
@@ -881,6 +887,8 @@ export function buildAnchorFixture(
     prefix: readonly string[];
     baseSteps: ReadonlySet<string>;
     bootstrapFiles: readonly string[];
+    /** The fixed anchor paths carried at the release bytes (RELEASE_ANCHOR_FIXED_PATHS). */
+    fixedFiles: readonly string[];
     branchOf: (step: string) => string | undefined;
     /** True when the release tree names the branch's slot exactly once. */
     uniqueBranch: (branch: string) => boolean;
@@ -916,7 +924,7 @@ export function buildAnchorFixture(
   };
   try {
     let parent = x.base;
-    let pending = releaseFiles([...x.bootstrapFiles]);
+    let pending = releaseFiles([...new Set([...x.bootstrapFiles, ...x.fixedFiles])]);
     const newestBase = x.prefix.filter((n) => x.baseSteps.has(n) && laneOf(n) === lane).at(-1);
     const baseBranch = newestBase !== undefined && newestBase <= x.target ? anchorable(newestBase) : undefined;
     if (newestBase === x.target || (baseBranch && missing.length)) {

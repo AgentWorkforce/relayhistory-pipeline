@@ -241,14 +241,29 @@ On a release sha with the anchor API, a held-step target commit must be the prot
 anchor"). R1 uses the branch tip from the full checkout when it exists (`anchorSource`
 `ref`). Otherwise it builds a fixture chain in the disposable checkout only
 (scripts/pg-proof/schema-rehearsal-core.ts `buildAnchorFixture`, `anchorSource`
-`fixture`): off the newest first-parent main commit (per verifier generation, down to the
-baseline's landing commit) whose lane steps are all prefix steps at the release bytes, a
-bootstrap-only anchor on that commit's newest target-lane slot, then one anchor per
-missing target-lane prefix step with a unique slot, up to the target, each at the release
-bytes (steps, their rollbacks, bootstrap files). It keeps the chain whose generation
-equals `generation` and removes the others; an existing ref is never overwritten
+`fixture`): off the newest first-parent main commit (down to the baseline's landing
+commit) whose lane steps are all prefix steps at the release bytes, a first anchor on that
+commit's newest target-lane slot, then one anchor per missing target-lane prefix step with
+a unique slot, up to the target, each at the release bytes (steps, their rollbacks). The
+first anchor carries every fixed anchor path at the release sha's bytes, as the operator's
+anchor does: the bootstrap chain files, the seven phase 2 verifiers, the function-boundary
+generator inputs and generated outputs, the migration sentinels and the bootstrap contract
+modules (`RELEASE_ANCHOR_FIXED_PATHS` in src/hoopdb/release-target.ts). So the target
+commit's verifiers are the release's own, and its generation is the prefix plus the
+release's verifiers, whichever main commit is the base. A main base's older verifiers
+can refuse a grant that a carried prefix step makes (062020's `GRANT EXECUTE` on the
+ingest functions against an older `session_ingest_verify.sql` failed R4 with 55000 before
+this). If that chain's generation is not `generation`, its refs are removed and R1
+refuses `rehearsal_generation_mismatch` (also for a generation computed with a main
+base's verifiers); an existing ref is never overwritten
 (`rehearsal_anchor_fixture_conflict`). The plan then binds the tip through production's
 own `targetAnchor`, so every `release_anchor_*` refusal surfaces unchanged.
+
+The `generation` for a fixture row is therefore computable without a database: the
+release sha's schema steps without the held ones (name and sha256, migrator order) plus
+the release sha's seven verifiers (name and sha256), through `manifestGeneration`
+(src/hoopdb/migrate.ts). It changes whenever the release sha changes a step in that prefix
+or a verifier file, so recompute it for each release sha.
 
 ## Candidate anchors
 

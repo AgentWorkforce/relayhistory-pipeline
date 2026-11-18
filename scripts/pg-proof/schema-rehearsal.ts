@@ -68,7 +68,11 @@
  * when the checkout has no such branch, a fixture anchor chain is built in the disposable
  * checkout's own object database and local refs only (schema-rehearsal-core.ts
  * buildAnchorFixture, source "fixture"; never pushed) off a first-parent main commit whose
- * lane steps are prefix steps at the release bytes. Older release checkouts: the commit
+ * lane steps are prefix steps at the release bytes, carrying every fixed anchor path
+ * (RELEASE_ANCHOR_FIXED_PATHS: bootstrap chain, the seven phase 2 verifiers, the
+ * generated function-boundary outputs, ...) at the release sha's bytes, as the operator's
+ * anchor does; its generation is the prefix plus the release's own verifiers. Older
+ * release checkouts: the commit
  * on the release sha's first-parent history at the dispatched generation (source "main").
  * Injections (REHEARSAL_INJECT) prove each refusal: ledger-gap, boundary-drift, late-step,
  * wrong-generation, stale-plan, missing-bootstrap (R2-bootstrap skipped: the apply refuses
@@ -349,20 +353,19 @@ export async function discoverAnchor(x: {
       : rehearsalRefuse("rehearsal_target_anchor_missing", { scanned });
   return hit;
 }
-/** The phase 2 verifier files' blob oids at a commit (the generation's verifier half). */
-function verifierKey(sha: string, paths: readonly string[]): string {
-  return paths.map((p) => git(["ls-tree", "--full-tree", sha, "--", p]).split("\t")[0]!.split(" ")[2] ?? "").join(",");
-}
 /**
  * The held-step target commit on a release checkout with the protected anchor: the
  * target's release/schema-<slot> branch tip when the checkout has it (source "ref",
  * returned unbound: the plan binds it through production's targetAnchor). Otherwise a
- * fixture chain (buildAnchorFixture) off the newest first-parent main commit, per
- * verifier generation, whose lane steps are all prefix steps at the release bytes (down
- * to the commit that landed the baseline), bound by the release checkout's own
- * releaseAnchorBinding at the dispatched generation; the fixture refs of every other
- * candidate are removed. None: rehearsal_target_anchor_missing; only other generations:
- * rehearsal_generation_mismatch.
+ * fixture chain (buildAnchorFixture) off the newest first-parent main commit whose lane
+ * steps are all prefix steps at the release bytes (down to the commit that landed the
+ * baseline; one try per distinct base step set, the only base input that decides whether
+ * a chain can be built), carrying `fixedFiles` at the release bytes, bound by the release
+ * checkout's own releaseAnchorBinding. Every such chain binds the same generation (the
+ * prefix and the release's verifiers), so the first bound chain decides: at the
+ * dispatched generation it is kept, otherwise its refs are removed and the run refuses
+ * rehearsal_generation_mismatch (a generation computed with an older base's verifiers is
+ * refused). No chain binds: rehearsal_target_anchor_missing. Git reads go to `ag.repo`.
  */
 export async function discoverReleaseAnchor(x: {
   RT: { releaseAnchorBinding: (i: Record<string, unknown>) => any };
@@ -375,7 +378,8 @@ export async function discoverReleaseAnchor(x: {
   generation: string;
   held: readonly string[];
   bootstrapFiles: readonly string[];
-  verifierPaths: readonly string[];
+  /** The release checkout's RELEASE_ANCHOR_FIXED_PATHS. */
+  fixedFiles: readonly string[];
 }): Promise<{ targetSha: string; source: "ref" | "fixture"; branch: string; refs: { branch: string; sha: string }[] }> {
   const branch = x.C.releaseAnchorBranch(x.target);
   if (!branch) return rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "no_anchor_branch" });
@@ -383,7 +387,8 @@ export async function discoverReleaseAnchor(x: {
   if (tip) return { targetSha: tip, source: "ref", branch, refs: [] };
   const prefix = await x.M.schemaStepDigests(x.held);
   const names = new Set(prefix.map(([n]) => n));
-  const release = laneTree(x.sha);
+  const repo = x.ag.repo;
+  const release = laneTree(x.sha, repo);
   const want = new Map([...release].filter(([n]) => names.has(n)));
   const slots = new Map<string, number>();
   for (const n of release.keys()) {
@@ -391,14 +396,14 @@ export async function discoverReleaseAnchor(x: {
     if (b) slots.set(b, (slots.get(b) ?? 0) + 1);
   }
   const rollbackPath = (n: string) => (n.startsWith("upstream:") ? `supabase/rollbacks/${n.slice(9, -4)}.down.sql` : undefined);
-  const stop = landingCommit(x.sha, x.baseline);
+  const stop = landingCommit(x.sha, x.baseline, repo);
   const seen = new Set<string>();
   const generations = new Set<string>();
   let scanned = 0;
-  for (const c of git(["rev-list", "--first-parent", "--max-count=3000", x.sha]).trim().split("\n")) {
+  for (const c of git(["rev-list", "--first-parent", "--max-count=3000", x.sha], repo).trim().split("\n")) {
     scanned++;
-    const lanes = laneTree(c);
-    const key = [...lanes].every(([n, oid]) => want.get(n) === oid) ? verifierKey(c, x.verifierPaths) : undefined;
+    const lanes = laneTree(c, repo);
+    const key = [...lanes].every(([n, oid]) => want.get(n) === oid) ? [...lanes.keys()].join(",") : undefined;
     if (key !== undefined && !seen.has(key)) {
       seen.add(key);
       let built: { tip: string; refs: { branch: string; sha: string }[] } | undefined;
@@ -411,6 +416,7 @@ export async function discoverReleaseAnchor(x: {
           prefix: prefix.map(([n]) => n),
           baseSteps: new Set(lanes.keys()),
           bootstrapFiles: x.bootstrapFiles,
+          fixedFiles: x.fixedFiles,
           branchOf: x.C.releaseAnchorBranch,
           uniqueBranch: (b) => slots.get(b) === 1,
           stepPath,
@@ -422,11 +428,13 @@ export async function discoverReleaseAnchor(x: {
       }
       if (built) {
         try {
-          const b = x.RT.releaseAnchorBinding({ repo: ROOT, releaseSha: x.sha, targetSha: built.tip, target: x.target, prefix });
+          const b = x.RT.releaseAnchorBinding({ repo, releaseSha: x.sha, targetSha: built.tip, target: x.target, prefix });
           if (b.targetGeneration === x.generation) return { targetSha: built.tip, source: "fixture", branch, refs: built.refs };
           generations.add(b.targetGeneration);
         } catch {}
         removeAnchorRefs(x.ag, built.refs);
+        // Any other base binds this same generation: stop at the first bound chain.
+        if (generations.size) break;
       }
     }
     if (c === stop) break;
@@ -872,7 +880,9 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       generation: B,
       held,
       bootstrapFiles: SESSION_BOOTSTRAP_FILES,
-      verifierPaths,
+      // The fixed anchor paths the fixture carries at the release bytes (the verifiers
+      // when the release checkout predates the list).
+      fixedFiles: (RT.RELEASE_ANCHOR_FIXED_PATHS as readonly string[] | undefined) ?? verifierPaths,
     });
     if (r.source === "fixture") fixtureMade = true;
     anchorInfo = { source: fixtureMade ? "fixture" : r.source, branch: r.branch };

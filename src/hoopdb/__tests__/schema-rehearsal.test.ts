@@ -58,9 +58,9 @@ import {
   type RoleRow,
   type Runner,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
-import { gitText, landingCommit, seedCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
+import { discoverReleaseAnchor, gitText, landingCommit, seedCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
 import { manifestGeneration, migrationProfile, RELEASE_TREE } from "../migrate.ts";
-import { releaseAnchorBinding, requireReleaseAnchor, treeSchemaSteps, treeVerifiers } from "../release-target.ts";
+import { RELEASE_ANCHOR_FIXED_PATHS, releaseAnchorBinding, requireReleaseAnchor, treeSchemaSteps, treeVerifiers } from "../release-target.ts";
 import { releaseAnchorBranch, SCHEMA_RELEASE } from "../schema-release-contract.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import { releaseProfile } from "../schema-release-inspect.ts";
@@ -1111,9 +1111,11 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
   /**
    * main: M0 (046000, 047000, verifiers, bootstrap b0, README) then R, the release sha
    * (047010 with its rollback, 050000, 050010, 050020, bootstrap b1). Target 050010,
-   * 050020 held: no main commit has exactly that prefix.
+   * 050020 held: no main commit has exactly that prefix. verifierDrift: R also changes the
+   * session_ingest verifier (as 062020's grants changed it after the anchor's main base).
    */
-  const fixture = () => {
+  const INGEST_VERIFY = RELEASE_TREE.verifiers.find((v) => v.name === "verify:session_ingest")!.path;
+  const fixture = (opts: { verifierDrift?: boolean } = {}) => {
     const repo = mkdtempSync(join(tmpdir(), "rehearsal-anchor-test-"));
     const g = (...args: string[]) => {
       const r = spawnSync("git", args, {
@@ -1139,6 +1141,7 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     for (const n of ["047010", "050000", "050010", "050020"]) put(file(n), `select '${n}';`);
     put(rollback("047010"), "select 'down';");
     SESSION_BOOTSTRAP_FILES.forEach((f, i) => put(f, `select 'bootstrap b1 ${i}';`));
+    if (opts.verifierDrift) put(INGEST_VERIFY, "select 'verify session_ingest, release bytes';");
     g("add", "-A");
     g("commit", "-q", "-m", "r");
     const release = g("rev-parse", "HEAD");
@@ -1159,6 +1162,7 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
         prefix: prefixOf(held).map(([n]) => n),
         baseSteps: new Set(treeSchemaSteps(repo, base).map(([n]) => n)),
         bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+        fixedFiles: RELEASE_ANCHOR_FIXED_PATHS,
         branchOf: releaseAnchorBranch,
         uniqueBranch: (b) => slots.get(b) === 1,
         stepPath: (n) => `supabase/migrations/${n.slice("upstream:".length)}`,
@@ -1166,7 +1170,26 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
       });
     const bind = (tip: string, target: string, held: string[]) =>
       releaseAnchorBinding({ repo, releaseSha: release, targetSha: tip, target, prefix: prefixOf(held) });
-    return { repo, g, ag, m0, release, build, bind, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
+    /** The generation of the prefix with the verifiers of commit `at`. */
+    const generationWith = (held: string[], at: string) =>
+      manifestGeneration({ steps: prefixOf(held), verifiers: treeVerifiers(repo, at).map((v) => [v.name, v.sha256]) });
+    /** The driver's discovery (discoverReleaseAnchor) in this repo, baseline 046000. */
+    const discover = (target: string, held: string[], generation: string) =>
+      discoverReleaseAnchor({
+        RT: { releaseAnchorBinding },
+        C: { releaseAnchorBranch },
+        M: { schemaStepDigests: async (h: readonly string[]) => prefixOf([...h]) },
+        ag,
+        sha: release,
+        baseline: s("046000"),
+        target,
+        generation,
+        held,
+        bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+        fixedFiles: RELEASE_ANCHOR_FIXED_PATHS,
+      });
+    const anchorRefs = () => g("for-each-ref", "--format=%(refname)", "refs/remotes/origin/release/");
+    return { repo, g, ag, m0, release, build, bind, generationWith, discover, anchorRefs, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
   };
 
   test("the fixture chain is linear, one anchor per unique slot, and production binds its tip", () => {
@@ -1207,6 +1230,64 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
       expect(a.refs.map((r) => r.branch)).toEqual(["release/schema-047000"]);
       expect(f.g("diff-tree", "-r", "--name-only", "--no-commit-id", f.m0, a.tip).split("\n").sort()).toEqual([...SESSION_BOOTSTRAP_FILES].sort());
       removeAnchorRefs(f.ag, a.refs);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a base whose verifier predates the release: the fixture carries the release's verifier bytes", () => {
+    const f = fixture({ verifierDrift: true });
+    try {
+      const held = [s("050020")];
+      const target = s("050010");
+      const oid = (c: string, p: string) => f.g("rev-parse", `${c}:${p}`);
+      expect(oid(f.m0, INGEST_VERIFY)).not.toBe(oid(f.release, INGEST_VERIFY));
+      const built = f.build(target, held);
+      // Every anchor commit of the chain, the base anchor first, carries the release bytes.
+      for (const r of built.refs) expect(oid(r.sha, INGEST_VERIFY)).toBe(oid(f.release, INGEST_VERIFY));
+      for (const v of RELEASE_TREE.verifiers) expect(oid(built.tip, v.path)).toBe(oid(f.release, v.path));
+      // Production accepts the chain; its diff from the main base is allowlisted release bytes.
+      expect(requireReleaseAnchor({ repo: f.repo, releaseSha: f.release, targetSha: built.tip, target }).mainBase).toBe(f.m0);
+      const changed = f.g("diff-tree", "-r", "--name-only", "--no-commit-id", f.m0, built.refs[0]!.sha).split("\n").sort();
+      expect(changed).toEqual([...SESSION_BOOTSTRAP_FILES, INGEST_VERIFY].sort());
+      // The bound generation is the release verifiers' one, never the base's.
+      const b = f.bind(built.tip, target, held);
+      expect(b.targetGeneration).toBe(f.generationWith(held, f.release));
+      expect(b.targetGeneration).not.toBe(f.generationWith(held, f.m0));
+      expect(b.manifest.verifiers).toEqual(treeVerifiers(f.repo, f.release).map((v) => [v.name, v.sha256]));
+      removeAnchorRefs(f.ag, built.refs);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("discovery binds the release-verifier generation and refuses a base-verifier one", async () => {
+    const f = fixture({ verifierDrift: true });
+    try {
+      const held = [s("050020")];
+      const target = s("050010");
+      const releaseGen = f.generationWith(held, f.release);
+      const baseGen = f.generationWith(held, f.m0);
+      // A generation computed with the main base's (older) verifiers: refused, nothing left.
+      let refusal: { code?: string; evidence?: Record<string, unknown> } = {};
+      await f.discover(target, held, baseGen).catch((e) => (refusal = e));
+      expect(refusal.code).toBe("rehearsal_generation_mismatch");
+      expect(f.anchorRefs()).toBe("");
+      // An unrelated generation: the same refusal code.
+      refusal = {};
+      await f.discover(target, held, "c".repeat(64)).catch((e) => (refusal = e));
+      expect(refusal.code).toBe("rehearsal_generation_mismatch");
+      expect(f.anchorRefs()).toBe("");
+      // The release-verifier generation: the fixture tip, bound by production at that generation.
+      const r = await f.discover(target, held, releaseGen);
+      expect(r.source).toBe("fixture");
+      expect(r.branch).toBe("release/schema-050010");
+      expect(f.bind(r.targetSha, target, held).targetGeneration).toBe(releaseGen);
+      expect(f.g("rev-parse", `${r.targetSha}:${INGEST_VERIFY}`)).toBe(f.g("rev-parse", `${f.release}:${INGEST_VERIFY}`));
+      // A second discovery finds the existing ref (source "ref"), never rebuilds it.
+      expect((await f.discover(target, held, releaseGen)).source).toBe("ref");
+      removeAnchorRefs(f.ag, r.refs);
+      expect(f.anchorRefs()).toBe("");
     } finally {
       f.cleanup();
     }
