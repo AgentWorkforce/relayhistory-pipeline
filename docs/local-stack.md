@@ -390,6 +390,7 @@ chunk (at most 16 MiB) plus about 3 KB per record of the scope for its keys and 
 synthetic scopes with `scripts/bench/staged-stream-rss.ts`: peak RSS +0.6 GB at 100000 records, +3.3 GB at 1000000),
 about 2 GB for the largest scope the default budgets stream (500000 records). That part scales with
 `SEARCH_INDEX_STREAM_MAX_READ_EVENTS`: lowering it lowers the largest streamed scope and this memory in proportion.
+`SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` fits it too: one process doing a whole staged run at the record cap with short ASCII turns (300 characters, every record a legacy turn) peaks at 2.4 GB RSS (`scripts/bench/staged-facts-rss.ts --whole-run`); turn text adds about 2.1 bytes of RSS per staged byte, about 4.6 when it holds characters outside Latin-1, which count 2.5 times toward the 512 MiB record bytes bound (so about 205 MiB of such records); a run at both bounds peaks at about 2.7 GB, under the chart's 3Gi default limit, and a run past the bound ends as `output_facts_chunk_unstageable` with the scope owing a pass.
 `SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` needs the same sizing (its keyed-records cap is the same 500000). An image upgrade
 turns this on for an install that never set the variable, so check the pod limit or set `false` before upgrading
 (see "Upgrading to the default-on image" below). On the first reconcile tick after the upgrade, every session
