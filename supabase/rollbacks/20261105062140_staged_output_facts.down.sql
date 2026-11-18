@@ -2,8 +2,8 @@
 -- sessions.search_reconcile_runs_v1, the functions, the tables sessions.staged_facts_v1 and
 -- sessions.staged_facts_runs_v1 (with their indexes and foreign keys), and its ledger row.
 -- Dropping the tables loses only in-progress staged facts: the run's next attempt stages them again.
--- Refused while a run that staged facts holds a live lease (a consumer is mid-run): stop the consumer or
--- wait for the lease to expire. The 20261105062110 staging is left exactly as that step alone leaves it.
+-- Refused while any staged run (20261105062110) holds a live lease, whether it staged facts yet or not
+-- (a consumer is mid-run and its next facts call would fail): stop the consumer or wait for the lease to expire. The 20261105062110 staging is left exactly as that step alone leaves it.
 -- Guard, object removal and ledger removal are one transaction under the migrator lock.
 -- On refusal the caller must ROLLBACK or disconnect.
 BEGIN;
@@ -16,11 +16,10 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062140_staged_output_facts.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='staged output facts: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062140_staged_output_facts.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'e9a7f736e5d4609a563ed17fb34b012c6e405e6cc8e68889a797a19bde98529d'
+ IF NOT FOUND OR v_sha<>'9d9d079dac32bdf2cddda7dcc3f7372f4b7bf59ce6c982d0b0ad62938d8af570'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='staged output facts: own applied checksum required';END IF;
- IF to_regclass('sessions.staged_facts_runs_v1') IS NOT NULL AND EXISTS(
-      SELECT 1 FROM sessions.search_reconcile_runs_v1 AS t JOIN sessions.staged_facts_runs_v1 AS f ON f.run_id=t.run_id
-       WHERE t.lease_nonce IS NOT NULL AND t.lease_expires_at>clock_timestamp())
+ IF to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL AND EXISTS(
+      SELECT 1 FROM sessions.search_reconcile_runs_v1 AS t WHERE t.lease_nonce IS NOT NULL AND t.lease_expires_at>clock_timestamp())
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='staged output facts: a staged run holds a live lease';END IF;
 END $rollback_guard$;
 DROP TRIGGER staged_facts_reset ON sessions.search_reconcile_runs_v1;
