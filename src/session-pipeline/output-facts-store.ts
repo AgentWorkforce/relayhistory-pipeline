@@ -184,8 +184,10 @@ export class StagedOutputFactsIncompleteError extends StagedRunRestart {
 }
 
 const hex = (v: string) => createHash("sha256").update(v).digest("hex");
-/** Items per staged_facts_stage_v1 call (the function takes at most 10000). */
-const STAGE_CHUNK = 500;
+/** Items one facts chunk may stage (staged_facts_stage_v1 takes at most this many per call). */
+export const MAX_CHUNK_ITEMS = 100_000;
+/** Items per call for the final phase's own facts. */
+const FINAL_CALL = 500;
 const READ_PAGE = 1000;
 
 type StageEntry = { k: string; i?: string; g?: string; m?: string; b: string };
@@ -225,18 +227,23 @@ export interface StagedFactsChunk {
 }
 
 async function stageEntries(tx: SqlExecutor, run: StagedRunRef, entries: StageEntry[], chunk: StagedFactsChunk | null): Promise<number> {
-  if (chunk && (!Number.isSafeInteger(chunk.seq) || chunk.seq < 0)) throw new Error("output_facts_invalid_chunk");
-  let staged = 0;
-  // One call per chunk even when it has no items (the call extends the run's chain); a chunk larger than
-  // one call goes in several, the first with the chunk's number (seq 0 restarts the chain), the rest
-  // under the same number as continuations: only the first call of a chunk moves the chain.
-  for (let i = 0; i === 0 || i < entries.length; i += STAGE_CHUNK) {
+  const call = async (batch: StageEntry[], seq: number | null, last: boolean | null) => {
     const { rows } = await tx.query<{ n: number | string }>(
       "SELECT sessions.staged_facts_stage_v1($1::bigint, $2::uuid, $3::jsonb, $4::integer, $5::boolean) AS n",
-      [run.runId, run.nonce, JSON.stringify(entries.slice(i, i + STAGE_CHUNK)), chunk ? (i === 0 ? chunk.seq : null) : null, chunk ? (i === 0 ? chunk.last : null) : null],
+      [run.runId, run.nonce, JSON.stringify(batch), seq, last],
     );
-    staged += Number(rows[0]?.n ?? 0);
+    return Number(rows[0]?.n ?? 0);
+  };
+  // A facts chunk is exactly one call, items or not: the call is the chain's step (the function takes up
+  // to MAX_CHUNK_ITEMS; the wiring's chunk size bounds it, a few items per projection row).
+  if (chunk) {
+    if (!Number.isSafeInteger(chunk.seq) || chunk.seq < 0) throw new Error("output_facts_invalid_chunk");
+    if (entries.length > MAX_CHUNK_ITEMS) throw new Error("output_facts_chunk_too_large");
+    return call(entries, chunk.seq, chunk.last);
   }
+  // The final phase's own facts: in calls of FINAL_CALL items, outside the chain.
+  let staged = 0;
+  for (let i = 0; i < entries.length; i += FINAL_CALL) staged += await call(entries.slice(i, i + FINAL_CALL), null, null);
   return staged;
 }
 

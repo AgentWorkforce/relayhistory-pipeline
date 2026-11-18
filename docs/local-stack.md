@@ -547,8 +547,17 @@ today.
 - **Exactness.** Over a whole read the staged facts equal the whole-set path's (`output-facts-parity.test.ts`). One
   difference: on a malformed event or commit link, the whole path stops at the first one and the staged path skips
   only that row. Both are incomplete with the same reason and delete nothing.
+- **Memory.** Event and fact rows never leave the database. The final step holds in memory the scope's legacy
+  records (kinds `legacy_conversation_turn`, `legacy_session_outcome`, `legacy_session_link`, `legacy_scope`,
+  `conversation_turn`, each one parsed record body, as `outputFactsFromScope` holds them for the whole-set path), the
+  session ids, and for each tool result with commit output only the tool calls with its tool use id and their parent
+  session events. The legacy records are the one part that grows with the session; it is to be measured (peak RSS at
+  100k and 1M records) or made group by group before the default flip.
 - **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the trigger, both tables and
-  the functions. It refuses while a run that staged facts holds a live lease.
+  the functions. It refuses while any staged run (062110) holds a live lease, facts or not.
+- **Operator resets.** The reset trigger's function runs as the role that updates `search_reconcile_runs_v1`. Every
+  062110 writer is a SECURITY DEFINER function owned by the table owner, so an operator reset of a run must also go
+  through one of them (or run as the owner), never as another role.
 
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 
