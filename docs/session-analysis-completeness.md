@@ -28,17 +28,31 @@ older than the cutover stay blocked until the census seal exists, which is condi
 1. `20261105062120` and `20261105062130` are both applied. 062130 puts the proof's database inputs
    into the source revision (below). Without it a verdict flip is not seen by reuse or publication.
 2. The pointer-move fix has landed and is deployed in the session pipeline. A move (the start date
-   changed, so the `d=` key changed) now deletes the old row and inserts the new one inside ONE
-   transaction: the publication transaction, or `inTransaction` without one (`src/hoopdb/index.ts`
-   `rekeyFrom`, called from `src/session-pipeline/pointer.ts`). The new row keeps
-   `least(old, new)` `created_at`, and a failure in between leaves the old row and its time intact.
-   **The recorded `cutover_at` must not be earlier than this fix's deploy time in that pipeline.**
-   Moves before the fix may have raised first-seen. The deploy time is **operator-attested**: the
-   recorder requires `--pointer-fix-deployed-at <iso>` and refuses (`cutover_before_pointer_fix`) an
-   effective cutover before it. It is stored in `org_s3_cutover.pointer_fix_deployed_at`, and a
-   CHECK (`org_s3_cutover_after_pointer_fix`) refuses any row or correction whose effective
-   cutover precedes it. A move whose re-key is skipped (manifest gone, publication retired,
-   operator-erased) throws the retryable `pointer_move_skipped` instead of reporting `moved`.
+   changed, so the `d=` key changed) deletes the old row and inserts the new one inside ONE
+   transaction (`src/hoopdb/index.ts` `rekeyFrom`, called from `src/session-pipeline/pointer.ts`):
+   the publication transaction when the pipeline has publication configured (the Lambda always
+   does), otherwise a pooled one-connection transaction, which needs `deps.db.pool`. A HoopDb
+   without a pool (a test double) runs the statements in sequence, without that guarantee. The new
+   row keeps `least(old, new)` `created_at`. Every outcome that inserts no new row throws inside the
+   transaction, so the delete rolls back and the old row (often a tombstone) stays:
+   - `pointer_move_fenced` (terminal): the session is erased or guarded. With
+     `SESSION_ERASE_FENCE_ENFORCED=1` the runtime upsert reports it fenced; with the flag off,
+     20261105050010's guard suppresses the insert, and the row being absent after the delete shows
+     it. The pointer writer returns `ignored` (`operator_erased`, or `move_guarded` with the flag off),
+     not an error, so the message completes instead of retrying into the dead-letter queue.
+   - `pointer_move_not_applied` (retryable): the write reported `applied=false` with the row
+     present.
+   - `pointer_move_skipped` (retryable), thrown before any delete: the new manifest vanished. A
+     retired managed publication is terminal (`ignored`, `managed_publication_hint`).
+
+   **The recorded `cutover_at` must not be earlier than the deploy, in that pipeline, of the commit
+   containing "fix(session-pipeline,session-analysis): fenced pointer moves are terminal and keep
+   the tombstone".** Moves before that deploy may have raised first-seen or dropped a fenced
+   tombstone. The deploy time is **operator-attested**: the recorder requires
+   `--pointer-fix-deployed-at <iso>` and refuses (`cutover_before_pointer_fix`) an effective cutover
+   before it. The first recording stores it in `org_s3_cutover.pointer_fix_deployed_at`, and a CHECK
+   (`org_s3_cutover_after_pointer_fix`) refuses any row or correction whose effective cutover
+   precedes it.
 3. The worker that passes `legacyDroppedReason` through, and fails (d) closed on it, has landed and
    is deployed.
 4. The operator index `supabase/pending/20261105062120_session_index_org_canonical.sql`
@@ -171,7 +185,11 @@ Preconditions, all of which must be true and verified before recording:
 5. `--pointer-fix-deployed-at` is the operator-attested time the pointer-move fix (blocker 2) was
    deployed in the org's session pipeline. Verify it from the deploy record, not from memory. The
    first recording stores it in `org_s3_cutover.pointer_fix_deployed_at`, and the effective cutover
-   must be at or after it. Times are compared at microsecond precision, as Postgres stores them.
+   must be at or after it. The recorder compares cutover with pointer-fix, and the flag with the
+   stored value on `--correct`, at microsecond precision. The not-in-the-future check uses millisecond
+   `Date.parse`. The database CHECK is authoritative. A malformed or calendar-invalid time (for
+   example `2026-02-30`) is refused as `cutover_time` (`cutover_pointer_fix_time` for the flag at
+   parse time), on a dry run too.
 
 Run from a checkout of this repository. The owner URL comes from 1Password into the environment
 only, never into a file:
@@ -203,7 +221,7 @@ That function copies the prior row into the append-only `sessions.org_s3_cutover
 writes the new times, `recorded_by`, `recorded_at` and note. It never changes the stored
 `pointer_fix_deployed_at`, and the database CHECK still requires the corrected cutover to be at or
 after it. On `--correct`, `--pointer-fix-deployed-at` must equal the stored time exactly; any other
-value is refused (`cutover_pointer_fix_mismatch`), because a correction does not re-attest the
+value, even one microsecond off, is refused (`cutover_pointer_fix_mismatch`), because a correction does not re-attest the
 pointer-fix deploy. The script runs the function with `--correct`:
 
 ```sh

@@ -223,19 +223,19 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
     } as typeof base;
     expect(await indexPointer(landedPut(later), published)).toMatchObject({ status: "moved", manifestKey: later });
     expect(transactions).toBeGreaterThan(0);
-    // Exactly one transaction holds the move: the authority lock, the old-key DELETE (RETURNING created_at)
-    // and the re-key upsert, in that order. No DELETE of the row runs outside it.
+    // The old-key DELETE runs in exactly one publication transaction, once, after that transaction's
+    // authority lock and before at least one later statement of the same transaction (the re-key write;
+    // its function name depends on the fence flag, so it is not matched by name). The row checks below
+    // show the write landed.
     const isDelete = (t: string) => /DELETE FROM sessions\.session_index\b[\s\S]*RETURNING created_at/.test(t);
     const moveTx = statements.filter((st) => st.some(isDelete));
     expect(moveTx).toHaveLength(1);
-    const order = (st: string[], pred: (t: string) => boolean) => st.findIndex(pred);
     const tx = moveTx[0]!;
-    const lock = order(tx, (t) => t.includes("session_publication_lock"));
-    const del = order(tx, isDelete);
-    const up = order(tx, (t) => t.includes("upsert_session_index"));
+    const lock = tx.findIndex((t) => t.includes("session_publication_lock"));
+    const del = tx.findIndex(isDelete);
     expect(lock).toBeGreaterThanOrEqual(0);
     expect(lock).toBeLessThan(del);
-    expect(del).toBeLessThan(up);
+    expect(del).toBeLessThan(tx.length - 1);
     expect(tx.filter(isDelete)).toHaveLength(1);
     expect(await row()).toMatchObject({ deleted_at: null, manifest_key: later, revision: "1" });
     expect(await created()).toBe(before);
@@ -261,26 +261,110 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
     expect(await created()).toBe(before);
   }, 60_000);
 
-  test("a move whose insert does not apply (applied=false) throws retryably and rolls its delete back", async () => {
+  // A pooled one-connection HoopDb over this PGlite (the move runs in a real BEGIN/COMMIT), and a
+  // publication-transaction HoopDb (the production path). `hook` may answer a statement instead of PGlite.
+  type Hook = (text: string, params: unknown[] | undefined, run: (t: string, p?: unknown[]) => Promise<{ rows: any[] }>) => Promise<{ rows: any[] } | undefined>;
+  const viaPool = (hook?: Hook) => {
+    const run = async (t: string, p?: unknown[]) => ({ rows: (await pg.query(t, p as unknown[])).rows });
+    const client = { query: async (t: string, p?: unknown[]) => (await hook?.(t, p, run)) ?? run(t, p), release() {} };
+    const base = deps().pointer;
+    return { ...base, db: { ...base.db, query: (t: string, p?: unknown[]) => client.query(t, p), pool: { connect: async () => client } } as unknown as HoopDb };
+  };
+  const viaPublication = (hook?: Hook) => {
+    const base = deps().pointer;
+    return {
+      ...base,
+      publication: {
+        schemaGeneration: "a".repeat(64),
+        transact: <T,>(work: (tx: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }) => Promise<T>) =>
+          pg.transaction(async (tx) => {
+            const run = async (t: string, p?: unknown[]) => ({ rows: (await tx.query(t, p as unknown[])).rows });
+            return work({ query: async (t: string, p?: unknown[]) => (await hook?.(t, p, run)) ?? run(t, p) });
+          }),
+      },
+    } as typeof base;
+  };
+  const witness = () => pg.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + "a".repeat(64) + "','pass') ON CONFLICT DO NOTHING");
+  // The move's write (the first write after its old-key DELETE) runs for real, then reports applied=false:
+  // the row is present, so this is not a guard.
+  const notApplied = (): Hook => {
+    let armed = false, once = true;
+    return async (t, p, run) => {
+      if (/DELETE FROM sessions\.session_index\b[\s\S]*RETURNING created_at/.test(t)) armed = true;
+      else if (armed && once && /upsert_session_index|ingest_operator_runtime_upsert/.test(t)) { once = false; await run(t, p); return { rows: [{ applied: false, revision: "3" }] }; }
+      return undefined;
+    };
+  };
+
+  for (const [path, make] of [["pooled", viaPool], ["publication", viaPublication]] as const)
+    test(`${path}: a move whose write reports applied=false throws retryably and rolls the delete back`, async () => {
+      await witness();
+      const a = await atRevision3();
+      const before = await created();
+      const later = await writeManifest(1, locLater);
+      await store.delete(objectKey(a));
+      const err = await indexPointer(landedPut(later), make(notApplied())).catch((e: unknown) => e as { code?: string; retryable?: boolean });
+      expect(err).toMatchObject({ code: "pointer_move_not_applied", retryable: true });
+      expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
+      expect(await created()).toBe(before);
+      expect(await indexPointer(landedPut(later), make())).toMatchObject({ status: "moved", manifestKey: later });
+    }, 60_000);
+
+  // An erased session: an erasure fence, and its row a tombstone at the old key K1. A put for K2 must
+  // end without error (no poison message) and leave the tombstone, with the fence flag off and on.
+  async function fencedTombstone() {
+    await witness();
     const a = await atRevision3();
-    const before = await created();
+    const r = (await pg.query<{ org_id: string; workspace_id: string; harness: string; session_id: string }>(
+      "SELECT org_id, workspace_id, harness, session_id FROM sessions.session_index WHERE session_id = 'sess_1'")).rows[0]!;
+    await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 'sess_1'");
+    await pg.query("INSERT INTO sessions.session_erasure_fences (org_id, workspace_id, source, session_id) VALUES ($1, $2, $3, $4)",
+      [r.org_id, r.workspace_id, r.harness, r.session_id]);
     const later = await writeManifest(1, locLater);
     await store.delete(objectKey(a));
-    let fakeOnce = true;
-    const client = {
-      async query(text: string, params?: unknown[]) {
-        if (fakeOnce && text.includes("upsert_session_index")) { fakeOnce = false; return { rows: [{ applied: false, revision: "3" }] }; }
-        return pg.query(text, params as unknown[]);
-      },
-      release() {},
-    };
-    const base = deps().pointer;
-    const pooled = { ...base, db: { ...base.db, pool: { connect: async () => client } } as unknown as HoopDb };
-    const err = await indexPointer(landedPut(later), pooled).catch((e: unknown) => e as { code?: string; retryable?: boolean });
-    expect(err).toMatchObject({ code: "pointer_move_not_applied", retryable: true });
-    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
-    expect(await created()).toBe(before);
-    expect(await indexPointer(landedPut(later), pooled)).toMatchObject({ status: "moved", manifestKey: later });
+    return { a, later };
+  }
+  // The fence-flag path calls the runtime upsert, which only its role may call.
+  const asRuntime: Hook = async (t, p, run) => {
+    if (!t.includes("ingest_operator_runtime_upsert")) return undefined;
+    await run("SET ROLE search_consumer_runtime");
+    try { return await run(t, p); } finally { await run("RESET ROLE"); }
+  };
+
+  for (const flag of ["off", "on"] as const)
+    for (const [path, make] of [["pooled", viaPool], ["publication", viaPublication]] as const)
+      test(`fence flag ${flag}, ${path}: a fenced move is a terminal ignored outcome and the tombstone stays`, async () => {
+        const previous = process.env.SESSION_ERASE_FENCE_ENFORCED;
+        delete process.env.SESSION_ERASE_FENCE_ENFORCED;
+        try {
+          const { a, later } = await fencedTombstone(); // set up with the flag off (plain writes)
+          if (flag === "on") {
+            process.env.SESSION_ERASE_FENCE_ENFORCED = "1";
+            // The runtime role's operator step (schema usage; the function's EXECUTE).
+            await pg.exec("GRANT USAGE ON SCHEMA sessions TO search_consumer_runtime; GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_upsert(jsonb,text,text) TO search_consumer_runtime");
+          }
+          const tombstone = async () => (await pg.query<{ manifest_key: string; dead: boolean }>(
+            "SELECT manifest_key, deleted_at IS NOT NULL AS dead FROM sessions.session_index WHERE session_id = 'sess_1'")).rows;
+          const hook = flag === "on" ? asRuntime : undefined;
+          expect(await indexPointer(landedPut(later), make(hook))).toEqual({
+            status: "ignored", reason: flag === "on" ? "operator_erased" : "move_guarded",
+          });
+          expect(await tombstone()).toEqual([{ manifest_key: a, dead: true }]);
+          // Redelivery: the same terminal outcome, still no error, still the tombstone.
+          expect(await indexPointer(landedPut(later), make(hook))).toMatchObject({ status: "ignored" });
+          expect(await tombstone()).toEqual([{ manifest_key: a, dead: true }]);
+        } finally {
+          if (previous === undefined) delete process.env.SESSION_ERASE_FENCE_ENFORCED; else process.env.SESSION_ERASE_FENCE_ENFORCED = previous;
+        }
+      }, 60_000);
+
+  test("fence flag off: through the consumer, the fenced move's message completes (no batch item failure)", async () => {
+    const { a, later } = await fencedTombstone();
+    const d = deps();
+    const pooled = viaPool();
+    expect((await processBatch([{ messageId: "f", body: body(later, "ObjectCreated:Put", "09") }], { ...d, pointer: pooled })).batchItemFailures).toEqual([]);
+    expect(await row()).toMatchObject({ manifest_key: a });
+    expect((await row())!.deleted_at).not.toBeNull();
   }, 60_000);
 
   test("a move is atomic: a failure after the delete leaves the old row and its created_at; the retry moves it", async () => {

@@ -206,15 +206,30 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
       throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
     // The stored key is gone (or tombstoned): re-key the row to this one. The
     // row is derived, and the upsert rebuilds it from this manifest. The delete
-    // and the re-insert commit together inside the upsert's transaction, and
-    // the new row keeps least(old, new) created_at (first-seen survives the move:
-    // the analysis cutover proof, 20261105062120), so a failure in between leaves
-    // the old row intact and a retry moves it again.
-    const moved = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, { rekeyFrom: stored.manifest_key });
-    // A skipped move (manifest_missing, publication_retired, operator_erased, ...) did not re-key: the
-    // old row would stay live naming a gone key. Retry instead of reporting a move that did not happen.
-    if (moved && moved.status === "skipped")
+    // and the re-insert run inside the upsert's transaction (the publication
+    // transaction, or a pooled one; a test double without a pool runs them in
+    // sequence), and the new row keeps least(old, new) created_at (first-seen
+    // survives the move: the analysis cutover proof, 20261105062120). Every
+    // outcome that inserts no new row throws inside that transaction, so the
+    // delete rolls back and the old row stays.
+    let moved: Awaited<ReturnType<typeof index.upsertRawPointer>>;
+    try {
+      moved = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, { rekeyFrom: stored.manifest_key });
+    } catch (error) {
+      // An erased (fenced) or guarded session: terminal. The old row (its tombstone) stays; retrying
+      // would only repeat the refusal until the dead-letter queue.
+      if ((error as { code?: unknown }).code === "pointer_move_fenced") {
+        const why = (error as { reason?: unknown }).reason;
+        return { status: "ignored", reason: why === "operator_erased" ? "operator_erased" : "move_guarded" };
+      }
+      throw error;
+    }
+    // Skipped before the delete ran (nothing changed). A retired managed publication is terminal, as
+    // on the in-place path; anything else (a manifest read that vanished) is retried.
+    if (moved && moved.status === "skipped") {
+      if (moved.reason === "publication_retired") return { status: "ignored", reason: "managed_publication_hint" };
       throw new PipelineError("pointer_move_skipped", `the session's move was not applied (${moved.reason}); retry`, true);
+    }
     return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}) };
   }
   return {

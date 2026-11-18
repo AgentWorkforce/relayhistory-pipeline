@@ -368,6 +368,26 @@ describe("operator recorder (scripts/record-org-s3-cutover.ts)", () => {
     expect((await pg.query<{ ok: boolean }>("SELECT pointer_fix_deployed_at = $1::timestamptz AS ok FROM sessions.org_s3_cutover", [FIX])).rows[0]!.ok).toBe(true);
   });
 
+  test("calendar-invalid times are refused in the parser and the recorder (dry run included)", async () => {
+    const { isoMicros } = await import("../org-s3-cutover.ts");
+    for (const bad of ["2026-02-30T10:00:00Z", "2026-13-01T10:00:00Z", "2026-11-17T24:00:00Z", "2026-11-17T10:60:00Z"]) {
+      expect(isoMicros(bad)).toBeNull();
+      expect(refusal(() => parseOrgS3CutoverArgs(base.map((a) => (a === "2026-11-17T10:00:00Z" ? bad : a)), NOW))).toBe("cutover_time");
+      expect(refusal(() => parseOrgS3CutoverArgs(base.map((a) => (a === "2026-11-17T09:00:00Z" ? bad : a)), NOW))).toBe("cutover_pointer_fix_time");
+      await expect(recordOrgS3Cutover(client(), input({ uploadsCutoverAt: bad }))).rejects.toMatchObject({ code: "cutover_time" });
+      await expect(recordOrgS3Cutover(client(), input({ pointerFixDeployedAt: bad }))).rejects.toMatchObject({ code: "cutover_time" });
+    }
+    expect(isoMicros("2026-11-17T10:00:00.000001+02:00")).toBe(isoMicros("2026-11-17T08:00:00.000001Z"));
+  });
+
+  test("--correct: a pointer-fix time one MICROSECOND off the stored value is a mismatch", async () => {
+    await recordOrgS3Cutover(client(), input({ execute: true }));
+    const micro = FIX.replace(/Z$/u, "001Z"); // FIX has millisecond precision; +1us
+    expect(micro).not.toBe(FIX);
+    const later = { uploadsCutoverAt: new Date(Date.now() - 4 * 3_600_000).toISOString(), turnsCutoverAt: new Date(Date.now() - 3_600_000).toISOString(), correct: true };
+    await expect(recordOrgS3Cutover(client(), input({ ...later, pointerFixDeployedAt: micro }))).rejects.toMatchObject({ code: "cutover_pointer_fix_mismatch" });
+  });
+
   test("cutover >= pointer fix is compared at microsecond precision, in the parser, the recorder and the database alike", async () => {
     const at = (us: string) => `2026-11-17T10:00:00.${us}Z`;
     const args = (cut: string, fix: string) => ["--org", KEY.orgId, "--uploads-cutover-at", cut, "--turns-cutover-at", cut,

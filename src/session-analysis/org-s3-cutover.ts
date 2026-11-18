@@ -73,11 +73,16 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d
  * milliseconds, so 10:00:00.000001 and 10:00:00.000002 would compare equal). Null when malformed.
  */
 export function isoMicros(at: string): bigint | null {
-  const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/u.exec(at);
+  const m = /^((\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}))(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/u.exec(at);
   if (!m) return null;
-  const seconds = Date.parse(`${m[1]}${m[3]}`);
+  // Calendar-valid only: the wall-clock fields must round-trip (2026-02-30 or 24:00:00 do not).
+  const [y, mo, d, h, mi, se] = [m[2], m[3], m[4], m[5], m[6], m[7]].map(Number) as [number, number, number, number, number, number];
+  const wall = new Date(Date.UTC(y, mo - 1, d, h, mi, se));
+  if (wall.getUTCFullYear() !== y || wall.getUTCMonth() !== mo - 1 || wall.getUTCDate() !== d ||
+      wall.getUTCHours() !== h || wall.getUTCMinutes() !== mi || wall.getUTCSeconds() !== se) return null;
+  const seconds = Date.parse(`${m[1]}${m[9]}`);
   if (!Number.isFinite(seconds)) return null;
-  return BigInt(seconds) * 1000n + BigInt((m[2] ?? "").padEnd(6, "0"));
+  return BigInt(seconds) * 1000n + BigInt((m[8] ?? "").padEnd(6, "0"));
 }
 /** The later of two ISO times at microsecond precision (both already validated). */
 const laterOf = (a: string, b: string) => (isoMicros(a)! >= isoMicros(b)! ? a : b);
@@ -115,11 +120,11 @@ export function parseOrgS3CutoverArgs(argv: readonly string[], now: Date = new D
   if (!flags.has("--attest-uploads-fenced")) throw new OrgS3CutoverRefusal("cutover_uploads_not_attested");
   if (!flags.has("--attest-turns-forwarded")) throw new OrgS3CutoverRefusal("cutover_turns_not_attested");
   for (const at of [uploadsCutoverAt, turnsCutoverAt]) {
-    if (!ISO.test(at) || !Number.isFinite(Date.parse(at))) throw new OrgS3CutoverRefusal("cutover_time");
+    if (!ISO.test(at) || isoMicros(at) === null) throw new OrgS3CutoverRefusal("cutover_time");
     if (Date.parse(at) > now.getTime()) throw new OrgS3CutoverRefusal("cutover_time_future");
   }
   const pointerFixDeployedAt = values.get("--pointer-fix-deployed-at") ?? "";
-  if (!ISO.test(pointerFixDeployedAt) || !Number.isFinite(Date.parse(pointerFixDeployedAt)))
+  if (!ISO.test(pointerFixDeployedAt) || isoMicros(pointerFixDeployedAt) === null)
     throw new OrgS3CutoverRefusal("cutover_pointer_fix_time");
   if (Date.parse(pointerFixDeployedAt) > now.getTime()) throw new OrgS3CutoverRefusal("cutover_time_future");
   if (isoMicros(laterOf(uploadsCutoverAt, turnsCutoverAt))! < isoMicros(pointerFixDeployedAt)!)
