@@ -634,6 +634,21 @@ describe("GCP self-host contract", () => {
     expect(() =>
       relaycastChartValues({ chartVersion: "0.2.0", baseUrl: "https://relay.gcp.example.com" }),
     ).toThrow(/published 0\.1\.0/);
+    // The pre-rename index path is refused, and the refusal names the current index.
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        chartRepo: "https://AgentWorkforce.github.io/helm-charts",
+        relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
+      }),
+    ).toThrow(/https:\/\/agentworkforce\.github\.io\/infra/);
+    expect(() =>
+      assertGcpInputs("gcp-dev", {
+        ...base,
+        chartRepo: "https://agentworkforce.github.io/infra",
+        relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
+      }),
+    ).not.toThrow(/published chart/);
   });
 
   it("rejects an unpublished RelayAuth chart or repository and pins its reviewed image", () => {

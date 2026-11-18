@@ -279,12 +279,17 @@ to run (`runtime_role_unset`).
 
 - `hoopdbRuntimeRole` / `hoopdbRuntimeRoleLogin` (required together): the dedicated non-owner
   role the services connect as, pre-provisioned by an operator
-  (`supabase/bootstrap/hoopdb_runtime_role_supabase.sql`). Once set, `HOOPDB_SUPABASE_SHIM` is no
-  longer repeated in `worker.extraEnv`; the chart renders it once from `worker.migrations.supabaseShim`.
+  (`supabase/bootstrap/hoopdb_runtime_role_supabase.sql`). Never `postgres`, `hoop`, `anon`,
+  `authenticated`, `service_role`, `authenticator` or `supabase_admin`. `hoopdbRuntimeRoleLogin`
+  must be `true` for now: a NOLOGIN role needs a workload login role, and there is no input for
+  one. On external HoopDb a runtime role also requires `hoopdbMigrationUrlKey`. Once set,
+  `HOOPDB_SUPABASE_SHIM` is no longer repeated in `worker.extraEnv`; the chart (0.3.0+) renders it
+  once into the migrate Job from `worker.migrations.supabaseShim`.
 - `hoopdbFunctionBoundaryMode` (external only): `event-trigger` after
   `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, or `global-default-revoke`
   (#98). Unset, the migrator's function-boundary gate refuses.
-- `hoopdbMigrationUrlKey` (external only, chart 0.3.2+): the `runtimeSecretName` key holding the
+- `hoopdbMigrationUrlKey` (external only; `chartVersion` an exact release 0.3.2 or later, no
+  prereleases): the `runtimeSecretName` key holding the
   migration owner's URL, read by the migrate Job only (`worker.migrations.hoopdb`). Every service
   keeps `HOOPDB_URL`, which then holds the runtime role's URL.
 

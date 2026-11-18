@@ -166,22 +166,63 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   }
   const endpointAccess = clusterEndpointAccess(eks.apiAccess?.publicAccessCidrs);
   const hoopdb = hoopdbBackend(stage, eks.hoopdb?.backend);
-  // The migrator's own identifier rule (src/hoopdb/migrate.ts migrationProfile).
-  const pgIdent = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
-  if (eks.hoopdbRuntimeRole !== undefined && (!pgIdent.test(eks.hoopdbRuntimeRole) || eks.hoopdbRuntimeRole === "postgres"))
-    throw new Error(`96bulls: eks.hoopdbRuntimeRole must name a dedicated non-owner role, got ${JSON.stringify(eks.hoopdbRuntimeRole)}. Nothing was created.`);
-  if (eks.hoopdbRuntimeRole !== undefined && typeof eks.hoopdbRuntimeRoleLogin !== "boolean")
-    throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin must be true or false when eks.hoopdbRuntimeRole is set (the migrator requires it outside local mode). Nothing was created.");
-  if (eks.hoopdbRuntimeRole === undefined && eks.hoopdbRuntimeRoleLogin !== undefined)
-    throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin is set without eks.hoopdbRuntimeRole. Nothing was created.");
-  if (eks.hoopdbFunctionBoundaryMode !== undefined && (hoopdb !== "external" || !["event-trigger", "global-default-revoke"].includes(eks.hoopdbFunctionBoundaryMode)))
-    throw new Error("96bulls: eks.hoopdbFunctionBoundaryMode is for external (Supabase) HoopDb only: event-trigger or global-default-revoke. Nothing was created.");
-  if (eks.hoopdbMigrationUrlKey !== undefined && (hoopdb !== "external" || !/^[A-Za-z0-9_.-]+$/.test(eks.hoopdbMigrationUrlKey) || eks.hoopdbMigrationUrlKey === "HOOPDB_URL"))
-    throw new Error("96bulls: eks.hoopdbMigrationUrlKey is for external HoopDb only and must be a Secret key other than HOOPDB_URL. Nothing was created.");
+  assertHoopdbProfileInputs(eks, hoopdb);
   if (eks.relaycast) assertRelaycastInputs(eks.relaycast);
   if (eks.sessionDirectory?.enabled) assertSessionDirectoryPreconditions({ hoopdb, relayauthTls: Boolean(eks.relayauth) });
   if (eks.ingress) ingressExposure({ ...(eks.ingress.scheme ? { scheme: eks.ingress.scheme } : {}), ...(eks.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: eks.ingress.rateLimitPer5Min } : {}), ...(eks.ingress.ampTransportEnabled !== undefined ? { ampTransportEnabled: eks.ingress.ampTransportEnabled } : {}) });
   return { endpointAccess, hoopdb };
+}
+
+/**
+ * Roles the services must never connect as: the Supabase/selfhosted migration owners, the
+ * Supabase platform API roles and PostgREST's switch role, and the platform superuser.
+ */
+export const RUNTIME_ROLE_DENYLIST = Object.freeze(["postgres", "hoop", "anon", "authenticated", "service_role", "authenticator", "supabase_admin"] as const);
+
+/** The first umbrella chart whose worker subchart (0.4.2) renders worker.migrations.hoopdb. */
+export const MIGRATION_URL_MIN_CHART = [0, 3, 2] as const;
+
+/**
+ * Exact X.Y.Z only. Prereleases (0.3.2-rc.1) and build metadata are refused: a prerelease
+ * sorts BEFORE its release under semver, so 0.3.2-rc.1 is not "0.3.2+" and may predate
+ * migrations.hoopdb.
+ */
+function exactChartVersion(v: string): [number, number, number] | undefined {
+  const m = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(v);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : undefined;
+}
+
+/** The migrator profile inputs (eks.ts hoopdbModeEnv / eksChartValues). Pure. */
+function assertHoopdbProfileInputs(eks: NonNullable<AwsInputs["eks"]>, hoopdb: HoopDbBackend): void {
+  // The migrator's own identifier rule (src/hoopdb/migrate.ts migrationProfile).
+  const pgIdent = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
+  const role = eks.hoopdbRuntimeRole;
+  if (role === undefined && eks.hoopdbRuntimeRoleLogin !== undefined)
+    throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin is set without eks.hoopdbRuntimeRole. Nothing was created.");
+  if (role !== undefined) {
+    if (!pgIdent.test(role) || (RUNTIME_ROLE_DENYLIST as readonly string[]).includes(role))
+      throw new Error(`96bulls: eks.hoopdbRuntimeRole must name a dedicated non-owner role (not ${RUNTIME_ROLE_DENYLIST.join(", ")}), got ${JSON.stringify(role)}. Nothing was created.`);
+    if (typeof eks.hoopdbRuntimeRoleLogin !== "boolean")
+      throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin must be true or false when eks.hoopdbRuntimeRole is set (the migrator requires it outside local mode). Nothing was created.");
+    // NOLOGIN needs HOOPDB_RUNTIME_WORKLOAD_ROLE (the login that is its member), which this stage has no input for.
+    if (eks.hoopdbRuntimeRoleLogin === false)
+      throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin=false is not supported: a NOLOGIN runtime role needs a workload login role, and this stage has no input for one. Use true (the services log in as the runtime role). Nothing was created.");
+    // External: the services connect as the runtime role, so the migrate Job needs the owner URL.
+    if (hoopdb === "external" && eks.hoopdbMigrationUrlKey === undefined)
+      throw new Error("96bulls: eks.hoopdbMigrationUrlKey is required with eks.hoopdbRuntimeRole on external HoopDb: HOOPDB_URL becomes the runtime role's URL, and migrate must connect as the owner. Nothing was created.");
+  }
+  if (eks.hoopdbFunctionBoundaryMode !== undefined && (hoopdb !== "external" || !["event-trigger", "global-default-revoke"].includes(eks.hoopdbFunctionBoundaryMode)))
+    throw new Error("96bulls: eks.hoopdbFunctionBoundaryMode is for external (Supabase) HoopDb only: event-trigger or global-default-revoke. Nothing was created.");
+  if (eks.hoopdbMigrationUrlKey !== undefined) {
+    if (hoopdb !== "external" || !/^[A-Za-z0-9_.-]+$/.test(eks.hoopdbMigrationUrlKey) || eks.hoopdbMigrationUrlKey === "HOOPDB_URL")
+      throw new Error("96bulls: eks.hoopdbMigrationUrlKey is for external HoopDb only and must be a Secret key other than HOOPDB_URL. Nothing was created.");
+    // Older charts ignore migrations.hoopdb and would run migrate with the services' (runtime) URL.
+    const v = exactChartVersion(eks.chartVersion ?? "");
+    const min = MIGRATION_URL_MIN_CHART;
+    const atLeast = v !== undefined && (v[0] !== min[0] ? v[0] > min[0] : v[1] !== min[1] ? v[1] > min[1] : v[2] >= min[2]);
+    if (!atLeast)
+      throw new Error(`96bulls: eks.hoopdbMigrationUrlKey needs eks.chartVersion ${min.join(".")}+ as an exact release (migrations.hoopdb; no prereleases), got ${JSON.stringify(eks.chartVersion)}. Nothing was created.`);
+  }
 }
 
 /**

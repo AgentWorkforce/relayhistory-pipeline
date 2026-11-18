@@ -54,7 +54,7 @@ Artifact provenance can be checked independently:
 ```sh
 artifact_dir=$(mktemp -d /tmp/relaycast-chart.XXXXXX)
 relaycast_repo=/path/to/relaycast
-helm repo add awf https://AgentWorkforce.github.io/helm-charts
+helm repo add awf https://agentworkforce.github.io/infra
 helm repo update awf
 helm pull awf/relaycast --version 0.1.0 --destination "$artifact_dir"
 sha256sum "$artifact_dir/relaycast-0.1.0.tgz"

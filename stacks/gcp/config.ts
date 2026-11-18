@@ -1,3 +1,4 @@
+import { CHART_REPO } from "../chart-repo.ts";
 import {
   claimlessWindowEnv,
   type ClaimlessWindow,
@@ -181,12 +182,8 @@ export function captureRelayauthChartPackage(
   );
 }
 
-/**
- * The AgentWorkforce chart index (gh-pages of AgentWorkforce/infra, formerly
- * AgentWorkforce/helm-charts). Pages does not redirect after a repository rename, so the
- * old https://AgentWorkforce.github.io/helm-charts path now serves a 404 index.
- */
-export const PUBLISHED_HELM_REPO = "https://agentworkforce.github.io/infra";
+/** The AgentWorkforce chart index (stacks/chart-repo.ts). */
+export const PUBLISHED_HELM_REPO = CHART_REPO;
 
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
   if (!repo) return true;
@@ -500,7 +497,7 @@ export function assertGcpInputs(
       !isPublishedHelmRepo(inputs.chartRepo)
     )
       throw new Error(
-        "96bulls: relaycast must use published chart 0.1.0 from the AgentWorkforce helm repository. Nothing was created.",
+        `96bulls: relaycast must use published chart 0.1.0 from the AgentWorkforce helm repository (${PUBLISHED_HELM_REPO}; the old .../helm-charts index is gone). Nothing was created.`,
       );
     requirePublicHttpsOrigin("relaycast.baseUrl", inputs.relaycast.baseUrl);
   }
@@ -512,7 +509,7 @@ export function assertGcpInputs(
         !isPublishedHelmRepo(inputs.chartRepo))
     )
       throw new Error(
-        `96bulls: relayauth must use published chart ${RELAYAUTH_PUBLISHED_CHART.version} from the AgentWorkforce helm repository. Nothing was created.`,
+        `96bulls: relayauth must use published chart ${RELAYAUTH_PUBLISHED_CHART.version} from the AgentWorkforce helm repository (${PUBLISHED_HELM_REPO}; the old .../helm-charts index is gone). Nothing was created.`,
       );
     requireSecretName(
       "relayauth.existingSecretName",

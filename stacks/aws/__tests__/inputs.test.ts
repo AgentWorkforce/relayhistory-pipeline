@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
+import { ecrPullPolicy, MIGRATION_URL_MIN_CHART, RUNTIME_ROLE_DENYLIST, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "../inputs.ts";
 import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn } from "../sandbox-rules.ts";
 import { verifyCallerArn } from "../preflight.ts";
 
@@ -236,35 +236,51 @@ describe("ecr.pullAccounts: read-only cross-account pull from the services repos
 });
 
 describe("HoopDb runtime role, function boundary and migration owner inputs", () => {
+  const profile = { hoopdbRuntimeRole: "example_runtime", hoopdbRuntimeRoleLogin: true, hoopdbFunctionBoundaryMode: "event-trigger", hoopdbMigrationUrlKey: "HOOPDB_MIGRATION_URL" } as const;
   const external = (patch: (e: NonNullable<AwsInputs["eks"]>) => void) =>
     filled((i) => {
       i.eks!.hoopdb = { backend: "external" };
+      i.eks!.chartVersion = "0.3.2";
       delete i.eks!.sessionDirectory;
       patch(i.eks!);
     });
+  const check = (patch: (e: NonNullable<AwsInputs["eks"]>) => void) => () => validateAwsInputs("aws-proof", external(patch), approved);
 
-  it("accepts the full external profile and the inputs unset", () => {
+  it("accepts the full external profile, and the inputs unset", () => {
     expect(validateAwsInputs("aws-proof", filled(), approved).hoopdb).toBe("cnpg");
-    const ok = external((e) => {
-      e.hoopdbRuntimeRole = "example_runtime";
-      e.hoopdbRuntimeRoleLogin = true;
-      e.hoopdbFunctionBoundaryMode = "event-trigger";
-      e.hoopdbMigrationUrlKey = "HOOPDB_MIGRATION_URL";
-    });
-    expect(validateAwsInputs("aws-proof", ok, approved).hoopdb).toBe("external");
+    expect(check((e) => Object.assign(e, profile))().hoopdb).toBe("external");
   });
 
-  it("refuses an unsafe or half-set runtime role", () => {
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "postgres"; e.hoopdbRuntimeRoleLogin = true; }), approved)).toThrow(/dedicated non-owner role/);
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "bad role"; e.hoopdbRuntimeRoleLogin = true; }), approved)).toThrow(/dedicated non-owner role/);
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "example_runtime"; }), approved)).toThrow(/hoopdbRuntimeRoleLogin must be true or false/);
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRoleLogin = false; }), approved)).toThrow(/without eks\.hoopdbRuntimeRole/);
+  it("refuses an unsafe, denylisted or half-set runtime role", () => {
+    for (const role of RUNTIME_ROLE_DENYLIST)
+      expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: role }))).toThrow(/dedicated non-owner role/);
+    expect([...RUNTIME_ROLE_DENYLIST]).toEqual(["postgres", "hoop", "anon", "authenticated", "service_role", "authenticator", "supabase_admin"]);
+    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: "bad role" }))).toThrow(/dedicated non-owner role/);
+    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRoleLogin: undefined }))).toThrow(/hoopdbRuntimeRoleLogin must be true or false/);
+    expect(check((e) => { e.hoopdbRuntimeRoleLogin = true; })).toThrow(/without eks\.hoopdbRuntimeRole/);
+  });
+
+  it("refuses a NOLOGIN runtime role: there is no workload-role input", () => {
+    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRoleLogin: false }))).toThrow(/hoopdbRuntimeRoleLogin=false is not supported.*workload login role/);
+  });
+
+  it("requires the owner URL key with a runtime role on external HoopDb (not in-cluster)", () => {
+    expect(check((e) => Object.assign(e, profile, { hoopdbMigrationUrlKey: undefined }))).toThrow(/hoopdbMigrationUrlKey is required with eks\.hoopdbRuntimeRole/);
+    // CNPG: migrate and the services read the CNPG Secret; no owner key needed or allowed.
+    expect(validateAwsInputs("aws-proof", filled((i) => Object.assign(i.eks!, { hoopdbRuntimeRole: "example_runtime", hoopdbRuntimeRoleLogin: true })), approved).hoopdb).toBe("cnpg");
   });
 
   it("keeps the boundary mode and the owner URL key to external HoopDb", () => {
     expect(() => validateAwsInputs("aws-proof", filled((i) => { i.eks!.hoopdbFunctionBoundaryMode = "event-trigger"; }), approved)).toThrow(/external \(Supabase\) HoopDb only/);
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbFunctionBoundaryMode = "none" as never; }), approved)).toThrow(/external \(Supabase\) HoopDb only/);
+    expect(check((e) => Object.assign(e, profile, { hoopdbFunctionBoundaryMode: "none" }))).toThrow(/external \(Supabase\) HoopDb only/);
     expect(() => validateAwsInputs("aws-proof", filled((i) => { i.eks!.hoopdbMigrationUrlKey = "HOOPDB_MIGRATION_URL"; }), approved)).toThrow(/hoopdbMigrationUrlKey is for external/);
-    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbMigrationUrlKey = "HOOPDB_URL"; }), approved)).toThrow(/other than HOOPDB_URL/);
+    expect(check((e) => Object.assign(e, profile, { hoopdbMigrationUrlKey: "HOOPDB_URL" }))).toThrow(/other than HOOPDB_URL/);
+  });
+
+  it("needs chart 0.3.2+ as an exact release for the owner URL key", () => {
+    for (const v of ["0.3.0", "0.3.1", "0.3.2-rc.1", "0.3.2+build.1", "0.3", "v0.3.2", "0.03.2"])
+      expect(check((e) => Object.assign(e, profile, { chartVersion: v }))).toThrow(/needs eks\.chartVersion 0\.3\.2\+ as an exact release/);
+    for (const v of ["0.3.2", "0.3.10", "0.4.0"]) expect(check((e) => Object.assign(e, profile, { chartVersion: v }))().hoopdb).toBe("external");
+    expect(MIGRATION_URL_MIN_CHART).toEqual([0, 3, 2]);
   });
 });

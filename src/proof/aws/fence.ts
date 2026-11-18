@@ -14,6 +14,7 @@
  *
  * Production-shaped names are refused everywhere, even inside the proof account.
  */
+import { CHART_REPO } from "../../../stacks/chart-repo.ts";
 import { LOCAL_READONLY_CONTEXT, PIPPEN_SANDBOX_PROOF_TARGET, PROOF_ACCOUNT_ID, PROOF_CLUSTER, PROOF_STAGE, SANDBOX_ACCOUNT_ID, SANDBOX_CLUSTER, SANDBOX_REGION, SANDBOX_STAGE, SESSIONS_DEV_PROOF_TARGET, type ProofTarget, type ProofTargetId } from "./guard.ts";
 
 export { PROOF_REGION } from "./guard.ts";
@@ -52,7 +53,8 @@ export const SANDBOX_BACKUP_BUCKET = `${SANDBOX_BUCKET_PREFIX}${SANDBOX_NAME_PRE
  * account-regional naming. Post-destroy must find it gone like the stage's other buckets.
  */
 export const SANDBOX_STATE_BUCKET = `${SANDBOX_BUCKET_PREFIX}alchemy-state-${SANDBOX_ACCOUNT_ID}-${SANDBOX_REGION}-an`;
-export const PROOF_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
+/** The published chart index the proof stage deploys from (stacks/chart-repo.ts). */
+export const PROOF_CHART_REPO = CHART_REPO;
 export const PROOF_CHART_HOST = "agentworkforce.github.io";
 
 /** Namespaces and their services, fixed by stacks/aws/eks.ts and relayauth.ts. */

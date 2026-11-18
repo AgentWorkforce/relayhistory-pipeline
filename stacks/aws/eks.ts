@@ -59,12 +59,9 @@ import {
 
 export { telemetryPolicy } from "./hardening.ts";
 
-/**
- * The AgentWorkforce chart index (gh-pages of AgentWorkforce/infra, formerly
- * AgentWorkforce/helm-charts). Pages does not redirect after a repository rename, so the
- * old https://AgentWorkforce.github.io/helm-charts path now serves a 404 index.
- */
-export const CHART_REPO = "https://agentworkforce.github.io/infra";
+import { CHART_REPO } from "../chart-repo.ts";
+/** The default 96bulls/relaycast chart repository (stacks/chart-repo.ts). */
+export { CHART_REPO };
 
 export type SupabaseFunctionBoundaryMode = "event-trigger" | "global-default-revoke";
 
@@ -371,11 +368,6 @@ export const eksStage = (i: EksStageInputs) =>
     const [maj, min] = i.chartVersion.split(".").map(Number);
     if (!(maj! > 0 || (maj === 0 && min! >= 3)))
       throw new Error(`96bulls: eks.chartVersion ${i.chartVersion} is too old; 0.3.0+ (worker 0.4.0) is required for summary encryption. Nothing was created.`);
-    // migrations.hoopdb is umbrella 0.3.2+ (worker 0.4.2); older charts ignore it and would run
-    // migrate with the services' (runtime) URL.
-    const patch = Number(i.chartVersion.split(".")[2]);
-    if (i.hoopdbMigrationUrlKey && maj === 0 && min === 3 && !(patch >= 2))
-      throw new Error(`96bulls: eks.hoopdbMigrationUrlKey needs eks.chartVersion 0.3.2+ (migrations.hoopdb); got ${i.chartVersion}. Nothing was created.`);
     assertServicesImage(i);
     const endpointAccess = clusterEndpointAccess(i.apiAccess?.publicAccessCidrs);
     const backend = hoopdbBackend(i.stage, i.hoopdb?.backend);

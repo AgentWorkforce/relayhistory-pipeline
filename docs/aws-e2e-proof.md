@@ -322,7 +322,7 @@ Changing a target means a reviewed code change to `fence.ts`.
 | probe images | `PROOF_PROBE_IMAGES` (Stage A services image) |
 | ingest host and origin | `proof-sessions.agentrelay.com`, `https://proof-sessions.agentrelay.com` |
 | buckets | `96bulls-aws-proof-locker-<proof-account-id>`, `96bulls-aws-proof-hoopdb-backups-<proof-account-id>` |
-| release and chart repo | `96bulls`, `https://AgentWorkforce.github.io/helm-charts` |
+| release and chart repo | `96bulls`, `https://agentworkforce.github.io/infra` |
 | namespaces | `96bulls`, `relayauth`, `relaycast`, `cnpg-system` |
 | namespaces a delete may name | `96bulls`, `relaycast` |
 | services | `96bulls-alleyoop`, `relayauth`, `relaycast` |
@@ -509,7 +509,7 @@ compare against.
 | --- | --- | --- |
 | R | `kubectl <ctx> -n {96bulls,relayauth,relaycast,cnpg-system} get pods -o json` | pod lists |
 | R | `helm --kube-context <ctx> -n <ns> list -o json` for each proof namespace | release lists |
-| R | `helm show values <chart> --repo https://AgentWorkforce.github.io/helm-charts --version <v>` for each deployed chart | public chart repo |
+| R | `helm show values <chart> --repo https://agentworkforce.github.io/infra --version <v>` for each deployed chart | public chart repo |
 
 ### 2. planted-trace
 

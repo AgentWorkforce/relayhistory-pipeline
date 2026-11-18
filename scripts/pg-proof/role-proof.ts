@@ -38,7 +38,7 @@ import {
   sessionsFunctionAcl,
 } from "../../src/hoopdb/migrate-guards.ts";
 import { gateOpen, workerTick } from "../../src/shared/worker.ts";
-import { hoopdbModeEnv } from "../../stacks/aws/eks.ts";
+import { eksChartValues } from "../../stacks/aws/eks.ts";
 import { gcpHoopdbModeEnv } from "../../stacks/gcp/config.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -2532,12 +2532,40 @@ await check(
     ];
   },
 );
+/**
+ * The migrate Job env the 96bulls worker chart renders for the AWS CNPG proof stage:
+ * worker.extraEnv as given, then HOOPDB_SUPABASE_SHIM from worker.migrations.supabaseShim
+ * (the chart's own migrate-only line; hoopdbModeEnv leaves it out once a runtime role is set).
+ * Fake stage inputs; only the migrator profile matters here.
+ */
+function awsCnpgMigrateEnv(runtimeRole: string): Record<string, string> {
+  const v = eksChartValues(
+    {
+      stage: "aws-example-proof",
+      runtimeSecretName: "example-runtime",
+      lockerBucket: "example-locker",
+      lockerRegion: "us-west-2",
+      tenantOrgId: "org_example",
+      relayhistoryOrigin: "https://history.example.com",
+      imageRepository: "example.invalid/96bulls-services",
+      imageDigest: `sha256:${"a".repeat(64)}`,
+      hoopdbRuntimeRole: runtimeRole,
+      hoopdbRuntimeRoleLogin: true,
+    },
+    false,
+    "http://relayauth.example.invalid:8787",
+    "http://relayauth.example.invalid:8787/.well-known/jwks.json",
+    { operatorRelease: "cnpg" },
+  );
+  return {
+    ...Object.fromEntries(v.worker.extraEnv.map((e) => [e.name, e.value])),
+    HOOPDB_SUPABASE_SHIM: v.worker.migrations.supabaseShim ? "true" : "false",
+  };
+}
 for (const [name, env] of [
   [
-    "AWS CNPG fixture env (hoopdbModeEnv)",
-    Object.fromEntries(
-      hoopdbModeEnv(true, "g6_rt2", true).map((e) => [e.name, e.value]),
-    ),
+    "AWS CNPG fixture env (eksChartValues)",
+    awsCnpgMigrateEnv("g6_rt2"),
   ],
 ] as const)
   await check(
