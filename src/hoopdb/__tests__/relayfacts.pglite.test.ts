@@ -343,8 +343,8 @@ describe("20261105062090 relayfacts operator erase", () => {
     expect(ERASE_DOWN).toContain(createHash("sha256").update(ERASE_SQL).digest("hex"));
     expect(ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
-    // 20261105062100 (the hosted per-user relayfacts erase) is the only later step.
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP]);
+    // The later steps are exactly 20261105062100 (the hosted per-user relayfacts erase) and 20261105062110 (search reconcile staging).
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -414,6 +414,9 @@ const USER_ERASE_FILE = "20261105062100_relayfacts_user_erase.sql";
 const USER_ERASE_STEP = `upstream:${USER_ERASE_FILE}`;
 const USER_ERASE_SQL = read(`supabase/migrations/${USER_ERASE_FILE}`);
 const USER_ERASE_DOWN = read("supabase/rollbacks/20261105062100_relayfacts_user_erase.down.sql");
+// 20261105062110 (search reconcile staging) is the step after 062100; its down must run before 062100's.
+const STAGING_STEP = "upstream:20261105062110_search_reconcile_staging.sql";
+const STAGING_DOWN = read("supabase/rollbacks/20261105062110_search_reconcile_staging.down.sql");
 const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
 const USER_ERASE_LOCK = "sessions.relayfacts_user_erase_lock_v1()";
 const USER_ERASE_GUARD = "sessions.relayfacts_user_erase_guard_v1()";
@@ -461,7 +464,8 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(USER_ERASE_DOWN).toContain(createHash("sha256").update(USER_ERASE_SQL).digest("hex"));
     expect(USER_ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:")).sort().at(-1)).toBe(USER_ERASE_STEP);
+    // 20261105062110 (search reconcile staging) is the only upstream step later than 062100.
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
     for (const fn of [USER_ERASE, USER_ERASE_LOCK, USER_ERASE_GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -568,10 +572,15 @@ describe("20261105062100 relayfacts user erase", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences WHERE workspace_id = 'ws-c' AND session_id = 'c' || chr(9) || '1'")).rows[0]!.n).toBe(1);
   });
 
-  test("rollback: 062090's down refuses while 062100 is applied; the down refuses while fences exist unless overridden, then drops everything and its ledger row; a rerun refuses", async () => {
+  test("rollback: 062090's down refuses while 062100 is applied; 062100's down refuses while 062110 is applied; the down refuses while fences exist unless overridden, then drops everything and its ledger row; a rerun refuses", async () => {
     const refusal = async (sql: string) => { const c = await code(db.exec(sql)); await db.exec("ROLLBACK"); return c; };
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     expect(await refusal(ERASE_DOWN)).toBe("55000");
+    // 062110 is applied on top of 062100: 062100's down refuses until 062110 is rolled back.
+    expect(await message(USER_ERASE_DOWN)).toContain("a later migration is applied");
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
+    await db.exec(STAGING_DOWN);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STAGING_STEP]!.sql)).rows[0]!.applied).toBe(false);
     // Fences exist (the tests above): refused, and nothing is dropped; any value but exactly 'true' still refuses.
     const fenceCount = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences")).rows[0]!.n;
     const fences = await fenceCount();
