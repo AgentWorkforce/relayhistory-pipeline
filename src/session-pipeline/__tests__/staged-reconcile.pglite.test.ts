@@ -509,7 +509,7 @@ describe("20261105062110 search reconcile staging", () => {
     expect(await runStagedReconcile(SCOPE, stamp, base, deps(killAt("want:done"))).catch((e) => e instanceof Kill)).toBe(true);
     await expire();
     // Attempt 2 attaches the hook after the want phase: no chunks, no seal -> restart, final rolled back.
-    expect(await runStagedReconcile(SCOPE, stamp, facts, opts(hooks()))).toEqual({ status: "restart", reason: "output_facts_stage_incomplete" });
+    expect(await runStagedReconcile(SCOPE, stamp, facts, opts(hooks()))).toEqual({ status: "restart", reason: "output_facts_stage_incomplete", attempts: 2 });
     expect(seen[0]).toEqual({ chunks: [], sealed: 0, finishes: 1 });
     expect([await staged_(), await commits()]).toEqual([0, 0]);
     // Attempt 3: killed mid facts pass (in its chunk transaction); the run stays in the want phase.
@@ -533,6 +533,34 @@ describe("20261105062110 search reconcile staging", () => {
     expect(seen.at(-1)!.chunks).toEqual([{ seq: 0, last: true, n: 0 }]);
   });
 
+  test("attempts cap reset on a source change drops a sibling scope's leased run: the sibling gets RH062, writes nothing, completes next time", async () => {
+    const f = fixture();
+    const expected = memoryReconcile(f);
+    await reset(f);
+    const cap = { cap: 1, retryEvery: 1000 };
+    // The failed scope: two claims (crashes) put it past a cap of 1.
+    for (let i = 0; i < 2; i++) {
+      expect(await runStagedReconcile(SCOPE, stamp, ops(), { ...deps(killAt("claimed")), attemptsCap: cap }).catch((e) => e instanceof Kill)).toBe(true);
+      await expire();
+    }
+    expect(await runStagedReconcile(SCOPE, stamp, ops(), { ...deps(), attemptsCap: cap })).toEqual({ status: "failed", reason: "staged_run_failed", attempts: 3 });
+    // A sibling scope of the same canonical session holds a live run; mid-run, the failed scope's source changes and it resets.
+    const sibling = { ...SCOPE, sessionId: "sess-1-alias" };
+    const moved = { ...stamp, epoch: "8" };
+    let reset_ = false;
+    const err = await runStagedReconcile(sibling, stamp, ops(), deps(async (p) => {
+      if (p !== "want:batch" || reset_) return;
+      reset_ = true;
+      const out = await runStagedReconcile(SCOPE, moved, { ...ops(), currentSource: async () => moved }, { ...deps(), attemptsCap: cap });
+      expect(out).toMatchObject({ status: "done", attempts: 1 }); // erased, claimed fresh, ran
+    })).then(() => null, (e: { code?: string }) => e.code);
+    expect(err).toBe(STAGED_RECONCILE_STALE_LEASE);
+    expect(await commits()).toBe(1); // only the reset scope's final step committed
+    // The sibling's next run starts fresh and completes.
+    expect(await runStagedReconcile(sibling, stamp, ops(), deps())).toMatchObject({ status: "done", attempts: 1 });
+    expect(await indexRows()).toEqual(expected);
+  });
+
   test("a source change mid-run abandons the run at the final check; the next tick restarts and converges on the new source", async () => {
     const f = fixture();
     await reset(f);
@@ -543,7 +571,7 @@ describe("20261105062110 search reconcile staging", () => {
         current = stampOf(changed, "8");
       }
     }));
-    expect(out).toEqual({ status: "restart", reason: "source_changed" });
+    expect(out).toEqual({ status: "restart", reason: "source_changed", attempts: 1 });
     const run = (await db.query<{ phase: string; last_error: string; lease_nonce: string | null }>(
       "SELECT phase, last_error, lease_nonce::text FROM sessions.search_reconcile_runs_v1")).rows;
     expect(run).toEqual([{ phase: "want", last_error: "source_changed", lease_nonce: null }]);
@@ -601,7 +629,7 @@ describe("20261105062110 search reconcile staging", () => {
     expect(out).toMatchObject({ status: "done", complete: false, inserted: 0, wanted: EXPECT.inserted, deleted: 0, reasons: ["search_version_conflict"] });
     expect(await indexRows()).toEqual(before);
     const truncating = { ...ops(), scanPage: async () => ({ rows: [], next: null, truncated: true }) };
-    expect(await runStagedReconcile(SCOPE, stamp, truncating, deps())).toEqual({ status: "incomplete", reasons: ["search_index_truncated"] });
+    expect(await runStagedReconcile(SCOPE, stamp, truncating, deps())).toEqual({ status: "incomplete", reasons: ["search_index_truncated"], attempts: 1 });
     expect((await db.query<{ last_error: string }>("SELECT last_error FROM sessions.search_reconcile_runs_v1")).rows).toEqual([{ last_error: "search_index_truncated" }]);
     expect(await staged_()).toBe(0);
   });
@@ -618,7 +646,7 @@ describe("20261105062110 search reconcile staging", () => {
         query: (text, params) => block && text.includes("pg_try_advisory_xact_lock") ? ((block = false), Promise.resolve({ rows: [{ ok: false }] })) as never : tx.query(text, params),
       })),
     });
-    expect(out).toEqual({ status: "busy", reason: "scope_busy" });
+    expect(out).toEqual({ status: "busy", reason: "scope_busy", attempts: 1 });
     const next = await runStagedReconcile(SCOPE, stamp, ops(), deps());
     expect(next).toMatchObject({ status: "done", complete: true, attempts: 2, resumedFrom: { phase: "write", cursor: null } });
     expect(await indexRows()).toEqual(expected);

@@ -509,7 +509,8 @@ How a staged run differs from the in-transaction stream it replaces:
   `staged_lease_lost` (the run was taken over or erased under this consumer), `staged_run_interrupted` (a step failed
   after the claim; logged as `search index staged run interrupted` with the error class and code, never its text;
   the lease is released; partial, resumed on the tick; a cap on the attempts of a permanently failing run is slice 3),
-  `output_facts_stage_incomplete` (an output-facts hook sent the run round again). A spent read budget or the keyed-records cap stays partial with
+  `output_facts_stage_incomplete` (an output-facts hook sent the run round again), `staged_run_failed` (past the
+  attempts cap, see "A stuck or failed staged run" below). A spent read budget or the keyed-records cap stays partial with
   `scope_too_large` and its code, as before.
 - **A second consumer** that reaches the same scope while a run holds a live lease gets `staged_run_leased` at the
   claim, before any work. The whole-read path itself does not look at the run table (the runtime role has no grant on
@@ -541,6 +542,67 @@ How a staged run differs from the in-transaction stream it replaces:
   restarts it. Otherwise it deletes, writes the directory events, catalog and state, and drops the run.
 - **Rollback.** `supabase/rollbacks/20261105062110_search_reconcile_staging.down.sql` drops only in-progress runs,
   which then start over. It refuses while any run holds a live lease.
+
+**One summary line per pass.** Every staged pass logs `search index staged run` once, fields only (never message
+text): `stage`, `org_id`, `workspace_id`, `harness`, `session_id`, `outcome` (`done`, `busy`, `restart`, `failed`,
+`incomplete`), `reason` (the first reason code; absent on a clean `done`), `attempt` (the run's claim count; absent
+when nothing was claimed), `count` (rows in the window), `inserted`, `deleted`, `duration_ms`. Level `warn` for
+`failed` and `incomplete`, `info` otherwise. With the flag off it is never logged.
+
+#### A stuck or failed staged run
+
+**The attempts cap.** A run claimed more than 24 times since it last finished or was reset (source changes and
+restarts included; the run row's `attempts`) is failed: each later claim abandons it at once with `last_error =
+'staged_run_failed'`, before any source read and without writing an index row, records the scope owing, and logs the
+summary line at `warn` with `outcome=failed`, `reason=staged_run_failed`. Every 72nd claim past the cap (about every 6
+hours at the default 5-minute tick) still runs in full, so a scope that failed through an outage (an object store
+down for two hours, say) heals on its own; a success removes the run as usual. A failed run whose source changes is
+dropped and claimed afresh (attempt 1). The cap counts claims, not failures: a scope that needs more than 24 claims to
+finish because the consumer keeps being restarted or killed under it is failed too.
+
+The slow retry has a cost: a scope whose read kills the pod (out of memory) does so again on every retry, about every
+6 hours, instead of never. To stop it, lower `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` below that scope's size
+(it then stays partial with the budget's code and is not read), or turn `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` off.
+
+**Symptoms.** A session stays partial for many ticks; the summary line for it shows the same `reason` tick after
+tick (`staged_run_interrupted`, then `staged_run_failed` past the cap); `search index staged run interrupted` lines
+name the error class and code.
+
+**Checks** (owner SQL, read only):
+
+```sql
+-- Failed runs.
+SELECT org_id, workspace_id, harness, session_id, attempts, phase, updated_at
+  FROM sessions.search_reconcile_runs_v1 WHERE last_error = 'staged_run_failed' ORDER BY updated_at;
+-- Every run, with its lease.
+SELECT org_id, workspace_id, harness, session_id, phase, attempts, last_error,
+       lease_expires_at > clock_timestamp() AS leased, updated_at
+  FROM sessions.search_reconcile_runs_v1 ORDER BY updated_at;
+```
+
+**Reset one scope** (owner SQL; the runtime role cannot): the next tick claims a fresh run (attempt 1). Its stage rows,
+and any staged output facts keyed to the run, go with it.
+
+```sql
+DELETE FROM sessions.search_reconcile_runs_v1
+ WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4;
+```
+
+Deleting a run under a live lease is safe: its holder's next step gets RH062, it stops with `staged_lease_lost` and
+writes no state, and the next tick starts over. The same holds when a failed run's source change drops a sibling
+scope's run of the same canonical session (the reset deletes by session or canonical id).
+
+**Cleanup** of old idle runs (abandoned, failed, or left by sessions that never come back), never one under a live
+lease:
+
+```sql
+DELETE FROM sessions.search_reconcile_runs_v1
+ WHERE (lease_nonce IS NULL OR lease_expires_at < clock_timestamp())
+   AND updated_at < clock_timestamp() - interval '7 days';
+```
+
+A failed scope that is still ticking is never selected (each tick's claim moves its `updated_at`); that is intended:
+reset it explicitly, or let the slow retry heal it.
 
 Preconditions before the flag may be turned on anywhere (1-3, 5 and 6 open, tracked for slice 2b):
 
