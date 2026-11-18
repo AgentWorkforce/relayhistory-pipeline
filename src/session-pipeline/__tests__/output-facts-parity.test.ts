@@ -1,4 +1,9 @@
 /**
+ * Staged equals whole (PGlite, always runs): the staged output facts of a 062110 run (migration
+ * 20261105062140, output-facts-store.ts stageOutputFactsBatch / finishStagedOutputFacts) leave the
+ * facts and state tables exactly as the whole-set path (output_facts_reconcile) does for the same
+ * read, for every batch split, across two runs whose facts change, and across a lost lease.
+ *
  * Differential parity: relayhistory's own `getSessionOutput` SQL (lib/session-output.ts
  * @ c7de2163, transcribed with positional parameters) over Neon-shaped tables on a
  * real Postgres, against `readSessionOutput` over the facts the producer writes for
@@ -12,6 +17,12 @@ import { outputFactsSchemaStatements } from "../output-facts-schema.ts";
 import { outputFactsFromScope, reconcileOutputFacts } from "../output-facts.ts";
 import { readSessionOutput, type SessionOutputFilter } from "../../session-read-api/output-query.ts";
 import { outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
+import type { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
+import {
+  advanceToFinal, as, chunksOf, claim, clearFacts, code, factsChunk, factsPass, factsSnapshot, finalStep, keyOf, stagedFactsDatabase, stagedPass,
+  stagedRows, wantPhase, wholePass, type Read,
+} from "./staged-facts-harness.ts";
+import { StagedRunRestart } from "../staged-reconcile.ts";
 
 const PG_URL = process.env.F4_TEST_POSTGRES_URL;
 const CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
@@ -203,4 +214,159 @@ suite("Output parity: relayhistory SQL on Postgres == facts query on ClickHouse"
     await load(fx);
     for (const w of windows) await run(w);
   }, 60_000);
+});
+
+// ---- staged equals whole (PGlite) -------------------------------------------------------------
+
+const STAGED_SCOPE = { orgId: OUTPUT_FIXTURE_SCOPE.orgId, workspaceId: OUTPUT_FIXTURE_SCOPE.workspaceId, harness: OUTPUT_FIXTURE_SCOPE.harness, sessionId: "s1", canonicalId: OUTPUT_FIXTURE_SCOPE.canonicalId };
+
+/** The fixture with its facts changed: a message, the commit link and the legacy turn gone, one commit result rewritten. */
+function changedFixture(): Read {
+  const f = outputFixture();
+  const rows = f.projectionRows
+    .filter((r) => r.table !== "session_commit_links")
+    .filter((r) => !(r.table === "convergence_events" && (r.row.record as { payload?: { message_id?: string } })?.payload?.message_id === "msg-2"))
+    .map((r) => (typeof r.row.content === "string" && r.row.content.includes("abc1234") ? { ...r, row: { ...r.row, content: "[main abc1234] fix\n 2 files changed, 9 insertions(+)" } } : r));
+  return { ...f, projectionRows: rows, records: f.records.filter((r) => r.kind !== "legacy_conversation_turn") };
+}
+
+describe("staged output facts equal the whole-set path (062140)", () => {
+  let db: PGlite;
+  beforeAll(async () => {
+    db = await stagedFactsDatabase();
+  }, 300_000);
+  afterAll(async () => {
+    await db?.close();
+  });
+
+  const whole = async (passes: Array<[Read, number]>) => {
+    await clearFacts(db);
+    const out = [];
+    for (const [read, v] of passes) out.push(await wholePass(db, STAGED_SCOPE, read, v));
+    return { out, snap: await factsSnapshot(db) };
+  };
+  const staged = async (passes: Array<[Read, number]>, size: number, recordsFirst = false) => {
+    await clearFacts(db);
+    const out = [];
+    for (const [read, v] of passes) out.push(await stagedPass(db, STAGED_SCOPE, read, v, size, recordsFirst));
+    return { out, snap: await factsSnapshot(db) };
+  };
+  const counts = (r: { inserted: number; deleted: number; complete: boolean; applied: boolean; reasons: string[] }) =>
+    ({ inserted: r.inserted, deleted: r.deleted, complete: r.complete, applied: r.applied, reasons: r.reasons });
+
+  test("one run: every batch split (a commit call and its result in different batches included) gives the same rows and counts", async () => {
+    const w = await whole([[outputFixture(), 1]]);
+    expect(w.snap.events.length).toBeGreaterThan(10);
+    expect(w.snap.facts.length).toBeGreaterThan(5);
+    expect(w.out[0]!.complete).toBe(true);
+    for (const size of [1, 2, 3, 7, 100])
+      for (const recordsFirst of [false, true]) {
+        const s = await staged([[outputFixture(), 1]], size, recordsFirst);
+        expect(s.snap, `size ${size}`).toEqual(w.snap);
+        expect(counts(s.out[0]!), `size ${size}`).toEqual(counts(w.out[0]!));
+        expect(await stagedRows(db)).toBe(0);
+      }
+  });
+
+  test("two runs whose facts change: the second deletes and rewrites as the whole path does; an older version is refused alike", async () => {
+    const w = await whole([[outputFixture(), 1], [changedFixture(), 2]]);
+    expect(w.out[1]!.deleted).toBeGreaterThan(0);
+    for (const size of [1, 4]) {
+      const s = await staged([[outputFixture(), 1], [changedFixture(), 2]], size);
+      expect(s.snap).toEqual(w.snap);
+      expect(s.out.map(counts)).toEqual(w.out.map(counts));
+    }
+    // A pass older than the stored version: nothing written on either path.
+    const before = await factsSnapshot(db);
+    const stale = await stagedPass(db, STAGED_SCOPE, outputFixture(), 1, 3);
+    expect(counts(stale)).toEqual(counts(await wholePass(db, STAGED_SCOPE, outputFixture(), 1)));
+    expect(stale.applied).toBe(false);
+    expect(await factsSnapshot(db)).toEqual(before);
+  });
+
+  test("an incomplete read inserts and never deletes, on both paths", async () => {
+    const incomplete = { ...changedFixture(), complete: false };
+    const w = await whole([[outputFixture(), 1], [incomplete, 2]]);
+    expect(w.out[1]!.deleted).toBe(0);
+    const s = await staged([[outputFixture(), 1], [incomplete, 2]], 2);
+    expect(s.snap).toEqual(w.snap);
+    expect(s.out.map(counts)).toEqual(w.out.map(counts));
+  });
+
+  test("a lost lease mid facts pass: the old holder's next chunk is RH062 and stages nothing; the taker's pass from chunk 0 gives the whole path's result", async () => {
+    const w = await whole([[outputFixture(), 1]]);
+    await clearFacts(db);
+    const chunks = chunksOf(outputFixture(), 3);
+    const a = (await claim(db, STAGED_SCOPE, "mf-1", 1))!;
+    await wantPhase(db, a, STAGED_SCOPE, null, 1);
+    await factsChunk(db, a, STAGED_SCOPE, chunks[0]!, { seq: 0, last: false }, 1);
+    await factsChunk(db, a, STAGED_SCOPE, chunks[1]!, { seq: 1, last: false }, 1);
+    await db.exec("UPDATE sessions.search_reconcile_runs_v1 SET lease_expires_at = clock_timestamp() - interval '1 second'");
+    const b = (await claim(db, STAGED_SCOPE, "mf-1", 1))!;
+    expect([b.runId, b.phase, b.cursor, b.restarted]).toEqual([a.runId, "want", keyOf(2), false]);
+    const staged0 = await stagedRows(db);
+    expect(await code(factsChunk(db, a, STAGED_SCOPE, chunks[2]!, { seq: 2, last: false }, 1))).toBe("RH062");
+    expect(await stagedRows(db)).toBe(staged0);
+    // The taker's attempt delivers the facts pass again from chunk 0, which drops the old holder's partial stage.
+    await wantPhase(db, b, STAGED_SCOPE, chunks, 1);
+    await advanceToFinal(db, b, true);
+    expect(await code(finalStep(db, a, STAGED_SCOPE, { sourceComplete: true, sourceVersion: 1 }))).toBe("RH062");
+    const r = await finalStep(db, b, STAGED_SCOPE, { sourceComplete: true, sourceVersion: 1 });
+    expect(await factsSnapshot(db)).toEqual(w.snap);
+    expect(counts(r)).toEqual(counts(w.out[0]!));
+  });
+
+  test("a stage that missed part of the facts pass is never reconciled: StagedRunRestart, nothing written; the next attempt converges", async () => {
+    const w = await whole([[outputFixture(), 1], [changedFixture(), 2]]);
+    await clearFacts(db);
+    await wholePass(db, STAGED_SCOPE, outputFixture(), 1);
+    const before = await factsSnapshot(db);
+    const chunks = chunksOf(changedFixture(), 3);
+    const run = (await claim(db, STAGED_SCOPE, "mf-2", 2))!;
+    await wantPhase(db, run, STAGED_SCOPE, null, 2);
+    await factsPass(db, run, STAGED_SCOPE, chunks, 2, { from: 1 }); // facts turned on after chunk 0
+    await advanceToFinal(db, run, true);
+    const err = await as(db, (tx) => import("../output-facts-store.ts").then((m) => m.finishStagedOutputFacts(tx, run, STAGED_SCOPE, { sourceComplete: true, sourceVersion: 2, at: new Date() }))).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(StagedRunRestart);
+    expect((err as StagedRunRestart).reason).toBe("output_facts_stage_incomplete");
+    expect(await factsSnapshot(db)).toEqual(before);
+    // The module abandons with that reason: the stage goes with the run's; the next attempt delivers the whole pass.
+    await as(db, (tx) => tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,'output_facts_stage_incomplete')", [run.runId, run.nonce]));
+    expect(await stagedRows(db)).toBe(0);
+    const again = (await claim(db, STAGED_SCOPE, "mf-2", 2))!;
+    expect([again.runId, again.phase, again.cursor]).toEqual([run.runId, "want", null]);
+    await wantPhase(db, again, STAGED_SCOPE, chunks, 2);
+    await advanceToFinal(db, again, true);
+    await finalStep(db, again, STAGED_SCOPE, { sourceComplete: true, sourceVersion: 2 });
+    expect(await factsSnapshot(db)).toEqual(w.snap);
+  });
+
+  test("a chunk larger than one stage call (continuations) and a large scope: still the whole path's rows", async () => {
+    const big = outputFixture();
+    const extra = big.projectionRows.filter((r) => r.table === "convergence_events").flatMap((r) =>
+      Array.from({ length: 80 }, (_, k) => ({ ...r, row: { ...r.row, event_id: `${String(r.row.event_id)}-x${k}` } })));
+    const read = { ...big, projectionRows: [...big.projectionRows, ...extra] };
+    expect(read.projectionRows.length).toBeGreaterThan(1200);
+    const w = await whole([[read, 1]]);
+    for (const size of [5000, 333]) {
+      const s = await staged([[read, 1]], size);
+      expect(s.snap, `size ${size}`).toEqual(w.snap);
+      expect(counts(s.out[0]!)).toEqual(counts(w.out[0]!));
+    }
+  });
+
+  test("a malformed event: both paths are incomplete and delete nothing; the staged one skips only that event (a superset of the whole path's rows)", async () => {
+    const bad = outputFixture();
+    bad.projectionRows[2] = { ...bad.projectionRows[2]!, row: { ...bad.projectionRows[2]!.row, ts: "not a time" } };
+    await whole([[outputFixture(), 1]]);
+    const w = await wholePass(db, STAGED_SCOPE, bad, 2);
+    const ws = await factsSnapshot(db);
+    await clearFacts(db);
+    await wholePass(db, STAGED_SCOPE, outputFixture(), 1);
+    const s = await stagedPass(db, STAGED_SCOPE, bad, 2, 3);
+    const ss = await factsSnapshot(db);
+    for (const r of [w, s]) expect([r.complete, r.deleted, r.reasons]).toEqual([false, 0, ["output_facts_invalid_time"]]);
+    const ids = (rows: string[]) => new Set(rows.map((j) => (JSON.parse(j) as { row_id: string }).row_id));
+    for (const k of ["events", "facts"] as const) for (const id of ids(ws[k])) expect(ids(ss[k]).has(id)).toBe(true);
+  });
 });
