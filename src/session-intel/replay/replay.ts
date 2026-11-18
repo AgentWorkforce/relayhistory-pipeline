@@ -5,6 +5,7 @@
  * deterministic order.
  */
 import { DEFAULT_INTERVAL_SECONDS } from "../../coordination-advisor/config.ts";
+import { isAlertClass } from "./classes.ts";
 import { detectorHash, type ReplayAlert, type ReplayDetector } from "./detector.ts";
 import type { Snapshot } from "./snapshot.ts";
 import { ReplayView } from "./views.ts";
@@ -51,6 +52,7 @@ export async function replaySnapshot(snapshot: Snapshot, opts: { detectors: Repl
     for (const d of opts.detectors) {
       for (const a of await d.run(view, now)) {
         if (a.detector !== d.name) throw new Error(`replay: detector ${d.name} returned an alert for ${a.detector}`);
+        if (a.alertClass !== undefined && !isAlertClass(a.alertClass)) throw new Error(`replay: detector ${d.name} returned an unknown alert class`);
         const k = `${a.detector}\u0000${a.alertId}`;
         // The first sentAt wins: a later tick repeating an alert never moves it.
         if (!seen.has(k)) seen.set(k, a);
@@ -83,7 +85,8 @@ export function parseReplayResult(raw: unknown): ReplayResult {
     if (!a || typeof a.detector !== "string" || !known.has(a.detector) || typeof a.alertId !== "string"
       || (a.urgency !== "high" && a.urgency !== "low") || typeof a.kind !== "string" || typeof a.sentAt !== "string"
       || !Number.isFinite(Date.parse(a.sentAt)) || !Array.isArray(a.pair) || a.pair.length !== 2
-      || !a.pair.every((p) => typeof p === "string") || typeof a.artifact !== "string" || !Array.isArray(a.evidence))
+      || !a.pair.every((p) => typeof p === "string") || typeof a.artifact !== "string" || !Array.isArray(a.evidence)
+      || (a.alertClass !== undefined && !isAlertClass(a.alertClass)))
       throw new Error("alerts: an alert is malformed");
   }
   return r;

@@ -9,7 +9,7 @@ import { at, FIXTURE_DIR, session, tmp, writeSnapshot } from "./helpers.ts";
 describe("loadSnapshot", () => {
   test("loads the committed fixture", async () => {
     const s = await loadSnapshot(FIXTURE_DIR, { now: new Date("2026-11-18T00:00:00Z") });
-    expect(s.sessions).toHaveLength(13);
+    expect(s.sessions).toHaveLength(15);
     expect(s.manifest.window).toEqual({ since: at("09:00"), until: at("13:00") });
     expect(s.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
   });

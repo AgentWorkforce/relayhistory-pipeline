@@ -4,6 +4,7 @@
  * across detectors, strips detector names, kinds, urgencies and alert ids, and shuffles with a seeded PRNG.
  * `packet.jsonl` goes to the adjudicators; `key.json` stays private. Verdicts are imported against the key.
  */
+import { alertClassOf, classesOfVerdict, type AlertClass } from "./classes.ts";
 import type { ReplayResult } from "./replay.ts";
 import { budgetK, DEFAULT_BUDGET_PER_100, rankAlerts } from "./score.ts";
 import { boundedString, isRecord, onlyKeys, pairId, seededShuffle, sha256Hex, textCompare } from "./util.ts";
@@ -15,7 +16,11 @@ export interface PacketEntry {
   /** Evidence refs only: no event kinds, which can hint at the detector. */
   evidence: Array<{ sessionId: string; eventId: string; ts: string }>;
 }
-export interface KeyMember { detector: string; detectorHash: string; alertId: string; kind: string; urgency: "high" | "low"; sentAt: string }
+export interface KeyMember {
+  detector: string; detectorHash: string; alertId: string; kind: string; urgency: "high" | "low"; sentAt: string;
+  /** The alert's class (classes.ts). A key written before classes existed lacks it; it is then derived. */
+  alertClass?: AlertClass;
+}
 export interface PacketKey {
   format: "session-intel-adjudication-key/1";
   seed: string;
@@ -38,7 +43,7 @@ export function buildPacket(results: ReplayResult[], opts: { seed: string; budge
       for (const a of rankAlerts(r.alerts.filter((x) => x.detector === d.name)).slice(0, k)) {
         const id = `${pairId(a.pair)}\u0002${a.artifact}`;
         const cur: Pooled = pool.get(id) ?? { pair: [...a.pair].sort(textCompare) as [string, string], artifact: a.artifact, members: [], evidence: new Map() };
-        cur.members.push({ detector: d.name, detectorHash: d.hash, alertId: a.alertId, kind: a.kind, urgency: a.urgency, sentAt: a.sentAt });
+        cur.members.push({ detector: d.name, detectorHash: d.hash, alertId: a.alertId, kind: a.kind, urgency: a.urgency, sentAt: a.sentAt, alertClass: alertClassOf(a) });
         for (const e of a.evidence) cur.evidence.set(`${e.sessionId}\u0000${e.eventId}\u0000${e.ts}`, { sessionId: e.sessionId, eventId: e.eventId, ts: e.ts });
         pool.set(id, cur);
       }
@@ -66,10 +71,14 @@ export function buildPacket(results: ReplayResult[], opts: { seed: string; budge
   return { packet, key };
 }
 
-export const VERDICTS = ["real_overlap", "intent_conflict", "constraint_violation", "planned", "unrelated", "unclear"] as const;
+/**
+ * `collision` and `overlap` are the taxonomy's precise forms; `real_overlap` (the M0 verdict) confirms either
+ * (classes.ts classesOfVerdict).
+ */
+export const VERDICTS = ["real_overlap", "collision", "overlap", "intent_conflict", "constraint_violation", "planned", "unrelated", "unclear"] as const;
 export type VerdictValue = typeof VERDICTS[number];
 export interface VerdictRecord { alertKey: string; verdict: VerdictValue; adjudicator: string }
-const POSITIVE: ReadonlySet<VerdictValue> = new Set(["real_overlap", "intent_conflict", "constraint_violation"]);
+const POSITIVE: ReadonlySet<VerdictValue> = new Set(["real_overlap", "collision", "overlap", "intent_conflict", "constraint_violation"]);
 
 export function parseVerdicts(raw: unknown[], key: PacketKey): VerdictRecord[] {
   const keys = new Set(key.entries.map((e) => e.alertKey));
@@ -91,6 +100,14 @@ export function parseVerdicts(raw: unknown[], key: PacketKey): VerdictRecord[] {
 
 export interface AgreementRow { a: string; b: string; shared: number; agreed: number; rate: number | null; kappa: number | null }
 export interface AdjudicatedDetector { detector: string; detectorHash: string; pooled: number; adjudicated: number; positive: number; negative: number; unclear: number; precision: number | null }
+/**
+ * Per (detector, alert class). `positive`: the consensus verdict confirms the alert's class. `misclassified`: it
+ * confirms real work of another class. Precision is positive / (positive + misclassified + negative).
+ */
+export interface AdjudicatedClass {
+  detector: string; detectorHash: string; alertClass: AlertClass; pooled: number; adjudicated: number;
+  positive: number; misclassified: number; negative: number; unclear: number; precision: number | null;
+}
 export interface VerdictReport {
   format: "session-intel-verdicts/1";
   adjudicators: string[];
@@ -99,6 +116,7 @@ export interface VerdictReport {
   agreement: AgreementRow[];
   consensus: Record<VerdictValue, number>;
   detectors: AdjudicatedDetector[];
+  classes: AdjudicatedClass[];
 }
 
 /** The majority verdict; a tie is "unclear". */
@@ -111,7 +129,7 @@ export function consensus(verdicts: VerdictValue[]): VerdictValue | null {
   return leaders.length === 1 ? leaders[0]![0] : "unclear";
 }
 
-/** Cohen's kappa over the six verdicts for two adjudicators' shared keys. */
+/** Cohen's kappa over the verdicts for two adjudicators' shared keys. */
 function kappa(pairs: Array<[VerdictValue, VerdictValue]>): number | null {
   if (!pairs.length) return null;
   const n = pairs.length;
@@ -156,9 +174,29 @@ export function verdictReport(key: PacketKey, verdicts: VerdictRecord[]): Verdic
   }
   const detectors = [...det.values()].map((d) => ({ ...d, precision: d.positive + d.negative > 0 ? d.positive / (d.positive + d.negative) : null }))
     .sort((a, b) => textCompare(a.detector, b.detector) || textCompare(a.detectorHash, b.detectorHash));
+  const cls = new Map<string, AdjudicatedClass>();
+  for (const e of key.entries) for (const m of e.members) {
+    const alertClass = m.alertClass ?? alertClassOf(m);
+    const k = `${m.detector}\u0000${m.detectorHash}\u0000${alertClass}`;
+    const c = cls.get(k) ?? { detector: m.detector, detectorHash: m.detectorHash, alertClass, pooled: 0, adjudicated: 0, positive: 0, misclassified: 0, negative: 0, unclear: 0, precision: null };
+    c.pooled++;
+    const v = verdictOf.get(e.alertKey);
+    if (v) {
+      c.adjudicated++;
+      if (v === "unclear") c.unclear++;
+      else if (classesOfVerdict(v).includes(alertClass)) c.positive++;
+      else if (POSITIVE.has(v)) c.misclassified++;
+      else c.negative++;
+    }
+    cls.set(k, c);
+  }
+  const classes = [...cls.values()].map((c) => {
+    const judged = c.positive + c.misclassified + c.negative;
+    return { ...c, precision: judged > 0 ? c.positive / judged : null };
+  }).sort((a, b) => textCompare(a.detector, b.detector) || textCompare(a.detectorHash, b.detectorHash) || textCompare(a.alertClass, b.alertClass));
   return {
     format: "session-intel-verdicts/1", adjudicators, entries: key.entries.length,
-    adjudicatedEntries: [...verdictOf.values()].filter(Boolean).length, agreement, consensus: counts, detectors,
+    adjudicatedEntries: [...verdictOf.values()].filter(Boolean).length, agreement, consensus: counts, detectors, classes,
   };
 }
 
@@ -170,6 +208,9 @@ export function verdictMarkdown(r: VerdictReport): string {
     ...r.agreement.map((a) => `| ${a.a} | ${a.b} | ${a.shared} | ${a.agreed} | ${pct(a.rate)} | ${a.kappa === null ? "n/a" : a.kappa.toFixed(2)} |`),
     "", "## Precision from consensus verdicts (unclear excluded)", "", "| Detector | Hash | Pooled | Adjudicated | Positive | Negative | Unclear | Precision |", "|---|---|---|---|---|---|---|---|",
     ...r.detectors.map((d) => `| ${d.detector} | ${d.detectorHash.slice(0, 12)} | ${d.pooled} | ${d.adjudicated} | ${d.positive} | ${d.negative} | ${d.unclear} | ${pct(d.precision)} |`),
+    "", "## Precision per alert class (the verdict must confirm the class; unclear excluded)", "",
+    "| Detector | Hash | Class | Pooled | Adjudicated | Positive | Misclassified | Negative | Unclear | Precision |", "|---|---|---|---|---|---|---|---|---|---|",
+    ...r.classes.map((c) => `| ${c.detector} | ${c.detectorHash.slice(0, 12)} | ${c.alertClass} | ${c.pooled} | ${c.adjudicated} | ${c.positive} | ${c.misclassified} | ${c.negative} | ${c.unclear} | ${pct(c.precision)} |`),
     "", "## Consensus", "", ...Object.entries(r.consensus).map(([k, v]) => `- ${k}: ${v}`),
   ];
   return `${lines.join("\n")}\n`;

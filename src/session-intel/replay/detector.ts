@@ -12,6 +12,7 @@ import { scanOnce, type ScanStats } from "../../coordination-advisor/scan.ts";
 import {
   RecordingRelaySender, ReplayAdvisorStore, snapshotCoordinationBackend, type RecordedWrite, type ReplayView, type SimClock,
 } from "./views.ts";
+import type { AlertClass } from "./classes.ts";
 import { canonicalJson, refString, sha256Hex, sortedPair, textCompare } from "./util.ts";
 
 export type AlertUrgency = "high" | "low";
@@ -35,6 +36,11 @@ export interface ReplayAlert {
   /** "dm" when a HIGH DM was recorded, else "pull". */
   channel: "dm" | "pull";
   evidence: AlertEvidence[];
+  /**
+   * The taxonomy class, when the detector decides it (M2's claim detectors). Absent, it is derived from kind
+   * and urgency (classes.ts classOfKind); the advisor leaves it absent.
+   */
+  alertClass?: AlertClass;
 }
 
 export interface ReplayDetector {

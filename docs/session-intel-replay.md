@@ -52,6 +52,25 @@ The parts the scan calls:
 
 The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). It keeps each alert's first `sentAt` and orders alerts deterministically. M2's intent and constraint detectors plug in behind the same interface.
 
+## Classes
+
+Scoring is class-aware, using the alert taxonomy (docs/proposals/session-intelligence.md, "Alert taxonomy"): `constraint_violation`, `intent_conflict`, `collision`, `overlap`, `planned_fleet` and `none`. `classes.ts` maps three things onto it.
+
+- **A detector kind, with its urgency:**
+  - `duplicate_work` and `superseded_work` are `collision`;
+  - `concurrent_edit` is `collision` at HIGH (the 60-minute row) and `overlap` otherwise;
+  - `nearby_work` and `similar_summary` are `overlap`;
+  - a kind that names a class is that class;
+  - anything else is `none`.
+
+  A detector can set `alertClass` on an alert itself; M2's claim detectors will. The advisor leaves it unset.
+- **A label incident kind:** `duplicate_work` and `superseded_work` are `collision`, `overlap` is `overlap`, and the conflict kinds are themselves.
+- **An adjudication verdict:**
+  - `collision` and `overlap` confirm their own class;
+  - `real_overlap` (the M0 verdict) confirms either, because it does not say which;
+  - `intent_conflict` and `constraint_violation` confirm themselves;
+  - `planned`, `unrelated` and `unclear` confirm none.
+
 ## Labels, scoring and adjudication
 
 `labels.json` has two lists:
@@ -69,16 +88,28 @@ For a split, the scorer classifies each alert by its pair:
 
 Dev scoring never reads held-out labels: an alert on a held-out pair is just unlabeled there, so no dev report shows which pairs are held out. Held-out scoring puts alerts on dev-labeled pairs out of scope.
 
-The scorer reports per detector, and per (urgency, kind) row:
+It scores in two modes and reports both:
 
-- alerts, true and false positives, precision and recall;
+- **pair-match**: a pair match is a true positive (the M0 behaviour);
+- **class-match**: a true positive needs the pair and the class (see Classes). A pair match whose class differs is counted as `misclassified`. It is not a true positive, but it stays in the precision denominator.
+
+For each mode, the scorer reports per detector, per (urgency, kind) row and per alert class:
+
+- alerts, true and false positives, misclassified, precision and recall. A class row's class-match recall is over the incidents of that class;
 - lead time (`harmAt` minus the first `sentAt` per detected incident): the counts before and after harm, and the median;
 - alerts per 100 sessions;
 - the top K at 5 per 100 sessions (`--budget`), ranked HIGH first, then the earliest.
 
+It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, `planned_fleet` or `none`; or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both `report.md` and `report.json`.
+
 Scoring uses `dev` unless you pass `--split heldout`. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused unless `--force`, which is recorded as forced. The ledger is a protocol aid, not a security boundary: keep one evaluation directory per study.
 
-`packet` pools each detector's top K and merges the same (pair, artifact) across detectors. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa, takes the majority verdict for each alert (a tie is `unclear`), and reports precision per detector, excluding `unclear`. The artifact itself can hint at a tier (a migration number, the "similar short summaries" text); that is the evidence the adjudicators need.
+`packet` pools each detector's top K and merges the same (pair, artifact) across detectors. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `collision`, `overlap`, `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa, and takes the majority verdict for each alert (a tie is `unclear`). It reports precision two ways, both excluding `unclear`:
+
+- **per detector:** any real verdict is positive;
+- **per (detector, alert class):** the verdict must confirm the alert's class. A real verdict of another class is misclassified, and counts against precision.
+
+The packet never shows the class; the private key records it. The artifact itself can hint at a tier (a migration number, the "similar short summaries" text); that is the evidence the adjudicators need.
 
 ## How to run
 
@@ -107,5 +138,6 @@ The synthetic fixture covers these cases:
 - a planned fleet writing one file, which stays silent;
 - a 45-minute shared file, HIGH, after harm;
 - a LOW nearby-work pair labeled as a hard negative;
+- a LOW nearby-work pair labeled as an `intent_conflict` incident, which class-match counts as misclassified;
 - a summary and a write that appear later in the window, which must not be visible early;
 - an unrelated pair, which stays silent.
