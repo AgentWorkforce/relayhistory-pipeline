@@ -29,6 +29,13 @@
  * the ledger target as a hash (backlogOpsLedgerId, never the name), and a backfill or drain execute refuses unless the
  * backfill / drain runs it binds recorded the same one (backlog_ops_bound_<kind>_ledger).
  *
+ * Path B (backlogOpsNoHeadParity; default off): the export modes read the secret BACKLOG_OPS_NO_HEAD_PARITY_ORGS and the
+ * variable BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS; the list reaches the export only in its stdin payload
+ * ({"dbUrl": ..., "noHeadParityOrgs": [...]}, each org also masked), the age as --no-head-parity-max-age. The receipt
+ * records their hash (`no_head_parity`, only when set). Before any credential, an export-execute refuses unless its DRY
+ * recorded the same hash, and a drain-execute unless its EXPORT recorded the hash of its own environment's values
+ * (refusal only: the drain tool gets neither value and is unchanged).
+ *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
@@ -43,6 +50,8 @@ import {
   backlogOpsBindings,
   backlogOpsDispatch,
   BACKLOG_OPS_LEDGER_TOOLS,
+  BACKLOG_OPS_NO_HEAD_PARITY_NONE,
+  backlogOpsNoHeadParity,
   backlogOpsLedgerEnv,
   backlogOpsLedgerId,
   backlogOpsLedgerTarget,
@@ -93,7 +102,10 @@ export function backlogOpsChildSpawn(
   session: string | null = null,
 ) {
   const since = isCatchup(d.mode) ? backlogOpsRevisionsSince(env, d) : null;
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, backlogOpsScope(env), since);
+  const scope = backlogOpsScope(env);
+  // Path B: the export's only (the drain's binding of it is in checkBoundReceipts).
+  const nhp = backlogOpsNoHeadParity(env, d, scope), exportNhp = toolOf(d.mode) === "export" ? nhp : null;
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, since, exportNhp);
   if (spec.needsDb !== (dbUrl !== null)) refuse("backlog_ops_db_binding");
   // The session reaches the presence tool, and only it, beside the URL on stdin.
   if ((d.mode === "presence-dry") !== (session !== null) || (session !== null && dbUrl === null)) refuse("backlog_ops_session_binding");
@@ -109,7 +121,8 @@ export function backlogOpsChildSpawn(
     command: process.execPath,
     args: [join(ROOT, spec.script), ...spec.args],
     env: childEnv,
-    input: dbUrl === null ? null : JSON.stringify(session === null ? { dbUrl } : { dbUrl, session }) + "\n",
+    input: dbUrl === null ? null
+      : JSON.stringify(session !== null ? { dbUrl, session } : exportNhp !== null ? { dbUrl, noHeadParityOrgs: exportNhp.orgs } : { dbUrl }) + "\n",
   };
 }
 
@@ -121,7 +134,9 @@ export function backlogOpsChildSpawn(
  */
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8"),
   revisionsSinceMs: number | null = backlogOpsRevisionsSince(env, d)) {
-  const paths = backlogOpsPaths(env), scope = backlogOpsScope(env).id;
+  const paths = backlogOpsPaths(env), scopeFull = backlogOpsScope(env), scope = scopeFull.id;
+  // Path B's id from this run's environment: an export-execute's DRY and a drain-execute's EXPORT must have recorded it.
+  const nhpId = backlogOpsNoHeadParity(env, d, scopeFull)?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
   // The ledger target this run's tool gets (read only when a binding needs it): a backfill or drain must have it equal
   // to the backfill / drain runs it binds (its dry run, the drain's BACKFILL and FULL).
   const ledgerTool = BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(d.mode));
@@ -142,7 +157,9 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
       try { if (JSON.parse(raw)?.mode === b.altMode) mode = b.altMode; } catch { /* checkBoundReceipt refuses it */ }
     }
     const bindsLedger = ledgerTool && BACKLOG_OPS_LEDGER_TOOLS.includes(toolOf(mode));
-    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}) });
+    const bindsNhp = (d.mode === "export-execute" && b.kind === "dry") || (d.mode === "drain-execute" && b.kind === "export");
+    checkBoundReceipt(raw, { mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact, ...(bindsLedger ? { ledger: ledger() } : {}),
+      ...(bindsNhp ? { noHeadParity: nhpId } : {}) });
     if (isCatchup(mode) && (revisionsSinceMs === null || JSON.parse(raw).summary.revisions_since_ms !== revisionsSinceMs))
       refuse(`backlog_ops_bound_${b.kind}_since`);
     raws[b.kind] = raw;
@@ -221,11 +238,15 @@ export async function backlogOpsRun(
   const scope = backlogOpsScope(env);
   // GitHub masks the secret's whole value; mask each org too, so a tool line naming one org never shows it.
   for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
+  // Path B's allow-list and age (shape, scope), before any credential; its orgs masked too.
+  const nhp = backlogOpsNoHeadParity(env, d, scope);
+  for (const org of nhp?.orgs ?? []) console.log(`::add-mask::${org}`);
   const since = backlogOpsRevisionsSince(env, d);
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope, isCatchup(d.mode) ? since : null, toolOf(d.mode) === "export" ? nhp : null);
   // The ledger target's shape, before any credential (backlog_ops_target_ledger_bucket / _region), and its receipt id.
   const ledger = backlogOpsLedgerId(d, backlogOpsLedgerTarget(env, t));
   checkBoundReceipts(env, d, undefined, since);
+  const nhpId = nhp?.id ?? BACKLOG_OPS_NO_HEAD_PARITY_NONE;
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
   // Credentials from here on: the database URL (backfill, export, presence) and the role session.
@@ -234,8 +255,8 @@ export async function backlogOpsRun(
   const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session);
   const { code, stdout } = await (deps.runChild ?? runChild)(child);
   let receipt;
-  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger); }
-  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id, ledger); }
+  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id, ledger, nhpId); }
+  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id, ledger, nhpId); }
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return receipt.exitCode === 0 && code === 0 ? 0 : 1;

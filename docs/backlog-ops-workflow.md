@@ -212,6 +212,66 @@ the sorted list).
   that safe is the operator's order: bind only a backfill that began after the scope's stop. A follow-up gate change
   will require the drain's BACKFILL and FULL receipts to carry exactly the drain's scope.
 
+## Path B: no-head parity (per org, default off)
+
+Decision 0005 step 0b, "Path B". While Neon is the privacy authority, the export cannot prove that a user has no
+control head. That user's buffered stages then stay unpublished (`head_unproven`). For orgs on an allow-list only,
+Path B accepts the SQL reader's own no-head proof without the authority:
+- the user has no control receipt on any epoch;
+- a `no_head` `owner_buffered_parity` row that still matches the digests recomputed at the verdict;
+- that row is at most the maximum age old.
+
+A row older than that is `head_unproven_parity_stale`, and a fenced authority still wins (`privacy_fenced`). Each
+stage published this way gets a proof record under `.drain/accepted-proofs/v1/` (execute only); its sidecar and
+the drain are unchanged.
+
+**Configuration (never a dispatch input: run inputs and logs of this public repository are public).**
+- `BACKLOG_OPS_NO_HEAD_PARITY_ORGS`: an environment **secret** in the same format as `BACKLOG_OPS_ORGS`
+  (comma-separated lowercase org UUIDs). Every org in it must also be in the run's `BACKLOG_OPS_ORGS` scope, so a
+  scoped run is required (`backlog_ops_no_head_parity_scope`). Set it identically on both environments, or on
+  neither.
+- `BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS`: an environment **variable** of digits, 60 to 21600 (6 h). It is
+  required exactly when the list is set (`backlog_ops_no_head_parity_max_age`). Set it identically on both
+  environments.
+- The workflow passes both values to the tool step for export and drain modes only. Every other mode refuses
+  either one (`backlog_ops_no_head_parity_unexpected`).
+- The export receives the list only on its stdin pipe, never in argv or a log, and each org is masked. It receives
+  the age as `--no-head-parity-max-age`.
+- Unset, every argv, stdin payload, summary and receipt is byte-identical to before.
+- The receipt records `no_head_parity: nhp_<32 hex>`, a hash of the sorted list and the age, and only when the list
+  is set.
+- Binding is refusal-only:
+  - an `export-execute` refuses unless its DRY recorded the same id
+    (`backlog_ops_bound_dry_no_head_parity`);
+  - a `drain-execute` refuses unless the EXPORT it binds recorded the id of its own environment's values
+    (`backlog_ops_bound_export_no_head_parity`);
+  - a receipt without the field counts as unset;
+  - the drain tool gets neither value, and what it publishes is unchanged.
+- The parity age is checked at each run's own verdict. An execute re-checks it on its own and never inherits the
+  dry run's result, so a parity row that ages out between the dry run and the execute is refused at the execute.
+
+**Residual risk, stated plainly:** a Neon-only deletion in the census-to-drain window is readable until the eraser
+removes it. Concretely, a deletion that reached Neon only (never the Worker) between the parity census and the drain
+is published and readable until the Neon-mode eraser removes it (10 min nominal, 48 h SLA).
+
+**Per-org procedure.** Every step is required, one org at a time.
+1. Once, for the allow-listed orgs, compare Neon's control heads with Supabase's receipts. Any user with a Neon
+   head but no Supabase receipt is out: drop the org from the list, or stop.
+2. Confirm that `INGEST_S3_FENCE_MIRROR=on` and that the Neon-mode eraser is running.
+3. Confirm that the drain's target bucket and key root equal those of the running Neon eraser. If they differ,
+   drained objects are outside erasure coverage. Do not proceed.
+4. Run a fresh bulk parity (the owner parity census) immediately before each export, so its rows are well inside
+   the maximum age at both the dry run and the execute.
+5. Run `export-dry`, then `export-execute` (the same list and age), then `drain-dry` and `drain-execute`, as in
+   [Modes and order](#modes-and-order).
+6. After the org's drain, run a Neon re-census. Check the list it produces against both the object store and the
+   search index. Any hit blocks the next org.
+
+**Open item:** this repository does not confirm that an erase also removes search-index rows created between the
+census and the drain. Search-index removal depends on the S3 ObjectRemoved -> search-index predicate-delete path.
+The eraser does not delete search-index rows itself. Until that is confirmed, step 6's search-index check is the
+control.
+
 ## Gates
 
 Every run passes the same gates as the guarded schema release:

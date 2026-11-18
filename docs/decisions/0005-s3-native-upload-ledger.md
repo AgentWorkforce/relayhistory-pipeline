@@ -118,6 +118,41 @@ one-time **fence backfill**:
    lists the stage keys whose receipt was acknowledged (`ingest_buffer_outbox.active_stage_token` and the
    committed `ingest_batches` rows) into an S3 manifest. The drain writes only stages on that list and
    reports the rest. Like the fence backfill, this is a one-time migration read, not ongoing accounting.
+
+   **Path B (no-head parity, per org, default off).** The export applies the SQL reader's per-user gate. For a user
+   with no mirrored control head it normally also requires the privacy authority to be ACTIVE on the policy's
+   control epoch, so while Neon is the authority, every such user's buffered stages stay unpublished. Path B
+   relaxes only that requirement, and only for orgs on an explicit allow-list (`--no-head-parity-org`; in the
+   workflow the secret `BACKLOG_OPS_NO_HEAD_PARITY_ORGS`, see docs/backlog-ops-workflow.md). An absent head
+   counts as version 0 without the authority when all of these hold, which is exactly the SQL reader's own no-head
+   branch (`owner_buffered_read_scope`, 20261105043700):
+   - the user has no control receipt on any epoch;
+   - the user's `owner_buffered_parity` row exists and says `no_head`;
+   - that row still matches the deletion-set, reset-set and lineage digests and the generation, all recomputed
+     at the export's verdict.
+
+   The export adds one condition beyond the reader: the row is at most the run's maximum age old, on the database
+   clock at that run's own verdict. If it is older, the reason is `head_unproven_parity_stale`. A fenced authority
+   still refuses everything (`privacy_fenced`). The stage's sidecar is unchanged (the drain is unchanged); a separate
+   proof record `.drain/accepted-proofs/v1/<org>/<sha256(stage key)>.json` (`proof: "no_head_parity"`) marks
+   each stage published this way. With the list empty, everything is byte-identical to before.
+
+   **Residual risk, stated plainly:** a Neon-only deletion in the census-to-drain window is readable until the
+   eraser removes it. Concretely, a deletion that reached Neon only (never the Worker) between the parity census
+   and the drain is published and readable until the Neon-mode eraser removes it (10 min nominal, 48 h SLA).
+   Preconditions for each allow-listed org, all required:
+   - a fresh bulk parity right before each export;
+   - `INGEST_S3_FENCE_MIRROR=on`;
+   - the Neon-mode eraser running;
+   - the drain's target bucket and key root equal to the running Neon eraser's (otherwise drained objects are
+     outside erasure coverage);
+   - a one-time comparison of Neon control heads against Supabase receipts for the allow-listed orgs;
+   - after each org's drain, a Neon re-census whose list is checked against both the object store and the search
+     index. Any hit blocks the next org.
+
+   **Open item:** this repository does not confirm that an erase also removes search-index rows created between
+   the census and the drain. Search-index removal depends on the S3 ObjectRemoved -> search-index predicate-delete
+   path. The eraser does not delete search-index rows itself.
 1. List `buffered-batches/v1/` staged objects. Each carries its tenant, origin and grouped scrubbed
    lines (`staging.ts:222`).
 2. Read the user's fence and privacy journal. Drop deleted sessions and batches the user's last reset

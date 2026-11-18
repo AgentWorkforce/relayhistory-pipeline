@@ -71,6 +71,21 @@
  * counts as `all`. Scoping changes no tool rule: the drain still writes nothing for an org without its
  * fence-authority marker.
  *
+ * Path B (no-head parity, docs/decisions/0005-s3-native-upload-ledger.md step 0b; default off): the export modes may
+ * prove an absent control head by a fresh no_head parity row alone for the orgs in the environment SECRET
+ * BACKLOG_OPS_NO_HEAD_PARITY_ORGS (same format as BACKLOG_OPS_ORGS, set identically on both environments or on
+ * neither; every org must be in the run's BACKLOG_OPS_ORGS scope, so a scoped run is required), with the parity row's
+ * maximum age in the environment variable BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS (digits, 60 to 21600, required
+ * exactly when the list is set). Neither is a dispatch input: run inputs are public. The list reaches the export only
+ * on its stdin pipe (never argv or a log); the age as --no-head-parity-max-age. The receipt records `no_head_parity`,
+ * a hash of the sorted list and the age (`nhp_<32 hex>`), only when the list is set (so with it unset every receipt is
+ * byte-identical to before). Binding, refusal-only: an export-execute refuses unless its dry run recorded the same
+ * value (backlog_ops_bound_dry_no_head_parity), and a drain-execute refuses unless the export it binds recorded the
+ * value its own environment gives (backlog_ops_bound_export_no_head_parity); a receipt without the field counts as
+ * unset. The drain tool itself is unchanged and gets neither value. Every other mode refuses either variable set.
+ * The parity age is checked by the export's SQL at each run's own verdict, so an execute re-checks it, never inherits
+ * the dry run's.
+ *
  * Receipts are counts only: every leaf a number, a boolean or a short lowercase code; any other string (an id, a
  * key, a URL) refuses the receipt. Errors carry fixed codes only.
  *
@@ -147,6 +162,7 @@ const CODE = /^[a-z][a-z0-9_]{0,39}$/u;
 const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const SCOPE_ID = /^(all|orgs_[0-9a-f]{32})$/u;
 const LEDGER_ID = /^(none|ledger_[0-9a-f]{32})$/u;
+const NHP_ID = /^(none|nhp_[0-9a-f]{32})$/u;
 /** The most orgs one scoped run may name. */
 export const BACKLOG_OPS_MAX_ORGS = 64;
 const KEY = /^[a-z][a-z0-9_]{0,63}$/u;
@@ -328,6 +344,35 @@ export function backlogOpsScope(env: Record<string, string | undefined>): Backlo
   return { orgs, id: "orgs_" + createHash("sha256").update(orgs.join(",")).digest("hex").slice(0, 32) };
 }
 
+/** Path B (header): the allow-list, the parity row's maximum age and their receipt id. Null when off. */
+export interface BacklogOpsNoHeadParity { orgs: string[]; maxAgeSeconds: number; id: string }
+export const BACKLOG_OPS_NO_HEAD_PARITY_NONE = "none";
+export const BACKLOG_OPS_NO_HEAD_PARITY_MIN_AGE_SECONDS = 60;
+export const BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS = 6 * 60 * 60;
+/** The tools that read Path B's variables: the export (uses them) and the drain (binds its export's record of them). */
+const NHP_TOOLS: readonly BacklogOpsTool[] = ["export", "drain"];
+export function backlogOpsNoHeadParity(env: Record<string, string | undefined>, d: Pick<BacklogOpsDispatch, "mode">, scope: BacklogOpsScope): BacklogOpsNoHeadParity | null {
+  const raw = (env.BACKLOG_OPS_NO_HEAD_PARITY_ORGS ?? "").trim(), ageRaw = (env.BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS ?? "").trim();
+  if (!NHP_TOOLS.includes(toolOf(d.mode))) {
+    if (raw !== "" || ageRaw !== "") refuse("backlog_ops_no_head_parity_unexpected");
+    return null;
+  }
+  if (raw === "") {
+    if (ageRaw !== "") refuse("backlog_ops_no_head_parity_max_age");
+    return null;
+  }
+  const parts = raw.split(",");
+  if (parts.length > BACKLOG_OPS_MAX_ORGS || !parts.every((o) => ORG_UUID.test(o))) refuse("backlog_ops_no_head_parity_orgs");
+  const orgs = [...new Set(parts)].sort();
+  if (orgs.length !== parts.length) refuse("backlog_ops_no_head_parity_orgs");
+  // At most the run's scope: a scoped run, every listed org in it.
+  if (scope.orgs === null || !orgs.every((o) => scope.orgs!.includes(o))) refuse("backlog_ops_no_head_parity_scope");
+  if (!/^[1-9][0-9]{1,4}$/u.test(ageRaw) || Number(ageRaw) < BACKLOG_OPS_NO_HEAD_PARITY_MIN_AGE_SECONDS || Number(ageRaw) > BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS)
+    refuse("backlog_ops_no_head_parity_max_age");
+  const maxAgeSeconds = Number(ageRaw);
+  return { orgs, maxAgeSeconds, id: "nhp_" + createHash("sha256").update(`backlog-ops-no-head-parity/v1\n${orgs.join(",")}\n${maxAgeSeconds}`).digest("hex").slice(0, 32) };
+}
+
 /**
  * The backfill's paging for production. Its users page is a DISTINCT over six tables, one of which (ingest_batches)
  * has no index on the owner key, so every page scans in full: the tool's 30 s default timed out on the first page
@@ -383,8 +428,10 @@ export function backlogOpsRevisionsSince(env: Record<string, string | undefined>
 
 /** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL },
-  revisionsSinceMs: number | null = null): { script: string; args: string[]; needsDb: boolean } {
+  revisionsSinceMs: number | null = null, noHeadParity: BacklogOpsNoHeadParity | null = null): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
+  // Path B reaches the export only (its orgs on stdin, backlogOpsChildSpawn; its age here).
+  if (noHeadParity !== null && tool !== "export") refuse("backlog_ops_no_head_parity_unexpected");
   // A catch-up needs its t (backlogOpsRevisionsSince); nothing else passes one.
   if (isCatchup(d.mode) !== (revisionsSinceMs !== null) || (revisionsSinceMs !== null && (!Number.isSafeInteger(revisionsSinceMs) || revisionsSinceMs < 1)))
     refuse("backlog_ops_revisions_since");
@@ -406,7 +453,8 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
     // Opt-in (slot_pace_ms, with slots_read=org only): the paced org slot read.
     ...(tool === "backfill" && d.slotsRead === "org" && d.slotPaceMs !== null ? ["--slot-pace-ms", String(d.slotPaceMs)] : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
-    ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
+    ...(scope.orgs ?? []).flatMap((o) => ["--org", o]),
+    ...(noHeadParity !== null ? ["--no-head-parity-max-age", String(noHeadParity.maxAgeSeconds)] : [])];
   return { script, args, needsDb: tool !== "drain" };
 }
 
@@ -464,15 +512,18 @@ export interface BacklogOpsReceipt {
   scope: string;
   /** The ledger target's id (backlogOpsLedgerId): `none` or `ledger_<32 hex>`; never a bucket name. */
   ledger: string;
+  /** Path B's id (backlogOpsNoHeadParity): present only when its allow-list is set; never an org id. */
+  no_head_parity?: string;
   exitCode: number;
   summary: unknown;
 }
 
 /** Parse the tool's last stdout line into a counts-only receipt (or a refused one). */
 export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string, scope: string = BACKLOG_OPS_SCOPE_ALL,
-  ledger: string = BACKLOG_OPS_LEDGER_NONE): BacklogOpsReceipt {
+  ledger: string = BACKLOG_OPS_LEDGER_NONE, noHeadParity: string = BACKLOG_OPS_NO_HEAD_PARITY_NONE): BacklogOpsReceipt {
   if (!SCOPE_ID.test(scope)) refuse("backlog_ops_scope");
   if (!LEDGER_ID.test(ledger)) refuse("backlog_ops_ledger_id");
+  if (!NHP_ID.test(noHeadParity)) refuse("backlog_ops_no_head_parity_id");
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
   let summary: unknown = { refused: "no_summary" };
   const last = lines.at(-1);
@@ -481,7 +532,9 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
     try { parsed = JSON.parse(last); } catch { parsed = undefined; }
     summary = parsed === undefined ? { refused: "summary_unparsed" } : countsOnly(parsed);
   }
-  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger, exitCode, summary };
+  // Unset: no field at all, so the receipt is byte-identical to one from before Path B.
+  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, ledger,
+    ...(noHeadParity !== BACKLOG_OPS_NO_HEAD_PARITY_NONE ? { no_head_parity: noHeadParity } : {}), exitCode, summary };
 }
 
 const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : null);
@@ -494,7 +547,8 @@ const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "obje
  * scoped org's admission stop or freshness, so it must never satisfy a scoped drain).
  */
 export type BacklogOpsBindingKind = "dry" | "backfill" | "full" | "export";
-export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind; exact?: boolean; ledger?: string }): void {
+export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind; exact?: boolean; ledger?: string;
+  noHeadParity?: string }): void {
   // A presence receipt never feeds an execute (presence binds nothing and nothing binds it).
   if (toolOf(expect.mode) === "presence") refuse("backlog_ops_bound_presence_receipt");
   let r: Record<string, any> | null;
@@ -513,6 +567,13 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
     const gotLedger = r.ledger === undefined ? BACKLOG_OPS_LEDGER_NONE : r.ledger;
     if (typeof gotLedger !== "string" || !LEDGER_ID.test(gotLedger) || !LEDGER_ID.test(expect.ledger) || gotLedger !== expect.ledger)
       refuse(`backlog_ops_bound_${toolOf(expect.mode)}_ledger`);
+  }
+  // Path B's id (only where the caller binds it: an export-execute's DRY, a drain-execute's EXPORT). A receipt without
+  // the field had the allow-list unset (`none`).
+  if (expect.noHeadParity !== undefined) {
+    const gotNhp = r.no_head_parity === undefined ? BACKLOG_OPS_NO_HEAD_PARITY_NONE : r.no_head_parity;
+    if (typeof gotNhp !== "string" || !NHP_ID.test(gotNhp) || !NHP_ID.test(expect.noHeadParity) || gotNhp !== expect.noHeadParity)
+      refuse(`backlog_ops_bound_${expect.kind ?? "dry"}_no_head_parity`);
   }
   const s = obj(r.summary);
   if (!s || s.refused !== undefined) refuse(`backlog_ops_bound_${toolOf(expect.mode)}_refused`);

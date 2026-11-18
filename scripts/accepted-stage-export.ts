@@ -25,18 +25,27 @@
  * It runs AFTER the fence backfill, and again right before the drain. It needs the owner's explicit OK. Rerunning
  * converges. Before draining: `failed`, `fence_late` and `orgs.incomplete` must all be 0.
  *
+ * Path B (default off; docs/decisions/0005-s3-native-upload-ledger.md step 0b): --no-head-parity-org <uuid> (repeatable,
+ * lowercase UUIDs, each also given as --org) with --no-head-parity-max-age <seconds | ISO duration like PT2H>, at most
+ * 6 h, required with the list and refused without it. The list may instead come on stdin as "noHeadParityOrgs": [...]
+ * beside dbUrl (how the backlog-ops workflow passes it, so the org ids never reach argv or a log); never both. For those
+ * orgs only, a user with no control head is proven at version 0 by a no_head parity row at most that old (checked at
+ * this run's verdict), with no control receipt and no active privacy authority needed (src/session-ingest/
+ * accepted-stage-export.ts "path B"). Empty: byte-identical to before.
+ *
  * Output: one JSON line of counts only (never a key, tenant id, hash or URL).
  */
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { MAX_EXPORT_CONCURRENCY, exportAcceptedStages } from "../src/session-ingest/accepted-stage-export.ts";
+import { MAX_EXPORT_CONCURRENCY, NO_HEAD_PARITY_MAX_AGE_SECONDS, exportAcceptedStages } from "../src/session-ingest/accepted-stage-export.ts";
 
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
 const ORG = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
 const KMS = /^arn:aws:kms:[a-z0-9-]+:\d{12}:key\/[0-9a-f-]{36}$/;
+const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface ExportArgs {
   mode: "dry_run" | "execute";
@@ -47,14 +56,46 @@ export interface ExportArgs {
   concurrency: number;
   statementTimeoutMs: number;
   kmsKeyArn?: string;
+  /** Path B's orgs from argv (the workflow passes them on stdin instead; see resolveNoHeadParity). */
+  noHeadParityOrgs: string[];
+  /** Path B's maximum parity row age, seconds; null when not given. */
+  noHeadParityMaxAgeSeconds: number | null;
 }
 
-const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn"]);
+/** Seconds, or an ISO 8601 duration of hours / minutes / seconds only (PT6H, PT90M, PT1H30M); null when malformed. */
+export function parseMaxAge(v: string): number | null {
+  if (/^[1-9][0-9]{0,5}$/.test(v)) return Number(v);
+  const m = /^PT(?:([0-9]{1,2})H)?(?:([0-9]{1,4})M)?(?:([0-9]{1,6})S)?$/.exec(v);
+  if (!m || v === "PT") return null;
+  return Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0);
+}
+
+/**
+ * Path B's final list and age: argv's or stdin's list (never both), every org a lowercase UUID inside the run's --org
+ * scope, the age required (1 s to 6 h) exactly when the list is non-empty. Null: off.
+ */
+export function resolveNoHeadParity(args: ExportArgs, stdinOrgs: unknown): { orgs: string[]; maxAgeSeconds: number } | null {
+  if (stdinOrgs !== undefined && (!Array.isArray(stdinOrgs) || !stdinOrgs.every((o) => typeof o === "string"))) throw new Error("no_head_parity_orgs_invalid");
+  if (stdinOrgs !== undefined && args.noHeadParityOrgs.length) throw new Error("no_head_parity_orgs_twice");
+  const orgs = (stdinOrgs as string[] | undefined) ?? args.noHeadParityOrgs;
+  if (orgs.length === 0) {
+    if (args.noHeadParityMaxAgeSeconds !== null) throw new Error("no_head_parity_max_age_without_orgs");
+    return null;
+  }
+  if (!orgs.every((o) => ORG_UUID.test(o)) || new Set(orgs).size !== orgs.length) throw new Error("no_head_parity_orgs_invalid");
+  if (!orgs.every((o) => args.orgs.includes(o))) throw new Error("no_head_parity_outside_scope");
+  const age = args.noHeadParityMaxAgeSeconds;
+  if (age === null) throw new Error("no_head_parity_max_age_required");
+  return { orgs: [...orgs].sort(), maxAgeSeconds: age };
+}
+
+const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn",
+  "--no-head-parity-org", "--no-head-parity-max-age"]);
 const BOOL_FLAGS = new Set(["--dry-run", "--execute"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
 export function parseExportArgs(argv: string[]): ExportArgs {
-  const orgs: string[] = [];
+  const orgs: string[] = [], nhp: string[] = [];
   const one = new Map<string, string>();
   const bools = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
@@ -64,6 +105,7 @@ export function parseExportArgs(argv: string[]): ExportArgs {
     const v = argv[++i];
     if (v === undefined || v.startsWith("--")) throw new Error(`${a} needs a value`);
     if (a === "--org") orgs.push(v);
+    else if (a === "--no-head-parity-org") nhp.push(v);
     else if (one.has(a)) throw new Error(`${a} given twice`);
     else one.set(a, v);
   }
@@ -82,8 +124,15 @@ export function parseExportArgs(argv: string[]): ExportArgs {
   const kmsKeyArn = one.get("--kms-key-arn");
   if (mode === "execute" && (kmsKeyArn === undefined || !KMS.test(kmsKeyArn))) throw new Error("--execute requires --kms-key-arn (the bucket's KMS key ARN)");
   if (mode === "dry_run" && kmsKeyArn !== undefined) throw new Error("--kms-key-arn is only for --execute");
+  for (const org of nhp) if (!ORG_UUID.test(org)) throw new Error("--no-head-parity-org must be a lowercase org UUID");
+  if (new Set(nhp).size !== nhp.length) throw new Error("--no-head-parity-org given twice for one org");
+  if (!nhp.every((o) => orgs.includes(o))) throw new Error("--no-head-parity-org must also be given as --org");
+  const ageRaw = one.get("--no-head-parity-max-age");
+  const age = ageRaw === undefined ? null : parseMaxAge(ageRaw);
+  if (ageRaw !== undefined && (age === null || age < 1 || age > NO_HEAD_PARITY_MAX_AGE_SECONDS))
+    throw new Error(`--no-head-parity-max-age must be seconds or an ISO duration (PT2H), 1 s to ${NO_HEAD_PARITY_MAX_AGE_SECONDS} s`);
   return {
-    mode, bucket, region, orgs,
+    mode, bucket, region, orgs, noHeadParityOrgs: nhp, noHeadParityMaxAgeSeconds: age,
     pageSize: int("--page-size", 1, 10_000) ?? 1_000,
     concurrency: int("--concurrency", 1, MAX_EXPORT_CONCURRENCY) ?? 8,
     statementTimeoutMs: int("--statement-timeout-ms", 1_000, 600_000) ?? 30_000,
@@ -105,7 +154,7 @@ if (import.meta.main) {
   try {
     args = parseExportArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--page-size n] [--concurrency n] [--statement-timeout-ms n]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--page-size n] [--concurrency n] [--statement-timeout-ms n] [--no-head-parity-org uuid ... --no-head-parity-max-age seconds|PT2H]; {"dbUrl": …[, "noHeadParityOrgs": [...]]} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -117,7 +166,9 @@ if (import.meta.main) {
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { throw new Error("stdin_invalid"); }
     let dbUrl = (parsed as { dbUrl?: unknown } | null)?.dbUrl;
-    if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== 1) throw new Error("db_url_required");
+    const keys = parsed && typeof parsed === "object" ? Object.keys(parsed) : [];
+    if (typeof dbUrl !== "string" || !dbUrl || !keys.every((k) => k === "dbUrl" || k === "noHeadParityOrgs")) throw new Error("db_url_required");
+    const noHeadParity = resolveNoHeadParity(args, (parsed as { noHeadParityOrgs?: unknown }).noHeadParityOrgs);
     // Keep the base options (idle_in_transaction_session_timeout) and add read-only by default; TCP keepalives so a
     // NAT or pooler does not idle the socket out between pages (as upload-fence-backfill.ts).
     const base = ownerClientConfig(dbUrl, "96bulls-accepted-stage-export");
@@ -137,6 +188,7 @@ if (import.meta.main) {
       store, keyRoot: "96bulls", dryRun: args.mode === "dry_run",
       ...(args.orgs.length ? { orgs: args.orgs } : {}),
       pageSize: args.pageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
+      ...(noHeadParity ? { noHeadParity } : {}),
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

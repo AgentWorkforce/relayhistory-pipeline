@@ -5,12 +5,12 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { CANDIDATE_KEYS, exportAcceptedStages, exportLockKey, scopedExportSql, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
+import { CANDIDATE_KEYS, NO_HEAD_PARITY_MAX_AGE_SECONDS, acceptedProofKey, exportAcceptedStages, exportLockKey, scopedExportSql, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
 import { ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, drainBufferedBatches, parseAcceptedComplete, parseAcceptedMarker } from "../buffered-drain.ts";
 import { applyFenceChange, fenceEpoch, orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedKey } from "../staging.ts";
 import type { Group } from "../writer.ts";
-import { parseExportArgs } from "../../../scripts/accepted-stage-export.ts";
+import { parseExportArgs, parseMaxAge, resolveNoHeadParity } from "../../../scripts/accepted-stage-export.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
 import { scratchStore } from "./support.ts";
 
@@ -658,7 +658,8 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     expect(() => parseExportArgs(["--bucket", "my-bucket"])).toThrow("exactly one of");
     expect(() => parseExportArgs(["--bucket", "my-bucket", "--execute"])).toThrow("--kms-key-arn");
     expect(() => parseExportArgs(["--bucket", "my-bucket", "--dry-run", "--org", "../x"])).toThrow("--org");
-    expect(parseExportArgs(["--dry-run", "--bucket", "my-bucket"])).toEqual({ mode: "dry_run", bucket: "my-bucket", region: "us-east-1", orgs: [], pageSize: 1_000, concurrency: 8, statementTimeoutMs: 30_000 });
+    expect(parseExportArgs(["--dry-run", "--bucket", "my-bucket"])).toEqual({ mode: "dry_run", bucket: "my-bucket", region: "us-east-1", orgs: [], pageSize: 1_000, concurrency: 8, statementTimeoutMs: 30_000,
+      noHeadParityOrgs: [], noHeadParityMaxAgeSeconds: null });
   });
 
   test("lander P2-1: a rerun that fails for an org revokes its completion; the drain refuses the org until a clean export", async () => {
@@ -719,4 +720,204 @@ test("scoped export SQL: no generic \"$1 IS NULL OR\" branch, unscoped text unch
   expect(scoped).toContain("o.org_id = ANY($1::text[])");
   const orgs = "WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))";
   expect(scopedExportSql(orgs, true)).toBe("WHERE org_id = ANY($1::text[])");
+});
+
+// ---- Path B (0005 step 0b): a listed org's absent head proven by a fresh no_head parity row, without the authority ----
+
+describe("Path B: no-head parity, per listed org, default off", () => {
+  const one = [{ source: "claude", session: "s1", records: [{ id: "a", rev: 1 }] }];
+  const SCOPE = [A.orgId, C.orgId];
+  const pathB = (orgs: string[] = [A.orgId], maxAgeSeconds = 3600): Partial<ExportOptions> => ({ orgs: SCOPE, noHeadParity: { orgs, maxAgeSeconds } });
+  const exportB = async (store: ObjectStore, s: Seeded, over: Partial<ExportOptions> = pathB()) => {
+    const summary = await run(store, over);
+    return { summary, v: (await verdict(store, s.key))! };
+  };
+  const asReplica = async (fn: () => Promise<unknown>) => {
+    await db.exec("SET session_replication_role = replica");
+    try { await fn(); } finally { await db.exec("SET session_replication_role = origin"); }
+  };
+  const ageParity = (interval: string) => asReplica(() => db.query(`UPDATE sessions.owner_buffered_parity SET written_at = clock_timestamp() - interval '${interval}'`));
+  const proofKey = (s: Seeded) => acceptedProofKey(ROOT, A.orgId, s.key);
+  /** Every object of the store with its bytes (versions differ across stores; contents must not). */
+  async function contents(store: ObjectStore): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const k of await allKeys(store)) {
+      const key = k.slice(0, k.lastIndexOf("@"));
+      if (!key.endsWith("/.drain/export-lock.json")) out[key] = await readText(store, key);
+    }
+    return out;
+  }
+  const OLD_SUMMARY_KEYS = ["mode", "rows", "live", "not_live", "fence_absent", "written", "updated", "already", "would_write", "invalid", "failed",
+    "gated", "fence_late", "superseded", "would_supersede", "orgs"];
+
+  test("off (unset), or on for another org only: the verdicts, the objects and the summary are byte-identical", async () => {
+    // Every absent-head case the gate distinguishes, each under three authorities.
+    const arrangements: [string, () => Promise<void>][] = [
+      ["proven no_head", async () => {}],
+      ["a receipt", async () => {
+        await asReplica(() => db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation) VALUES ($1,$2,$3,$4,1,$5,'selection','{}',$6)`, [A.orgId, A.workspaceId, A.userId, POLICY_EPOCH, hex("d"), GEN]));
+        await prove(A);
+      }],
+      ["no parity row", () => asReplica(() => db.exec("DELETE FROM sessions.owner_buffered_parity"))],
+      ["an old parity row", () => ageParity("1 day")],
+    ];
+    const OFF: Partial<ExportOptions> = { orgs: SCOPE }, ON_OTHER: Partial<ExportOptions> = { orgs: SCOPE, noHeadParity: { orgs: [C.orgId], maxAgeSeconds: 3600 } };
+    for (const authority of ["active", null, "fenced"] as const) {
+      for (const [name, arrange] of arrangements) {
+        // One state, one store: a first run off writes the verdicts; then on (for another org) and off again must
+        // leave every object's bytes as they were and report the same counts.
+        const store = scratch();
+        await backfillFence(store, A);
+        await seed(A, one);
+        await arrange();
+        await setAuthority(authority);
+        const first = await run(store, OFF);
+        expect(Object.keys(first)).toEqual(OLD_SUMMARY_KEYS);
+        const before = await contents(store);
+        const on = await run(store, ON_OTHER);
+        expect(on.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0 });
+        const afterOn = await contents(store);
+        const off = await run(store, OFF);
+        expect(Object.keys(off)).toEqual(OLD_SUMMARY_KEYS);
+        const { no_head_parity: _, ...onRest } = on;
+        expect([authority, name, onRest]).toEqual([authority, name, off]);
+        expect([authority, name, afterOn]).toEqual([authority, name, before]);
+        expect([authority, name, await contents(store)]).toEqual([authority, name, before]);
+        expect(Object.keys(before).some((k) => k.includes("accepted-proofs"))).toBe(false);
+        await db.exec(`SET session_replication_role = replica; DELETE FROM sessions.ingest_control_receipts; DELETE FROM sessions.owner_buffered_parity;
+          DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;`);
+        await setAuthority("active");
+      }
+    }
+  });
+
+  test("positive: listed org, zero receipts, fresh no_head parity, no authority: live, the drain's own sidecar, and a proof record", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await grantAuthority(store);
+    const s = await stageInBoth(store, one);
+    await setAuthority(null);
+    const { summary, v } = await exportB(store, s);
+    expect(summary).toMatchObject({ live: 1, not_live: 0, failed: 0, gated: {}, no_head_parity: { live: 1, proofs: 1, would_proof: 0 } });
+    expect(v).toMatchObject({ v: 2, live: true, kept: [[0]] });
+    // The sidecar is the unchanged six-key v2 marker the drain parses; the proof lives beside it.
+    expect(Object.keys(JSON.parse(await readText(store, s.key + ACCEPTED_SUFFIX))).sort()).toEqual(["fence", "kept", "kind", "live", "stage_sha256", "v"]);
+    expect(JSON.parse(await readText(store, proofKey(s)))).toEqual({ v: 1, kind: "buffered-accepted-proof", proof: "no_head_parity", stage_sha256: s.sha256, max_age_seconds: 3600 });
+    const text = JSON.stringify(summary);
+    for (const needle of ["org-a", "ws-a", "user-1", s.sha256]) expect(text).not.toContain(needle);
+    // The (unchanged) drain publishes it.
+    expect((await drain(store)).objects).toMatchObject({ drained: 1, accepted_mismatch: 0 });
+  });
+
+  test("with an active authority the authority proves the head: live, no Path B proof record", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    const { summary, v } = await exportB(store, s);
+    expect(v.live).toBe(true);
+    expect(summary.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0 });
+    expect(await exists(store, proofKey(s))).toBe(false);
+  });
+
+  test("negatives: org not listed, a receipt, no parity row, parity naming a head -> head_unproven; too old -> head_unproven_parity_stale", async () => {
+    const cases: [string, () => Promise<void>, Partial<ExportOptions>, string][] = [
+      ["org not listed", async () => {}, pathB([C.orgId]), "head_unproven"],
+      ["one receipt on the policy epoch", async () => {
+        await asReplica(() => db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation) VALUES ($1,$2,$3,$4,1,$5,'selection','{}',$6)`, [A.orgId, A.workspaceId, A.userId, POLICY_EPOCH, hex("d"), GEN]));
+        await prove(A);
+      }, pathB(), "head_unproven"],
+      ["one receipt on another epoch", async () => {
+        await asReplica(() => db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation) VALUES ($1,$2,$3,$4,1,$5,'selection','{}',$6)`, [A.orgId, A.workspaceId, A.userId, hex("9"), hex("d"), GEN]));
+        await prove(A);
+      }, pathB(), "head_unproven"],
+      ["no parity row", () => asReplica(() => db.exec("DELETE FROM sessions.owner_buffered_parity")), pathB(), "head_unproven"],
+      ["parity says a head existed", () => asReplica(() => db.query("UPDATE sessions.owner_buffered_parity SET no_head = false, head_epoch = $1, head_version = 1, head_digest = $2, head_kind = 'selection'", [POLICY_EPOCH, hex("d")])), pathB(), "head_unproven"],
+      ["parity older than the max age", () => ageParity("2 hours"), pathB([A.orgId], 3600), "head_unproven_parity_stale"],
+      ["parity written in the future", () => ageParity("-1 hour"), pathB(), "head_unproven_parity_stale"],
+    ];
+    for (const [name, arrange, over, reason] of cases) {
+      const store = scratch();
+      await backfillFence(store, A);
+      const s = await seed(A, one);
+      await setAuthority(null);
+      expect([name, (await exportB(store, s)).v.live]).toEqual([name, true]); // Path B holds before the arrangement
+      await arrange();
+      const { summary, v } = await exportB(store, s, over);
+      expect([name, v.live, summary.gated]).toEqual([name, false, { [reason]: 1 }]);
+      expect([name, summary.no_head_parity]).toEqual([name, { live: 0, proofs: 0, would_proof: 0 }]);
+      await db.exec(`SET session_replication_role = replica; DELETE FROM sessions.ingest_control_receipts; DELETE FROM sessions.owner_buffered_parity;
+        DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;`);
+      await setAuthority("active");
+    }
+  });
+
+  test("negatives: a fenced authority still wins (privacy_fenced); a deletion after the parity census is parity_mismatch (digests recomputed now)", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await setAuthority("fenced");
+    expect(await exportB(store, s)).toMatchObject({ v: { live: false }, summary: { gated: { privacy_fenced: 1 } } });
+    await setAuthority(null);
+    expect((await exportB(store, s)).v.live).toBe(true);
+    // A deletion of another session after the census: the parity row is still no_head and fresh, its digest is stale.
+    await db.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1,$2,$3,$4,'claude','other')", [A.orgId, A.workspaceId, A.userId, ORIGIN]);
+    const after = await exportB(store, s);
+    expect(after.v.live).toBe(false);
+    expect(after.summary.gated).toEqual({ parity_mismatch: 1 });
+    // A reset after the census too.
+    await prove(A);
+    expect((await exportB(store, s)).v.live).toBe(true);
+    await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, reset_at) VALUES ($1,$2,$3,'req-9', now() - interval '1 day')", [A.orgId, A.workspaceId, A.userId]);
+    expect((await exportB(store, s)).summary.gated).toMatchObject({ parity_mismatch: 1 });
+  });
+
+  test("a dry run writes no proof (it cannot forge one); an execute re-checks the parity age at its own verdict", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await setAuthority(null);
+    const dry = await run(store, { ...pathB(), dryRun: true });
+    expect(dry).toMatchObject({ mode: "dry_run", live: 1, would_write: 1, no_head_parity: { live: 1, proofs: 0, would_proof: 1 } });
+    expect(await exists(store, proofKey(s))).toBe(false);
+    expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
+    // The parity row ages past the max between the dry run and the execute: the execute refuses it.
+    await ageParity("2 hours");
+    const { summary, v } = await exportB(store, s, pathB([A.orgId], 3600));
+    expect(v.live).toBe(false);
+    expect(summary.gated).toEqual({ head_unproven_parity_stale: 1 });
+    expect(await exists(store, proofKey(s))).toBe(false);
+  });
+
+  test("options: the list must be non-empty, inside the run's --org scope, and the age bounded", async () => {
+    const store = scratch();
+    for (const [over, err] of [
+      [{ noHeadParity: { orgs: [A.orgId], maxAgeSeconds: 3600 } }, "export_no_head_parity_outside_scope"],
+      [{ orgs: [C.orgId], noHeadParity: { orgs: [A.orgId], maxAgeSeconds: 3600 } }, "export_no_head_parity_outside_scope"],
+      [{ orgs: SCOPE, noHeadParity: { orgs: [], maxAgeSeconds: 3600 } }, "export_no_head_parity_orgs_invalid"],
+      [{ orgs: SCOPE, noHeadParity: { orgs: [A.orgId], maxAgeSeconds: 0 } }, "export_no_head_parity_max_age_invalid"],
+      [{ orgs: SCOPE, noHeadParity: { orgs: [A.orgId], maxAgeSeconds: NO_HEAD_PARITY_MAX_AGE_SECONDS + 1 } }, "export_no_head_parity_max_age_invalid"],
+    ] as [Partial<ExportOptions>, string][])
+      expect(run(store, over)).rejects.toThrow(err);
+  });
+
+  test("CLI: Path B flags (lowercase UUIDs inside --org, the age required with them and bounded), or the list on stdin, never both", () => {
+    const O1 = "11111111-2222-4333-8444-555555555555", O2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const base = ["--dry-run", "--bucket", "my-bucket", "--org", O1, "--org", O2];
+    expect(parseExportArgs(base)).toMatchObject({ noHeadParityOrgs: [], noHeadParityMaxAgeSeconds: null });
+    expect(parseExportArgs([...base, "--no-head-parity-org", O1, "--no-head-parity-max-age", "PT1H30M"])).toMatchObject({ noHeadParityOrgs: [O1], noHeadParityMaxAgeSeconds: 5400 });
+    expect(parseExportArgs([...base, "--no-head-parity-max-age", "3600"]).noHeadParityMaxAgeSeconds).toBe(3600);
+    expect(parseMaxAge("PT6H")).toBe(21_600);
+    for (const bad of ["0", "21601", "PT7H", "PT", "1h", "-5", "P1D"])
+      expect(() => parseExportArgs([...base, "--no-head-parity-max-age", bad])).toThrow("--no-head-parity-max-age");
+    expect(() => parseExportArgs([...base, "--no-head-parity-org", O2.toUpperCase()])).toThrow("lowercase");
+    expect(() => parseExportArgs(["--dry-run", "--bucket", "my-bucket", "--org", O2, "--no-head-parity-org", O1])).toThrow("also be given as --org");
+    const args = parseExportArgs(base);
+    expect(resolveNoHeadParity(args, undefined)).toBeNull();
+    expect(() => resolveNoHeadParity({ ...args, noHeadParityMaxAgeSeconds: 60 }, undefined)).toThrow("no_head_parity_max_age_without_orgs");
+    expect(() => resolveNoHeadParity(args, [O1])).toThrow("no_head_parity_max_age_required");
+    expect(resolveNoHeadParity({ ...args, noHeadParityMaxAgeSeconds: 60 }, [O2, O1])).toEqual({ orgs: [O1, O2], maxAgeSeconds: 60 });
+    expect(() => resolveNoHeadParity({ ...args, noHeadParityMaxAgeSeconds: 60 }, ["33333333-2222-4333-8444-555555555555"])).toThrow("no_head_parity_outside_scope");
+    expect(() => resolveNoHeadParity({ ...args, noHeadParityOrgs: [O1], noHeadParityMaxAgeSeconds: 60 }, [O1])).toThrow("no_head_parity_orgs_twice");
+    expect(() => resolveNoHeadParity({ ...args, noHeadParityMaxAgeSeconds: 60 }, "x")).toThrow("no_head_parity_orgs_invalid");
+  });
 });

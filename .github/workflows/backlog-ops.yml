@@ -16,6 +16,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # binds a refresh. The optional org scope is the
 # environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
 # empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
+# Path B (default off) is the SECRET BACKLOG_OPS_NO_HEAD_PARITY_ORGS and the variable BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS,
+# passed to the tool step for export and drain modes only; the receipt records only their hash.
 # presence-dry is DRY ONLY (no presence-execute exists or is accepted): a counts-only look at ONE session for support
 # diagnosis, in the dry environment with the dry AWS role; its DB login is the migration owner, read-only only by
 # default_transaction_read_only=on and a READ ONLY transaction. Its session id is the dry environment's SECRET
@@ -274,6 +276,12 @@ jobs:
           BACKLOG_OPS_LEDGER_BUCKET: ${{ vars.BACKLOG_OPS_LEDGER_BUCKET }}
           BACKLOG_OPS_LEDGER_REGION: ${{ vars.BACKLOG_OPS_LEDGER_REGION }}
           BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}
+          # Path B (src/session-ingest/backlog-ops.ts; default off): the export's no-head-parity allow-list (a SECRET,
+          # same format as BACKLOG_OPS_ORGS and inside it; set identically on both environments or neither) and the parity
+          # row's maximum age in seconds (a variable, 60-21600). Never dispatch inputs (run inputs are public). Export
+          # modes use them; drain modes only check the bound export recorded the same; every other mode gets them empty.
+          BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && secrets.BACKLOG_OPS_NO_HEAD_PARITY_ORGS || '' }}
+          BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && vars.BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS || '' }}
           BACKLOG_OPS_REVISIONS_SINCE_MS: ${{ steps.recheck.outputs.revisions_since_ms }}
         run: bun scripts/backlog-ops.ts
       - name: Publish the counts-only receipt

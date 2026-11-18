@@ -36,6 +36,18 @@
  *                 unproven; and the owner's G2 parity row matching that head and the deletion-set,
  *                 reset-set and lineage digests recomputed now. A closed gate is not live, counted by reason
  *                 (`gated`). The export role must be able to run the owner-only parity function (the owner login).
+ *   path B        `noHeadParity` (default off; docs/decisions/0005 step 0b, "Path B"): for the listed orgs only, an absent
+ *                 head also counts as version 0 WITHOUT an active privacy authority, exactly as the SQL reader's own
+ *                 no-head branch accepts it (owner_buffered_read_scope, 20261105043700: it never consults the
+ *                 authority's state beyond `fenced`): the user has no control receipt on any epoch, the current
+ *                 parity row says no_head, and (the checks below, unchanged) it still matches the digests recomputed
+ *                 now; and, beyond the reader, the parity row is at most `maxAgeSeconds` old on the database clock at
+ *                 THIS run's verdict (`head_unproven_parity_stale` otherwise). A fenced authority still wins
+ *                 (`privacy_fenced`). A stage live by this path gets, besides its unchanged sidecar, a proof record
+ *                 `<keyRoot>/.drain/accepted-proofs/v1/<org>/<sha256(stage key)>.json` {proof: "no_head_parity"}
+ *                 (execute only, before the sidecar; never deleted). The sidecar itself is unchanged, because the
+ *                 drain (buffered-drain.ts, untouched) accepts only the six-key v2 marker. With `noHeadParity` unset
+ *                 the verdict, the objects and the summary are byte-identical to before.
  *   the S3 fence  the user's S3 fence as the export saw it (instance, resets, resetsCompleted, and the epoch of every
  *                 kept session), read BEFORE the SQL snapshot of the verdict (a candidate page lists the users first):
  *                 the drain refuses a stage when any of these has moved since (`fence_moved_since_export`), so a
@@ -98,10 +110,22 @@ export interface ExportOptions {
   statementTimeoutMs?: number;
   nowMs?: () => number;
   lockTtlMs?: number;
+  /**
+   * Path B (header): orgs whose absent control heads may be proven by a fresh no_head parity row alone. Every org must
+   * also be in `orgs` (a scoped run); maxAgeSeconds in [1, NO_HEAD_PARITY_MAX_AGE_SECONDS]. Unset: off.
+   */
+  noHeadParity?: { orgs: string[]; maxAgeSeconds: number };
 }
 
+/** Path B's ceiling on a parity row's age (6 h). */
+export const NO_HEAD_PARITY_MAX_AGE_SECONDS = 6 * 60 * 60;
+/** The audit record of a stage made live by Path B (never read by the drain). */
+export const acceptedProofKey = (keyRoot: string, orgId: string, stageKey: string) =>
+  `${keyRoot}/.drain/accepted-proofs/v1/${orgId}/${sha256Hex(stageKey)}.json`;
+export interface AcceptedProof { v: 1; kind: "buffered-accepted-proof"; proof: "no_head_parity"; stage_sha256: string; max_age_seconds: number }
+
 /** Why the reader's per-user gate is closed (closed codes, from VERDICT_PAGE's `gate`). */
-export const GATE_REASONS = ["privacy_fenced", "policy_invalid", "head_unproven", "head_pending", "head_foreign_epoch", "receipts_mismatch", "parity_missing", "parity_mismatch"] as const;
+export const GATE_REASONS = ["privacy_fenced", "policy_invalid", "head_unproven", "head_unproven_parity_stale", "head_pending", "head_foreign_epoch", "receipts_mismatch", "parity_missing", "parity_mismatch"] as const;
 export type GateReason = (typeof GATE_REASONS)[number];
 
 export class ExportError extends Error {
@@ -138,6 +162,11 @@ export interface ExportSummary {
   superseded: number;
   would_supersede: number;
   orgs: { complete: number; would_complete: number; already_complete: number; incomplete: number };
+  /**
+   * Path B only (absent when `noHeadParity` is unset, so the summary is byte-identical then): stages live by a no_head
+   * parity proof without an active authority, and their proof records written / that would be.
+   */
+  no_head_parity?: { live: number; proofs: number; would_proof: number };
 }
 
 /** The candidate stages: active, acknowledged, not redacted, of a committed buffered batch (one definition, three uses). */
@@ -231,7 +260,8 @@ ${CANDIDATE_FROM}
   -- The head is the mirrored current head (ingest_source_control_heads), never max(receipts): it must be at the
   -- policy's control epoch and not pending, and owner_buffered_parity_expected (reused as is) must prove the user's
   -- receipts are exactly 1..version at that epoch with the head's tip digest and kind, and none on another epoch. An
-  -- absent head is version 0 only when proven absent (all four conditions below).
+  -- absent head is version 0 only when proven absent (all four conditions below; or, Path B, for an org in $3 only,
+  -- the three that are not the authority plus a parity row at most $4 seconds old).
   -- Then the owner's G2 parity row must match that head and the digests recomputed now. The first failing check names
   -- the reason; a NULL reason is an open gate.
   SELECT u.org_id, u.workspace_id, u.user_id, coalesce(h.version, 0) AS head_version,
@@ -240,10 +270,10 @@ ${CANDIDATE_FROM}
            WHEN NOT pol.pol_valid OR pol.pol_epoch IS NULL OR pol.pol_baseline IS NULL THEN 'policy_invalid'
            -- An absent head is version 0 only when ALL hold: the privacy authority is active, on the policy's control
            -- epoch; the user has no receipt on ANY epoch; and the current G2 parity row proves no_head.
-           WHEN h.org_id IS NULL AND NOT coalesce(pol.authority_active AND pol.authority_epoch = pol.pol_epoch
-             AND NOT EXISTS (SELECT 1 FROM sessions.ingest_control_receipts AS r
-                              WHERE r.org_id = u.org_id AND r.workspace_id = u.workspace_id AND r.user_id = u.user_id)
-             AND par.org_id IS NOT NULL AND par.no_head, false) THEN 'head_unproven'
+           -- Path B ($3): or, for a listed org, the last two without the authority (the SQL reader's no-head branch)...
+           WHEN h.org_id IS NULL AND NOT pf.authority_proof AND NOT pf.nhp_proof THEN 'head_unproven'
+           -- ... and that parity row at most $4 seconds old now (this run's database clock, never an earlier run's).
+           WHEN h.org_id IS NULL AND NOT pf.authority_proof AND NOT pf.nhp_fresh THEN 'head_unproven_parity_stale'
            WHEN h.pending IS NOT FALSE AND h.org_id IS NOT NULL THEN 'head_pending'
            WHEN h.org_id IS NOT NULL AND h.epoch IS DISTINCT FROM pol.pol_epoch THEN 'head_foreign_epoch'
            WHEN NOT coalesce(x.receipts_ok, false) THEN 'receipts_mismatch'
@@ -257,7 +287,9 @@ ${CANDIDATE_FROM}
              AND par.deletion_set_digest = x.deletion_set_digest AND par.reset_set_digest = x.reset_set_digest
              AND par.target_lineage_digest = x.target_lineage_digest, false) THEN 'parity_mismatch'
            ELSE NULL
-         END AS gate_reason
+         END AS gate_reason,
+         -- Which proof opened an absent head (read only when the gate is open): Path B when the authority's did not.
+         CASE WHEN h.org_id IS NULL AND NOT pf.authority_proof THEN 'no_head_parity' END AS head_proof
     FROM users AS u CROSS JOIN pol
     LEFT JOIN sessions.ingest_source_control_heads AS h
       ON h.org_id = u.org_id AND h.workspace_id = u.workspace_id AND h.user_id = u.user_id
@@ -265,11 +297,23 @@ ${CANDIDATE_FROM}
       ON par.org_id = u.org_id AND par.workspace_id = u.workspace_id AND par.user_id = u.user_id
     LEFT JOIN LATERAL sessions.owner_buffered_parity_expected(u.org_id, u.workspace_id, u.user_id, pol.pol_epoch,
                                                               h.version, h.digest, h.kind) AS x ON true
+    CROSS JOIN LATERAL (
+      SELECT NOT EXISTS (SELECT 1 FROM sessions.ingest_control_receipts AS r
+                          WHERE r.org_id = u.org_id AND r.workspace_id = u.workspace_id AND r.user_id = u.user_id) AS none
+    ) AS rc
+    CROSS JOIN LATERAL (
+      SELECT coalesce(pol.authority_active AND pol.authority_epoch = pol.pol_epoch
+               AND rc.none AND par.org_id IS NOT NULL AND par.no_head, false) AS authority_proof,
+             -- $3 NULL (the default): never.
+             coalesce(u.org_id = ANY($3::text[]) AND rc.none AND par.org_id IS NOT NULL AND par.no_head, false) AS nhp_proof,
+             coalesce(par.written_at <= clock_timestamp()
+               AND par.written_at >= clock_timestamp() - make_interval(secs => $4::double precision), false) AS nhp_fresh
+    ) AS pf
 ), stg AS MATERIALIZED (
   SELECT c.*, pol.lazy, pol.pol_identity, pol.pol_epoch, pol.clock_epoch, pol.clock_identity, pol.v2,
          (SELECT count(*) FROM sessions.upload_resets AS ur
            WHERE ur.org_id = c.org_id AND ur.workspace_id = c.workspace_id AND ur.user_id = c.user_id) AS resets,
-         g.head_version, g.gate_reason
+         g.head_version, g.gate_reason, g.head_proof
     FROM cand AS c CROSS JOIN pol
     JOIN gate AS g ON g.org_id = c.org_id AND g.workspace_id = c.workspace_id AND g.user_id = c.user_id
 ), stage_ok AS (
@@ -386,7 +430,7 @@ ${CANDIDATE_FROM}
     FROM kept AS k GROUP BY k.stage_token
 )
 SELECT st.stage_key, st.stage_sha256, st.claim_token::text AS claim_token, st.org_id, st.workspace_id, st.user_id,
-       st.origin_id, st.digest, st.group_ordinals, st.v2, st.gate_reason,
+       st.origin_id, st.digest, st.group_ordinals, st.v2, st.gate_reason, st.head_proof,
        (so.ok AND NOT EXISTS (SELECT 1 FROM bad_stage AS bs WHERE bs.stage_token = st.stage_token)) AS stage_ok,
        coalesce(kj.kept, '[]'::jsonb) AS kept
   FROM stg AS st JOIN stage_ok AS so ON so.stage_token = st.stage_token
@@ -435,6 +479,16 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(opts.keyRoot)) throw new Error("export_key_root_invalid");
   if (opts.orgs) for (const org of opts.orgs) if (!ORG.test(org)) throw new Error("export_org_invalid");
   const orgScope = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
+  // Path B: off unless given; when given, a non-empty list of orgs inside this run's scope and a bounded age.
+  const nhp = opts.noHeadParity;
+  if (nhp !== undefined) {
+    if (!Array.isArray(nhp.orgs) || nhp.orgs.length === 0 || !nhp.orgs.every((o) => ORG.test(o))) throw new Error("export_no_head_parity_orgs_invalid");
+    if (!orgScope || !nhp.orgs.every((o) => orgScope.includes(o))) throw new Error("export_no_head_parity_outside_scope");
+    if (!Number.isInteger(nhp.maxAgeSeconds) || nhp.maxAgeSeconds < 1 || nhp.maxAgeSeconds > NO_HEAD_PARITY_MAX_AGE_SECONDS)
+      throw new Error("export_no_head_parity_max_age_invalid");
+  }
+  const nhpOrgs = nhp ? [...new Set(nhp.orgs)].sort() : null;
+  const nhpAge = nhp ? nhp.maxAgeSeconds : null;
   const nowMs = opts.nowMs ?? Date.now;
   // The dry run's defence in depth: every mutation throws.
   const store: ObjectStore = opts.dryRun
@@ -451,6 +505,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     mode: opts.dryRun ? "dry_run" : "execute", rows: 0, live: 0, not_live: 0, fence_absent: 0,
     written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0, gated: {}, fence_late: 0, superseded: 0, would_supersede: 0,
     orgs: { complete: 0, would_complete: 0, already_complete: 0, incomplete: 0 },
+    ...(nhpOrgs ? { no_head_parity: { live: 0, proofs: 0, would_proof: 0 } } : {}),
   };
   const perOrg = new Map<string, { stages: number; bad: boolean }>();
   const { sql } = opts;
@@ -535,7 +590,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         preRead.add(userKey(r));
         await fenceOf(r.org_id, r.workspace_id, r.user_id);
       });
-      const rows = (await readOnly(() => sql.query(scopedExportSql(VERDICT_PAGE, orgScope !== null), [orgScope, page.map((r) => String(r.stage_key))]))).rows;
+      const rows = (await readOnly(() => sql.query(scopedExportSql(VERDICT_PAGE, orgScope !== null), [orgScope, page.map((r) => String(r.stage_key)), nhpOrgs, nhpAge]))).rows;
       // The v2 gate turned off mid-export: stop before writing this page.
       if (rows.some((r) => r.v2 !== true)) throw new ExportError("export_claim_sessions_gate_off");
       await mapLimit(rows, concurrency, async (r) => {
@@ -586,12 +641,32 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         }
         if (live) summary.live++;
         else summary.not_live++;
+        // Path B: live with an absent head the authority did not prove. Only for a listed org (SQL already requires it;
+        // checked again here), and only when Path B is on (otherwise SQL cannot open such a gate at all).
+        const byParity = live && r.head_proof === "no_head_parity";
+        if (byParity && (nhpOrgs === null || !nhpOrgs.includes(org))) {
+          summary.failed++;
+          tally.bad = true;
+          return;
+        }
         const marker: AcceptedMarker = {
           v: 2, kind: "buffered-accepted", stage_sha256: r.stage_sha256 as string, live,
           kept: live ? lines! : [], fence: fenceView,
         };
         const key = (r.stage_key as string) + ACCEPTED_SUFFIX;
         try {
+          if (byParity) {
+            // The proof record first, so every sidecar this path made live has one. Execute only: a dry run counts it
+            // (and its store refuses every write anyway).
+            if (opts.dryRun) summary.no_head_parity!.would_proof++;
+            else {
+              if (!leaseOk()) throw new Error("export_lock_lost");
+              const proof: AcceptedProof = { v: 1, kind: "buffered-accepted-proof", proof: "no_head_parity", stage_sha256: r.stage_sha256 as string, max_age_seconds: nhpAge! };
+              await store.put(objectKey(acceptedProofKey(opts.keyRoot, org, r.stage_key as string)), encoder.encode(JSON.stringify(proof)), { contentType: "application/json" });
+              summary.no_head_parity!.proofs++;
+            }
+            summary.no_head_parity!.live++;
+          }
           const existing = await readMarker(store, key);
           const same = existing !== null && existing !== "invalid" && JSON.stringify(existing.doc) === JSON.stringify(marker);
           if (same) { summary.already++; return; }

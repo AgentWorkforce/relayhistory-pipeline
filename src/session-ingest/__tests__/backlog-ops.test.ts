@@ -36,6 +36,7 @@ import {
   backlogOpsLedgerEnv,
   backlogOpsLedgerId,
   backlogOpsLedgerTarget,
+  backlogOpsNoHeadParity,
   backlogOpsReceipt,
   backlogOpsRevisionsSince,
   backlogOpsRole,
@@ -644,9 +645,10 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   // Only the operate job may mint an OIDC token.
   expect(code_.match(/id-token: write/g)?.length).toBe(1);
   expect(yml).toContain("id-token: write");
-  // Three secrets, all only in the one credential step: the owner URL (database tools only), the org scope (a
-  // secret, never a variable, so this public repository's logs mask the org ids) and presence-dry's session id.
-  expect(yml.match(/secrets\./g)?.length).toBe(3);
+  // Four secrets, all only in the one credential step: the owner URL (database tools only), the org scope (a
+  // secret, never a variable, so this public repository's logs mask the org ids), presence-dry's session id and Path B's
+  // allow-list (export and drain modes only).
+  expect(yml.match(/secrets\./g)?.length).toBe(4);
   expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
   expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
   expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry') && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
@@ -1206,4 +1208,130 @@ test("workflow: the proof runs on a change to the ledger-aware tools, and runs t
   expect(proof).toMatch(/^ {8}run: bun test --timeout \d+ \.\/src\/session-ingest\/__tests__\/ledger-tool-store\.test\.ts$/mu);
   for (const f of ["buffered-drain.test.ts", "upload-fence-backfill.pglite.test.ts"])
     expect(proof).toContain(`          bun test --timeout 300000 ./src/session-ingest/__tests__/${f}\n`);
+});
+
+// ---- Path B (no-head parity) ----
+
+test("Path B: env only (a secret list inside the scope, a bounded age variable), export and drain modes only; an id, never an org", () => {
+  const scope = backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG1},${ORG2}` });
+  const nhp = (e: Record<string, string>, mode: BacklogOpsMode = "export-dry", sc = scope) => backlogOpsNoHeadParity(e, { mode }, sc);
+  expect(nhp({})).toBeNull();
+  expect(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: " ", BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "" })).toBeNull();
+  const one = nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" })!;
+  expect(one.orgs).toEqual([ORG1]);
+  expect(one.maxAgeSeconds).toBe(3600);
+  expect(one.id).toMatch(/^nhp_[0-9a-f]{32}$/u);
+  expect(one.id).not.toContain(ORG1.slice(0, 8));
+  // The id binds both the list and the age.
+  expect(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3601" })!.id).not.toBe(one.id);
+  expect(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: `${ORG2},${ORG1}`, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" })!.id).not.toBe(one.id);
+  expect(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: `${ORG2},${ORG1}`, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" })!.id)
+    .toBe(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: `${ORG1},${ORG2}`, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" })!.id);
+  expect(nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }, "drain-execute")!.id).toBe(one.id);
+  // (d) a subset of the run's scope: a scoped run, every org in it.
+  expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }, "export-dry", backlogOpsScope({}))))
+    .toBe("backlog_ops_no_head_parity_scope");
+  expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG2, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }, "export-dry", backlogOpsScope({ BACKLOG_OPS_ORGS: ORG1 }))))
+    .toBe("backlog_ops_no_head_parity_scope");
+  for (const bad of [ORG2.toUpperCase(), `${ORG1},`, `${ORG1},${ORG1}`, "org-a", `${ORG1}, ${ORG2}`])
+    expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: bad, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }))).toBe("backlog_ops_no_head_parity_orgs");
+  // The age: required with the list, refused without it, digits 60..21600.
+  for (const age of ["", "59", "21601", "3600s", "PT1H", "0", "-1", "03600"])
+    expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: age }))).toBe("backlog_ops_no_head_parity_max_age");
+  expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }))).toBe("backlog_ops_no_head_parity_max_age");
+  // Every other tool refuses either variable.
+  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("export-") && !m.startsWith("drain-"))) {
+    expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1 }, mode))).toBe("backlog_ops_no_head_parity_unexpected");
+    expect(codeSync(() => nhp({ BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" }, mode))).toBe("backlog_ops_no_head_parity_unexpected");
+    expect(nhp({}, mode)).toBeNull();
+  }
+});
+
+test("Path B: the export gets the age in argv and the list on stdin only; unset, every argv, stdin and receipt is byte-identical", () => {
+  const aws = { accessKeyId: "ASIA0000000000000000", secretAccessKey: "s", sessionToken: "t" };
+  const scoped = { ...target, BACKLOG_OPS_ORGS: `${ORG1},${ORG2}` };
+  const on = { ...scoped, BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ORG1, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: "3600" };
+  for (const mode of ["export-dry", "export-execute"] as BacklogOpsMode[]) {
+    const d = backlogOpsDispatch(dispatchEnv(mode), true);
+    const off = backlogOpsChildSpawn(scoped, d, aws, "postgresql://x");
+    expect(off.input).toBe(JSON.stringify({ dbUrl: "postgresql://x" }) + "\n");
+    expect(off.args.slice(1)).toEqual(backlogOpsToolArgs(d, backlogOpsTarget(target), backlogOpsScope(scoped)).args);
+    expect(off.args.join(" ")).not.toContain("no-head-parity");
+    const spawned = backlogOpsChildSpawn(on, d, aws, "postgresql://x");
+    expect(spawned.args.slice(-2)).toEqual(["--no-head-parity-max-age", "3600"]);
+    expect(spawned.args.slice(1, -2)).toEqual(off.args.slice(1));
+    expect(spawned.args.filter((a) => a === ORG1).length).toBe(1); // only the scope's own --org
+    expect(JSON.parse(spawned.input!)).toEqual({ dbUrl: "postgresql://x", noHeadParityOrgs: [ORG1] });
+    expect(Object.values(spawned.env).join(" ")).not.toContain(ORG1);
+  }
+  // The drain tool gets nothing of Path B (its binding is refusal-only, in checkBoundReceipts).
+  for (const mode of ["drain-dry", "drain-execute"] as BacklogOpsMode[]) {
+    const d = backlogOpsDispatch(dispatchEnv(mode), true);
+    const off = backlogOpsChildSpawn(scoped, d, aws, null), withNhp = backlogOpsChildSpawn(on, d, aws, null);
+    expect(withNhp).toEqual(off);
+    expect(codeSync(() => backlogOpsToolArgs(d, backlogOpsTarget(target), backlogOpsScope(scoped), null, backlogOpsNoHeadParity(on, d, backlogOpsScope(scoped))))).toBe("backlog_ops_no_head_parity_unexpected");
+  }
+  // Receipts: no field when unset (the same bytes as before Path B); the id when set; never an org.
+  const d = backlogOpsDispatch(dispatchEnv("export-dry"));
+  const before = backlogOpsReceipt(d, "9", 0, JSON.stringify({ mode: "dry_run", failed: 0 }), "all", "none");
+  expect(JSON.stringify(before)).toBe(JSON.stringify({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: "export-dry", sha, run: "9", scope: "all", ledger: "none", exitCode: 0, summary: { mode: "dry_run", failed: 0 } }));
+  expect(JSON.stringify(backlogOpsReceipt(d, "9", 0, JSON.stringify({ mode: "dry_run", failed: 0 }), "all", "none", "none"))).toBe(JSON.stringify(before));
+  const id = backlogOpsNoHeadParity(on, d, backlogOpsScope(on))!.id;
+  const withId = backlogOpsReceipt(d, "9", 0, JSON.stringify({ mode: "dry_run", failed: 0 }), "all", "none", id);
+  expect(withId.no_head_parity).toBe(id);
+  expect(JSON.stringify(withId)).not.toContain(ORG1);
+  expect(codeSync(() => backlogOpsReceipt(d, "9", 0, "{}", "all", "none", ORG1))).toBe("backlog_ops_no_head_parity_id");
+});
+
+test("Path B bindings: an export-execute's DRY and a drain-execute's EXPORT must carry this run's id; unset binds as before", () => {
+  const scoped = backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG1},${ORG2}` }).id;
+  const base = { BACKLOG_OPS_ORGS: `${ORG1},${ORG2}`, RUNNER_TEMP: "/tmp/rt" };
+  const nhpEnv = (orgs: string, age: string) => ({ BACKLOG_OPS_NO_HEAD_PARITY_ORGS: orgs, BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: age });
+  const idOf = (orgs: string, age: string) => backlogOpsNoHeadParity({ ...base, ...nhpEnv(orgs, age) }, { mode: "export-dry" }, backlogOpsScope(base))!.id;
+  const A1 = idOf(ORG1, "3600"), OTHER_LIST = idOf(`${ORG1},${ORG2}`, "3600"), OTHER_AGE = idOf(ORG1, "7200");
+  const put = (raw: string, nhp?: string) => JSON.stringify({ ...JSON.parse(raw), scope: scoped, ...(nhp !== undefined ? { no_head_parity: nhp } : {}) });
+  // (b) export-execute binds its DRY.
+  const exFiles = (dry?: string): Record<string, string> => ({
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": put(receipt("export-dry", DRY, { ...exportOk, mode: "dry_run" }), dry),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk)),
+  });
+  const ex = (e: Record<string, string>, f: Record<string, string>) => {
+    const env = { ...dispatchEnv("export-execute"), ...e };
+    return codeSync(() => checkBoundReceipts(env, backlogOpsDispatch(env, true), (p: string) => f[p]!));
+  };
+  expect(ex(base, exFiles())).toBeNull(); // unset, and a receipt from before Path B
+  expect(ex({ ...base, ...nhpEnv(ORG1, "3600") }, exFiles(A1))).toBeNull();
+  expect(ex({ ...base, ...nhpEnv(ORG1, "3600") }, exFiles(OTHER_LIST))).toBe("backlog_ops_bound_dry_no_head_parity");
+  expect(ex({ ...base, ...nhpEnv(ORG1, "3600") }, exFiles(OTHER_AGE))).toBe("backlog_ops_bound_dry_no_head_parity");
+  expect(ex({ ...base, ...nhpEnv(ORG1, "3600") }, exFiles())).toBe("backlog_ops_bound_dry_no_head_parity"); // dry ran without it
+  expect(ex(base, exFiles(A1))).toBe("backlog_ops_bound_dry_no_head_parity"); // dry ran with it, execute without
+  expect(ex({ ...base, ...nhpEnv(ORG1, "3600") }, exFiles("nhp_bad"))).toBe("backlog_ops_bound_dry_no_head_parity");
+  // A list outside the scope refuses before any receipt is compared.
+  expect(ex({ ...base, BACKLOG_OPS_ORGS: ORG2, ...nhpEnv(ORG1, "3600") }, exFiles(A1))).toBe("backlog_ops_no_head_parity_scope");
+  // (e) drain-execute binds its EXPORT's id (refusal only); its DRY and BACKFILL are not compared.
+  const drFiles = (exp?: string, dry?: string): Record<string, string> => ({
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": put(receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 }), dry),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk)),
+    "/tmp/rt/backlog-ops-bound/export/backlog-ops-receipt.json": put(receipt("export-execute", EXPORT, exportOk), exp),
+  });
+  const dr = (e: Record<string, string>, f: Record<string, string>) => {
+    const env = { ...dispatchEnv("drain-execute"), ...e };
+    return codeSync(() => checkBoundReceipts(env, backlogOpsDispatch(env, true), (p: string) => f[p]!));
+  };
+  expect(dr(base, drFiles())).toBeNull();
+  expect(dr({ ...base, ...nhpEnv(ORG1, "3600") }, drFiles(A1))).toBeNull();
+  expect(dr({ ...base, ...nhpEnv(ORG1, "3600") }, drFiles(A1, "none"))).toBeNull();
+  expect(dr({ ...base, ...nhpEnv(ORG1, "3600") }, drFiles(OTHER_AGE))).toBe("backlog_ops_bound_export_no_head_parity");
+  expect(dr({ ...base, ...nhpEnv(ORG1, "3600") }, drFiles())).toBe("backlog_ops_bound_export_no_head_parity");
+  expect(dr(base, drFiles(A1))).toBe("backlog_ops_bound_export_no_head_parity");
+});
+
+test("workflow: Path B comes from a secret and a variable for export and drain modes only, never a dispatch input", () => {
+  const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
+  expect(yml).toContain("BACKLOG_OPS_NO_HEAD_PARITY_ORGS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && secrets.BACKLOG_OPS_NO_HEAD_PARITY_ORGS || '' }}");
+  expect(yml).toContain("BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS: ${{ (startsWith(inputs.mode, 'export-') || startsWith(inputs.mode, 'drain-')) && vars.BACKLOG_OPS_NO_HEAD_PARITY_MAX_AGE_SECONDS || '' }}");
+  expect(yml).not.toContain("vars.BACKLOG_OPS_NO_HEAD_PARITY_ORGS");
+  expect(yml).not.toMatch(/inputs\.[a-z_]*(parity|head)/u);
+  const inputs = yml.slice(yml.indexOf("    inputs:"), yml.indexOf("  pull_request:"));
+  expect(inputs.match(/^      [a-z_]+:$/gmu)?.length).toBe(10);
 });
