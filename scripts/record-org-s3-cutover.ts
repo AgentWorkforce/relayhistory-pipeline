@@ -12,7 +12,8 @@
  * --correct changes an existing row (owner-only sessions.org_s3_cutover_correct_v1; the prior row goes
  * to sessions.org_s3_cutover_history). It may only move cutover_at LATER. Moving it earlier needs
  * Khaliq's explicit approval, passed as --khaliq-approved-lowering, and prints a loud warning. Deleting a
- * row is not offered by this script (runbook-only, Khaliq-gated).
+ * row is not offered by this script (runbook-only, Khaliq-gated). On --correct, --pointer-fix-deployed-at
+ * must equal the time stored with the row (cutover_pointer_fix_mismatch otherwise); a correction keeps it.
  *
  * Dry-run by default (reads counts, writes nothing). --execute inserts exactly one immutable row. The
  * connection is the guarded schema release's owner client (SUPABASE_MIGRATION_OWNER_URL, from 1Password

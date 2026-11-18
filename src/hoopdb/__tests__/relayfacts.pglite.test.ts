@@ -578,7 +578,7 @@ describe("20261105062100 relayfacts user erase", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.relayfacts_erasure_fences WHERE workspace_id = 'ws-c' AND session_id = 'c' || chr(9) || '1'")).rows[0]!.n).toBe(1);
   });
 
-  test("rollback: 062090's down refuses while 062100 is applied; 062100's down refuses while 062110 is applied; the down refuses while fences exist unless overridden, then drops everything and its ledger row; a rerun refuses", async () => {
+  test("rollback: 062090's down refuses while 062100 is applied; 062100's down refuses while 062110 is applied; 062110's down refuses while 062120/062130 are applied (062130 then 062120 come off first); the down refuses while fences exist unless overridden, then drops everything and its ledger row; a rerun refuses", async () => {
     const refusal = async (sql: string) => { const c = await code(db.exec(sql)); await db.exec("ROLLBACK"); return c; };
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     expect(await refusal(ERASE_DOWN)).toBe("55000");

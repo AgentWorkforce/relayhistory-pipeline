@@ -204,6 +204,7 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
     const later = await writeManifest(1, locLater);
     await store.delete(objectKey(a));
     let transactions = 0;
+    const statements: string[][] = []; // per publication transaction, in order
     // The publication authority's schema-generation witness (the role-validation pass the migrator records).
     await pg.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + "a".repeat(64) + "','pass')");
     const base = deps().pointer;
@@ -214,12 +215,28 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
         transact: <T,>(work: (tx: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }) => Promise<T>) =>
           pg.transaction(async (tx) => {
             transactions += 1;
-            return work({ query: async (t: string, p?: unknown[]) => ({ rows: (await tx.query(t, p as unknown[])).rows }) });
+            const mine: string[] = [];
+            statements.push(mine);
+            return work({ query: async (t: string, p?: unknown[]) => (mine.push(t), { rows: (await tx.query(t, p as unknown[])).rows }) });
           }),
       },
     } as typeof base;
     expect(await indexPointer(landedPut(later), published)).toMatchObject({ status: "moved", manifestKey: later });
     expect(transactions).toBeGreaterThan(0);
+    // Exactly one transaction holds the move: the authority lock, the old-key DELETE (RETURNING created_at)
+    // and the re-key upsert, in that order. No DELETE of the row runs outside it.
+    const isDelete = (t: string) => /DELETE FROM sessions\.session_index\b[\s\S]*RETURNING created_at/.test(t);
+    const moveTx = statements.filter((st) => st.some(isDelete));
+    expect(moveTx).toHaveLength(1);
+    const order = (st: string[], pred: (t: string) => boolean) => st.findIndex(pred);
+    const tx = moveTx[0]!;
+    const lock = order(tx, (t) => t.includes("session_publication_lock"));
+    const del = order(tx, isDelete);
+    const up = order(tx, (t) => t.includes("upsert_session_index"));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(lock).toBeLessThan(del);
+    expect(del).toBeLessThan(up);
+    expect(tx.filter(isDelete)).toHaveLength(1);
     expect(await row()).toMatchObject({ deleted_at: null, manifest_key: later, revision: "1" });
     expect(await created()).toBe(before);
     expect((await pg.query("SELECT 1 FROM sessions.session_index WHERE session_id = 'sess_1'")).rows).toHaveLength(1);
@@ -242,6 +259,28 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
     expect(err).toMatchObject({ code: "pointer_move_skipped", retryable: true });
     expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
     expect(await created()).toBe(before);
+  }, 60_000);
+
+  test("a move whose insert does not apply (applied=false) throws retryably and rolls its delete back", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const later = await writeManifest(1, locLater);
+    await store.delete(objectKey(a));
+    let fakeOnce = true;
+    const client = {
+      async query(text: string, params?: unknown[]) {
+        if (fakeOnce && text.includes("upsert_session_index")) { fakeOnce = false; return { rows: [{ applied: false, revision: "3" }] }; }
+        return pg.query(text, params as unknown[]);
+      },
+      release() {},
+    };
+    const base = deps().pointer;
+    const pooled = { ...base, db: { ...base.db, pool: { connect: async () => client } } as unknown as HoopDb };
+    const err = await indexPointer(landedPut(later), pooled).catch((e: unknown) => e as { code?: string; retryable?: boolean });
+    expect(err).toMatchObject({ code: "pointer_move_not_applied", retryable: true });
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
+    expect(await created()).toBe(before);
+    expect(await indexPointer(landedPut(later), pooled)).toMatchObject({ status: "moved", manifestKey: later });
   }, 60_000);
 
   test("a move is atomic: a failure after the delete leaves the old row and its created_at; the retry moves it", async () => {
