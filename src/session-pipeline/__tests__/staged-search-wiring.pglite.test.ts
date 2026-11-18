@@ -26,7 +26,7 @@ import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
 import { indexSearchScope, searchIndexStagedStartup, type SearchIndexDeps, type SearchIndexResult, type StagedReconcile } from "../search-index.ts";
-import { STAGED_RECONCILE_FUNCTIONS, assertStagedReconcileSchema, type StagedBoundary } from "../staged-reconcile.ts";
+import { STAGED_RECONCILE_FUNCTIONS, StagedRunRestart, assertStagedReconcileSchema, type StagedBoundary } from "../staged-reconcile.ts";
 import { SCOPE, decompress, exportStreamScope, generate, prefixFor, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { readCanonicalScope } from "../../session-read-api/canonical-projection.ts";
 import { outputFactsFromScope } from "../output-facts.ts";
@@ -138,7 +138,7 @@ async function rig(x: ExportedScope) {
     const hits = (await adapter.index.query({ tenant: tenantOf, order: "asc", limit: n })).hits;
     await adapter.index.deleteEvents(tenantOf, hits.map((h) => ({ tsMs: h.tsMs, sessionId: h.sessionId, source: h.source, machineId: h.machineId, kind: h.kind, eventId: h.eventId })));
   };
-  return { hoop, adapter, tick, pass, scan, directory, runs, staged, expire, addStale, dropSome, recorded, requeued };
+  return { hoop, adapter, tick, pass, transact, scan, directory, runs, staged, expire, addStale, dropSome, recorded, requeued };
 }
 
 /** The whole read with unlimited limits: the reference every staged run must end equal to. */
@@ -272,11 +272,9 @@ describe("staged reconcile through the consumer wiring", () => {
     });
     expect(out).toMatchObject({ complete: false, reasons: ["staged_lease_lost"] });
     expect([await r.runs(), await r.staged()]).toEqual([0, 0]);
-    // Nothing written back after the erase; the lost lease leaves the scope owing (the next tick's
-    // erase pass records it complete again).
+    // Nothing written back after the erase, and the lost lease writes no state: the erase pass's stays.
     expect(await r.scan()).toEqual([]);
-    expect(r.recorded.at(-1)?.complete).toBe(false);
-    expect(await r.pass({ staged: stagedOn() })).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(r.recorded.at(-1)?.complete).toBe(true);
   }, 120_000);
 
   test("T1: a whole read completing between two write pages: the next page abandons, no stale row comes back, the scope ends owing", async () => {
@@ -342,16 +340,108 @@ describe("staged reconcile through the consumer wiring", () => {
   test("T4: a source read longer than the lease keeps the run: the heartbeat renews it, a second consumer is leased out", async () => {
     const r = await seeded(x);
     const slow = { ...x.store, getObject: async (...a: Parameters<typeof x.store.getObject>) => {
-      await new Promise((resolve) => setTimeout(resolve, 50)); // about 5 s for passes 1-3 here
+      await new Promise((resolve) => setTimeout(resolve, 110)); // about 10 s for passes 1-3 here
       return x.store.getObject(...a);
     } } as typeof x.store;
-    const first = r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store: slow, staged: stagedOn({ leaseMs: 1000 }) });
-    await new Promise((resolve) => setTimeout(resolve, 2500)); // well past the 1 s lease, mid-read
-    const second = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ leaseMs: 1000 }) });
+    // A 3 s lease renewed every 1 s; the second consumer comes at 6 s (two leases later), mid-read.
+    const first = r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store: slow, staged: stagedOn({ leaseMs: 3000 }) });
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+    const second = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ leaseMs: 3000 }) });
     expect(second).toMatchObject({ complete: false, reasons: ["staged_run_leased"] });
     expect(await first).toMatchObject({ complete: true });
     expect(await r.scan()).toEqual(ref.scan);
   }, 120_000);
+
+  test("N3: a transient lease renewal failure is logged and retried; the lease stays renewed", async () => {
+    const r = await seeded(x);
+    const slow = { ...x.store, getObject: async (...a: Parameters<typeof x.store.getObject>) => {
+      await new Promise((resolve) => setTimeout(resolve, 110));
+      return x.store.getObject(...a);
+    } } as typeof x.store;
+    // The first renewal (an advance in the want phase, before any batch) fails once with a transient error.
+    let failed = 0;
+    const base = r.transact;
+    const flaky = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+      base((tx) => work({
+        query: (sql: string, params?: unknown[]) => {
+          if (failed === 0 && sql.includes("search_reconcile_advance_v1") && params?.[2] === "want") {
+            failed += 1;
+            return Promise.reject(Object.assign(new Error("transient"), { code: "08006" }));
+          }
+          return tx.query(sql, params);
+        },
+      }));
+    const lines: string[] = [];
+    const stderr = process.stderr.write, stdout = process.stdout.write;
+    const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
+      ((chunk: unknown, ...rest: unknown[]) => {
+        lines.push(String(chunk));
+        return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
+      }) as typeof process.stdout.write;
+    process.stdout.write = tap(stdout, process.stdout);
+    process.stderr.write = tap(stderr, process.stderr);
+    try {
+      const first = r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store: slow, transact: flaky, staged: stagedOn({ leaseMs: 3000 }) });
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+      // Had the renewal stopped at the failure, the lease would have expired at about 3 s.
+      expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ leaseMs: 3000 }) })).toMatchObject({ reasons: ["staged_run_leased"] });
+      expect(await first).toMatchObject({ complete: true });
+    } finally {
+      process.stdout.write = stdout;
+      process.stderr.write = stderr;
+    }
+    expect(failed).toBe(1);
+    const warned = lines.flatMap((l) => l.split("\n")).filter((l) => l.includes("search index staged lease renewal failed")).map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(warned.length).toBe(1);
+    expect(warned[0]).toMatchObject({ stage: "search-index", error_code: "08006" });
+    expect(JSON.stringify(warned[0])).not.toContain("transient");
+  }, 120_000);
+
+  test("N2: the taker finishes, then the old holder hits RH062: staged_lease_lost writes nothing, the state stays current", async () => {
+    const r = await seeded(x);
+    let took = false;
+    const out = await r.pass({
+      limits: STAGED_LIMITS, stream: UNLIMITED,
+      staged: stagedOn({
+        boundary: async (p) => {
+          if (p !== "want:batch" || took) return;
+          took = true;
+          await r.expire();
+          expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() })).toMatchObject({ complete: true });
+        },
+      }),
+    });
+    expect(out).toMatchObject({ complete: false, reasons: ["staged_lease_lost"] });
+    expect(r.recorded.at(-1)?.complete).toBe(true);
+    expect(await r.scan()).toEqual(ref.scan);
+  }, 120_000);
+
+  for (const [name, error, reason] of [
+    ["StagedRunRestart", () => new StagedRunRestart("output_facts_stage_incomplete"), "output_facts_stage_incomplete"],
+    ["RH062", () => Object.assign(new Error("stale"), { code: "RH062" }), "staged_lease_lost"],
+  ] as const)
+    test(`N1: a hook error on the delivery made by the facts pass's final emit (${name}) reaches the run as itself`, async () => {
+      // Count the chunks of a clean pass first.
+      const count = async () => {
+        const r = await seeded(x);
+        let n = 0;
+        await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ factsChunk: 16, hooks: { async onBatch(_t: SqlExecutor, _r: unknown, b: { phase: string }) { if (b.phase === "facts") n += 1; } } as never }) });
+        return n;
+      };
+      const n = await count();
+      expect(n).toBeGreaterThanOrEqual(3);
+      const r = await seeded(x);
+      // The module delivers one chunk behind: the chunk before the last is delivered from the final emit.
+      const hooks = { async onBatch(_t: SqlExecutor, _r: unknown, b: { phase: string; chunk?: { seq: number } }) {
+        if (b.phase === "facts" && b.chunk!.seq === n - 2) throw error();
+      } };
+      const out = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ factsChunk: 16, hooks: hooks as never }) });
+      expect(out.reasons).toEqual([reason]);
+      if (name === "StagedRunRestart") {
+        const run = (await r.hoop.pg.query<{ phase: string; last_error: string }>("SELECT phase, last_error FROM sessions.search_reconcile_runs_v1")).rows;
+        expect(run).toEqual([{ phase: "want", last_error: "output_facts_stage_incomplete" }]); // abandoned
+      }
+    }, 120_000);
 
   test("A1: a deadline spent inside the facts pass: partial with scope_too_large and stream_deadline, onFinish never runs", async () => {
     const r = await seeded(x);
