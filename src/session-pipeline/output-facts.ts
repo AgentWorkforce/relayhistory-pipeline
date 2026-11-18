@@ -455,6 +455,15 @@ export type OutputFactsStagedItem =
   | { kind: "session"; sessionId: string }
   | { kind: "note"; reason: string };
 
+/**
+ * The most staged items outputFactsBatchStep makes from one input (a projection row or a record): a
+ * convergence event gives its session id, its event fact (or a note), a message fact or a commit
+ * candidate (never both: assistant vs tool_result), and a call or a parent (never both: tool_call vs
+ * session_event); a commit link gives a fact or a note; a record gives one record item; anything else
+ * none. A facts chunk of N inputs is at most N times this many items.
+ */
+export const OUTPUT_FACTS_MAX_ITEMS_PER_INPUT = 4;
+
 /** The relevant record kinds of legacyAndTurns. */
 const LEGACY_RECORD_KINDS = new Set(["legacy_conversation_turn", "legacy_session_outcome", "legacy_session_link", "legacy_scope", "conversation_turn"]);
 

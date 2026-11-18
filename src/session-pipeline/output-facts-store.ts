@@ -17,6 +17,7 @@ import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { StagedRunRestart, type StagedFactsEvents, type StagedRunRef } from "./staged-reconcile.ts";
 import {
   callMessageIds,
+  OUTPUT_FACTS_MAX_ITEMS_PER_INPUT,
   outputFactsBatchStep,
   outputFactsFinishStep,
   type OutputFactsStagedCandidate,
@@ -186,6 +187,11 @@ export class StagedOutputFactsIncompleteError extends StagedRunRestart {
 const hex = (v: string) => createHash("sha256").update(v).digest("hex");
 /** Items one facts chunk may stage (staged_facts_stage_v1 takes at most this many per call). */
 export const MAX_CHUNK_ITEMS = 100_000;
+/**
+ * The largest facts chunk (projection rows plus records) that always fits one staged_facts_stage_v1
+ * call. The wiring's chunk size must not exceed it (phase B: checked at startup).
+ */
+export const MAX_FACTS_CHUNK_INPUTS = Math.floor(MAX_CHUNK_ITEMS / OUTPUT_FACTS_MAX_ITEMS_PER_INPUT);
 /** Items per call for the final phase's own facts. */
 const FINAL_CALL = 500;
 const READ_PAGE = 1000;
