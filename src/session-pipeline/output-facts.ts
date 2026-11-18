@@ -246,6 +246,129 @@ function legacyAndTurns(records: RelayhistoryStreamRecord[], scope: OutputFactsS
   return { rows, ok: true };
 }
 
+type FactDraft = Omit<OutputFactRow, "org_id" | "workspace_id" | "version" | "row_id" | "fingerprint" | "scope_source">;
+type FactsTenant = Pick<OutputFactsScope, "orgId" | "workspaceId" | "harness">;
+
+/** One output fact row, with its identity hash and fingerprint (both paths build every fact here). */
+function factRow(scope: FactsTenant, version: number, f: FactDraft): OutputFactRow {
+  const row = { org_id: scope.orgId, workspace_id: scope.workspaceId, version, scope_source: scope.harness, ...f };
+  const identity = [row.fact_kind, row.ts, row.source, row.session_id, row.fact_key, row.origin, row.row_key];
+  return { ...row, row_id: sha256(identity), fingerprint: sha256([...identity, row.added, row.removed, row.reverted]) };
+}
+
+/** One convergence event's event-fact row; `ts` is chTime(e.ts). */
+function eventFactRow(scope: FactsTenant & { canonicalId: string }, version: number, e: Json, ts: string): EventFactRow {
+  const base = { org_id: scope.orgId, workspace_id: scope.workspaceId, version };
+  const taskRef = isObject(e.task_ref) ? e.task_ref : {};
+  const files = Array.isArray(e.files_touched) ? e.files_touched.map(jtext) : [];
+  // One key for every fact kind: the scope's canonical session id and harness. The event's
+  // own ids (machine, kind, event id) stay in the identity, so dedup is unchanged; the
+  // projected session id may be an owner/alias id, and keying on it would split one
+  // session's facts across two keys (and outside the scope's delete filter).
+  const identity = [ts, scope.canonicalId, scope.harness, e.machine_id, e.kind, e.event_id];
+  const row = {
+    ...base,
+    ts,
+    session_id: scope.canonicalId,
+    source: scope.harness,
+    machine_id: String(e.machine_id),
+    kind: String(e.kind),
+    event_id: String(e.event_id),
+    project_id: jtext(e.project_id),
+    task_ref_id: jtext(taskRef.id),
+    task_ref_empty: Object.keys(taskRef).length === 0 ? 1 : 0,
+    task_ref_json: canonicalJson(taskRef),
+    branch: branchOf(taskRef),
+    task_title: jtext(e.task_title),
+    user_id: jtext(e.user_id),
+    model: jtext(e.model),
+    provider: jtext(e.provider),
+    input_tokens: int(e.input_tokens),
+    output_tokens: int(e.output_tokens),
+    reasoning_tokens: int(e.reasoning_tokens),
+    cache_read_tokens: int(e.cache_read_tokens),
+    cache_create_tokens: int(e.cache_create_tokens),
+    cache_create_5m_tokens: nint(e.cache_create_5m_tokens),
+    cache_create_1h_tokens: nint(e.cache_create_1h_tokens),
+    cost_usd_micros: nint(e.cost_usd_micros),
+    files_touched: files,
+  };
+  const { version: _v, ...covered } = row;
+  return { ...row, row_id: sha256(identity), fingerprint: sha256([covered]) };
+}
+
+/** The messages CTE for one event: its message fact, or null. */
+function messageFact(scope: FactsTenant & { canonicalId: string }, e: Json, ts: string): FactDraft | null {
+  const content = jtext(e.content);
+  const payloadKind = ptext(e, "kind");
+  if (
+    e.actor_role === "assistant" && btrimSpaces(content ?? "") !== "" &&
+    ["session_event", "assistant", "text"].includes(String(e.kind)) &&
+    (payloadKind === "text" || (payloadKind === null && ["assistant", "text"].includes(String(e.type))))
+  ) {
+    const messageId = nullIfEmpty(jtext(e.request_key)) ?? nullIfEmpty(ptext(e, "message_id")) ?? jtext(e.delivery_record_id) ?? `${e.machine_id}:${e.event_id}`;
+    return { fact_kind: "message", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: messageId, origin: "", row_key: `${e.machine_id}\u001f${e.kind}\u001f${e.event_id}`, added: null, removed: null, reverted: 0 };
+  }
+  return null;
+}
+
+/** commit_candidates, third branch, before the call check: a tool result's commit facts (empty: not a candidate). */
+function toolResultCommitFacts(scope: FactsTenant & { canonicalId: string }, e: Json, ts: string): FactDraft[] {
+  const content = jtext(e.content);
+  if (e.actor_role !== "tool_result" || content === null) return [];
+  return commitMatches(content).map((m, i) => {
+    const stats = normalizeStats({ added: m.added ?? "0", deleted: m.deleted ?? "0" });
+    return { fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: m.sha, origin: "tool_result", row_key: `${e.machine_id}\u001f${e.event_id}\u001f${i}`, added: stats.added, removed: stats.removed, reverted: 0 };
+  });
+}
+
+/** commit_candidates, first branch: one session_commit_links row's commit fact; null when it lacks a sha or a time. */
+function commitLinkFact(scope: FactsTenant & { canonicalId: string }, row: Json): FactDraft | null {
+  const sha = jtext(row.commit_sha);
+  const at = jtext(row.linked_at) ?? jtext(row.received_at);
+  if (sha === null || at === null) return null;
+  const stats = normalizeStats(row.numstat);
+  return { fact_kind: "commit", ts: chTime(at), source: scope.harness, session_id: scope.canonicalId, fact_key: sha.toLowerCase(), origin: "commit_link", row_key: String(row.record_id ?? sha), ...stats, reverted: 0 };
+}
+
+/**
+ * Legacy outcomes/turns, contained like the projection: a malformed record (a missing
+ * timestamp, an unparseable clock) marks the facts inexact; it never throws out of the pass,
+ * which would abort indexSearchScope after its transcript writes.
+ */
+function legacyFacts(scope: OutputFactsScope, records: RelayhistoryStreamRecord[], push: (f: FactDraft) => void): string[] {
+  const reasons: string[] = [];
+  try {
+    const legacy = legacyAndTurns(records, scope);
+    if (!legacy.ok) reasons.push("output_facts_legacy_invalid");
+    for (const { table, row } of legacy.rows) {
+      if (table === "session_outcomes") {
+        const sha = String(row.commit_sha).toLowerCase();
+        const at = jtext(row.shipped_at) ?? String(row.created_at);
+        const ts = chTime(at);
+        const stats = normalizeStats(row.numstat_json);
+        push({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "outcome", row_key: sha, ...stats, reverted: 0 });
+        push({ fact_kind: "outcome", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "", row_key: sha, added: null, removed: null, reverted: row.reverted === true ? 1 : 0 });
+      } else if (table === "conversation_turns") {
+        const content = typeof row.content === "string" ? row.content : "";
+        if (row.role !== "assistant" || btrimSpaces(content) === "") continue;
+        // NOT EXISTS (… m.source = t.source …) compares the STORED turn source.
+        const stored = jtext(row.legacy_stored_source) ?? jtext(row.source) ?? scope.harness;
+        const at = String(row.ts);
+        const ts = chTime(at);
+        const key = jtext(row.id) ?? JSON.stringify([row.workspace_id, stored, Number(row.turn_index)]);
+        push({ fact_kind: "legacy_turn_message", ts, source: stored, session_id: scope.canonicalId, fact_key: key, origin: "", row_key: key, added: null, removed: null, reverted: 0 });
+      }
+    }
+  } catch (error) {
+    reasons.push(error instanceof Error && error.message.startsWith("output_facts_") ? error.message : "output_facts_legacy_invalid");
+  }
+  return reasons;
+}
+
+const errorReason = (error: unknown, fallback: string) =>
+  error instanceof Error && error.message.startsWith("output_facts_") ? error.message : fallback;
+
 /**
  * The scope's facts. `projectionRows` and `records` are `readCanonicalScope`'s
  * (canonical-projection.ts ScopeRead); `scopeComplete` is that read's `complete`.
@@ -257,13 +380,8 @@ export function outputFactsFromScope(
 ): OutputFacts {
   const reasons: string[] = [];
   let complete = read.complete;
-  const base = { org_id: scope.orgId, workspace_id: scope.workspaceId, version };
   const facts: OutputFactRow[] = [];
-  const pushFact = (f: Omit<OutputFactRow, "org_id" | "workspace_id" | "version" | "row_id" | "fingerprint" | "scope_source">) => {
-    const row = { ...base, scope_source: scope.harness, ...f };
-    const identity = [row.fact_kind, row.ts, row.source, row.session_id, row.fact_key, row.origin, row.row_key];
-    facts.push({ ...row, row_id: sha256(identity), fingerprint: sha256([...identity, row.added, row.removed, row.reverted]) });
-  };
+  const pushFact = (f: FactDraft) => facts.push(factRow(scope, version, f));
   const events = read.projectionRows.filter((r) => r.table === "convergence_events").map((r) => r.row);
   const eventRows: EventFactRow[] = [];
   const bySession = new Map<string, Json[]>();
@@ -274,110 +392,151 @@ export function outputFactsFromScope(
   try {
     for (const e of events) {
       const ts = chTime(String(e.ts));
-      const taskRef = isObject(e.task_ref) ? e.task_ref : {};
-      const files = Array.isArray(e.files_touched) ? e.files_touched.map(jtext) : [];
-      // One key for every fact kind: the scope's canonical session id and harness. The event's
-      // own ids (machine, kind, event id) stay in the identity, so dedup is unchanged; the
-      // projected session id may be an owner/alias id, and keying on it would split one
-      // session's facts across two keys (and outside the scope's delete filter).
-      const identity = [ts, scope.canonicalId, scope.harness, e.machine_id, e.kind, e.event_id];
-      const row = {
-        ...base,
-        ts,
-        session_id: scope.canonicalId,
-        source: scope.harness,
-        machine_id: String(e.machine_id),
-        kind: String(e.kind),
-        event_id: String(e.event_id),
-        project_id: jtext(e.project_id),
-        task_ref_id: jtext(taskRef.id),
-        task_ref_empty: Object.keys(taskRef).length === 0 ? 1 : 0,
-        task_ref_json: canonicalJson(taskRef),
-        branch: branchOf(taskRef),
-        task_title: jtext(e.task_title),
-        user_id: jtext(e.user_id),
-        model: jtext(e.model),
-        provider: jtext(e.provider),
-        input_tokens: int(e.input_tokens),
-        output_tokens: int(e.output_tokens),
-        reasoning_tokens: int(e.reasoning_tokens),
-        cache_read_tokens: int(e.cache_read_tokens),
-        cache_create_tokens: int(e.cache_create_tokens),
-        cache_create_5m_tokens: nint(e.cache_create_5m_tokens),
-        cache_create_1h_tokens: nint(e.cache_create_1h_tokens),
-        cost_usd_micros: nint(e.cost_usd_micros),
-        files_touched: files,
-      };
-      const { version: _v, ...covered } = row;
-      eventRows.push({ ...row, row_id: sha256(identity), fingerprint: sha256([covered]) });
-
+      eventRows.push(eventFactRow(scope, version, e, ts));
       // messages CTE
-      const content = jtext(e.content);
-      const payloadKind = ptext(e, "kind");
-      if (
-        e.actor_role === "assistant" && btrimSpaces(content ?? "") !== "" &&
-        ["session_event", "assistant", "text"].includes(String(e.kind)) &&
-        (payloadKind === "text" || (payloadKind === null && ["assistant", "text"].includes(String(e.type))))
-      ) {
-        const messageId = nullIfEmpty(jtext(e.request_key)) ?? nullIfEmpty(ptext(e, "message_id")) ?? jtext(e.delivery_record_id) ?? `${e.machine_id}:${e.event_id}`;
-        pushFact({ fact_kind: "message", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: messageId, origin: "", row_key: `${e.machine_id}\u001f${e.kind}\u001f${e.event_id}`, added: null, removed: null, reverted: 0 });
-      }
+      const message = messageFact(scope, e, ts);
+      if (message) pushFact(message);
       // commit_candidates, third branch
-      if (e.actor_role === "tool_result" && content !== null) {
-        const matches = commitMatches(content);
-        if (matches.length && resultHasCommitCall(e, bySession.get(JSON.stringify([e.source, e.session_id])) ?? [])) {
-          matches.forEach((m, i) => {
-            const stats = normalizeStats({ added: m.added ?? "0", deleted: m.deleted ?? "0" });
-            pushFact({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: m.sha, origin: "tool_result", row_key: `${e.machine_id}\u001f${e.event_id}\u001f${i}`, added: stats.added, removed: stats.removed, reverted: 0 });
-          });
-        }
-      }
+      const commits = toolResultCommitFacts(scope, e, ts);
+      if (commits.length && resultHasCommitCall(e, bySession.get(JSON.stringify([e.source, e.session_id])) ?? [])) commits.forEach(pushFact);
     }
     // commit_candidates, first branch: session_commit_links
     for (const { table, row } of read.projectionRows) {
       if (table !== "session_commit_links") continue;
-      const sha = jtext(row.commit_sha);
-      const at = jtext(row.linked_at) ?? jtext(row.received_at);
-      if (sha === null || at === null) { complete = false; reasons.push("output_facts_commit_link_invalid"); continue; }
-      const stats = normalizeStats(row.numstat);
-      pushFact({ fact_kind: "commit", ts: chTime(at), source: scope.harness, session_id: scope.canonicalId, fact_key: sha.toLowerCase(), origin: "commit_link", row_key: String(row.record_id ?? sha), ...stats, reverted: 0 });
+      const link = commitLinkFact(scope, row);
+      if (link === null) { complete = false; reasons.push("output_facts_commit_link_invalid"); continue; }
+      pushFact(link);
     }
   } catch (error) {
     complete = false;
-    reasons.push(error instanceof Error && error.message.startsWith("output_facts_") ? error.message : "output_facts_projection_invalid");
+    reasons.push(errorReason(error, "output_facts_projection_invalid"));
   }
 
-  // Legacy outcomes/turns are contained like the projection: a malformed record (a missing
-  // timestamp, an unparseable clock) marks the facts inexact; it never throws out of the pass,
-  // which would abort indexSearchScope after its transcript writes.
-  try {
-    const legacy = legacyAndTurns(read.records, scope);
-    if (!legacy.ok) { complete = false; reasons.push("output_facts_legacy_invalid"); }
-    for (const { table, row } of legacy.rows) {
-      if (table === "session_outcomes") {
-        const sha = String(row.commit_sha).toLowerCase();
-        const at = jtext(row.shipped_at) ?? String(row.created_at);
-        const ts = chTime(at);
-        const stats = normalizeStats(row.numstat_json);
-        pushFact({ fact_kind: "commit", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "outcome", row_key: sha, ...stats, reverted: 0 });
-        pushFact({ fact_kind: "outcome", ts, source: scope.harness, session_id: scope.canonicalId, fact_key: sha, origin: "", row_key: sha, added: null, removed: null, reverted: row.reverted === true ? 1 : 0 });
-      } else if (table === "conversation_turns") {
-        const content = typeof row.content === "string" ? row.content : "";
-        if (row.role !== "assistant" || btrimSpaces(content) === "") continue;
-        // NOT EXISTS (… m.source = t.source …) compares the STORED turn source.
-        const stored = jtext(row.legacy_stored_source) ?? jtext(row.source) ?? scope.harness;
-        const at = String(row.ts);
-        const ts = chTime(at);
-        const key = jtext(row.id) ?? JSON.stringify([row.workspace_id, stored, Number(row.turn_index)]);
-        pushFact({ fact_kind: "legacy_turn_message", ts, source: stored, session_id: scope.canonicalId, fact_key: key, origin: "", row_key: key, added: null, removed: null, reverted: 0 });
-      }
-    }
-  } catch (error) {
-    complete = false;
-    reasons.push(error instanceof Error && error.message.startsWith("output_facts_") ? error.message : "output_facts_legacy_invalid");
-  }
+  const legacy = legacyFacts(scope, read.records, pushFact);
+  if (legacy.length) { complete = false; reasons.push(...legacy); }
   const times = [...eventRows.map((r) => r.ts), ...facts.map((f) => f.ts)].sort();
   return { events: eventRows, facts, complete, reasons: [...new Set(reasons)], range: times.length ? { min: times[0]!, max: times.at(-1)! } : null };
+}
+
+// ---- the staged steps (staged reconcile, slice 2c; migration 20261105062140) ------------------
+//
+// A staged reconcile hands the facts its read in chunks (the facts pass of staged-reconcile.ts: once
+// per attempt at the end of the want phase, the whole read's post-fold projection rows and records
+// in source order, chunks not self-contained). outputFactsBatchStep turns one chunk into staged items; whatever needs the
+// session as a whole (the tool_result commit check, the legacy outcome/turn fold, the scope's
+// session ids) is staged as input and decided by outputFactsFinishStep at the end. Over a whole
+// read, the facts both steps produce are outputFactsFromScope's, with one difference on a
+// malformed event or commit link: outputFactsFromScope stops at the first one (in read order),
+// the batch step skips just that row. Both mark the pass incomplete with the same reason, so
+// neither deletes; the staged pass may insert well-formed rows the whole pass did not reach.
+
+/** The scope a staged run's facts are built for: everything but the session id set, known only at the end. */
+export type OutputFactsStagedScope = FactsTenant & { canonicalId: string };
+
+/** The fields of a convergence event the tool_result commit check reads, payload values as text. */
+function commitCheckEvent(e: Json): Json {
+  return {
+    kind: e.kind,
+    ts: e.ts,
+    tool_name: e.tool_name,
+    record: { payload: Object.fromEntries(["tool_use_id", "parent_id", "message_id", "turn_id", "args_json"].map((k) => [k, ptext(e, k)])) },
+  };
+}
+
+/** A staged item: the store keys and writes these (output-facts-store.ts stageOutputFactsBatch). */
+export type OutputFactsStagedItem =
+  | { kind: "event"; row: EventFactRow }
+  | { kind: "fact"; row: OutputFactRow }
+  /** A tool result with commit output: its facts count once the session's calls are known. */
+  | { kind: "candidate"; group: string; match: string; body: { result: Json; facts: OutputFactRow[] } }
+  /** A tool call (match: its tool use id) or a session event (match: its message id) the check may need. */
+  | { kind: "call" | "parent"; group: string; match: string; body: Json }
+  | { kind: "record"; body: RelayhistoryStreamRecord }
+  | { kind: "session"; sessionId: string }
+  | { kind: "note"; reason: string };
+
+/** The relevant record kinds of legacyAndTurns. */
+const LEGACY_RECORD_KINDS = new Set(["legacy_conversation_turn", "legacy_session_outcome", "legacy_session_link", "legacy_scope", "conversation_turn"]);
+
+/** One chunk of a staged run's facts pass as staged items (the per-event step). */
+export function outputFactsBatchStep(
+  scope: OutputFactsStagedScope,
+  batch: { projectionRows: ReadonlyArray<{ table: string; row: Json }>; records: readonly RelayhistoryStreamRecord[] },
+  version: number,
+): OutputFactsStagedItem[] {
+  const items: OutputFactsStagedItem[] = [];
+  const note = (reason: string) => items.push({ kind: "note", reason });
+  for (const { table, row: e } of batch.projectionRows) {
+    if (table === "convergence_events") {
+      // factsScope (search-index.ts): every session id a projected event carries.
+      if (typeof e.session_id === "string") items.push({ kind: "session", sessionId: e.session_id });
+      const group = JSON.stringify([e.source, e.session_id]);
+      try {
+        const ts = chTime(String(e.ts));
+        items.push({ kind: "event", row: eventFactRow(scope, version, e, ts) });
+        const message = messageFact(scope, e, ts);
+        if (message) items.push({ kind: "fact", row: factRow(scope, version, message) });
+        const commits = toolResultCommitFacts(scope, e, ts);
+        // No tool use id: resultHasCommitCall is false whatever else the session holds.
+        const toolUse = nullIfEmpty(ptext(e, "tool_use_id"));
+        if (commits.length && toolUse !== null)
+          items.push({ kind: "candidate", group, match: toolUse, body: { result: commitCheckEvent(e), facts: commits.map((f) => factRow(scope, version, f)) } });
+      } catch (error) {
+        note(errorReason(error, "output_facts_projection_invalid"));
+      }
+      // The commit check's other side: every call by its tool use id, every session event by its message id.
+      const callUse = e.kind === "tool_call" ? nullIfEmpty(ptext(e, "tool_use_id")) : null;
+      if (callUse !== null) items.push({ kind: "call", group, match: callUse, body: commitCheckEvent(e) });
+      const parentMessage = e.kind === "session_event" ? nullIfEmpty(ptext(e, "message_id")) : null;
+      if (parentMessage !== null) items.push({ kind: "parent", group, match: parentMessage, body: commitCheckEvent(e) });
+    } else if (table === "session_commit_links") {
+      try {
+        const link = commitLinkFact(scope, e);
+        if (link === null) note("output_facts_commit_link_invalid");
+        else items.push({ kind: "fact", row: factRow(scope, version, link) });
+      } catch (error) {
+        note(errorReason(error, "output_facts_projection_invalid"));
+      }
+    }
+  }
+  for (const r of batch.records) if (LEGACY_RECORD_KINDS.has(r.kind)) items.push({ kind: "record", body: r });
+  return items;
+}
+
+/** A staged candidate with the session's calls and parent events its check needs (any superset of them). */
+export interface OutputFactsStagedCandidate {
+  result: Json;
+  facts: OutputFactRow[];
+  sessionEvents: Json[];
+}
+
+/**
+ * The finish step: the staged candidates' commit check and the legacy fold over the whole
+ * scope (`scope.sessionIds` complete). Returns the facts decided here (the batch steps staged the
+ * rest) and the pass's verdict: `complete` is the read's own (`sourceComplete`) and no note.
+ */
+export function outputFactsFinishStep(
+  scope: OutputFactsScope,
+  staged: { candidates: Iterable<OutputFactsStagedCandidate>; records: RelayhistoryStreamRecord[]; notes: string[]; sourceComplete: boolean },
+  version: number,
+): { facts: OutputFactRow[]; complete: boolean; reasons: string[] } {
+  const facts: OutputFactRow[] = [];
+  const reasons = [...staged.notes];
+  for (const c of staged.candidates) {
+    // An unparseable call time throws in the check, as it does inside outputFactsFromScope's loop.
+    try {
+      if (resultHasCommitCall(c.result, c.sessionEvents)) facts.push(...c.facts);
+    } catch (error) {
+      reasons.push(errorReason(error, "output_facts_projection_invalid"));
+    }
+  }
+  reasons.push(...legacyFacts(scope, staged.records, (f) => facts.push(factRow(scope, version, f))));
+  return { facts, complete: staged.sourceComplete && reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+/** The commit check's lookup keys for a candidate's calls' parents: their non-empty message ids. */
+export function callMessageIds(calls: Json[]): string[] {
+  return [...new Set(calls.map((c) => nullIfEmpty(ptext(c, "message_id"))).filter((m): m is string => m !== null))];
 }
 
 export interface ReconcileOutputFactsResult {
