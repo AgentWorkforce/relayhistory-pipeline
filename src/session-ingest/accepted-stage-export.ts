@@ -111,10 +111,53 @@ export interface ExportOptions {
   nowMs?: () => number;
   lockTtlMs?: number;
   /**
+   * Attempts per object-store call on `transient` (a throttle, 408/429 or 5xx), including the first; default
+   * EXPORT_TRANSIENT_ATTEMPTS. 1 = no retry (the behaviour before). Any other code is never retried.
+   */
+  transientAttempts?: number;
+  /** The pause between transient retries (tests); default setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+  /**
    * Path B (header): orgs whose absent control heads may be proven by a fresh no_head parity row alone. Every org must
    * also be in `orgs` (a scoped run); maxAgeSeconds in [1, NO_HEAD_PARITY_MAX_AGE_SECONDS]. Unset: off.
    */
   noHeadParity?: { orgs: string[]; maxAgeSeconds: number };
+}
+
+/**
+ * Object-store attempts on `transient` per call (first included). A 50k-stage production export saw ~0.2% transient
+ * failures on single attempts (failed_codes store_transient), which leaves every org incomplete; retried, they clear.
+ */
+export const EXPORT_TRANSIENT_ATTEMPTS = 5;
+/** Backoff before retry n (0-based): 250 ms doubling, capped at 4 s. */
+export const exportTransientBackoffMs = (n: number) => Math.min(4000, 250 * 2 ** n);
+
+/**
+ * `store` with every call retried on ObjectStoreError `transient`, at most `attempts` times in all, backing off
+ * between tries; any other error, and the last transient one, is thrown as is. A put is retried too: a create or CAS
+ * whose first attempt landed then answers already_exists / precondition_failed, which the callers settle by reading
+ * the object back (the sidecar, proof and superseded writes). Not used for the run lease (its CAS must not be replayed).
+ */
+export function retryTransient(store: ObjectStore, attempts: number, sleep: (ms: number) => Promise<void>): ObjectStore {
+  const retried = new Set<PropertyKey>(["getObject", "head", "list", "put"]);
+  return new Proxy(store, {
+    get(target, prop) {
+      const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+      if (typeof value !== "function") return value;
+      const fn = (value as (...a: unknown[]) => unknown).bind(target);
+      if (!retried.has(prop)) return fn;
+      return async (...args: unknown[]) => {
+        for (let n = 0; ; n++) {
+          try {
+            return await fn(...args);
+          } catch (error) {
+            if (!isObjectStoreError(error, "transient") || n + 1 >= attempts) throw error;
+            await sleep(exportTransientBackoffMs(n));
+          }
+        }
+      };
+    },
+  });
 }
 
 /** Path B's ceiling on a parity row's age (6 h). */
@@ -508,7 +551,10 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   const nhpAge = nhp ? nhp.maxAgeSeconds : null;
   const nowMs = opts.nowMs ?? Date.now;
   // The dry run's defence in depth: every mutation throws.
-  const store: ObjectStore = opts.dryRun
+  const attempts = opts.transientAttempts ?? EXPORT_TRANSIENT_ATTEMPTS;
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 10) throw new Error("export_transient_attempts_invalid");
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const base: ObjectStore = opts.dryRun
     ? new Proxy(opts.store, {
         get(target, prop) {
           if (prop === "put" || prop === "delete") return async () => { throw new Error("export_dry_run_write_refused"); };
@@ -517,6 +563,9 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         },
       })
     : opts.store;
+  // Every read and write of the run retries transients; the lease below uses `base` (a replayed CAS renewal could
+  // find its own write and read as lost).
+  const store = retryTransient(base, attempts, sleep);
   const io = s3LedgerObjects(store, opts.keyRoot);
   const summary: ExportSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", rows: 0, live: 0, not_live: 0, fence_absent: 0,
@@ -547,9 +596,28 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   if (opts.dryRun) {
     await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs(), exportLockKey(opts.keyRoot));
     await assertPeerUnlocked(opts.store, drainLockKey(opts.keyRoot), nowMs());
-  } else lease = await acquireExclusiveLock(store, opts.keyRoot, { holder: `export-${randomUUID()}`, ttlMs: opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS, now: nowMs, key: exportLockKey(opts.keyRoot), peerKey: drainLockKey(opts.keyRoot) });
+  } else lease = await acquireExclusiveLock(base, opts.keyRoot, { holder: `export-${randomUUID()}`, ttlMs: opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS, now: nowMs, key: exportLockKey(opts.keyRoot), peerKey: drainLockKey(opts.keyRoot) });
   const ttl = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
-  const renew = lease ? setInterval(() => { lease!.renew().catch(() => {}); }, Math.max(500, Math.floor(ttl / 3))) : undefined;
+  // A renewal that fails transiently is tried again (bounded) before the next tick: one missed renewal is the safety
+  // margin alive() keeps, so a single 503 used to end the run (export_lock_lost). A renewal that lost the lock (its CAS
+  // found another version, including its own earlier write after an ambiguous 5xx) stays lost: a hard stop.
+  let renewing = false;
+  const renewBounded = async () => {
+    for (let n = 0; n < attempts; n++) {
+      try {
+        await lease!.renew();
+        return;
+      } catch (error) {
+        if (!isObjectStoreError(error, "transient")) return;
+        await sleep(exportTransientBackoffMs(n));
+      }
+    }
+  };
+  const renew = lease ? setInterval(() => {
+    if (renewing) return;
+    renewing = true;
+    renewBounded().finally(() => { renewing = false; });
+  }, Math.max(500, Math.floor(ttl / 3))) : undefined;
   const leaseOk = () => opts.dryRun || (lease !== undefined && lease.alive());
 
   try {
@@ -722,8 +790,16 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
           if (opts.dryRun) { summary.would_write++; return; }
           if (!leaseOk()) throw new Error("export_lock_lost");
           // A verdict that changed since an earlier export replaces it (CAS): the drain acts on the latest.
-          await store.put(objectKey(key), encoder.encode(JSON.stringify(marker)),
-            existing && existing !== "invalid" ? { ifMatch: existing.version, contentType: "application/json" } : existing === "invalid" ? { contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
+          try {
+            await store.put(objectKey(key), encoder.encode(JSON.stringify(marker)),
+              existing && existing !== "invalid" ? { ifMatch: existing.version, contentType: "application/json" } : existing === "invalid" ? { contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
+          } catch (error) {
+            // A retried create/CAS whose first attempt landed (a transient after the write): the sidecar is then exactly
+            // this verdict. Anything else is the conflict it was.
+            if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
+            const now = await readMarker(store, key);
+            if (now === null || now === "invalid" || JSON.stringify(now.doc) !== JSON.stringify(marker)) throw error;
+          }
           if (existing) summary.updated++;
           else summary.written++;
         } catch (error) {

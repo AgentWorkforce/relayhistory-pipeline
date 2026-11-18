@@ -870,6 +870,68 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     expect(await exists(inner, s.key + ACCEPTED_SUFFIX)).toBe(false);
   });
 
+  test("transient store errors are retried (bounded): reads, and a write whose first attempt landed, end clean", async () => {
+    const inner = scratch();
+    await backfillFence(inner, A);
+    const s = await seed(A, one);
+    const seen = new Set<string>();
+    const pauses: number[] = [];
+    const flaky = new Proxy(inner, {
+      get(target, prop) {
+        const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        if (typeof value !== "function") return value;
+        const fn = (value as (...a: unknown[]) => Promise<unknown>).bind(target);
+        if (prop !== "getObject" && prop !== "put") return fn;
+        return async (key: unknown, ...rest: unknown[]) => {
+          const id = `${String(prop)}:${String(key)}`;
+          if (String(key).includes("/.drain/")) return fn(key, ...rest); // the lease and lock keys: untouched
+          if (seen.has(id)) return fn(key, ...rest);
+          seen.add(id);
+          // First call per key and method fails transiently; a put lands first (the ambiguous 5xx).
+          if (prop === "put") await fn(key, ...rest);
+          throw new ObjectStoreError("transient", "fs", "injected 503", { status: 503 });
+        };
+      },
+    });
+    const summary = await run(flaky, { sleep: async (ms: number) => { pauses.push(ms); } });
+    expect(summary).toMatchObject({ failed: 0, failed_codes: {}, live: 1, written: 1, orgs: { complete: 1, incomplete: 0 } });
+    expect(pauses.length).toBeGreaterThan(0);
+    expect(pauses.every((ms) => ms === 250)).toBe(true);
+    expect(parseAcceptedMarker(await readText(inner, s.key + ACCEPTED_SUFFIX))?.live).toBe(true);
+  });
+
+  test("the transient retry is bounded, and a non-transient code is never retried", async () => {
+    for (const [code, attempts, calls] of [["transient", 3, 3], ["transient", undefined, 5], ["unauthorized", 5, 1]] as const) {
+      const inner = scratch();
+      await backfillFence(inner, A);
+      await seed(A, one);
+      let fenceReads = 0;
+      const store = new Proxy(inner, {
+        get(target, prop) {
+          if (prop === "getObject") return async (key: unknown, ...rest: unknown[]) => {
+            if (String(key).endsWith("upload-fences.json")) {
+              fenceReads++;
+              throw new ObjectStoreError(code, "fs", "injected");
+            }
+            return (target.getObject as (...a: unknown[]) => unknown).call(target, key, ...rest);
+          };
+          const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+      const summary = await run(store, { sleep: async () => {}, ...(attempts === undefined ? {} : { transientAttempts: attempts }) });
+      expect(fenceReads).toBe(calls);
+      expect(summary.failed).toBe(1);
+      expect(Object.keys(summary.failed_codes)).toEqual([code === "transient" ? expect.stringMatching(/^fence_/) : expect.stringMatching(/^fence_/)]);
+      expect(summary.orgs.incomplete).toBe(1);
+      await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;");
+    }
+  });
+
+  test("transientAttempts outside 1..10 refuses", async () => {
+    for (const bad of [0, 11, 1.5]) await expect(run(scratch(), { transientAttempts: bad })).rejects.toThrow("export_transient_attempts_invalid");
+  });
+
   test("failureCode: closed codes only, never a message", () => {
     expect(failureCode(new ObjectStoreError("transient", "s3", "GET https://bucket/96bulls/org/key 503"))).toBe("store_transient");
     expect(failureCode(new Error("export_proof_mismatch"))).toBe("export_proof_mismatch");
