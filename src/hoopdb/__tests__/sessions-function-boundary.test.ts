@@ -541,7 +541,7 @@ describe("unified sessions function-boundary generator", () => {
     }
     // The consumer role verifier allowlists exactly the same writers (both of its lists).
     const verify = readFileSync(join(root, "supabase/bootstrap/session_consumer_role_verify.sql"), "utf8");
-    const listed = [...verify.matchAll(/'(sessions\.(?:output_facts_[a-z_]+|search_reconcile_[a-z_]+_v1|ingest_operator_runtime_upsert)\([^']*\))'/g)].map((m) => m[1]!);
+    const listed = [...verify.matchAll(/'(sessions\.(?:output_facts_[a-z_]+|search_reconcile_[a-z_]+_v1|staged_facts_[a-z_]+_v1|ingest_operator_runtime_upsert)\([^']*\))'/g)].map((m) => m[1]!);
     expect([...new Set(listed)].sort()).toEqual([...CONSUMER_RUNTIME_FUNCTIONS].sort());
     for (const fn of CONSUMER_RUNTIME_FUNCTIONS) expect(listed.filter((x) => x === fn).length, fn).toBe(2);
   });

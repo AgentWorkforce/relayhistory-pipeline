@@ -1735,6 +1735,32 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.staged_facts_read_v1(bigint,uuid,text,text,text[],bigint,integer)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.staged_facts_run_v1(bigint,uuid,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.staged_facts_seal_v1(bigint,uuid)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.staged_facts_stage_v1(bigint,uuid,jsonb,integer,boolean)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.staged_facts_status_v1(bigint,uuid)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.staged_facts_whole_v1(bigint)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.summary_regeneration_audit_append_only()": [
       "<owner>:EXECUTE"
     ],
