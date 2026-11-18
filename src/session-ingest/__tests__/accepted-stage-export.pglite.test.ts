@@ -4,8 +4,8 @@ import { zstdDecompressSync } from "node:zlib";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { CANDIDATE_KEYS, NO_HEAD_PARITY_MAX_AGE_SECONDS, acceptedProofKey, exportAcceptedStages, exportLockKey, scopedExportSql, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
+import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { CANDIDATE_KEYS, NO_HEAD_PARITY_MAX_AGE_SECONDS, acceptedProofKey, exportAcceptedStages, failureCode, exportLockKey, scopedExportSql, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
 import { ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, drainBufferedBatches, parseAcceptedComplete, parseAcceptedMarker } from "../buffered-drain.ts";
 import { applyFenceChange, fenceEpoch, orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedKey } from "../staging.ts";
@@ -748,7 +748,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     return out;
   }
   const OLD_SUMMARY_KEYS = ["mode", "rows", "live", "not_live", "fence_absent", "written", "updated", "already", "would_write", "invalid", "failed",
-    "gated", "fence_late", "superseded", "would_supersede", "orgs"];
+    "failed_codes", "gated", "fence_late", "superseded", "would_supersede", "orgs"];
 
   test("off (unset), or on for another org only: the verdicts, the objects and the summary are byte-identical", async () => {
     // Every absent-head case the gate distinguishes, each under three authorities.
@@ -836,13 +836,47 @@ describe("Path B: no-head parity, per listed org, default off", () => {
       await store.put(objectKey(proofKey(s)), enc.encode(planted), { contentType: "application/json" });
       for (const dryRun of [true, false]) {
         const summary = await run(store, { ...pathB(), dryRun });
-        expect(summary).toMatchObject({ failed: 1, written: 0, would_write: 0, orgs: { incomplete: 1 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+        expect(summary).toMatchObject({ failed: 1, failed_codes: { export_proof_mismatch: 1 }, written: 0, would_write: 0, orgs: { incomplete: 1 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
       }
       expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
       expect(await readText(store, proofKey(s))).toBe(planted);
       await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; DELETE FROM sessions.owner_buffered_parity; SET session_replication_role = origin;");
       await setAuthority("active");
     }
+  });
+
+  test("failed_codes: an unreadable fence counts its cause (codes only), sums to failed, org incomplete", async () => {
+    const inner = scratch();
+    await backfillFence(inner, A);
+    const s = await seed(A, one);
+    const store = new Proxy(inner, {
+      get(target, prop) {
+        if (prop === "getObject") return async (key: unknown, ...rest: unknown[]) => {
+          if (String(key).endsWith("upload-fences.json")) throw new ObjectStoreError("transient", "fs", "injected 503", { status: 503 });
+          return (target.getObject as (...a: unknown[]) => unknown).call(target, key, ...rest);
+        };
+        const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const summary = await run(store, {});
+    expect(summary.failed).toBe(1);
+    const codes = Object.entries(summary.failed_codes);
+    expect(codes).toHaveLength(1);
+    expect(codes[0]![0]).toMatch(/^fence_[a-z0-9_]+$/);
+    expect(codes[0]![0]).not.toBe("fence_internal");
+    expect(codes[0]![1]).toBe(1);
+    expect(summary.orgs.incomplete).toBe(1);
+    expect(await exists(inner, s.key + ACCEPTED_SUFFIX)).toBe(false);
+  });
+
+  test("failureCode: closed codes only, never a message", () => {
+    expect(failureCode(new ObjectStoreError("transient", "s3", "GET https://bucket/96bulls/org/key 503"))).toBe("store_transient");
+    expect(failureCode(new Error("export_proof_mismatch"))).toBe("export_proof_mismatch");
+    expect(failureCode(new Error("connect ECONNRESET 10.0.0.1:443"))).toBe("internal");
+    expect(failureCode(Object.assign(new Error("Some message with /a/key"), { code: "ledger_fence_invalid" }))).toBe("ledger_fence_invalid");
+    expect(failureCode("x")).toBe("internal");
+    expect(failureCode(null)).toBe("internal");
   });
 
   test("a failed proof put leaves no sidecar, counts as failed and leaves the org incomplete", async () => {
@@ -861,7 +895,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
       },
     });
     const summary = await run(store, pathB());
-    expect(summary).toMatchObject({ failed: 1, written: 0, orgs: { incomplete: 1, complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+    expect(summary).toMatchObject({ failed: 1, failed_codes: { injected_put_failure: 1 }, written: 0, orgs: { incomplete: 1, complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
     expect(await exists(inner, s.key + ACCEPTED_SUFFIX)).toBe(false);
     expect(await exists(inner, proofKey(s))).toBe(false);
   });
@@ -881,7 +915,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     } };
     const summary = await exportAcceptedStages({ sql, store, keyRoot: ROOT, dryRun: false, ...pathB(), lockTtlMs: 60_000,
       nowMs: () => 1_893_542_400_000 + (late ? 3_600_000 : 0) });
-    expect(summary).toMatchObject({ failed: 1, written: 0, orgs: { complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+    expect(summary).toMatchObject({ failed: 1, failed_codes: { export_lock_lost: 1 }, written: 0, orgs: { complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
     expect(await exists(store, proofKey(s))).toBe(false);
     expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
   });
