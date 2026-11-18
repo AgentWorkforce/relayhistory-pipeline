@@ -444,7 +444,7 @@ describe("staged reconcile through the consumer wiring", () => {
     }, 120_000);
 
   /** A rig whose scan pages are corrupt until `heal()`, counting source reads and index writes. */
-  async function failing() {
+  async function failing(override = true) {
     const r = await seeded(x);
     const index = r.adapter.index as SearchIndexAdapter;
     const page = index.scanFingerprintsPage!.bind(index);
@@ -460,7 +460,7 @@ describe("staged reconcile through the consumer wiring", () => {
     index.deleteEvents = (async (...a: Parameters<typeof remove>) => { counts.deletes += 1; return remove(...a); }) as typeof remove;
     const store = { ...x.store, getObject: (...a: Parameters<typeof x.store.getObject>) => { counts.reads += 1; return x.store.getObject(...a); } } as typeof x.store;
     const cap = { cap: 2, retryEvery: 3 };
-    const pass = () => r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store, staged: stagedOn({ attemptsCap: cap }) });
+    const pass = () => r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store, staged: stagedOn(override ? { attemptsCap: cap } : {}) });
     const tick = async () => {
       const before = { ...counts };
       const out = await pass();
@@ -523,6 +523,37 @@ describe("staged reconcile through the consumer wiring", () => {
     expect(await r.runs()).toBe(0);
     expect(await r.scan()).toEqual(ref.scan);
   }, 300_000);
+
+  test("attempts cap, production constants (no override): claim 25 fails without a read, claim 96 reads and finishes", async () => {
+    const { r, tick, heal } = await failing(false);
+    expect((await tick()).out.reasons).toEqual(["staged_run_interrupted"]); // claim 1; the lease is released
+    await r.hoop.pg.exec("UPDATE sessions.search_reconcile_runs_v1 SET attempts = 24");
+    await r.expire();
+    const failed = await tick(); // claim 25
+    expect(failed.out.reasons).toEqual(["staged_run_failed"]);
+    expect([failed.reads, failed.writes]).toEqual([0, 0]);
+    heal();
+    await r.hoop.pg.exec("UPDATE sessions.search_reconcile_runs_v1 SET attempts = 95");
+    await r.expire();
+    const retry = await tick(); // claim 96 = 24 + 72: the slow retry
+    expect(retry.reads).toBeGreaterThan(0);
+    expect(retry.out).toMatchObject({ complete: true });
+    expect(await r.runs()).toBe(0);
+    expect(await r.scan()).toEqual(ref.scan);
+  }, 300_000);
+
+  test("summary line on a thrown pass: one warn line, outcome incomplete, then the error goes on", async () => {
+    const r = await seeded(x);
+    const broken = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+      r.transact((tx) => work({
+        query: (sql: string, params?: unknown[]) =>
+          sql.includes("search_reconcile_claim_v1") ? Promise.reject(Object.assign(new Error("down"), { code: "08006" })) : tx.query(sql, params),
+      }));
+    const { value, lines } = await summaries(() =>
+      r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, transact: broken, staged: stagedOn() }).then(() => null, (e: { code?: string }) => e.code));
+    expect(value).toBe("08006");
+    expect(lines.map((l) => [l.level, l.outcome, l.reason ?? null, l.attempt ?? null])).toEqual([["warn", "incomplete", null, null]]);
+  }, 120_000);
 
   test("attempts cap: a source change resets a failed run (fresh claim, attempt 1)", async () => {
     const { r, tick, heal } = await failing();

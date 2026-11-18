@@ -846,7 +846,7 @@ async function stagedSearchScopeRun(
     // scope the taker just finished back to owing.
     if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return result(["staged_lease_lost"]);
     // Every other outcome after the claim but done leaves the scope owing a pass: the tick resumes it.
-    // TODO(slice 3): cap the attempts of a permanently failing run (failed runs, operator reset).
+    // A run that keeps failing is capped by the attempts cap (attemptsCap below, staged_run_failed).
     log.warn("search index staged run interrupted", {
       stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,
       ...(error instanceof Error ? { error_name: error.name } : {}), ...errorFields(error),
@@ -909,10 +909,20 @@ function stagedOutcome(r: SearchIndexResult): "done" | "busy" | "restart" | "fai
 async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
   const started = Date.now();
   const seen: { attempts?: number } = {};
-  const out = await stagedSearchScopeRun(scope, deps, limits, h, seen);
+  const scopeFields = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
+  let out: SearchIndexResult;
+  try {
+    out = await stagedSearchScopeRun(scope, deps, limits, h, seen);
+  } catch (error) {
+    // Thrown (before the claim, in the reset, in owing()): still one line, then the error goes on.
+    log.warn("search index staged run", {
+      ...scopeFields, outcome: "incomplete", ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }), duration_ms: Date.now() - started,
+    });
+    throw error;
+  }
   const outcome = stagedOutcome(out);
   log[outcome === "incomplete" || outcome === "failed" ? "warn" : "info"]("search index staged run", {
-    stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+    ...scopeFields,
     outcome, ...(out.reasons[0] ? { reason: out.reasons[0] } : {}), ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }),
     count: out.rows, inserted: out.inserted, deleted: out.deleted, duration_ms: Date.now() - started,
   });

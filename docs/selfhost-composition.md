@@ -718,7 +718,7 @@ With it on:
   1` at most every 20 seconds) on the whole-read path. A streamed scope no longer runs in that transaction: it runs
   as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
   in docs/local-stack.md, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
-  `staged_lease_lost`, `output_facts_stage_incomplete`).
+  `staged_lease_lost`, `output_facts_stage_incomplete`, `staged_run_failed`).
 
 What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
 reads no more index rows than the bounded scan did; only the reason code past that point changes. A
