@@ -42,6 +42,7 @@ import {
   requestedAlchemyCommand,
   captureRelayauthChartPackage,
   captureRelaycastChartPackage,
+  PUBLISHED_HELM_REPO,
   type GcpInputs,
 } from "./config.ts";
 import { prepareRelayauthChart, prepareRelaycastChart } from "./chart-cache.ts";
@@ -77,7 +78,9 @@ import {
 } from "./bucket-iam.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
-const DEFAULT_CHART_REPO = "https://AgentWorkforce.github.io/helm-charts";
+// The chart index moved with the AgentWorkforce/helm-charts -> AgentWorkforce/infra rename;
+// GitHub Pages does not redirect, so the old /helm-charts URL serves a 404 index.
+const DEFAULT_CHART_REPO = PUBLISHED_HELM_REPO;
 const PSA_CIDR = "10.80.0.0/20";
 
 interface EnsurePrivateCloudSqlInput {

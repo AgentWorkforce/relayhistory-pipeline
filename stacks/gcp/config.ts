@@ -181,6 +181,13 @@ export function captureRelayauthChartPackage(
   );
 }
 
+/**
+ * The AgentWorkforce chart index (gh-pages of AgentWorkforce/infra, formerly
+ * AgentWorkforce/helm-charts). Pages does not redirect after a repository rename, so the
+ * old https://AgentWorkforce.github.io/helm-charts path now serves a 404 index.
+ */
+export const PUBLISHED_HELM_REPO = "https://agentworkforce.github.io/infra";
+
 export function isPublishedHelmRepo(repo: string | undefined): boolean {
   if (!repo) return true;
   let url: URL;
@@ -196,7 +203,7 @@ export function isPublishedHelmRepo(repo: string | undefined): boolean {
     !url.search &&
     !url.hash &&
     url.hostname.toLowerCase() === "agentworkforce.github.io" &&
-    url.pathname.replace(/\/$/, "") === "/helm-charts"
+    url.pathname.replace(/\/$/, "") === new URL(PUBLISHED_HELM_REPO).pathname
   );
 }
 

@@ -60,6 +60,13 @@ import {
 export { telemetryPolicy } from "./hardening.ts";
 
 /**
+ * The AgentWorkforce chart index (gh-pages of AgentWorkforce/infra, formerly
+ * AgentWorkforce/helm-charts). Pages does not redirect after a repository rename, so the
+ * old https://AgentWorkforce.github.io/helm-charts path now serves a 404 index.
+ */
+export const CHART_REPO = "https://agentworkforce.github.io/infra";
+
+/**
  * HOOPDB_DB_MODE, an explicit shim choice and the dedicated runtime role for the
  * migrator. There is no runtime-role default in either mode: in-cluster (selfhosted) the
  * role is created by the privileged supabase/bootstrap/hoopdb_runtime_role.sql step, run
@@ -425,7 +432,7 @@ export const eksStage = (i: EksStageInputs) =>
     const chart = yield* Kubernetes.HelmChart("96bulls", {
       cluster,
       chart: "96bulls",
-      repo: i.chartRepo ?? "https://AgentWorkforce.github.io/helm-charts",
+      repo: i.chartRepo ?? CHART_REPO,
       version: i.chartVersion,
       releaseName: "96bulls",
       namespace: "96bulls",
@@ -437,7 +444,7 @@ export const eksStage = (i: EksStageInputs) =>
       ? yield* Kubernetes.HelmChart("relaycast", {
           cluster,
           chart: "relaycast",
-          repo: i.chartRepo ?? "https://AgentWorkforce.github.io/helm-charts",
+          repo: i.chartRepo ?? CHART_REPO,
           version: i.relaycast.chartVersion,
           releaseName: "relaycast",
           namespace: RELAYCAST_NAMESPACE,
