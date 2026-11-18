@@ -712,7 +712,10 @@ With it on:
   That is the same key memory as the default streaming budgets already need (about 0.5 GB), so the pod sizing
   above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
 - **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
-  1` at most every 20 seconds), on the whole-read path as on the streamed one.
+  1` at most every 20 seconds) on the whole-read path. A streamed scope no longer runs in that transaction: it runs
+  as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
+  in docs/local-stack.md, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
+  `staged_lease_lost`, `output_facts_stage_incomplete`).
 
 What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
 reads no more index rows than the bounded scan did; only the reason code past that point changes. A

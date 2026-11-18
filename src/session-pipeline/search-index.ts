@@ -62,6 +62,7 @@ export const STREAM_READ_CEILING: Readonly<StreamReadLimits> = Object.freeze({
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
+import { errorFields, log } from "../shared/log.ts";
 import { PipelineError, type ManifestReader, type ObjectStore } from "../shared/vendor.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
@@ -189,7 +190,7 @@ export interface StagedReconcile {
   /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
   keyedRecordsCap: number;
   /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
-  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks">>;
+  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError">>;
 }
 
 /**
@@ -466,6 +467,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // Erased: no live manifest is left, so every row of the scope goes, in or
       // out of the window. One predicate delete, no listing, so no size can
       // truncate it. It throws on failure and the message retries.
+      // Staged: the scope's staged runs (and their stage rows) go FIRST, so no write page of a
+      // run already past its scope-lock check can put erased rows back after the index erase
+      // (a write page takes the same scope lock this transaction holds).
+      if (deps.staged && deps.adapter) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, pointerSnapshot.canonicalId])]);
       await io.erase(scope,pointerSnapshot.canonicalId);
       // Erasure purges the fact tables whenever they exist, flag or not: turning the producer
       // off must never leave an erased session's facts behind.
@@ -483,8 +488,6 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // Postgres (flag on): the scope's facts and state rows go in this transaction; a re-upload
       // starts from no state, so its fresh epoch is never refused as stale.
       if (pgFacts) await pgFacts.erase(factsScope(scope, pointerSnapshot.canonicalId));
-      // Staged: the scope's staged runs and their stage rows go with it.
-      if (deps.staged && deps.adapter) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, pointerSnapshot.canonicalId])]);
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
@@ -710,12 +713,14 @@ const STAGED_BUDGETS = new Set<string>([STREAM_READ_BYTES_BUDGET, STREAM_READ_EV
  * Resume is the reconcile tick's: a successful claim records the scope as owing a pass (state
  * partial), so an interrupted run is listed by the tick and resumes at its committed cursor once
  * its lease expires. Nothing here answers `busy` (the queue's requeue and dead-letter path):
+ * Every outcome after a successful claim that is not done leaves the scope owing (directory events
+ * invalidated, state incomplete); staged_run_leased claimed nothing and writes nothing.
  *   staged_run_leased       another tick holds the run's live lease; nothing written
- *   scope_busy / canonical_scope_busy   a lock was held at the final step; lease released
+ *   scope_busy / canonical_scope_busy   a lock was held at a write page or the final step; lease released
  *   stream_source_changed   the stamp moved; the run was abandoned and restarts on the tick
  *   output_facts_stage_incomplete   a hook sent the run round again (StagedRunRestart)
  *   staged_lease_lost       the run was taken over or erased under this tick
- *   staged_run_interrupted  a step failed after the claim; the run resumes on the tick
+ *   staged_run_interrupted  a step failed after the claim (logged: class and code); lease released
  */
 async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
   const binding = deps.adapter!;
@@ -735,6 +740,8 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
         {
           readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
           ...(deps.originLabels ? { originLabels: true as const } : {}),
+          // The same deadline as the in-transaction stream (between chunks of every pass, the facts pass included).
+          ...(deps.streamDeadline ? { deadline: deps.streamDeadline } : {}),
           perPass: { keyedRecordsCap: staged.keyedRecordsCap },
         },
         budget, h.version, h.fromMs,
@@ -788,11 +795,14 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
       await io.record(scope, h.revision, r.inWindow, complete, h.at, canonicalId);
       return { complete, reasons };
     },
+    // Without the scope locks, on purpose: it only ever marks the scope owing. Racing a final step
+    // that recorded the scope current, it can at worst leave a current scope owing one more pass.
     async claimed(tx) {
-      claimed = true;
       await adapterProjectionIo(binding, tx).record(scope, h.revision, 0, false, h.at, canonicalId);
     },
   };
+  // Without the scope locks, as `claimed`: it only invalidates and marks owing, so a race with a
+  // final step that recorded the scope current errs toward one more pass, never toward stale data.
   const owing = async (reasons: string[], partial: boolean): Promise<SearchIndexResult> => {
     await deps.transact(async (tx) => {
       await invalidateDirectoryEvents(tx, scope);
@@ -808,18 +818,32 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
       deletePage: Math.min(limits.insertBatch, MAX_SCAN_PAGE),
       keepFingerprintPrefix: BUFFERED_FINGERPRINT_PREFIX,
       abandonOn: (error) => (error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null),
+      releaseOnError: true,
       ...staged.run,
+      // `claimed` only once the claim committed (a failed claim commit is the caller's error).
+      boundary: async (point) => {
+        if (point === "claimed") claimed = true;
+        await staged.run?.boundary?.(point);
+      },
     });
   } catch (error) {
-    if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return result(["staged_lease_lost"]);
-    if (claimed) return result(["staged_run_interrupted"], { partial: true });
-    throw error;
+    if (!claimed) throw error;
+    // After the claim, every outcome but done leaves the scope owing a pass: the tick resumes it.
+    if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return owing(["staged_lease_lost"], false);
+    // TODO(slice 3): cap the attempts of a permanently failing run (failed runs, operator reset).
+    log.warn("search index staged run interrupted", {
+      stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,
+      ...(error instanceof Error ? { error_name: error.name } : {}), ...errorFields(error),
+    });
+    return owing(["staged_run_interrupted"], true);
   }
   switch (outcome.status) {
     case "busy":
-      return result([outcome.reason === "run_leased" ? "staged_run_leased" : outcome.reason]);
+      // Not claimed: the holder of the live lease is responsible for the scope.
+      if (outcome.reason === "run_leased") return result(["staged_run_leased"]);
+      return owing([outcome.reason], false);
     case "restart":
-      return result([outcome.reason === "source_changed" ? STREAM_SOURCE_CHANGED : outcome.reason]);
+      return owing([outcome.reason === "source_changed" ? STREAM_SOURCE_CHANGED : outcome.reason], false);
     case "incomplete": {
       const [reason] = outcome.reasons;
       if (reason === "source_incomplete") {

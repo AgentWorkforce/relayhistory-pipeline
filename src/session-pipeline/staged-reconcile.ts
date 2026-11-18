@@ -239,6 +239,8 @@ export interface StagedReconcileDeps {
   abandonOn?: (error: unknown) => string | null;
   /** Tests only. */
   boundary?: (point: StagedBoundary) => void | Promise<void>;
+  /** On an error the run cannot map (thrown to the caller): release the lease first (best effort). */
+  releaseOnError?: boolean;
   /** Items per facts chunk (default 5000). */
   factsChunk?: number;
   /** The output-facts hooks (slice 2c); absent: none is called. */
@@ -357,8 +359,44 @@ export async function runStagedReconcile<R>(
     await deps.transact((tx) => tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, reason]));
   };
 
+  const tryLock = async (tx: SqlExecutor, key: string) =>
+    (await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [key])).rows[0]?.ok === true;
+  const moved = (now: SourceStamp) =>
+    now.canonicalId !== stamp.canonicalId || now.epoch !== stamp.epoch || now.manifestFingerprint !== stamp.manifestFingerprint;
+  const exclusive = async (tx: SqlExecutor): Promise<"ok" | "busy" | "changed"> => {
+    if (!(await tryLock(tx, scopeLockKey(scope, "search")))) return "busy";
+    return moved(await ops.currentSource(tx)) ? "changed" : "ok";
+  };
+  /**
+   * A long source read (passes 1-3, the facts pass) makes no step call, so nothing renews the lease:
+   * renew it on a timer (a third of the lease) while `work` runs, so another consumer's tick does not
+   * take the run over mid-read. A renewal that fails (taken over, erased) stops the timer; the next
+   * step call then answers RH062.
+   */
+  const heartbeat = async <T>(work: () => Promise<T>): Promise<T> => {
+    let stopped = false;
+    let pending: Promise<unknown> = Promise.resolve();
+    const timer = setInterval(() => {
+      if (stopped) return;
+      pending = pending.then(() =>
+        deps.transact((tx) => advance(tx, phase, cursor)).catch(() => {
+          stopped = true;
+        }),
+      );
+    }, Math.max(250, Math.floor(leaseMs / 3)));
+    try {
+      return await work();
+    } finally {
+      stopped = true;
+      clearInterval(timer);
+      await pending;
+    }
+  };
   let read: R | null | undefined;
-  const source = async (): Promise<R | null> => (read === undefined ? (read = await ops.readSource()) : read);
+  // `beat` false inside the final transaction: it holds the run row (no takeover is possible), and a
+  // renewal there would wait on that same row.
+  const source = async (beat = true): Promise<R | null> =>
+    read === undefined ? (read = await (beat ? heartbeat(() => ops.readSource()) : ops.readSource())) : read;
 
   try {
     if (phase === "want") {
@@ -386,10 +424,12 @@ export async function runStagedReconcile<R>(
           const chunk = { seq: seq++, last };
           return deps.transact((tx) => deps.hooks!.onBatch!(tx, ref, { phase: "facts", events, chunk }));
         };
-        await ops.factsPass!(r, factsChunk, async (events) => {
-          if (pending) await deliver(pending, false);
-          pending = events;
-        });
+        await heartbeat(() =>
+          ops.factsPass!(r, factsChunk, async (events) => {
+            if (pending) await deliver(pending, false);
+            pending = events;
+          }),
+        );
         await deliver(pending ?? { projectionRows: [], records: [] }, true);
         await boundary("want:facts");
       }
@@ -442,6 +482,17 @@ export async function runStagedReconcile<R>(
           return { status: "incomplete", reasons: ["source_incomplete"] };
         }
         const page = await deps.transact(async (tx) => {
+          // Exclusive with a whole read and the erase pass of the scope: the same scope try-lock, and
+          // the source stamp re-read under it, before anything is written to the index.
+          const gate = await exclusive(tx);
+          if (gate === "busy") {
+            await advance(tx, "write", cursor, { release: true });
+            return { gate } as const;
+          }
+          if (gate === "changed") {
+            await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_changed"]);
+            return { gate } as const;
+          }
           const keys: string[] = [];
           let after = cursor;
           while (keys.length < writeKeys) {
@@ -461,6 +512,7 @@ export async function runStagedReconcile<R>(
           return { after, wanted: keys.length, written };
         });
         if (page === null) break;
+        if ("gate" in page) return page.gate === "busy" ? { status: "busy", reason: "scope_busy" } : { status: "restart", reason: "source_changed" };
         cursor = page.after;
         wanted += page.wanted;
         done += page.written;
@@ -474,24 +526,21 @@ export async function runStagedReconcile<R>(
     const outcome = await deps.transact(async (tx): Promise<StagedReconcileOutcome> => {
       // Locks first, in indexSearchScope's order (scope, then the source, then canonical); then
       // the run row, held to the end so no takeover can interleave with the final step.
-      const lock = async (key: string) =>
-        (await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [key])).rows[0]?.ok === true;
-      if (!(await lock(scopeLockKey(scope, "search")))) {
+      if (!(await tryLock(tx, scopeLockKey(scope, "search")))) {
         await advance(tx, "final", null, { release: true });
         return { status: "busy", reason: "scope_busy" };
       }
       await advance(tx, "final", null);
-      const now = await ops.currentSource(tx);
-      if (now.canonicalId !== stamp.canonicalId || now.epoch !== stamp.epoch || now.manifestFingerprint !== stamp.manifestFingerprint) {
+      if (moved(await ops.currentSource(tx))) {
         await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_changed"]);
         return { status: "restart", reason: "source_changed" };
       }
-      if (!(await lock(canonicalLockKey(scope, stamp.canonicalId)))) {
+      if (!(await tryLock(tx, canonicalLockKey(scope, stamp.canonicalId)))) {
         await advance(tx, "final", null, { release: true });
         return { status: "busy", reason: "canonical_scope_busy" };
       }
       // A run resumed at the final step reads the source here, under the locks.
-      const r = await source();
+      const r = await source(false);
       if (r === null) {
         await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_incomplete"]);
         return { status: "incomplete", reasons: ["source_incomplete"] };
@@ -535,7 +584,12 @@ export async function runStagedReconcile<R>(
       return { status: "restart", reason: error.reason };
     }
     const reason = deps.abandonOn?.(error) ?? null;
-    if (reason === null) throw error;
+    if (reason === null) {
+      // The step rolled back; with releaseOnError the lease is freed (best effort) so the next tick
+      // retries without waiting for it to expire. Off (the default, and a crash): it expires.
+      if (deps.releaseOnError) await deps.transact((tx) => advance(tx, phase, cursor, { release: true })).catch(() => {});
+      throw error;
+    }
     await abandon(reason);
     return { status: "incomplete", reasons: [reason] };
   }
