@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as w
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, fenceAuthorityKey, fenceEpoch, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
@@ -399,6 +399,58 @@ describe("buffered backlog drain (0005)", () => {
     await store.delete(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)));
     expect((await run(store)).objects.drained).toBe(1);
   });
+
+  test("the deployment-wide stop (.stop.json), as admission: present, valid or not, --execute writes nothing of any org", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    // Beside a valid per-org marker AND a valid deployment-wide marker: the stop still wins.
+    await store.put(objectKey(fenceAuthorityKey(ROOT)), enc.encode(JSON.stringify(AUTHORITY)));
+    for (const doc of [{ v: 1, stop: "all", writtenAtMs: 1 }, { v: 1 }, "not json"]) {
+      await store.put(objectKey(fenceAuthorityStopKey(ROOT)), enc.encode(typeof doc === "string" ? doc : JSON.stringify(doc)));
+      const dry = await run(store, { dryRun: true });
+      expect(dry.objects.would_drain).toBe(1);
+      expect(dry.orgs_without_authority).toBe(1);
+      const stopped = await run(store);
+      expect(stopped.objects).toMatchObject({ fence_authority_stopped: 1, drained: 0 });
+      expect(stopped.orgs_without_authority).toBe(1);
+      expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+      expect([...(await canonical(store)).keys()]).toEqual([]);
+    }
+    // Removing the stop restores the markers' verdict.
+    await store.delete(objectKey(fenceAuthorityStopKey(ROOT)));
+    expect((await run(store)).objects.drained).toBe(1);
+  });
+
+  test("a stop written mid-run is honoured within AUTHORITY_TTL_MS, before the next batch's first canonical byte", async () => {
+    const store = await scratch();
+    for (let i = 0; i < 2; i++) await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]);
+    // The stop doc sits at a side key; the store serves it at the stop key once the operator "writes" it.
+    const side = `${ROOT}/side/stop.json`;
+    await store.put(objectKey(side), enc.encode(JSON.stringify({ v: 1, stop: "all", writtenAtMs: 1 })));
+    let t = Date.parse("2030-01-05T00:00:00.000Z");
+    let groups = 0, written = false;
+    const watched = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getObject") return (k: Parameters<ObjectStore["getObject"]>[0]) =>
+          written && String(k) === fenceAuthorityStopKey(ROOT) ? target.getObject(objectKey(side)) : target.getObject(k);
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const summary = await run(watched, {
+      concurrency: 1, now: () => new Date(t),
+      onProgress: () => {
+        if (groups++ === 0) {
+          written = true;
+          t += 61_000;
+        }
+      },
+    });
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.objects.fence_authority_stopped).toBe(1);
+    expect([...(await canonical(store)).keys()]).toHaveLength(1);
+  });
+
 
   test("a reset begun but not finished (resetsCompleted < resets) skips the batch until it completes", async () => {
     const store = await scratch();
