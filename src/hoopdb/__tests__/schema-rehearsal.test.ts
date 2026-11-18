@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   BOOTSTRAP_NEW_ROLES,
   bootstrapAddedRoles,
@@ -1113,9 +1113,12 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
    * (047010 with its rollback, 050000, 050010, 050020, bootstrap b1). Target 050010,
    * 050020 held: no main commit has exactly that prefix. verifierDrift: R also changes the
    * session_ingest verifier (as 062020's grants changed it after the anchor's main base).
+   * between: further first-parent main commits after M0, each adding those steps (and a
+   * step's rollback when R has one) at R's bytes. deletedAtRelease: a fixed anchor path M0
+   * carries and R deletes.
    */
   const INGEST_VERIFY = RELEASE_TREE.verifiers.find((v) => v.name === "verify:session_ingest")!.path;
-  const fixture = (opts: { verifierDrift?: boolean } = {}) => {
+  const fixture = (opts: { verifierDrift?: boolean; between?: string[][]; deletedAtRelease?: string } = {}) => {
     const repo = mkdtempSync(join(tmpdir(), "rehearsal-anchor-test-"));
     const g = (...args: string[]) => {
       const r = spawnSync("git", args, {
@@ -1135,13 +1138,25 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     for (const v of RELEASE_TREE.verifiers) put(v.path, `select 'verify ${v.name}';`);
     SESSION_BOOTSTRAP_FILES.forEach((f, i) => put(f, `select 'bootstrap b0 ${i}';`));
     put("README.md", "x");
+    if (opts.deletedAtRelease) put(opts.deletedAtRelease, "export const base = 1;\n");
     g("add", "-A");
     g("commit", "-q", "-m", "m0");
     const m0 = g("rev-parse", "HEAD");
+    const mids: string[] = [];
+    for (const [i, group] of (opts.between ?? []).entries()) {
+      for (const n of group) {
+        put(file(n), `select '${n}';`);
+        if (n === "047010") put(rollback(n), "select 'down';");
+      }
+      g("add", "-A");
+      g("commit", "-q", "-m", `m${i + 1}`);
+      mids.push(g("rev-parse", "HEAD"));
+    }
     for (const n of ["047010", "050000", "050010", "050020"]) put(file(n), `select '${n}';`);
     put(rollback("047010"), "select 'down';");
     SESSION_BOOTSTRAP_FILES.forEach((f, i) => put(f, `select 'bootstrap b1 ${i}';`));
     if (opts.verifierDrift) put(INGEST_VERIFY, "select 'verify session_ingest, release bytes';");
+    if (opts.deletedAtRelease) rmSync(join(repo, opts.deletedAtRelease));
     g("add", "-A");
     g("commit", "-q", "-m", "r");
     const release = g("rev-parse", "HEAD");
@@ -1189,7 +1204,12 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
         fixedFiles: RELEASE_ANCHOR_FIXED_PATHS,
       });
     const anchorRefs = () => g("for-each-ref", "--format=%(refname)", "refs/remotes/origin/release/");
-    return { repo, g, ag, m0, release, build, bind, generationWith, discover, anchorRefs, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
+    const cleanup = () => {
+      rmSync(repo, { recursive: true, force: true });
+      // The rehearsal-anchor-index-* directory this fixture created.
+      rmSync(dirname(ag.indexFile), { recursive: true, force: true });
+    };
+    return { repo, g, ag, m0, mids, release, build, bind, generationWith, discover, anchorRefs, cleanup };
   };
 
   test("the fixture chain is linear, one anchor per unique slot, and production binds its tip", () => {
@@ -1197,7 +1217,8 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     try {
       const held = [s("050020")];
       const built = f.build(s("050010"), held);
-      // The bootstrap-only base anchor (047000), then 047010, 050000 and the target.
+      // The base anchor on 047000 (the fixed anchor paths, bootstrap files included, at the
+      // release bytes), then 047010, 050000 and the target.
       expect(built.refs.map((r) => r.branch)).toEqual([
         "release/schema-047000",
         "release/schema-047010",
@@ -1288,6 +1309,83 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
       expect((await f.discover(target, held, releaseGen)).source).toBe("ref");
       removeAnchorRefs(f.ag, r.refs);
       expect(f.anchorRefs()).toBe("");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("discovery skips a newer base that cannot anchor and binds on an older base with another step set", async () => {
+    // main: M0 (046000, 047000), M1 (+047010), M2 (+050010 before 050000), R. All three
+    // have the same verifiers and different step sets. M2 cannot anchor (050010 is its
+    // newest step but 047010 and 050000 are missing below it: "gap"); M1 can.
+    const f = fixture({ verifierDrift: true, between: [["047010"], ["050010"]] });
+    try {
+      const held = [s("050020")];
+      const target = s("050010");
+      const [m1, m2] = f.mids as [string, string];
+      expect(code(() => f.build(target, held, m2))).toBe("rehearsal_target_anchor_missing");
+      expect(f.anchorRefs()).toBe("");
+      const releaseGen = f.generationWith(held, f.release);
+      // A release checkout without the fixed anchor path list: refused, no fallback, no refs.
+      for (const fixedFiles of [[], undefined as unknown as string[]]) {
+        let missing: { code?: string; detail?: Record<string, unknown> } = {};
+        await discoverReleaseAnchor({
+          RT: { releaseAnchorBinding },
+          C: { releaseAnchorBranch },
+          M: { schemaStepDigests: async () => [] },
+          ag: f.ag,
+          sha: f.release,
+          baseline: s("046000"),
+          target,
+          generation: releaseGen,
+          held,
+          bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+          fixedFiles,
+        }).catch((e) => (missing = e));
+        expect(missing.code).toBe("rehearsal_target_anchor_missing");
+        expect(missing.detail).toEqual({ reason: "no_fixed_anchor_paths" });
+        expect(f.anchorRefs()).toBe("");
+      }
+      // A mismatching generation: M2 fails, M1 binds and decides; M0 is never tried
+      // (scanned R, M2, M1), and no ref of either candidate is left.
+      let refusal: { code?: string; detail?: Record<string, unknown> } = {};
+      await f.discover(target, held, "c".repeat(64)).catch((e) => (refusal = e));
+      expect(refusal.code).toBe("rehearsal_generation_mismatch");
+      expect(refusal.detail).toEqual({ candidates: [releaseGen], scanned: 3, source: "fixture" });
+      expect(f.anchorRefs()).toBe("");
+      // The release generation: bound on M1, the newest base that can anchor.
+      const r = await f.discover(target, held, releaseGen);
+      expect(r.source).toBe("fixture");
+      expect(r.refs.map((x) => x.branch)).toEqual(["release/schema-047010", "release/schema-050000", "release/schema-050010"]);
+      expect(requireReleaseAnchor({ repo: f.repo, releaseSha: f.release, targetSha: r.targetSha, target }).mainBase).toBe(m1);
+      expect(f.bind(r.targetSha, target, held).targetGeneration).toBe(releaseGen);
+      // Only the bound chain's refs exist (M2's were removed).
+      expect(f.anchorRefs().split("\n").sort()).toEqual(r.refs.map((x) => `refs/remotes/origin/${x.branch}`).sort());
+      removeAnchorRefs(f.ag, r.refs);
+      expect(f.anchorRefs()).toBe("");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("a fixed anchor path the release deletes is absent from the fixture, and production accepts the chain", () => {
+    const deleted = "src/hoopdb/migration-sentinels.ts";
+    expect(RELEASE_ANCHOR_FIXED_PATHS).toContain(deleted);
+    const f = fixture({ deletedAtRelease: deleted });
+    try {
+      const held = [s("050020")];
+      const target = s("050010");
+      const at = (c: string) => f.g("ls-tree", "--full-tree", "--name-only", c, "--", deleted);
+      expect(at(f.m0)).toBe(deleted);
+      expect(at(f.release)).toBe("");
+      const built = f.build(target, held);
+      // The first anchor commit removes it; it stays absent up to the tip.
+      for (const r of built.refs) expect(at(r.sha)).toBe("");
+      const changed = f.g("diff-tree", "-r", "--name-only", "--no-commit-id", f.m0, built.refs[0]!.sha).split("\n").sort();
+      expect(changed).toEqual([...SESSION_BOOTSTRAP_FILES, deleted].sort());
+      expect(requireReleaseAnchor({ repo: f.repo, releaseSha: f.release, targetSha: built.tip, target }).mainBase).toBe(f.m0);
+      expect(f.bind(built.tip, target, held).targetGeneration).toBe(f.generationWith(held, f.release));
+      removeAnchorRefs(f.ag, built.refs);
     } finally {
       f.cleanup();
     }

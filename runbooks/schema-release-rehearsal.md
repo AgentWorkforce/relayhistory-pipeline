@@ -27,7 +27,7 @@ runs against; never point it anywhere else.
 | `sha` | Release commit (40 lowercase hex). Checked out with full history; its own `migrate.ts`, `release-target.ts`, `schema-release-*.ts` and boundary modules run. |
 | `baseline` | The last step the production ledger holds today, lane-prefixed (`upstream:<file>.sql`). The seed is exactly the schema steps of the first-parent commit that added this file. |
 | `target` | `RELEASE_TARGET_STEP` for the release. |
-| `generation` | The 64-hex target generation the apply must mark PASS. The target commit is found on the release sha's first-parent history at this generation. |
+| `generation` | The 64-hex target generation the apply must mark PASS. The target commit must have this generation: with nothing held it is the release sha; with held steps on a release sha with the anchor API it is the release anchor tip (the `release/schema-<slot>` branch when it exists in the checkout, otherwise the fixture chain; see "The target commit under the release anchor"), on older release shas the commit on the release sha's first-parent history at this generation. |
 | `inject_failure` | `none` for a clean apply, or one refusal to prove (below). |
 | `expect_refusal` | Empty (default): the run passes only if no stage FAILs. `<stage>:<code>` (for example `R1:rehearsal_target_anchor_missing`) marks a known-negative row: the run passes only if that stage FAILs with exactly that code and no later stage ran; any other outcome, including a clean pass, fails the job. It does not change `inject_failure`. |
 | `observe_turns_lock_hold` | Default false. On a clean row only, start the read-only 062020 relation-lock observer before R0 and require its exact ledger receipt and threshold result. Its JSONL is uploaded as `turns-lock-hold.jsonl`. |
@@ -245,12 +245,14 @@ anchor"). R1 uses the branch tip from the full checkout when it exists (`anchorS
 commit) whose lane steps are all prefix steps at the release bytes, a first anchor on that
 commit's newest target-lane slot, then one anchor per missing target-lane prefix step with
 a unique slot, up to the target, each at the release bytes (steps, their rollbacks). The
-first anchor carries every fixed anchor path at the release sha's bytes, as the operator's
-anchor does: the bootstrap chain files, the seven phase 2 verifiers, the function-boundary
-generator inputs and generated outputs, the migration sentinels and the bootstrap contract
-modules (`RELEASE_ANCHOR_FIXED_PATHS` in src/hoopdb/release-target.ts). So the target
-commit's verifiers are the release's own, and its generation is the prefix plus the
-release's verifiers, whichever main commit is the base. A main base's older verifiers
+first anchor carries every fixed anchor path at the release sha's bytes: the bootstrap
+chain files, the seven phase 2 verifiers, the function-boundary generator inputs and
+generated outputs, the migration sentinels and the bootstrap contract modules
+(`RELEASE_ANCHOR_FIXED_PATHS` in src/hoopdb/release-target.ts): the anchor shape the
+operator must create for the rehearsed generation to be the production one (see below; it
+is not a shape production enforces). So the target commit's verifiers are the release's
+own, and its generation is the prefix plus the release's verifiers, whichever main commit
+is the base. A main base's older verifiers
 can refuse a grant that a carried prefix step makes (062020's `GRANT EXECUTE` on the
 ingest functions against an older `session_ingest_verify.sql` failed R4 with 55000 before
 this). If that chain's generation is not `generation`, its refs are removed and R1
@@ -264,6 +266,22 @@ release sha's schema steps without the held ones (name and sha256, migrator orde
 the release sha's seven verifiers (name and sha256), through `manifestGeneration`
 (src/hoopdb/migrate.ts). It changes whenever the release sha changes a step in that prefix
 or a verifier file, so recompute it for each release sha.
+
+Production's `requireReleaseAnchor` also accepts an anchor that carries only the bootstrap
+chain files (as Release A, `release/schema-047000`, does). Such an anchor keeps the main
+base's verifier files, so it binds a different generation than the rehearsed one, and its
+`verify:target:*` can refuse (55000) on grants that a carried prefix step makes. So the
+real anchor must carry the fixed paths at the release sha's bytes, and the operator must
+compare the anchor tip's generation with the rehearsed `generation` before dispatching
+plan or apply (runbooks/guarded-session-schema-release.md, "Release anchor", operator
+step 1).
+
+The fixture does not carry the lane modules (`scripts/sessions-function-boundary/lanes/*.ts`,
+allowed by `releaseAnchorPathAllowed` but not in the fixed list). The rehearsal imports
+every module from the release checkout and reads only step digests and verifier SQL from
+the anchor, so its result is unaffected. A real anchor should also carry the lane modules
+present at the release, for its own push CI (the rehearsal does not run the anchor
+branch's CI).
 
 ## Candidate anchors
 

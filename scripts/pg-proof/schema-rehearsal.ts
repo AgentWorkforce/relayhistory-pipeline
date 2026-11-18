@@ -70,10 +70,12 @@
  * buildAnchorFixture, source "fixture"; never pushed) off a first-parent main commit whose
  * lane steps are prefix steps at the release bytes, carrying every fixed anchor path
  * (RELEASE_ANCHOR_FIXED_PATHS: bootstrap chain, the seven phase 2 verifiers, the
- * generated function-boundary outputs, ...) at the release sha's bytes, as the operator's
- * anchor does; its generation is the prefix plus the release's own verifiers. Older
- * release checkouts: the commit
- * on the release sha's first-parent history at the dispatched generation (source "main").
+ * generated function-boundary outputs, ...) at the release sha's bytes: the anchor shape
+ * the operator must create for the rehearsed generation to be the production one
+ * (production also accepts a bootstrap-only anchor, which binds another generation; it
+ * does not enforce this shape). Its generation is the prefix plus the release's own
+ * verifiers. Older release checkouts: the commit on the release sha's first-parent
+ * history at the dispatched generation (source "main").
  * Injections (REHEARSAL_INJECT) prove each refusal: ledger-gap, boundary-drift, late-step,
  * wrong-generation, stale-plan, missing-bootstrap (R2-bootstrap skipped: the apply refuses
  * 42704, then R2-bootstrap-rerun and R1-rerun complete the release as late-step does);
@@ -378,13 +380,18 @@ export async function discoverReleaseAnchor(x: {
   generation: string;
   held: readonly string[];
   bootstrapFiles: readonly string[];
-  /** The release checkout's RELEASE_ANCHOR_FIXED_PATHS. */
+  /** The release checkout's RELEASE_ANCHOR_FIXED_PATHS (missing or empty: refused before a fixture). */
   fixedFiles: readonly string[];
 }): Promise<{ targetSha: string; source: "ref" | "fixture"; branch: string; refs: { branch: string; sha: string }[] }> {
   const branch = x.C.releaseAnchorBranch(x.target);
   if (!branch) return rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "no_anchor_branch" });
   const tip = anchorRefTip(x.ag, branch);
   if (tip) return { targetSha: tip, source: "ref", branch, refs: [] };
+  // A fixture needs the release checkout's fixed anchor path list (every release checkout
+  // with releaseAnchorBinding exports it): refuse rather than build a different shape.
+  const fixed: unknown = x.fixedFiles;
+  if (!Array.isArray(fixed) || !fixed.length || !fixed.every((p) => typeof p === "string" && p.length > 0))
+    return rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "no_fixed_anchor_paths" });
   const prefix = await x.M.schemaStepDigests(x.held);
   const names = new Set(prefix.map(([n]) => n));
   const repo = x.ag.repo;
@@ -880,9 +887,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       generation: B,
       held,
       bootstrapFiles: SESSION_BOOTSTRAP_FILES,
-      // The fixed anchor paths the fixture carries at the release bytes (the verifiers
-      // when the release checkout predates the list).
-      fixedFiles: (RT.RELEASE_ANCHOR_FIXED_PATHS as readonly string[] | undefined) ?? verifierPaths,
+      // Checked by discoverReleaseAnchor before it builds a fixture (no fallback).
+      fixedFiles: RT.RELEASE_ANCHOR_FIXED_PATHS,
     });
     if (r.source === "fixture") fixtureMade = true;
     anchorInfo = { source: fixtureMade ? "fixture" : r.source, branch: r.branch };

@@ -865,10 +865,12 @@ export function removeAnchorRefs(x: AnchorGit, refs: readonly { branch: string; 
  *  - the first commit carries the SESSION_BOOTSTRAP_FILES and every `fixedFiles` path (the
  *    release checkout's RELEASE_ANCHOR_FIXED_PATHS: the seven phase 2 verifiers, the
  *    function-boundary generator inputs and outputs, the migration sentinels and the
- *    bootstrap contract modules) at the release sha's bytes, as the operator's anchor
- *    does (runbooks/guarded-session-schema-release.md, "Release anchor"). So the target
- *    commit's verifiers, and with them the bound generation, are the release's own, never
- *    an older base's that predate a prefix step's grants. It is its own anchor (the
+ *    bootstrap contract modules) at the release sha's bytes: the anchor shape the operator
+ *    must create for the rehearsed generation to be the production one
+ *    (runbooks/guarded-session-schema-release.md, "Release anchor"; production does not
+ *    enforce it and also accepts a bootstrap-only anchor). So the target commit's
+ *    verifiers, and with them the bound generation, are the release's own, never an
+ *    older base's that predate a prefix step's grants. It is its own anchor (the
  *    branch of base's newest target-lane step, when that slot is unique) or, when that
  *    slot cannot anchor, folds into the next commit;
  *  - then one commit per missing target-lane prefix step with a unique anchor slot, up to
