@@ -123,6 +123,17 @@ export const NO_HEAD_PARITY_MAX_AGE_SECONDS = 6 * 60 * 60;
 export const acceptedProofKey = (keyRoot: string, orgId: string, stageKey: string) =>
   `${keyRoot}/.drain/accepted-proofs/v1/${orgId}/${sha256Hex(stageKey)}.json`;
 export interface AcceptedProof { v: 1; kind: "buffered-accepted-proof"; proof: "no_head_parity"; stage_sha256: string; max_age_seconds: number }
+/** A proof record, or null when it does not parse as one. */
+export function parseAcceptedProof(text: string): AcceptedProof | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    return v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 5 && v.v === 1 && v.kind === "buffered-accepted-proof" &&
+      v.proof === "no_head_parity" && typeof v.stage_sha256 === "string" && HEX64.test(v.stage_sha256) &&
+      Number.isSafeInteger(v.max_age_seconds) && (v.max_age_seconds as number) >= 1 ? (v as unknown as AcceptedProof) : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Why the reader's per-user gate is closed (closed codes, from VERDICT_PAGE's `gate`). */
 export const GATE_REASONS = ["privacy_fenced", "policy_invalid", "head_unproven", "head_unproven_parity_stale", "head_pending", "head_foreign_epoch", "receipts_mismatch", "parity_missing", "parity_mismatch"] as const;
@@ -166,7 +177,7 @@ export interface ExportSummary {
    * Path B only (absent when `noHeadParity` is unset, so the summary is byte-identical then): stages live by a no_head
    * parity proof without an active authority, and their proof records written / that would be.
    */
-  no_head_parity?: { live: number; proofs: number; would_proof: number };
+  no_head_parity?: { live: number; proofs: number; would_proof: number; proofs_existing: number };
 }
 
 /** The candidate stages: active, acknowledged, not redacted, of a committed buffered batch (one definition, three uses). */
@@ -505,7 +516,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     mode: opts.dryRun ? "dry_run" : "execute", rows: 0, live: 0, not_live: 0, fence_absent: 0,
     written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0, gated: {}, fence_late: 0, superseded: 0, would_supersede: 0,
     orgs: { complete: 0, would_complete: 0, already_complete: 0, incomplete: 0 },
-    ...(nhpOrgs ? { no_head_parity: { live: 0, proofs: 0, would_proof: 0 } } : {}),
+    ...(nhpOrgs ? { no_head_parity: { live: 0, proofs: 0, would_proof: 0, proofs_existing: 0 } } : {}),
   };
   const perOrg = new Map<string, { stages: number; bad: boolean }>();
   const { sql } = opts;
@@ -656,14 +667,37 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         const key = (r.stage_key as string) + ACCEPTED_SUFFIX;
         try {
           if (byParity) {
-            // The proof record first, so every sidecar this path made live has one. Execute only: a dry run counts it
-            // (and its store refuses every write anyway).
-            if (opts.dryRun) summary.no_head_parity!.would_proof++;
-            else {
+            // The proof record first, so every sidecar this path made live has one. Create-only: a rerun never rewrites
+            // it. One already there must name this stage's bytes (proofs_existing); one that does not parse or names
+            // other bytes fails the stage (the catch below). A dry run only reads (its store refuses every write).
+            const proofKey = objectKey(acceptedProofKey(opts.keyRoot, org, r.stage_key as string));
+            const existingProof = async (): Promise<"absent" | "match"> => {
+              let text: string;
+              try {
+                text = decoder.decode(await readAll((await store.getObject(proofKey)).body));
+              } catch (error) {
+                if (isObjectStoreError(error, "not_found")) return "absent";
+                throw error;
+              }
+              if (parseAcceptedProof(text)?.stage_sha256 !== r.stage_sha256) throw new Error("export_proof_mismatch");
+              return "match";
+            };
+            if (opts.dryRun) {
+              if ((await existingProof()) === "match") summary.no_head_parity!.proofs_existing++;
+              else summary.no_head_parity!.would_proof++;
+            } else {
               if (!leaseOk()) throw new Error("export_lock_lost");
               const proof: AcceptedProof = { v: 1, kind: "buffered-accepted-proof", proof: "no_head_parity", stage_sha256: r.stage_sha256 as string, max_age_seconds: nhpAge! };
-              await store.put(objectKey(acceptedProofKey(opts.keyRoot, org, r.stage_key as string)), encoder.encode(JSON.stringify(proof)), { contentType: "application/json" });
-              summary.no_head_parity!.proofs++;
+              try {
+                // An identical record already there is not an error (created false): it is an existing proof.
+                const put = await store.put(proofKey, encoder.encode(JSON.stringify(proof)), { ifNoneMatch: true, contentType: "application/json" });
+                if (put.created) summary.no_head_parity!.proofs++;
+                else summary.no_head_parity!.proofs_existing++;
+              } catch (error) {
+                if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
+                if ((await existingProof()) !== "match") throw new Error("export_proof_mismatch");
+                summary.no_head_parity!.proofs_existing++;
+              }
             }
             summary.no_head_parity!.live++;
           }

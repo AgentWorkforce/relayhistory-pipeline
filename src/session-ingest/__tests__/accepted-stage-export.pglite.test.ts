@@ -775,7 +775,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
         expect(Object.keys(first)).toEqual(OLD_SUMMARY_KEYS);
         const before = await contents(store);
         const on = await run(store, ON_OTHER);
-        expect(on.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0 });
+        expect(on.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0, proofs_existing: 0 });
         const afterOn = await contents(store);
         const off = await run(store, OFF);
         expect(Object.keys(off)).toEqual(OLD_SUMMARY_KEYS);
@@ -798,7 +798,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     const s = await stageInBoth(store, one);
     await setAuthority(null);
     const { summary, v } = await exportB(store, s);
-    expect(summary).toMatchObject({ live: 1, not_live: 0, failed: 0, gated: {}, no_head_parity: { live: 1, proofs: 1, would_proof: 0 } });
+    expect(summary).toMatchObject({ live: 1, not_live: 0, failed: 0, gated: {}, no_head_parity: { live: 1, proofs: 1, would_proof: 0, proofs_existing: 0 } });
     expect(v).toMatchObject({ v: 2, live: true, kept: [[0]] });
     // The sidecar is the unchanged six-key v2 marker the drain parses; the proof lives beside it.
     expect(Object.keys(JSON.parse(await readText(store, s.key + ACCEPTED_SUFFIX))).sort()).toEqual(["fence", "kept", "kind", "live", "stage_sha256", "v"]);
@@ -809,13 +809,140 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     expect((await drain(store)).objects).toMatchObject({ drained: 1, accepted_mismatch: 0 });
   });
 
+  test("the proof record is create-only: a rerun keeps its bytes (proofs_existing), even with another max age", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await setAuthority(null);
+    expect((await run(store, pathB())).no_head_parity).toEqual({ live: 1, proofs: 1, would_proof: 0, proofs_existing: 0 });
+    const bytes = await readText(store, proofKey(s));
+    const version = (await store.head(objectKey(proofKey(s))))!.version;
+    for (const age of [3600, 1800]) {
+      const again = await run(store, pathB([A.orgId], age));
+      expect(again).toMatchObject({ live: 1, already: 1, written: 0, updated: 0, failed: 0, no_head_parity: { live: 1, proofs: 0, would_proof: 0, proofs_existing: 1 } });
+      expect(await readText(store, proofKey(s))).toBe(bytes);
+      expect((await store.head(objectKey(proofKey(s))))!.version).toEqual(version);
+    }
+    // A dry run sees the same record.
+    expect((await run(store, { ...pathB(), dryRun: true })).no_head_parity).toEqual({ live: 1, proofs: 0, would_proof: 0, proofs_existing: 1 });
+  });
+
+  test("a proof record already there naming other bytes, or not parsing, fails the stage (no sidecar, org incomplete)", async () => {
+    for (const planted of [JSON.stringify({ v: 1, kind: "buffered-accepted-proof", proof: "no_head_parity", stage_sha256: hex("e"), max_age_seconds: 3600 }), "not json"]) {
+      const store = scratch();
+      await backfillFence(store, A);
+      const s = await seed(A, one);
+      await setAuthority(null);
+      await store.put(objectKey(proofKey(s)), enc.encode(planted), { contentType: "application/json" });
+      for (const dryRun of [true, false]) {
+        const summary = await run(store, { ...pathB(), dryRun });
+        expect(summary).toMatchObject({ failed: 1, written: 0, would_write: 0, orgs: { incomplete: 1 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+      }
+      expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
+      expect(await readText(store, proofKey(s))).toBe(planted);
+      await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; DELETE FROM sessions.owner_buffered_parity; SET session_replication_role = origin;");
+      await setAuthority("active");
+    }
+  });
+
+  test("a failed proof put leaves no sidecar, counts as failed and leaves the org incomplete", async () => {
+    const inner = scratch();
+    await backfillFence(inner, A);
+    const s = await seed(A, one);
+    await setAuthority(null);
+    const store = new Proxy(inner, {
+      get(target, prop) {
+        if (prop === "put") return async (key: unknown, ...rest: unknown[]) => {
+          if (String(key).includes("/.drain/accepted-proofs/")) throw new Error("injected_put_failure");
+          return (target.put as (...a: unknown[]) => unknown).call(target, key, ...rest);
+        };
+        const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const summary = await run(store, pathB());
+    expect(summary).toMatchObject({ failed: 1, written: 0, orgs: { incomplete: 1, complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+    expect(await exists(inner, s.key + ACCEPTED_SUFFIX)).toBe(false);
+    expect(await exists(inner, proofKey(s))).toBe(false);
+  });
+
+  test("the lease lost before the proof put: no proof, no sidecar, failed", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await setAuthority(null);
+    // The clock jumps past the lease's safe window as soon as the verdict page has been read.
+    let late = false;
+    const log: string[] = [];
+    const sql: ExportSql = { async query(text, params) {
+      const out = await recordingSql(log).query(text, params);
+      if (text.includes("WITH pol AS MATERIALIZED")) late = true;
+      return out;
+    } };
+    const summary = await exportAcceptedStages({ sql, store, keyRoot: ROOT, dryRun: false, ...pathB(), lockTtlMs: 60_000,
+      nowMs: () => 1_893_542_400_000 + (late ? 3_600_000 : 0) });
+    expect(summary).toMatchObject({ failed: 1, written: 0, orgs: { complete: 0 }, no_head_parity: { proofs: 0, proofs_existing: 0 } });
+    expect(await exists(store, proofKey(s))).toBe(false);
+    expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
+  });
+
+  test("a listed org does not bypass the other gates: policy_invalid, head_pending", async () => {
+    {
+      const store = scratch();
+      await backfillFence(store, A);
+      const s = await seed(A, one);
+      await setAuthority(null);
+      await db.exec("UPDATE sessions.ingest_lazy_policy SET valid_until = now() - interval '1 second'");
+      const { summary, v } = await exportB(store, s);
+      expect([v.live, summary.gated]).toEqual([false, { policy_invalid: 1 }]);
+      expect(await exists(store, proofKey(s))).toBe(false);
+      await db.exec("UPDATE sessions.ingest_lazy_policy SET valid_until = now() + interval '1 day'");
+      await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; DELETE FROM sessions.owner_buffered_parity; SET session_replication_role = origin;");
+    }
+    {
+      const store = scratch();
+      await backfillFence(store, A);
+      await putHead(A, { version: 1, digest: hex("d"), kind: "selection", pending: true });
+      const s = await seed(A, one, { admVersion: 1 });
+      await setAuthority(null);
+      const { summary, v } = await exportB(store, s);
+      expect([v.live, summary.gated]).toEqual([false, { head_pending: 1 }]);
+      expect(await exists(store, proofKey(s))).toBe(false);
+    }
+  });
+
+  test("an active authority on another epoch does not prove the head, so a listed org takes Path B (with a proof record)", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await asReplica(() => db.query("UPDATE sessions.ingest_privacy_authority SET control_epoch = $1", [hex("9")]));
+    expect((await run(store, { orgs: SCOPE })).gated).toEqual({ head_unproven: 1 }); // off: refused as before
+    const { summary, v } = await exportB(store, s);
+    expect(v.live).toBe(true);
+    expect(summary.no_head_parity).toMatchObject({ live: 1, proofs: 1 });
+    expect(await exists(store, proofKey(s))).toBe(true);
+  });
+
+  test("a mixed run: the listed org's no-head user goes live, an unlisted org's no-head user stays head_unproven", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const a = await seed(A, one);
+    const c = await seed(C, one);
+    await setAuthority(null);
+    const summary = await run(store, pathB([A.orgId]));
+    expect(summary).toMatchObject({ rows: 2, live: 1, not_live: 1, failed: 0, gated: { head_unproven: 1 }, no_head_parity: { live: 1, proofs: 1 } });
+    expect((await verdict(store, a.key))!.live).toBe(true);
+    expect((await verdict(store, c.key))!.live).toBe(false);
+    expect(await exists(store, acceptedProofKey(ROOT, C.orgId, c.key))).toBe(false);
+  });
+
   test("with an active authority the authority proves the head: live, no Path B proof record", async () => {
     const store = scratch();
     await backfillFence(store, A);
     const s = await seed(A, one);
     const { summary, v } = await exportB(store, s);
     expect(v.live).toBe(true);
-    expect(summary.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0 });
+    expect(summary.no_head_parity).toEqual({ live: 0, proofs: 0, would_proof: 0, proofs_existing: 0 });
     expect(await exists(store, proofKey(s))).toBe(false);
   });
 
@@ -844,7 +971,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
       await arrange();
       const { summary, v } = await exportB(store, s, over);
       expect([name, v.live, summary.gated]).toEqual([name, false, { [reason]: 1 }]);
-      expect([name, summary.no_head_parity]).toEqual([name, { live: 0, proofs: 0, would_proof: 0 }]);
+      expect([name, summary.no_head_parity]).toEqual([name, { live: 0, proofs: 0, would_proof: 0, proofs_existing: 0 }]);
       await db.exec(`SET session_replication_role = replica; DELETE FROM sessions.ingest_control_receipts; DELETE FROM sessions.owner_buffered_parity;
         DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;`);
       await setAuthority("active");
@@ -877,7 +1004,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
     const s = await seed(A, one);
     await setAuthority(null);
     const dry = await run(store, { ...pathB(), dryRun: true });
-    expect(dry).toMatchObject({ mode: "dry_run", live: 1, would_write: 1, no_head_parity: { live: 1, proofs: 0, would_proof: 1 } });
+    expect(dry).toMatchObject({ mode: "dry_run", live: 1, would_write: 1, no_head_parity: { live: 1, proofs: 0, would_proof: 1, proofs_existing: 0 } });
     expect(await exists(store, proofKey(s))).toBe(false);
     expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
     // The parity row ages past the max between the dry run and the execute: the execute refuses it.
@@ -897,7 +1024,7 @@ describe("Path B: no-head parity, per listed org, default off", () => {
       [{ orgs: SCOPE, noHeadParity: { orgs: [A.orgId], maxAgeSeconds: 0 } }, "export_no_head_parity_max_age_invalid"],
       [{ orgs: SCOPE, noHeadParity: { orgs: [A.orgId], maxAgeSeconds: NO_HEAD_PARITY_MAX_AGE_SECONDS + 1 } }, "export_no_head_parity_max_age_invalid"],
     ] as [Partial<ExportOptions>, string][])
-      expect(run(store, over)).rejects.toThrow(err);
+      await expect(run(store, over)).rejects.toThrow(err);
   });
 
   test("CLI: Path B flags (lowercase UUIDs inside --org, the age required with them and bounded), or the list on stdin, never both", () => {
