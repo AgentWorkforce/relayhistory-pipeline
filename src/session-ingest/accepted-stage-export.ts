@@ -162,6 +162,12 @@ export interface ExportSummary {
   /** A row whose stage key, tenant or sha does not bind (never written). */
   invalid: number;
   failed: number;
+  /**
+   * `failed`, by cause: a closed lowercase code per failure (ObjectStoreError `store_<code>`, a tool code such as
+   * `export_proof_mismatch`, `fence_<cause>` for an unreadable fence, `no_head_parity_unlisted`, `supersede_<cause>`),
+   * never a key, an id or a message. Sums to `failed`.
+   */
+  failed_codes: Partial<Record<string, number>>;
   /** Not live because the reader's per-user gate is closed, by reason (stages, not users). */
   gated: Partial<Record<GateReason, number>>;
   /**
@@ -514,7 +520,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   const io = s3LedgerObjects(store, opts.keyRoot);
   const summary: ExportSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", rows: 0, live: 0, not_live: 0, fence_absent: 0,
-    written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0, gated: {}, fence_late: 0, superseded: 0, would_supersede: 0,
+    written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0, failed_codes: {}, gated: {}, fence_late: 0, superseded: 0, would_supersede: 0,
     orgs: { complete: 0, would_complete: 0, already_complete: 0, incomplete: 0 },
     ...(nhpOrgs ? { no_head_parity: { live: 0, proofs: 0, would_proof: 0, proofs_existing: 0 } } : {}),
   };
@@ -574,17 +580,25 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     }
     /** The user's S3 fence, once per page per user (the backfill wrote it; absent means not backfilled). */
     let fences = new Map<string, Promise<FenceDoc | null | "invalid">>();
+    /** Why a user's fence read as "invalid" (its failure code), for failed_codes. */
+    let fenceCauses = new Map<string, string>();
     const fenceOf = (org: string, ws: string, user: string) => {
       const k = JSON.stringify([org, ws, user]);
       if (!fences.has(k)) fences.set(k, (async () => {
         try {
           const read = await io.readFence(io.keysFor({ orgId: org, workspaceId: ws, userId: user }).fence);
           return read.state === "present" ? read.fence : null;
-        } catch {
+        } catch (error) {
+          fenceCauses.set(k, failureCode(error));
           return "invalid" as const;
         }
       })());
       return fences.get(k)!;
+    };
+    const fenceCauseOf = (org: string, ws: string, user: string) => fenceCauses.get(JSON.stringify([org, ws, user])) ?? "internal";
+    const fail = (code: string) => {
+      summary.failed++;
+      summary.failed_codes[code] = (summary.failed_codes[code] ?? 0) + 1;
     };
     const candidates = (await readOnly(() => sql.query(scopedExportSql(CANDIDATE_KEYS, orgScope !== null), [orgScope]))).rows;
     for (let at = 0; at < candidates.length; at += pageSize) {
@@ -594,6 +608,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       // pre-control verdict.
       const page = candidates.slice(at, at + pageSize);
       fences = new Map();
+      fenceCauses = new Map();
       const userKey = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.user_id]);
       const preRead = new Set<string>();
       await mapLimit([...new Map(page.map((r) => [userKey(r), r])).values()], concurrency, async (r) => {
@@ -633,7 +648,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         if (live) {
           const fence = await fenceOf(org, r.workspace_id as string, r.user_id as string);
           if (fence === "invalid") {
-            summary.failed++;
+            fail(`fence_${fenceCauseOf(org, r.workspace_id as string, r.user_id as string)}`);
             tally.bad = true;
             return;
           }
@@ -656,7 +671,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         // checked again here), and only when Path B is on (otherwise SQL cannot open such a gate at all).
         const byParity = live && r.head_proof === "no_head_parity";
         if (byParity && (nhpOrgs === null || !nhpOrgs.includes(org))) {
-          summary.failed++;
+          fail("no_head_parity_unlisted");
           tally.bad = true;
           return;
         }
@@ -711,8 +726,8 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
             existing && existing !== "invalid" ? { ifMatch: existing.version, contentType: "application/json" } : existing === "invalid" ? { contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
           if (existing) summary.updated++;
           else summary.written++;
-        } catch {
-          summary.failed++;
+        } catch (error) {
+          fail(failureCode(error));
           tally.bad = true;
         }
       });
@@ -726,8 +741,10 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       if (!ORG.test(org)) continue;
       try {
         await supersedeStale(org);
-      } catch {
+      } catch (error) {
         summary.failed++;
+        const code = `supersede_${failureCode(error)}`;
+        summary.failed_codes[code] = (summary.failed_codes[code] ?? 0) + 1;
         const tally = perOrg.get(org);
         if (tally) tally.bad = true;
       }
@@ -846,6 +863,18 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     } while (cursor);
     await flush();
   }
+}
+
+/**
+ * A failure's closed code for failed_codes: an ObjectStoreError's `store_<code>`; an error whose message is itself a
+ * code (`export_proof_mismatch`, `export_lock_lost`, a ledger code); else `internal`. Never a message, key or id.
+ */
+export function failureCode(error: unknown): string {
+  if (isObjectStoreError(error)) return `store_${(error as { code: string }).code}`;
+  if (error instanceof Error && /^[a-z][a-z0-9_]{0,39}$/u.test(error.message)) return error.message;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[a-z][a-z0-9_]{0,39}$/u.test(code)) return code;
+  return "internal";
 }
 
 async function readMarker(store: ObjectStore, key: string): Promise<{ doc: AcceptedMarker; version: ObjectVersion } | "invalid" | null> {
