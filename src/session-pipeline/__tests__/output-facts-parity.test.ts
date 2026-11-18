@@ -341,7 +341,7 @@ describe("staged output facts equal the whole-set path (062140)", () => {
     expect(await factsSnapshot(db)).toEqual(w.snap);
   });
 
-  test("a chunk larger than one stage call (continuations) and a large scope: still the whole path's rows", async () => {
+  test("a large scope in large chunks (one stage call per chunk): still the whole path's rows", async () => {
     const big = outputFixture();
     const extra = big.projectionRows.filter((r) => r.table === "convergence_events").flatMap((r) =>
       Array.from({ length: 80 }, (_, k) => ({ ...r, row: { ...r.row, event_id: `${String(r.row.event_id)}-x${k}` } })));
@@ -353,6 +353,48 @@ describe("staged output facts equal the whole-set path (062140)", () => {
       expect(s.snap, `size ${size}`).toEqual(w.snap);
       expect(counts(s.out[0]!)).toEqual(counts(w.out[0]!));
     }
+  });
+
+  test("order does not matter: the read shuffled and chunked differently gives the whole path's rows (the facts pass is set-equal, not order-equal, to the whole read)", async () => {
+    const w = await whole([[outputFixture(), 1], [changedFixture(), 2]]);
+    // A deterministic shuffle (an LCG), several seeds and chunk sizes; records spread across chunks too.
+    const shuffled = <T,>(xs: T[], seed: number) => {
+      const out = [...xs];
+      let x = seed;
+      for (let i = out.length - 1; i > 0; i--) {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        const j = x % (i + 1);
+        [out[i], out[j]] = [out[j]!, out[i]!];
+      }
+      return out;
+    };
+    for (const [seed, size] of [[1, 1], [7, 2], [42, 5], [99, 100]] as const) {
+      await clearFacts(db);
+      const out = [];
+      for (const [read, v] of [[outputFixture(), 1], [changedFixture(), 2]] as const) {
+        const rows = shuffled(read.projectionRows, seed);
+        const records = shuffled(read.records, seed + 1);
+        const n = Math.max(1, Math.ceil(rows.length / size));
+        // Records go one per chunk from the end, so they interleave with the rows.
+        const chunks = Array.from({ length: n }, (_, i) => ({ projectionRows: rows.slice(i * size, (i + 1) * size), records: records.filter((_r, j) => (n - 1 - (j % n)) === i) }));
+        const run = (await claim(db, STAGED_SCOPE, `mf-${v}-${seed}`, v))!;
+        await wantPhase(db, run, STAGED_SCOPE, chunks, v);
+        await advanceToFinal(db, run, true);
+        out.push(await finalStep(db, run, STAGED_SCOPE, { sourceComplete: read.complete, sourceVersion: v }));
+      }
+      expect(await factsSnapshot(db), `seed ${seed} size ${size}`).toEqual(w.snap);
+      expect(out.map(counts)).toEqual(w.out.map(counts));
+    }
+  });
+
+  test("a byte-identical legacy record seen twice is one staged item, and the whole path gives the same facts with or without the duplicate", async () => {
+    const dup = outputFixture();
+    dup.records = [...dup.records, ...dup.records.filter((r) => r.kind !== "legacy_scope")];
+    const w = await whole([[outputFixture(), 1]]);
+    const wd = await whole([[dup, 1]]);
+    expect(wd.snap).toEqual(w.snap);
+    const s = await staged([[dup, 1]], 3);
+    expect(s.snap).toEqual(w.snap);
   });
 
   test("a malformed event: both paths are incomplete and delete nothing; the staged one skips only that event (a superset of the whole path's rows)", async () => {

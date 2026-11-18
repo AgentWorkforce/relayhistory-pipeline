@@ -112,7 +112,8 @@ describe("20261105062140 staged output facts", () => {
     // Another nonce, or no such run: RH062.
     expect(await code(as(db, (tx) => stage(tx, { ...run, nonce: crypto.randomUUID() }, [], 0, false)))).toBe("RH062");
     expect(await code(as(db, (tx) => stage(tx, { ...run, runId: "999999" }, [], 0, false)))).toBe("RH062");
-    // Want phase: a chunk number and its last flag together (both null: a continuation), never negative; entries well formed.
+    // Want phase: a chunk number and its last flag, both given (a facts chunk is one call), never negative; entries well formed.
+    expect(await code(as(db, (tx) => stage(tx, run, [], null, null)))).toBe("22023");
     expect(await code(as(db, (tx) => stage(tx, run, [], 0, null)))).toBe("22023");
     expect(await code(as(db, (tx) => stage(tx, run, [], null, true)))).toBe("22023");
     expect(await code(as(db, (tx) => stage(tx, run, [], -1, false)))).toBe("22023");
@@ -345,22 +346,22 @@ describe("20261105062140 staged output facts", () => {
     });
   });
 
-  test("a chunk staged again under a continuation stages nothing new and leaves the chain as it is", async () => {
+  test("a chunk seen again under its own number after the last one breaks the chain; items already staged are not staged twice", async () => {
     await clearFacts(db);
     const run = (await claim(db, SCOPE))!;
-    await wantPhase(db, run, SCOPE, null, 1);
-    await factsChunk(db, run, SCOPE, CHUNKS[0]!, { seq: 0, last: false }, 1);
+    await wantPhase(db, run, SCOPE, CHUNKS, 1);
     const n = await stagedRows(db);
-    const again = await as(db, (tx) => tx.query<{ n: number }>("SELECT sessions.staged_facts_stage_v1($1::bigint,$2::uuid,'[]'::jsonb,NULL,NULL) n", [run.runId, run.nonce]));
-    expect([again.rows[0]!.n, await stagedRows(db)]).toEqual([0, n]);
-    expect(await chain(db)).toEqual([{ whole: true, seq: 0, done: false, sealed: false }]);
+    expect(await chain(db)).toEqual([{ whole: true, seq: LAST, done: true, sealed: false }]);
+    const again = await factsChunk(db, run, SCOPE, CHUNKS[LAST]!, { seq: LAST, last: true }, 1);
+    expect([again, await stagedRows(db)]).toEqual([0, n]);
+    expect((await chain(db))[0]!.whole).toBe(false);
     await clearFacts(db);
     await stagedPass(db, SCOPE, outputFixture(), 1, 4);
   });
 });
 
 describe("20261105062140 rollback", () => {
-  test("the checksum-pinned down refuses under a later step or a live staged lease, removes the trigger, the tables and the functions and its ledger row; a rerun refuses; the up applies again", async () => {
+  test("the checksum-pinned down refuses under a later step or any live staged lease, removes the trigger, the tables and the functions and its ledger row; a rerun refuses; the up applies again", async () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
     const db = await stagedFactsDatabase();
@@ -371,9 +372,11 @@ describe("20261105062140 rollback", () => {
         await db.exec("ROLLBACK");
       }
       for (const step of later) await db.exec(read(`supabase/rollbacks/${step.name.slice("upstream:".length).replace(/\.sql$/, ".down.sql")}`));
-      // A run that staged facts under a live lease refuses the down; once expired, the down proceeds.
+      // Any staged run under a live lease refuses the down, before its first facts chunk as after it; once expired, the down proceeds.
       const run = (await claim(db, SCOPE))!;
       await wantPhase(db, run, SCOPE, null, 1);
+      expect(await code(db.exec(DOWN))).toBe("55000");
+      await db.exec("ROLLBACK");
       await factsChunk(db, run, SCOPE, CHUNKS[0]!, { seq: 0, last: false }, 1);
       expect(await code(db.exec(DOWN))).toBe("55000");
       await db.exec("ROLLBACK");
@@ -390,7 +393,7 @@ describe("20261105062140 rollback", () => {
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
       expect(await code(db.exec(DOWN))).toBe("55000");
       await db.exec("ROLLBACK");
-      // The 062110 down is no longer refused by this step.
+      // The up applies again cleanly after the down.
       await db.exec(SQL);
       expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.staged_facts_v1')::text r")).rows[0]!.r).toBe("sessions.staged_facts_v1");
     } finally {

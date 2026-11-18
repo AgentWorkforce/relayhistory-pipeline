@@ -176,8 +176,8 @@ $whole$;
 -- p_entries: [{"k": kind, "i": item key (all kinds but event and fact), "g": group key,
 -- "m": match key, "b": the item as JSON text}]. An event or fact is keyed by its own row_id and
 -- fingerprint and carries its ts. In the want phase p_seq / p_last are the chunk's number and whether
--- it is the last (one call per chunk, items or not), or both null for a further call of the same chunk
--- (a chunk larger than one call), which leaves the chain as it is; in the final phase both are null.
+-- it is the last: a facts chunk is exactly one call, items or not (up to 100000 items; the wiring's
+-- chunk size bounds it). In the final phase both are null and the call is outside the chain.
 -- Returns the items newly staged.
 CREATE FUNCTION sessions.staged_facts_stage_v1(p_run_id bigint, p_nonce uuid, p_entries jsonb, p_seq integer, p_last boolean)
 RETURNS integer
@@ -190,8 +190,8 @@ DECLARE
   v_n integer;
 BEGIN
   r := sessions.staged_facts_run_v1(p_run_id, p_nonce, ARRAY['want', 'final']);
-  IF jsonb_typeof(p_entries) IS DISTINCT FROM 'array' OR jsonb_array_length(p_entries) > 10000
-     OR (r.phase = 'want' AND ((p_seq IS NULL) <> (p_last IS NULL) OR p_seq < 0))
+  IF jsonb_typeof(p_entries) IS DISTINCT FROM 'array' OR jsonb_array_length(p_entries) > 100000
+     OR (r.phase = 'want' AND (p_seq IS NULL OR p_last IS NULL OR p_seq < 0))
      OR (r.phase = 'final' AND (p_seq IS NOT NULL OR p_last IS NOT NULL)) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'staged facts: invalid batch';
   END IF;
@@ -214,7 +214,7 @@ BEGIN
   IF r.phase = 'want' AND p_seq = 0 THEN
     DELETE FROM sessions.staged_facts_v1 AS f WHERE f.run_id = p_run_id;
     v_chain := ROW(p_run_id, true, 0, p_last, false);
-  ELSIF r.phase = 'want' AND p_seq IS NOT NULL THEN
+  ELSIF r.phase = 'want' THEN
     v_chain := ROW(p_run_id, v_found AND v_chain.whole AND NOT v_chain.done AND NOT v_chain.sealed AND p_seq = v_chain.seq + 1, p_seq, p_last, false);
   ELSIF NOT v_found THEN
     v_chain := ROW(p_run_id, false, NULL, false, false);
