@@ -27,7 +27,10 @@ import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
 import { indexSearchScope, searchIndexStagedStartup, type SearchIndexDeps, type SearchIndexResult, type StagedReconcile } from "../search-index.ts";
 import { STAGED_RECONCILE_FUNCTIONS, assertStagedReconcileSchema, type StagedBoundary } from "../staged-reconcile.ts";
-import { SCOPE, exportStreamScope, generate, prefixFor, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
+import { SCOPE, decompress, exportStreamScope, generate, prefixFor, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
+import { readCanonicalScope } from "../../session-read-api/canonical-projection.ts";
+import { outputFactsFromScope } from "../output-facts.ts";
+import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { clonedReplayDatabase, closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
 
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -332,6 +335,61 @@ describe("staged reconcile through the consumer wiring", () => {
       expect(r.recorded.at(-1)?.complete).toBe(false);
     }
   }, 300_000);
+
+  test("facts pass (output-facts hooks): killed mid-pass and resumed, the chunks give the whole read's facts exactly", async () => {
+    const r = await seeded(x);
+    type Chunk = { seq: number; last: boolean };
+    type Events = { projectionRows: Array<{ table: string; row: Record<string, unknown> }>; records: RelayhistoryStreamRecord[] };
+    let staged: { chunks: Chunk[]; events: Events[]; sealed: number } = { chunks: [], events: [], sealed: 0 };
+    const finished: Array<typeof staged> = [];
+    let killAt: number | undefined = 1;
+    const hooks = {
+      async onBatch(_tx: SqlExecutor, _run: unknown, batch: { phase: "facts"; events: Events; chunk: Chunk } | { phase: "write" }) {
+        if (batch.phase !== "facts") return;
+        if (batch.chunk.seq === 0) staged = { chunks: [], events: [], sealed: 0 };
+        staged.chunks.push(batch.chunk);
+        staged.events.push(batch.events);
+        if (batch.chunk.seq === killAt) {
+          killAt = undefined;
+          throw new Kill("facts");
+        }
+      },
+      async onWantDone() {
+        staged.sealed += 1;
+      },
+      async onFinish(_tx: SqlExecutor, _run: unknown, pass: { complete: boolean; sourceComplete: boolean }) {
+        expect(pass).toMatchObject({ complete: true, sourceComplete: true });
+        finished.push(staged);
+      },
+    };
+    const run = { factsChunk: 16, hooks };
+    expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn(run) })).toMatchObject({ complete: false, reasons: ["staged_run_interrupted"] });
+    await r.expire();
+    expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn(run) })).toMatchObject({ complete: true });
+    expect(finished.length).toBe(1);
+    const done = finished[0]!;
+    expect(done.chunks.map((c) => c.seq)).toEqual([...done.chunks.keys()]);
+    expect(done.chunks.map((c) => c.last)).toEqual(done.chunks.map((_, i) => i === done.chunks.length - 1));
+    expect(done.sealed).toBe(1);
+    expect(done.chunks.length).toBeGreaterThan(2);
+    // The whole read of the same source, with unlimited limits, and the facts each input builds.
+    const whole = await readCanonicalScope(SCOPE, x.keys, { reader: x.reader, store: x.store, prefixFor, decompress } as never,
+      { maxScopeBytes: 1 << 30, maxScopeEvents: 1 << 24, maxRows: 1 << 24, insertBatch: 5000 }, NOW.getTime(), x.canonicalId);
+    expect(whole.complete).toBe(true);
+    const fScope = { orgId: SCOPE.orgId, workspaceId: SCOPE.workspaceId, harness: SCOPE.harness, sessionIds: [SCOPE.sessionId, x.canonicalId], canonicalId: x.canonicalId };
+    const stagedInput = {
+      projectionRows: done.events.flatMap((e) => e.projectionRows),
+      records: done.events.flatMap((e) => e.records),
+      complete: true,
+    };
+    expect(stagedInput.projectionRows.length).toBe(whole.projectionRows.length);
+    expect(stagedInput.records.length).toBe(whole.records.length);
+    const sorted = (rows: Array<{ row_id: string }>) => [...rows].sort((a, b) => (a.row_id < b.row_id ? -1 : 1));
+    const a = outputFactsFromScope(fScope, stagedInput as never, 7);
+    const b = outputFactsFromScope(fScope, { projectionRows: whole.projectionRows, records: whole.records, complete: true } as never, 7);
+    expect(a.events.length).toBeGreaterThan(0);
+    expect({ ...a, events: sorted(a.events), facts: sorted(a.facts) }).toEqual({ ...b, events: sorted(b.events), facts: sorted(b.facts) });
+  }, 120_000);
 
   test("flag on with the 062110 functions missing: startup refuses, naming the migration", async () => {
     const r = await rig(x);
