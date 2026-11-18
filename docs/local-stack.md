@@ -150,7 +150,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 0.5 GB of keys on top of its usual limit); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
-| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -466,12 +466,42 @@ byte budget (scopes up to 2 GiB under 500000 records) and the paged scan itself.
 
 Turning the default on is a separate, gated step, not part of this slice.
 
-### Staged reconcile (Phase 3, not wired yet)
+### Staged reconcile (Phase 3), staged runs
 
 Migration `20261105062110_search_reconcile_staging.sql` and `src/session-pipeline/staged-reconcile.ts` let the
 streaming reconcile above keep its diff state in Postgres instead of in memory, commit it in batches, and resume after
-a crash. They sit behind `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (default off). Nothing calls them yet: the consumer
-wiring is a later change, so applying the migration changes no runtime path.
+a crash. They sit behind `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (default off), and with it on the consumer uses them
+(`search-index.ts` `stagedSearchScope`).
+
+**Which scopes take the staged path.** With the flag on, exactly the scopes that stream today: a scope whose whole read
+stopped on `scope_too_large` alone, on the self-host consumer (the Postgres or OpenSearch adapter binding). Those scopes
+already take a flag-specific path since slice 1 (paged scans, per-pass budgets), so the staged run changes no other
+scope. Every scope the whole read completes, and every scope partial for another reason, stays on the whole read
+exactly as with the flag on in slice 1. With the flag off nothing here runs (no query, log line or reason code).
+
+How a staged run differs from the in-transaction stream it replaces:
+
+- **No long transaction.** The index transaction that found the scope too large commits without a write and hands the
+  scope to the staged run. Passes 1-3 and pass 4 read the source outside any transaction; the wanted keys and the index
+  scan are staged in committed batches; only the final step holds the scope and canonical advisory locks.
+- **Resume on the reconcile tick.** A successful claim records the scope as owing a pass (search state incomplete) in
+  the claim's own transaction, so an interrupted run is listed by the next tick and resumes at its committed cursor
+  once its lease expires. No staged outcome answers `busy`: the queue's requeue, backoff and dead-letter path is never
+  used for a staged scope.
+- **Outcome reasons** (all incomplete, none `busy`): `staged_run_leased` (another consumer holds the run's live
+  lease; nothing written), `scope_busy` / `canonical_scope_busy` (a lock was held at the final step; the lease is
+  released), `stream_source_changed` (the source stamp moved; the run was abandoned and restarts on the tick),
+  `staged_lease_lost` (the run was taken over or erased under this consumer), `staged_run_interrupted` (a step failed
+  after the claim; partial, resumed on the tick). A spent read budget or the keyed-records cap stays partial with
+  `scope_too_large` and its code, as before.
+- **A second consumer** that reaches the same scope while a run holds a live lease gets `staged_run_leased` at the
+  claim, before any work. The whole-read path itself does not look at the run table (the runtime role has no grant on
+  it and 062110 has no reader for it): for a scope with a live run it either refuses the scope as too large and reaches
+  the claim (the same source), or completes because the source shrank, which moves the stamp, so the run abandons at
+  its final check.
+- **Erasure.** The erase pass (no live pointer left) also drops the scope's staged runs and stage rows
+  (`search_reconcile_erase_scope_v1`), in the erase transaction under the scope lock.
+- **Startup.** With the flag on the consumer refuses to start unless every 062110 writer exists, naming the migration.
 
 - **Tables.** `sessions.search_reconcile_runs_v1` holds one run per scope: the source stamp it started from
   (canonical id, directory epoch, admitted-manifest fingerprint), its phase (`want`, `have`, `write`, `final`), the
@@ -489,8 +519,9 @@ wiring is a later change, so applying the migration changes no runtime path.
 
 Preconditions before the flag may be turned on anywhere (1-3, 5 and 6 open, tracked for slice 2b):
 
-1. **Erasure.** Session erasure must call `search_reconcile_erase_scope_v1` (`eraseStagedReconcileRuns`). Until it
-   does, the staged rows of an erased session outlive the erase. Those rows hold index identities (machine, session
+1. **Erasure.** The consumer's erase pass now calls `search_reconcile_erase_scope_v1` (`eraseStagedReconcileRuns`)
+   under the scope lock. Other erase paths (the operator session and user erase) do not yet, so the staged rows of a
+   session erased that way outlive the erase. Those rows hold index identities (machine, session
    and event ids, timestamps, fingerprints) but no content. Calling it is not enough on its own: a tick that read its
    stamp before the erase can claim afterwards, re-creating the run and staging that session's identities again. Its
    final step then abandons the run, which drops the stage rows but keeps the `search_reconcile_runs_v1` row (org,

@@ -78,6 +78,43 @@ export interface SearchProjectionIo {
 }
 
 /**
+ * One keyset page of a scope's in-window index identities (the staged reconcile's index scan,
+ * one page per committed transaction): rows strictly after `after` in scan order, at most `limit`
+ * (1..MAX_SCAN_PAGE), and the position to continue from (absent: the last page). Every row is
+ * checked to lie in the scope and the window, and to advance.
+ */
+export async function adapterScanPage(
+  binding: SearchServiceBinding,
+  scope: SearchProjectionScope,
+  canonicalId: string,
+  fromMs: number,
+  limit: number,
+  after?: SearchPosition,
+): Promise<{ rows: SearchFingerprint[]; next?: SearchPosition }> {
+  const page = binding.index.scanFingerprintsPage?.bind(binding.index);
+  if (!page) throw new Error("search paged scan unsupported by this index");
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_SCAN_PAGE) throw new Error("search keyset scan bounds invalid");
+  const result = await page(
+    { orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionIds: [...new Set([scope.sessionId, canonicalId])] },
+    { fromMs, limit, ...(after ? { after } : {}) },
+  );
+  if (!result || !Array.isArray(result.rows) || result.rows.length > limit) throw new Error("search scan result invalid");
+  let previous = after;
+  for (const row of result.rows) {
+    assertPosition(row);
+    if (row.workspaceId !== scope.workspaceId || row.source !== scope.harness || ![scope.sessionId, canonicalId].includes(row.sessionId) || row.tsMs < fromMs || typeof row.fingerprint !== "string")
+      throw new Error("search scan scope invalid");
+    if (previous && comparePositions(previous, row) >= 0) throw new Error("search scan order invalid");
+    previous = row;
+  }
+  if (!result.next) return { rows: [...result.rows] };
+  if (result.rows.length === 0) throw new Error("search scan result invalid");
+  assertPosition(result.next);
+  if (comparePositions(result.next, result.rows[result.rows.length - 1]!) !== 0) throw new Error("search scan result invalid");
+  return { rows: [...result.rows], next: { ...result.next } };
+}
+
+/**
  * `pagedScan` (the staged reconcile only) adds `scanPages` over the adapter's
  * scanFingerprintsPage, and refuses an adapter without it. Absent: the io is exactly the
  * one without paging.

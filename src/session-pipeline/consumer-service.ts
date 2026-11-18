@@ -68,6 +68,7 @@ import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
 import { assertStagedSearchIndex, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
+import { assertStagedReconcileSchema } from "./staged-reconcile.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1175,6 +1176,9 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   await assertRuntimeIdentity(db);
   await assertServiceSchema(db);
   await assertSearchTenantGate(db);
+  // SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true: the 062110 writers must exist (names the
+  // migration), checked now rather than on the first large scope. Off: no query.
+  if (searchStaged) await assertStagedReconcileSchema(db);
   // A healthy start clears a stale UNHEALTHY marker from an earlier crash
   // loop; without this the marker is sticky across restarts.
   clearUnhealthyFile(config.unhealthyFile);
