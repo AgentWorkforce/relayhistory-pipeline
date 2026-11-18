@@ -27,6 +27,7 @@ whole table.
 | `alleyoop-courier`, `hoopdb-indexer`, `referee`, `bob-costas`, `session-brief` | Deployment (worker) | `src/<name>/...` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (`src/shared/worker.ts` `serveHealth`) |
 | `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
 | `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
+| `session-analysis` | Deployment (worker, default off; `SESSION_ANALYSIS_ENABLED=true`) | `src/session-analysis/runner.ts` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz`; exits 2 on a refused config ([session-analysis-runner.md](session-analysis-runner.md)) |
 | `session-ingest` | Deployment (HTTP) | `src/session-ingest/selfhost-server.ts` | `RELAYHISTORY_INGEST_PORT`, default 8081 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`), `GET /readyz` (section 3) |
 | `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)) |
 | `user-erase` | Job (one-shot, operator-run, default off; `OPERATOR_USER_ERASE_ENABLED=1`) | `src/session-erase/user-erase-main.ts` | none | exit code (0 verified / disabled, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)); see `docs/operator-user-erase.md` |
@@ -106,6 +107,16 @@ dormant; any other value fails startup.
   stack**, whose consumer has no freshness sweep, so marked sessions would keep
   their workspaces' directory event reads refused until a new upload. See
   `runbooks/epoch-event-time-repair.md`.
+
+### `SERVICE=session-analysis`
+
+The session-analysis job processor (lane F1) as a pod, for EKS next to ingest-edge, in place of the
+session-pipeline Lambda's `{"sessionAnalysis": true}` schedule. It runs the Lambda's exact path:
+both build their deps with `src/session-analysis/runtime-deps.ts`. It is off unless
+`SESSION_ANALYSIS_ENABLED` is exactly `true`. Dormant, it reads nothing and its probes answer 200
+`{"ok":true,"enabled":false}`. The env contract, the database role, the S3 and KMS grants (with
+the us-east-1 bucket and us-west-2 cluster note), the chart values infra needs and the activation
+checklist are in [session-analysis-runner.md](session-analysis-runner.md).
 
 ### `SERVICE=session-erase-bytes`
 

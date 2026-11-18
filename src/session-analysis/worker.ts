@@ -1,11 +1,16 @@
 /**
  * The session-analysis tick: claim up to `batch` due analysis jobs and run each one
  * (relayhistory worker.ts runSessionAnalysisTick, kind "analysis"). Off unless
- * SESSION_ANALYSIS_ENABLED=true and a model transport is configured. Runtime: the session
- * pipeline Lambda's `{"sessionAnalysis": true}` invocation (src/session-pipeline/lambda.ts),
- * driven by the stack's one-minute `session-analysis-job-schedule`, DISABLED unless
- * `transcriptStore.sessionPipeline.analysisJobs.enabled`. The model key is the pipeline
- * secret's `openai_api_key` only (operator-loaded from 1Password; never on disk). Each tick
+ * SESSION_ANALYSIS_ENABLED=true and a model transport is configured. Runtimes (both build their
+ * deps with runtime-deps.ts analysisTickDeps, so they run one path):
+ *   - the session pipeline Lambda's `{"sessionAnalysis": true}` invocation
+ *     (src/session-pipeline/lambda.ts), driven by the stack's one-minute
+ *     `session-analysis-job-schedule`, DISABLED unless
+ *     `transcriptStore.sessionPipeline.analysisJobs.enabled`. Its model key is the pipeline
+ *     secret's `openai_api_key` only (operator-loaded from 1Password; never on disk);
+ *   - the EKS runner, SERVICE=session-analysis (runner.ts, docs/session-analysis-runner.md),
+ *     default off, its key from a mounted Secret file.
+ * Each tick
  * first sweeps orphan publication tickets (store.ts sweepAnalysisTickets).
  *
  * Evidence comes from the trusted producer read of the canonical scope; the pointer and
@@ -133,6 +138,11 @@ export function analysisTick(deps: {
    * decision records in that job's workspace. Absent = no extractor, no call, no count.
    */
   decisionRecords?: DecisionRecordsSink;
+  /**
+   * The EKS runner's drain signal (runner.ts): true once SIGTERM arrived, so no further job is
+   * claimed in this tick; the job in flight still finishes. Absent (the Lambda) = never stops early.
+   */
+  stopping?: () => boolean;
 }) {
   return async (): Promise<Record<string, number>> => {
     const counts: Record<string, number> = { completed: 0, failed: 0, "lease-lost": 0, idle: 0 };
@@ -154,6 +164,7 @@ export function analysisTick(deps: {
         onError: () => { counts.sweep_failed = (counts.sweep_failed ?? 0) + 1; },
       });
     for (let i = 0; i < deps.config.batch; i += 1) {
+      if (deps.stopping?.()) break;
       const outcome = await runAnalysisJob(
         store,
         {
