@@ -149,7 +149,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_MAX_ROWS` | session-pipeline consumer (self-host SERVICE only, enabled) | Index rows compared for one scope, a positive integer. Default 500000; accepted 500000 to 1000000. Same startup rules. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
-| `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 0.5 GB of keys on top of its usual limit); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
+| `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 2 GB on top of its usual limit, about 3 KB per record, measured); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
 | `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
@@ -384,10 +384,13 @@ past the whole-read bound is refused and the consumer logs a warning at startup 
 so values set before stay valid); from `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the events floor is already the
 2000000 cap, so a scope past the events bound never streams there, while one past only the bytes bound still can.
 
-Minimum consumer memory with streaming on: the non-streaming sizing plus about 0.5 GB. The streaming reader never
-holds the scope (up to 512 MiB at the default budgets) at once; it holds one decompressed chunk (at most 16 MiB)
-plus about 1 KB of keys per record of the scope, about 0.5 GB for the largest scope the default budgets stream
-(500000 records). Lowering `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` lowers that part in proportion. An image upgrade
+Minimum consumer memory with streaming on: the non-streaming sizing plus about 2 GB at the default budgets. The
+streaming reader never holds the scope (up to 512 MiB at the default budgets) at once; it holds one decompressed
+chunk (at most 16 MiB) plus about 3 KB per record of the scope for its keys and per-record state (measured on
+synthetic scopes with `scripts/bench/staged-stream-rss.ts`: peak RSS +0.6 GB at 100000 records, +3.3 GB at 1000000),
+about 2 GB for the largest scope the default budgets stream (500000 records). That part scales with
+`SEARCH_INDEX_STREAM_MAX_READ_EVENTS`: lowering it lowers the largest streamed scope and this memory in proportion.
+`SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` needs the same sizing (its keyed-records cap is the same 500000). An image upgrade
 turns this on for an install that never set the variable, so check the pod limit or set `false` before upgrading
 (see "Upgrading to the default-on image" below). On the first reconcile tick after the upgrade, every session
 already partial with `scope_too_large` alone is streamed (or refused by the budgets) in turn. A refused scope stays
@@ -443,7 +446,7 @@ With it on:
 - **Per-pass read budget.** `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` bound each pass of a streamed scope,
   not the sum of its passes, so a scope is refused only when its own size exceeds a budget, never four times its
   size: at the defaults a scope up to 2 GiB streams (records are capped below).
-- **Interim keyed-records cap.** Every record a pass reads is still keyed in memory (about 1 KB each), so one pass
+- **Interim keyed-records cap.** Every record a pass reads is still keyed in memory (about 3 KB each, measured), so one pass
   may read at most 500000 records, and one index scan may hold at most 500000 rows (or `SEARCH_INDEX_MAX_ROWS` when
   that is higher). The cap counts records read, not unique keys: a record carried by two sibling manifests counts
   twice. Past it, nothing is deleted and the scope is retried every reconcile tick, with one of two outcomes:
@@ -452,8 +455,8 @@ With it on:
   - a **whole-read** scope whose index scan passes the cap is marked incomplete (not partial) with
     `stream_keyed_records_cap` alone, in place of `search_index_truncated`. Its missing rows are still written.
 
-  That is the same key memory as the default streaming budgets already need (about 0.5 GB), so the pod sizing
-  above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
+  That is the same key memory as the default streaming budgets already need (about 2 GB at the cap), so the pod
+  sizing above holds. The cap is a constant, not a setting; a later slice replaces the in-memory keys and removes it.
 - **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
   1` at most every 20 seconds) on the whole-read path. A streamed scope no longer runs in that transaction: it runs
   as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
