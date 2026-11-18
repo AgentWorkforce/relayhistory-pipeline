@@ -17,6 +17,7 @@ import type { ObjectStore } from "../../packages/object-store/src/index.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migration/neon-s3-erasure/eraser.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
+import { postgresClaimsPort, sessionIntelClaimsEnabled } from "./claims.ts";
 import { decisionRecordsEnabled, postgresDecisionRecordsSink } from "./decision-records.ts";
 import { analysisConfig, type analysisTick } from "./worker.ts";
 
@@ -67,7 +68,14 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
       decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
-    ...(decisionRecordsEnabled(env) ? { decisionRecords: postgresDecisionRecordsSink(inputs.db) } : {}),
+    // SUMMARY_DECISION_RECORDS_ENABLED is the outer gate (decisions, unchanged); SESSION_INTEL_CLAIMS_ENABLED
+    // inside it adds the claims port (claims.ts) next to it.
+    ...(decisionRecordsEnabled(env)
+      ? {
+          decisionRecords: postgresDecisionRecordsSink(inputs.db),
+          ...(sessionIntelClaimsEnabled(env) ? { claims: postgresClaimsPort(inputs.db) } : {}),
+        }
+      : {}),
     transact: inputs.transact,
     // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
     // pages, every version of a ticketed result key that no published job owns.
