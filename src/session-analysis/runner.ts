@@ -5,12 +5,13 @@
  * worker.ts analysisTick over deps from runtime-deps.ts analysisTickDeps (the builder the Lambda
  * uses too). Contract, IAM and chart values: docs/session-analysis-runner.md.
  *
- *   SESSION_ANALYSIS_ENABLED          exactly "true" runs; unset, "" or "false" is dormant (no config,
- *                                     credential, database or store work; probes 200 enabled:false;
- *                                     SIGTERM exits 0); anything else refuses startup (exit 2)
+ *   SESSION_ANALYSIS_ENABLED          exactly "true" runs; unset, "" or "false" is dormant (it reads only
+ *                                     WORKER_HEALTH_PORT: no other setting, scrub engine, credential,
+ *                                     database or store work; probes 200 enabled:false; SIGTERM exits 0);
+ *                                     anything else refuses startup (exit 2)
  *   SESSION_ANALYSIS_TICK_MS          wait between ticks, 1000..600000, default 30000
- *   SESSION_ANALYSIS_BATCH            jobs per tick, 1..20, default 2 (worker.ts analysisConfig;
- *                                     malformed refuses here instead of silently defaulting)
+ *   SESSION_ANALYSIS_BATCH            jobs per tick, 1..20 (no leading zero), default 2; refused here
+ *                                     unless worker.ts analysisConfig reads the very same value
  *   SESSION_ANALYSIS_OPENAI_API_KEY_FILE | SESSION_ANALYSIS_OPENAI_API_KEY
  *                                     the model key, exactly one source (a mounted Secret file is the
  *                                     intended one); a key ending "-disabled" means no model (the tick
@@ -36,7 +37,9 @@
  * else 503 loop_stalled / tick_failing. GET /readyz 200 after the first good tick, 503 starting before.
  * SIGTERM/SIGINT: no further job is claimed; the job in flight finishes (its lease is 600 s; a pod
  * killed earlier leaves it to lease expiry, as a Lambda timeout does), then the pool closes and the
- * process exits 0. Logs: codes and counts only (src/shared/log.ts allowlist); no key, URL, bucket or id.
+ * process exits 0. A second signal is logged and ignored (the drain goes on); the third exits 143 at
+ * once. The scrub engine (SCRUB_ENGINE, READER_MAX_RULESET) is selected only once enabled, after the
+ * config is validated; its failure is a refusal (exit 2). Logs: codes and counts only (src/shared/log.ts allowlist); no key, URL, bucket or id.
  */
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -56,7 +59,7 @@ import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
-import { analysisTick } from "./worker.ts";
+import { analysisConfig, analysisTick } from "./worker.ts";
 import { analysisTickDeps, type AnalysisTickDeps } from "./runtime-deps.ts";
 import { ANALYSIS_LEASE_SECONDS } from "./processor.ts";
 
@@ -102,9 +105,11 @@ export interface AnalysisRunnerConfig {
   cutoverProof: boolean;
 }
 
-const int = (raw: string | undefined, dflt: number, min: number, max: number, code: string): number => {
+const int = (value: string | undefined, dflt: number, min: number, max: number, code: string): number => {
+  const raw = value?.trim();
   if (raw === undefined || raw === "") return dflt;
-  if (!/^\d{1,9}$/.test(raw)) return refuse(code);
+  // No sign, no leading zero, no exponent: the decimal written is the value used.
+  if (!/^[1-9]\d{0,8}$/.test(raw)) return refuse(code);
   const n = Number(raw);
   return n >= min && n <= max ? n : refuse(code);
 };
@@ -126,14 +131,17 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
   if (credentials !== "podIdentity" && credentials !== "role") refuse("credentials_mode_invalid");
   const assume = env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS;
   if (assume !== undefined && assume !== "" && assume !== "false" && assume !== "true") refuse("assume_no_legacy_turns_invalid");
+  // Strict here, and it must be exactly what worker.ts analysisConfig runs (1-20, default 2): the
+  // stall window and the startup line are sized from it.
+  const batch = int(env.SESSION_ANALYSIS_BATCH, 2, 1, 20, "batch_invalid");
+  if (analysisConfig(env).batch !== batch) refuse("batch_invalid");
   let maximum: number | undefined;
   try { maximum = readerMaxRuleset(env); } catch { refuse("reader_max_ruleset_invalid"); }
   // TLS is validated now (a bad profile or CA is a startup refusal, not a failed first tick).
   try { postgresTlsOptions(env); } catch { refuse("postgres_tls_invalid"); }
   return {
     tickMs: int(env.SESSION_ANALYSIS_TICK_MS, 30_000, 1_000, 600_000, "tick_ms_invalid"),
-    // Strict here; worker.ts analysisConfig then reads the same value (1-20, default 2).
-    batch: int(env.SESSION_ANALYSIS_BATCH?.trim(), 2, 1, 20, "batch_invalid"),
+    batch,
     poolMax: int(env.SESSION_ANALYSIS_PG_POOL_MAX, 4, 1, 16, "pool_max_invalid"),
     bucket,
     region,
@@ -314,6 +322,10 @@ export interface AnalysisRunnerOptions {
   now?: () => number;
   onListening?: (port: number) => void;
   ports?: RunnerPorts;
+  /** Replaces the scrub engine selection (tests). Runs only when enabled, after config validation. */
+  scrubInit?: () => Promise<unknown>;
+  /** Replaces the hard exit on the third stop signal (tests). */
+  hardExit?: (code: number) => void;
   /** Replaces the real tick built from the deps (tests). Receives the drain check. */
   tick?: (stopping: () => boolean) => AnalysisTickFn;
 }
@@ -327,14 +339,29 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
   // Enabled: every setting and both secrets are validated before anything listens.
   const cfg = enabled ? analysisRunnerConfig(env) : undefined;
   const secrets = enabled && !options.tick ? runnerSecrets(env) : undefined;
+  // SCRUB_ENGINE selection, only for an enabled runner and after READER_MAX_RULESET was refused by code above.
+  if (cfg) {
+    try { await (options.scrubInit ?? initScrubEngine)(); } catch { refuse("scrub_engine_invalid"); }
+  }
   const state: RunnerHealthState = { enabled, lastProgressAt: now(), ticks: 0, consecutiveFailures: 0 };
   const stop = new AbortController();
-  const onSignal = () => stop.abort();
-  process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSignal);
+  // Every stop signal is handled, so a second one never kills the job in flight; the third exits now.
+  let signals = 0;
+  const onSignal = () => {
+    signals += 1;
+    if (signals === 2) log.warn("session analysis runner draining", { stage: STAGE, reason: "signal_repeated", count: signals });
+    if (signals >= 3) {
+      log.error("session analysis runner hard stop", { stage: STAGE, reason: "signal_repeated", count: signals });
+      (options.hardExit ?? ((c: number) => process.exit(c)))(143);
+    }
+    stop.abort();
+  };
+  const onAbort = () => stop.abort();
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
   if (options.signal) {
     if (options.signal.aborted) stop.abort();
-    else options.signal.addEventListener("abort", onSignal, { once: true });
+    else options.signal.addEventListener("abort", onAbort, { once: true });
   }
   let db: HoopDb | undefined;
   const server = runnerHealthServer(state, cfg ? runnerMaxTickAgeMs(cfg) : 0, now);
@@ -372,7 +399,7 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
     stop.abort();
     process.removeListener("SIGTERM", onSignal);
     process.removeListener("SIGINT", onSignal);
-    options.signal?.removeEventListener("abort", onSignal);
+    options.signal?.removeEventListener("abort", onAbort);
     await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections?.(); });
     await db?.end?.().catch(() => {});
   }
@@ -384,8 +411,7 @@ export function runnerExitCode(error: unknown): 1 | 2 {
 }
 
 if (import.meta.main)
-  initScrubEngine()
-    .then(() => analysisRunnerService())
+  analysisRunnerService()
     .then(() => process.exit(0))
     .catch((error) => {
       log.error("session analysis runner refused", { stage: STAGE, ...errorFields(error), ok: false });

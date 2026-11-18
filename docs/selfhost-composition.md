@@ -113,7 +113,7 @@ dormant; any other value fails startup.
 The session-analysis job processor (lane F1) as a pod, for EKS next to ingest-edge, in place of the
 session-pipeline Lambda's `{"sessionAnalysis": true}` schedule. It runs the Lambda's exact path:
 both build their deps with `src/session-analysis/runtime-deps.ts`. It is off unless
-`SESSION_ANALYSIS_ENABLED` is exactly `true`. Dormant, it reads nothing and its probes answer 200
+`SESSION_ANALYSIS_ENABLED` is exactly `true`. Dormant, it reads only `WORKER_HEALTH_PORT` and its probes answer 200
 `{"ok":true,"enabled":false}`. The env contract, the database role, the S3 and KMS grants (with
 the us-east-1 bucket and us-west-2 cluster note), the chart values infra needs and the activation
 checklist are in [session-analysis-runner.md](session-analysis-runner.md).

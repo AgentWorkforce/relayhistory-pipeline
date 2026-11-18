@@ -40,25 +40,32 @@ unchanged.
 | Entry | `docker/entrypoint.sh` `SERVICE=session-analysis` runs `bun run /app/src/session-analysis/runner.ts` (services image) |
 | Kind | Deployment, `replicas: 1` (see "Concurrency") |
 | Port | `WORKER_HEALTH_PORT`, default 8081, probes only, never exposed outside the cluster |
-| `GET /healthz` | Dormant: 200 `{"ok":true,"enabled":false}`. Enabled: 200 `{"ok":true,"enabled":true,"reason":"starting"\|"ok"}`. Two 503 cases: `tick_failing` after 5 failed ticks in a row (a rotated DB password, an unreachable database), and `loop_stalled` when no tick has ended within `TICK_MS + BATCH x 600 s + 60 s` |
+| `GET /healthz` | Dormant: 200 `{"ok":true,"enabled":false}`. Enabled: 200 `{"ok":true,"enabled":true,"reason":"starting"\|"ok"}`. Two 503 cases: `tick_failing` after 5 failed ticks in a row (a rotated DB password, an unreachable database), and `loop_stalled` when no tick has ended within `TICK_MS + BATCH x 600 s + 60 s`. That window is sized for a full batch of lease-long jobs, so it is coarse: about 21 min at the default `BATCH=2`, and about 3.4 h at `BATCH=20`. A hung job is therefore detected late at large batches; keep `BATCH` small (the default) |
 | `GET /readyz` | 200 once the first tick has succeeded; 503 `starting` before that. Dormant: 200 |
 | Cadence | One tick, then a wait of `SESSION_ANALYSIS_TICK_MS`, repeated. A tick sweeps orphan result tickets, then claims and runs up to `SESSION_ANALYSIS_BATCH` jobs one after another (600 s lease each) and stops at the first idle claim |
-| SIGTERM / SIGINT | No further job is claimed. The job in flight finishes, then the probe server and the pool close and the process exits 0. There is no lease-release RPC. A pod killed before its job finishes leaves the job to lease expiry (600 s): the job becomes claimable again, with the attempt already counted, exactly as after a Lambda timeout |
+| SIGTERM / SIGINT | No further job is claimed. The job in flight finishes, then the probe server and the pool close and the process exits 0. A second signal is logged and ignored, so the drain goes on; a third exits 143 at once. There is no lease-release RPC. A pod killed before its job finishes leaves the job to lease expiry (600 s): the job becomes claimable again, with the attempt already counted, exactly as after a Lambda timeout |
 | Exit codes | 0 clean stop; 2 refused configuration (do not retry unchanged); 1 any other startup failure |
 | Logs | JSON lines through `src/shared/log.ts` (field allowlist). Each tick logs `count` (completed), `failed`, `skipped` (lease lost), `deleted` (orphan tickets swept), `retried` (sweep failures) and `duration_ms`. A failed tick logs `error_code` and the failure streak as `count`. Startup logs `state`, `status` (`model_configured` or `model_not_configured`), `count` (batch) and `port`. No log line carries a key, URL, bucket, transcript text or ids beyond the existing conventions |
 
 ## Env contract
 
 Flags are strict. `SESSION_ANALYSIS_ENABLED` must be exactly `true` to run. Unset, empty or `false`
-leaves the runner dormant: it reads no other setting or secret, opens no pool, builds no client and
-idles with green probes. Any other value refuses startup (exit 2). Every malformed setting below
-also refuses startup with a code; none falls back to a silent default.
+leaves the runner dormant: it reads only `WORKER_HEALTH_PORT` (a malformed port still refuses), and
+no other setting or secret. It selects no scrub engine, opens no pool, builds no client and idles
+with green probes. Any other flag value refuses startup (exit 2). Every malformed setting below also
+refuses startup with a code; none falls back to a silent default. Numbers are trimmed, then must be
+plain decimals with no sign, exponent or leading zero.
+
+Once enabled, the order is: settings (including `READER_MAX_RULESET`, refused as
+`reader_max_ruleset_invalid`), then both secrets, then the scrub engine (`SCRUB_ENGINE`, as every
+services entry selects it). An engine selection failure is the refusal `scrub_engine_invalid`
+(exit 2), never exit 1.
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `SESSION_ANALYSIS_ENABLED` | yes | `true` runs; see above |
 | `SESSION_ANALYSIS_TICK_MS` | no | Wait between ticks, 1000..600000 ms, default 30000 |
-| `SESSION_ANALYSIS_BATCH` | no | Jobs per tick, 1..20, default 2 (the same `worker.ts` `analysisConfig` the Lambda reads) |
+| `SESSION_ANALYSIS_BATCH` | no | Jobs per tick, 1..20, default 2. Refused unless `worker.ts` `analysisConfig`, which the Lambda also reads, runs exactly that value, so `005` is refused rather than logged as 5 and run as 2 |
 | `SESSION_ANALYSIS_OPENAI_API_KEY_FILE` or `SESSION_ANALYSIS_OPENAI_API_KEY` | exactly one | The model key. The file form (absolute path to a mounted k8s Secret key, 1..65536 bytes, one trailing newline dropped) is the intended one. The key is read once at startup, so a rotation needs a rollout. A key ending in `-disabled` means no model: the runner stays up and claims nothing, as `modelKey` does. Never logged |
 | `SESSION_ANALYSIS_DATABASE_URL_FILE` or `SESSION_ANALYSIS_DATABASE_URL` | exactly one | `postgres(ql)://` URL for the worker role (next section). No `ssl*` or `options` query parameters (`postgres-tls.ts`). Never logged |
 | `SESSION_POSTGRES_TLS_PROFILE` | no | `supabase` (default, the pinned Supabase CA) or `custom-ca` with `SESSION_POSTGRES_CA_FILE` and `SESSION_POSTGRES_CA_SHA256` |
@@ -69,6 +76,7 @@ also refuses startup with a code; none falls back to a silent default.
 | `PIPELINE_KEY_PREFIX` | yes | The bare key root, as the Lambda reads it |
 | `PIPELINE_ORG_FROM_PREFIX` | yes, `true` | The org-prefix layout, as the Lambda requires |
 | `READER_MAX_RULESET` | no | As the Lambda: unset keeps legacy sealed reads; `8`..`10` enforces |
+| `SCRUB_ENGINE` | no | As every services entry (`docs/scrub-engine.md`); read only when enabled |
 | `WORKER_HEALTH_PORT` | no | Probe port, default 8081 |
 | `SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS` | **must stay unset** | Passed through to `analysisConfig` unchanged. Only unset, `false` or `true` are accepted, and the startup line logs `reason: assume_no_legacy_turns` when it is `true` |
 | `SESSION_ANALYSIS_CUTOVER_PROOF` | per the cutover branch | Passed through unread (condition (d) lives on its own branch; the runner never interprets it) |
@@ -126,6 +134,12 @@ Cross-account and cross-region notes:
   in agentrelay-prod. The pod role needs an identity policy with the statements above, and the
   bucket policy and the key policy must also name the pod role's ARN with the same statements. The
   Lambda's grants are written as bucket-policy and key-policy principals.
+- **`kms:CallerAccount`.** The Lambda's key-policy statements pin `kms:CallerAccount` to the
+  sessions account. Cross-account, the caller is the pod role's account, so that condition must not
+  be copied as is. In the key policy, the pod role's statements replace it with the exact
+  principal (the pod role ARN), keep `kms:ViaService` and the encryption-context `StringLike`, and
+  may add `kms:CallerAccount` equal to the cluster's account. The pod role's identity policy names
+  the key ARN as its resource, not `*`. Both are infra-side changes that need Khaliq's OK.
 - **Cross-region.** The pod runs in us-west-2 and the bucket is in us-east-1. Requests are signed for
   and sent to the bucket's region (`SESSION_ANALYSIS_S3_REGION`). The KMS `ViaService` condition
   stays `s3.us-east-1.amazonaws.com`, because S3 calls KMS in the bucket's region. Expect
@@ -161,6 +175,31 @@ the values the sessions umbrella would need to expose, with nothing enabled by d
 
 The chart must never set `SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS`.
 
+## How long one job can run (drain bound)
+
+One job is **not** bounded end to end by its 600 s lease in code. These parts are bounded:
+
+| Part | Bound |
+| --- | --- |
+| Analysis model call | `SESSION_ANALYSIS_TIMEOUT_MS`, 120 s, abort signal |
+| Brief model call | `SESSION_SUMMARY_TIMEOUT_MS`, 20 s, abort signal |
+| Result put | `ANALYSIS_PUT_TIMEOUT_MS`, 120 s, aborted |
+| Orphan-ticket sweep transactions | `statement_timeout` 60 s per transaction (lambda.ts `transaction`) |
+
+These parts have no deadline of their own:
+
+- the canonical evidence read (manifest and chunk GETs);
+- the claim, reserve, complete and fail statements and the pointer and harness queries, which run
+  as single statements on the pool (no statement timeout);
+- the decision-records insert after completion.
+
+So the typical job is far below 600 s, but a stuck S3 GET or a stuck plain query can hold a job past
+its lease. The lease then lapses, another worker may claim the job, and the late `complete` is
+refused by the lease and revision checks, so correctness holds. `terminationGracePeriodSeconds: 660`
+makes a clean drain likely, not certain. A pod killed in that case falls back to lease expiry. The
+Lambda is bounded differently: its function timeout is 300 s for the whole tick. Adding a per-job
+wall deadline in the runner is follow-up work, if wanted before activation.
+
 ## Concurrency with the Lambda
 
 Claims are leased (`FOR UPDATE SKIP LOCKED` with a 600 s lease and 3 attempts), so a runner and the
@@ -169,6 +208,12 @@ model budget, though. The cutover order is therefore: start the runner dormant, 
 then disable the Lambda schedule (`transcriptStore.sessionPipeline.analysisJobs.enabled=false`, a
 stack change). Rollback is the reverse. Keep `replicas: 1`; more replicas are safe but only add
 throughput the admission limits do not need.
+
+The Lambda has no reserved concurrency (`stacks/aws/session-pipeline.ts` sets none;
+`maxConcurrency` there is the SQS event source's `MaximumConcurrency`, not the function's). One
+function serves SQS, every schedule and the analysis tick, so analysis ticks can already overlap:
+a tick runs up to 300 s and the schedule fires every minute. Leases keep that safe. While both the
+runner and the Lambda schedule are on, the claim rate is the sum of both.
 
 ## Activation checklist (blocked)
 
@@ -179,16 +224,17 @@ that OK.
 2. The cutover rows are in place, and condition (d), `SESSION_ANALYSIS_CUTOVER_PROOF`, is proven on
    its own branch.
 3. The admission role (`bulls96_analysis_admit`) has LOGIN, so the read path can enqueue jobs at all.
-4. The database path from the cluster is settled. Hyperdrive is Cloudflare-only and 0007 removes it,
+4. Decide whether a per-job wall deadline (section "How long one job can run") is required first.
+5. The database path from the cluster is settled. Hyperdrive is Cloudflare-only and 0007 removes it,
    so the runner connects directly over TLS. The decision covers which endpoint, which region and
    which pooler.
-5. The worker role's login and Secret exist for the runner.
-6. The Pod Identity role, the bucket-policy and key-policy grants (cross-account) and the
+6. The worker role's login and Secret exist for the runner.
+7. The Pod Identity role, the bucket-policy and key-policy grants (cross-account) and the
    association exist.
-7. The model-key Secret exists in the namespace, loaded from 1Password and never written to disk.
-8. The chart values above are merged in infra and deployed with `sessionAnalysis.run: "false"`.
+8. The model-key Secret exists in the namespace, loaded from 1Password and never written to disk.
+9. The chart values above are merged in infra and deployed with `sessionAnalysis.run: "false"`.
    Probes are green and the pod is dormant.
-9. Set `sessionAnalysis.run: "true"`. `/readyz` is 200 after the first tick, and the tick logs show
+10. Set `sessionAnalysis.run: "true"`. `/readyz` is 200 after the first tick, and the tick logs show
    `count` and `failed` as expected.
-10. Disable the Lambda's `session-analysis-job-schedule` (step "Concurrency").
-11. Khaliq's words for each of steps 1 to 10.
+11. Disable the Lambda's `session-analysis-job-schedule` (section "Concurrency with the Lambda").
+12. Khaliq's words for each of steps 1 to 11.
