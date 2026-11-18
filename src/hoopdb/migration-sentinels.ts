@@ -512,6 +512,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.session_analysis_source_revision binds the org S3 cutover (org_s3_cutover_v1)",
     sql: "SELECT coalesce((SELECT position('org_s3_cutover_v1' IN prosrc) > 0 FROM pg_proc WHERE oid = to_regprocedure('sessions.session_analysis_source_revision(text,text,text)')), false) AS applied",
   },
+  "upstream:20261105062140_staged_output_facts.sql": {
+    evidence: "table sessions.staged_facts_v1 and function sessions.staged_facts_reconcile_v1",
+    sql: "SELECT to_regclass('sessions.staged_facts_v1') IS NOT NULL AND to_regprocedure('sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
