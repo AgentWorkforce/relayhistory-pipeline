@@ -221,7 +221,8 @@ this step reads those rows to find the user's sessions.
 - Request ids: refused (`22023`) when the id belongs to another user in `operator_user_erasures`, or already fences
   sessions under another org or workspace.
 - Result and log: the job result gains `"relayfacts": {sessions, fencesAdded, evidenceRows, recordsDeleted,
-  recordsRewritten}` and logs `{"event":"user_erase_relayfacts", ...counts}`; a failure logs
+  recordsRewritten}` and logs `{"event":"user_erase_relayfacts", ...counts}` (with `20261105062150` applied the counts
+  also include intent and constraint claims, see `docs/relayfacts.md`, Claims); a failure logs
   `{"event":"user_erase_relayfacts","outcome":"failed","sqlstate":"…"}` (the five-character code only) and stops
   before `begin`. A rerun adds no fence and deletes nothing (zero counts except `sessions`). A user with no
   `session_index` row and a workspace id of `''` return zeros. A `40P01` (deadlock with a concurrent per-session

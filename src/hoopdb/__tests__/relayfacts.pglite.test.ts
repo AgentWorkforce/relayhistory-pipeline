@@ -93,7 +93,10 @@ describe("20261105062080 relayfacts", () => {
     expect(SQL).not.toMatch(/CONCURRENTLY/i);
     expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("relayfacts_v1");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(true);
-    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_")).sort()).toEqual([INSERT, SUPERSEDE].sort());
+    // 062150 adds the claims writer, supersede and reader for the same worker.
+    expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_")).sort()).toEqual([INSERT, SUPERSEDE,
+      "sessions.relayfacts_claims_insert_v1(text,text,jsonb)", "sessions.relayfacts_claims_supersede_v1(text,text,uuid,uuid)",
+      "sessions.relayfacts_claims_v1(text,text,text,text,timestamp with time zone,integer)"].sort());
     // Columns: no transcript body anywhere.
     const cols = async (t: string) => (await db.query<{ column_name: string }>(
       "SELECT column_name FROM information_schema.columns WHERE table_schema='sessions' AND table_name=$1 ORDER BY ordinal_position", [t])).rows.map((c) => c.column_name);
@@ -345,8 +348,8 @@ describe("20261105062090 relayfacts operator erase", () => {
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
     // The later steps are exactly 20261105062100 (the hosted per-user relayfacts erase), 20261105062110 (search reconcile
     // staging), 20261105062120 (analysis org S3 cutover), 20261105062130 (the cutover in the source revision) and
-    // 20261105062140 (staged output facts).
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP]);
+    // 20261105062140 (staged output facts), then 20261105062150 (relayfacts claims).
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > ERASE_STEP)).toEqual([USER_ERASE_STEP, STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_evidence_"))).toEqual([]);
     for (const fn of [ERASE, GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -427,6 +430,9 @@ const CUTOVER_REVISION_DOWN = read("supabase/rollbacks/20261105062130_analysis_c
 // 20261105062140 (staged output facts) sits above 062130 and references the 062110 stage table: its down runs first of all.
 const STAGED_FACTS_STEP = "upstream:20261105062140_staged_output_facts.sql";
 const STAGED_FACTS_DOWN = read("supabase/rollbacks/20261105062140_staged_output_facts.down.sql");
+// 20261105062150 (relayfacts claims) sits above 062140: its down runs first of all.
+const CLAIMS_STEP = "upstream:20261105062150_relayfacts_claims.sql";
+const CLAIMS_DOWN = read("supabase/rollbacks/20261105062150_relayfacts_claims.down.sql");
 const USER_ERASE = "sessions.relayfacts_user_erase_v1(text,text,text,text)";
 const USER_ERASE_LOCK = "sessions.relayfacts_user_erase_lock_v1()";
 const USER_ERASE_GUARD = "sessions.relayfacts_user_erase_guard_v1()";
@@ -475,8 +481,8 @@ describe("20261105062100 relayfacts user erase", () => {
     expect(USER_ERASE_DOWN).toContain("SET LOCAL lock_timeout='5s'");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[USER_ERASE_STEP]!.sql)).rows[0]!.applied).toBe(true);
     // 20261105062110 (search reconcile staging), then 062120 and 062130 (analysis org S3 cutover), then 062140 (staged output
-    // facts), are the upstream steps later than 062100.
-    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP]);
+    // facts) and 062150 (relayfacts claims), are the upstream steps later than 062100.
+    expect(Object.keys(MIGRATION_SENTINELS).filter((k) => k.startsWith("upstream:") && k > USER_ERASE_STEP)).toEqual([STAGING_STEP, CUTOVER_STEP, CUTOVER_REVISION_STEP, STAGED_FACTS_STEP, CLAIMS_STEP]);
     expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_user_erase_"))).toEqual([]);
     for (const fn of [USER_ERASE, USER_ERASE_LOCK, USER_ERASE_GUARD]) {
       const r = (await db.query<{ secdef: boolean; cfg: string[]; public_exec: boolean }>(
@@ -593,6 +599,10 @@ describe("20261105062100 relayfacts user erase", () => {
     // 062140, then 062130 and 062120, come off first; 062110's down refuses while any is applied, and 062130's while 062140 is.
     expect(await message(STAGING_DOWN)).toContain("a later migration is applied");
     expect(await message(CUTOVER_REVISION_DOWN)).toContain("a later migration is applied");
+    // 062150 comes off first: 062140's down refuses while it is applied.
+    expect(await message(STAGED_FACTS_DOWN)).toContain("a later migration is applied");
+    await db.exec(CLAIMS_DOWN);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[CLAIMS_STEP]!.sql)).rows[0]!.applied).toBe(false);
     await db.exec(STAGED_FACTS_DOWN);
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STAGED_FACTS_STEP]!.sql)).rows[0]!.applied).toBe(false);
     await db.exec(CUTOVER_REVISION_DOWN);

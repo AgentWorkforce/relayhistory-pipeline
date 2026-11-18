@@ -108,6 +108,104 @@ function firstSentence(text: string): string {
   return cutAt(match ? match[1]! : text, DECISION_TITLE_MAX).trim();
 }
 
+/** A cited reference, as far as the extractors read it (never its summary or detail). */
+export interface CitedReference {
+  source: string;
+  sessionId: string;
+  /** 0-based position among the snapshot's references of the same session. */
+  index: number;
+  kind: string | null;
+  at: string | null;
+}
+
+/** Each reference id's source, session, per-session position, kind and time (first occurrence wins). */
+export function referencePositions(snapshot: SessionAnalysisSnapshot): Map<string, CitedReference> {
+  const position = new Map<string, CitedReference>();
+  const perSession = new Map<string, number>();
+  for (const reference of snapshot.evidence?.references ?? []) {
+    const index = perSession.get(reference.sessionId) ?? 0;
+    perSession.set(reference.sessionId, index + 1);
+    if (!position.has(reference.id))
+      position.set(reference.id, {
+        source: reference.source,
+        sessionId: reference.sessionId,
+        index,
+        kind: typeof reference.kind === "string" ? reference.kind : null,
+        at: typeof reference.at === "string" ? reference.at : null,
+      });
+  }
+  return position;
+}
+
+/** One claim cut to the record bounds: its text, its evidence rows, and the references those rows cite. */
+export interface ClaimCut {
+  title: string;
+  statement: string;
+  spans: DecisionEvidence[];
+  cited: CitedReference[];
+}
+
+/**
+ * The shared rules for every recorded claim: confidence high or medium, text present, the whole text
+ * and every stored cut scrub-clean, and at least one usable cited reference (one evidence row per
+ * cited session, at most 10). Null when the claim is not recorded.
+ */
+export function cutClaim(
+  claim: { text?: unknown; evidenceIds?: readonly string[]; confidence?: unknown },
+  position: ReadonlyMap<string, CitedReference>,
+): ClaimCut | null {
+  if (claim.confidence !== "high" && claim.confidence !== "medium") return null;
+  if (typeof claim.text !== "string") return null;
+  const statementFull = collapse(claim.text);
+  if (!statementFull) return null;
+  const statement = cutAt(statementFull, DECISION_STATEMENT_MAX).trim();
+  const title = firstSentence(statement);
+  const text = cutAt(statement, DECISION_CLAIM_MAX).trim();
+  // The whole text and every stored cut must pass the scrubber unchanged.
+  if (![statementFull, statement, title, text].every(scrubClean)) return null;
+  const refMatch = GITHUB_REF.exec(statementFull);
+  const ref = refMatch && refMatch[0].length <= 500 ? refMatch[0] : null;
+  // One evidence row per cited session: its lowest and highest cited position.
+  const spans = new Map<string, DecisionEvidence>();
+  const cited: CitedReference[] = [];
+  for (const id of claim.evidenceIds ?? []) {
+    const at = position.get(id);
+    if (!at) continue;
+    if (!SOURCE.test(at.source)) continue;
+    if (!at.sessionId || at.sessionId.length > SESSION_ID_MAX || /[\r\n]/u.test(at.sessionId)) continue;
+    if (at.index > TURN_MAX) continue;
+    const key = `${at.source}\u0000${at.sessionId}`;
+    const span = spans.get(key);
+    if (span) {
+      span.turn_start = Math.min(span.turn_start, at.index);
+      span.turn_end = Math.max(span.turn_end, at.index);
+      cited.push(at);
+    } else if (spans.size < DECISION_EVIDENCE_MAX) {
+      spans.set(key, { source: at.source, session_id: at.sessionId, turn_start: at.index, turn_end: at.index, claim: text, ref });
+      cited.push(at);
+    }
+  }
+  if (spans.size === 0) return null;
+  return { title, statement, spans: [...spans.values()], cited };
+}
+
+/**
+ * Adds `spans` to `existing`: at most one evidence row per session per record in a batch (a
+ * second claim with the same title widens that session's span instead of adding a row for a
+ * shifted range), at most 10 rows.
+ */
+export function mergeSpans(existing: DecisionEvidence[], spans: readonly DecisionEvidence[]): void {
+  for (const span of spans) {
+    const same = existing.find((e) => e.source === span.source && e.session_id === span.session_id);
+    if (same) {
+      same.turn_start = Math.min(same.turn_start, span.turn_start);
+      same.turn_end = Math.max(same.turn_end, span.turn_end);
+    } else if (existing.length < DECISION_EVIDENCE_MAX) {
+      existing.push(span);
+    }
+  }
+}
+
 /**
  * The decision records of one analysis snapshot, for the job's own workspace. Only decisions
  * with high or medium confidence and at least one cited reference; at most 100 records of at
@@ -118,65 +216,20 @@ function firstSentence(text: string): string {
  * (docs/relayfacts.md, Deduplication limits).
  */
 export function extractDecisionRecords(snapshot: SessionAnalysisSnapshot): DecisionRecordInput[] {
-  const references = snapshot.evidence?.references ?? [];
-  // 0-based position of each reference among the references of its own session.
-  const position = new Map<string, { source: string; sessionId: string; index: number }>();
-  const perSession = new Map<string, number>();
-  for (const reference of references) {
-    const index = perSession.get(reference.sessionId) ?? 0;
-    perSession.set(reference.sessionId, index + 1);
-    if (!position.has(reference.id)) position.set(reference.id, { source: reference.source, sessionId: reference.sessionId, index });
-  }
+  const position = referencePositions(snapshot);
   const topic = decisionTopic(snapshot.metrics?.filesChanged ?? []);
   const records = new Map<string, DecisionRecordInput>();
   for (const decision of snapshot.understanding?.decisions ?? []) {
     if (records.size >= DECISION_BATCH_MAX) break;
-    if (decision.confidence !== "high" && decision.confidence !== "medium") continue;
-    if (typeof decision.text !== "string") continue;
-    const statementFull = collapse(decision.text);
-    if (!statementFull) continue;
-    const statement = cutAt(statementFull, DECISION_STATEMENT_MAX).trim();
-    const title = firstSentence(statement);
-    const claim = cutAt(statement, DECISION_CLAIM_MAX).trim();
-    // The whole text and every stored cut must pass the scrubber unchanged.
-    if (![statementFull, statement, title, claim].every(scrubClean)) continue;
-    const refMatch = GITHUB_REF.exec(statementFull);
-    const ref = refMatch && refMatch[0].length <= 500 ? refMatch[0] : null;
-    // One evidence row per cited session: its lowest and highest cited position.
-    const spans = new Map<string, DecisionEvidence>();
-    for (const id of decision.evidenceIds ?? []) {
-      const at = position.get(id);
-      if (!at) continue;
-      if (!SOURCE.test(at.source)) continue;
-      if (!at.sessionId || at.sessionId.length > SESSION_ID_MAX || /[\r\n]/u.test(at.sessionId)) continue;
-      if (at.index > TURN_MAX) continue;
-      const key = `${at.source}\u0000${at.sessionId}`;
-      const span = spans.get(key);
-      if (span) {
-        span.turn_start = Math.min(span.turn_start, at.index);
-        span.turn_end = Math.max(span.turn_end, at.index);
-      } else if (spans.size < DECISION_EVIDENCE_MAX) {
-        spans.set(key, { source: at.source, session_id: at.sessionId, turn_start: at.index, turn_end: at.index, claim, ref });
-      }
-    }
-    if (spans.size === 0) continue;
-    const dedupe = `${topic}\u0000${decisionTitleKey(title)}`;
+    const cut = cutClaim(decision, position);
+    if (!cut) continue;
+    const dedupe = `${topic}\u0000${decisionTitleKey(cut.title)}`;
     const existing = records.get(dedupe);
     if (existing) {
-      // At most one evidence row per session per record in a batch: a second decision with the
-      // same title widens that session's span instead of adding a row for a shifted range.
-      for (const span of spans.values()) {
-        const same = existing.evidence.find((e) => e.source === span.source && e.session_id === span.session_id);
-        if (same) {
-          same.turn_start = Math.min(same.turn_start, span.turn_start);
-          same.turn_end = Math.max(same.turn_end, span.turn_end);
-        } else if (existing.evidence.length < DECISION_EVIDENCE_MAX) {
-          existing.evidence.push(span);
-        }
-      }
+      mergeSpans(existing.evidence, cut.spans);
       continue;
     }
-    records.set(dedupe, { topic, title, statement, status: "decided", evidence: [...spans.values()] });
+    records.set(dedupe, { topic, title: cut.title, statement: cut.statement, status: "decided", evidence: cut.spans });
   }
   return [...records.values()];
 }
