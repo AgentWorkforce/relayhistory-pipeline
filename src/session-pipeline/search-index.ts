@@ -73,7 +73,14 @@ import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
 import { outputFactsFromScope, passVersion, type OutputFactsScope } from "./output-facts.ts";
-import { clickhouseOutputFactsStore, type OutputFactsStore } from "./output-facts-store.ts";
+import {
+  clickhouseOutputFactsStore,
+  finishStagedOutputFacts,
+  MAX_FACTS_CHUNK_INPUTS,
+  sealOutputFactsWant,
+  stageOutputFactsChunk,
+  type OutputFactsStore,
+} from "./output-facts-store.ts";
 import { adapterProjectionIo, adapterScanPage, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
 import {
   STAGED_RECONCILE_STALE_LEASE,
@@ -83,6 +90,7 @@ import {
   type SourceStamp,
   type StagedIdentity,
   type StagedReconcileDeps,
+  type StagedReconcileHooks,
   type StagedReconcileOps,
 } from "./staged-reconcile.ts";
 import { MAX_SCAN_PAGE, type SearchPosition } from "@rhc/search-index/contracts.ts";
@@ -422,6 +430,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
   if (deps.outputFacts && deps.outputFactsStore) throw new Error("output facts: choose the ClickHouse or the Postgres store, not both");
+  if (deps.outputFacts && deps.staged) throw new Error("output facts: the staged reconcile stages the Postgres store's facts only");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   // Staged (SEARCH_INDEX_STAGED_RECONCILE_ENABLED, adapter binding): a scope that would stream
@@ -495,8 +504,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     }
     const fromMs = await io.fromMs(at);
     const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
+    // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
+    // facts store and no staged run, a too-large scope stays incomplete (scope_too_large) as before.
+    const stagedFacts = !!deps.outputFactsStore && !!deps.staged && !!deps.adapter;
     if (
-      deps.stream && !deps.outputFacts && !deps.outputFactsStore && siblingKeys.length &&
+      deps.stream && !deps.outputFacts && (!deps.outputFactsStore || stagedFacts) && siblingKeys.length &&
       s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
     ) {
       if (deps.streamSlot?.used)
@@ -509,6 +521,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         };
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, reasons: [] };
       }
+      // Never with a facts store: the in-transaction streamed reconcile builds no facts.
+      if (deps.outputFactsStore) throw new Error("search index: the streamed reconcile cannot carry output facts");
       return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
     }
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
@@ -816,6 +830,9 @@ async function stagedSearchScopeRun(
     });
     return result(reasons, partial ? { partial: true } : {});
   };
+  // Self-host output facts (the Postgres store): staged through the run's hooks.
+  let facts: SearchIndexResult["outputFacts"];
+  const factsHooks = deps.outputFactsStore ? stagedOutputFactsHooks(scope, canonicalId, h, (r) => (facts = r)) : undefined;
   let outcome: Awaited<ReturnType<typeof runStagedReconcile>>;
   try {
     outcome = await runStagedReconcile(scope, h.stamp, ops, {
@@ -831,7 +848,10 @@ async function stagedSearchScopeRun(
           stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,
           ...(error instanceof Error ? { error_name: error.name } : {}), ...errorFields(error),
         }),
+      ...(factsHooks ? { hooks: factsHooks } : {}),
       ...staged.run,
+      // Never more inputs per facts chunk than one staged call takes (output-facts-store.ts).
+      factsChunk: Math.min(staged.run?.factsChunk ?? STAGED_FACTS_CHUNK, MAX_FACTS_CHUNK_INPUTS),
       // `claimed` only once the claim committed (a failed claim commit is the caller's error).
       boundary: async (point) => {
         if (point === "claimed") claimed = true;
@@ -881,6 +901,7 @@ async function stagedSearchScopeRun(
         complete: outcome.complete,
         reasons: [...(read?.reasons ?? []), ...outcome.reasons],
         ...stream(),
+        ...(facts ? { outputFacts: facts } : {}),
       };
   }
 }
@@ -927,6 +948,39 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
     count: out.rows, inserted: out.inserted, deleted: out.deleted, duration_ms: Date.now() - started,
   });
   return out;
+}
+
+/** Inputs per facts chunk of a staged run (the module's default; clamped to MAX_FACTS_CHUNK_INPUTS). */
+export const STAGED_FACTS_CHUNK = 5000;
+
+/**
+ * The staged run's output-facts hooks (slice 2c, migration 20261105062140; RELAYHISTORY_SELFHOST_OUTPUT_FACTS):
+ * every facts chunk is staged in its own transaction, the want -> have advance seals the stage, and the
+ * final transaction (after `commit`, before the run finishes) reconciles the facts from the stage and
+ * records their state. A stage that does not hold the whole facts pass throws a StagedRunRestart (the
+ * run goes round again, the facts tables untouched); a chunk that cannot be staged throws a
+ * non-retryable PipelineError (abandonOn: the run abandons with output_facts_chunk_unstageable).
+ * Versioned by the directory epoch the run started from, as the whole-set path is.
+ */
+function stagedOutputFactsHooks(
+  scope: SessionScope, canonicalId: string, h: StagedHandoff,
+  done: (r: NonNullable<SearchIndexResult["outputFacts"]>) => void,
+): StagedReconcileHooks {
+  const fScope = { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: scope.sessionId, canonicalId };
+  const sourceVersion = Number(h.epoch);
+  return {
+    async onBatch(tx, run, batch) {
+      if (batch.phase === "facts") await stageOutputFactsChunk(tx, run, fScope, batch.events, batch.chunk, sourceVersion);
+    },
+    async onWantDone(tx, run) {
+      await sealOutputFactsWant(tx, run);
+    },
+    async onFinish(tx, run, pass) {
+      // The whole-set path builds from the read's completeness and the pass's (truncation, stale write).
+      const r = await finishStagedOutputFacts(tx, run, fScope, { sourceComplete: pass.sourceComplete && pass.complete, sourceVersion, at: h.at });
+      done({ inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons });
+    },
+  };
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */
@@ -1098,11 +1152,15 @@ async function streamedReconcile(
  * RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true (the facts are built from a whole read), where it is
  * off without failing startup. "true" is an explicit on and, with output facts, still fails
  * startup; "false" is an explicit off. Any other value fails startup (strict flag grammar:
- * "1", "0", "TRUE" and padded values are refused, never guessed).
+ * "1", "0", "TRUE" and padded values are refused, never guessed). With the staged reconcile on
+ * (searchIndexStagedOn), output facts do not change the answer: the staged hooks carry them.
  */
 export type SearchIndexStreamFlag = "explicit_on" | "explicit_off" | "default_on" | "default_off_output_facts";
 
 export function searchIndexStreamFlag(env: Record<string, string | undefined>, outputFacts: boolean): SearchIndexStreamFlag {
+  // With the staged reconcile on, the self-host output facts are staged by its hooks (slice 2c), so they
+  // no longer hold streaming off; with it off, every answer below is today's.
+  if (outputFacts && searchIndexStagedOn(env)) outputFacts = false;
   const flag = env.SEARCH_INDEX_STREAMING_ENABLED;
   if (flag === undefined || flag === "") return outputFacts ? "default_off_output_facts" : "default_on";
   if (flag === "false") return "explicit_off";
@@ -1364,22 +1422,31 @@ function stagedScanBounds(staged: StagedReconcile, limits: SearchIndexLimits): {
  *   unset or ""  off (returns undefined: the search deps carry no `staged`)
  *   "false"      off
  *   "true"       on (SearchIndexDeps.staged); fails startup unless the streaming reconcile
- *                resolved on (`stream`, SEARCH_INDEX_STREAMING_ENABLED), and fails together
- *                with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true
+ *                resolved on (`stream`, SEARCH_INDEX_STREAMING_ENABLED); with
+ *                RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true the facts are staged (slice 2c)
  *   anything     else fails startup ("1", "TRUE" and padded values included)
  *
  * Errors name the variables, never a value. On: `notice` is the one startup log line.
  */
+/**
+ * Whether the staged reconcile is on: SEARCH_INDEX_STAGED_RECONCILE_ENABLED is exactly "true". The one
+ * place that decides it (searchIndexStagedStartup validates the value; streaming and the output
+ * facts follow this answer).
+ */
+export function searchIndexStagedOn(env: Record<string, string | undefined>): boolean {
+  return env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED === "true";
+}
+
 export function searchIndexStagedStartup(
   env: Record<string, string | undefined>,
   stream: StreamReadLimits | undefined,
-  outputFacts: boolean,
+  _outputFacts: boolean,
 ): { staged: StagedReconcile; notice: SearchIndexStreamNotice } | undefined {
   const flag = env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED;
   if (flag === undefined || flag === "" || flag === "false") return undefined;
-  if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
-  if (outputFacts)
-    throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
+  if (!searchIndexStagedOn(env)) throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
+  // RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true is accepted: its Postgres facts are staged by the run's
+  // hooks (stagedOutputFactsHooks, migration 20261105062140).
   if (!stream)
     throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)");
   return {

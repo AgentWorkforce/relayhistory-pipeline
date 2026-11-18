@@ -309,6 +309,8 @@ describe("outputFactsBatchStep: items per input are bounded (a facts chunk alway
     const fx = outputFixture();
     const base = fx.projectionRows.find((r) => r.table === "convergence_events")!.row;
     const payload = (p: Record<string, unknown>) => ({ deliveryRecordId: "r", payload: p });
+    // Example shapes only: the bound itself is the case analysis in outputFactsBatchStep (output-facts.ts); a new
+    // item kind there must update OUTPUT_FACTS_MAX_ITEMS_PER_INPUT and this test.
     // The widest shapes: an assistant message that is also a parent session event; a commit tool result that is
     // also a parent; a malformed time (a note instead of the event) on a parent.
     const crafted = [

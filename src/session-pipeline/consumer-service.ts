@@ -66,7 +66,7 @@ import {
 } from "./pointer.ts";
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
-import { postgresOutputFactsStore } from "./output-facts-store.ts";
+import { assertStagedOutputFactsSchema, postgresOutputFactsStore } from "./output-facts-store.ts";
 import { assertStagedSearchIndex, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
 import { assertStagedReconcileSchema } from "./staged-reconcile.ts";
 import {
@@ -1149,14 +1149,15 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // and the search deps below carry no `limits`, exactly as before.
   const searchLimits = searchIndexLimitsFromEnv(env);
   // SEARCH_INDEX_STREAMING_ENABLED, default on (off by default with
-  // RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, logged; an explicit "true" with it still fails
-  // startup): the streaming reconcile for a scope past the whole-read bound, within
+  // RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, logged, and an explicit "true" with it fails
+  // startup, unless the staged reconcile is on, which stages the facts): the streaming reconcile for a scope past the whole-read bound, within
   // SEARCH_INDEX_STREAM_MAX_READ_* (search-index.ts searchIndexStreamStartup). Off returns
   // undefined and the search deps carry no `stream`.
   const { stream: searchStream, notice: streamNotice } = searchIndexStreamStartup(env, searchLimits, config.outputFacts);
   if (streamNotice) log[streamNotice.level](streamNotice.message, { service: "session-pipeline-consumer", ...streamNotice.fields });
   // SEARCH_INDEX_STAGED_RECONCILE_ENABLED, default off (Phase 3 slice 1; search-index.ts
-  // searchIndexStagedStartup): "true" needs streaming on and no output facts. Off returns
+  // searchIndexStagedStartup): "true" needs streaming on; with output facts on, they are staged
+  // by the run's hooks (migration 20261105062140). Off returns
   // undefined, logs nothing, and the search deps carry no `staged`.
   const searchStaged = searchIndexStagedStartup(env, searchStream, config.outputFacts);
   if (searchStaged) log.info(searchStaged.notice.message, { service: "session-pipeline-consumer", ...searchStaged.notice.fields });
@@ -1179,6 +1180,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true: the 062110 writers must exist (names the
   // migration), checked now rather than on the first large scope. Off: no query.
   if (searchStaged) await assertStagedReconcileSchema(db);
+  // With output facts too: the 062140 writers must exist (names the migration).
+  if (searchStaged && config.outputFacts) await assertStagedOutputFactsSchema(db);
   // A healthy start clears a stale UNHEALTHY marker from an earlier crash
   // loop; without this the marker is sticky across restarts.
   clearUnhealthyFile(config.unhealthyFile);

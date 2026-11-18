@@ -244,8 +244,13 @@ describe("consumer service config", () => {
     await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", SEARCH_INDEX_STREAMING_ENABLED: "false" })).rejects.toThrow(
       "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on",
     );
-    await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).rejects.toThrow(
-      "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
+    // With output facts (slice 2c): streaming resolves on and the staged run starts, the facts staged by its hooks.
+    expect(await startup({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([
+      expect.objectContaining({ level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", state: "on", service: "session-pipeline-consumer" }),
+    ]);
+    // Streaming explicitly off still refuses it, facts or not.
+    await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", SEARCH_INDEX_STREAMING_ENABLED: "false", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).rejects.toThrow(
+      "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on",
     );
   });
   test("minimal valid config enables with the reader floor", () => {

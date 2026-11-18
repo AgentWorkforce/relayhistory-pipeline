@@ -172,16 +172,17 @@ describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Pha
     expect(searchIndexStagedStartup({ [VAR]: "true" }, defaultOn, false)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP });
   });
 
-  test("true needs streaming on and refuses output facts, naming the variables", () => {
+  test("true needs streaming on, naming the variables; with output facts it starts (slice 2c stages them)", () => {
     expect(refusal({ [VAR]: "true" }, undefined, false)).toBe(
       "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
     );
     // Streaming explicitly off resolves to no budgets: refused the same way.
     expect(refusal({ [VAR]: "true" }, searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, false), false)).toContain("requires the streaming reconcile on");
-    for (const streaming of [stream, undefined])
-      expect(refusal({ [VAR]: "true" }, streaming, true)).toBe(
-        "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
-      );
+    // Output facts on: started with streaming on, refused without it, as without facts.
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, true)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP });
+    expect(refusal({ [VAR]: "true" }, undefined, true)).toBe(
+      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
+    );
   });
 
   test("any other value fails startup with a fixed message that never carries the value", () => {

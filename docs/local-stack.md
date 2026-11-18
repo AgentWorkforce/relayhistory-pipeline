@@ -147,10 +147,10 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_MAX_SCOPE_BYTES` | session-pipeline consumer (self-host SERVICE only, enabled) | Raw bytes of one search index scope; above it the session is marked partial (`scope_too_large`). Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 64 MiB; accepted 64 MiB to 256 MiB (the replay bound). The indexer holds the scope several times over in memory, so raise the pod limit with it. Needs no manual re-index: every reconcile tick (`CONSUMER_RECONCILE_EVERY_MINUTES`) the consumer re-sends each session the search state lists as partial, `scope_too_large` ones included, so after a restart with a higher limit those sessions are indexed again under it (a large backlog over several ticks; a key in retry backoff waits for it). Unset or empty is the default; malformed, below 64 MiB or above 256 MiB fails startup before any connection opens, naming the variable only. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_SCOPE_EVENTS` | session-pipeline consumer (self-host SERVICE only, enabled) | Records of one search index scope, a positive integer. Default 100000; accepted 100000 to 1000000. Same partial, re-index and startup rules as `SEARCH_INDEX_MAX_SCOPE_BYTES`. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_ROWS` | session-pipeline consumer (self-host SERVICE only, enabled) | Index rows compared for one scope, a positive integer. Default 500000; accepted 500000 to 1000000. Same startup rules. Never read by the hosted Lambda. |
-| `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on: streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset or `""` is the default, which is on, except off (logged at startup with `reason=output_facts`, no failure) when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` and the staged reconcile is off. `false` is off, and neither budget is read; set it explicitly to turn streaming off. `true` is an explicit on and, with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` and the staged reconcile off, fails startup. With `SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true`, output facts do not change any of this: the staged run stages them. Any other value (`1` and `0` included) fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 2 GB on top of its usual limit, about 3 KB per record, measured); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
-| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on, and with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`; any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default off (unset, `""` or `false`). `true` turns on the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on; with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` it starts and stages the facts of a too-large scope ("Staged output facts" below; migration `20261105062140` required); any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -645,7 +645,7 @@ flight): it answers busy, so redelivered ticks of a hot scope do not each hold a
 claim's uncommitted first insert of the same scope it waits at most 2 s (`lock_timeout` on the function), then
 answers busy. `staged-reconcile-claim.postgres.test.ts` proves both on real PostgreSQL in pg-proof.
 
-#### Staged output facts (Phase 3 slice 2c, not wired yet)
+#### Staged output facts (Phase 3 slice 2c)
 
 Migration `20261105062140_staged_output_facts.sql` and the staged writer in `output-facts-store.ts` let a staged run
 carry the self-host output facts (`RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`) without holding the session's whole fact
@@ -672,6 +672,19 @@ today.
   after it, a gap, no seal) is never reconciled. The final step throws `StagedOutputFactsIncompleteError` (a
   `StagedRunRestart`), the run is abandoned with `output_facts_stage_incomplete` and goes round again, and the facts
   tables keep what they had.
+- **Wiring.** With `SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` and `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` the
+  consumer starts (it checks the 062140 writers at startup, naming the migration), streaming resolves on, and a scope
+  the whole read refuses as too large runs as a staged run whose hooks stage, seal and reconcile its facts (in the
+  final transaction, after the directory write, before the run finishes). A scope the whole read completes still
+  takes the whole-set path. With a facts store and the staged reconcile off, a too-large scope stays incomplete
+  (`scope_too_large`) as before; the in-transaction streamed reconcile never runs with facts. The ClickHouse facts
+  flag (`SEARCH_INDEX_OUTPUT_FACTS`) is refused together with a staged run.
+- **Chunk bounds.** The facts pass closes a chunk at 5000 inputs (never more than 25000, what one staged call takes
+  at 4 items per input) or at 32 MiB of the inputs' JSON text, catalog rows included; one larger input is a chunk
+  of its own. The writer checks the serialized call before sending it (128 MiB, half the database's jsonb limit). A
+  chunk that still cannot be staged (over that, or refused by the database for its size or memory) abandons the run
+  as `output_facts_chunk_unstageable` and writes no facts; any other staging error releases the lease and the next
+  tick retries.
 - **Exactness.** Over a whole read the staged facts equal the whole-set path's (`output-facts-parity.test.ts`). One
   difference: on a malformed event or commit link, the whole path stops at the first one and the staged path skips
   only that row. Both are incomplete with the same reason and delete nothing.
@@ -682,8 +695,8 @@ today.
   their parent session events, tool arguments included. The streaming sizing above (about 3 KB per record, about
   2 GB at the default budgets) covers a record's keys and state, not its body: the parsed legacy record bodies come on
   top of it and are bounded only by the scope's bytes. Sending a facts chunk holds the chunk's entries plus their JSON
-  text (several times the chunk's bytes), and the database holds the jsonb parameter. A facts chunk has an item bound
-  (25000 inputs, at most 4 items each) and no byte bound yet; the wiring adds one before the flag is on. The memory
+  text (several times the chunk's bytes), and the database holds the jsonb parameter. A facts chunk is bounded by inputs
+  and by bytes ("Chunk bounds" above). The memory
   measurement (peak RSS at 100k and 1M records with facts on), or a finish step that folds group by group, is owed
   before the default flip.
 - **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the trigger, both tables and

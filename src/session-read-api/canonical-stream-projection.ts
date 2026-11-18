@@ -282,15 +282,28 @@ export interface StreamedScope {
   regenerate(keys: ReadonlySet<string>, batch: number, write: (rows: IndexRow[]) => Promise<void>): Promise<void>;
   /**
    * The staged reconcile's facts pass (only on a complete read): one more pass handing the whole read's
-   * facts input to `emit` in chunks of about `chunk` items (the first also carries every catalog row):
+   * facts input to `emit` in chunks of at most `chunk` inputs and about `maxBytes` of JSON text (one input
+   * over that is a chunk alone):
    * the catalog rows, then every post-fold record and every convergence_events row the whole read produces
    * (in and out of the window, shadowed direct rows excluded), in manifest read order. Over all chunks
    * they equal readCanonicalScope's `records` and `projectionRows` as multisets; the whole read lists them
    * in fold/slot order, so a consumer must not depend on the order.
    * Throws as `regenerate` does on a changed or unreadable source.
    */
-  facts(chunk: number, emit: (events: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[] }) => Promise<void>): Promise<void>;
+  facts(
+    chunk: number,
+    emit: (events: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[] }) => Promise<void>,
+    /** A chunk also closes once its inputs' JSON text reaches this many characters (default FACTS_CHUNK_MAX_BYTES). */
+    maxBytes?: number,
+  ): Promise<void>;
 }
+
+/**
+ * The facts pass's byte bound per chunk: the inputs' JSON text. The staged writer sends a chunk as one
+ * jsonb parameter, which PostgreSQL refuses above about 256 MB (54000) and which the writer holds
+ * several times over (entries plus their JSON text), so 32 MiB keeps a wide margin.
+ */
+export const FACTS_CHUNK_MAX_BYTES = 32 * 1024 * 1024;
 
 /** The fold's summary of one record copy: no payload. */
 interface Seat {
@@ -905,31 +918,46 @@ export async function streamCanonicalScope(
       if (found !== keys.size) throw new PipelineError(STREAM_SOURCE_CHANGED, "the streamed source changed", false);
       if (rows.length) await write(rows);
     },
-    async facts(chunk, emit) {
-      // The whole read's catalog rows come first (readCanonicalScope: catalogRows, then convergence_events).
-      let projectionRows: Array<{ table: string; row: Json }> = (projErr.has(D) ? [] : catalogRows).map((r) => ({ table: r.table, row: r.row as Json }));
+    async facts(chunk, emit, maxBytes = FACTS_CHUNK_MAX_BYTES) {
+      let projectionRows: Array<{ table: string; row: Json }> = [];
       let records: RelayhistoryStreamRecord[] = [];
+      // A chunk closes at `chunk` inputs or at `maxBytes` of their JSON text, whichever comes first, so
+      // its one staged call stays far below the database's jsonb limit (a record alone can be MiBs). A
+      // single input over `maxBytes` is a chunk of its own.
+      let bytes = 0;
       const take = () => {
         const out = { projectionRows, records };
         projectionRows = [];
         records = [];
+        bytes = 0;
         return out;
       };
+      const full = () => projectionRows.length + records.length >= chunk || bytes >= maxBytes;
+      const size = (item: unknown) => JSON.stringify(item)?.length ?? 0;
+      // The whole read's catalog rows come first (readCanonicalScope: catalogRows, then convergence_events),
+      // counted and sized like every other input; emitted raw, before the pass, as the last chunk is.
+      for (const r of projErr.has(D) ? [] : catalogRows) {
+        projectionRows.push({ table: r.table, row: r.row as Json });
+        bytes += size(r.row);
+        if (full()) await emit(take());
+      }
       // Inside the pass: a hook error is the caller's, not the source's (pass() unwraps it).
       const flush = async () => {
-        if (projectionRows.length + records.length < chunk) return;
+        if (!full()) return;
         await emit(take()).catch((error: unknown) => { throw new CallerFailed(error); });
       };
       try {
         await pass(async () => {
           const onRecord = async (record: RelayhistoryStreamRecord) => {
             records.push(record);
+            bytes += size(record);
             await flush();
           };
           for await (const p of projected(onRecord)) {
             if ("mapError" in p) throw new StreamStop(STREAM_SOURCE_CHANGED);
             if (p.shadowed) continue;
             projectionRows.push({ table: "convergence_events", row: p.row });
+            bytes += size(p.row);
             await flush();
           }
         });

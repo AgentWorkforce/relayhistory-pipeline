@@ -13,6 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { PipelineError } from "../shared/vendor.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { StagedRunRestart, type StagedFactsChunk, type StagedFactsEvents, type StagedRunRef } from "./staged-reconcile.ts";
 import {
@@ -192,6 +193,20 @@ export const MAX_CHUNK_ITEMS = 100_000;
  * call. The wiring's chunk size must not exceed it (phase B: checked at startup).
  */
 export const MAX_FACTS_CHUNK_INPUTS = Math.floor(MAX_CHUNK_ITEMS / OUTPUT_FACTS_MAX_ITEMS_PER_INPUT);
+/**
+ * The most UTF-8 bytes one staged_facts_stage_v1 parameter may hold: half of PostgreSQL's jsonb limit
+ * (about 256 MB, 54000 above it), so a chunk never reaches the database's own refusal. The facts pass
+ * closes a chunk at FACTS_CHUNK_MAX_BYTES (32 MiB) of input JSON; the entries of a chunk are larger:
+ * up to OUTPUT_FACTS_MAX_ITEMS_PER_INPUT (4) items per input, each a subset of its input re-serialized
+ * as a JSON string inside JSON (escaping roughly doubles quote-heavy text). We assume a worst case of 8x
+ * the input text (4 items x 2 for escaping), 256 MiB: over this limit, which is reached only by
+ * pathological text (control characters escape to six bytes), the chunk fails by name
+ * (output_facts_chunk_too_large -> OUTPUT_FACTS_CHUNK_UNSTAGEABLE) instead of by the database's limit.
+ * Typical entries are 2-3x their input.
+ */
+export const MAX_STAGE_CALL_BYTES = 128 * 1024 * 1024;
+/** Tests only: the send limit stageEntries checks (MAX_STAGE_CALL_BYTES in production). */
+export const stagedFactsSendLimit = { bytes: MAX_STAGE_CALL_BYTES };
 /** Items per call for the final phase's own facts. */
 const FINAL_CALL = 500;
 const READ_PAGE = 1000;
@@ -229,9 +244,12 @@ function stageEntry(item: OutputFactsStagedItem): StageEntry {
 
 async function stageEntries(tx: SqlExecutor, run: StagedRunRef, entries: StageEntry[], chunk: StagedFactsChunk | null): Promise<number> {
   const call = async (batch: StageEntry[], seq: number | null, last: boolean | null) => {
+    const text = JSON.stringify(batch);
+    // The authoritative size check, before anything is sent (see MAX_STAGE_CALL_BYTES).
+    if (Buffer.byteLength(text, "utf8") > stagedFactsSendLimit.bytes) throw new Error("output_facts_chunk_too_large");
     const { rows } = await tx.query<{ n: number | string }>(
       "SELECT sessions.staged_facts_stage_v1($1::bigint, $2::uuid, $3::jsonb, $4::integer, $5::boolean) AS n",
-      [run.runId, run.nonce, JSON.stringify(batch), seq, last],
+      [run.runId, run.nonce, text, seq, last],
     );
     return Number(rows[0]?.n ?? 0);
   };
@@ -262,7 +280,30 @@ export async function stageOutputFactsChunk(
   sourceVersion: number,
 ): Promise<number> {
   const items = outputFactsBatchStep(scope, events, sourceVersionOf(sourceVersion));
-  return stageEntries(tx, run, items.map(stageEntry), chunk);
+  try {
+    return await stageEntries(tx, run, items.map(stageEntry), chunk);
+  } catch (error) {
+    throw unstageable(error) ?? error;
+  }
+}
+
+/** The reason a staged run abandons with when a facts chunk cannot be staged (see unstageable). */
+export const OUTPUT_FACTS_CHUNK_UNSTAGEABLE = "output_facts_chunk_unstageable";
+
+/**
+ * A chunk that cannot be staged as sent and will not be on the next attempt either: the database
+ * refuses its size (54000 program_limit_exceeded, 54001 statement_too_complex, 53200 out_of_memory),
+ * the client cannot build it (a RangeError: string or array length), or it has more items than one
+ * call takes. As a non-retryable
+ * PipelineError the staged run abandons with OUTPUT_FACTS_CHUNK_UNSTAGEABLE (stagedSearchScope's
+ * abandonOn) instead of failing the same chunk on every tick. Anything else (a lost lease, a
+ * connection error) is returned as null and rethrown as it is.
+ */
+export function unstageable(error: unknown): PipelineError | null {
+  const code = (error as { code?: unknown } | null)?.code;
+  const sized = code === "54000" || code === "54001" || code === "53200";
+  const local = error instanceof RangeError || (error instanceof Error && error.message === "output_facts_chunk_too_large");
+  return sized || local ? new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, "a staged output facts chunk could not be staged", false) : null;
 }
 
 /** The want phase ended (onWantDone, in the advance transaction). Returns whether the stage is whole. */
@@ -358,4 +399,28 @@ export async function finishStagedOutputFacts(
     await store.recordState(fScope, { complete: result.complete, at: pass.at, range: result.complete ? range : span, sourceVersion: v });
   }
   return result;
+}
+
+/** The 062140 writers the staged facts hooks call. */
+export const STAGED_OUTPUT_FACTS_FUNCTIONS = [
+  "sessions.staged_facts_stage_v1(bigint,uuid,jsonb,integer,boolean)",
+  "sessions.staged_facts_seal_v1(bigint,uuid)",
+  "sessions.staged_facts_read_v1(bigint,uuid,text,text,text[],bigint,integer)",
+  "sessions.staged_facts_status_v1(bigint,uuid)",
+  "sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)",
+] as const;
+
+/**
+ * Startup with the staged reconcile and RELAYHISTORY_SELFHOST_OUTPUT_FACTS both on: every 062140 writer
+ * exists, or the consumer refuses to start naming the migration (never on the first large scope).
+ */
+export async function assertStagedOutputFactsSchema(db: SqlExecutor): Promise<void> {
+  const { rows } = await db.query<{ fn: string }>(
+    "SELECT fn FROM unnest($1::text[]) AS fn WHERE to_regprocedure(fn) IS NULL",
+    [[...STAGED_OUTPUT_FACTS_FUNCTIONS]],
+  );
+  if (rows.length)
+    throw new Error(
+      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true requires migration 20261105062140_staged_output_facts.sql (missing sessions.staged_facts_* functions)",
+    );
 }
