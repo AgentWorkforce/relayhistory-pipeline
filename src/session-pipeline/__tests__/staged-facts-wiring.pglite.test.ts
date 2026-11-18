@@ -139,6 +139,40 @@ async function rig(x: ExportedScope) {
   return { hoop, tick, pass, transact, count, facts, expire, recorded };
 }
 
+/** One streamed read's facts pass, chunked at `chunk` inputs and `bytes` UTF-8 bytes. */
+async function factsChunksOf(x: ExportedScope, chunk: number, bytes: number) {
+  const admitted = (await readCanonicalScope(SCOPE, x.keys, { reader: x.reader, store: x.store, prefixFor, decompress } as never,
+    { ...TINY, maxRows: 1 << 24, insertBatch: 5000 }, NOW.getTime(), x.canonicalId)).admitted!;
+  const read = await streamCanonicalScope(SCOPE, admitted, { store: x.store, prefixFor, decompress } as never, UNLIMITED, NOW.getTime(), 0);
+  expect(read.complete).toBe(true);
+  const chunks: Array<{ inputs: string[]; sizes: number[]; bytes: number }> = [];
+  await read.facts(chunk, async (e) => {
+    const inputs = [...e.projectionRows.map((p) => JSON.stringify(p)), ...e.records.map((r) => JSON.stringify(r))];
+    const sizes = [...e.projectionRows.map((p) => Buffer.byteLength(JSON.stringify(p.row), "utf8")), ...e.records.map((r) => Buffer.byteLength(JSON.stringify(r), "utf8"))];
+    chunks.push({ inputs, sizes, bytes: sizes.reduce((n, v) => n + v, 0) });
+  }, bytes);
+  return chunks;
+}
+
+/** Every split of the facts pass holds the same inputs, each chunk within both bounds or a single larger input. */
+async function checkFactsChunks(x: ExportedScope) {
+  const whole = await factsChunksOf(x, 1_000_000, Number.MAX_SAFE_INTEGER);
+  expect(whole.length).toBe(1);
+  const total = whole[0]!.inputs.slice().sort();
+  const largest = Math.max(...whole[0]!.sizes);
+  for (const [chunk, bytes] of [[7, Number.MAX_SAFE_INTEGER], [1_000_000, 4096], [50, 1500], [1_000_000, largest], [1_000_000, largest - 1], [1, 1]] as const) {
+    const chunks = await factsChunksOf(x, chunk, bytes);
+    expect(chunks.flatMap((c) => c.inputs).sort(), `${chunk}/${bytes}`).toEqual(total);
+    for (const c of chunks) {
+      expect(c.inputs.length).toBeLessThanOrEqual(chunk);
+      // Never over the byte bound, unless one input alone is larger: then it is a chunk of its own.
+      expect(c.bytes <= bytes || c.inputs.length === 1, `${chunk}/${bytes}: ${c.bytes} bytes in ${c.inputs.length}`).toBe(true);
+    }
+    if (bytes < Number.MAX_SAFE_INTEGER) expect(chunks.length).toBeGreaterThan(1);
+  }
+  return total.length;
+}
+
 describe("staged output facts through the consumer wiring", () => {
   let x: ExportedScope;
   let ref: Awaited<ReturnType<Awaited<ReturnType<typeof rig>>["facts"]>>;
@@ -233,12 +267,50 @@ describe("staged output facts through the consumer wiring", () => {
       stagedFactsSendLimit.bytes = Number.MAX_SAFE_INTEGER;
     }
     stagedFactsSendLimit.bytes = Number.MAX_SAFE_INTEGER;
-    expect(await r.facts()).toEqual(ref);
+    // The facts rows are untouched; their state now owes a pass (recorded at the claim), as on the whole
+    // read's partial path.
+    const after = await r.facts();
+    expect([after.events, after.facts]).toEqual([ref.events, ref.facts]);
+    expect(after.state.length).toBeGreaterThan(0);
+    expect(after.state.every((row) => JSON.parse(row).complete === false)).toBe(true);
     // Abandoned (not left leased): the run row stays, back at want, with no facts stage.
     expect([await r.count("search_reconcile_runs_v1"), await r.count("staged_facts_runs_v1"), await r.count("staged_facts_v1")]).toEqual([1, 0, 0]);
     const again = await r.pass({ ...FACTS, limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
     expect(again).toMatchObject({ complete: true });
     expect(await r.facts()).toEqual(ref);
+  }, 180_000);
+
+  const stateRows = (r: Awaited<ReturnType<typeof rig>>) =>
+    r.hoop.pg.query<{ session_id: string; complete: boolean; source_version: string }>(
+      "SELECT session_id, complete, source_version::text FROM sessions.output_facts_session_state ORDER BY session_id").then((q) => q.rows);
+
+  test("the session grows (a new directory epoch) and the staged run abandons: every facts state row owes a pass at the new epoch; the next run converges", async () => {
+    const r = await withFacts();
+    expect((await stateRows(r)).every((s) => s.complete)).toBe(true);
+    await r.hoop.pg.exec("UPDATE sessions.session_directory SET event_projection_epoch = event_projection_epoch + 1");
+    const epoch = (await r.hoop.pg.query<{ e: string }>("SELECT max(event_projection_epoch)::text e FROM sessions.session_directory")).rows[0]!.e;
+    stagedFactsSendLimit.bytes = 64;
+    try {
+      const out = await r.pass({ ...FACTS, limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() });
+      expect(out.reasons).toEqual([OUTPUT_FACTS_CHUNK_UNSTAGEABLE]);
+    } finally {
+      stagedFactsSendLimit.bytes = Number.MAX_SAFE_INTEGER;
+    }
+    const owing = await stateRows(r);
+    expect(owing.length).toBeGreaterThan(0);
+    expect(owing.every((s) => !s.complete && s.source_version === epoch)).toBe(true);
+    expect(await r.pass({ ...FACTS, limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn() })).toMatchObject({ complete: true });
+    expect((await stateRows(r)).every((s) => s.complete)).toBe(true);
+  }, 180_000);
+
+  test("a run killed right after its claim leaves the facts state owing (recorded in the claim's transaction)", async () => {
+    const r = await withFacts();
+    const out = await r.pass({
+      ...FACTS, limits: STAGED_LIMITS, stream: UNLIMITED,
+      staged: stagedOn({ releaseOnError: false, boundary: (p) => { if (p === "claimed") throw new Kill(p); } }),
+    });
+    expect(out.reasons).toEqual(["staged_run_interrupted"]);
+    expect((await stateRows(r)).every((s) => !s.complete)).toBe(true);
   }, 180_000);
 
   test("a facts store and no staged run: a too-large scope stays incomplete (scope_too_large, partial), the streamed reconcile is never reached", async () => {
@@ -293,35 +365,9 @@ describe("staged output facts through the consumer wiring", () => {
       expect([await r.count("search_reconcile_runs_v1"), await r.count("staged_facts_runs_v1")]).toEqual([0, 0]);
     }, 180_000);
 
-  test("facts pass bounded by bytes as well as inputs: catalog rows counted, every chunk within both bounds or a single input, the same inputs in total", async () => {
-    const r = await rig(x);
-    await r.tick({});
-    const admitted = (await readCanonicalScope(SCOPE, x.keys, { reader: x.reader, store: x.store, prefixFor, decompress } as never,
-      { ...TINY, maxRows: 1 << 24, insertBatch: 5000 }, NOW.getTime(), x.canonicalId)).admitted!;
-    const read = await streamCanonicalScope(SCOPE, admitted, { store: x.store, prefixFor, decompress } as never, UNLIMITED, NOW.getTime(), 0);
-    expect(read.complete).toBe(true);
-    const all = async (chunk: number, bytes?: number) => {
-      const chunks: Array<{ inputs: string[]; bytes: number }> = [];
-      await read.facts(chunk, async (e) => {
-        const inputs = [...e.projectionRows.map((p) => JSON.stringify(p)), ...e.records.map((x) => JSON.stringify(x))];
-        chunks.push({ inputs, bytes: [...e.projectionRows.map((p) => JSON.stringify(p.row)), ...e.records.map((x) => JSON.stringify(x))].reduce((n, s) => n + s.length, 0) });
-      }, bytes);
-      return chunks;
-    };
-    const whole = await all(1_000_000, Number.MAX_SAFE_INTEGER);
-    expect(whole.length).toBe(1);
-    const total = whole[0]!.inputs.slice().sort();
-    for (const [chunk, bytes] of [[7, Number.MAX_SAFE_INTEGER], [1_000_000, 4096], [50, 1500], [1, 1]] as const) {
-      const chunks = await all(chunk, bytes);
-      expect(chunks.flatMap((c) => c.inputs).sort(), `${chunk}/${bytes}`).toEqual(total);
-      for (const c of chunks) {
-        expect(c.inputs.length).toBeLessThanOrEqual(chunk);
-        // A chunk closes once it reaches the byte bound: under it, or over it by its last input only.
-        expect(c.bytes < bytes + Math.max(...c.inputs.map((s) => s.length)) || c.inputs.length === 1).toBe(true);
-      }
-      if (bytes < Number.MAX_SAFE_INTEGER) expect(chunks.length).toBeGreaterThan(1);
-    }
-    expect(FACTS_CHUNK_MAX_BYTES).toBe(32 * 1024 * 1024);
+  test("facts pass bounded by UTF-8 bytes as well as inputs: catalog rows counted, every chunk within both bounds or a single input, the same inputs in total", async () => {
+    await checkFactsChunks(x);
+    expect(FACTS_CHUNK_MAX_BYTES).toBe(16 * 1024 * 1024);
   }, 180_000);
 });
 
@@ -397,6 +443,20 @@ describe("the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP, wi
     expect(wide.weighted).toBeGreaterThan(cap);
     await reconciled(await run("ascii", cap));
     await refused(await run("wide", cap));
+  }, 180_000);
+
+  test("wide text: the facts pass counts its chunks in UTF-8 bytes (three per em dash), every chunk within the bound", async () => {
+    const wide = scopes.get("wide")!.x;
+    expect(await checkFactsChunks(wide)).toBeGreaterThan(30);
+    // A wide record's size is its UTF-8 bytes, more than its character count (the bound a character count
+    // would apply is looser by two bytes per em dash).
+    const one = (await factsChunksOf(wide, 1_000_000, Number.MAX_SAFE_INTEGER))[0]!;
+    const wideRecords = one.inputs.map((text, i) => ({ text, bytes: one.sizes[i]! })).filter((v) => v.text.includes("\u2014"));
+    expect(wideRecords.length).toBe(30);
+    for (const v of wideRecords) {
+      const chars = JSON.stringify(JSON.parse(v.text)).length;
+      expect(v.bytes).toBe(chars + 2);
+    }
   }, 180_000);
 
   test("a mixed run sums both weights", () => {

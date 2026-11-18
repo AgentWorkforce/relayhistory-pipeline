@@ -842,6 +842,18 @@ async function stagedSearchScopeRun(
     async claimed(tx, run) {
       seen.attempts = run.attempts;
       await adapterProjectionIo(binding, tx).record(scope, h.revision, 0, false, h.at, canonicalId);
+      // The Postgres facts owe a pass too, in the claim's own transaction (so a run killed after the claim
+      // is covered), exactly as the whole read's partial branch records them: complete false over the span
+      // they last covered, versioned by the directory epoch the run started from. The store's version rule
+      // refuses it against a newer epoch (that state is newer than this run). Racing a final step that
+      // just recorded the facts current at the same epoch, it can at worst leave them owing one more pass,
+      // as `owing` can for the search state; only this run's own final step records them complete again.
+      if (deps.outputFactsStore) {
+        const store = deps.outputFactsStore(tx);
+        const fScope = factsScope(scope, canonicalId);
+        const prior = await store.previousState(fScope);
+        await store.recordState(fScope, { complete: false, at: h.at, range: prior.range, sourceVersion: Number(h.epoch) });
+      }
     },
   };
   // Without the scope locks, as `claimed`: it only invalidates and marks owing, so a race with a

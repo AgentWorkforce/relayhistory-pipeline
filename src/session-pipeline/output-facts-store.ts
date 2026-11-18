@@ -190,19 +190,20 @@ const hex = (v: string) => createHash("sha256").update(v).digest("hex");
 export const MAX_CHUNK_ITEMS = 100_000;
 /**
  * The largest facts chunk (projection rows plus records) that always fits one staged_facts_stage_v1
- * call. The wiring's chunk size must not exceed it (phase B: checked at startup).
+ * call by item count. The staged run clamps its chunk size to it (search-index.ts, Math.min).
  */
 export const MAX_FACTS_CHUNK_INPUTS = Math.floor(MAX_CHUNK_ITEMS / OUTPUT_FACTS_MAX_ITEMS_PER_INPUT);
 /**
  * The most UTF-8 bytes one staged_facts_stage_v1 parameter may hold: half of PostgreSQL's jsonb limit
- * (about 256 MB, 54000 above it), so a chunk never reaches the database's own refusal. The facts pass
- * closes a chunk at FACTS_CHUNK_MAX_BYTES (32 MiB) of input JSON; the entries of a chunk are larger:
- * up to OUTPUT_FACTS_MAX_ITEMS_PER_INPUT (4) items per input, each a subset of its input re-serialized
- * as a JSON string inside JSON (escaping roughly doubles quote-heavy text). We assume a worst case of 8x
- * the input text (4 items x 2 for escaping), 256 MiB: over this limit, which is reached only by
- * pathological text (control characters escape to six bytes), the chunk fails by name
- * (output_facts_chunk_too_large -> OUTPUT_FACTS_CHUNK_UNSTAGEABLE) instead of by the database's limit.
- * Typical entries are 2-3x their input.
+ * (about 256 MB, 54000 above it), so a chunk never reaches the database's own refusal. A chunk holds at
+ * most FACTS_CHUNK_MAX_BYTES (16 MiB) of its inputs' UTF-8 JSON text and MAX_FACTS_CHUNK_INPUTS inputs;
+ * its entries are at most 2 x the input bytes (an input's items' bodies: the event row plus at most one
+ * call, parent, candidate or record, each a subset of the input) x 2 (a body is JSON text inside JSON: at
+ * worst every character is a quote or backslash and is escaped; characters above ASCII are not escaped)
+ * = 64 MiB, plus about 2 KB of fixed part per input (field names, hashes, keys; 1.8 KB measured) x 25000 =
+ * about 49 MiB: about 113 MiB, under this limit. Only an input larger than FACTS_CHUNK_MAX_BYTES by itself,
+ * sent as a chunk alone, can pass it; it then fails by name (output_facts_chunk_too_large ->
+ * OUTPUT_FACTS_CHUNK_UNSTAGEABLE), never by the database's limit.
  */
 export const MAX_STAGE_CALL_BYTES = 128 * 1024 * 1024;
 /** Tests only: the send limit stageEntries checks (MAX_STAGE_CALL_BYTES in production). */
@@ -330,7 +331,8 @@ export function unstageable(error: unknown, at: { seq: number; items: number } =
   if (!sized && !local) return null;
   // Counts and codes only, never content: which bound (item size), where, and why.
   const why = sized ? `database ${String(code)}` : error instanceof RangeError ? "client RangeError" : `send limit ${stagedFactsSendLimit.bytes} bytes`;
-  return new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, `staged output facts: item size bound: chunk ${at.seq}, ${at.items} items, ${why}`, false);
+  const where = at.seq < 0 ? "final step" : `chunk ${at.seq}, ${at.items} items`;
+  return new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, `staged output facts: item size bound: ${where}, ${why}`, false);
 }
 
 /** The want phase ended (onWantDone, in the advance transaction). Returns whether the stage is whole. */
@@ -379,26 +381,37 @@ export async function finishStagedOutputFacts(
   )).rows[0];
   if ((await status())?.whole !== true) throw new StagedOutputFactsIncompleteError();
 
-  const seen = await readStaged<{ session_id: string }>(tx, run, "session");
-  const fScope: OutputFactsScope = {
-    orgId: scope.orgId,
-    workspaceId: scope.workspaceId,
-    harness: scope.harness,
-    sessionIds: [...new Set([scope.sessionId, scope.canonicalId, ...seen.map((s) => s.session_id)])],
-    canonicalId: scope.canonicalId,
-  };
-  const notes = (await readStaged<{ reason: string }>(tx, run, "note")).map((n) => n.reason);
-  const candidates: OutputFactsStagedCandidate[] = [];
-  for (const c of await readStaged<{ group: string; match: string; result: Record<string, unknown>; facts: OutputFactRow[] }>(tx, run, "candidate")) {
-    const g = hex(c.group);
-    const calls = await readStaged<Record<string, unknown>>(tx, run, "call", g, [hex(c.match)]);
-    const messages = callMessageIds(calls);
-    const parents = messages.length ? await readStaged<Record<string, unknown>>(tx, run, "parent", g, messages.map(hex)) : [];
-    candidates.push({ result: c.result, facts: c.facts, sessionEvents: [...calls, ...parents] });
-  }
-  const records = await readStaged<RelayhistoryStreamRecord>(tx, run, "record");
-  const finish = outputFactsFinishStep(fScope, { candidates, records, notes, sourceComplete: pass.sourceComplete }, v);
-  if (finish.facts.length) await stageEntries(tx, run, finish.facts.map((row) => stageEntry({ kind: "fact", row })), null);
+  // The read-back, the decision and the final staging: a size failure there (the final call over the send
+  // limit, the database refusing it, a RangeError building or parsing it) is as deterministic as a chunk's,
+  // so it abandons the run by name (unstageable) instead of releasing it to fail the same way next tick.
+  const decided = await (async () => {
+    try {
+      const seen = await readStaged<{ session_id: string }>(tx, run, "session");
+      const fScope: OutputFactsScope = {
+        orgId: scope.orgId,
+        workspaceId: scope.workspaceId,
+        harness: scope.harness,
+        sessionIds: [...new Set([scope.sessionId, scope.canonicalId, ...seen.map((s) => s.session_id)])],
+        canonicalId: scope.canonicalId,
+      };
+      const notes = (await readStaged<{ reason: string }>(tx, run, "note")).map((n) => n.reason);
+      const candidates: OutputFactsStagedCandidate[] = [];
+      for (const c of await readStaged<{ group: string; match: string; result: Record<string, unknown>; facts: OutputFactRow[] }>(tx, run, "candidate")) {
+        const g = hex(c.group);
+        const calls = await readStaged<Record<string, unknown>>(tx, run, "call", g, [hex(c.match)]);
+        const messages = callMessageIds(calls);
+        const parents = messages.length ? await readStaged<Record<string, unknown>>(tx, run, "parent", g, messages.map(hex)) : [];
+        candidates.push({ result: c.result, facts: c.facts, sessionEvents: [...calls, ...parents] });
+      }
+      const records = await readStaged<RelayhistoryStreamRecord>(tx, run, "record");
+      const finish = outputFactsFinishStep(fScope, { candidates, records, notes, sourceComplete: pass.sourceComplete }, v);
+      if (finish.facts.length) await stageEntries(tx, run, finish.facts.map((row) => stageEntry({ kind: "fact", row })), null);
+      return { fScope, finish };
+    } catch (error) {
+      throw unstageable(error) ?? error;
+    }
+  })();
+  const { fScope, finish } = decided;
 
   const store = postgresOutputFactsStore(tx);
   const prev = await store.previousState(fScope);

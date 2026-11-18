@@ -82,8 +82,9 @@
  *                                   streams a scope above those limits (issue 610
  *                                   Phase 2) instead of indexing it partial. Unset
  *                                   with RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true" is
- *                                   off (logged, no failure); "true" with it fails
- *                                   startup; "false" is off; anything else fails startup
+ *                                   off (logged, no failure) and "true" with it fails
+ *                                   startup, unless the staged reconcile is on (it stages
+ *                                   the facts); "false" is off; anything else fails startup
  *   SEARCH_INDEX_STREAM_MAX_READ_BYTES        streaming only: bytes / records read, summed
  *   SEARCH_INDEX_STREAM_MAX_READ_EVENTS       over every pass of one scope (search-index.ts
  *                                   searchIndexStreamFromEnv). Unset: 2 GiB / 2000000
@@ -96,8 +97,9 @@
  *                                   up to the cap), the streaming budgets above bound each
  *                                   pass instead of their sum, and the records one pass keys
  *                                   are capped at 500000 (stream_keyed_records_cap). "true"
- *                                   fails startup unless streaming resolved on, and with
- *                                   RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true"; any other
+ *                                   fails startup unless streaming resolved on; with
+ *                                   RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true" it stages the
+ *                                   facts (slice 2c, migration 20261105062140); any other
  *                                   value fails startup. Never read by the hosted Lambda or
  *                                   the large-read worker
  *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |

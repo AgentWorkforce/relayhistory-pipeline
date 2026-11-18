@@ -13,7 +13,10 @@ import type { PGlite } from "../../../packages/pipeline/node_modules/@electric-s
 import { plan, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { CONSUMER_RUNTIME_FUNCTIONS, RUNTIME_APPLICATION_FUNCTIONS } from "../../hoopdb/migrate-guards.ts";
 import { MIGRATION_SENTINELS } from "../../hoopdb/migration-sentinels.ts";
-import { finishStagedOutputFacts, sealOutputFactsWant, StagedOutputFactsIncompleteError } from "../output-facts-store.ts";
+import {
+  finishStagedOutputFacts, MAX_STAGE_CALL_BYTES, OUTPUT_FACTS_CHUNK_UNSTAGEABLE, sealOutputFactsWant, stagedFactsSendLimit, StagedOutputFactsIncompleteError,
+} from "../output-facts-store.ts";
+import { PipelineError } from "../../shared/vendor.ts";
 import { StagedRunRestart } from "../staged-reconcile.ts";
 import { outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
 import {
@@ -344,6 +347,22 @@ describe("20261105062140 staged output facts", () => {
       const snap = await factsSnapshot(db);
       expect([snap.events.length, snap.facts.length]).toEqual([0, 0]);
     });
+  });
+
+  test("a size failure in the final step (its own staging over the send limit) is the named non-retryable error, nothing reconciled", async () => {
+    await clearFacts(db);
+    const run = await stagedRun();
+    await advanceToFinal(db, run, true);
+    stagedFactsSendLimit.bytes = 64;
+    try {
+      const err = await as(db, (tx) => finishStagedOutputFacts(tx, run, SCOPE, { sourceComplete: true, sourceVersion: 1, at: new Date() })).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(PipelineError);
+      expect(err).toMatchObject({ code: OUTPUT_FACTS_CHUNK_UNSTAGEABLE, retryable: false, message: "staged output facts: item size bound: final step, send limit 64 bytes" });
+    } finally {
+      stagedFactsSendLimit.bytes = MAX_STAGE_CALL_BYTES;
+    }
+    expect((await factsSnapshot(db)).events).toEqual([]);
+    await as(db, (tx) => tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,'x')", [run.runId, run.nonce]));
   });
 
   test("a chunk seen again under its own number after the last one breaks the chain; items already staged are not staged twice", async () => {

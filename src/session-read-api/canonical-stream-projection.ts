@@ -282,7 +282,7 @@ export interface StreamedScope {
   regenerate(keys: ReadonlySet<string>, batch: number, write: (rows: IndexRow[]) => Promise<void>): Promise<void>;
   /**
    * The staged reconcile's facts pass (only on a complete read): one more pass handing the whole read's
-   * facts input to `emit` in chunks of at most `chunk` inputs and about `maxBytes` of JSON text (one input
+   * facts input to `emit` in chunks of at most `chunk` inputs and `maxBytes` of UTF-8 JSON text (one input
    * over that is a chunk alone):
    * the catalog rows, then every post-fold record and every convergence_events row the whole read produces
    * (in and out of the window, shadowed direct rows excluded), in manifest read order. Over all chunks
@@ -293,17 +293,23 @@ export interface StreamedScope {
   facts(
     chunk: number,
     emit: (events: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[] }) => Promise<void>,
-    /** A chunk also closes once its inputs' JSON text reaches this many characters (default FACTS_CHUNK_MAX_BYTES). */
+    /** A chunk holds at most this many UTF-8 bytes of its inputs' JSON text (default FACTS_CHUNK_MAX_BYTES); one larger input is a chunk alone. */
     maxBytes?: number,
   ): Promise<void>;
 }
 
 /**
- * The facts pass's byte bound per chunk: the inputs' JSON text. The staged writer sends a chunk as one
- * jsonb parameter, which PostgreSQL refuses above about 256 MB (54000) and which the writer holds
- * several times over (entries plus their JSON text), so 32 MiB keeps a wide margin.
+ * The facts pass's byte bound per chunk: its inputs' JSON text in UTF-8 bytes. The staged writer sends a
+ * chunk as one jsonb parameter and checks it against MAX_STAGE_CALL_BYTES (128 MiB, half PostgreSQL's
+ * jsonb limit) first. Worst case (output-facts-store.ts): an input's items' bodies together are at most
+ * 2 x its bytes (the event row plus at most one call, parent, candidate or record, each a subset of the
+ * input), and a body is JSON text inside JSON, which at most doubles it (every quote or backslash
+ * escaped; characters above ASCII are not escaped, so wide text costs only its UTF-8 bytes): 4 x 16 MiB
+ * = 64 MiB. Plus a fixed part per input (field names, hashes, keys: 1.8 KB measured for a minimal event
+ * with four items, 2 KB allowed) for at most 25000 inputs (MAX_FACTS_CHUNK_INPUTS): about 49 MiB. Total
+ * at most about 113 MiB, under 128 MiB.
  */
-export const FACTS_CHUNK_MAX_BYTES = 32 * 1024 * 1024;
+export const FACTS_CHUNK_MAX_BYTES = 16 * 1024 * 1024;
 
 /** The fold's summary of one record copy: no payload. */
 interface Seat {
@@ -921,9 +927,9 @@ export async function streamCanonicalScope(
     async facts(chunk, emit, maxBytes = FACTS_CHUNK_MAX_BYTES) {
       let projectionRows: Array<{ table: string; row: Json }> = [];
       let records: RelayhistoryStreamRecord[] = [];
-      // A chunk closes at `chunk` inputs or at `maxBytes` of their JSON text, whichever comes first, so
-      // its one staged call stays far below the database's jsonb limit (a record alone can be MiBs). A
-      // single input over `maxBytes` is a chunk of its own.
+      // A chunk holds at most `chunk` inputs and `maxBytes` of their JSON text in UTF-8: an input that would
+      // take an open chunk past `maxBytes` closes it first, so only an input larger than `maxBytes` on its
+      // own makes a chunk over it, and then a chunk of its own.
       let bytes = 0;
       const take = () => {
         const out = { projectionRows, records };
@@ -932,33 +938,30 @@ export async function streamCanonicalScope(
         bytes = 0;
         return out;
       };
-      const full = () => projectionRows.length + records.length >= chunk || bytes >= maxBytes;
-      const size = (item: unknown) => JSON.stringify(item)?.length ?? 0;
+      const open = () => projectionRows.length + records.length;
+      const size = (item: unknown) => Buffer.byteLength(JSON.stringify(item) ?? "", "utf8");
+      /** Add one input; `send` emits a chunk (raw before and after the pass, wrapped inside it). */
+      const add = async (put: () => void, n: number, send: (events: ReturnType<typeof take>) => Promise<void>) => {
+        if (open() && bytes + n > maxBytes) await send(take());
+        put();
+        bytes += n;
+        if (open() >= chunk || bytes >= maxBytes) await send(take());
+      };
       // The whole read's catalog rows come first (readCanonicalScope: catalogRows, then convergence_events),
       // counted and sized like every other input; emitted raw, before the pass, as the last chunk is.
-      for (const r of projErr.has(D) ? [] : catalogRows) {
-        projectionRows.push({ table: r.table, row: r.row as Json });
-        bytes += size(r.row);
-        if (full()) await emit(take());
-      }
+      for (const r of projErr.has(D) ? [] : catalogRows)
+        await add(() => projectionRows.push({ table: r.table, row: r.row as Json }), size(r.row), emit);
       // Inside the pass: a hook error is the caller's, not the source's (pass() unwraps it).
-      const flush = async () => {
-        if (!full()) return;
-        await emit(take()).catch((error: unknown) => { throw new CallerFailed(error); });
-      };
+      const inPass = (events: ReturnType<typeof take>) => emit(events).catch((error: unknown) => { throw new CallerFailed(error); });
       try {
         await pass(async () => {
           const onRecord = async (record: RelayhistoryStreamRecord) => {
-            records.push(record);
-            bytes += size(record);
-            await flush();
+            await add(() => records.push(record), size(record), inPass);
           };
           for await (const p of projected(onRecord)) {
             if ("mapError" in p) throw new StreamStop(STREAM_SOURCE_CHANGED);
             if (p.shadowed) continue;
-            projectionRows.push({ table: "convergence_events", row: p.row });
-            bytes += size(p.row);
-            await flush();
+            await add(() => projectionRows.push({ table: "convergence_events", row: p.row }), size(p.row), inPass);
           }
         });
       } catch (error) {
@@ -967,7 +970,7 @@ export async function streamCanonicalScope(
       }
       // The last chunk outside the pass: emitted raw, as regenerate's last write, so a hook error
       // (a restart, a lost lease) reaches the caller as itself.
-      if (projectionRows.length || records.length) await emit(take());
+      if (open()) await emit(take());
     },
   });
 }
