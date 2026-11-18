@@ -14,6 +14,7 @@ import {
   controlPlaneLogGroupName,
   controlPlaneLogging,
   hoopdbBackend,
+  hoopdbInCluster,
   denyInsecureTransport,
   ecrPushPolicy,
   githubImagePublishTrust,
@@ -217,6 +218,12 @@ describe("HoopDb backend", () => {
     expect(hoopdbBackend("aws-sandbox-claude", "cnpg")).toBe("cnpg");
     // sessions-dev must never be switched to an empty in-cluster database.
     expect(() => hoopdbBackend("aws-sessions-dev", "cnpg")).toThrow(/keeps its external HoopDb/);
+  });
+  it("is in-cluster exactly where eksChartValues runs HoopDb in the cluster: CNPG or any aws-sandbox-* stage", () => {
+    expect(hoopdbInCluster("aws-example-dev", "external")).toBe(false);
+    expect(hoopdbInCluster("aws-proof", "cnpg")).toBe(true);
+    expect(hoopdbInCluster("aws-sandbox-example", "external")).toBe(true);
+    expect(hoopdbInCluster("aws-sandbox-example", "cnpg")).toBe(true);
   });
   it("refuses CNPG on every production-looking stage before the proof/sandbox allowlist", () => {
     for (const stage of ["aws-proof-prod", "aws-production", "aws-sandbox-prod-agent", "aws-proof-preprod", "aws-PROD"])
