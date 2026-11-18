@@ -19,6 +19,7 @@ case "${SERVICE:-}" in
   session-pipeline-output-facts-bootstrap) exec bun run /app/src/session-pipeline/output-facts-bootstrap.ts ;;
   session-ingest)   exec bun run /app/src/session-ingest/selfhost-server.ts ;;
   session-publication) exec bun run /app/src/session-ingest/publication-service.ts --continuous ;;
+  session-analysis) exec bun run /app/src/session-analysis/runner.ts ;;
   session-erase-bytes) exec bun run /app/src/session-erase/selfhost-eraser-main.ts ;;
   user-erase) exec bun run /app/src/session-erase/user-erase-main.ts ;;
   s3-ledger-rearm-sweeper) exec bun run /app/src/session-ingest/rearm-sweeper-main.ts --loop ;;

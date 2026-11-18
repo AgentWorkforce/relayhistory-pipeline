@@ -94,10 +94,8 @@ import { briefTick } from "../session-brief/worker.ts";
 import { BriefDocumentError, publishBriefDocumentsTick } from "./brief-documents.ts";
 import { briefRegenFromEnv } from "../session-brief/regen.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
-import { decisionRecordsEnabled, postgresDecisionRecordsSink } from "../session-analysis/decision-records.ts";
-import { zstdDecompressSync } from "node:zlib";
+import { analysisTickDeps, type AnalysisTickDeps } from "../session-analysis/runtime-deps.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
-import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
@@ -426,6 +424,24 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
 }
 
 /**
+ * The Lambda's analysisTick deps: the shared builder over this runtime's pool, bucket and
+ * execution-role credentials. Exported so the EKS runner's parity test can compare the two.
+ */
+export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "keyPrefix" | "readerMaxRuleset">, db: HoopDb, store: ObjectStore, key: string | null): AnalysisTickDeps {
+  return analysisTickDeps({
+    db,
+    transact: (work) => transaction(db, work),
+    store,
+    bucket: env.bucket,
+    region: env.region,
+    keyPrefix: env.keyPrefix,
+    readerMaxRuleset: env.readerMaxRuleset,
+    modelKey: key,
+    credentials: () => lambdaCredentials(),
+  });
+}
+
+/**
  * The shared runtime for every invocation kind. Network-free: pools and clients
  * connect lazily. The analysis source field is carried raw and not validated here.
  */
@@ -536,30 +552,9 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     // Summaries regeneration flags (default off: null, today's behaviour).
     regen: briefRegenFromEnv(briefSettings.model, key),
   });
-  // Session analysis (lane F1): the same secret-only model key; no key = no claim.
-  const sessionAnalysis = analysisTick({
-    config: analysisConfig(),
-    db,
-    store,
-    canonical: {
-      store,
-      provider: "s3",
-      bucket: env.bucket,
-      prefix: bindings,
-      readerMaxRuleset: env.readerMaxRuleset,
-      decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
-    },
-    transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
-    ...(decisionRecordsEnabled() ? { decisionRecords: postgresDecisionRecordsSink(db) } : {}),
-    transact: (work) => transaction(db, work),
-    // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
-    // pages, every version of a ticketed result key that no published job owns.
-    // Built per call so each step signs with the current Lambda credentials.
-    eraser: {
-      eraseStep: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseStep(prefix, opts),
-      verifyErased: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).verifyErased(prefix, opts),
-    },
-  });
+  // Session analysis (lane F1): the same secret-only model key; no key = no claim. The deps come from
+  // the builder the EKS runner shares (src/session-analysis/runtime-deps.ts), so both run one path.
+  const sessionAnalysis = analysisTick(lambdaAnalysisDeps(env, db, store, key));
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;

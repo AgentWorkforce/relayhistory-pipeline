@@ -26,6 +26,7 @@ const EXPECTED: Record<string, string[]> = {
   "session-read-api": ["run", "/app/src/session-read-api/server.ts"],
   "session-ingest": ["run", "/app/src/session-ingest/selfhost-server.ts"],
   "session-publication": ["run", "/app/src/session-ingest/publication-service.ts", "--continuous"],
+  "session-analysis": ["run", "/app/src/session-analysis/runner.ts"],
   "session-pipeline-consumer": ["run", "/app/src/session-pipeline/consumer-service.ts"],
   "session-pipeline-consumer-bootstrap": ["run", "/app/src/session-pipeline/consumer-bootstrap.ts"],
   "session-pipeline-output-facts-bootstrap": ["run", "/app/src/session-pipeline/output-facts-bootstrap.ts"],
