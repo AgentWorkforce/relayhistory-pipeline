@@ -931,7 +931,7 @@ test("real tree: after the full tree including 062140, the staged output facts w
   await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
   expect(await ledger(s.db)).toContain(SOF);
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
-  // Consumer-only: never in the general runtime list; the five writers are the consumer's, the two helpers nobody's.
+  // Consumer-only: never in the general runtime list; the five writers are the consumer's, the three helpers nobody's.
   expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.staged_facts_"))).toEqual([]);
   const writers = CONSUMER_RUNTIME_FUNCTIONS.filter((f) => f.startsWith("sessions.staged_facts_"));
   expect(writers.length).toBe(5);
@@ -940,7 +940,7 @@ test("real tree: after the full tree including 062140, the staged output facts w
       "SELECT DISTINCT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END g FROM pg_proc p, aclexplode(p.proacl) a WHERE p.oid = $1::regprocedure AND a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner ORDER BY 1",
       [fn])).rows.map((r) => r.g);
   for (const fn of writers) expect(await grantees(fn), fn).toEqual(["search_consumer_runtime"]);
-  for (const fn of ["sessions.staged_facts_run_v1(bigint,uuid,text[])", "sessions.staged_facts_whole_v1(bigint)"]) expect(await grantees(fn), fn).toEqual([]);
+  for (const fn of ["sessions.staged_facts_run_v1(bigint,uuid,text[])", "sessions.staged_facts_whole_v1(bigint)", "sessions.staged_facts_reset_v1()"]) expect(await grantees(fn), fn).toEqual([]);
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   for (const [fn, role] of [

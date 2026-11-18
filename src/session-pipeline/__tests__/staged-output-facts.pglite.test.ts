@@ -17,7 +17,7 @@ import { finishStagedOutputFacts, sealOutputFactsWant, StagedOutputFactsIncomple
 import { StagedRunRestart } from "../staged-reconcile.ts";
 import { outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
 import {
-  advanceToFinal, anchor, as, chunksOf, claim, clearFacts, code, factsChunk, factsPass, factsSnapshot, finalStep, keyOf, RUNTIME,
+  advanceToFinal, as, chain, chunksOf, claim, clearFacts, code, factsChunk, factsPass, factsSnapshot, finalStep, keyOf, RUNTIME,
   stagedFactsDatabase, stagedPass, stagedRows, wantPhase, WANT_KEYS, wholePass, type Claimed,
 } from "./staged-facts-harness.ts";
 
@@ -37,7 +37,7 @@ const WRITERS = [
   "sessions.staged_facts_status_v1(bigint,uuid)",
   "sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)",
 ];
-const HELPERS = ["sessions.staged_facts_run_v1(bigint,uuid,text[])", "sessions.staged_facts_whole_v1(bigint)"];
+const HELPERS = ["sessions.staged_facts_run_v1(bigint,uuid,text[])", "sessions.staged_facts_whole_v1(bigint)", "sessions.staged_facts_reset_v1()"];
 const OTHER_ROLES = ["anon", "authenticated", "service_role", "bulls96_read_api", "bulls96_session_ingest"];
 const SCOPE = { orgId: OUTPUT_FIXTURE_SCOPE.orgId, workspaceId: OUTPUT_FIXTURE_SCOPE.workspaceId, harness: OUTPUT_FIXTURE_SCOPE.harness, sessionId: "s1", canonicalId: OUTPUT_FIXTURE_SCOPE.canonicalId };
 const CHUNKS = chunksOf(outputFixture(), 4);
@@ -84,12 +84,19 @@ describe("20261105062140 staged output facts", () => {
     }
     for (const fn of HELPERS)
       for (const role of [RUNTIME, ...OTHER_ROLES]) expect((await db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok).toBe(false);
-    const rls = await db.query<{ rls: boolean; policies: number }>(
-      "SELECT c.relrowsecurity rls, (SELECT count(*)::int FROM pg_policy p WHERE p.polrelid = c.oid) policies FROM pg_class c WHERE c.oid = 'sessions.staged_facts_v1'::regclass");
-    expect(rls.rows[0]).toEqual({ rls: true, policies: 0 });
-    for (const role of [RUNTIME, ...OTHER_ROLES])
-      for (const priv of ["SELECT", "INSERT", "UPDATE", "DELETE"])
-        expect((await db.query<{ ok: boolean }>("SELECT has_table_privilege($1, 'sessions.staged_facts_v1', $2) ok", [role, priv])).rows[0]!.ok).toBe(false);
+    for (const table of ["sessions.staged_facts_v1", "sessions.staged_facts_runs_v1"]) {
+      const rls = await db.query<{ rls: boolean; policies: number }>(
+        "SELECT c.relrowsecurity rls, (SELECT count(*)::int FROM pg_policy p WHERE p.polrelid = c.oid) policies FROM pg_class c WHERE c.oid = $1::regclass", [table]);
+      expect(rls.rows[0]).toEqual({ rls: true, policies: 0 });
+      for (const role of [RUNTIME, ...OTHER_ROLES])
+        for (const priv of ["SELECT", "INSERT", "UPDATE", "DELETE"])
+          expect((await db.query<{ ok: boolean }>("SELECT has_table_privilege($1, $2, $3) ok", [role, table, priv])).rows[0]!.ok).toBe(false);
+    }
+    // On the 062110 tables: one reset trigger on the run table; no key references the stage table (its bulk deletes stay as they were).
+    const triggers = async (table: string) => (await db.query<{ t: string }>(
+      "SELECT tgname t FROM pg_trigger WHERE tgrelid = $1::regclass ORDER BY 1", [table])).rows.map((r) => r.t);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_constraint WHERE confrelid = 'sessions.search_reconcile_stage_v1'::regclass")).rows[0]!.n).toBe(0);
+    expect((await triggers("sessions.search_reconcile_runs_v1")).filter((t) => !t.startsWith("RI_ConstraintTrigger"))).toEqual(["staged_facts_reset"]);
     expect(await code(as(db, (tx) => tx.query("SELECT 1 FROM sessions.staged_facts_v1")))).toBe("42501");
   });
 
@@ -139,17 +146,17 @@ describe("20261105062140 staged output facts", () => {
 
   test("the stage goes with the run on every 062110 path: finish, abandon, a restart on a changed source, erase_scope", async () => {
     await clearFacts(db);
-    const anchored = async () => (await anchor(db)).length;
+    const chained = async () => (await chain(db)).length;
     // finish (after the facts step)
     let run = await stagedRun();
-    expect([await stagedRows(db) > 0, await anchored()]).toEqual([true, 1]);
+    expect([await stagedRows(db) > 0, await chained()]).toEqual([true, 1]);
     await advanceToFinal(db, run, true);
     await finalStep(db, run, SCOPE, { sourceComplete: true, sourceVersion: 1 });
-    expect([await stagedRows(db), await anchored()]).toEqual([0, 0]);
+    expect([await stagedRows(db), await chained()]).toEqual([0, 0]);
     // abandon (the run row stays, back at want)
     run = await stagedRun();
     await as(db, (tx) => tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,'test')", [run.runId, run.nonce]));
-    expect([await stagedRows(db), await anchored()]).toEqual([0, 0]);
+    expect([await stagedRows(db), await chained()]).toEqual([0, 0]);
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n).toBe(1);
     // a claim restart: the same run row, another source stamp
     await clearFacts(db);
@@ -157,19 +164,19 @@ describe("20261105062140 staged output facts", () => {
     await expire();
     const restarted = (await claim(db, SCOPE, "mf-2"))!;
     expect([restarted.runId, restarted.restarted, restarted.phase, restarted.cursor]).toEqual([run.runId, true, "want", null]);
-    expect([await stagedRows(db), await anchored()]).toEqual([0, 0]);
-    // ... and the writer puts the anchor back on the restarted attempt's first chunk, whole from there.
+    expect([await stagedRows(db), await chained()]).toEqual([0, 0]);
+    // ... and the restarted attempt's first chunk starts a new chain, whole from there.
     await wantPhase(db, restarted, SCOPE, null, 1);
     await factsChunk(db, restarted, SCOPE, CHUNKS[0]!, { seq: 0, last: false }, 1);
-    expect(await anchor(db)).toEqual([{ whole: true, seq: 0, done: false, sealed: false }]);
+    expect(await chain(db)).toEqual([{ whole: true, seq: 0, done: false, sealed: false }]);
     expect(await stagedRows(db)).toBeGreaterThan(0);
     // erase_scope (by the canonical id), leased or not
     await as(db, (tx) => tx.query("SELECT sessions.search_reconcile_erase_scope_v1($1,$2,$3,$4::text[])", [SCOPE.orgId, SCOPE.workspaceId, SCOPE.harness, [SCOPE.canonicalId]]));
-    expect([await stagedRows(db), await anchored()]).toEqual([0, 0]);
+    expect([await stagedRows(db), await chained()]).toEqual([0, 0]);
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n).toBe(0);
   });
 
-  test("the anchor never disturbs the 062110 diff pages", async () => {
+  test("the facts stage never touches the 062110 stage table or its diff pages", async () => {
     await clearFacts(db);
     const run = await stagedRun();
     await advanceToFinal(db, run, true);
@@ -210,7 +217,7 @@ describe("20261105062140 staged output facts", () => {
       await clearFacts(db);
       const run = await stagedRun();
       await advanceToFinal(db, run, true);
-      expect(await anchor(db)).toEqual([{ whole: true, seq: LAST, done: true, sealed: true }]);
+      expect(await chain(db)).toEqual([{ whole: true, seq: LAST, done: true, sealed: true }]);
       expect(await status(run)).toBe(true);
       await finalStep(db, run, SCOPE, { sourceComplete: true, sourceVersion: 1 });
     });
@@ -219,7 +226,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2, { from: 1 });
       await advanceToFinal(db, run, true);
-      expect(await anchor(db)).toEqual([{ whole: false, seq: LAST, done: true, sealed: true }]);
+      expect(await chain(db)).toEqual([{ whole: false, seq: LAST, done: true, sealed: true }]);
       await finishFails(run);
     });
 
@@ -227,7 +234,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2, { skip: [1] });
       await advanceToFinal(db, run, true);
-      expect((await anchor(db))[0]!.whole).toBe(false);
+      expect((await chain(db))[0]!.whole).toBe(false);
       await finishFails(run);
     });
 
@@ -235,7 +242,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2, { skip: [LAST] });
       await advanceToFinal(db, run, true);
-      expect(await anchor(db)).toEqual([{ whole: false, seq: LAST - 1, done: false, sealed: true }]);
+      expect(await chain(db)).toEqual([{ whole: false, seq: LAST - 1, done: false, sealed: true }]);
       await finishFails(run);
     });
 
@@ -243,7 +250,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2, { skip: [LAST] });
       await advanceToFinal(db, run, false);
-      expect(await anchor(db)).toEqual([{ whole: true, seq: LAST - 1, done: false, sealed: false }]);
+      expect(await chain(db)).toEqual([{ whole: true, seq: LAST - 1, done: false, sealed: false }]);
       await finishFails(run);
     });
 
@@ -254,7 +261,7 @@ describe("20261105062140 staged output facts", () => {
       const taken = (await claim(db, SCOPE, "mf-2", 2))!;
       expect(taken.runId).toBe(run.runId);
       expect(await code(as(db, (tx) => sealOutputFactsWant(tx, run)))).toBe("RH062");
-      expect((await anchor(db))[0]!.sealed).toBe(false);
+      expect((await chain(db))[0]!.sealed).toBe(false);
       await db.exec("DELETE FROM sessions.search_reconcile_runs_v1");
     });
 
@@ -263,7 +270,7 @@ describe("20261105062140 staged output facts", () => {
       await factsPass(db, run, SCOPE, CHUNKS, 2);
       await factsChunk(db, run, SCOPE, { projectionRows: [], records: [] }, { seq: LAST + 1, last: true }, 2);
       await advanceToFinal(db, run, true);
-      expect((await anchor(db))[0]!.whole).toBe(false);
+      expect((await chain(db))[0]!.whole).toBe(false);
       await finishFails(run);
       run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2);
@@ -275,14 +282,14 @@ describe("20261105062140 staged output facts", () => {
       await finalStep(db, run, SCOPE, { sourceComplete: true, sourceVersion: 2 });
     });
 
-    test("facts on only after the want phase (no anchor), or a seal with no chunk staged: never reconciled", async () => {
+    test("facts on only after the want phase (no chain), or a seal with no chunk staged: never reconciled", async () => {
       let run = await seeded();
       await advanceToFinal(db, run, false);
-      expect(await anchor(db)).toEqual([]);
+      expect(await chain(db)).toEqual([]);
       await finishFails(run);
       run = await seeded();
       await advanceToFinal(db, run, true);
-      expect(await anchor(db)).toEqual([{ whole: false, seq: null, done: false, sealed: true }]);
+      expect(await chain(db)).toEqual([{ whole: false, seq: null, done: false, sealed: true }]);
       await finishFails(run);
     });
 
@@ -290,7 +297,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2);
       await advanceToFinal(db, run, false);
-      expect(await anchor(db)).toEqual([{ whole: true, seq: LAST, done: true, sealed: false }]);
+      expect(await chain(db)).toEqual([{ whole: true, seq: LAST, done: true, sealed: false }]);
       await finishFails(run);
     });
 
@@ -330,7 +337,7 @@ describe("20261105062140 staged output facts", () => {
       const run = await seeded();
       await factsChunk(db, run, SCOPE, { projectionRows: [], records: [] }, { seq: 0, last: true }, 2);
       await advanceToFinal(db, run, true);
-      expect(await anchor(db)).toEqual([{ whole: true, seq: 0, done: true, sealed: true }]);
+      expect(await chain(db)).toEqual([{ whole: true, seq: 0, done: true, sealed: true }]);
       const r = await finalStep(db, run, SCOPE, { sourceComplete: true, sourceVersion: 2 });
       expect(r.applied).toBe(true);
       const snap = await factsSnapshot(db);
@@ -346,14 +353,14 @@ describe("20261105062140 staged output facts", () => {
     const n = await stagedRows(db);
     const again = await as(db, (tx) => tx.query<{ n: number }>("SELECT sessions.staged_facts_stage_v1($1::bigint,$2::uuid,'[]'::jsonb,NULL,NULL) n", [run.runId, run.nonce]));
     expect([again.rows[0]!.n, await stagedRows(db)]).toEqual([0, n]);
-    expect(await anchor(db)).toEqual([{ whole: true, seq: 0, done: false, sealed: false }]);
+    expect(await chain(db)).toEqual([{ whole: true, seq: 0, done: false, sealed: false }]);
     await clearFacts(db);
     await stagedPass(db, SCOPE, outputFixture(), 1, 4);
   });
 });
 
 describe("20261105062140 rollback", () => {
-  test("the checksum-pinned down refuses under a later step or a live staged lease, removes the anchors, the table and the functions and its ledger row; a rerun refuses; the up applies again", async () => {
+  test("the checksum-pinned down refuses under a later step or a live staged lease, removes the trigger, the tables and the functions and its ledger row; a rerun refuses; the up applies again", async () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
     const db = await stagedFactsDatabase();
@@ -374,8 +381,10 @@ describe("20261105062140 rollback", () => {
       await db.exec(DOWN);
       expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.staged_facts_v1')::text r")).rows[0]!.r).toBeNull();
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'staged\\_facts\\_%'")).rows[0]!.n).toBe(0);
-      // No fold row of this step is left behind; the run and its 062110 stage rows are untouched.
-      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1 WHERE side = 'fold'")).rows[0]!.n).toBe(0);
+      // No object of this step is left behind; the run and its 062110 stage rows are untouched.
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.staged_facts_runs_v1')::text r")).rows[0]!.r).toBeNull();
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname = 'staged_facts_reset'")).rows[0]!.n).toBe(0);
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n).toBe(1);
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_stage_v1 WHERE side = 'want'")).rows[0]!.n).toBe(WANT_KEYS);
       expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [STEP])).rows[0]!.n).toBe(0);
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
