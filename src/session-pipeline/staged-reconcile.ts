@@ -40,6 +40,7 @@
 import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
+import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -117,23 +118,48 @@ export interface StagedRunRef {
 }
 
 /**
- * Hooks for a consumer of the run's batches (the output-facts slice, 2c). Both run inside the
- * module's own transaction for that step, so a throw rolls the step back and the run resumes there
- * after the lease expires (the hook then sees the step again: it must be idempotent per run id).
- * A hook may call further sessions functions on `tx` under the same run id and lease nonce.
+ * A "want" batch's events, in the shape outputFactsFromScope reads (output-facts.ts): the projection
+ * rows with their table names (convergence_events, session_commit_links, ...) and the stream
+ * records, both AFTER the fold, i.e. the same winners readCanonicalScope would produce for the
+ * batch's keys, never pre-fold copies.
  */
-export interface StagedReconcileHooks<E> {
+export interface StagedFactsEvents {
+  projectionRows: ReadonlyArray<{ table: string; row: Record<string, unknown> }>;
+  records: readonly RelayhistoryStreamRecord[];
+}
+
+/**
+ * Hooks for a consumer of the run's batches (the output-facts slice, 2c). Both run inside the
+ * module's own transaction for that step, so a throw rolls the step back (with any writes the hook
+ * made on `tx`) and the run resumes there after the lease expires; the hook then sees the step
+ * again, so it must be idempotent per run id. A hook may call further sessions functions on `tx`
+ * under the same run id and lease nonce. Delivering "want" events costs the wiring one more source
+ * pass per run, made only when `onBatch` is set.
+ */
+export interface StagedReconcileHooks<W = StagedFactsEvents, R = unknown> {
   /**
-   * Once per committed batch of the run's events, in the batch's own transaction, after the
-   * module staged or wrote it: `phase` "want" for a batch of passes 1-3 output (events are the
-   * projected events of the batch's keys), "write" for a pass 4 batch (the rows written).
+   * Once per committed batch, in the batch's own transaction, after the module staged or wrote it:
+   * `phase` "want" for a batch of passes 1-3 output (`events` as StagedFactsEvents), "write" for a
+   * pass 4 batch (the index rows written; facts may ignore it).
+   *
+   * Order: "want" batches arrive in ascending stream index key of their keys (streamIndexKey, C
+   * order), each key once per run attempt. That is the only order guaranteed. Batches are not
+   * self-contained: related events of one session (a commit call and its result, a turn's parts)
+   * can sit in different batches, so anything that needs the session as a whole must stage what it
+   * needs and decide in `onFinish`.
    */
-  onBatch?(tx: SqlExecutor, run: StagedRunRef, batch: { phase: "want" | "write"; events: readonly E[] }): Promise<void>;
+  onBatch?(tx: SqlExecutor, run: StagedRunRef, batch: { phase: "want"; events: W } | { phase: "write"; events: readonly R[] }): Promise<void>;
   /**
    * Once, in the final transaction, after `commit` and before the run is finished (its stage rows
-   * dropped). `complete` is the pass's own verdict (false: a refused write, nothing deleted).
+   * dropped). `complete` is the pass's own verdict (false: a refused write, nothing deleted);
+   * `sourceComplete` is the source read's own completeness (ScopeRead.complete, what
+   * outputFactsFromScope takes as `complete`). They can differ.
    */
-  onFinish?(tx: SqlExecutor, run: StagedRunRef, pass: { complete: boolean; inserted: number; deleted: number; wanted: number }): Promise<void>;
+  onFinish?(
+    tx: SqlExecutor,
+    run: StagedRunRef,
+    pass: { complete: boolean; sourceComplete: boolean; inserted: number; deleted: number; wanted: number },
+  ): Promise<void>;
 }
 
 /** Where a test may stop a run. In-transaction points roll their transaction back. */
