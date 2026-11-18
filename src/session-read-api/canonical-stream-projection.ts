@@ -282,9 +282,11 @@ export interface StreamedScope {
   regenerate(keys: ReadonlySet<string>, batch: number, write: (rows: IndexRow[]) => Promise<void>): Promise<void>;
   /**
    * The staged reconcile's facts pass (only on a complete read): one more pass handing the whole read's
-   * facts input to `emit` in chunks of about `chunk` items, in source order: the catalog rows first, then
-   * every post-fold record and every convergence_events row the whole read produces (in and out of the
-   * window, shadowed direct rows excluded), as readCanonicalScope's `records` and `projectionRows`.
+   * facts input to `emit` in chunks of about `chunk` items (the first also carries every catalog row):
+   * the catalog rows, then every post-fold record and every convergence_events row the whole read produces
+   * (in and out of the window, shadowed direct rows excluded), in manifest read order. Over all chunks
+   * they equal readCanonicalScope's `records` and `projectionRows` as multisets; the whole read lists them
+   * in fold/slot order, so a consumer must not depend on the order.
    * Throws as `regenerate` does on a changed or unreadable source.
    */
   facts(chunk: number, emit: (events: { projectionRows: Array<{ table: string; row: Json }>; records: RelayhistoryStreamRecord[] }) => Promise<void>): Promise<void>;
@@ -907,33 +909,37 @@ export async function streamCanonicalScope(
       // The whole read's catalog rows come first (readCanonicalScope: catalogRows, then convergence_events).
       let projectionRows: Array<{ table: string; row: Json }> = (projErr.has(D) ? [] : catalogRows).map((r) => ({ table: r.table, row: r.row as Json }));
       let records: RelayhistoryStreamRecord[] = [];
-      const flush = async (force: boolean) => {
-        if (!force && projectionRows.length + records.length < chunk) return;
-        if (!projectionRows.length && !records.length) return;
+      const take = () => {
         const out = { projectionRows, records };
         projectionRows = [];
         records = [];
-        // A hook error is the caller's, not the source's.
-        await emit(out).catch((error: unknown) => { throw new CallerFailed(error); });
+        return out;
+      };
+      // Inside the pass: a hook error is the caller's, not the source's (pass() unwraps it).
+      const flush = async () => {
+        if (projectionRows.length + records.length < chunk) return;
+        await emit(take()).catch((error: unknown) => { throw new CallerFailed(error); });
       };
       try {
         await pass(async () => {
           const onRecord = async (record: RelayhistoryStreamRecord) => {
             records.push(record);
-            await flush(false);
+            await flush();
           };
           for await (const p of projected(onRecord)) {
             if ("mapError" in p) throw new StreamStop(STREAM_SOURCE_CHANGED);
             if (p.shadowed) continue;
             projectionRows.push({ table: "convergence_events", row: p.row });
-            await flush(false);
+            await flush();
           }
         });
       } catch (error) {
         if (error instanceof StreamStop) throw new PipelineError(error.code, "the streamed source changed or could not be read", false);
         throw error;
       }
-      await flush(true);
+      // The last chunk outside the pass: emitted raw, as regenerate's last write, so a hook error
+      // (a restart, a lost lease) reaches the caller as itself.
+      if (projectionRows.length || records.length) await emit(take());
     },
   });
 }

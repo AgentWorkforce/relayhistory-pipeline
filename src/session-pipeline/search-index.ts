@@ -190,7 +190,7 @@ export interface StagedReconcile {
   /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
   keyedRecordsCap: number;
   /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
-  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError">>;
+  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError" | "heartbeatMs">>;
 }
 
 /**
@@ -714,7 +714,8 @@ const STAGED_BUDGETS = new Set<string>([STREAM_READ_BYTES_BUDGET, STREAM_READ_EV
  * partial), so an interrupted run is listed by the tick and resumes at its committed cursor once
  * its lease expires. Nothing here answers `busy` (the queue's requeue and dead-letter path):
  * Every outcome after a successful claim that is not done leaves the scope owing (directory events
- * invalidated, state incomplete); staged_run_leased claimed nothing and writes nothing.
+ * invalidated, state incomplete), except staged_lease_lost (the taker or the erase owns the state);
+ * staged_run_leased claimed nothing and writes nothing.
  *   staged_run_leased       another tick holds the run's live lease; nothing written
  *   scope_busy / canonical_scope_busy   a lock was held at a write page or the final step; lease released
  *   stream_source_changed   the stamp moved; the run was abandoned and restarts on the tick
@@ -819,6 +820,11 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
       keepFingerprintPrefix: BUFFERED_FINGERPRINT_PREFIX,
       abandonOn: (error) => (error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null),
       releaseOnError: true,
+      onHeartbeatError: (error) =>
+        log.warn("search index staged lease renewal failed", {
+          stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,
+          ...(error instanceof Error ? { error_name: error.name } : {}), ...errorFields(error),
+        }),
       ...staged.run,
       // `claimed` only once the claim committed (a failed claim commit is the caller's error).
       boundary: async (point) => {
@@ -828,8 +834,12 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
     });
   } catch (error) {
     if (!claimed) throw error;
-    // After the claim, every outcome but done leaves the scope owing a pass: the tick resumes it.
-    if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return owing(["staged_lease_lost"], false);
+    // RH062 happens only after a takeover (the taker's claim already recorded the scope owing) or
+    // when the run row is gone (erased, or the taker finished and recorded the scope current): this
+    // pass writes nothing, or it would rewrite state with an older revision after an erase, or flip a
+    // scope the taker just finished back to owing.
+    if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return result(["staged_lease_lost"]);
+    // Every other outcome after the claim but done leaves the scope owing a pass: the tick resumes it.
     // TODO(slice 3): cap the attempts of a permanently failing run (failed runs, operator reset).
     log.warn("search index staged run interrupted", {
       stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,

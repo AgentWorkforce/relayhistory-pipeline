@@ -457,7 +457,7 @@ With it on:
 - **Between scan pages** the consumer checks the scope's deadline (if any) and keeps its transaction busy (`SELECT
   1` at most every 20 seconds) on the whole-read path. A streamed scope no longer runs in that transaction: it runs
   as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
-  in docs/local-stack.md, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
+  below, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
   `staged_lease_lost`, `output_facts_stage_incomplete`).
 
 What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
@@ -496,7 +496,9 @@ How a staged run differs from the in-transaction stream it replaces:
   the claim's own transaction, so an interrupted run is listed by the next tick and resumes at its committed cursor
   once its lease expires (a crash) or at once (an error: the lease is released). Every outcome after a successful claim
   that is not done leaves the scope owing (directory events invalidated, state incomplete), so the next tick always
-  takes it again. No staged outcome answers `busy`: the queue's requeue, backoff and dead-letter path is never used
+  takes it again; except `staged_lease_lost`, which writes nothing (the consumer that took the run over, or the
+  erase, owns the state). A failed lease renewal during a read is logged (`search index staged lease renewal
+  failed`, error class and code) and retried at the next renewal; only RH062 or 42501 stop renewing. No staged outcome answers `busy`: the queue's requeue, backoff and dead-letter path is never used
   for a staged scope.
 - **Outcome reasons** (all incomplete, none `busy`): `staged_run_leased` (another consumer holds the run's live
   lease; nothing written), `scope_busy` / `canonical_scope_busy` (a lock was held at the final step; the lease is

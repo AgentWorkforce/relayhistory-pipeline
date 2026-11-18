@@ -106,8 +106,8 @@ export interface StagedReconcileOps<R> {
   claimed?(tx: SqlExecutor): Promise<void>;
   /**
    * Only with `hooks.onBatch`: the facts pass. One source pass handing the whole-read facts input
-   * (post-fold records and every projection row) to `emit` in source order, at most `chunk` items per
-   * call, awaiting each.
+   * (post-fold records and every projection row) to `emit` in manifest read order, about `chunk` items
+   * per call (the first may also carry every catalog row), awaiting each.
    */
   factsPass?(read: R, chunk: number, emit: (events: StagedFactsEvents) => Promise<void>): Promise<void>;
   /** Only with `hooks.onFinish`: the source read's own completeness (default true: an incomplete read never reaches the final step). */
@@ -134,7 +134,8 @@ export interface StagedRunRef {
  * A "facts" chunk's events, in the shape outputFactsFromScope reads (output-facts.ts): the projection
  * rows with their table names (convergence_events, session_commit_links, ...) and the stream
  * records, both AFTER the fold (the winners readCanonicalScope would produce), never pre-fold copies.
- * Concatenated over every chunk of the pass they equal the whole read's projectionRows and records.
+ * Over every chunk of the pass they equal the whole read's projectionRows and records as multisets.
+ * Order: manifest read order, which is not the whole read's fold/slot order; do not depend on it.
  */
 export interface StagedFactsEvents {
   projectionRows: ReadonlyArray<{ table: string; row: Record<string, unknown> }>;
@@ -239,6 +240,10 @@ export interface StagedReconcileDeps {
   abandonOn?: (error: unknown) => string | null;
   /** Tests only. */
   boundary?: (point: StagedBoundary) => void | Promise<void>;
+  /** A lease renewal during a source read failed for another reason than RH062/42501 (retried at the next beat). */
+  onHeartbeatError?: (error: unknown) => void;
+  /** Tests only: the lease renewal interval during a source read (default a third of the lease, at least 250 ms). */
+  heartbeatMs?: number;
   /** On an error the run cannot map (thrown to the caller): release the lease first (best effort). */
   releaseOnError?: boolean;
   /** Items per facts chunk (default 5000). */
@@ -379,11 +384,15 @@ export async function runStagedReconcile<R>(
     const timer = setInterval(() => {
       if (stopped) return;
       pending = pending.then(() =>
-        deps.transact((tx) => advance(tx, phase, cursor)).catch(() => {
-          stopped = true;
+        deps.transact((tx) => advance(tx, phase, cursor)).catch((error: unknown) => {
+          // The run is gone or not ours (taken over, erased) or the role is refused: stop for good;
+          // the next step call answers it. Anything else is retried at the next beat.
+          const code = (error as { code?: unknown })?.code;
+          if (code === STAGED_RECONCILE_STALE_LEASE || code === "42501") stopped = true;
+          else deps.onHeartbeatError?.(error);
         }),
       );
-    }, Math.max(250, Math.floor(leaseMs / 3)));
+    }, deps.heartbeatMs ?? Math.max(250, Math.floor(leaseMs / 3)));
     try {
       return await work();
     } finally {
