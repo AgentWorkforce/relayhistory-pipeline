@@ -11,9 +11,17 @@
  * Ranges are ClickHouse DateTime64(6) text ("YYYY-MM-DD HH:MM:SS.ffffff", UTC) on both
  * sides of the interface, as the builder emits them.
  */
+import { createHash } from "node:crypto";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
+import { StagedRunRestart, type StagedFactsEvents, type StagedRunRef } from "./staged-reconcile.ts";
 import {
+  callMessageIds,
+  outputFactsBatchStep,
+  outputFactsFinishStep,
+  type OutputFactsStagedCandidate,
+  type OutputFactsStagedItem,
+  type OutputFactsStagedScope,
   eraseOutputFacts,
   outputFactsSchema,
   previousOutputFactsState,
@@ -25,6 +33,7 @@ import {
   type OutputFactsScope,
   type StatePhase,
 } from "./output-facts.ts";
+import type { RelayhistoryStreamRecord } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 
 export interface OutputFactsReconcileInput {
   eventFacts: EventFactRow[];
@@ -143,4 +152,202 @@ export function postgresOutputFactsStore(tx: SqlExecutor): OutputFactsStore {
     // The tables come with the migration the consumer requires before it serves.
     schemaReady: async () => ({ ready: true, present: true }),
   };
+}
+
+// ---- the staged writer (staged reconcile, slice 2c; migration 20261105062140) ------------------
+//
+// A staged run's facts, on the run's own transactions and lease: stageOutputFactsChunk in the
+// transaction of each chunk of the facts pass (the whole read's facts input, delivered once per
+// attempt at the end of the want phase, numbered from 0, the last one flagged),
+// sealOutputFactsWant in the transaction that ends the want phase, and
+// finishStagedOutputFacts in the final transaction BEFORE search_reconcile_finish_v1 (which drops
+// the stage). The whole-set path (postgresOutputFactsStore.reconcile) is unchanged.
+
+/** The scope a staged run's facts belong to: the run's scope and its canonical id. */
+export interface StagedOutputFactsScope extends OutputFactsStagedScope {
+  /** The scope's own session id (with the canonical id and every projected one, the facts' session id set). */
+  sessionId: string;
+}
+
+/**
+ * The stage does not cover the run's whole want pass (facts were off for part of it, or the hook
+ * was attached late): nothing was written. The run must go round again from its first batch: as a
+ * StagedRunRestart thrown from onFinish, the module rolls the final transaction back and abandons
+ * the run with this reason, which drops the stage (anchor and all) with the run's; the next attempt
+ * has the hook from its first batch.
+ */
+export class StagedOutputFactsIncompleteError extends StagedRunRestart {
+  constructor() {
+    super("output_facts_stage_incomplete");
+    this.name = "StagedOutputFactsIncompleteError";
+  }
+}
+
+const hex = (v: string) => createHash("sha256").update(v).digest("hex");
+/** Items per staged_facts_stage_v1 call (the function takes at most 10000). */
+const STAGE_CHUNK = 500;
+const READ_PAGE = 1000;
+
+type StageEntry = { k: string; i?: string; g?: string; m?: string; b: string };
+
+/** The Postgres row of an event or fact (no ClickHouse version, a Postgres instant), as postgresOutputFactsStore.reconcile sends it. */
+const pgRow = <T extends { version: number; ts: string }>({ version: _v, ...row }: T) => ({ ...row, ts: pgInstant(row.ts) });
+
+function stageEntry(item: OutputFactsStagedItem): StageEntry {
+  switch (item.kind) {
+    case "event":
+    case "fact":
+      return { k: item.kind, b: JSON.stringify(pgRow(item.row)) };
+    case "candidate": {
+      const b = JSON.stringify({ group: item.group, match: item.match, ...item.body });
+      return { k: "candidate", i: hex(b), g: hex(item.group), m: hex(item.match), b };
+    }
+    case "call":
+    case "parent": {
+      const b = JSON.stringify(item.body);
+      return { k: item.kind, i: hex(b), g: hex(item.group), m: hex(item.match), b };
+    }
+    case "record": {
+      const b = JSON.stringify(item.body);
+      return { k: "record", i: hex(b), b };
+    }
+    case "session":
+      return { k: "session", i: hex(item.sessionId), b: JSON.stringify({ session_id: item.sessionId }) };
+    case "note":
+      return { k: "note", i: hex(item.reason), b: JSON.stringify({ reason: item.reason }) };
+  }
+}
+
+/** A chunk of the facts pass: its number within the attempt (from 0) and whether it is the last. */
+export interface StagedFactsChunk {
+  seq: number;
+  last: boolean;
+}
+
+async function stageEntries(tx: SqlExecutor, run: StagedRunRef, entries: StageEntry[], chunk: StagedFactsChunk | null): Promise<number> {
+  if (chunk && (!Number.isSafeInteger(chunk.seq) || chunk.seq < 0)) throw new Error("output_facts_invalid_chunk");
+  let staged = 0;
+  // One call per chunk even when it has no items (the call extends the anchor's chain); a chunk larger than
+  // one call goes in several, the first with the chunk's number (seq 0 restarts the chain), the rest
+  // under the same number as continuations: only the first call of a chunk moves the chain.
+  for (let i = 0; i === 0 || i < entries.length; i += STAGE_CHUNK) {
+    const { rows } = await tx.query<{ n: number | string }>(
+      "SELECT sessions.staged_facts_stage_v1($1::bigint, $2::uuid, $3::jsonb, $4::integer, $5::boolean) AS n",
+      [run.runId, run.nonce, JSON.stringify(entries.slice(i, i + STAGE_CHUNK)), chunk ? (i === 0 ? chunk.seq : null) : null, chunk ? (i === 0 ? chunk.last : null) : null],
+    );
+    staged += Number(rows[0]?.n ?? 0);
+  }
+  return staged;
+}
+
+/**
+ * One chunk of the facts pass: its facts and the inputs the finish step needs, staged on the
+ * chunk's own transaction. Chunk 0 drops what the run had staged and starts over (a facts pass is
+ * delivered whole on each attempt); a later chunk must be the next number. Idempotent per run.
+ */
+export async function stageOutputFactsChunk(
+  tx: SqlExecutor,
+  run: StagedRunRef,
+  scope: StagedOutputFactsScope,
+  events: StagedFactsEvents,
+  chunk: StagedFactsChunk,
+  sourceVersion: number,
+): Promise<number> {
+  const items = outputFactsBatchStep(scope, events, sourceVersionOf(sourceVersion));
+  return stageEntries(tx, run, items.map(stageEntry), chunk);
+}
+
+/** The want phase ended (onWantDone, in the advance transaction). Returns whether the stage is whole. */
+export async function sealOutputFactsWant(tx: SqlExecutor, run: StagedRunRef): Promise<boolean> {
+  const { rows } = await tx.query<{ whole: boolean }>("SELECT sessions.staged_facts_seal_v1($1::bigint, $2::uuid) AS whole", [run.runId, run.nonce]);
+  return rows[0]?.whole === true;
+}
+
+async function readStaged<T>(tx: SqlExecutor, run: StagedRunRef, kind: string, group: string | null = null, match: string[] | null = null): Promise<T[]> {
+  const out: T[] = [];
+  let after: string | null = null;
+  for (;;) {
+    const { rows }: { rows: Array<{ seq: string | number; body: string }> } = await tx.query<{ seq: string | number; body: string }>(
+      "SELECT seq, body FROM sessions.staged_facts_read_v1($1::bigint, $2::uuid, $3, $4, $5::text[], $6::bigint, $7)",
+      [run.runId, run.nonce, kind, group, match, after, READ_PAGE],
+    );
+    for (const r of rows) out.push(JSON.parse(r.body) as T);
+    if (rows.length < READ_PAGE) return out;
+    after = String(rows.at(-1)!.seq);
+  }
+}
+
+export interface StagedOutputFactsResult extends OutputFactsReconcileResult {
+  /** The scope the facts were reconciled for (the session id set includes every projected id). */
+  scope: OutputFactsScope;
+  range: FactsRange;
+}
+
+/**
+ * The final transaction's facts step, before search_reconcile_finish_v1: decide what needs the
+ * whole session, stage it, then reconcile from the stage with output_facts_reconcile's version
+ * rule and result, and record the scope's state as indexSearchScope does for the whole-set path.
+ * Throws StagedOutputFactsIncompleteError, before writing anything, when the stage does not cover
+ * the whole want pass: a partial stage is never read as the session's facts.
+ */
+export async function finishStagedOutputFacts(
+  tx: SqlExecutor,
+  run: StagedRunRef,
+  scope: StagedOutputFactsScope,
+  pass: { sourceComplete: boolean; sourceVersion: number; at: Date },
+): Promise<StagedOutputFactsResult> {
+  const v = sourceVersionOf(pass.sourceVersion);
+  const status = async () => (await tx.query<{ whole: boolean; lo: string | null; hi: string | null }>(
+    `SELECT s.whole, ${CH_TEXT("s.min_ts")} AS lo, ${CH_TEXT("s.max_ts")} AS hi FROM sessions.staged_facts_status_v1($1::bigint, $2::uuid) AS s`,
+    [run.runId, run.nonce],
+  )).rows[0];
+  if ((await status())?.whole !== true) throw new StagedOutputFactsIncompleteError();
+
+  const seen = await readStaged<{ session_id: string }>(tx, run, "session");
+  const fScope: OutputFactsScope = {
+    orgId: scope.orgId,
+    workspaceId: scope.workspaceId,
+    harness: scope.harness,
+    sessionIds: [...new Set([scope.sessionId, scope.canonicalId, ...seen.map((s) => s.session_id)])],
+    canonicalId: scope.canonicalId,
+  };
+  const notes = (await readStaged<{ reason: string }>(tx, run, "note")).map((n) => n.reason);
+  const candidates: OutputFactsStagedCandidate[] = [];
+  for (const c of await readStaged<{ group: string; match: string; result: Record<string, unknown>; facts: OutputFactRow[] }>(tx, run, "candidate")) {
+    const g = hex(c.group);
+    const calls = await readStaged<Record<string, unknown>>(tx, run, "call", g, [hex(c.match)]);
+    const messages = callMessageIds(calls);
+    const parents = messages.length ? await readStaged<Record<string, unknown>>(tx, run, "parent", g, messages.map(hex)) : [];
+    candidates.push({ result: c.result, facts: c.facts, sessionEvents: [...calls, ...parents] });
+  }
+  const records = await readStaged<RelayhistoryStreamRecord>(tx, run, "record");
+  const finish = outputFactsFinishStep(fScope, { candidates, records, notes, sourceComplete: pass.sourceComplete }, v);
+  if (finish.facts.length) await stageEntries(tx, run, finish.facts.map((row) => stageEntry({ kind: "fact", row })), null);
+
+  const store = postgresOutputFactsStore(tx);
+  const prev = await store.previousState(fScope);
+  const st = await status();
+  const range: FactsRange = st?.lo && st.hi ? { min: st.lo, max: st.hi } : null;
+  const { rows } = await tx.query<{ applied: boolean; inserted: string | number; deleted: string | number }>(
+    `SELECT applied, inserted, deleted FROM sessions.staged_facts_reconcile_v1($1::bigint, $2::uuid, $3, $4, $5, $6::text[], $7, $8, $9::bigint)`,
+    [run.runId, run.nonce, ...scopeArgs(fScope), fScope.canonicalId, finish.complete, v],
+  );
+  const r = rows[0];
+  const applied = r?.applied === true;
+  const result: StagedOutputFactsResult = {
+    inserted: Number(r?.inserted ?? 0),
+    deleted: Number(r?.deleted ?? 0),
+    complete: applied && finish.complete,
+    reasons: applied ? [...new Set(finish.reasons)] : [...new Set([...finish.reasons, "output_facts_stale_source_version"])],
+    applied,
+    scope: fScope,
+    range,
+  };
+  if (applied) {
+    // indexSearchScope's Postgres branch, unchanged: a complete pass records its own span, any other the union with the prior one.
+    const prior = prev.range;
+    const span = prior && range ? { min: prior.min < range.min ? prior.min : range.min, max: prior.max > range.max ? prior.max : range.max } : (range ?? prior);
+    await store.recordState(fScope, { complete: result.complete, at: pass.at, range: result.complete ? range : span, sourceVersion: v });
+  }
+  return result;
 }

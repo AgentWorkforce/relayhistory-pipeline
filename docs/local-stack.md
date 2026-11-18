@@ -517,6 +517,35 @@ flight): it answers busy, so redelivered ticks of a hot scope do not each hold a
 claim's uncommitted first insert of the same scope it waits at most 2 s (`lock_timeout` on the function), then
 answers busy. `staged-reconcile-claim.postgres.test.ts` proves both on real PostgreSQL in pg-proof.
 
+#### Staged output facts (Phase 3 slice 2c, not wired yet)
+
+Migration `20261105062140_staged_output_facts.sql` and the staged writer in `output-facts-store.ts` let a staged run
+carry the self-host output facts (`RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`) without holding the session's whole fact
+set: `sessions.output_facts_reconcile` takes it as one jsonb argument, which is why output facts turn streaming off
+today.
+
+- **Staging.** The wiring delivers the read's facts input once per attempt, at the end of the want phase, as
+  numbered chunks (every post-fold record and projection row, in source order). Each chunk stages its event and
+  message facts, its commit links, and what needs the whole session (tool calls and results for the commit check,
+  legacy outcome and turn records, the session ids) in `sessions.staged_facts_v1`. The final transaction decides
+  those, stages the result, and runs `sessions.staged_facts_reconcile_v1`: `output_facts_reconcile` over the staged
+  rows, with the same version rule, upserts and complete-only deletes. It must run before `search_reconcile_finish_v1`,
+  which drops the stage.
+- **Lifecycle.** The stage hangs off one anchor row in `search_reconcile_stage_v1` (side `fold`, key
+  `~output_facts`) by a cascading foreign key, so every 062110 path that drops a run's stage rows (finish, abandon, a
+  restart on a changed source, `erase_scope`) drops the facts stage too. No 062110 function is replaced.
+- **Wholeness.** The anchor records whether the stage holds the attempt's whole facts pass: chunk 0 drops whatever
+  the run had staged and starts the chain, each later chunk must be the next number, and the want -> have advance
+  seals it, whole only if the last chunk was seen. A stage that is not whole (facts turned on mid-pass or after it, a
+  gap, no seal) is never reconciled. The final step throws `StagedOutputFactsIncompleteError` (a `StagedRunRestart`),
+  the run is abandoned with `output_facts_stage_incomplete` and goes round again, and the facts tables keep what they
+  had.
+- **Exactness.** Over a whole read the staged facts equal the whole-set path's (`output-facts-parity.test.ts`). One
+  difference: on a malformed event or commit link, the whole path stops at the first one and the staged path skips
+  only that row. Both are incomplete with the same reason and delete nothing.
+- **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the anchors, the table and
+  the functions. It refuses while a run that staged facts holds a live lease.
+
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
 
 The hosted session pipeline Lambda has its own flags, separate from the self-host ones above (it keeps ignoring
