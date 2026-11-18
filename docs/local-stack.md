@@ -339,11 +339,12 @@ disposable containers (`docs/session-search-proof.md`).
 
 `SEARCH_INDEX_STREAMING_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only,
 **default on**) indexes a session that is too large for one search index pass instead of marking it partial.
-Unset or `""` is the code default: on, except off when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (the facts are
-built from a whole read), where startup does not fail and the consumer logs `pipeline consumer streaming reconcile
+Unset or `""` is the code default: on, except off when `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` and the staged
+reconcile is off (the facts are then built from a whole read), where startup does not fail and the consumer logs `pipeline consumer streaming reconcile
 off` with `reason=output_facts` (info, once per start). `false` turns it off, with or without output facts, and the
 consumer then reads neither budget below. `true` is an explicit on and still fails startup together with
-`RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`. Any other value (`1`, `0`, `TRUE`, padded values included) fails startup.
+`RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` while the staged reconcile is off. With `SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true`
+output facts change none of this: the staged run stages them. Any other value (`1`, `0`, `TRUE`, padded values included) fails startup.
 To turn streaming off, set `SEARCH_INDEX_STREAMING_ENABLED=false` explicitly: leaving the variable out of the
 environment no longer means off. It applies only to a scope whose whole read stopped on `scope_too_large` alone
 (above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before. The hosted
@@ -432,8 +433,9 @@ which neither budget is read.
 `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only)
 is **default off**: unset, `""` and `false` are off, and off changes nothing (no log line, no reason code, the same
 SQL and index calls as before). `true` turns it on and needs the streaming reconcile above to resolve on: with
-`SEARCH_INDEX_STREAMING_ENABLED=false`, or with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (on or off by default),
-startup fails naming the variable. Any other value (`1`, `TRUE`, padded values included) fails startup. On, the
+`SEARCH_INDEX_STREAMING_ENABLED=false` startup fails naming the variable. With `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`
+it starts and stages the facts of a too-large scope (migration `20261105062140`, checked at startup; see "Staged
+output facts" in docs/local-stack.md). Any other value (`1`, `TRUE`, padded values included) fails startup. On, the
 consumer logs `pipeline consumer staged reconcile on` once at startup, and refuses to start on a search index without
 paged scans (the Postgres and OpenSearch adapters both have them). The hosted pipeline Lambda and the large-read
 worker never read it.
@@ -681,11 +683,15 @@ today.
   (`scope_too_large`) as before; the in-transaction streamed reconcile never runs with facts. The ClickHouse facts
   flag (`SEARCH_INDEX_OUTPUT_FACTS`) is refused together with a staged run.
 - **Chunk bounds.** The facts pass closes a chunk at 5000 inputs (never more than 25000, what one staged call takes
-  at 4 items per input) or at 32 MiB of the inputs' JSON text, catalog rows included; one larger input is a chunk
-  of its own. The writer checks the serialized call before sending it (128 MiB, half the database's jsonb limit). A
-  chunk that still cannot be staged (over that, or refused by the database for its size or memory) abandons the run
-  as `output_facts_chunk_unstageable` and writes no facts; any other staging error releases the lease and the next
-  tick retries.
+  at 4 items per input) or at 16 MiB of the inputs' JSON text in UTF-8, catalog rows included: an input that would
+  take an open chunk past it closes that chunk first, so only one input larger than the bound alone makes a chunk
+  over it. The writer checks the serialized call before sending it (128 MiB, half the database's jsonb limit; 16 MiB
+  of input is at most about 113 MiB of entries). A chunk, or the final step's own staging, that still cannot be
+  staged (over that, refused by the database for its size or memory, or past the run's record bytes bound) abandons
+  the run as `output_facts_chunk_unstageable` and writes no facts; any other staging error releases the lease and
+  the next tick retries. A staged run records the facts state owing when it claims the scope, in the claim's
+  transaction, so a run that is abandoned, interrupted or killed leaves the facts owing a pass, never marked complete
+  over facts it did not reconcile.
 - **Exactness.** Over a whole read the staged facts equal the whole-set path's (`output-facts-parity.test.ts`). One
   difference: on a malformed event or commit link, the whole path stops at the first one and the staged path skips
   only that row. Both are incomplete with the same reason and delete nothing.
