@@ -194,10 +194,11 @@ export interface StagedReconcile {
 }
 
 /**
- * The staged reconcile's interim cap on keyed records (about 1 KB of memory each): the largest
- * scope the default streaming budgets stream today (2,000,000 / STREAM_PASSES), so turning the
- * flag on never asks a pod for more key memory than streaming already does (about 0.5 GB). A
- * later slice replaces the in-memory keys and removes it.
+ * The staged reconcile's interim cap on keyed records (about 3 KB of peak memory each, measured
+ * with scripts/bench/staged-stream-rss.ts: +0.6 GB at 100000 records, +3.3 GB at 1000000): the
+ * largest scope the default streaming budgets stream today (2,000,000 / STREAM_PASSES), so turning
+ * the flag on never asks a pod for more memory than streaming already does (about 2 GB at the
+ * cap). A later slice replaces the in-memory keys and removes it.
  */
 export const STAGED_KEYED_RECORDS_CAP = 500_000;
 
@@ -1076,8 +1077,8 @@ export function searchIndexStreamFlag(env: Record<string, string | undefined>, o
  * default streams scopes up to 512 MiB and 500,000 records. Set, a budget must lie between
  * its floor (searchIndexStreamFloor: four times the effective whole-read bound, capped at the
  * ceiling; at or below it no scope past that bound could stream) and the ceiling; lower it to
- * shrink the largest streamed scope and the pod memory it needs (one chunk plus about 1 KB
- * of keys per record read). Off reads neither budget. Errors name the variable and its
+ * shrink the largest streamed scope and the pod memory it needs (one chunk plus about 3 KB
+ * per record read, measured). Off reads neither budget. Errors name the variable and its
  * range, never the value.
  */
 export function searchIndexStreamFromEnv(

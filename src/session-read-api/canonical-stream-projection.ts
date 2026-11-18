@@ -115,7 +115,7 @@ export interface StreamDeps {
    * The staged reconcile only (SEARCH_INDEX_STAGED_RECONCILE_ENABLED): each budget bounds one
    * pass, not the sum of every pass, so a scope is refused when its size exceeds a budget
    * (never four times its size), and a pass that reads more than `keyedRecordsCap` records
-   * (each keyed in memory, about 1 KB apiece) stops the stream with
+   * (each keyed in memory, about 3 KB apiece measured) stops the stream with
    * STREAM_KEYED_RECORDS_CAP. Absent: summed budgets, exactly as before.
    */
   perPass?: StreamPerPass;
