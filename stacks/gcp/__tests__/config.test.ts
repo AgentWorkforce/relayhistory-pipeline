@@ -648,7 +648,7 @@ describe("GCP self-host contract", () => {
         chartRepo: "https://agentworkforce.github.io/infra",
         relaycast: { chartVersion: "0.1.0", baseUrl: "https://relay.gcp.example.com" },
       }),
-    ).not.toThrow(/published chart/);
+    ).not.toThrow();
   });
 
   it("rejects an unpublished RelayAuth chart or repository and pins its reviewed image", () => {

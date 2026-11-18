@@ -254,9 +254,14 @@ describe("HoopDb runtime role, function boundary and migration owner inputs", ()
   it("refuses an unsafe, denylisted or half-set runtime role", () => {
     for (const role of RUNTIME_ROLE_DENYLIST)
       expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: role }))).toThrow(/dedicated non-owner role/);
-    expect([...RUNTIME_ROLE_DENYLIST]).toEqual(["postgres", "hoop", "anon", "authenticated", "service_role", "authenticator", "supabase_admin"]);
+    expect([...RUNTIME_ROLE_DENYLIST]).toEqual(["postgres", "hoop", "anon", "authenticated", "service_role", "authenticator", "supabase_admin", "supabase_auth_admin", "supabase_storage_admin", "pgbouncer"]);
+    // Case-insensitive: mixed and upper case spellings are refused too.
+    for (const role of ["Postgres", "SERVICE_ROLE", "Supabase_Auth_Admin", "supabase_STORAGE_admin", "PgBouncer", "Hoop"])
+      expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: role }))).toThrow(/dedicated non-owner role/);
+    // A name that merely contains a denied one is still a dedicated role.
+    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: "postgres_runtime" }))().hoopdb).toBe("external");
     expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRole: "bad role" }))).toThrow(/dedicated non-owner role/);
-    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRoleLogin: undefined }))).toThrow(/hoopdbRuntimeRoleLogin must be true or false/);
+    expect(check((e) => Object.assign(e, profile, { hoopdbRuntimeRoleLogin: undefined }))).toThrow(/hoopdbRuntimeRoleLogin must be set to true when/);
     expect(check((e) => { e.hoopdbRuntimeRoleLogin = true; })).toThrow(/without eks\.hoopdbRuntimeRole/);
   });
 
@@ -280,7 +285,22 @@ describe("HoopDb runtime role, function boundary and migration owner inputs", ()
   it("needs chart 0.3.2+ as an exact release for the owner URL key", () => {
     for (const v of ["0.3.0", "0.3.1", "0.3.2-rc.1", "0.3.2+build.1", "0.3", "v0.3.2", "0.03.2"])
       expect(check((e) => Object.assign(e, profile, { chartVersion: v }))).toThrow(/needs eks\.chartVersion 0\.3\.2\+ as an exact release/);
-    for (const v of ["0.3.2", "0.3.10", "0.4.0"]) expect(check((e) => Object.assign(e, profile, { chartVersion: v }))().hoopdb).toBe("external");
+    for (const v of ["0.3.2", "0.3.10", "0.4.0", "1.0.0"]) expect(check((e) => Object.assign(e, profile, { chartVersion: v }))().hoopdb).toBe("external");
     expect(MIGRATION_URL_MIN_CHART).toEqual([0, 3, 2]);
+  });
+
+  it("does not require (or accept) the owner URL key where HoopDb is in-cluster: CNPG and aws-sandbox-*", () => {
+    const sandbox = (patch: (e: NonNullable<AwsInputs["eks"]>) => void) =>
+      filled((i) => {
+        delete i.eks!.hoopdb; // external by default, yet the sandbox chart runs its own HoopDb
+        delete i.eks!.sessionDirectory;
+        patch(i.eks!);
+      });
+    const role = { hoopdbRuntimeRole: "example_runtime", hoopdbRuntimeRoleLogin: true } as const;
+    expect(validateAwsInputs("aws-sandbox-example", sandbox((e) => Object.assign(e, role)), approved).hoopdb).toBe("external");
+    expect(() => validateAwsInputs("aws-sandbox-example", sandbox((e) => Object.assign(e, role, { chartVersion: "0.3.2", hoopdbMigrationUrlKey: "HOOPDB_MIGRATION_URL" })), approved)).toThrow(/not CNPG or an aws-sandbox-\* stage/);
+    expect(() => validateAwsInputs("aws-sandbox-example", sandbox((e) => Object.assign(e, role, { hoopdbFunctionBoundaryMode: "event-trigger" })), approved)).toThrow(/not CNPG or an aws-sandbox-\* stage/);
+    // CNPG (the proof example): same rule.
+    expect(validateAwsInputs("aws-proof", filled((i) => Object.assign(i.eks!, role)), approved).hoopdb).toBe("cnpg");
   });
 });

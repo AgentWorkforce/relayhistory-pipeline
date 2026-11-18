@@ -279,10 +279,12 @@ to run (`runtime_role_unset`).
 
 - `hoopdbRuntimeRole` / `hoopdbRuntimeRoleLogin` (required together): the dedicated non-owner
   role the services connect as, pre-provisioned by an operator
-  (`supabase/bootstrap/hoopdb_runtime_role_supabase.sql`). Never `postgres`, `hoop`, `anon`,
-  `authenticated`, `service_role`, `authenticator` or `supabase_admin`. `hoopdbRuntimeRoleLogin`
+  (`supabase/bootstrap/hoopdb_runtime_role_supabase.sql`). Never (in any letter case) `postgres`,
+  `hoop`, `anon`, `authenticated`, `service_role`, `authenticator`, `supabase_admin`,
+  `supabase_auth_admin`, `supabase_storage_admin` or `pgbouncer`. `hoopdbRuntimeRoleLogin`
   must be `true` for now: a NOLOGIN role needs a workload login role, and there is no input for
-  one. On external HoopDb a runtime role also requires `hoopdbMigrationUrlKey`. Once set,
+  one. On external HoopDb a runtime role also requires `hoopdbMigrationUrlKey`; where HoopDb runs
+  in the cluster (CNPG, or any `aws-sandbox-*` stage) it is neither required nor accepted. Once set,
   `HOOPDB_SUPABASE_SHIM` is no longer repeated in `worker.extraEnv`; the chart (0.3.0+) renders it
   once into the migrate Job from `worker.migrations.supabaseShim`.
 - `hoopdbFunctionBoundaryMode` (external only): `event-trigger` after

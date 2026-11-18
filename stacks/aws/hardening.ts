@@ -383,6 +383,17 @@ export function hoopdbBackend(stage: string, backend: string | undefined): HoopD
   return b;
 }
 
+/**
+ * Whether the chart runs HoopDb in the cluster for this stage, exactly as eks.ts eksChartValues
+ * decides it (`sandbox || cnpg`): the CNPG backend, or any aws-sandbox-* stage (the umbrella's
+ * own hoopdb is enabled there whatever eks.hoopdb.backend says). In-cluster, the migrate Job and
+ * the services read the in-cluster Secret, and the external-only migrator inputs
+ * (hoopdbMigrationUrlKey, hoopdbFunctionBoundaryMode) are not rendered.
+ */
+export function hoopdbInCluster(stage: string, backend: HoopDbBackend): boolean {
+  return backend === "cnpg" || stage.startsWith("aws-sandbox-");
+}
+
 // ---------------------------------------------------------------------------
 // Buckets and the GitHub publisher
 // ---------------------------------------------------------------------------
