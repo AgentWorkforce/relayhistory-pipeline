@@ -29,8 +29,9 @@ import { NEON_FREE_SQL } from "../shared/never-in-neon.ts";
 import { SESSION_POINTERS_SQL } from "../session-read-api/session-timing-source.ts";
 import type { AnalysisModelTransport } from "./engine/model.ts";
 import type { AnalysisEvidenceDeps } from "./evidence.ts";
+import { type ClaimsPort, claimsHook } from "./claims.ts";
 import { type DecisionRecordsSink, decisionRecordsHook } from "./decision-records.ts";
-import { runAnalysisJob } from "./processor.ts";
+import { type AnalysisJob, type AnalysisJobOutput, runAnalysisJob } from "./processor.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
 import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 
@@ -145,6 +146,17 @@ export function canonicalEvidenceDeps(
   };
 }
 
+/** Decisions exactly as before; then, only with the claims port, intents and constraints. Never throws. */
+function relayfactsHook(decisions: DecisionRecordsSink, claims: ClaimsPort | undefined, counts: Record<string, number>) {
+  const decided = decisionRecordsHook(decisions, counts);
+  if (!claims) return decided;
+  const claimed = claimsHook(claims, counts);
+  return async (job: AnalysisJob, output: AnalysisJobOutput) => {
+    await decided(job, output);
+    await claimed(job, output);
+  };
+}
+
 export function analysisTick(deps: {
   config: AnalysisConfig;
   db: SqlExecutor;
@@ -160,6 +172,12 @@ export function analysisTick(deps: {
    * decision records in that job's workspace. Absent = no extractor, no call, no count.
    */
   decisionRecords?: DecisionRecordsSink;
+  /**
+   * Relayfacts claims (SESSION_INTEL_CLAIMS_ENABLED inside SUMMARY_DECISION_RECORDS_ENABLED): after the
+   * unchanged decisionRecords hook, constraints and intents through relayfacts_claims_insert_v1 plus the
+   * narrow supersession step (claims.ts). Absent = decisionRecords exactly as before.
+   */
+  claims?: ClaimsPort;
   /**
    * The EKS runner's drain signal (runner.ts): true once SIGTERM arrived, so no further job is
    * claimed in this tick; the job in flight still finishes. Absent (the Lambda) = never stops early.
@@ -194,7 +212,7 @@ export function analysisTick(deps: {
           transport: deps.transport,
           assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns,
           cutoverProof: deps.config.cutoverProof,
-          ...(deps.decisionRecords ? { onCompleted: decisionRecordsHook(deps.decisionRecords, counts) } : {}),
+          ...(deps.decisionRecords ? { onCompleted: relayfactsHook(deps.decisionRecords, deps.claims, counts) } : {}),
         },
         { leaseSeconds: deps.config.leaseSeconds },
       );
