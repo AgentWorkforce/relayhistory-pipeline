@@ -504,6 +504,14 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "tables sessions.search_reconcile_runs_v1 and sessions.search_reconcile_stage_v1 and function sessions.search_reconcile_claim_v1",
     sql: "SELECT to_regclass('sessions.search_reconcile_runs_v1') IS NOT NULL AND to_regclass('sessions.search_reconcile_stage_v1') IS NOT NULL AND to_regprocedure('sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062120_analysis_org_s3_cutover.sql": {
+    evidence: "table sessions.org_s3_cutover and function sessions.session_analysis_cutover_free",
+    sql: "SELECT to_regclass('sessions.org_s3_cutover') IS NOT NULL AND to_regprocedure('sessions.session_analysis_cutover_free(text,text,text,text,timestamptz)') IS NOT NULL AS applied",
+  },
+  "upstream:20261105062130_analysis_cutover_source_revision.sql": {
+    evidence: "function sessions.session_analysis_source_revision binds the org S3 cutover (org_s3_cutover_v1)",
+    sql: "SELECT coalesce((SELECT position('org_s3_cutover_v1' IN prosrc) > 0 FROM pg_proc WHERE oid = to_regprocedure('sessions.session_analysis_source_revision(text,text,text)')), false) AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

@@ -2646,6 +2646,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const MDE = "upstream:20261105062090_relayfacts_erase.sql";
     const MUE = "upstream:20261105062100_relayfacts_user_erase.sql";
     const SRS = "upstream:20261105062110_search_reconcile_staging.sql";
+    const OSC = "upstream:20261105062120_analysis_org_s3_cutover.sql";
+    const OSR = "upstream:20261105062130_analysis_cutover_source_revision.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2656,7 +2658,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2707,6 +2709,32 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062130 is newest: 062120's down refuses (55000) while it is applied; its checksum-pinned down
+    // restores 046000's revision body exactly and drops its ledger row, and refuses on a rerun.
+    const revSrc = async () => (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.session_analysis_source_revision(text,text,text)'::regprocedure")).rows[0]!.s;
+    expect(await names()).toContain(OSR);
+    expect(await revSrc()).toContain("org_s3_cutover_v1");
+    expect((await failure(rollback("20261105062120_analysis_org_s3_cutover.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062130_analysis_cutover_source_revision.down.sql");
+    expect(await names()).not.toContain(OSR);
+    expect(await revSrc()).toBe(bodyOf("20261105046000_analysis_jobs.sql", "session_analysis_source_revision", "$revision$"));
+    expect((await failure(rollback("20261105062130_analysis_cutover_source_revision.down.sql")))?.code).toBe("55000");
+    // 20261105062120 is newest: the 062110 staged-reconcile down refuses (55000) while it is applied; its
+    // checksum-pinned down refuses while a cutover is recorded, then drops the proof, the tables, their functions
+    // and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(OSC);
+    expect((await failure(rollback("20261105062110_search_reconcile_staging.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(SRS);
+    await db.exec("INSERT INTO sessions.org_s3_cutover (pointer_fix_deployed_at, org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by) VALUES ('2026-01-01T00:00:00Z', 'org-r', now() - interval '1 hour', now() - interval '1 hour', 'uploads_fenced_worker_admission_stopped+neon_turn_writes_forwarded', 'test')");
+    expect((await failure(rollback("20261105062120_analysis_org_s3_cutover.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.org_s3_cutover")).toBe("sessions.org_s3_cutover");
+    await db.exec("ALTER TABLE sessions.org_s3_cutover DISABLE TRIGGER org_s3_cutover_immutable; DELETE FROM sessions.org_s3_cutover; ALTER TABLE sessions.org_s3_cutover ENABLE TRIGGER org_s3_cutover_immutable");
+    await rollback("20261105062120_analysis_org_s3_cutover.down.sql");
+    expect(await names()).not.toContain(OSC);
+    expect(await relation("sessions.org_s3_cutover")).toBe(null);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname IN ('session_analysis_cutover_free','session_analysis_first_seen_v1','org_s3_cutover_immutable_v1','org_s3_cutover_stamp_v1','org_s3_cutover_correct_v1')")).rows[0]!.n).toBe(0);
+    expect(await relation("sessions.org_s3_cutover_history")).toBe(null);
+    expect((await failure(rollback("20261105062120_analysis_org_s3_cutover.down.sql")))?.code).toBe("55000");
     // 20261105062110 is newest: the 062100 down refuses (55000) while the staged reconcile tables are applied; the
     // checksum-pinned 062110 down drops its nine functions, two tables and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(SRS);

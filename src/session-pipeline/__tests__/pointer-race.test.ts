@@ -12,7 +12,7 @@ import { sha256Hex } from "../../../packages/object-store/src/crypto.ts";
 import { computeContentSha256, manifestKey, objectKey, objectStoreManifestReader, prefixAllowed, prefixOrgResolver, rawChunkKey, type ChunkEntry, type ManifestV1, type ObjectStore, type ManifestReader } from "../../shared/vendor.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
-import { droppedFanout } from "../pointer.ts";
+import { droppedFanout, indexPointer } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
@@ -37,6 +37,8 @@ afterEach(async () => { await pg.close(); await rm(root, { recursive: true, forc
 const loc = { prefix: "96bulls/org_1", workspaceId: "ws_1", machineId: "srv_bb", harness: "claude", sessionId: "sess_1", startDate: "2026-11-01" };
 /** The same session after the exporter moved its start date (review #2 N1). */
 const locB = { ...loc, startDate: "2026-10-31" };
+/** The same session moved to a LATER start date. */
+const locLater = { ...loc, startDate: "2026-11-03" };
 /** A move further than the probe reaches (MOVE_PROBE_DAYS). */
 const locFar = { ...loc, startDate: "2026-08-01" };
 async function writeManifest(revision: number, at: typeof loc = loc) {
@@ -168,6 +170,102 @@ describe("an exporter date move (review #2 N1, real SQL)", () => {
     expect(await failures("5", body(b, "ObjectCreated:Put", "05"))).toEqual([]);
     expect(await row()).toMatchObject({ deleted_at: null, manifest_key: b });
     expect(await directoryLive()).toBe(true);
+  }, 60_000);
+
+  // First-seen across a move (the analysis cutover proof, 20261105062120). The new key restarts at
+  // revision 1, as the exporter writes it, so the revision fence keeps it out and the move branch runs.
+  const created = async () => (await pg.query<{ c: string }>("SELECT created_at::text c FROM sessions.session_index WHERE session_id = 'sess_1'")).rows[0]!.c;
+  const landedPut = (key: string) => ({ provider: "s3" as const, bucket: "bucket", key, etag: "e" });
+
+  test("a move to a LATER start date is 'moved' and keeps the earlier created_at", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const later = await writeManifest(1, locLater);
+    await store.delete(objectKey(a));
+    const out = await indexPointer(landedPut(later), deps().pointer);
+    expect(out).toMatchObject({ status: "moved", manifestKey: later });
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: later, revision: "1" });
+    expect(await created()).toBe(before);
+  }, 60_000);
+
+  test("a move to an EARLIER start date lowers created_at to the new start (least never raises)", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const earlier = await writeManifest(1, locB);
+    await store.delete(objectKey(a));
+    expect(await indexPointer(landedPut(earlier), deps().pointer)).toMatchObject({ status: "moved", manifestKey: earlier });
+    expect(Date.parse(await created())).toBeLessThan(Date.parse(before));
+    expect(await created()).toBe((await pg.query<{ c: string }>(`SELECT '${locB.startDate}T10:00:00Z'::timestamptz::text c`)).rows[0]!.c);
+  }, 60_000);
+
+  test("a move through the PUBLICATION transaction (the production path) is 'moved', revision 1, created_at unchanged", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const later = await writeManifest(1, locLater);
+    await store.delete(objectKey(a));
+    let transactions = 0;
+    // The publication authority's schema-generation witness (the role-validation pass the migrator records).
+    await pg.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','" + "a".repeat(64) + "','pass')");
+    const base = deps().pointer;
+    const published = {
+      ...base,
+      publication: {
+        schemaGeneration: "a".repeat(64),
+        transact: <T,>(work: (tx: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> }) => Promise<T>) =>
+          pg.transaction(async (tx) => {
+            transactions += 1;
+            return work({ query: async (t: string, p?: unknown[]) => ({ rows: (await tx.query(t, p as unknown[])).rows }) });
+          }),
+      },
+    } as typeof base;
+    expect(await indexPointer(landedPut(later), published)).toMatchObject({ status: "moved", manifestKey: later });
+    expect(transactions).toBeGreaterThan(0);
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: later, revision: "1" });
+    expect(await created()).toBe(before);
+    expect((await pg.query("SELECT 1 FROM sessions.session_index WHERE session_id = 'sess_1'")).rows).toHaveLength(1);
+  }, 60_000);
+
+  test("a skipped move (the new manifest vanished before the re-key) throws retryably and leaves the old row", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const later = await writeManifest(1, locLater);
+    await store.delete(objectKey(a));
+    // The new key's manifest reads as gone once the move is detected (the re-key's own read).
+    let moving = false;
+    const base = deps().pointer;
+    const db = { ...base.db, async query(text: string, params?: unknown[]) {
+      if (text.includes("deleted_at IS NOT NULL AS deleted FROM sessions.session_index")) moving = true;
+      return base.db.query(text, params);
+    } } as HoopDb;
+    const vanishing: ManifestReader = { ...reader, read: async (k) => (moving && k === later ? null : reader.read(k)) };
+    const err = await indexPointer(landedPut(later), { ...base, db, reader: vanishing }).catch((e: unknown) => e as { code?: string; retryable?: boolean });
+    expect(err).toMatchObject({ code: "pointer_move_skipped", retryable: true });
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
+    expect(await created()).toBe(before);
+  }, 60_000);
+
+  test("a move is atomic: a failure after the delete leaves the old row and its created_at; the retry moves it", async () => {
+    const a = await atRevision3();
+    const before = await created();
+    const later = await writeManifest(1, locLater);
+    await store.delete(objectKey(a));
+    // A pooled HoopDb whose one connection is this PGlite: the move runs in a real transaction.
+    let failNext = true;
+    const client = {
+      async query(text: string, params?: unknown[]) {
+        if (failNext && text.includes("upsert_session_index")) { failNext = false; throw new Error("injected failure after the delete"); }
+        return pg.query(text, params as unknown[]);
+      },
+      release() {},
+    };
+    const base = deps().pointer;
+    const pooled = { ...base, db: { ...base.db, pool: { connect: async () => client } } as unknown as HoopDb };
+    await expect(indexPointer(landedPut(later), pooled)).rejects.toThrow("injected failure after the delete");
+    expect(await row()).toMatchObject({ deleted_at: null, manifest_key: a, revision: "3" });
+    expect(await created()).toBe(before);
+    expect(await indexPointer(landedPut(later), pooled)).toMatchObject({ status: "moved", manifestKey: later });
+    expect(await row()).toMatchObject({ manifest_key: later, revision: "1" });
+    expect(await created()).toBe(before);
   }, 60_000);
 
   test("deleting the old key never tombstones a row that already names the new key", async () => {

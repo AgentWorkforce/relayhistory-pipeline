@@ -205,14 +205,16 @@ async function indexLocked(landed: ObjectLanded, orgId: string, scope: SessionSc
     if (otherLive)
       throw new PipelineError("pointer_move_pending", "the session's other key is still live; retry after its erasure", true);
     // The stored key is gone (or tombstoned): re-key the row to this one. The
-    // row is derived, and the upsert rebuilds it from this manifest.
-    await deps.db.query(
-      `DELETE FROM sessions.session_index
-        WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
-          AND manifest_key = $6`,
-      [...pk, stored.manifest_key],
-    );
-    await upsert();
+    // row is derived, and the upsert rebuilds it from this manifest. The delete
+    // and the re-insert commit together inside the upsert's transaction, and
+    // the new row keeps least(old, new) created_at (first-seen survives the move:
+    // the analysis cutover proof, 20261105062120), so a failure in between leaves
+    // the old row intact and a retry moves it again.
+    const moved = await index.upsertRawPointer(message.payload as Parameters<typeof index.upsertRawPointer>[0], message.ctx, { rekeyFrom: stored.manifest_key });
+    // A skipped move (manifest_missing, publication_retired, operator_erased, ...) did not re-key: the
+    // old row would stay live naming a gone key. Retry instead of reporting a move that did not happen.
+    if (moved && moved.status === "skipped")
+      throw new PipelineError("pointer_move_skipped", `the session's move was not applied (${moved.reason}); retry`, true);
     return { status: "moved", scope, manifestKey: landed.key, ...(revision !== undefined ? { revision } : {}) };
   }
   return {

@@ -25,6 +25,13 @@ hostname and the exact `relayhistory_legacy` database before building a pool.
 runtime edges in this repo only. Edges on the Cloud side, in unmerged work and
 in the preserved tooling below are outside it.
 
+**The session analysis job reads no Neon edge.** It reads canonical S3 evidence
+only. Whether that evidence is complete for a session that may have Neon-only
+turns is decided by conditions (a) to (d) in
+[session-analysis-completeness.md](session-analysis-completeness.md). That
+covers the scoped per-org cutover proof (`SESSION_ANALYSIS_CUTOVER_PROOF`,
+migrations `20261105062120` and `20261105062130`) and its operator recorder.
+
 ## Runtime consumers
 
 | Consumer | Route / flag | Under the profile | Test that proves it | Gap |

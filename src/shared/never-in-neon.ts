@@ -14,6 +14,10 @@
  *   objects   no manifest of the scope was written by the Neon export/sync: no signed export
  *             marker and no backfill epoch (neonDerivedManifest). This catches a turns-only
  *             Neon session that was copied to S3 after the seal.
+ *
+ * The analysis worker has one more, scoped route (condition (d), SESSION_ANALYSIS_CUTOVER_PROOF=on):
+ * the org's recorded S3 cutover (sessions.session_analysis_cutover_free, 20261105062120). See
+ * docs/session-analysis-completeness.md. The read API does not use it.
  */
 import { RELAYHISTORY_EXPORT_EXTENSION } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import type { ManifestV1 } from "./vendor.ts";

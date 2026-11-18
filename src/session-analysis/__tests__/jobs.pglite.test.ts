@@ -234,6 +234,70 @@ describe("analysis_request_v1", () => {
     }
   });
 
+  test("062130: without a cutover row the revision is byte-identical to 046000's (applying it invalidates nothing)", async () => {
+    // 046000's exact body, installed beside the replaced one under another name.
+    const original = read("supabase/migrations/20261105046000_analysis_jobs.sql").match(
+      /CREATE FUNCTION sessions\.session_analysis_source_revision\([\s\S]*?\n\$revision\$;/,
+    )![0].replace("sessions.session_analysis_source_revision(", "sessions.test_revision_046000(");
+    await pg.exec(original);
+    const both = async (session = KEY.sessionId) =>
+      (await pg.query<{ now: string | null; then: string | null }>(
+        "SELECT sessions.session_analysis_source_revision($1, $2, $3) AS now, sessions.test_revision_046000($1, $2, $3) AS then",
+        [KEY.orgId, KEY.workspaceId, session],
+      )).rows[0]!;
+    let r = await both();
+    expect(r.now).toMatch(/^[0-9a-f]{64}$/);
+    expect(r.now).toBe(r.then);
+    expect((await both("no-such-session")).now).toBeNull();
+    // Another org's cutover changes nothing here.
+    await pg.query(`INSERT INTO sessions.org_s3_cutover (pointer_fix_deployed_at, org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by)
+      VALUES ('2026-01-01T00:00:00Z', 'org-other', now() - interval '3 hours', now() - interval '3 hours', 'uploads_fenced_worker_admission_stopped+neon_turn_writes_forwarded', 'op')`);
+    r = await both();
+    expect(r.now).toBe(r.then);
+    // This org's cutover: the revision moves (once), the 046000 value does not.
+    await pg.query(`INSERT INTO sessions.org_s3_cutover (pointer_fix_deployed_at, org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by)
+      VALUES ('2026-01-01T00:00:00Z', $1, now() - interval '3 hours', now() - interval '3 hours', 'uploads_fenced_worker_admission_stopped+neon_turn_writes_forwarded', 'op')`, [KEY.orgId]);
+    const after = await both();
+    expect(after.then).toBe(r.then);
+    expect(after.now).not.toBe(r.now);
+    await pg.exec("DROP FUNCTION sessions.test_revision_046000(text, text, text)");
+  });
+
+  test("062130: an older pointer of the session in ANOTHER workspace flips the cutover verdict and moves the revision: no reuse", async () => {
+    await pg.query(`INSERT INTO sessions.org_s3_cutover (pointer_fix_deployed_at, org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by)
+      VALUES ('2026-01-01T00:00:00Z', $1, now() - interval '3 hours', now() - interval '3 hours', 'uploads_fenced_worker_admission_stopped+neon_turn_writes_forwarded', 'op')`, [KEY.orgId]);
+    const verdict = async () =>
+      (await pg.query<{ f: boolean }>("SELECT sessions.session_analysis_cutover_free($1, $2, $3, $4, now() - interval '1 minute') AS f",
+        [KEY.orgId, KEY.workspaceId, KEY.harness, KEY.sessionId])).rows[0]!.f;
+    expect(await verdict()).toBe(true);
+    const first = await request();
+    const store = jobStore();
+    expect((await publish(store, (await store.claim({ leaseSeconds: 600 }))!)).stage).toBe("completed");
+    const rev = async () => (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
+    const before = await rev();
+    // Control: unchanged inputs are reused.
+    await age("session_analysis_requests_v2", "3 minutes");
+    expect((await request()).request.analysisId).toBe(first.request.analysisId);
+    // The same physical session id appears in another workspace with an older first activity.
+    await pointer(pg, { key: { ...KEY, workspaceId: "ws-other" }, manifestKey: "org-a/ws-other/m-1/claude/2026-10-29/s-1/manifest.json" });
+    await pg.query("UPDATE sessions.session_index SET created_at = now() - interval '5 hours' WHERE workspace_id = 'ws-other'");
+    expect(await verdict()).toBe(false);
+    expect(await rev()).not.toBe(before);
+    await age("session_analysis_requests_v2", "3 minutes");
+    const third = await request();
+    expect(third.request.analysisId).not.toBe(first.request.analysisId);
+    expect(third.request.status).toBe("queued");
+  });
+
+  test("062130: a stricter correction of the cutover moves the revision", async () => {
+    await pg.query(`INSERT INTO sessions.org_s3_cutover (pointer_fix_deployed_at, org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by)
+      VALUES ('2026-01-01T00:00:00Z', $1, now() - interval '3 hours', now() - interval '3 hours', 'uploads_fenced_worker_admission_stopped+neon_turn_writes_forwarded', 'op')`, [KEY.orgId]);
+    const rev = async () => (await pg.query<{ r: string }>("SELECT sessions.session_analysis_source_revision($1, $2, $3) AS r", [KEY.orgId, KEY.workspaceId, KEY.sessionId])).rows[0]!.r;
+    const before = await rev();
+    await pg.query("SELECT sessions.org_s3_cutover_correct_v1($1, now() - interval '2 hours', now() - interval '2 hours', 'op2', NULL, false)", [KEY.orgId]);
+    expect(await rev()).not.toBe(before);
+  });
+
   test("P2: a change that flips the never-in-Neon proof (an old tombstoned pointer) moves the revision: no reuse", async () => {
     await pg.query(
       `INSERT INTO sessions.ingest_frozen_source_completeness
@@ -520,7 +584,10 @@ test("the migration's engine identity is src/session-analysis/versions.ts", () =
 describe("analysisTick is default-off", () => {
   test("disabled or without a model it claims nothing", async () => {
     const { analysisConfig, analysisTick } = await import("../worker.ts");
-    expect(analysisConfig({})).toEqual({ enabled: false, batch: 2, leaseSeconds: 600, assumeNoLegacyTurns: false });
+    expect(analysisConfig({})).toEqual({ enabled: false, batch: 2, leaseSeconds: 600, assumeNoLegacyTurns: false, cutoverProof: false });
+    // SESSION_ANALYSIS_CUTOVER_PROOF: exactly "on" switches condition (d) on; anything else is off.
+    expect(analysisConfig({ SESSION_ANALYSIS_CUTOVER_PROOF: "on" }).cutoverProof).toBe(true);
+    for (const v of ["true", "ON", "1", " on", ""]) expect(analysisConfig({ SESSION_ANALYSIS_CUTOVER_PROOF: v }).cutoverProof).toBe(false);
     expect(analysisConfig({ SESSION_ANALYSIS_ENABLED: "1", SESSION_ANALYSIS_BATCH: "99" }).enabled).toBe(false);
     await request();
     const base = { db: hoopDb(pg), store: null as never, canonical: null as never };
