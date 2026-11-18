@@ -104,8 +104,12 @@ export interface StagedReconcileOps<R> {
    * record the scope as owing a pass, so a crash leaves it for the next reconcile tick.
    */
   claimed?(tx: SqlExecutor): Promise<void>;
-  /** Only with `hooks.onBatch`: the post-fold facts input of these keys (one more source pass per run). */
-  wantEvents?(read: R, keys: readonly string[]): Promise<StagedFactsEvents>;
+  /**
+   * Only with `hooks.onBatch`: the facts pass. One source pass handing the whole-read facts input
+   * (post-fold records and every projection row) to `emit` in source order, at most `chunk` items per
+   * call, awaiting each.
+   */
+  factsPass?(read: R, chunk: number, emit: (events: StagedFactsEvents) => Promise<void>): Promise<void>;
   /** Only with `hooks.onFinish`: the source read's own completeness (default true: an incomplete read never reaches the final step). */
   sourceComplete?(read: R): boolean;
   /** The scope's current source stamp, read on `tx` under the scope lock. */
@@ -127,26 +131,20 @@ export interface StagedRunRef {
 }
 
 /**
- * A "want" batch's events, in the shape outputFactsFromScope reads (output-facts.ts): the projection
+ * A "facts" chunk's events, in the shape outputFactsFromScope reads (output-facts.ts): the projection
  * rows with their table names (convergence_events, session_commit_links, ...) and the stream
- * records, both AFTER the fold, i.e. the same winners readCanonicalScope would produce for the
- * batch's keys, never pre-fold copies.
+ * records, both AFTER the fold (the winners readCanonicalScope would produce), never pre-fold copies.
+ * Concatenated over every chunk of the pass they equal the whole read's projectionRows and records.
  */
 export interface StagedFactsEvents {
   projectionRows: ReadonlyArray<{ table: string; row: Record<string, unknown> }>;
   records: readonly RelayhistoryStreamRecord[];
 }
 
-/**
- * Where a "want" batch sits in the run's want pass: the run's own position (chunk_cursor), covering
- * every batch the module staged in this run, whether or not a hook was attached at the time. `before`
- * is the cursor before this batch was staged (null on the first batch of the pass, i.e. the pass
- * started from nothing in this or an earlier attempt), `after` the cursor this batch set (its last
- * key). A hook attached late, or after a resume, sees a `before` it never recorded.
- */
-export interface StagedWantCursor {
-  before: string | null;
-  after: string;
+/** Where a "facts" chunk sits in the attempt's facts pass: `seq` from 0, `last` on the final chunk. */
+export interface StagedFactsChunk {
+  seq: number;
+  last: boolean;
 }
 
 /**
@@ -166,30 +164,33 @@ export class StagedRunRestart extends Error {
  * module's own transaction for that step, so a throw rolls the step back (with any writes the hook
  * made on `tx`) and the run resumes there after the lease expires; the hook then sees the step
  * again, so it must be idempotent per run id. A hook may call further sessions functions on `tx`
- * under the same run id and lease nonce. Delivering "want" events costs the wiring one more source
- * pass per run, made only when `onBatch` is set.
+ * under the same run id and lease nonce. The facts pass costs the wiring one more source
+ * pass per attempt, made only when `onBatch` is set.
  */
 export interface StagedReconcileHooks<W = StagedFactsEvents, R = unknown> {
   /**
-   * Once per committed batch, in the batch's own transaction, after the module staged or wrote it:
-   * `phase` "want" for a batch of passes 1-3 output (`events` as StagedFactsEvents), "write" for a
-   * pass 4 batch (the index rows written; facts may ignore it).
+   * "facts": the attempt's facts pass. At the end of the want phase (after its last batch, before the
+   * want -> have advance), and only when `onBatch` is set, the module makes ONE extra source pass that
+   * streams the whole-read facts input in source order: every post-fold record and every projection row
+   * the whole read produces (convergence_events rows in and out of the window, catalog rows, display
+   * values), in chunks, each delivered here in its own committed transaction. `chunk.seq` counts from 0
+   * within the attempt; `chunk.last` marks the final chunk; a scope with no input gets one empty chunk
+   * (seq 0, last). The pass is not resumable: a kill before the advance resumes in the want phase and
+   * the pass runs again from seq 0 (reset on seq 0). An attempt that resumed past the want phase gets no
+   * chunks and no seal.
    *
-   * Order: "want" batches arrive in ascending stream index key of their keys (streamIndexKey, C
-   * order), each key once per run attempt. That is the only order guaranteed. Batches are not
-   * self-contained: related events of one session (a commit call and its result, a turn's parts)
-   * can sit in different batches, so anything that needs the session as a whole must stage what it
-   * needs and decide in `onFinish`.
+   * "write": once per pass 4 batch, in its transaction, after the rows were written (facts may ignore it).
    */
   onBatch?(
     tx: SqlExecutor,
     run: StagedRunRef,
-    batch: { phase: "want"; events: W; cursor: StagedWantCursor } | { phase: "write"; events: readonly R[] },
+    batch: { phase: "facts"; events: W; chunk: StagedFactsChunk } | { phase: "write"; events: readonly R[] },
   ): Promise<void>;
   /**
-   * Once per want pass, in the same transaction as the want -> have advance: the seal of the pass.
-   * `cursor` is the run's cursor at that point, the last want key staged in the pass (null when the
-   * pass staged nothing). Not called on an attempt that resumed past the want phase.
+   * Once per want pass, in the same transaction as the want -> have advance, after the facts pass's
+   * last chunk: the seal. `cursor` is the run's cursor at that point (the last want key staged, null
+   * when the pass staged nothing; informational). Not called on an attempt that resumed past the want
+   * phase.
    */
   onWantDone?(tx: SqlExecutor, run: StagedRunRef, pass: { cursor: string | null }): Promise<void>;
   /**
@@ -209,6 +210,7 @@ export interface StagedReconcileHooks<W = StagedFactsEvents, R = unknown> {
 export type StagedBoundary =
   | "claimed"
   | "want:batch"
+  | "want:facts"
   | "want:done"
   | "have:batch"
   | "have:done"
@@ -237,6 +239,8 @@ export interface StagedReconcileDeps {
   abandonOn?: (error: unknown) => string | null;
   /** Tests only. */
   boundary?: (point: StagedBoundary) => void | Promise<void>;
+  /** Items per facts chunk (default 5000). */
+  factsChunk?: number;
   /** The output-facts hooks (slice 2c); absent: none is called. */
   hooks?: StagedReconcileHooks;
 }
@@ -312,7 +316,8 @@ export async function runStagedReconcile<R>(
     await deps.boundary?.(p);
   };
 
-  if (deps.hooks?.onBatch && !ops.wantEvents) throw new Error("staged reconcile: onBatch needs ops.wantEvents");
+  if (deps.hooks?.onBatch && !ops.factsPass) throw new Error("staged reconcile: onBatch needs ops.factsPass");
+  const factsChunk = deps.factsChunk ?? 5000;
   const claim = await deps.transact(async (tx) => {
     const { rows } = await tx.query<{
       run_id: string; lease_nonce: string; phase: StagedPhase; chunk_cursor: string | null;
@@ -367,14 +372,26 @@ export async function runStagedReconcile<R>(
       for (let i = 0; i < todo.length; i += stageBatch) {
         const batch = todo.slice(i, i + stageBatch);
         const last = batch[batch.length - 1]!.key;
-        const events = deps.hooks?.onBatch ? await ops.wantEvents!(r, batch.map((w) => w.key)) : undefined;
-        const before = cursor; // the run's own cursor before this batch (null: the pass's first batch)
-        await deps.transact(async (tx) => {
-          await stage(tx, "want", 3, batch.map((w) => ({ k: w.key, o: ownerOf(w), t: w.tsMs, f: w.fingerprint })), last);
-          if (events) await deps.hooks!.onBatch!(tx, { runId: lease.runId, nonce: lease.nonce }, { phase: "want", events, cursor: { before, after: last } });
-        });
+        await deps.transact((tx) => stage(tx, "want", 3, batch.map((w) => ({ k: w.key, o: ownerOf(w), t: w.tsMs, f: w.fingerprint })), last));
         cursor = last;
         await boundary("want:batch");
+      }
+      // The facts pass (hooks only): one source pass, its chunks each in their own transaction, the
+      // last flagged; an empty scope still gets one empty last chunk. Not resumable: rerun from seq 0.
+      if (deps.hooks?.onBatch) {
+        const ref = { runId: lease.runId, nonce: lease.nonce };
+        let seq = 0;
+        let pending: StagedFactsEvents | undefined;
+        const deliver = (events: StagedFactsEvents, last: boolean) => {
+          const chunk = { seq: seq++, last };
+          return deps.transact((tx) => deps.hooks!.onBatch!(tx, ref, { phase: "facts", events, chunk }));
+        };
+        await ops.factsPass!(r, factsChunk, async (events) => {
+          if (pending) await deliver(pending, false);
+          pending = events;
+        });
+        await deliver(pending ?? { projectionRows: [], records: [] }, true);
+        await boundary("want:facts");
       }
       const kinds = [...new Set(ops.regenerableKinds(r))].sort();
       const sealed = cursor;
