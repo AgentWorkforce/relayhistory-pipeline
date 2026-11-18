@@ -129,6 +129,30 @@ export interface StagedFactsEvents {
 }
 
 /**
+ * Where a "want" batch sits in the run's want pass: the run's own position (chunk_cursor), covering
+ * every batch the module staged in this run, whether or not a hook was attached at the time. `before`
+ * is the cursor before this batch was staged (null on the first batch of the pass, i.e. the pass
+ * started from nothing in this or an earlier attempt), `after` the cursor this batch set (its last
+ * key). A hook attached late, or after a resume, sees a `before` it never recorded.
+ */
+export interface StagedWantCursor {
+  before: string | null;
+  after: string;
+}
+
+/**
+ * Thrown by a hook (typically `onFinish`, when its stage does not cover the whole want pass) to send
+ * the run round again: the module rolls the step back, abandons the run with `reason` (its stage rows
+ * go, cascading anything keyed to them) and returns `restart`; the next attempt restages from
+ * nothing with the hook attached from the first batch, so it does not loop.
+ */
+export class StagedRunRestart extends Error {
+  constructor(readonly reason: "output_facts_stage_incomplete") {
+    super(`staged reconcile restart: ${reason}`);
+  }
+}
+
+/**
  * Hooks for a consumer of the run's batches (the output-facts slice, 2c). Both run inside the
  * module's own transaction for that step, so a throw rolls the step back (with any writes the hook
  * made on `tx`) and the run resumes there after the lease expires; the hook then sees the step
@@ -148,7 +172,17 @@ export interface StagedReconcileHooks<W = StagedFactsEvents, R = unknown> {
    * can sit in different batches, so anything that needs the session as a whole must stage what it
    * needs and decide in `onFinish`.
    */
-  onBatch?(tx: SqlExecutor, run: StagedRunRef, batch: { phase: "want"; events: W } | { phase: "write"; events: readonly R[] }): Promise<void>;
+  onBatch?(
+    tx: SqlExecutor,
+    run: StagedRunRef,
+    batch: { phase: "want"; events: W; cursor: StagedWantCursor } | { phase: "write"; events: readonly R[] },
+  ): Promise<void>;
+  /**
+   * Once per want pass, in the same transaction as the want -> have advance: the seal of the pass.
+   * `cursor` is the run's cursor at that point, the last want key staged in the pass (null when the
+   * pass staged nothing). Not called on an attempt that resumed past the want phase.
+   */
+  onWantDone?(tx: SqlExecutor, run: StagedRunRef, pass: { cursor: string | null }): Promise<void>;
   /**
    * Once, in the final transaction, after `commit` and before the run is finished (its stage rows
    * dropped). `complete` is the pass's own verdict (false: a refused write, nothing deleted);
