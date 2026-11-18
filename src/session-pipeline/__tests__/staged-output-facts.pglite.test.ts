@@ -239,6 +239,25 @@ describe("20261105062140 staged output facts", () => {
       await finishFails(run);
     });
 
+    test("a budget or deadline stop inside the facts pass (chunks 0..n, no last chunk, no seal): never reconciled, facts untouched", async () => {
+      const run = await seeded();
+      await factsPass(db, run, SCOPE, CHUNKS, 2, { skip: [LAST] });
+      await advanceToFinal(db, run, false);
+      expect(await anchor(db)).toEqual([{ whole: true, seq: LAST - 1, done: false, sealed: false }]);
+      await finishFails(run);
+    });
+
+    test("the seal is lease-checked: a lost lease is RH062 and seals nothing", async () => {
+      const run = await seeded();
+      await factsPass(db, run, SCOPE, CHUNKS, 2);
+      await expire();
+      const taken = (await claim(db, SCOPE, "mf-2", 2))!;
+      expect(taken.runId).toBe(run.runId);
+      expect(await code(as(db, (tx) => sealOutputFactsWant(tx, run)))).toBe("RH062");
+      expect((await anchor(db))[0]!.sealed).toBe(false);
+      await db.exec("DELETE FROM sessions.search_reconcile_runs_v1");
+    });
+
     test("a chunk after the last one, or after the seal: never reconciled", async () => {
       let run = await seeded();
       await factsPass(db, run, SCOPE, CHUNKS, 2);
