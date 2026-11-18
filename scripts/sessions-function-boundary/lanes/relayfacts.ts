@@ -67,3 +67,30 @@ export const relayfactsUserErase: LaneManifest = {
   },
   replaces: {},
 };
+
+const CLAIMS_MIGRATION = "supabase/migrations/20261105062150_relayfacts_claims.sql";
+
+/**
+ * Lane: relayfacts-claims (slot 062150, Session Intelligence M1-1).
+ * Intent and constraint claims in two new tables (relayfacts_claims_v1, relayfacts_claim_evidence_v1): insert,
+ * supersede and the claims reader (claims plus the 062080 decisions) for the worker and the advisor (service_role),
+ * and the owner-pinned fence guard trigger function. REPLACES the 062090 per-session erase (ACL: bulls96_session_ingest)
+ * and the 062100 per-user erase (owner only) so both reach the new tables; their ACLs are kept.
+ */
+export const relayfactsClaims: LaneManifest = {
+  lane: "relayfacts-claims",
+  owner: "relayfacts claims: intents and constraints with scope and observed_at (slot 062150)",
+  migration: CLAIMS_MIGRATION,
+  prefixes: ["sessions.relayfacts_claims_"],
+  grantSources: [{ path: CLAIMS_MIGRATION, roles: ["service_role"] }],
+  functions: {
+    "sessions.relayfacts_claims_insert_v1(text,text,jsonb)": { secdef: true, grants: ["service_role"] },
+    "sessions.relayfacts_claims_supersede_v1(text,text,uuid,uuid)": { secdef: true, grants: ["service_role"] },
+    "sessions.relayfacts_claims_v1(text,text,text,text,timestamp with time zone,integer)": { secdef: true, grants: ["service_role"] },
+    "sessions.relayfacts_claims_fence_guard_v1()": { secdef: true, grants: [] },
+  },
+  replaces: {
+    "sessions.relayfacts_evidence_erase_session_v1(text,text,text,text,uuid)": { secdef: true, original: ERASE_MIGRATION },
+    "sessions.relayfacts_user_erase_v1(text,text,text,text)": { secdef: false, original: USER_ERASE_MIGRATION },
+  },
+};

@@ -829,6 +829,9 @@ test("real tree: after the full tree including 062080, a dropped relayfacts work
   expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
   // The read-API functions are not runtime application functions.
   expect(RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_")).sort()).toEqual([
+    // 062150's claims writer, supersede and reader are the same worker's.
+    "sessions.relayfacts_claims_insert_v1(text,text,jsonb)", "sessions.relayfacts_claims_supersede_v1(text,text,uuid,uuid)",
+    "sessions.relayfacts_claims_v1(text,text,text,text,timestamp with time zone,integer)",
     "sessions.relayfacts_insert_v1(text,text,jsonb)", "sessions.relayfacts_supersede_v1(text,text,uuid,uuid)",
   ]);
   await s.db.exec(`DROP FUNCTION ${fn}`);
@@ -947,6 +950,36 @@ test("real tree: after the full tree including 062140, the staged output facts w
     ["sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)", "bulls96_read_api"],
     ["sessions.staged_facts_whole_v1(bigint)", "search_consumer_runtime"],
   ] as const) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
+});
+
+test("real tree: after the full tree including 062150, the relayfacts claims writer, supersede and reader are service_role and runtime functions, never read-API ones, and an extra grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const RFC = "upstream:20261105062150_relayfacts_claims.sql";
+  expect(s.split.held).toContain(RFC);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(RFC);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  const writer = "sessions.relayfacts_claims_insert_v1(text,text,jsonb)";
+  const supersede = "sessions.relayfacts_claims_supersede_v1(text,text,uuid,uuid)";
+  const reader = "sessions.relayfacts_claims_v1(text,text,text,text,timestamp with time zone,integer)";
+  const trigger = "sessions.relayfacts_claims_fence_guard_v1()";
+  // The analysis worker's runtime role holds the writer, supersede and the reader; the fence guard is owner-only.
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toEqual(expect.arrayContaining([writer, supersede, reader]));
+  expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(trigger);
+  expect(CONSUMER_RUNTIME_FUNCTIONS.filter((f) => f.startsWith("sessions.relayfacts_"))).toEqual([]);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  await s.db.exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN CREATE ROLE bulls96_read_api; END IF; END $$`);
+  for (const [fn, role] of [[reader, "bulls96_read_api"], [writer, "bulls96_read_api"], [supersede, "bulls96_session_ingest"], [trigger, "service_role"]] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
     await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
