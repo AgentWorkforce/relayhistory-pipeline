@@ -508,7 +508,7 @@ How a staged run differs from the in-transaction stream it replaces:
   released), `stream_source_changed` (the source stamp moved; the run was abandoned and restarts on the tick),
   `staged_lease_lost` (the run was taken over or erased under this consumer), `staged_run_interrupted` (a step failed
   after the claim; logged as `search index staged run interrupted` with the error class and code, never its text;
-  the lease is released; partial, resumed on the tick; a cap on the attempts of a permanently failing run is slice 3),
+  the lease is released; partial, resumed on the tick; a run that keeps failing hits the attempts cap below),
   `output_facts_stage_incomplete` (an output-facts hook sent the run round again), `staged_run_failed` (past the
   attempts cap, see "A stuck or failed staged run" below). A spent read budget or the keyed-records cap stays partial with
   `scope_too_large` and its code, as before.
@@ -557,12 +557,17 @@ restarts included; the run row's `attempts`) is failed: each later claim abandon
 summary line at `warn` with `outcome=failed`, `reason=staged_run_failed`. Every 72nd claim past the cap (about every 6
 hours at the default 5-minute tick) still runs in full, so a scope that failed through an outage (an object store
 down for two hours, say) heals on its own; a success removes the run as usual. A failed run whose source changes is
-dropped and claimed afresh (attempt 1). The cap counts claims, not failures: a scope that needs more than 24 claims to
-finish because the consumer keeps being restarted or killed under it is failed too.
+dropped and claimed afresh (attempt 1). That is the only automatic reset of the count, and only past the cap: below it
+every claim counts whatever its cause, so the cap counts claims, not failures. A scope that needs more than 24 claims to
+finish because the consumer keeps being restarted or killed under it is failed too, and a scope at claim 24 that is
+interrupted once is failed until the next slow retry or an operator reset. The slow retry heals only a scope that
+finishes within that one claim; a failed scope that needs more than one claim to finish needs the operator reset.
 
 The slow retry has a cost: a scope whose read kills the pod (out of memory) does so again on every retry, about every
-6 hours, instead of never. To stop it, lower `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` below that scope's size
-(it then stays partial with the budget's code and is not read), or turn `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` off.
+6 hours, instead of never. To stop it, lower `SEARCH_INDEX_STREAM_MAX_READ_BYTES` / `_EVENTS` below that scope's size,
+or turn `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` off. Under a lowered budget the scope is read up to the budget on each
+claim that runs (or refused from its declared size before any read) and reports `scope_too_large` with the budget's
+code; after 24 such claims it reports `staged_run_failed`, and the budget's code again on each slow-retry claim.
 
 **Symptoms.** A session stays partial for many ticks; the summary line for it shows the same `reason` tick after
 tick (`staged_run_interrupted`, then `staged_run_failed` past the cap); `search index staged run interrupted` lines
@@ -571,7 +576,8 @@ name the error class and code.
 **Checks** (owner SQL, read only):
 
 ```sql
--- Failed runs.
+-- Failed runs. A failed run whose slow-retry claim just ended on another code (a budget, a source change) shows that
+-- code in last_error until its next failed claim; in the second query, any run with attempts past 24 is failed too.
 SELECT org_id, workspace_id, harness, session_id, attempts, phase, updated_at
   FROM sessions.search_reconcile_runs_v1 WHERE last_error = 'staged_run_failed' ORDER BY updated_at;
 -- Every run, with its lease.
@@ -581,11 +587,15 @@ SELECT org_id, workspace_id, harness, session_id, phase, attempts, last_error,
 ```
 
 **Reset one scope** (owner SQL; the runtime role cannot): the next tick claims a fresh run (attempt 1). Its stage rows,
-and any staged output facts keyed to the run, go with it.
+and any staged output facts keyed to the run (migration 20261105062140), go with it. In psql:
 
 ```sql
+\set org 'org-id'
+\set ws 'workspace-id'
+\set harness 'claude'
+\set session 'session-id'
 DELETE FROM sessions.search_reconcile_runs_v1
- WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4;
+ WHERE org_id = :'org' AND workspace_id = :'ws' AND harness = :'harness' AND session_id = :'session';
 ```
 
 Deleting a run under a live lease is safe: its holder's next step gets RH062, it stops with `staged_lease_lost` and

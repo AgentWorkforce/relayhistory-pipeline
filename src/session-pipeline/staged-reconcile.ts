@@ -339,10 +339,12 @@ export async function runStagedReconcile<R>(
   const cap = deps.attemptsCap;
   const claimOnce = (reset: boolean) =>
     deps.transact(async (tx) => {
-      // A failed run whose source changed starts over: the erase drops it (and any sibling scope's
-      // run of the same canonical id, leased or not; that holder then gets RH062, writes no state and
-      // retries on its next tick), and the claim below creates a fresh one.
-      if (reset) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, stamp.canonicalId])]);
+      // A failed run whose source changed starts over: the erase drops it by its own session id, and
+      // the claim below creates a fresh one. A sibling scope (an alias of the same canonical session)
+      // keeps its run and its count. When this scope IS the canonical session, the erase function
+      // still drops the siblings' runs by canonical id, leased or not: such a holder then gets RH062,
+      // writes no state and retries on its next tick.
+      if (reset) await eraseStagedReconcileRuns(tx, scope, [scope.sessionId]);
       const { rows } = await tx.query<{
         run_id: string; lease_nonce: string; phase: StagedPhase; chunk_cursor: string | null;
         write_wanted: string; write_done: string; attempts: number; restarted: boolean;
