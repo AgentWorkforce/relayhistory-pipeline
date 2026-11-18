@@ -41,6 +41,8 @@ import { readCanonicalScope } from "../session-read-api/canonical-projection.ts"
 import {
   STREAM_DEADLINE,
   STREAM_KEYED_RECORDS_CAP,
+  STREAM_READ_BYTES_BUDGET,
+  STREAM_SOURCE_CHANGED,
   STREAM_PASSES,
   STREAM_READ_EVENTS_BUDGET,
   StreamBudgetError,
@@ -71,8 +73,18 @@ import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/se
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
 import { outputFactsFromScope, passVersion, type OutputFactsScope } from "./output-facts.ts";
 import { clickhouseOutputFactsStore, type OutputFactsStore } from "./output-facts-store.ts";
-import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
-import { MAX_SCAN_PAGE } from "@rhc/search-index/contracts.ts";
+import { adapterProjectionIo, adapterScanPage, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
+import {
+  STAGED_RECONCILE_STALE_LEASE,
+  admittedManifestFingerprint,
+  eraseStagedReconcileRuns,
+  runStagedReconcile,
+  type SourceStamp,
+  type StagedIdentity,
+  type StagedReconcileDeps,
+  type StagedReconcileOps,
+} from "./staged-reconcile.ts";
+import { MAX_SCAN_PAGE, type SearchPosition } from "@rhc/search-index/contracts.ts";
 /** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
 const BUFFERED_FINGERPRINT_PREFIX = "bf";
 
@@ -176,6 +188,8 @@ export interface SearchIndexDeps {
 export interface StagedReconcile {
   /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
   keyedRecordsCap: number;
+  /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
+  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary">>;
 }
 
 /**
@@ -408,7 +422,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   if (deps.outputFacts && deps.outputFactsStore) throw new Error("output facts: choose the ClickHouse or the Postgres store, not both");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
-  return deps.transact(async (tx) => {
+  // Staged (SEARCH_INDEX_STAGED_RECONCILE_ENABLED, adapter binding): a scope that would stream
+  // leaves this transaction without a write and runs as a staged run, outside it, in its own
+  // committed batches (stagedSearchScope).
+  let handoff: StagedHandoff | undefined;
+  const first = await deps.transact(async (tx): Promise<SearchIndexResult> => {
     const io = deps.adapter
       ? deps.staged
         ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
@@ -465,6 +483,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // Postgres (flag on): the scope's facts and state rows go in this transaction; a re-upload
       // starts from no state, so its fresh epoch is never refused as stale.
       if (pgFacts) await pgFacts.erase(factsScope(scope, pointerSnapshot.canonicalId));
+      // Staged: the scope's staged runs and their stage rows go with it.
+      if (deps.staged && deps.adapter) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, pointerSnapshot.canonicalId])]);
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
@@ -478,6 +498,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       if (deps.streamSlot?.used)
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, deferred: true, reasons: ["stream_deferred"] };
       if (deps.streamSlot) deps.streamSlot.used = true;
+      if (deps.staged && deps.adapter) {
+        handoff = {
+          admitted: s3.admitted, revision: s3.revision, version, fromMs, at, manifests: s3.manifests, epoch: pointerSnapshot.epoch,
+          stamp: { canonicalId: pointerSnapshot.canonicalId, epoch: pointerSnapshot.epoch, manifestFingerprint: await sourceFingerprint(tx, scope, pointerSnapshot.canonicalId) },
+        };
+        return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, reasons: [] };
+      }
       return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
     }
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
@@ -625,6 +652,191 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       ...(outputFacts ? { outputFacts } : {}),
     };
   });
+  return handoff ? stagedSearchScope(scope, deps, limits, handoff) : first;
+}
+
+/** What the index transaction hands a staged run: the admitted read and the source stamp it saw. */
+interface StagedHandoff {
+  admitted: NonNullable<Awaited<ReturnType<typeof readCanonicalScope>>["admitted"]>;
+  revision: number;
+  version: number;
+  fromMs: number;
+  at: Date;
+  manifests: number;
+  /** The directory epoch the pointer snapshot read: the directory write's expected epoch. */
+  epoch: string;
+  stamp: SourceStamp;
+}
+
+/**
+ * The staged run's manifest fingerprint: the scope's live pointer rows (manifest key and
+ * revision) under its canonical id, from the database, so the final step re-checks it without a
+ * source read.
+ */
+async function sourceFingerprint(tx: SqlExecutor, scope: SessionScope, canonicalId: string): Promise<string> {
+  const { rows } = await tx.query<{ manifest_key: string; revision: string }>(
+    `SELECT manifest_key, revision::text AS revision FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL`,
+    [scope.orgId, scope.workspaceId, scope.harness, canonicalId],
+  );
+  return admittedManifestFingerprint(rows.map((r) => ({ manifestKey: r.manifest_key, revision: r.revision })));
+}
+
+/** Index scan cursors: page number (so cursors only grow) and the position to continue from. */
+const STAGED_CURSOR_MAX = 480;
+function encodeScanCursor(page: number, next: SearchPosition): string {
+  const head = String(page).padStart(12, "0");
+  const json = JSON.stringify(next);
+  // A position too long for the run's cursor column resumes the scan from its start instead
+  // (staging is idempotent per identity); the page number still grows.
+  return head.length + 1 + json.length <= STAGED_CURSOR_MAX ? `${head}|${json}` : `${head}~`;
+}
+function decodeScanCursor(cursor: string | null): { page: number; after?: SearchPosition } {
+  if (cursor === null) return { page: 0 };
+  const page = Number(cursor.slice(0, 12));
+  return cursor[12] === "|" ? { page, after: JSON.parse(cursor.slice(13)) as SearchPosition } : { page };
+}
+
+const STAGED_BUDGETS = new Set<string>([STREAM_READ_BYTES_BUDGET, STREAM_READ_EVENTS_BUDGET, STREAM_DEADLINE, STREAM_KEYED_RECORDS_CAP]);
+
+/**
+ * SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true, adapter binding: the streamed reconcile of a scope
+ * the whole read refused as too large (`scope_too_large` alone), as a staged run
+ * (staged-reconcile.ts): passes 1-3 and pass 4 read the source outside any transaction, the
+ * diff state lives in the 062110 stage table, every batch commits on its own, and only the final
+ * step holds the scope and canonical locks. Same rows, deletes, directory events, catalog and
+ * state as streamedReconcile.
+ *
+ * Resume is the reconcile tick's: a successful claim records the scope as owing a pass (state
+ * partial), so an interrupted run is listed by the tick and resumes at its committed cursor once
+ * its lease expires. Nothing here answers `busy` (the queue's requeue and dead-letter path):
+ *   staged_run_leased       another tick holds the run's live lease; nothing written
+ *   scope_busy / canonical_scope_busy   a lock was held at the final step; lease released
+ *   stream_source_changed   the stamp moved; the run was abandoned and restarts on the tick
+ *   output_facts_stage_incomplete   a hook sent the run round again (StagedRunRestart)
+ *   staged_lease_lost       the run was taken over or erased under this tick
+ *   staged_run_interrupted  a step failed after the claim; the run resumes on the tick
+ */
+async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
+  const binding = deps.adapter!;
+  const budget = deps.stream!;
+  const staged = deps.staged!;
+  const canonicalId = h.stamp.canonicalId;
+  let read: Awaited<ReturnType<typeof streamCanonicalScope>> | undefined;
+  let claimed = false;
+  const stream = () => (read ? { stream: { passes: read.meter.passes, chunks: read.meter.chunks, bytes: read.meter.bytes, events: read.meter.events } } : {});
+  const result = (reasons: string[], extra: Partial<SearchIndexResult> = {}): SearchIndexResult => ({
+    manifests: h.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, reasons, ...stream(), ...extra,
+  });
+  const ops: StagedReconcileOps<NonNullable<typeof read>> = {
+    async readSource() {
+      read = await streamCanonicalScope(
+        scope, h.admitted,
+        {
+          readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
+          ...(deps.originLabels ? { originLabels: true as const } : {}),
+          perPass: { keyedRecordsCap: staged.keyedRecordsCap },
+        },
+        budget, h.version, h.fromMs,
+      );
+      return read.complete && read.directorySessionId === canonicalId && read.events !== null ? read : null;
+    },
+    wanted: (r) => [...r.wanted].map(([key, w]) => ({ key, ...r.owners[w.owner]!, tsMs: w.tsMs, fingerprint: w.fingerprint })),
+    regenerableKinds: (r) => [...S3_ACTIVITY_KINDS, ...r.kinds],
+    async scanPage(_tx, after, limit) {
+      const at = decodeScanCursor(after);
+      const page = await adapterScanPage(binding, scope, canonicalId, h.fromMs, limit, at.after);
+      return {
+        rows: page.rows.map((r) => ({ key: streamIndexKey(r), machineId: r.machineId, sessionId: r.sessionId, source: r.source, kind: r.kind, eventId: r.eventId, workspaceId: r.workspaceId, tsMs: r.tsMs, fingerprint: r.fingerprint })),
+        next: page.next ? encodeScanCursor(at.page + 1, page.next) : null,
+      };
+    },
+    async regenerate(tx, r, keys, emit) {
+      const io = adapterProjectionIo(binding, tx);
+      let written = 0;
+      await r.regenerate(keys, limits.insertBatch, async (rows) => {
+        written += await io.upsert(rows, scope, canonicalId);
+        emit?.(rows);
+      });
+      return written;
+    },
+    async currentSource(tx) {
+      const snapshot = await livePointerSnapshot(tx, scope);
+      return { canonicalId: snapshot.canonicalId, epoch: snapshot.epoch, manifestFingerprint: await sourceFingerprint(tx, scope, snapshot.canonicalId) };
+    },
+    async remove(tx, identities) {
+      return adapterProjectionIo(binding, tx).remove(scope, identities.map(({ key: _key, ...position }: StagedIdentity) => position));
+    },
+    async commit(tx, r, pass) {
+      const io = adapterProjectionIo(binding, tx);
+      let complete = pass.complete;
+      const reasons: string[] = [];
+      if (!complete) await invalidateDirectoryEvents(tx, scope);
+      else {
+        const directoryKey = { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: canonicalId };
+        const written = await (deps.writeEvents ?? writeDirectoryEvents)(tx, directoryKey, { sourceSessionId: scope.sessionId, expectedEpoch: h.epoch, sources: r.sources, events: r.events! });
+        if (written.written) await (deps.writeCatalog ?? directoryCatalogWriter(deps.desktopCatalog === true))(tx, directoryKey, r.catalog, { expectedEpoch: h.epoch, sourceSessionId: scope.sessionId });
+        else {
+          complete = false;
+          reasons.push("directory_event_sources_changed");
+          await invalidateDirectoryEvents(tx, scope);
+        }
+      }
+      await io.record(scope, h.revision, r.inWindow, complete, h.at, canonicalId);
+      return { complete, reasons };
+    },
+    async claimed(tx) {
+      claimed = true;
+      await adapterProjectionIo(binding, tx).record(scope, h.revision, 0, false, h.at, canonicalId);
+    },
+  };
+  const owing = async (reasons: string[], partial: boolean): Promise<SearchIndexResult> => {
+    await deps.transact(async (tx) => {
+      await invalidateDirectoryEvents(tx, scope);
+      await adapterProjectionIo(binding, tx).record(scope, h.revision, 0, false, h.at, canonicalId);
+    });
+    return result(reasons, partial ? { partial: true } : {});
+  };
+  let outcome: Awaited<ReturnType<typeof runStagedReconcile>>;
+  try {
+    outcome = await runStagedReconcile(scope, h.stamp, ops, {
+      transact: deps.transact,
+      scanPage: Math.min(limits.insertBatch, MAX_SCAN_PAGE),
+      deletePage: Math.min(limits.insertBatch, MAX_SCAN_PAGE),
+      keepFingerprintPrefix: BUFFERED_FINGERPRINT_PREFIX,
+      abandonOn: (error) => (error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null),
+      ...staged.run,
+    });
+  } catch (error) {
+    if ((error as { code?: unknown })?.code === STAGED_RECONCILE_STALE_LEASE) return result(["staged_lease_lost"]);
+    if (claimed) return result(["staged_run_interrupted"], { partial: true });
+    throw error;
+  }
+  switch (outcome.status) {
+    case "busy":
+      return result([outcome.reason === "run_leased" ? "staged_run_leased" : outcome.reason]);
+    case "restart":
+      return result([outcome.reason === "source_changed" ? STREAM_SOURCE_CHANGED : outcome.reason]);
+    case "incomplete": {
+      const [reason] = outcome.reasons;
+      if (reason === "source_incomplete") {
+        const r = read!;
+        return owing(r.reasons.length ? r.reasons : ["canonical_metadata_incomplete"], r.partial);
+      }
+      if (reason && STAGED_BUDGETS.has(reason)) return owing(["scope_too_large", reason], true);
+      return owing(outcome.reasons, false);
+    }
+    case "done":
+      return {
+        manifests: h.manifests,
+        rows: read?.inWindow ?? 0,
+        inserted: outcome.inserted,
+        deleted: outcome.deleted,
+        complete: outcome.complete,
+        reasons: [...(read?.reasons ?? []), ...outcome.reasons],
+        ...stream(),
+      };
+  }
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */

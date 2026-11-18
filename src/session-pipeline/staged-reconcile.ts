@@ -98,7 +98,16 @@ export interface StagedReconcileOps<R> {
    */
   scanPage(tx: SqlExecutor, after: string | null, limit: number): Promise<{ rows: StagedIdentity[]; next: string | null; truncated?: boolean }>;
   /** Pass 4: write the rows of these keys on `tx`; returns the rows the index accepted. */
-  regenerate(tx: SqlExecutor, read: R, keys: ReadonlySet<string>): Promise<number>;
+  regenerate(tx: SqlExecutor, read: R, keys: ReadonlySet<string>, emit?: (rows: readonly unknown[]) => void): Promise<number>;
+  /**
+   * Inside the claim's transaction, after a claim succeeded (this attempt holds the run): e.g.
+   * record the scope as owing a pass, so a crash leaves it for the next reconcile tick.
+   */
+  claimed?(tx: SqlExecutor): Promise<void>;
+  /** Only with `hooks.onBatch`: the post-fold facts input of these keys (one more source pass per run). */
+  wantEvents?(read: R, keys: readonly string[]): Promise<StagedFactsEvents>;
+  /** Only with `hooks.onFinish`: the source read's own completeness (default true: an incomplete read never reaches the final step). */
+  sourceComplete?(read: R): boolean;
   /** The scope's current source stamp, read on `tx` under the scope lock. */
   currentSource(tx: SqlExecutor): Promise<SourceStamp>;
   /** Remove these index identities on `tx`; returns the rows removed. */
@@ -228,11 +237,13 @@ export interface StagedReconcileDeps {
   abandonOn?: (error: unknown) => string | null;
   /** Tests only. */
   boundary?: (point: StagedBoundary) => void | Promise<void>;
+  /** The output-facts hooks (slice 2c); absent: none is called. */
+  hooks?: StagedReconcileHooks;
 }
 
 export type StagedReconcileOutcome =
   | { status: "busy"; reason: "run_leased" | "scope_busy" | "canonical_scope_busy" }
-  | { status: "restart"; reason: "source_changed" }
+  | { status: "restart"; reason: "source_changed" | StagedRunRestart["reason"] }
   | { status: "incomplete"; reasons: string[] }
   | {
       status: "done";
@@ -301,6 +312,7 @@ export async function runStagedReconcile<R>(
     await deps.boundary?.(p);
   };
 
+  if (deps.hooks?.onBatch && !ops.wantEvents) throw new Error("staged reconcile: onBatch needs ops.wantEvents");
   const claim = await deps.transact(async (tx) => {
     const { rows } = await tx.query<{
       run_id: string; lease_nonce: string; phase: StagedPhase; chunk_cursor: string | null;
@@ -310,7 +322,9 @@ export async function runStagedReconcile<R>(
          FROM sessions.search_reconcile_claim_v1($1,$2,$3,$4,$5,$6::bigint,$7,$8)`,
       [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint, leaseMs],
     );
-    return rows[0] ?? null;
+    const row = rows[0] ?? null;
+    if (row) await ops.claimed?.(tx);
+    return row;
   });
   if (!claim) return { status: "busy", reason: "run_leased" };
   const lease: Lease = { runId: claim.run_id, nonce: claim.lease_nonce };
@@ -353,12 +367,21 @@ export async function runStagedReconcile<R>(
       for (let i = 0; i < todo.length; i += stageBatch) {
         const batch = todo.slice(i, i + stageBatch);
         const last = batch[batch.length - 1]!.key;
-        await deps.transact((tx) => stage(tx, "want", 3, batch.map((w) => ({ k: w.key, o: ownerOf(w), t: w.tsMs, f: w.fingerprint })), last));
+        const events = deps.hooks?.onBatch ? await ops.wantEvents!(r, batch.map((w) => w.key)) : undefined;
+        const before = cursor; // the run's own cursor before this batch (null: the pass's first batch)
+        await deps.transact(async (tx) => {
+          await stage(tx, "want", 3, batch.map((w) => ({ k: w.key, o: ownerOf(w), t: w.tsMs, f: w.fingerprint })), last);
+          if (events) await deps.hooks!.onBatch!(tx, { runId: lease.runId, nonce: lease.nonce }, { phase: "want", events, cursor: { before, after: last } });
+        });
         cursor = last;
         await boundary("want:batch");
       }
       const kinds = [...new Set(ops.regenerableKinds(r))].sort();
-      await deps.transact((tx) => advance(tx, "have", null, { kinds }));
+      const sealed = cursor;
+      await deps.transact(async (tx) => {
+        await advance(tx, "have", null, { kinds });
+        await deps.hooks?.onWantDone?.(tx, { runId: lease.runId, nonce: lease.nonce }, { cursor: sealed });
+      });
       phase = "have";
       cursor = null;
       await boundary("want:done");
@@ -414,7 +437,9 @@ export async function runStagedReconcile<R>(
             await advance(tx, "final", null);
             return null;
           }
-          const written = await ops.regenerate(tx, r, new Set(keys));
+          const emitted: unknown[] = [];
+          const written = await ops.regenerate(tx, r, new Set(keys), deps.hooks?.onBatch ? (rows) => { emitted.push(...rows); } : undefined);
+          if (deps.hooks?.onBatch) await deps.hooks.onBatch(tx, { runId: lease.runId, nonce: lease.nonce }, { phase: "write", events: emitted });
           await advance(tx, "write", after, { wanted: keys.length, done: written });
           return { after, wanted: keys.length, written };
         });
@@ -469,6 +494,8 @@ export async function runStagedReconcile<R>(
       }
       await boundary("final:removed");
       const committed = await ops.commit(tx, r, { complete, inserted: done, deleted, wanted });
+      if (deps.hooks?.onFinish)
+        await deps.hooks.onFinish(tx, { runId: lease.runId, nonce: lease.nonce }, { complete, sourceComplete: ops.sourceComplete?.(r) ?? true, inserted: done, deleted, wanted });
       await boundary("final:committed");
       await tx.query("SELECT sessions.search_reconcile_finish_v1($1::bigint,$2::uuid)", [lease.runId, lease.nonce]);
       return {
@@ -485,6 +512,11 @@ export async function runStagedReconcile<R>(
     if (outcome.status === "done") await boundary("finished");
     return outcome;
   } catch (error) {
+    // A hook sends the run round again: its step rolled back, the run restarts from nothing.
+    if (error instanceof StagedRunRestart) {
+      await abandon(error.reason);
+      return { status: "restart", reason: error.reason };
+    }
     const reason = deps.abandonOn?.(error) ?? null;
     if (reason === null) throw error;
     await abandon(reason);
@@ -493,3 +525,29 @@ export async function runStagedReconcile<R>(
 }
 
 export const STAGED_PHASES: readonly StagedPhase[] = PHASES;
+
+/** The 062110 writers the staged reconcile calls. */
+export const STAGED_RECONCILE_FUNCTIONS = [
+  "sessions.search_reconcile_claim_v1(text,text,text,text,text,bigint,text,integer)",
+  "sessions.search_reconcile_stage_batch_v1(bigint,uuid,text,smallint,jsonb,text)",
+  "sessions.search_reconcile_advance_v1(bigint,uuid,text,text,text[],bigint,bigint,boolean)",
+  "sessions.search_reconcile_diff_page_v1(bigint,uuid,text,text,integer,text)",
+  "sessions.search_reconcile_finish_v1(bigint,uuid)",
+  "sessions.search_reconcile_abandon_v1(bigint,uuid,text)",
+  "sessions.search_reconcile_erase_scope_v1(text,text,text,text[])",
+] as const;
+
+/**
+ * Startup with SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true: every 062110 writer exists, or the
+ * consumer refuses to start naming the migration (never on the first large scope).
+ */
+export async function assertStagedReconcileSchema(db: SqlExecutor): Promise<void> {
+  const { rows } = await db.query<{ fn: string }>(
+    "SELECT fn FROM unnest($1::text[]) AS fn WHERE to_regprocedure(fn) IS NULL",
+    [[...STAGED_RECONCILE_FUNCTIONS]],
+  );
+  if (rows.length)
+    throw new Error(
+      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires migration 20261105062110_search_reconcile_staging.sql (missing sessions.search_reconcile_* functions)",
+    );
+}

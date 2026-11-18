@@ -30,6 +30,7 @@ import {
 } from "../../session-read-api/__tests__/stream-fixture.ts";
 import {
   STAGED_RECONCILE_STALE_LEASE,
+  StagedRunRestart,
   admittedManifestFingerprint,
   eraseStagedReconcileRuns,
   runStagedReconcile,
@@ -466,6 +467,58 @@ describe("20261105062110 search reconcile staging", () => {
     await reset(fixture());
     const stuck = { ...ops(), scanPage: async (_tx: SqlExecutor, after: string | null) => ({ rows: [], next: after ?? "x" }) };
     await expect(runStagedReconcile(SCOPE, stamp, stuck, deps())).rejects.toThrow("index scan cursor did not advance");
+  });
+
+  test("hooks: want batches carry the run's cursor, the seal closes the pass, StagedRunRestart sends the run round once", async () => {
+    const f = fixture();
+    const expected = memoryReconcile(f);
+    await reset(f);
+    const base = ops();
+    const withEvents = { ...base, wantEvents: async () => ({ projectionRows: [], records: [] }) };
+    // Attempt 1 has no hook; killed after two want batches.
+    expect(await runStagedReconcile(SCOPE, stamp, base, deps(killAt("want:batch", 2))).catch((e) => e instanceof Kill)).toBe(true);
+    await expire();
+    // Attempt 2 attaches the hook late: its first batch's `before` is the run's cursor, not null; it
+    // never saw the whole pass, so its onFinish sends the run round again.
+    type Seen = { before: string | null; after: string };
+    const runs_: Array<{ batches: Seen[]; sealed: Array<string | null>; finishes: number; writes: number }> = [];
+    const hooked = () => {
+      const seen = { batches: [] as Seen[], sealed: [] as Array<string | null>, finishes: 0, writes: 0 };
+      runs_.push(seen);
+      return {
+        async onBatch(_tx: SqlExecutor, _run: unknown, batch: { phase: "want"; cursor: Seen } | { phase: "write" }) {
+          if (batch.phase === "want") seen.batches.push(batch.cursor);
+          else seen.writes += 1;
+        },
+        async onWantDone(_tx: SqlExecutor, _run: unknown, pass: { cursor: string | null }) {
+          seen.sealed.push(pass.cursor);
+        },
+        async onFinish() {
+          seen.finishes += 1;
+          const whole = seen.batches[0]?.before === null && seen.batches.every((b, i) => i === 0 || b.before === seen.batches[i - 1]!.after)
+            && seen.sealed.length === 1 && seen.sealed[0] === seen.batches.at(-1)?.after;
+          if (!whole) throw new StagedRunRestart("output_facts_stage_incomplete");
+        },
+      };
+    };
+    const second = await runStagedReconcile(SCOPE, stamp, withEvents, { ...deps(), hooks: hooked() });
+    expect(second).toEqual({ status: "restart", reason: "output_facts_stage_incomplete" });
+    expect(runs_[0]!.batches[0]!.before).not.toBeNull();
+    expect(runs_[0]!.finishes).toBe(1);
+    // The final step rolled back: nothing deleted, no commit; the run restarts from nothing.
+    expect([await staged_(), await commits()]).toEqual([0, 0]);
+    expect((await db.query<{ phase: string; last_error: string }>("SELECT phase, last_error FROM sessions.search_reconcile_runs_v1")).rows)
+      .toEqual([{ phase: "want", last_error: "output_facts_stage_incomplete" }]);
+    // Attempt 3 has the hook from the first batch: whole and sealed, it finishes; no loop.
+    const third = await runStagedReconcile(SCOPE, stamp, withEvents, { ...deps(), hooks: hooked() });
+    expect(third).toMatchObject({ status: "done", complete: true });
+    const t = runs_[1]!;
+    expect(t.batches[0]!.before).toBeNull();
+    expect(t.batches.length).toBe(Math.ceil(f.wants.length / 7));
+    expect(t.sealed).toEqual([t.batches.at(-1)!.after]);
+    expect(t.finishes).toBe(1);
+    expect(runs_[0]!.writes).toBeGreaterThan(0); // pass 4 ran (and committed its index rows) in attempt 2
+    expect(await indexRows()).toEqual(expected);
   });
 
   test("a source change mid-run abandons the run at the final check; the next tick restarts and converges on the new source", async () => {
