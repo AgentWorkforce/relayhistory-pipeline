@@ -190,7 +190,7 @@ export interface StagedReconcile {
   /** The most records one streamed pass may key in memory, and the floor of the index-scan cap. */
   keyedRecordsCap: number;
   /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
-  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError" | "heartbeatMs">>;
+  run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError" | "heartbeatMs" | "attemptsCap">>;
 }
 
 /**
@@ -721,10 +721,13 @@ const STAGED_BUDGETS = new Set<string>([STREAM_READ_BYTES_BUDGET, STREAM_READ_EV
  *   scope_busy / canonical_scope_busy   a lock was held at a write page or the final step; lease released
  *   stream_source_changed   the stamp moved; the run was abandoned and restarts on the tick
  *   output_facts_stage_incomplete   a hook sent the run round again (StagedRunRestart)
+ *   staged_run_failed       past the attempts cap (not a slow-retry claim): abandoned before any read
  *   staged_lease_lost       the run was taken over or erased under this tick
  *   staged_run_interrupted  a step failed after the claim (logged: class and code); lease released
  */
-async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
+async function stagedSearchScopeRun(
+  scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff, seen: { attempts?: number },
+): Promise<SearchIndexResult> {
   const binding = deps.adapter!;
   const budget = deps.stream!;
   const staged = deps.staged!;
@@ -799,7 +802,8 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
     },
     // Without the scope locks, on purpose: it only ever marks the scope owing. Racing a final step
     // that recorded the scope current, it can at worst leave a current scope owing one more pass.
-    async claimed(tx) {
+    async claimed(tx, run) {
+      seen.attempts = run.attempts;
       await adapterProjectionIo(binding, tx).record(scope, h.revision, 0, false, h.at, canonicalId);
     },
   };
@@ -821,6 +825,7 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
       keepFingerprintPrefix: BUFFERED_FINGERPRINT_PREFIX,
       abandonOn: (error) => (error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null),
       releaseOnError: true,
+      attemptsCap: { cap: STAGED_RUN_MAX_ATTEMPTS, retryEvery: STAGED_RUN_RETRY_EVERY },
       onHeartbeatError: (error) =>
         log.warn("search index staged lease renewal failed", {
           stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId,
@@ -864,6 +869,9 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
       if (reason && STAGED_BUDGETS.has(reason)) return owing(["scope_too_large", reason], true);
       return owing(outcome.reasons, false);
     }
+    case "failed":
+      // Past the attempts cap: abandoned before any read; owing, and retried every Nth claim only.
+      return owing([STAGED_RUN_FAILED], false);
     case "done":
       return {
         manifests: h.manifests,
@@ -875,6 +883,40 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
         ...stream(),
       };
   }
+}
+
+/** A run claimed more than this many times since it last finished or was reset is failed (staged_run_failed). */
+export const STAGED_RUN_MAX_ATTEMPTS = 24;
+/** Past the cap, every this-many-th claim still runs (about 6 hours at the default 5-minute tick). */
+export const STAGED_RUN_RETRY_EVERY = 72;
+export const STAGED_RUN_FAILED = "staged_run_failed";
+
+/** The summary line's outcome, from the pass result. */
+function stagedOutcome(r: SearchIndexResult): "done" | "busy" | "restart" | "failed" | "incomplete" {
+  if (r.complete) return "done";
+  const [first] = r.reasons;
+  if (first === "staged_run_leased" || first === "scope_busy" || first === "canonical_scope_busy") return "busy";
+  if (first === STREAM_SOURCE_CHANGED || first === "output_facts_stage_incomplete") return "restart";
+  if (first === STAGED_RUN_FAILED) return "failed";
+  return "incomplete";
+}
+
+/**
+ * The staged run of one scope, with ONE summary line per pass ("search index staged run", fields
+ * only: the scope, the outcome, the first reason, the claim count, rows, inserted, deleted, the
+ * duration). Warn for incomplete and failed outcomes, info otherwise. Never on the flag-off path.
+ */
+async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
+  const started = Date.now();
+  const seen: { attempts?: number } = {};
+  const out = await stagedSearchScopeRun(scope, deps, limits, h, seen);
+  const outcome = stagedOutcome(out);
+  log[outcome === "incomplete" || outcome === "failed" ? "warn" : "info"]("search index staged run", {
+    stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+    outcome, ...(out.reasons[0] ? { reason: out.reasons[0] } : {}), ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }),
+    count: out.rows, inserted: out.inserted, deleted: out.deleted, duration_ms: Date.now() - started,
+  });
+  return out;
 }
 
 /** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */

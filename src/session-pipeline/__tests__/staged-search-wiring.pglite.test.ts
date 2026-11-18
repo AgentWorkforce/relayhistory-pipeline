@@ -443,6 +443,125 @@ describe("staged reconcile through the consumer wiring", () => {
       }
     }, 120_000);
 
+  /** A rig whose scan pages are corrupt until `heal()`, counting source reads and index writes. */
+  async function failing() {
+    const r = await seeded(x);
+    const index = r.adapter.index as SearchIndexAdapter;
+    const page = index.scanFingerprintsPage!.bind(index);
+    let corrupt = true;
+    index.scanFingerprintsPage = (async (...a: Parameters<typeof page>) => {
+      const got = await page(...a);
+      return corrupt ? { ...got, rows: [...got.rows].reverse() } : got;
+    }) as typeof page;
+    const counts = { reads: 0, upserts: 0, deletes: 0 };
+    const upsert = index.upsert.bind(index);
+    const remove = index.deleteEvents.bind(index);
+    index.upsert = (async (...a: Parameters<typeof upsert>) => { counts.upserts += 1; return upsert(...a); }) as typeof upsert;
+    index.deleteEvents = (async (...a: Parameters<typeof remove>) => { counts.deletes += 1; return remove(...a); }) as typeof remove;
+    const store = { ...x.store, getObject: (...a: Parameters<typeof x.store.getObject>) => { counts.reads += 1; return x.store.getObject(...a); } } as typeof x.store;
+    const cap = { cap: 2, retryEvery: 3 };
+    const pass = () => r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, store, staged: stagedOn({ attemptsCap: cap }) });
+    const tick = async () => {
+      const before = { ...counts };
+      const out = await pass();
+      return { out, reads: counts.reads - before.reads, writes: counts.upserts - before.upserts + counts.deletes - before.deletes };
+    };
+    return { r, tick, heal: () => { corrupt = false; } };
+  }
+  /** The summary lines a block of work logs. */
+  async function summaries<T>(work: () => Promise<T>): Promise<{ value: T; lines: Array<Record<string, unknown>> }> {
+    const raw: string[] = [];
+    const stdout = process.stdout.write, stderr = process.stderr.write;
+    const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
+      ((chunk: unknown, ...rest: unknown[]) => {
+        raw.push(String(chunk));
+        return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
+      }) as typeof process.stdout.write;
+    process.stdout.write = tap(stdout, process.stdout);
+    process.stderr.write = tap(stderr, process.stderr);
+    try {
+      const value = await work();
+      const lines = raw.flatMap((l) => l.split("\n")).filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((l) => l.message === "search index staged run");
+      return { value, lines };
+    } finally {
+      process.stdout.write = stdout;
+      process.stderr.write = stderr;
+    }
+  }
+
+  test("attempts cap: past it a claim fails before any read and writes nothing; every Nth claim retries; a healed scope finishes", async () => {
+    const { r, tick, heal } = await failing();
+    const seen: Array<{ reason: string; reads: number; writes: number }> = [];
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      const t = await tick();
+      seen.push({ reason: t.out.reasons[0]!, reads: t.reads > 0 ? 1 : 0, writes: t.writes });
+      expect(r.recorded.at(-1)?.complete).toBe(false);
+    }
+    // cap 2, retry every 3: claims 1-2 run (2 resumes in the have phase, which reads no source), 3-4 fail,
+    // 5 retries (the failure abandoned the run, so it starts over and reads), 6 fails.
+    expect(seen).toEqual([
+      { reason: "staged_run_interrupted", reads: 1, writes: 0 },
+      { reason: "staged_run_interrupted", reads: 0, writes: 0 },
+      { reason: "staged_run_failed", reads: 0, writes: 0 },
+      { reason: "staged_run_failed", reads: 0, writes: 0 },
+      { reason: "staged_run_interrupted", reads: 1, writes: 0 },
+      { reason: "staged_run_failed", reads: 0, writes: 0 },
+    ]);
+    expect((await r.hoop.pg.query<{ last_error: string; attempts: number }>("SELECT last_error, attempts FROM sessions.search_reconcile_runs_v1")).rows)
+      .toEqual([{ last_error: "staged_run_failed", attempts: 6 }]);
+    heal();
+    // Claim 7 fails (no read), claim 8 is the next slow retry: it runs and finishes; the row goes.
+    const { value, lines } = await summaries(async () => [await tick(), await tick()]);
+    expect(value.map((t) => [t.out.reasons[0] ?? "done", t.reads > 0])).toEqual([["staged_run_failed", false], ["done", true]]);
+    expect(value[1]!.out.complete).toBe(true);
+    expect(lines.map((l) => [l.level, l.outcome, l.reason ?? null, l.attempt])).toEqual([["warn", "failed", "staged_run_failed", 7], ["info", "done", null, 8]]);
+    for (const l of lines) {
+      expect(l).toMatchObject({ stage: "search-index", org_id: SCOPE.orgId, workspace_id: SCOPE.workspaceId, harness: SCOPE.harness, session_id: SCOPE.sessionId });
+      expect(typeof l.duration_ms).toBe("number");
+    }
+    expect(await r.runs()).toBe(0);
+    expect(await r.scan()).toEqual(ref.scan);
+  }, 300_000);
+
+  test("attempts cap: a source change resets a failed run (fresh claim, attempt 1)", async () => {
+    const { r, tick, heal } = await failing();
+    for (let i = 0; i < 3; i++) await tick();
+    expect((await r.hoop.pg.query<{ attempts: number }>("SELECT attempts FROM sessions.search_reconcile_runs_v1")).rows).toEqual([{ attempts: 3 }]);
+    heal();
+    await r.hoop.pg.exec("UPDATE sessions.session_directory SET event_projection_epoch = event_projection_epoch + 1");
+    const { value, lines } = await summaries(() => tick());
+    expect(value.reads).toBeGreaterThan(0);
+    expect(value.out).toMatchObject({ complete: true });
+    expect(lines.map((l) => l.attempt)).toEqual([1]);
+    expect(await r.runs()).toBe(0);
+  }, 300_000);
+
+  test("operator SQL: reset lets the next tick run at once; cleanup removes old idle runs and never one under a live lease", async () => {
+    const { r, tick, heal } = await failing();
+    for (let i = 0; i < 3; i++) await tick();
+    // List failed runs (runbook query).
+    expect((await r.hoop.pg.query<{ session_id: string }>("SELECT session_id FROM sessions.search_reconcile_runs_v1 WHERE last_error = 'staged_run_failed'")).rows.length).toBe(1);
+    heal();
+    // Reset (runbook, owner SQL).
+    await r.hoop.pg.query("DELETE FROM sessions.search_reconcile_runs_v1 WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4", [SCOPE.orgId, SCOPE.workspaceId, SCOPE.harness, SCOPE.sessionId]);
+    const after = await tick();
+    expect(after.reads).toBeGreaterThan(0);
+    expect(after.out).toMatchObject({ complete: true });
+    // Cleanup (runbook): an idle old run goes, a run under a live lease stays.
+    const CLEANUP = "DELETE FROM sessions.search_reconcile_runs_v1 WHERE (lease_nonce IS NULL OR lease_expires_at < clock_timestamp()) AND updated_at < clock_timestamp() - interval '7 days'";
+    let killed = false;
+    expect(await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: stagedOn({ releaseOnError: false, boundary: (p) => { if (p === "want:batch" && !killed) { killed = true; throw new Kill(p); } } }) }))
+      .toMatchObject({ reasons: ["staged_run_interrupted"] });
+    await r.hoop.pg.exec("UPDATE sessions.search_reconcile_runs_v1 SET updated_at = clock_timestamp() - interval '30 days'");
+    await r.hoop.pg.exec(CLEANUP);
+    expect(await r.runs()).toBe(1); // live lease: kept
+    await r.expire();
+    await r.hoop.pg.exec("UPDATE sessions.search_reconcile_runs_v1 SET updated_at = clock_timestamp() - interval '30 days'");
+    await r.hoop.pg.exec(CLEANUP);
+    expect([await r.runs(), await r.staged()]).toEqual([0, 0]);
+  }, 300_000);
+
   test("A1: a deadline spent inside the facts pass: partial with scope_too_large and stream_deadline, onFinish never runs", async () => {
     const r = await seeded(x);
     const deadline = { at: Number.MAX_SAFE_INTEGER };
