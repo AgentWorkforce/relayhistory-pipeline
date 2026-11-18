@@ -17,7 +17,9 @@
  *      whose sha256 is not the object's is `accepted_mismatch`. None of them is read further or written.
  *   0b. --execute writes nothing of an org without a valid fence-authority marker, by admission's own rule
  *      (ledger-s3 requireFenceAuthority: per-org marker, else the deployment-wide one): `fence_authority_missing`
- *      or `fence_authority_invalid`. The dry run classifies anyway and counts `orgs_without_authority`.
+ *      or `fence_authority_invalid`; while the deployment-wide stop (`.ledger/fence-authority/.stop.json`) is present,
+ *      valid or not, nothing of any org: `fence_authority_stopped`. The dry run classifies anyway and counts
+ *      `orgs_without_authority`.
  *   1. Skip it when its create-only `drained` marker (`<staged key>.drained.json`) exists.
  *   2. Read it (bounded), refuse a buffered-GC redaction barrier, check that the key names exactly this
  *      header and these bytes (org, workspace, machine, batch digest, claim token, sha256 of the stored
@@ -77,7 +79,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import {
-  entryForgotten, fenceAuthorityKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
+  entryForgotten, fenceAuthorityKey, fenceAuthorityStopKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
   sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
 } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
@@ -342,6 +344,7 @@ export type ObjectOutcome =
   | "control_pending"
   | "fence_authority_missing"
   | "fence_authority_invalid"
+  | "fence_authority_stopped"
   | "user_hold"
   | "user_stopped"
   | "hold_failed"
@@ -362,7 +365,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "fence_authority_stopped", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
@@ -530,10 +533,11 @@ interface BatchGroup {
  * Listed keys grouped by `…/m=…/b=<batch32>`. Every object of one batch digest (retries with other
  * claim tokens, a GC replacement, their markers) sorts contiguously, so the group is complete.
  */
-type Authority = "ok" | "missing" | "invalid";
+type Authority = "ok" | "missing" | "invalid" | "stopped";
 
 /**
- * Exactly admission's rule (ledger-s3 requireFenceAuthority): the org's own marker
+ * Exactly admission's rule (ledger-s3 requireFenceAuthority): the deployment-wide stop first (present, valid or not:
+ * "stopped", every org), then the org's own marker
  * (`.ledger/fence-authority/<org>.json`, with that orgId), else the deployment-wide one; a present but invalid
  * per-org marker refuses outright. The marker attests the drain's own preconditions (fence, ownership and revision
  * backfills complete, control mirror on, re-arm sweeper live, Worker HTTP admission off).
@@ -549,6 +553,7 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
     }
   };
   try {
+    if (await read(fenceAuthorityStopKey(keyRoot))) return "stopped";
     const org = await read(orgFenceAuthorityKey(keyRoot, orgId));
     if (org) return validOrgFenceAuthority(org.v) && (org.v as { orgId: string }).orgId === orgId ? "ok" : "invalid";
     const all = await read(fenceAuthorityKey(keyRoot));
@@ -557,6 +562,11 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
   } catch {
     return "invalid";
   }
+}
+
+/** The refusal for a non-"ok" authority. */
+function authorityOutcome(a: Exclude<Authority, "ok">): ObjectOutcome {
+  return a === "missing" ? "fence_authority_missing" : a === "stopped" ? "fence_authority_stopped" : "fence_authority_invalid";
 }
 
 async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, exportComplete: boolean, authority: Authority): AsyncGenerator<BatchGroup> {
@@ -899,9 +909,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   summary.orgs = orgs.length;
 
   /**
-   * Admission's fence authority per org, re-read at most every AUTHORITY_TTL_MS (as admission's cache).
-   * TODO(#595): once the deployment-wide stop (`.ledger/fence-authority/.stop.json`) is on main, read it here through
-   * main's fence-authority reader on the same cadence, and once more before each canonical write (refuse on stop).
+   * Admission's fence authority per org (the deployment-wide stop included), re-read at most every AUTHORITY_TTL_MS
+   * (as admission's cache): per group before its writes, and once more before each batch's first canonical byte.
    */
   const authorities = new Map<string, { value: Authority; at: number }>();
   async function currentAuthority(org: string): Promise<Authority> {
@@ -1149,7 +1158,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       // --execute writes only for an org admission itself would admit (the dry run still classifies, and reports
       // the org in orgs_without_authority).
       if (!opts.dryRun && authority !== "ok") {
-        note(authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid");
+        note(authorityOutcome(authority));
         continue;
       }
       if (!group.accepted.has(key)) {
@@ -1446,7 +1455,10 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       }
       let machineId = machine;
       // The authority (cached at most AUTHORITY_TTL_MS) and the lease, once more right before the first canonical byte.
-      if (await currentAuthority(header.org_id) !== "ok") return "fence_authority_missing";
+      {
+        const authority = await currentAuthority(header.org_id);
+        if (authority !== "ok") return authorityOutcome(authority);
+      }
       if (!leaseOk()) return "lock_lost";
       if (toWrite.length) {
         // The hold intent, BEFORE the first canonical byte: without it on storage, nothing of the batch is written.
