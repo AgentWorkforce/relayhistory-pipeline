@@ -73,15 +73,21 @@ describe("CloudNativePG proof HoopDb", () => {
     expect(modeEnv(external as never)).toEqual({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false" });
     // No runtime-role default anywhere: the owner `hoop` is refused in selfhosted, so CNPG needs the bootstrap-created role.
     expect(modeEnv(cnpg as never)).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke" });
+    // A configured runtime role drops HOOPDB_SUPABASE_SHIM from extraEnv: the chart renders it once
+    // into the migrate Job from worker.migrations.supabaseShim (no duplicate env key).
     expect(modeEnv(eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime" }, false, "i", "j") as never)).toEqual({
       HOOPDB_DB_MODE: "supabase",
-      HOOPDB_SUPABASE_SHIM: "false",
       HOOPDB_RUNTIME_ROLE: "bulls96_runtime",
       HOOPDB_RUNTIME_ROLE_LOGIN: "true",
     });
     expect(
       modeEnv(eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime", hoopdbRuntimeRoleLogin: false }, false, "i", "j", { operatorRelease: "cnpg" }) as never),
-    ).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke", HOOPDB_RUNTIME_ROLE: "bulls96_runtime", HOOPDB_RUNTIME_ROLE_LOGIN: "false" });
+    ).toEqual({ HOOPDB_DB_MODE: "selfhosted", HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke", HOOPDB_RUNTIME_ROLE: "bulls96_runtime", HOOPDB_RUNTIME_ROLE_LOGIN: "false" });
+    for (const v of [eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime" }, false, "i", "j"), eksChartValues({ ...base, hoopdbRuntimeRole: "bulls96_runtime" }, false, "i", "j", { operatorRelease: "cnpg" })]) {
+      const names = v.worker.extraEnv.map((e) => e.name);
+      expect(names).not.toContain("HOOPDB_SUPABASE_SHIM");
+      expect(new Set(names).size).toBe(names.length);
+    }
     expect(cnpg.hoopdb).toMatchObject({ enabled: true, cluster: { storage: { storageClass: STORAGE_CLASS } } });
   });
 });
@@ -344,4 +350,45 @@ it("only an explicitly enabled exact POST Amp endpoint bypasses the operator blo
   expect(ingestWafRules(2000, true).slice(0, 4)).toEqual(ingestWafRules(2000).slice(0, 4));
   expect(ingressExposure({ ampTransportEnabled: true })).toMatchObject({ ampTransportEnabled: true });
   expect(() => ingressExposure({ ampTransportEnabled: "true" as never })).toThrow(/boolean/);
+});
+
+describe("runtime role, function boundary and migration owner pass-through", () => {
+  it("leaves the values byte-identical while none of the new inputs is set", () => {
+    // Frozen from origin/main before these inputs existed: JSON text, so key order counts too.
+    const external = eksChartValues(base, false, "i", "j");
+    expect(JSON.stringify(external.worker.extraEnv)).toBe('[{"name":"HOOPDB_DB_MODE","value":"supabase"},{"name":"HOOPDB_SUPABASE_SHIM","value":"false"}]');
+    expect(JSON.stringify(external.worker.migrations)).toBe('{"supabaseShim":false}');
+    expect(JSON.stringify(external.worker.hoopdb)).toBe('{"existingSecret":"96bulls-runtime","key":"HOOPDB_URL"}');
+    const cnpg = eksChartValues(base, false, "i", "j", { operatorRelease: "cnpg" });
+    expect(JSON.stringify(cnpg.worker.extraEnv)).toBe(
+      '[{"name":"HOOPDB_DB_MODE","value":"selfhosted"},{"name":"HOOPDB_SUPABASE_SHIM","value":"true"},{"name":"HOOPDB_FUNCTION_BOUNDARY_MODE","value":"global-default-revoke"}]',
+    );
+    expect(JSON.stringify(cnpg.worker.migrations)).toBe('{"supabaseShim":true}');
+    // Explicitly undefined is the same as absent.
+    const unset = { hoopdbRuntimeRole: undefined, hoopdbRuntimeRoleLogin: undefined, hoopdbFunctionBoundaryMode: undefined, hoopdbMigrationUrlKey: undefined };
+    expect(JSON.stringify(eksChartValues({ ...base, ...unset }, false, "i", "j"))).toBe(JSON.stringify(external));
+    expect(JSON.stringify(eksChartValues({ ...base, ...unset }, false, "i", "j", { operatorRelease: "cnpg" }))).toBe(JSON.stringify(cnpg));
+  });
+
+  it("renders the Supabase boundary mode and gives only the migrate Job the owner URL", () => {
+    const v = eksChartValues(
+      { ...base, hoopdbRuntimeRole: "example_runtime", hoopdbRuntimeRoleLogin: true, hoopdbFunctionBoundaryMode: "event-trigger", hoopdbMigrationUrlKey: "HOOPDB_MIGRATION_URL" },
+      false, "i", "j",
+    );
+    expect(v.worker.extraEnv).toEqual([
+      { name: "HOOPDB_DB_MODE", value: "supabase" },
+      { name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "event-trigger" },
+      { name: "HOOPDB_RUNTIME_ROLE", value: "example_runtime" },
+      { name: "HOOPDB_RUNTIME_ROLE_LOGIN", value: "true" },
+    ]);
+    expect(v.worker.migrations).toEqual({ supabaseShim: false, hoopdb: { existingSecret: "96bulls-runtime", key: "HOOPDB_MIGRATION_URL" } });
+    expect(v.worker.hoopdb).toEqual({ existingSecret: "96bulls-runtime", key: "HOOPDB_URL" });
+    expect(v.alleyoop.hoopdb).toEqual({ existingSecret: "96bulls-runtime", key: "HOOPDB_URL" });
+  });
+
+  it("keeps in-cluster HoopDb on global-default-revoke and its own URL", () => {
+    const v = eksChartValues({ ...base, hoopdbFunctionBoundaryMode: "event-trigger", hoopdbMigrationUrlKey: "HOOPDB_MIGRATION_URL" }, false, "i", "j", { operatorRelease: "cnpg" });
+    expect(v.worker.migrations).toEqual({ supabaseShim: true });
+    expect(v.worker.extraEnv.find((e) => e.name === "HOOPDB_FUNCTION_BOUNDARY_MODE")?.value).toBe("global-default-revoke");
+  });
 });

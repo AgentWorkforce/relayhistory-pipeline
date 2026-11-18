@@ -234,3 +234,37 @@ describe("ecr.pullAccounts: read-only cross-account pull from the services repos
     expect(repo).toContain("...(pullPolicy ? { policy: pullPolicy } : {}),");
   });
 });
+
+describe("HoopDb runtime role, function boundary and migration owner inputs", () => {
+  const external = (patch: (e: NonNullable<AwsInputs["eks"]>) => void) =>
+    filled((i) => {
+      i.eks!.hoopdb = { backend: "external" };
+      delete i.eks!.sessionDirectory;
+      patch(i.eks!);
+    });
+
+  it("accepts the full external profile and the inputs unset", () => {
+    expect(validateAwsInputs("aws-proof", filled(), approved).hoopdb).toBe("cnpg");
+    const ok = external((e) => {
+      e.hoopdbRuntimeRole = "example_runtime";
+      e.hoopdbRuntimeRoleLogin = true;
+      e.hoopdbFunctionBoundaryMode = "event-trigger";
+      e.hoopdbMigrationUrlKey = "HOOPDB_MIGRATION_URL";
+    });
+    expect(validateAwsInputs("aws-proof", ok, approved).hoopdb).toBe("external");
+  });
+
+  it("refuses an unsafe or half-set runtime role", () => {
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "postgres"; e.hoopdbRuntimeRoleLogin = true; }), approved)).toThrow(/dedicated non-owner role/);
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "bad role"; e.hoopdbRuntimeRoleLogin = true; }), approved)).toThrow(/dedicated non-owner role/);
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRole = "example_runtime"; }), approved)).toThrow(/hoopdbRuntimeRoleLogin must be true or false/);
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbRuntimeRoleLogin = false; }), approved)).toThrow(/without eks\.hoopdbRuntimeRole/);
+  });
+
+  it("keeps the boundary mode and the owner URL key to external HoopDb", () => {
+    expect(() => validateAwsInputs("aws-proof", filled((i) => { i.eks!.hoopdbFunctionBoundaryMode = "event-trigger"; }), approved)).toThrow(/external \(Supabase\) HoopDb only/);
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbFunctionBoundaryMode = "none" as never; }), approved)).toThrow(/external \(Supabase\) HoopDb only/);
+    expect(() => validateAwsInputs("aws-proof", filled((i) => { i.eks!.hoopdbMigrationUrlKey = "HOOPDB_MIGRATION_URL"; }), approved)).toThrow(/hoopdbMigrationUrlKey is for external/);
+    expect(() => validateAwsInputs("aws-proof", external((e) => { e.hoopdbMigrationUrlKey = "HOOPDB_URL"; }), approved)).toThrow(/other than HOOPDB_URL/);
+  });
+});

@@ -69,6 +69,14 @@ export interface AwsInputs {
   /** Khaliq, 2026-10-28: EKS is the first cloud compute target. Omit to declare the baseline only. */
   eks?: {
     chartVersion: string; runtimeSecretName: string; relayauthJwksUrl: string;
+    /** HOOPDB_RUNTIME_ROLE (eks.ts): the dedicated non-owner role the services connect as. The migrator has no default. */
+    hoopdbRuntimeRole?: string;
+    /** HOOPDB_RUNTIME_ROLE_LOGIN; required (true/false) whenever hoopdbRuntimeRole is set. */
+    hoopdbRuntimeRoleLogin?: boolean;
+    /** External HoopDb only: HOOPDB_FUNCTION_BOUNDARY_MODE (eks.ts). */
+    hoopdbFunctionBoundaryMode?: "event-trigger" | "global-default-revoke";
+    /** External HoopDb only: the runtimeSecretName key with the migration owner's URL (migrate Job only; chart 0.3.2+). */
+    hoopdbMigrationUrlKey?: string;
     /** One tenant org (existing shape). */
     tenantOrgId?: string;
     /** Several tenant orgs; AlleyOop accepts exactly these (tenants.ts). tenantOrgIds[0] must equal tenantOrgId if both are set. */
@@ -158,6 +166,18 @@ export function validateAwsInputs(stage: string, inputs: AwsInputs, approvedImag
   }
   const endpointAccess = clusterEndpointAccess(eks.apiAccess?.publicAccessCidrs);
   const hoopdb = hoopdbBackend(stage, eks.hoopdb?.backend);
+  // The migrator's own identifier rule (src/hoopdb/migrate.ts migrationProfile).
+  const pgIdent = /^[A-Za-z_][A-Za-z0-9_$-]{0,62}$/;
+  if (eks.hoopdbRuntimeRole !== undefined && (!pgIdent.test(eks.hoopdbRuntimeRole) || eks.hoopdbRuntimeRole === "postgres"))
+    throw new Error(`96bulls: eks.hoopdbRuntimeRole must name a dedicated non-owner role, got ${JSON.stringify(eks.hoopdbRuntimeRole)}. Nothing was created.`);
+  if (eks.hoopdbRuntimeRole !== undefined && typeof eks.hoopdbRuntimeRoleLogin !== "boolean")
+    throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin must be true or false when eks.hoopdbRuntimeRole is set (the migrator requires it outside local mode). Nothing was created.");
+  if (eks.hoopdbRuntimeRole === undefined && eks.hoopdbRuntimeRoleLogin !== undefined)
+    throw new Error("96bulls: eks.hoopdbRuntimeRoleLogin is set without eks.hoopdbRuntimeRole. Nothing was created.");
+  if (eks.hoopdbFunctionBoundaryMode !== undefined && (hoopdb !== "external" || !["event-trigger", "global-default-revoke"].includes(eks.hoopdbFunctionBoundaryMode)))
+    throw new Error("96bulls: eks.hoopdbFunctionBoundaryMode is for external (Supabase) HoopDb only: event-trigger or global-default-revoke. Nothing was created.");
+  if (eks.hoopdbMigrationUrlKey !== undefined && (hoopdb !== "external" || !/^[A-Za-z0-9_.-]+$/.test(eks.hoopdbMigrationUrlKey) || eks.hoopdbMigrationUrlKey === "HOOPDB_URL"))
+    throw new Error("96bulls: eks.hoopdbMigrationUrlKey is for external HoopDb only and must be a Secret key other than HOOPDB_URL. Nothing was created.");
   if (eks.relaycast) assertRelaycastInputs(eks.relaycast);
   if (eks.sessionDirectory?.enabled) assertSessionDirectoryPreconditions({ hoopdb, relayauthTls: Boolean(eks.relayauth) });
   if (eks.ingress) ingressExposure({ ...(eks.ingress.scheme ? { scheme: eks.ingress.scheme } : {}), ...(eks.ingress.rateLimitPer5Min !== undefined ? { rateLimitPer5Min: eks.ingress.rateLimitPer5Min } : {}), ...(eks.ingress.ampTransportEnabled !== undefined ? { ampTransportEnabled: eks.ingress.ampTransportEnabled } : {}) });

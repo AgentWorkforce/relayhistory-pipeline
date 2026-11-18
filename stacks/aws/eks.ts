@@ -66,6 +66,8 @@ export { telemetryPolicy } from "./hardening.ts";
  */
 export const CHART_REPO = "https://agentworkforce.github.io/infra";
 
+export type SupabaseFunctionBoundaryMode = "event-trigger" | "global-default-revoke";
+
 /**
  * HOOPDB_DB_MODE, an explicit shim choice and the dedicated runtime role for the
  * migrator. There is no runtime-role default in either mode: in-cluster (selfhosted) the
@@ -74,14 +76,29 @@ export const CHART_REPO = "https://agentworkforce.github.io/infra";
  * Helm side's, helm-charts #24; GCP is pending too); external (supabase) it is
  * pre-provisioned by an operator. Unset, the migrator refuses to run.
  */
-export function hoopdbModeEnv(inCluster: boolean, runtimeRole?: string, runtimeLogin = true): Array<{ name: string; value: string }> {
+export function hoopdbModeEnv(
+  inCluster: boolean,
+  runtimeRole?: string,
+  runtimeLogin = true,
+  supabaseFunctionBoundary?: SupabaseFunctionBoundaryMode,
+): Array<{ name: string; value: string }> {
   return [
     { name: "HOOPDB_DB_MODE", value: inCluster ? "selfhosted" : "supabase" },
-    { name: "HOOPDB_SUPABASE_SHIM", value: inCluster ? "true" : "false" },
+    // The worker chart renders HOOPDB_SUPABASE_SHIM once into the migrate Job from
+    // worker.migrations.supabaseShim; a copy here duplicates that env key (the GCP stack's
+    // gcpHoopdbModeEnv leaves it out for the same reason). It is dropped once a runtime role
+    // is configured, the first profile the migrator will run. Without one the migrator
+    // refuses anyway, and the values stay exactly as they were.
+    ...(runtimeRole ? [] : [{ name: "HOOPDB_SUPABASE_SHIM", value: inCluster ? "true" : "false" }]),
     // Selfhosted (dedicated HoopDb database): the exact global function default (owner + superusers),
     // installed by supabase/bootstrap/hoopdb_function_default_revoke.sql before migrate.
-    // Supabase: no default; the operator selects a control (#98), so it fails closed.
-    ...(inCluster ? [{ name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" }] : []),
+    // Supabase: no default; the operator selects a control (#98) with
+    // eks.hoopdbFunctionBoundaryMode. Unset, the migrator's gate fails closed.
+    ...(inCluster
+      ? [{ name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: "global-default-revoke" }]
+      : supabaseFunctionBoundary
+        ? [{ name: "HOOPDB_FUNCTION_BOUNDARY_MODE", value: supabaseFunctionBoundary }]
+        : []),
     ...(runtimeRole
       ? [
           { name: "HOOPDB_RUNTIME_ROLE", value: runtimeRole },
@@ -109,6 +126,19 @@ export interface EksStageInputs {
   hoopdbRuntimeRole?: string;
   /** HOOPDB_RUNTIME_ROLE_LOGIN: whether that role logs in itself (default true). */
   hoopdbRuntimeRoleLogin?: boolean;
+  /**
+   * External (Supabase) only: HOOPDB_FUNCTION_BOUNDARY_MODE. "event-trigger" needs
+   * supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql installed first;
+   * "global-default-revoke" needs the owner's project-wide default revoke (#98). Unset,
+   * the migrator's function-boundary gate refuses.
+   */
+  hoopdbFunctionBoundaryMode?: SupabaseFunctionBoundaryMode;
+  /**
+   * External only: the runtimeSecretName key holding the migration owner's URL. Only the
+   * migrate Job reads it (worker.migrations.hoopdb, worker chart 0.4.2 / umbrella 0.3.2+);
+   * every service keeps HOOPDB_URL, which is then the runtime role's URL.
+   */
+  hoopdbMigrationUrlKey?: string;
   lockerBucket: string;
   lockerRegion: string;
   /** One tenant org (single-tenant mode). */
@@ -178,7 +208,7 @@ export const OTEL_ENDPOINT = "http://otel-collector:4318";
  * tested without loading either the AWS or Kubernetes providers.
  */
 export function eksChartValues(
-  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest" | "hoopdbRuntimeRole" | "hoopdbRuntimeRoleLogin">,
+  i: Pick<EksStageInputs, "stage" | "claimlessWindow" | "runtimeSecretName" | "lockerBucket" | "lockerRegion" | "tenantOrgId" | "tenantOrgIds" | "relayhistoryOrigin" | "imageRepository" | "imageDigest" | "hoopdbRuntimeRole" | "hoopdbRuntimeRoleLogin" | "hoopdbFunctionBoundaryMode" | "hoopdbMigrationUrlKey">,
   sandbox: boolean,
   authIssuer: string,
   authJwksUrl: string,
@@ -200,7 +230,11 @@ export function eksChartValues(
       hoopdb: inCluster ? {} : { existingSecret: i.runtimeSecretName, key: "HOOPDB_URL" },
       locker: { endpoint: "", bucket: i.lockerBucket, region: i.lockerRegion, credentials: { mode: "podIdentity" } },
       // Supabase already has anon/authenticated/service_role; the plain-Postgres shim is for in-cluster DBs only.
-      migrations: { supabaseShim: inCluster },
+      migrations: {
+        supabaseShim: inCluster,
+        // External: only the migrate Job connects as the migration owner; the services keep HOOPDB_URL.
+        ...(!inCluster && i.hoopdbMigrationUrlKey ? { hoopdb: { existingSecret: i.runtimeSecretName, key: i.hoopdbMigrationUrlKey } } : {}),
+      },
       // The bucket is created and versioned by IaC; the pods' role has no CreateBucket.
       lockerInit: { enabled: false },
       deployment: { name: "hosted", id: i.stage },
@@ -208,7 +242,7 @@ export function eksChartValues(
       // this Secret key as a read-only file into Bob Costas only (SUMMARY_MASTER_KEYS_FILE).
       summaryEncryption: { existingSecret: i.runtimeSecretName, key: "SUMMARY_MASTER_KEYS" },
       // The migrator's explicit database-mode contract (src/hoopdb/migrate.ts); never inferred from the host.
-      extraEnv: [...hoopdbModeEnv(inCluster, i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin), ...tenants.extraEnv],
+      extraEnv: [...hoopdbModeEnv(inCluster, i.hoopdbRuntimeRole, i.hoopdbRuntimeRoleLogin, i.hoopdbFunctionBoundaryMode), ...tenants.extraEnv],
     },
     alleyoop: {
       image: { repository: i.imageRepository, digest: i.imageDigest },
@@ -337,6 +371,11 @@ export const eksStage = (i: EksStageInputs) =>
     const [maj, min] = i.chartVersion.split(".").map(Number);
     if (!(maj! > 0 || (maj === 0 && min! >= 3)))
       throw new Error(`96bulls: eks.chartVersion ${i.chartVersion} is too old; 0.3.0+ (worker 0.4.0) is required for summary encryption. Nothing was created.`);
+    // migrations.hoopdb is umbrella 0.3.2+ (worker 0.4.2); older charts ignore it and would run
+    // migrate with the services' (runtime) URL.
+    const patch = Number(i.chartVersion.split(".")[2]);
+    if (i.hoopdbMigrationUrlKey && maj === 0 && min === 3 && !(patch >= 2))
+      throw new Error(`96bulls: eks.hoopdbMigrationUrlKey needs eks.chartVersion 0.3.2+ (migrations.hoopdb); got ${i.chartVersion}. Nothing was created.`);
     assertServicesImage(i);
     const endpointAccess = clusterEndpointAccess(i.apiAccess?.publicAccessCidrs);
     const backend = hoopdbBackend(i.stage, i.hoopdb?.backend);

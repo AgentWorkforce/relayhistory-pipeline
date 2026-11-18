@@ -262,6 +262,36 @@ plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
 `SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
 summary and rebuilds each as an encrypted object.
 
+## HoopDb migrator profile (external Supabase)
+
+The migrate Job's profile comes from `eks.*` inputs (`stacks/aws/eks.ts` `hoopdbModeEnv`,
+`src/hoopdb/migrate.ts` `migrationProfile`). None has a default; with all of them unset the
+chart values are exactly what they were before these inputs existed, and the migrator refuses
+to run (`runtime_role_unset`).
+
+```json
+"chartVersion": "0.3.2",
+"hoopdbRuntimeRole": "example_runtime",
+"hoopdbRuntimeRoleLogin": true,
+"hoopdbFunctionBoundaryMode": "event-trigger",
+"hoopdbMigrationUrlKey": "HOOPDB_MIGRATION_URL"
+```
+
+- `hoopdbRuntimeRole` / `hoopdbRuntimeRoleLogin` (required together): the dedicated non-owner
+  role the services connect as, pre-provisioned by an operator
+  (`supabase/bootstrap/hoopdb_runtime_role_supabase.sql`). Once set, `HOOPDB_SUPABASE_SHIM` is no
+  longer repeated in `worker.extraEnv`; the chart renders it once from `worker.migrations.supabaseShim`.
+- `hoopdbFunctionBoundaryMode` (external only): `event-trigger` after
+  `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql`, or `global-default-revoke`
+  (#98). Unset, the migrator's function-boundary gate refuses.
+- `hoopdbMigrationUrlKey` (external only, chart 0.3.2+): the `runtimeSecretName` key holding the
+  migration owner's URL, read by the migrate Job only (`worker.migrations.hoopdb`). Every service
+  keeps `HOOPDB_URL`, which then holds the runtime role's URL.
+
+The pre-migrate role and boundary steps are in
+`runbooks/session-directory-search-worker-bootstrap.md` ("Database mode, runtime role and one
+migration authority", "Function boundary", "Supabase (hosted)").
+
 ## Production transcript store (`aws-sessions-prod`)
 
 Production AWS is S3 only (decision 0001). The `aws-sessions-prod` stage in
