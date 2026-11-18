@@ -696,9 +696,12 @@ today.
   2 GB at the default budgets) covers a record's keys and state, not its body: the parsed legacy record bodies come on
   top of it and are bounded only by the scope's bytes. Sending a facts chunk holds the chunk's entries plus their JSON
   text (several times the chunk's bytes), and the database holds the jsonb parameter. A facts chunk is bounded by inputs
-  and by bytes ("Chunk bounds" above). The memory
-  measurement (peak RSS at 100k and 1M records with facts on), or a finish step that folds group by group, is owed
-  before the default flip.
+  and by bytes ("Chunk bounds" above). Measured with
+  `scripts/bench/staged-facts-rss.ts` (Bun, synthetic, the consumer process only; the stage lives in the database):
+  the facts pass on top of passes 1-3 adds about 0.13 GB at 100k records (0.73 against 0.60 GB) and 0.23 GB at 1M
+  (3.36 against 3.12 GB), at most one 5000-input chunk in flight (about 5 MB sent); the final step holding a
+  session's legacy turns peaks at about 0.33 GB for 100k turns and 2.7 GB for 1M (about 2.7 KB per turn of about
+  300 characters). The legacy part is the same fold the whole-set path makes over the same records.
 - **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the trigger, both tables and
   the functions. It refuses while any staged run (062110) holds a live lease, facts or not.
 - **Operator resets.** The reset trigger's function runs as the role that updates `search_reconcile_runs_v1`. Every
