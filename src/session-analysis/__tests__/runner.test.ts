@@ -97,6 +97,12 @@ test("every malformed setting refuses with a code (no silent default)", () => {
     [{ SESSION_ANALYSIS_BATCH: "0" }, "batch_invalid"],
     [{ SESSION_ANALYSIS_BATCH: "21" }, "batch_invalid"],
     [{ SESSION_ANALYSIS_BATCH: "two" }, "batch_invalid"],
+    // A leading zero: analysisConfig would run 2 while a looser parser logged and sized for 5.
+    [{ SESSION_ANALYSIS_BATCH: "005" }, "batch_invalid"],
+    [{ SESSION_ANALYSIS_BATCH: "05" }, "batch_invalid"],
+    [{ SESSION_ANALYSIS_TICK_MS: "030000" }, "tick_ms_invalid"],
+    [{ SESSION_ANALYSIS_TICK_MS: "3e4" }, "tick_ms_invalid"],
+    [{ SESSION_ANALYSIS_PG_POOL_MAX: "04" }, "pool_max_invalid"],
     [{ SESSION_ANALYSIS_PG_POOL_MAX: "17" }, "pool_max_invalid"],
     [{ SESSION_ANALYSIS_S3_CREDENTIALS: "irsa" }, "credentials_mode_invalid"],
     [{ SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS: "yes" }, "assume_no_legacy_turns_invalid"],
@@ -105,6 +111,15 @@ test("every malformed setting refuses with a code (no silent default)", () => {
     [{ WORKER_HEALTH_PORT: "70000" }, "no_refusal"], // the port is the service's, checked there
   ];
   for (const [extra, want] of cases) expect([extra, code(() => analysisRunnerConfig(baseEnv(extra)))]).toEqual([extra, want]);
+});
+
+test("BATCH, TICK_MS and POOL_MAX are trimmed like the port, and BATCH is what analysisConfig runs", async () => {
+  const { analysisConfig } = await import("../worker.ts");
+  for (const raw of ["1", " 7 ", "20", "\t12"]) {
+    const env = baseEnv({ SESSION_ANALYSIS_BATCH: raw });
+    expect(analysisRunnerConfig(env).batch).toBe(analysisConfig(env).batch);
+  }
+  expect(analysisRunnerConfig(baseEnv({ SESSION_ANALYSIS_TICK_MS: " 5000 ", SESSION_ANALYSIS_PG_POOL_MAX: " 3 " }))).toMatchObject({ tickMs: 5000, poolMax: 3 });
 });
 
 test("SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS is passed through, never defaulted on", () => {
@@ -126,9 +141,11 @@ test("secrets: exactly one source, absolute regular file, no whitespace; codes n
   expect(code(() => runnerSecret({ X: `${MODEL_KEY} extra` }, "X", "model_key"))).toBe("model_key_invalid");
   writeFileSync(join(dir, "empty"), "");
   expect(code(() => runnerSecret({ X_FILE: join(dir, "empty") }, "X", "model_key"))).toBe("model_key_invalid");
-  try { runnerSecret({ X: `${MODEL_KEY} x` }, "X", "model_key"); } catch (e) {
-    expect(String((e as Error).message)).not.toContain(MODEL_KEY);
-  }
+  let thrown: unknown;
+  try { runnerSecret({ X: `${MODEL_KEY} x` }, "X", "model_key"); } catch (e) { thrown = e; }
+  expect(thrown).toBeInstanceOf(AnalysisRunnerRefused);
+  expect(String((thrown as Error).message)).toBe("model_key_invalid");
+  expect(String((thrown as Error).message)).not.toContain(MODEL_KEY);
 });
 
 test("runnerSecrets: both secrets required; a -disabled key is no model; a non-postgres URL refuses without echoing it", () => {
@@ -266,6 +283,48 @@ test("a refused config rejects before anything listens", async () => {
   await expect(analysisRunnerService(baseEnv(), { port: 0 })).rejects.toThrow("database_url_missing");
 });
 
+test("the scrub engine is selected only when enabled, after config; its failure is a refusal (exit 2)", async () => {
+  let inits = 0;
+  const scrubInit = async () => { inits += 1; throw new Error("bad selector"); };
+  // Dormant with a broken scrub selector and READER_MAX_RULESET: still dormant, nothing initialised.
+  const stop = new AbortController();
+  let port = 0;
+  const dormant = analysisRunnerService({ READER_MAX_RULESET: "99", SCRUB_ENGINE: "nonsense" }, { host: "127.0.0.1", port: 0, signal: stop.signal, scrubInit, onListening: (p) => { port = p; } });
+  while (!port) await Bun.sleep(5);
+  stop.abort();
+  expect(await dormant).toEqual({ enabled: false, ticks: 0 });
+  expect(inits).toBe(0);
+  // Enabled with a bad READER_MAX_RULESET: its own refusal fires first, before any engine selection.
+  const tick = () => async () => ({});
+  await expect(analysisRunnerService(baseEnv({ READER_MAX_RULESET: "99" }), { port: 0, scrubInit, tick })).rejects.toThrow("reader_max_ruleset_invalid");
+  expect(inits).toBe(0);
+  // Enabled with a valid config: an engine failure is a refusal, so exit 2, not 1.
+  let refused: unknown;
+  try { await analysisRunnerService(baseEnv(), { port: 0, scrubInit, tick }); } catch (e) { refused = e; }
+  expect(refused).toBeInstanceOf(AnalysisRunnerRefused);
+  expect((refused as AnalysisRunnerRefused).code).toBe("scrub_engine_invalid");
+  expect(runnerExitCode(refused)).toBe(2);
+  expect(inits).toBe(1);
+});
+
+test("a second stop signal is ignored while draining; the third exits 143", async () => {
+  let release!: () => void, port = 0, started = 0;
+  const exits: number[] = [];
+  const done = analysisRunnerService(baseEnv({ SESSION_ANALYSIS_TICK_MS: "1000" }), {
+    host: "127.0.0.1", port: 0, onListening: (p) => { port = p; }, hardExit: (c) => { exits.push(c); },
+    tick: () => async () => { started += 1; await new Promise<void>((r) => { release = r; }); return {}; },
+  });
+  while (!port || !started) await Bun.sleep(5);
+  process.emit("SIGTERM");
+  process.emit("SIGINT");
+  await Bun.sleep(10);
+  expect(exits).toEqual([]);
+  process.emit("SIGTERM");
+  expect(exits).toEqual([143]);
+  release();
+  expect(await done).toEqual({ enabled: true, ticks: 1 });
+});
+
 test("SIGTERM drains: the tick in flight finishes, no further job or tick starts, the service exits clean", async () => {
   let started = 0, finished = 0, release!: () => void;
   let sawStopping = false;
@@ -308,8 +367,13 @@ test("deps parity: the runner and the Lambda build identical analysisTick deps f
       const db = fakeDb();
       const store = { marker: "store" } as unknown as ObjectStore;
       const cfg = analysisRunnerConfig(env);
-      const runner = runnerAnalysisDeps(env, cfg, { databaseUrl: "postgresql://unused", modelKey: MODEL_KEY }, { pool: () => db, store: () => store }).deps;
-      const lambda = lambdaAnalysisDeps({ bucket: cfg.bucket, region: cfg.region, keyPrefix: cfg.keyPrefix, readerMaxRuleset: cfg.readerMaxRuleset }, db, store, MODEL_KEY);
+      const erasers: Record<"runner" | "lambda", S3EraserConfig[]> = { runner: [], lambda: [] };
+      const factory = (side: "runner" | "lambda") => (c: S3EraserConfig): PagedEraser => {
+        erasers[side].push(c);
+        return { eraseStep: async () => ({ side }) as never, verifyErased: async () => ({ side }) as never };
+      };
+      const runner = runnerAnalysisDeps(env, cfg, { databaseUrl: "postgresql://unused", modelKey: MODEL_KEY }, { pool: () => db, store: () => store, eraserFactory: factory("runner") }).deps;
+      const lambda = lambdaAnalysisDeps({ bucket: cfg.bucket, region: cfg.region, keyPrefix: cfg.keyPrefix, readerMaxRuleset: cfg.readerMaxRuleset }, db, store, MODEL_KEY, { eraserFactory: factory("lambda") });
       expect(Object.keys(runner).sort()).toEqual(Object.keys(lambda).sort());
       expect(runner.config).toEqual(lambda.config);
       expect(runner.db).toBe(lambda.db);
@@ -323,7 +387,32 @@ test("deps parity: the runner and the Lambda build identical analysisTick deps f
       expect(runner.transport === null).toBe(lambda.transport === null);
       expect(runner.transport).not.toBeNull();
       expect("decisionRecords" in runner).toBe("decisionRecords" in lambda);
+      expect("decisionRecords" in runner).toBe("SUMMARY_DECISION_RECORDS_ENABLED" in flags);
       expect(Object.keys(runner.eraser!).sort()).toEqual(Object.keys(lambda.eraser!).sort());
+      // Both sides build the sweeper's eraser for the same bucket, region and credentials, on every call.
+      for (const deps of [runner, lambda]) {
+        await deps.eraser!.eraseStep("96bulls/org", {} as never);
+        await deps.eraser!.verifyErased("96bulls/org", {} as never);
+      }
+      expect(erasers.runner).toHaveLength(2);
+      expect(erasers.lambda).toHaveLength(2);
+      expect(erasers.runner).toEqual(erasers.lambda);
+      expect(erasers.runner[0]).toEqual({ bucket: BUCKET, region: "us-east-1", credentials: { accessKeyId: "AKIDROLE", secretAccessKey: AWS_SECRET } });
+      // The transports carry the same key to the same request (the vendored engine's one URL).
+      const sent: { side: string; auth: string | null; url: string }[] = [];
+      const realFetch = globalThis.fetch;
+      for (const [side, deps] of [["runner", runner], ["lambda", lambda]] as const) {
+        globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+          sent.push({ side, auth: new Headers(init?.headers).get("authorization"), url: String(input instanceof Request ? input.url : input) });
+          return new Response("{}", { status: 500 });
+        }) as typeof fetch;
+        try { await deps.transport!.complete({ model: "m", instructions: "i", input: "x", timeoutMs: 1000 } as never).catch(() => {}); }
+        finally { globalThis.fetch = realFetch; }
+      }
+      expect(sent).toHaveLength(2);
+      expect(sent[0]!.auth).toContain(MODEL_KEY);
+      expect(sent[0]!.auth).toBe(sent[1]!.auth);
+      expect(sent[0]!.url).toBe(sent[1]!.url);
     }
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];

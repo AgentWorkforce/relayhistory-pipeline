@@ -94,7 +94,7 @@ import { briefTick } from "../session-brief/worker.ts";
 import { BriefDocumentError, publishBriefDocumentsTick } from "./brief-documents.ts";
 import { briefRegenFromEnv } from "../session-brief/regen.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
-import { analysisTickDeps, type AnalysisTickDeps } from "../session-analysis/runtime-deps.ts";
+import { analysisTickDeps, type AnalysisRuntimeInputs, type AnalysisTickDeps } from "../session-analysis/runtime-deps.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
@@ -425,9 +425,11 @@ async function init(composition?: SearchComposition): Promise<Runtime> {
 
 /**
  * The Lambda's analysisTick deps: the shared builder over this runtime's pool, bucket and
- * execution-role credentials. Exported so the EKS runner's parity test can compare the two.
+ * execution-role credentials. Exported so the EKS runner's parity test can compare the two
+ * (`ports.eraserFactory` is that test's port only; runtimeFromSecret never passes it).
  */
-export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "keyPrefix" | "readerMaxRuleset">, db: HoopDb, store: ObjectStore, key: string | null): AnalysisTickDeps {
+export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "keyPrefix" | "readerMaxRuleset">, db: HoopDb, store: ObjectStore, key: string | null,
+  ports: Pick<AnalysisRuntimeInputs, "eraserFactory"> = {}): AnalysisTickDeps {
   return analysisTickDeps({
     db,
     transact: (work) => transaction(db, work),
@@ -438,6 +440,7 @@ export function lambdaAnalysisDeps(env: Pick<LambdaEnv, "bucket" | "region" | "k
     readerMaxRuleset: env.readerMaxRuleset,
     modelKey: key,
     credentials: () => lambdaCredentials(),
+    ...(ports.eraserFactory ? { eraserFactory: ports.eraserFactory } : {}),
   });
 }
 
