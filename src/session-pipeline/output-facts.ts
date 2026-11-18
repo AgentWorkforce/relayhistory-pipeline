@@ -220,15 +220,26 @@ function resultHasCommitCall(result: Json, sessionEvents: Json[]): boolean {
   });
 }
 
+/**
+ * Append every item of `items` to `target`. Not `target.push(...items)`: a call takes a bounded number of
+ * arguments (about 638000 on Bun 1.4.2), so a spread of a large session's rows throws.
+ */
+export function appendAll<T>(target: T[], items: Iterable<T>): void {
+  for (const item of items) target.push(item);
+}
+
 /** Outcome and legacy-turn sources of the scope, grouped per session id they name. */
-function legacyAndTurns(records: RelayhistoryStreamRecord[], scope: OutputFactsScope): { rows: Array<{ table: string; row: Json }>; ok: boolean } {
+export function legacyAndTurns(records: RelayhistoryStreamRecord[], scope: OutputFactsScope): { rows: Array<{ table: string; row: Json }>; ok: boolean } {
   const bySession = new Map<string, RelayhistoryStreamRecord[]>();
   const relevant = new Set(["legacy_conversation_turn", "legacy_session_outcome", "legacy_session_link", "legacy_scope", "conversation_turn"]);
   for (const r of records) {
     if (!relevant.has(r.kind)) continue;
     const sid = jtext(r.payload?.session_id);
     if (sid === null || !scope.sessionIds.includes(sid)) return { rows: [], ok: false };
-    bySession.set(sid, [...(bySession.get(sid) ?? []), r]);
+    // Appended in place: copying the list per record is quadratic (a 1M-record legacy session failed).
+    const list = bySession.get(sid);
+    if (list) list.push(r);
+    else bySession.set(sid, [r]);
   }
   const rows: Array<{ table: string; row: Json }> = [];
   try {
@@ -238,7 +249,7 @@ function legacyAndTurns(records: RelayhistoryStreamRecord[], scope: OutputFactsS
       const hasLegacyEvidence = list.some((r) => r.kind.startsWith("legacy_"));
       if (legacy.rejected > 0 || (hasLegacyEvidence && legacy.coverage === null))
         return { rows: [], ok: false };
-      rows.push(...mergeTurnRows(legacy.rows, canonicalLiveTurns(list, identity)));
+      appendAll(rows, mergeTurnRows(legacy.rows, canonicalLiveTurns(list, identity)));
     }
   } catch {
     return { rows: [], ok: false };

@@ -15,6 +15,7 @@ import {
 import { OutputScopeError, readSessionOutput } from "../../session-read-api/output-query.ts";
 import { LINK_SHA, OUTCOME_SHA, outputFixture, OUTPUT_FIXTURE_SCOPE } from "./output-facts-fixture.ts";
 import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
+import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 
 describe("normalizeStats (session-output.ts stat_entries + normalized_stats)", () => {
   test("array of numstat entries sums each side", () => {
@@ -327,5 +328,74 @@ describe("outputFactsBatchStep: items per input are bounded (a facts chunk alway
     expect(MAX_FACTS_CHUNK_INPUTS * OUTPUT_FACTS_MAX_ITEMS_PER_INPUT).toBeLessThanOrEqual(MAX_CHUNK_ITEMS);
     // staged-reconcile.ts deps.factsChunk defaults to 5000 inputs.
     expect(MAX_FACTS_CHUNK_INPUTS).toBeGreaterThanOrEqual(5000);
+  });
+});
+
+describe("legacyAndTurns: linear append, no argument spread (the whole-set path and the staged finish share it)", () => {
+  /** The body before the fix, verbatim (copy-on-append, rows.push(...merged)). */
+  async function before(records: RelayhistoryStreamRecord[], scope: typeof OUTPUT_FIXTURE_SCOPE) {
+    const { canonicalLegacy } = await import("../../session-read-api/canonical-legacy.ts");
+    const { canonicalLiveTurns, mergeTurnRows } = await import("../../session-read-api/canonical-turns.ts");
+    const { jtext } = await import("../output-facts.ts");
+    const bySession = new Map<string, RelayhistoryStreamRecord[]>();
+    const relevant = new Set(["legacy_conversation_turn", "legacy_session_outcome", "legacy_session_link", "legacy_scope", "conversation_turn"]);
+    for (const r of records) {
+      if (!relevant.has(r.kind)) continue;
+      const sid = jtext(r.payload?.session_id);
+      if (sid === null || !scope.sessionIds.includes(sid)) return { rows: [], ok: false };
+      bySession.set(sid, [...(bySession.get(sid) ?? []), r]);
+    }
+    const rows: Array<{ table: string; row: Record<string, unknown> }> = [];
+    try {
+      for (const [sessionId, list] of bySession) {
+        const identity = { orgId: scope.orgId, workspaceId: scope.workspaceId, source: scope.harness, sessionId };
+        const legacy = canonicalLegacy(list, identity);
+        const hasLegacyEvidence = list.some((r) => r.kind.startsWith("legacy_"));
+        if (legacy.rejected > 0 || (hasLegacyEvidence && legacy.coverage === null)) return { rows: [], ok: false };
+        rows.push(...mergeTurnRows(legacy.rows, canonicalLiveTurns(list, identity)));
+      }
+    } catch {
+      return { rows: [], ok: false };
+    }
+    return { rows, ok: true };
+  }
+  const turn = (sessionId: string, i: number, extra: Record<string, unknown> = {}): RelayhistoryStreamRecord => ({
+    kind: "legacy_conversation_turn", origin_id: "legacy:conversation_turns", record_id: `legacy:conversation_turns:${sessionId}-t-${i}`, revision: "1",
+    operation: "upsert", received_at: "2026-11-05T00:00:00.000000Z",
+    payload: { org_id: "org-f4", workspace_id: "ws-f4", source: "codex", session_id: sessionId, id: `${sessionId}-t-${i}`, turn_index: i,
+      role: i % 3 ? "assistant" : "user", session_owner: "u1", content: `turn ${i}`, actor_name: "a", actor_role: "owner",
+      ts: new Date(Date.parse("2026-11-05T08:00:00Z") + (i % 7) * 1000).toISOString(), ...extra },
+  });
+  const coverage = (sessionId: string): RelayhistoryStreamRecord => ({
+    kind: "legacy_scope", origin_id: "legacy:scope", record_id: "legacy:scope:coverage", revision: "1", operation: "upsert", received_at: "2026-11-05T00:00:00.000000Z",
+    payload: { org_id: "org-f4", workspace_id: "ws-f4", source: "codex", session_id: sessionId, version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] },
+  });
+
+  test("a mixed input (two sessions, interleaved, outcomes, turns with tied times): the same rows in the same order as before", async () => {
+    const { legacyAndTurns } = await import("../output-facts.ts");
+    const scope = { ...OUTPUT_FIXTURE_SCOPE, sessionIds: [...OUTPUT_FIXTURE_SCOPE.sessionIds, "s2"] };
+    const fx = outputFixture();
+    const records: RelayhistoryStreamRecord[] = [];
+    for (let i = 0; i < 40; i++) records.push(turn(i % 2 ? "s1" : "s2", i));
+    records.splice(5, 0, coverage("s2"));
+    records.push(...fx.records);
+    const now = legacyAndTurns(records, scope);
+    expect(now.ok).toBe(true);
+    expect(now.rows.length).toBeGreaterThan(40);
+    expect(now).toEqual(await before(records, scope));
+    // An out-of-scope session id refuses the whole input, as before.
+    const outside = [...records, turn("s9", 1)];
+    expect(legacyAndTurns(outside, scope)).toEqual(await before(outside, scope));
+  });
+
+  // The old body threw from about 639000 turns in one session (Bun 1.4.2): rows.push(...merged) passed every row
+  // as an argument. The throw depends on the count, not the rows, so the append helper is tested with numbers.
+  test("appendAll takes more items than a call takes arguments; the spread it replaces throws there", async () => {
+    const { appendAll } = await import("../output-facts.ts");
+    const items = Array.from({ length: 700_000 }, (_, i) => i);
+    const target = [-1];
+    appendAll(target, items);
+    expect([target.length, target[1], target.at(-1)]).toEqual([700_001, 0, 699_999]);
+    expect(() => [].push(...(items as never[]))).toThrow(RangeError);
   });
 });
