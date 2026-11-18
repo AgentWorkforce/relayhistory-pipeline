@@ -110,6 +110,32 @@ export interface StagedReconcileOps<R> {
   commit(tx: SqlExecutor, read: R, pass: { complete: boolean; inserted: number; deleted: number; wanted: number }): Promise<{ complete: boolean; reasons: string[] }>;
 }
 
+/** The run a hook is called for: its id and the lease nonce it holds (the writers' arguments). */
+export interface StagedRunRef {
+  runId: string;
+  nonce: string;
+}
+
+/**
+ * Hooks for a consumer of the run's batches (the output-facts slice, 2c). Both run inside the
+ * module's own transaction for that step, so a throw rolls the step back and the run resumes there
+ * after the lease expires (the hook then sees the step again: it must be idempotent per run id).
+ * A hook may call further sessions functions on `tx` under the same run id and lease nonce.
+ */
+export interface StagedReconcileHooks<E> {
+  /**
+   * Once per committed batch of the run's events, in the batch's own transaction, after the
+   * module staged or wrote it: `phase` "want" for a batch of passes 1-3 output (events are the
+   * projected events of the batch's keys), "write" for a pass 4 batch (the rows written).
+   */
+  onBatch?(tx: SqlExecutor, run: StagedRunRef, batch: { phase: "want" | "write"; events: readonly E[] }): Promise<void>;
+  /**
+   * Once, in the final transaction, after `commit` and before the run is finished (its stage rows
+   * dropped). `complete` is the pass's own verdict (false: a refused write, nothing deleted).
+   */
+  onFinish?(tx: SqlExecutor, run: StagedRunRef, pass: { complete: boolean; inserted: number; deleted: number; wanted: number }): Promise<void>;
+}
+
 /** Where a test may stop a run. In-transaction points roll their transaction back. */
 export type StagedBoundary =
   | "claimed"
