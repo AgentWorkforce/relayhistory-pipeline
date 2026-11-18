@@ -82,6 +82,10 @@ async function moveTransaction<T>(db: HoopDb, work: (tx: { query: HoopDb["query"
   }
 }
 
+/** A move the erase fence (or a guard) refuses: terminal, mapped to an ignored outcome by pointer.ts. */
+const movedFenced = (reason: "operator_erased" | "move_guarded") =>
+  Object.assign(new Error(`pointer move refused (${reason})`), { code: "pointer_move_fenced", reason, retryable: false });
+
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
 export function hoopDbSessionIndex(deps: IndexDeps): HoopDbSessionPointerIndex {return sessionIndex(deps,false);}
 function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerIndex{
@@ -249,13 +253,26 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerInd
           : "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
         operatorErase ? [JSON.stringify([row]), canonical.sessionId, canonical.machineId] : [JSON.stringify([row])],
       );
-      if (rows[0]?.fenced === true) return { status: "skipped", reason: "operator_erased" };
+      // A move (opts.rekeyFrom) has already deleted the old-key row in this transaction. Every outcome
+      // that does not insert the new row must THROW, so the transaction rolls the delete back and the old
+      // row (often a tombstone) stays: returning would commit the delete with no new row.
+      if (rows[0]?.fenced === true) {
+        if (opts.rekeyFrom) throw movedFenced("operator_erased");
+        return { status: "skipped", reason: "operator_erased" };
+      }
       const applied = rows[0]?.applied ?? false;
-      // A move whose insert did not apply would leave its delete with no new row (or, on a pooled path
-      // without a transaction, a committed delete). Throw retryably so the move's transaction rolls back
-      // and the old row stays; the pointer writer retries.
-      if (opts.rekeyFrom && !applied)
+      if (opts.rekeyFrom && !applied) {
+        // The old row is gone, so nothing could fence the insert by revision: a missing row means a
+        // BEFORE INSERT guard suppressed it (20261105050010's erase-fence guard with the fence flag off,
+        // or the publication pointer guard). That is terminal: retrying cannot change it.
+        const present = await deps.db.query(
+          `SELECT 1 FROM sessions.session_index
+            WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id],
+        );
+        if (present.rows.length === 0) throw movedFenced("move_guarded");
         throw Object.assign(new Error("pointer move: the re-keyed row was not applied; retry"), { code: "pointer_move_not_applied", retryable: true });
+      }
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
       const sessionUuid =
