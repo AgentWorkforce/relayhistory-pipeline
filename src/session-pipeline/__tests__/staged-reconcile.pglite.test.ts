@@ -469,56 +469,68 @@ describe("20261105062110 search reconcile staging", () => {
     await expect(runStagedReconcile(SCOPE, stamp, stuck, deps())).rejects.toThrow("index scan cursor did not advance");
   });
 
-  test("hooks: want batches carry the run's cursor, the seal closes the pass, StagedRunRestart sends the run round once", async () => {
+  test("hooks: the facts pass delivers seq 0..n with last, the seal follows it; a late hook restarts once; a kill mid-pass reruns from seq 0", async () => {
     const f = fixture();
     const expected = memoryReconcile(f);
     await reset(f);
     const base = ops();
-    const withEvents = { ...base, wantEvents: async () => ({ projectionRows: [], records: [] }) };
-    // Attempt 1 has no hook; killed after two want batches.
-    expect(await runStagedReconcile(SCOPE, stamp, base, deps(killAt("want:batch", 2))).catch((e) => e instanceof Kill)).toBe(true);
-    await expire();
-    // Attempt 2 attaches the hook late: its first batch's `before` is the run's cursor, not null; it
-    // never saw the whole pass, so its onFinish sends the run round again.
-    type Seen = { before: string | null; after: string };
-    const runs_: Array<{ batches: Seen[]; sealed: Array<string | null>; finishes: number; writes: number }> = [];
-    const hooked = () => {
-      const seen = { batches: [] as Seen[], sealed: [] as Array<string | null>, finishes: 0, writes: 0 };
-      runs_.push(seen);
+    // The facts input: one item per wanted key, emitted in chunks of at most `chunk`.
+    const facts = {
+      ...base,
+      async factsPass(_r: unknown, chunk: number, emit: (e: { projectionRows: Array<{ table: string; row: Record<string, unknown> }>; records: never[] }) => Promise<void>) {
+        const rows = source.wants.map((w) => ({ table: "convergence_events", row: { event_id: w.eventId } }));
+        for (let i = 0; i < rows.length; i += chunk) await emit({ projectionRows: rows.slice(i, i + chunk), records: [] });
+      },
+    };
+    type Seen = { chunks: Array<{ seq: number; last: boolean; n: number }>; sealed: number; finishes: number };
+    const seen: Seen[] = [];
+    const hooks = (killAtSeq?: number) => {
+      const me: Seen = { chunks: [], sealed: 0, finishes: 0 };
+      seen.push(me);
       return {
-        async onBatch(_tx: SqlExecutor, _run: unknown, batch: { phase: "want"; cursor: Seen } | { phase: "write" }) {
-          if (batch.phase === "want") seen.batches.push(batch.cursor);
-          else seen.writes += 1;
+        async onBatch(_tx: SqlExecutor, _run: unknown, batch: { phase: "facts"; chunk: { seq: number; last: boolean }; events: { projectionRows: unknown[] } } | { phase: "write" }) {
+          if (batch.phase !== "facts") return;
+          if (batch.chunk.seq === 0) me.chunks = [];
+          me.chunks.push({ ...batch.chunk, n: batch.events.projectionRows.length });
+          if (killAtSeq !== undefined && batch.chunk.seq === killAtSeq) throw new Kill(`facts:${killAtSeq}`);
         },
-        async onWantDone(_tx: SqlExecutor, _run: unknown, pass: { cursor: string | null }) {
-          seen.sealed.push(pass.cursor);
+        async onWantDone() {
+          me.sealed += 1;
         },
         async onFinish() {
-          seen.finishes += 1;
-          const whole = seen.batches[0]?.before === null && seen.batches.every((b, i) => i === 0 || b.before === seen.batches[i - 1]!.after)
-            && seen.sealed.length === 1 && seen.sealed[0] === seen.batches.at(-1)?.after;
+          me.finishes += 1;
+          const whole = me.chunks.length > 0 && me.chunks.every((c, i) => c.seq === i && c.last === (i === me.chunks.length - 1)) && me.sealed === 1;
           if (!whole) throw new StagedRunRestart("output_facts_stage_incomplete");
         },
       };
     };
-    const second = await runStagedReconcile(SCOPE, stamp, withEvents, { ...deps(), hooks: hooked() });
-    expect(second).toEqual({ status: "restart", reason: "output_facts_stage_incomplete" });
-    expect(runs_[0]!.batches[0]!.before).not.toBeNull();
-    expect(runs_[0]!.finishes).toBe(1);
-    // The final step rolled back: nothing deleted, no commit; the run restarts from nothing.
+    const opts = (h: ReturnType<typeof hooks>) => ({ ...deps(), factsChunk: 8, hooks: h });
+    // Attempt 1 has no hook; killed after the want phase.
+    expect(await runStagedReconcile(SCOPE, stamp, base, deps(killAt("want:done"))).catch((e) => e instanceof Kill)).toBe(true);
+    await expire();
+    // Attempt 2 attaches the hook after the want phase: no chunks, no seal -> restart, final rolled back.
+    expect(await runStagedReconcile(SCOPE, stamp, facts, opts(hooks()))).toEqual({ status: "restart", reason: "output_facts_stage_incomplete" });
+    expect(seen[0]).toEqual({ chunks: [], sealed: 0, finishes: 1 });
     expect([await staged_(), await commits()]).toEqual([0, 0]);
-    expect((await db.query<{ phase: string; last_error: string }>("SELECT phase, last_error FROM sessions.search_reconcile_runs_v1")).rows)
-      .toEqual([{ phase: "want", last_error: "output_facts_stage_incomplete" }]);
-    // Attempt 3 has the hook from the first batch: whole and sealed, it finishes; no loop.
-    const third = await runStagedReconcile(SCOPE, stamp, withEvents, { ...deps(), hooks: hooked() });
-    expect(third).toMatchObject({ status: "done", complete: true });
-    const t = runs_[1]!;
-    expect(t.batches[0]!.before).toBeNull();
-    expect(t.batches.length).toBe(Math.ceil(f.wants.length / 7));
-    expect(t.sealed).toEqual([t.batches.at(-1)!.after]);
-    expect(t.finishes).toBe(1);
-    expect(runs_[0]!.writes).toBeGreaterThan(0); // pass 4 ran (and committed its index rows) in attempt 2
+    // Attempt 3: killed mid facts pass (in its chunk transaction); the run stays in the want phase.
+    expect(await runStagedReconcile(SCOPE, stamp, facts, opts(hooks(2))).catch((e) => (e instanceof Kill ? e.message : e))).toBe("facts:2");
+    expect((await db.query<{ phase: string }>("SELECT phase FROM sessions.search_reconcile_runs_v1")).rows).toEqual([{ phase: "want" }]);
+    await expire();
+    // Attempt 4 resumes in the want phase: nothing left to stage, the facts pass reruns from seq 0, sealed, done.
+    expect(await runStagedReconcile(SCOPE, stamp, facts, opts(hooks()))).toMatchObject({ status: "done", complete: true });
+    const done = seen[2]!;
+    const n = Math.ceil(f.wants.length / 8);
+    expect(done.chunks.map((c) => c.seq)).toEqual([...Array(n).keys()]);
+    expect(done.chunks.map((c) => c.last)).toEqual([...Array(n).keys()].map((i) => i === n - 1));
+    expect(done.chunks.reduce((a, c) => a + c.n, 0)).toBe(f.wants.length);
+    expect([done.sealed, done.finishes]).toEqual([1, 1]);
     expect(await indexRows()).toEqual(expected);
+    // An empty facts input still gets one empty last chunk.
+    await reset(fixture());
+    const empty = { ...base, factsPass: async () => {} };
+    const h = hooks();
+    expect(await runStagedReconcile(SCOPE, stamp, empty, opts(h))).toMatchObject({ status: "done" });
+    expect(seen.at(-1)!.chunks).toEqual([{ seq: 0, last: true, n: 0 }]);
   });
 
   test("a source change mid-run abandons the run at the final check; the next tick restarts and converges on the new source", async () => {
