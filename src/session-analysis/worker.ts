@@ -29,17 +29,23 @@ import { runAnalysisJob } from "./processor.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "./store.ts";
 import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 
+/** Condition (d)'s database half (062120); the worker's own connection, never caller input. */
+export const CUTOVER_FREE_SQL = "SELECT sessions.session_analysis_cutover_free($1, $2, $3, $4, $5::timestamptz) AS free";
+
 export interface AnalysisConfig {
   enabled: boolean;
   batch: number;
   leaseSeconds: number;
   /** SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS=true: analyze scopes without the export's coverage marker. */
   assumeNoLegacyTurns: boolean;
+  /** SESSION_ANALYSIS_CUTOVER_PROOF=on: accept the scoped per-org cutover proof (condition (d)). */
+  cutoverProof: boolean;
 }
 
 /**
  * SESSION_ANALYSIS_ENABLED ("true" only), SESSION_ANALYSIS_BATCH (1-20, default 2),
- * SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS ("true" only; default off).
+ * SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS ("true" only; default off),
+ * SESSION_ANALYSIS_CUTOVER_PROOF ("on" only; default off).
  */
 export function analysisConfig(env: NodeJS.ProcessEnv = process.env): AnalysisConfig {
   const raw = env.SESSION_ANALYSIS_BATCH?.trim() ?? "";
@@ -49,6 +55,7 @@ export function analysisConfig(env: NodeJS.ProcessEnv = process.env): AnalysisCo
     batch,
     leaseSeconds: 600,
     assumeNoLegacyTurns: env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS === "true",
+    cutoverProof: env.SESSION_ANALYSIS_CUTOVER_PROOF === "on",
   };
 }
 
@@ -79,6 +86,8 @@ export const WORKER_POINTERS_SQL = SESSION_POINTERS_SQL.replace("p.manifest_key,
 export function canonicalEvidenceDeps(
   db: SqlExecutor,
   canonical: Omit<CanonicalDeps, "pointers">,
+  /** The trusted producer read; injectable for tests only. */
+  producer: typeof canonicalProducerSnapshot = canonicalProducerSnapshot,
 ): AnalysisEvidenceDeps & { anchorManifestKey(identity: CanonicalIdentity): Promise<string> } {
   const deps: CanonicalDeps = { ...canonical, pointers: (identity) => pointers(db, identity) };
   return {
@@ -91,12 +100,14 @@ export function canonicalEvidenceDeps(
       return rows.filter((r) => Number(r.live) > 0).map((r) => String(r.harness));
     },
     async snapshot(identity) {
-      const snap = await canonicalProducerSnapshot(deps, identity);
+      const snap = await producer(deps, identity);
       return {
         exists: snap.exists,
         generation: snap.generation,
         legacyCoverage: snap.legacyCoverage,
         neonDerived: snap.neonDerived,
+        legacyRowsMerged: snap.legacyRowsMerged,
+        ...(snap.legacyDroppedReason !== undefined ? { legacyDroppedReason: snap.legacyDroppedReason } : {}),
         rows: snap.rows,
       };
     },
@@ -108,6 +119,17 @@ export function canonicalEvidenceDeps(
      */
     async neonFree(identity) {
       const { rows } = await db.query<{ free: boolean }>(NEON_FREE_SQL, [identity.orgId, identity.workspaceId, identity.sessionId]);
+      return rows[0]?.free === true;
+    },
+    /** Condition (d): sessions.session_analysis_cutover_free (SECURITY DEFINER; never reads Neon). */
+    async cutoverFree(identity) {
+      const { rows } = await db.query<{ free: boolean }>(CUTOVER_FREE_SQL, [
+        identity.orgId,
+        identity.workspaceId,
+        identity.source,
+        identity.sessionId,
+        identity.earliestEvidenceAt,
+      ]);
       return rows[0]?.free === true;
     },
     async anchorManifestKey(identity) {
@@ -160,6 +182,7 @@ export function analysisTick(deps: {
           evidence,
           transport: deps.transport,
           assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns,
+          cutoverProof: deps.config.cutoverProof,
           ...(deps.decisionRecords ? { onCompleted: decisionRecordsHook(deps.decisionRecords, counts) } : {}),
         },
         { leaseSeconds: deps.config.leaseSeconds },

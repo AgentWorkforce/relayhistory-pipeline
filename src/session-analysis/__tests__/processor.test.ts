@@ -22,6 +22,7 @@ import { CanonicalReadError } from "../../session-read-api/canonical.ts";
 import {
   apiEvent,
   apiTurn,
+  earliestEvidenceAt,
   loadSessionSource,
   SessionSourceIncompleteError,
   SessionSourceNotFoundError,
@@ -284,6 +285,43 @@ describe("canonical evidence adapter", () => {
     await expect(
       loadSessionSource(deps({ neonFree: neonFree(true) }, { ...noMarker, neonDerived: undefined as never }), SCOPE),
     ).rejects.toThrow("legacy evidence coverage is unknown");
+  });
+
+  test("(d) cutover proof: only with the switch on, only over an all-canonical snapshot, and only when the database proves it", async () => {
+    const noMarker: CanonicalScopeRows = { ...projectedRows(), legacyCoverage: null, legacyRowsMerged: false };
+    const asked: unknown[] = [];
+    const cutoverFree = (v: boolean) => async (id: unknown) => (asked.push(id), v);
+    const on = { cutoverProof: true };
+    // Off (the default): (d) is never consulted; the refusal is byte-identical to before.
+    await expect(loadSessionSource(deps({ cutoverFree: cutoverFree(true) }, noMarker), SCOPE)).rejects.toThrow("legacy evidence coverage is unknown");
+    await expect(loadSessionSource(deps({ cutoverFree: cutoverFree(true) }, noMarker), SCOPE, { cutoverProof: false })).rejects.toThrow("legacy evidence coverage is unknown");
+    expect(asked).toEqual([]);
+    // On, and the database proves it: analyzed. The proof gets the scope, harness and the snapshot's earliest turn/event time.
+    expect((await loadSessionSource(deps({ cutoverFree: cutoverFree(true) }, noMarker), SCOPE, on)).sourceProvider).toBe("claude");
+    expect(asked).toEqual([{ ...SCOPE, source: "claude", earliestEvidenceAt: earliestEvidenceAt(noMarker.rows) }]);
+    expect(earliestEvidenceAt(noMarker.rows)).toBe("2026-11-05T11:00:00.000Z");
+    // On, and the database refuses (no cutover row, first seen before it, ...): refused.
+    await expect(loadSessionSource(deps({ cutoverFree: cutoverFree(false) }, noMarker), SCOPE, on)).rejects.toThrow("legacy evidence coverage is unknown");
+    // On, but no database half wired: refused.
+    await expect(loadSessionSource(deps({}, noMarker), SCOPE, on)).rejects.toThrow("legacy evidence coverage is unknown");
+    // On, but the snapshot is not entirely canonical: a Neon-derived manifest, merged legacy rows, or an
+    // absent merge flag each refuse without asking the database.
+    asked.length = 0;
+    for (const bad of [{ neonDerived: true }, { legacyRowsMerged: true }, { legacyRowsMerged: undefined }, { neonDerived: undefined as never },
+      { legacyDroppedReason: "legacy_provenance_invalid" }])
+      await expect(loadSessionSource(deps({ cutoverFree: cutoverFree(true) }, { ...noMarker, ...bad }), SCOPE, on)).rejects.toThrow("legacy evidence coverage is unknown");
+    expect(asked).toEqual([]);
+    // On, but a turn/event has no parseable time: no earliest evidence time, so no proof.
+    const undated = { ...noMarker, rows: noMarker.rows.map((r, i) => (i === 0 && r.table === "convergence_events" ? { ...r, row: { ...r.row, ts: "not a time" } } : r)) };
+    expect(earliestEvidenceAt(undated.rows)).toBeNull();
+    // (c) still works alongside (d), and the marker short-circuits both.
+    expect((await loadSessionSource(deps({ neonFree: async () => true, cutoverFree: cutoverFree(false) }, noMarker), SCOPE, on)).sourceProvider).toBe("claude");
+    expect((await loadSessionSource(deps({ cutoverFree: cutoverFree(false) }, projectedRows()), SCOPE, on)).sourceProvider).toBe("claude");
+    // The job processor threads the switch: off refuses the job's evidence, on analyzes it.
+    await expect(processSessionAnalysis(job(), { evidence: deps({ cutoverFree: cutoverFree(true) }, noMarker), transport: fakeTransport([]) }))
+      .rejects.toThrow("legacy evidence coverage is unknown");
+    const out = await processSessionAnalysis(job(), { evidence: deps({ cutoverFree: cutoverFree(true) }, noMarker), transport: fakeTransport([]), cutoverProof: true });
+    expect(out.harness).toBe("claude");
   });
 
   test("refuses a projected row from another source", async () => {

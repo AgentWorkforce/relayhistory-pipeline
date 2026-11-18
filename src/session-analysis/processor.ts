@@ -93,7 +93,7 @@ export class UnsupportedAnalysisJobError extends Error {}
 /** relayhistory processSessionAnalysis + processSessionBrief over one canonical evidence read. */
 export async function processSessionAnalysis(
   job: AnalysisJob,
-  deps: { evidence: AnalysisEvidenceDeps; transport: AnalysisModelTransport; assumeNoLegacyTurns?: boolean },
+  deps: { evidence: AnalysisEvidenceDeps; transport: AnalysisModelTransport; assumeNoLegacyTurns?: boolean; cutoverProof?: boolean },
 ): Promise<AnalysisJobOutput> {
   if (
     job.analysisVersion !== SESSION_ANALYSIS_VERSION ||
@@ -106,7 +106,7 @@ export async function processSessionAnalysis(
   const source = await loadSessionSource(
     deps.evidence,
     { orgId: job.orgId, workspaceId: job.workspaceId, sessionId: job.sessionId },
-    { assumeNoLegacyTurns: deps.assumeNoLegacyTurns === true },
+    { assumeNoLegacyTurns: deps.assumeNoLegacyTurns === true, cutoverProof: deps.cutoverProof === true },
   );
   // relayhistory assertOwnedSource: the evidence must be the job's own scope.
   if (
@@ -220,6 +220,8 @@ export async function runAnalysisJob(
     evidence: AnalysisEvidenceDeps;
     transport: AnalysisModelTransport;
     assumeNoLegacyTurns?: boolean;
+    /** SESSION_ANALYSIS_CUTOVER_PROOF=on: condition (d) of loadSessionSource. */
+    cutoverProof?: boolean;
     /**
      * Runs once after the job has completed (never before, never on lease loss or failure).
      * Its errors are contained: it never changes the job's outcome. Absent = nothing runs.

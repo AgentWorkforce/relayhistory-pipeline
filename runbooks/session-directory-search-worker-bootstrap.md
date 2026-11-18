@@ -441,6 +441,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105062090_relayfacts_erase.sql` | function sessions.relayfacts_evidence_erase_session_v1 and trigger relayfacts_evidence_fence_guard on sessions.relayfacts_evidence_v1 (relayfacts operator erase; EXECUTE to bulls96_session_ingest only) |
 | `upstream:20261105062100_relayfacts_user_erase.sql` | function sessions.relayfacts_user_erase_v1, table sessions.relayfacts_erasure_fences and triggers relayfacts_user_erase_guard, relayfacts_user_erase_lock_evidence and relayfacts_user_erase_lock_records (relayfacts per-user erase; owner-only, no EXECUTE grant) |
 | `upstream:20261105062110_search_reconcile_staging.sql` | tables sessions.search_reconcile_runs_v1 and sessions.search_reconcile_stage_v1 and function sessions.search_reconcile_claim_v1 (staged search reconcile; seven SECURITY DEFINER writers, EXECUTE to search_consumer_runtime only) |
+| `upstream:20261105062120_analysis_org_s3_cutover.sql` | tables sessions.org_s3_cutover and sessions.org_s3_cutover_history and function sessions.session_analysis_cutover_free (analysis org S3 cutover proof; owner-only tables and correction; EXECUTE to service_role only) |
+| `upstream:20261105062130_analysis_cutover_source_revision.sql` | function sessions.session_analysis_source_revision binds the org S3 cutover (org_s3_cutover_v1); replaced body, ACL kept |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |

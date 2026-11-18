@@ -212,6 +212,11 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105062100_relayfacts_user_erase.sql",
       // Search reconcile staging: new tables/functions only; no G4 function names them, no ingest path calls them.
       "20261105062110_search_reconcile_staging.sql",
+      // Analysis org S3 cutover proof: one owner-only table and one SECURITY DEFINER proof for the analysis worker
+      // (service_role). No G4 function names them, and no G4 ingest path calls them.
+      "20261105062120_analysis_org_s3_cutover.sql",
+      // The source revision binds the cutover proof (a replaced 046000 function; no G4 function names it).
+      "20261105062130_analysis_cutover_source_revision.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

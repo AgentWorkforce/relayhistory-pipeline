@@ -51,15 +51,46 @@ export interface IndexDeps {
   brief?: { idleSeconds: number; maxWaitSeconds: number } | null;
 }
 
+/**
+ * A pointer move (src/session-pipeline/pointer.ts): the row still names `rekeyFrom`, an older key of
+ * the same identity. The upsert deletes that row and inserts the new one in ONE transaction, keeping
+ * least(old, new) created_at, so a failure in between leaves the old row and its first-seen intact.
+ */
+export interface UpsertOptions { rekeyFrom?: string }
+export type HoopDbSessionPointerIndex = SessionPointerIndex & {
+  upsertRawPointer(pointer: RawPointer, ctx: TraceContext, opts?: UpsertOptions): ReturnType<SessionPointerIndex["upsertRawPointer"]>;
+};
+
+/**
+ * One transaction on one pooled connection (shared/db.ts inTransaction, inlined: importing db.ts
+ * as a value pulls its schema-asset reads into the large-read worker bundle).
+ */
+async function moveTransaction<T>(db: HoopDb, work: (tx: { query: HoopDb["query"] }) => Promise<T>): Promise<T> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await work({
+      query: (async (text: string, params?: unknown[]) => ({ rows: (await client.query(text, params as unknown[])).rows })) as HoopDb["query"],
+    });
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
-export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {return sessionIndex(deps,false);}
-function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
+export function hoopDbSessionIndex(deps: IndexDeps): HoopDbSessionPointerIndex {return sessionIndex(deps,false);}
+function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerIndex{
   const operatorErase = eraseRuntimeFlag(process.env, ERASE_FENCE_FLAG);
   const fromEnv = briefConfig();
   const brief =
     deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
   return {
-    async upsertRawPointer(pointer: RawPointer, ctx: TraceContext) {
+    async upsertRawPointer(pointer: RawPointer, ctx: TraceContext, opts: UpsertOptions = {}) {
       const pk = {
         org_id: ctx.orgId,
         workspace_id: pointer.workspaceId,
@@ -118,12 +149,16 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
         }};
         const final=await withPublicationAuthority(config.transact,evidence,async tx=>{
           const db={...deps.db,query:tx.query.bind(tx)}as HoopDb;
-          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true).upsertRawPointer(pointer,ctx);
+          return sessionIndex({...deps,db,reader:cached,queue:postgresPipelineQueue(tx)},true).upsertRawPointer(pointer,ctx,opts);
         });
         return final.current?final.value:{status:"skipped",reason:"publication_retired"};
       }
       if(!authorized&&pointer.manifestKey.includes('/upload-generations/'))
         throw Object.assign(Error("publication_authority_unconfigured"),{code:"publication_authority_unconfigured"});
+      // A move without the publication transaction (no publication config): the delete and the
+      // re-insert still commit together. (A test double without a pool runs them in sequence.)
+      if(!authorized&&opts.rekeyFrom&&deps.db.pool)
+        return moveTransaction(deps.db,tx=>sessionIndex({...deps,db:{...deps.db,query:tx.query}as HoopDb},true).upsertRawPointer(pointer,ctx,opts));
       const f = pointerFields(m);
       const ext = sessionExt(m);
       const canonical = canonicalManifestIdentity(m);
@@ -191,6 +226,20 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
         trace_id: f.traceId,
         deleted_at: null,
       };
+      if (opts.rekeyFrom) {
+        // The move's delete, in this upsert's transaction; the new row keeps the older first-seen.
+        const removed = await deps.db.query<{ created_at: unknown }>(
+          `DELETE FROM sessions.session_index
+            WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
+              AND manifest_key = $6
+            RETURNING created_at`,
+          [pk.org_id, pk.workspace_id, pk.harness, pk.session_id, pk.machine_id, opts.rekeyFrom],
+        );
+        const before = removed.rows[0]?.created_at;
+        const prior = before instanceof Date ? before.getTime() : before == null ? Number.NaN : Date.parse(String(before));
+        if (Number.isFinite(prior) && (row.created_at == null || prior < Date.parse(String(row.created_at))))
+          row.created_at = new Date(prior).toISOString();
+      }
       const { rows } = await deps.db.query<{
         applied: boolean;
         revision: string;

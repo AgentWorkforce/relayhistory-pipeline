@@ -167,6 +167,17 @@ export interface CanonicalScopeRows {
    * manifest read.
    */
   neonDerived: boolean;
+  /**
+   * Whether this snapshot merged any legacy (Neon-exported) turn rows into its live canonical rows
+   * (canonical.ts `legacyRowsMerged`). Condition (d) requires it present and false: a snapshot that
+   * carries exported Neon rows came, in part, from Neon. Absent never counts as false.
+   */
+  legacyRowsMerged?: boolean;
+  /**
+   * canonical.ts `legacyDroppedReason`: invalid legacy evidence was dropped from this snapshot.
+   * Condition (d) refuses when it is set (the snapshot is then known to be missing Neon rows).
+   */
+  legacyDroppedReason?: string;
   /** canonicalSourceGeneration: pointer set identity, recorded as the job's source revision. */
   generation: string;
   rows: Array<{ table: string; row: RecordValue }>;
@@ -190,6 +201,50 @@ export interface AnalysisEvidenceDeps {
    * outright, false requires the marker.
    */
   neonFree?(identity: AnalysisScope & { source: string }): Promise<boolean>;
+  /**
+   * Condition (d), the scoped cutover proof (sessions.session_analysis_cutover_free, 062120): the
+   * org has a recorded S3 cutover (uploads fenced AND Neon turn writes forwarded), the scope has a
+   * live pointer, and both the session's first-seen time and `earliestEvidenceAt` (the earliest
+   * turn/event time in THIS snapshot) are strictly after it. Consulted only with
+   * SESSION_ANALYSIS_CUTOVER_PROOF=on. Never reads Neon.
+   */
+  cutoverFree?(identity: AnalysisScope & { source: string; earliestEvidenceAt: string }): Promise<boolean>;
+}
+
+/**
+ * The earliest turn/event time in a snapshot (ISO), or null when the snapshot has no turn or
+ * event, or any of them has no parseable time (doubt: the cutover proof then refuses).
+ */
+export function earliestEvidenceAt(rows: CanonicalScopeRows["rows"]): string | null {
+  let earliest = Number.POSITIVE_INFINITY;
+  let any = false;
+  for (const { table, row } of rows) {
+    if (table !== "conversation_turns" && table !== "convergence_events") continue;
+    const ts = iso(row.ts);
+    const parsed = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
+    if (!Number.isFinite(parsed)) return null;
+    any = true;
+    if (parsed < earliest) earliest = parsed;
+  }
+  return any ? new Date(earliest).toISOString() : null;
+}
+
+/**
+ * Condition (d): the snapshot is entirely canonical S3 evidence (no Neon export/backfill manifest,
+ * no merged legacy rows, no dropped invalid legacy evidence; the producer snapshot itself already refused an incomplete projection or a
+ * pointer set that moved during the read) AND the org's recorded cutover proves no Neon-only turn or
+ * event can exist for the session. Any doubt is false.
+ */
+async function cutoverProven(
+  deps: AnalysisEvidenceDeps,
+  identity: AnalysisScope & { source: string },
+  snapshot: CanonicalScopeRows,
+): Promise<boolean> {
+  if (!deps.cutoverFree || snapshot.neonDerived !== false || snapshot.legacyRowsMerged !== false) return false;
+  if (snapshot.legacyDroppedReason !== undefined) return false;
+  const earliest = earliestEvidenceAt(snapshot.rows);
+  if (!earliest) return false;
+  return (await deps.cutoverFree({ ...identity, earliestEvidenceAt: earliest })) === true;
 }
 
 /** Postgres timestamptz text or ISO, as the JS Date JSON relayhistory's readers returned. */
@@ -569,6 +624,11 @@ export async function loadSessionSource(
      * READ_API_TIMING_ASSUME_NO_TURNS pattern): analyze a scope without the coverage marker.
      */
     assumeNoLegacyTurns?: boolean;
+    /**
+     * SESSION_ANALYSIS_CUTOVER_PROOF=on (default off): also accept condition (d), the scoped
+     * per-org cutover proof (cutoverProven). Off: the gate is byte-identical to before.
+     */
+    cutoverProof?: boolean;
   } = {},
 ): Promise<SessionSourceSnapshot & { sourceGeneration: string }> {
   const { sessionId } = scope;
@@ -585,10 +645,13 @@ export async function loadSessionSource(
   // Without the export's coverage marker a Neon-era scope may lack turns Neon held, so its
   // evidence is incomplete (the turns route's turns_unknown). A session that never existed
   // in Neon has no Neon-only evidence: it is complete from S3 alone (neonFree proves it).
+  // (d), only when switched on: the org's recorded S3 cutover proves it for this session
+  // (docs/session-analysis-completeness.md).
   if (
     !snapshot.legacyCoverage &&
     options.assumeNoLegacyTurns !== true &&
-    !(deps.neonFree && snapshot.neonDerived === false && (await deps.neonFree({ ...scope, source: harness })))
+    !(deps.neonFree && snapshot.neonDerived === false && (await deps.neonFree({ ...scope, source: harness }))) &&
+    !(options.cutoverProof === true && (await cutoverProven(deps, { ...scope, source: harness }, snapshot)))
   )
     throw new SessionSourceIncompleteError("RelayHistory legacy evidence coverage is unknown");
   const budget = new EvidenceBudget();
