@@ -23,25 +23,28 @@
 --     'note'       a reason a batch could not be read exactly (the pass is then incomplete)
 --   Logged, RLS on, no policy, no table grant: reachable only through the functions.
 --
---   Lifecycle: the stage rows go with the run, and no 062110 function is replaced for it. The
---   first stage call of a run adds one anchor row to sessions.search_reconcile_stage_v1 (side
---   'fold', key_hash '~output_facts': '~' is outside the base64 alphabet of a stream index key, so
---   it is never a real fold key, and the 062110 diff pages read only the 'want' and 'have'
---   sides), and every staged_facts_v1 row references that anchor ON DELETE CASCADE. Every 062110
---   path that drops a run's stage rows (search_reconcile_finish_v1, search_reconcile_abandon_v1,
---   a search_reconcile_claim_v1 restart on a changed source, and search_reconcile_erase_scope_v1)
---   deletes the anchor, and the facts stage goes with it in the same statement.
+--   sessions.staged_facts_runs_v1: one row per 062110 run that staged facts, the chain state
+--   (whole, seq, done, sealed; see Wholeness), REFERENCES search_reconcile_runs_v1 ON DELETE CASCADE;
+--   every staged_facts_v1 row REFERENCES it ON DELETE CASCADE. Logged, RLS on, no policy, no grant.
 --
---   Wholeness: the anchor's payload {"whole", "seq", "done", "sealed"} says whether the stage holds
---   the run's entire facts input. The wiring delivers that input once per attempt, at the end of the
---   want phase, as numbered chunks (seq 0, 1, ...; the last one flagged), each in its own
---   transaction. Chunk 0 drops whatever the run had staged (an earlier attempt's partial pass) and
---   starts the chain whole; a later chunk keeps it whole only when it is the next number and the
---   chain is neither done nor sealed. The want -> have advance seals the anchor, whole only if the
---   last chunk was seen. A run whose facts input was not staged in one unbroken pass (facts turned
---   on after the pass, or mid-pass, or a gap) therefore never yields a whole stage. The reconcile
---   writes only a whole, sealed stage; anything else leaves the facts tables as they are (the
---   caller reports it and the run goes round again).
+--   Lifecycle: the stage rows go with the run, and no 062110 function is replaced for it.
+--   search_reconcile_finish_v1 and search_reconcile_erase_scope_v1 delete the run row: the facts
+--   stage cascades from it. search_reconcile_abandon_v1 and a search_reconcile_claim_v1 restart on
+--   a changed source keep the run row and reset it to the start of the want phase: the trigger
+--   staged_facts_reset on search_reconcile_runs_v1 (AFTER UPDATE, one call per run update, its WHEN
+--   clause matching only that reset) deletes the run's facts stage. Nothing here touches
+--   search_reconcile_stage_v1, so the 062110 bulk deletes of stage rows cost what they cost without
+--   this step.
+--
+--   Wholeness: staged_facts_runs_v1 says whether the stage holds the run's entire facts input. The
+--   wiring delivers that input once per attempt, at the end of the want phase, as numbered chunks
+--   (seq 0, 1, ...; the last one flagged), each in its own transaction. Chunk 0 drops whatever the
+--   run had staged (an earlier attempt's partial pass) and starts the chain whole; a later chunk keeps
+--   it whole only when it is the next number and the chain is neither done nor sealed. The want ->
+--   have advance seals it, whole only if the last chunk was seen. A run whose facts input was not
+--   staged in one unbroken pass (facts turned on after the pass, or mid-pass, or a gap) therefore
+--   never yields a whole stage. The reconcile writes only a whole, sealed stage; anything else leaves
+--   the facts tables as they are (the caller reports it and the run goes round again).
 --
 -- Writer functions (SECURITY DEFINER, search_path pinned, EXECUTE to search_consumer_runtime
 -- alone; each takes the run id and its lease nonce and goes through search_reconcile_lease_v1,
@@ -59,14 +62,15 @@
 --                              whole writes nothing (applied = false); then the same stale
 --                              source_version rule (applied = false, nothing written), the same
 --                              out-of-scope refusal, upserts and complete-only deletes
--- Helpers (owner-only, not SECURITY DEFINER): staged_facts_run_v1 (the lease plus the phase check)
--- and staged_facts_whole_v1 (the anchor's verdict).
+-- Helpers (owner-only, not SECURITY DEFINER): staged_facts_run_v1 (the lease plus the phase check),
+-- staged_facts_whole_v1 (the chain's verdict) and the trigger function staged_facts_reset_v1.
 -- The 045040 helpers output_facts_writer_scope and output_facts_stored_version are reused as is.
 --
 -- Roles: never created or altered here; search_consumer_runtime and bulls96_read_api are
 -- provisioned before migrate and checked here, fail closed (42704 absent, 55000 elevated).
--- New objects only: no existing function is replaced, no extension, no temp table. The foreign key
--- adds PostgreSQL's internal referential triggers to sessions.search_reconcile_stage_v1.
+-- New objects only: no existing function is replaced, no extension, no temp table. On the 062110
+-- run table this adds the reset trigger and, through the foreign key, PostgreSQL's internal
+-- referential triggers (one probe per deleted run row).
 --
 -- Transactional (no CONCURRENTLY, no enum change): migrate.ts wraps it with its ledger row.
 -- Code only; applying it to a real database needs Khaliq's explicit OK. Down path:
@@ -91,10 +95,17 @@ BEGIN
 END
 $roles$;
 
+CREATE TABLE sessions.staged_facts_runs_v1 (
+  run_id bigint PRIMARY KEY REFERENCES sessions.search_reconcile_runs_v1 (run_id) ON DELETE CASCADE,
+  whole boolean NOT NULL,
+  seq integer CHECK (seq >= 0),
+  done boolean NOT NULL,
+  sealed boolean NOT NULL
+);
+ALTER TABLE sessions.staged_facts_runs_v1 ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE sessions.staged_facts_v1 (
-  run_id bigint NOT NULL,
-  anchor_side text NOT NULL DEFAULT 'fold' CHECK (anchor_side = 'fold'),
-  anchor_key text COLLATE "C" NOT NULL DEFAULT '~output_facts' CHECK (anchor_key = '~output_facts'),
+  run_id bigint NOT NULL REFERENCES sessions.staged_facts_runs_v1 (run_id) ON DELETE CASCADE,
   item_kind text NOT NULL CHECK (item_kind IN ('event', 'fact', 'candidate', 'call', 'parent', 'record', 'session', 'note')),
   item_key text COLLATE "C" NOT NULL CHECK (char_length(item_key) BETWEEN 1 AND 200),
   seq bigint GENERATED ALWAYS AS IDENTITY,
@@ -104,19 +115,39 @@ CREATE TABLE sessions.staged_facts_v1 (
   ts timestamptz,
   body text NOT NULL,
   PRIMARY KEY (run_id, item_kind, item_key),
-  FOREIGN KEY (run_id, anchor_side, anchor_key)
-    REFERENCES sessions.search_reconcile_stage_v1 (run_id, side, key_hash) ON DELETE CASCADE,
   CHECK ((item_kind IN ('event', 'fact')) = (row_id IS NOT NULL AND ts IS NOT NULL))
 );
--- The cascade probes this index for every 062110 stage row a finish, abandon or restart deletes.
-CREATE INDEX staged_facts_v1_anchor ON sessions.staged_facts_v1 (run_id, anchor_side, anchor_key);
 CREATE INDEX staged_facts_v1_match ON sessions.staged_facts_v1 (run_id, item_kind, group_key, match_key);
 CREATE INDEX staged_facts_v1_row ON sessions.staged_facts_v1 (run_id, item_kind, row_id) WHERE row_id IS NOT NULL;
 CREATE INDEX staged_facts_v1_seq ON sessions.staged_facts_v1 (run_id, item_kind, seq);
 ALTER TABLE sessions.staged_facts_v1 ENABLE ROW LEVEL SECURITY;
 
-REVOKE ALL ON sessions.staged_facts_v1
+REVOKE ALL ON sessions.staged_facts_runs_v1, sessions.staged_facts_v1
   FROM PUBLIC, anon, authenticated, service_role, search_consumer_runtime, bulls96_read_api;
+
+-- The reset of a run that 062110 keeps (abandon; a claim restart on a changed source): both put
+-- the run back at the start of the want phase with no lease holder or a new source stamp. Its
+-- facts stage goes (the next attempt stages its facts pass again from chunk 0).
+CREATE FUNCTION sessions.staged_facts_reset_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp AS $reset$
+BEGIN
+  DELETE FROM sessions.staged_facts_runs_v1 AS f WHERE f.run_id = NEW.run_id;
+  RETURN NULL;
+END
+$reset$;
+
+CREATE TRIGGER staged_facts_reset
+AFTER UPDATE ON sessions.search_reconcile_runs_v1
+FOR EACH ROW
+WHEN (NEW.phase = 'want' AND NEW.pass = 0 AND NEW.chunk_cursor IS NULL AND NEW.write_wanted = 0 AND NEW.write_done = 0
+      AND (OLD.phase IS DISTINCT FROM NEW.phase OR OLD.pass IS DISTINCT FROM NEW.pass OR OLD.chunk_cursor IS NOT NULL
+           OR OLD.canonical_id IS DISTINCT FROM NEW.canonical_id OR OLD.pointer_epoch IS DISTINCT FROM NEW.pointer_epoch
+           OR OLD.manifest_fingerprint IS DISTINCT FROM NEW.manifest_fingerprint
+           OR (OLD.lease_nonce IS NOT NULL AND NEW.lease_nonce IS NULL)
+           OR OLD.last_error IS DISTINCT FROM NEW.last_error))
+EXECUTE FUNCTION sessions.staged_facts_reset_v1();
 
 -- The run held under this nonce (search_reconcile_lease_v1: 42501 for another caller, RH062 for a
 -- lost lease, the lease extended), in one of these phases (55000 otherwise).
@@ -139,9 +170,7 @@ CREATE FUNCTION sessions.staged_facts_whole_v1(p_run_id bigint)
 RETURNS boolean
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp AS $whole$
-  SELECT coalesce((SELECT (s.payload->>'whole')::boolean AND (s.payload->>'sealed')::boolean
-                     FROM sessions.search_reconcile_stage_v1 AS s
-                    WHERE s.run_id = p_run_id AND s.side = 'fold' AND s.key_hash = '~output_facts'), false);
+  SELECT coalesce((SELECT f.whole AND f.sealed FROM sessions.staged_facts_runs_v1 AS f WHERE f.run_id = p_run_id), false);
 $whole$;
 
 -- p_entries: [{"k": kind, "i": item key (all kinds but event and fact), "g": group key,
@@ -156,8 +185,8 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $stage$
 DECLARE
   r sessions.search_reconcile_runs_v1%ROWTYPE;
-  v_anchor jsonb;
-  v_next jsonb;
+  v_chain sessions.staged_facts_runs_v1%ROWTYPE;
+  v_found boolean;
   v_n integer;
 BEGIN
   r := sessions.staged_facts_run_v1(p_run_id, p_nonce, ARRAY['want', 'final']);
@@ -178,29 +207,21 @@ BEGIN
         OR (x.e->>'k' NOT IN ('event', 'fact') AND coalesce(x.e->>'i', '') = '')) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'staged facts: incomplete stage entry';
   END IF;
-  -- The anchor the run's facts stage hangs off (see the header): 062110 drops it with the run's stage
-  -- rows. Chunk 0 starts the chain over; a later chunk extends it; an anchor first made by anything
-  -- but chunk 0 is never whole.
-  SELECT s.payload INTO v_anchor FROM sessions.search_reconcile_stage_v1 AS s
-   WHERE s.run_id = p_run_id AND s.side = 'fold' AND s.key_hash = '~output_facts' FOR UPDATE;
+  -- The run's chain (see the header). Chunk 0 starts it over; a later chunk extends it; a chain first
+  -- made by anything but chunk 0 is never whole.
+  SELECT * INTO v_chain FROM sessions.staged_facts_runs_v1 AS f WHERE f.run_id = p_run_id FOR UPDATE;
+  v_found := FOUND;
   IF r.phase = 'want' AND p_seq = 0 THEN
     DELETE FROM sessions.staged_facts_v1 AS f WHERE f.run_id = p_run_id;
-    v_next := jsonb_build_object('whole', true, 'seq', 0, 'done', p_last, 'sealed', false);
+    v_chain := ROW(p_run_id, true, 0, p_last, false);
   ELSIF r.phase = 'want' AND p_seq IS NOT NULL THEN
-    v_next := jsonb_build_object(
-      'whole', v_anchor IS NOT NULL AND (v_anchor->>'whole')::boolean AND NOT (v_anchor->>'done')::boolean
-               AND NOT (v_anchor->>'sealed')::boolean AND p_seq = (v_anchor->>'seq')::integer + 1,
-      'seq', p_seq, 'done', p_last, 'sealed', false);
-  ELSE
-    v_next := coalesce(v_anchor, jsonb_build_object('whole', false, 'seq', NULL, 'done', false, 'sealed', false));
+    v_chain := ROW(p_run_id, v_found AND v_chain.whole AND NOT v_chain.done AND NOT v_chain.sealed AND p_seq = v_chain.seq + 1, p_seq, p_last, false);
+  ELSIF NOT v_found THEN
+    v_chain := ROW(p_run_id, false, NULL, false, false);
   END IF;
-  IF v_anchor IS NULL THEN
-    INSERT INTO sessions.search_reconcile_stage_v1 (run_id, side, key_hash, match_key, owner, ts_ms, fingerprint, payload)
-    VALUES (p_run_id, 'fold', '~output_facts', '~output_facts', jsonb_build_array(r.workspace_id, r.session_id)::text, 0, 'output_facts', v_next);
-  ELSIF v_next IS DISTINCT FROM v_anchor THEN
-    UPDATE sessions.search_reconcile_stage_v1 AS s SET payload = v_next
-     WHERE s.run_id = p_run_id AND s.side = 'fold' AND s.key_hash = '~output_facts';
-  END IF;
+  INSERT INTO sessions.staged_facts_runs_v1 AS f (run_id, whole, seq, done, sealed)
+  VALUES (v_chain.run_id, v_chain.whole, v_chain.seq, v_chain.done, v_chain.sealed)
+  ON CONFLICT (run_id) DO UPDATE SET whole = EXCLUDED.whole, seq = EXCLUDED.seq, done = EXCLUDED.done, sealed = EXCLUDED.sealed;
   INSERT INTO sessions.staged_facts_v1 (run_id, item_kind, item_key, group_key, match_key, row_id, ts, body)
   SELECT p_run_id, x.k,
          CASE WHEN x.k IN ('event', 'fact') THEN (x.b->>'row_id') || ':' || coalesce(x.b->>'fingerprint', '') ELSE x.i END,
@@ -243,28 +264,18 @@ BEGIN
 END
 $read$;
 
--- The want phase ended (called in the transaction that ends it): the anchor is sealed, whole only if
--- the chain saw its last chunk. No anchor: the facts input was never staged on this run; sealed, not whole.
+-- The want phase ended (called in the transaction that ends it): the chain is sealed, whole only if
+-- it saw its last chunk. No chain: the facts input was never staged on this run; sealed, not whole.
 CREATE FUNCTION sessions.staged_facts_seal_v1(p_run_id bigint, p_nonce uuid)
 RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $seal$
-DECLARE
-  r sessions.search_reconcile_runs_v1%ROWTYPE;
-  v_anchor jsonb;
+DECLARE r sessions.search_reconcile_runs_v1%ROWTYPE;
 BEGIN
   r := sessions.staged_facts_run_v1(p_run_id, p_nonce, ARRAY['want', 'have']);
-  SELECT s.payload INTO v_anchor FROM sessions.search_reconcile_stage_v1 AS s
-   WHERE s.run_id = p_run_id AND s.side = 'fold' AND s.key_hash = '~output_facts' FOR UPDATE;
-  IF NOT FOUND THEN
-    INSERT INTO sessions.search_reconcile_stage_v1 (run_id, side, key_hash, match_key, owner, ts_ms, fingerprint, payload)
-    VALUES (p_run_id, 'fold', '~output_facts', '~output_facts', jsonb_build_array(r.workspace_id, r.session_id)::text, 0, 'output_facts',
-            jsonb_build_object('whole', false, 'seq', NULL, 'done', false, 'sealed', true));
-  ELSE
-    UPDATE sessions.search_reconcile_stage_v1 AS s
-       SET payload = v_anchor || jsonb_build_object('whole', (v_anchor->>'whole')::boolean AND (v_anchor->>'done')::boolean, 'sealed', true)
-     WHERE s.run_id = p_run_id AND s.side = 'fold' AND s.key_hash = '~output_facts';
-  END IF;
+  INSERT INTO sessions.staged_facts_runs_v1 AS f (run_id, whole, seq, done, sealed)
+  VALUES (p_run_id, false, NULL, false, true)
+  ON CONFLICT (run_id) DO UPDATE SET whole = f.whole AND f.done, sealed = true;
   RETURN sessions.staged_facts_whole_v1(p_run_id);
 END
 $seal$;
@@ -418,6 +429,7 @@ $reconcile$;
 
 REVOKE ALL ON FUNCTION sessions.staged_facts_run_v1(bigint, uuid, text[]) FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.staged_facts_whole_v1(bigint) FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION sessions.staged_facts_reset_v1() FROM PUBLIC, anon, authenticated, service_role;
 REVOKE ALL ON FUNCTION sessions.staged_facts_stage_v1(bigint, uuid, jsonb, integer, boolean)
   FROM PUBLIC, anon, authenticated, service_role, bulls96_read_api;
 REVOKE ALL ON FUNCTION sessions.staged_facts_seal_v1(bigint, uuid)

@@ -173,7 +173,7 @@ export interface StagedOutputFactsScope extends OutputFactsStagedScope {
  * The stage does not cover the run's whole want pass (facts were off for part of it, or the hook
  * was attached late): nothing was written. The run must go round again from its first batch: as a
  * StagedRunRestart thrown from onFinish, the module rolls the final transaction back and abandons
- * the run with this reason, which drops the stage (anchor and all) with the run's; the next attempt
+ * the run with this reason, which drops the run's facts stage (the reset trigger); the next attempt
  * has the hook from its first batch.
  */
 export class StagedOutputFactsIncompleteError extends StagedRunRestart {
@@ -227,7 +227,7 @@ export interface StagedFactsChunk {
 async function stageEntries(tx: SqlExecutor, run: StagedRunRef, entries: StageEntry[], chunk: StagedFactsChunk | null): Promise<number> {
   if (chunk && (!Number.isSafeInteger(chunk.seq) || chunk.seq < 0)) throw new Error("output_facts_invalid_chunk");
   let staged = 0;
-  // One call per chunk even when it has no items (the call extends the anchor's chain); a chunk larger than
+  // One call per chunk even when it has no items (the call extends the run's chain); a chunk larger than
   // one call goes in several, the first with the chunk's number (seq 0 restarts the chain), the rest
   // under the same number as continuations: only the first call of a chunk moves the chain.
   for (let i = 0; i === 0 || i < entries.length; i += STAGE_CHUNK) {

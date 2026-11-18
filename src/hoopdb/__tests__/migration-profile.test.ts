@@ -2711,7 +2711,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       return src.slice(open, src.indexOf(tag, open));
     };
     // 20261105062140 is newest: 062130's down refuses (55000) while it is applied; its checksum-pinned down drops its
-    // table, its seven functions, the fold-side anchors it left in the 062110 stage table and its ledger row, and refuses on a rerun.
+    // trigger on the 062110 run table, its two tables, its eight functions and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(SOF);
     expect((await failure(rollback("20261105062130_analysis_cutover_source_revision.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(OSR);

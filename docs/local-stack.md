@@ -531,19 +531,23 @@ today.
   those, stages the result, and runs `sessions.staged_facts_reconcile_v1`: `output_facts_reconcile` over the staged
   rows, with the same version rule, upserts and complete-only deletes. It must run before `search_reconcile_finish_v1`,
   which drops the stage.
-- **Lifecycle.** The stage hangs off one anchor row in `search_reconcile_stage_v1` (side `fold`, key
-  `~output_facts`) by a cascading foreign key, so every 062110 path that drops a run's stage rows (finish, abandon, a
-  restart on a changed source, `erase_scope`) drops the facts stage too. No 062110 function is replaced.
-- **Wholeness.** The anchor records whether the stage holds the attempt's whole facts pass: chunk 0 drops whatever
-  the run had staged and starts the chain, each later chunk must be the next number, and the want -> have advance
-  seals it, whole only if the last chunk was seen. A stage that is not whole (facts turned on mid-pass or after it, a
-  gap, no seal) is never reconciled. The final step throws `StagedOutputFactsIncompleteError` (a `StagedRunRestart`),
-  the run is abandoned with `output_facts_stage_incomplete` and goes round again, and the facts tables keep what they
-  had.
+- **Lifecycle.** The facts stage is two tables of its own: `sessions.staged_facts_runs_v1` (one row per run: the
+  chain state) references `search_reconcile_runs_v1` with a cascading foreign key, and `sessions.staged_facts_v1`
+  references that. `search_reconcile_finish_v1` and `search_reconcile_erase_scope_v1` delete the run row, so the facts
+  stage cascades; `search_reconcile_abandon_v1` and a claim restart on a changed source keep the run row and reset it,
+  and the AFTER UPDATE trigger `staged_facts_reset` on the run table (its WHEN clause matches only that reset, one call
+  per run update) deletes the facts stage. Nothing references `search_reconcile_stage_v1`, so 062110's bulk deletes
+  of millions of stage rows cost what they cost without this step. No 062110 function is replaced.
+- **Wholeness.** `staged_facts_runs_v1` records whether the stage holds the attempt's whole facts pass: chunk 0 drops
+  whatever the run had staged and starts the chain, each later chunk must be the next number, and the want -> have
+  advance seals it, whole only if the last chunk was seen. A stage that is not whole (facts turned on mid-pass or
+  after it, a gap, no seal) is never reconciled. The final step throws `StagedOutputFactsIncompleteError` (a
+  `StagedRunRestart`), the run is abandoned with `output_facts_stage_incomplete` and goes round again, and the facts
+  tables keep what they had.
 - **Exactness.** Over a whole read the staged facts equal the whole-set path's (`output-facts-parity.test.ts`). One
   difference: on a malformed event or commit link, the whole path stops at the first one and the staged path skips
   only that row. Both are incomplete with the same reason and delete nothing.
-- **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the anchors, the table and
+- **Rollback.** `supabase/rollbacks/20261105062140_staged_output_facts.down.sql` removes the trigger, both tables and
   the functions. It refuses while a run that staged facts holds a live lease.
 
 ### Hosted Lambda: streamed ClickHouse reconcile (issue 610 L3 D1)
