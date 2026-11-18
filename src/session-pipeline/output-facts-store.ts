@@ -278,14 +278,38 @@ export async function stageOutputFactsChunk(
   events: StagedFactsEvents,
   chunk: StagedFactsChunk,
   sourceVersion: number,
+  /**
+   * The record bytes staged so far this attempt (`used` weighted, `counted` as UTF-8), their bound and the
+   * weight of a record with any code unit above 0xFF; the caller resets both sums at chunk 0.
+   */
+  recordBytes?: { used: number; counted: number; cap: number; wideWeight: number },
 ): Promise<number> {
   const items = outputFactsBatchStep(scope, events, sourceVersionOf(sourceVersion));
+  const entries = items.map(stageEntry);
+  if (recordBytes) {
+    // Counted before anything is sent, so a run past the bound stops before the stage holds its records.
+    for (const e of entries) {
+      if (e.k !== "record") continue;
+      const bytes = Buffer.byteLength(e.b, "utf8");
+      recordBytes.counted += bytes;
+      recordBytes.used += WIDE_TEXT.test(e.b) ? bytes * recordBytes.wideWeight : bytes;
+    }
+    if (recordBytes.used > recordBytes.cap)
+      throw new PipelineError(
+        OUTPUT_FACTS_CHUNK_UNSTAGEABLE,
+        `staged output facts: run bytes bound: ${recordBytes.counted} record bytes (${Math.ceil(recordBytes.used)} weighted) staged this attempt, bound ${recordBytes.cap} (chunk ${chunk.seq})`,
+        false,
+      );
+  }
   try {
-    return await stageEntries(tx, run, items.map(stageEntry), chunk);
+    return await stageEntries(tx, run, entries, chunk);
   } catch (error) {
-    throw unstageable(error) ?? error;
+    throw unstageable(error, { seq: chunk.seq, items: entries.length }) ?? error;
   }
 }
+
+/** Any UTF-16 code unit above 0xFF: the runtime keeps such a string 16-bit (twice the heap per character). */
+const WIDE_TEXT = /[^\u0000-\u00ff]/;
 
 /** The reason a staged run abandons with when a facts chunk cannot be staged (see unstageable). */
 export const OUTPUT_FACTS_CHUNK_UNSTAGEABLE = "output_facts_chunk_unstageable";
@@ -299,11 +323,14 @@ export const OUTPUT_FACTS_CHUNK_UNSTAGEABLE = "output_facts_chunk_unstageable";
  * abandonOn) instead of failing the same chunk on every tick. Anything else (a lost lease, a
  * connection error) is returned as null and rethrown as it is.
  */
-export function unstageable(error: unknown): PipelineError | null {
+export function unstageable(error: unknown, at: { seq: number; items: number } = { seq: -1, items: -1 }): PipelineError | null {
   const code = (error as { code?: unknown } | null)?.code;
   const sized = code === "54000" || code === "54001" || code === "53200";
   const local = error instanceof RangeError || (error instanceof Error && error.message === "output_facts_chunk_too_large");
-  return sized || local ? new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, "a staged output facts chunk could not be staged", false) : null;
+  if (!sized && !local) return null;
+  // Counts and codes only, never content: which bound (item size), where, and why.
+  const why = sized ? `database ${String(code)}` : error instanceof RangeError ? "client RangeError" : `send limit ${stagedFactsSendLimit.bytes} bytes`;
+  return new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, `staged output facts: item size bound: chunk ${at.seq}, ${at.items} items, ${why}`, false);
 }
 
 /** The want phase ended (onWantDone, in the advance transaction). Returns whether the stage is whole. */

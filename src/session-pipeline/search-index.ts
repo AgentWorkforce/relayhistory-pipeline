@@ -199,6 +199,8 @@ export interface StagedReconcile {
   keyedRecordsCap: number;
   /** Tests only: the staged run's batch sizes, lease and phase-boundary seam (staged-reconcile.ts). */
   run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError" | "heartbeatMs" | "attemptsCap">>;
+  /** Tests only: the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP in production). */
+  factsRecordBytesCap?: number;
 }
 
 /**
@@ -209,6 +211,27 @@ export interface StagedReconcile {
  * cap). A later slice replaces the in-memory keys and removes it.
  */
 export const STAGED_KEYED_RECORDS_CAP = 500_000;
+
+/**
+ * The most weighted bytes of record items (legacy outcomes and turns, live conversation turns: their
+ * JSON text, STAGED_FACTS_WIDE_TEXT_WEIGHT applied) one staged run's facts pass may stage per attempt.
+ * The final step reads them all back and folds them in memory. Measured with
+ * scripts/bench/staged-facts-rss.ts --whole-run (one process, Bun 1.4.2, 100000 legacy turns):
+ *   300 ASCII characters (762 staged bytes each)          peak 0.66 GB
+ *   3000 ASCII characters (3462 bytes each)               peak 1.22 GB   -> about 2.09 B of RSS per staged byte
+ *   3000 characters with one above U+00FF (3464 bytes)    peak 1.89-1.94 GB -> about 4.6 B per staged byte
+ * Model: peak = a(records) + slope x staged bytes, with a(500000 records) = 1.61 GB (500000 short ASCII turns
+ * peak 2.41 GB). At both bounds: ASCII 1.61 + 2.09 x 0.537 = 2.73 GB; wide text, counted 2.5 x,
+ * 1.61 + 4.6 x 0.215 = 2.60 GB; both under the chart's 3Gi. Over it the run abandons as
+ * output_facts_chunk_unstageable, as for an unstageable chunk. Only with output facts on.
+ */
+export const STAGED_FACTS_RECORD_BYTES_CAP = 512 * 1024 * 1024;
+/**
+ * A staged record whose JSON text holds any code unit above 0xFF counts this many times its UTF-8 bytes
+ * toward STAGED_FACTS_RECORD_BYTES_CAP: the runtime then keeps the whole text as a 16-bit string, about
+ * 4.6 B of peak RSS per staged byte instead of 2.09 (the model above).
+ */
+export const STAGED_FACTS_WIDE_TEXT_WEIGHT = 2.5;
 
 export interface SearchIndexLimits {
   /** Largest scope read into memory, summed over its manifests' raw bytes. */
@@ -832,7 +855,9 @@ async function stagedSearchScopeRun(
   };
   // Self-host output facts (the Postgres store): staged through the run's hooks.
   let facts: SearchIndexResult["outputFacts"];
-  const factsHooks = deps.outputFactsStore ? stagedOutputFactsHooks(scope, canonicalId, h, (r) => (facts = r)) : undefined;
+  const factsHooks = deps.outputFactsStore
+    ? stagedOutputFactsHooks(scope, canonicalId, h, staged.factsRecordBytesCap ?? STAGED_FACTS_RECORD_BYTES_CAP, (r) => (facts = r))
+    : undefined;
   let outcome: Awaited<ReturnType<typeof runStagedReconcile>>;
   try {
     outcome = await runStagedReconcile(scope, h.stamp, ops, {
@@ -963,14 +988,18 @@ export const STAGED_FACTS_CHUNK = 5000;
  * Versioned by the directory epoch the run started from, as the whole-set path is.
  */
 function stagedOutputFactsHooks(
-  scope: SessionScope, canonicalId: string, h: StagedHandoff,
+  scope: SessionScope, canonicalId: string, h: StagedHandoff, recordBytesCap: number,
   done: (r: NonNullable<SearchIndexResult["outputFacts"]>) => void,
 ): StagedReconcileHooks {
   const fScope = { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: scope.sessionId, canonicalId };
   const sourceVersion = Number(h.epoch);
+  // The record bytes this attempt's facts pass staged (STAGED_FACTS_RECORD_BYTES_CAP); chunk 0 starts it over.
+  const recordBytes = { used: 0, counted: 0, cap: recordBytesCap, wideWeight: STAGED_FACTS_WIDE_TEXT_WEIGHT };
   return {
     async onBatch(tx, run, batch) {
-      if (batch.phase === "facts") await stageOutputFactsChunk(tx, run, fScope, batch.events, batch.chunk, sourceVersion);
+      if (batch.phase !== "facts") return;
+      if (batch.chunk.seq === 0) recordBytes.used = recordBytes.counted = 0;
+      await stageOutputFactsChunk(tx, run, fScope, batch.events, batch.chunk, sourceVersion, recordBytes);
     },
     async onWantDone(tx, run) {
       await sealOutputFactsWant(tx, run);

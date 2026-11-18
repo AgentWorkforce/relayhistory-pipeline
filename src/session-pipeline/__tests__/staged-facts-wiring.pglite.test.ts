@@ -31,7 +31,7 @@ import { CONSUMER_WORKER, outputFactsDeps } from "../consumer-service.ts";
 import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
 import {
-  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK,
+  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK, STAGED_FACTS_RECORD_BYTES_CAP, STAGED_FACTS_WIDE_TEXT_WEIGHT,
   type SearchIndexDeps, type SearchIndexResult, type StagedReconcile,
 } from "../search-index.ts";
 import {
@@ -40,7 +40,8 @@ import {
 } from "../output-facts-store.ts";
 import { OUTPUT_FACTS_MAX_ITEMS_PER_INPUT } from "../output-facts.ts";
 import type { StagedBoundary } from "../staged-reconcile.ts";
-import { SCOPE, decompress, exportStreamScope, generate, prefixFor, type ExportedScope } from "../../session-read-api/__tests__/stream-fixture.ts";
+import { SCOPE, USER, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line } from "../../session-read-api/__tests__/stream-fixture.ts";
+import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { FACTS_CHUNK_MAX_BYTES, streamCanonicalScope } from "../../session-read-api/canonical-stream-projection.ts";
 import { readCanonicalScope } from "../../session-read-api/canonical-projection.ts";
 import { clonedReplayDatabase, closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -324,6 +325,101 @@ describe("staged output facts through the consumer wiring", () => {
   }, 180_000);
 });
 
+describe("the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP, wide text weighted)", () => {
+  // Scopes with 30 legacy turns on the exporter-owned legacy machine (legacy-provenance.ts admits them only there):
+  // ASCII turns, turns each holding one character above U+00FF, and half of each.
+  type Shape = "ascii" | "wide" | "mixed";
+  const scopes = new Map<Shape, { x: ExportedScope; counted: number; weighted: number }>();
+  beforeAll(async () => {
+    const machine = legacyMachineId(SCOPE.workspaceId, USER);
+    const payload = { org_id: SCOPE.orgId, workspace_id: SCOPE.workspaceId, source: SCOPE.harness, session_id: SCOPE.sessionId };
+    for (const shape of ["ascii", "wide", "mixed"] as const) {
+      const legacy: Line[] = [{ machine, userId: USER, record: { kind: "legacy_scope", origin_id: "legacy:scope", record_id: "legacy:scope:coverage", revision: "1", operation: "upsert",
+        received_at: "2026-11-01T00:00:00.000000Z", payload: { ...payload, version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] } } }];
+      for (let i = 0; i < 30; i++) {
+        const wide = shape === "wide" || (shape === "mixed" && i % 2 === 0);
+        legacy.push({ machine, userId: USER, record: { kind: "legacy_conversation_turn", origin_id: "legacy:conversation_turns", record_id: `legacy:conversation_turns:t-${i}`, revision: "1",
+          operation: "upsert", received_at: "2026-11-01T00:00:00.000000Z",
+          payload: { ...payload, id: `t-${i}`, turn_index: i, role: i % 2 ? "assistant" : "user", session_owner: USER, actor_name: "a", actor_role: "owner",
+            ts: new Date(Date.parse("2026-11-01T09:00:00Z") + i * 1000).toISOString(), content: (wide ? "\u2014 " : "") + `legacy turn ${i} `.repeat(20) } } });
+      }
+      const x = await exportStreamScope([...generate(31), ...legacy], 1200);
+      cleanup.length = 0;
+      // What the facts pass stages as record items: each record's JSON text; wide ones weigh STAGED_FACTS_WIDE_TEXT_WEIGHT.
+      let counted = 0;
+      let weighted = 0;
+      for (const l of legacy) {
+        const text = JSON.stringify(l.record);
+        const bytes = Buffer.byteLength(text, "utf8");
+        counted += bytes;
+        weighted += /[^\u0000-\u00ff]/.test(text) ? bytes * STAGED_FACTS_WIDE_TEXT_WEIGHT : bytes;
+      }
+      scopes.set(shape, { x, counted, weighted: Math.ceil(weighted) });
+    }
+  }, 300_000);
+  afterAll(() => {
+    for (const s of scopes.values()) s.x.dispose();
+  });
+  const withCap = (cap: number): StagedReconcile => ({ ...stagedOn(), factsRecordBytesCap: cap });
+  const run = async (shape: Shape, cap: number, facts = true) => {
+    const r = await rig(scopes.get(shape)!.x);
+    await r.tick({});
+    const out = await r.pass({ ...(facts ? FACTS : {}), limits: STAGED_LIMITS, stream: UNLIMITED, staged: withCap(cap) });
+    return { r, out };
+  };
+  const reconciled = async ({ r, out }: Awaited<ReturnType<typeof run>>) => {
+    expect(out).toMatchObject({ complete: true });
+    expect(out.outputFacts).toMatchObject({ complete: true });
+    expect((await r.facts()).facts.some((row) => JSON.parse(row).fact_kind === "legacy_turn_message")).toBe(true);
+  };
+  const refused = async ({ r, out }: Awaited<ReturnType<typeof run>>) => {
+    expect(out).toMatchObject({ complete: false, reasons: [OUTPUT_FACTS_CHUNK_UNSTAGEABLE] });
+    expect(out.outputFacts).toBeUndefined();
+    expect((await r.facts()).events).toEqual([]);
+    // Abandoned by name, not retried in the pass: the run row stays, its facts stage is gone.
+    expect([await r.count("search_reconcile_runs_v1"), await r.count("staged_facts_runs_v1"), await r.count("staged_facts_v1")]).toEqual([1, 0, 0]);
+  };
+
+  for (const shape of ["ascii", "wide", "mixed"] as const) {
+    test(`${shape}: exactly at the weighted bound the run reconciles (legacy facts included)`, async () => {
+      await reconciled(await run(shape, scopes.get(shape)!.weighted));
+    }, 180_000);
+    test(`${shape}: one byte under it the run abandons as output_facts_chunk_unstageable, nothing reconciled`, async () => {
+      await refused(await run(shape, scopes.get(shape)!.weighted - 1));
+    }, 180_000);
+  }
+
+  test("the same bytes that pass as ASCII are refused when each record holds one wide character", async () => {
+    const ascii = scopes.get("ascii")!;
+    const wide = scopes.get("wide")!;
+    const cap = wide.counted; // at least the ASCII records' bytes (each wide record is two bytes longer)
+    expect(ascii.counted).toBeLessThanOrEqual(cap);
+    expect(wide.weighted).toBeGreaterThan(cap);
+    await reconciled(await run("ascii", cap));
+    await refused(await run("wide", cap));
+  }, 180_000);
+
+  test("a mixed run sums both weights", () => {
+    const { counted, weighted } = scopes.get("mixed")!;
+    expect(weighted).toBeGreaterThan(counted);
+    expect(weighted).toBeLessThan(counted * STAGED_FACTS_WIDE_TEXT_WEIGHT);
+  });
+
+  test("facts off (no facts store): the bound does not apply", async () => {
+    const { out } = await run("wide", 1, false);
+    expect(out).toMatchObject({ complete: true });
+    expect(out.outputFacts).toBeUndefined();
+  }, 180_000);
+
+  test("the production bound, the weight and their model keep a run at both bounds under 2.8 GB", () => {
+    expect(STAGED_FACTS_RECORD_BYTES_CAP).toBe(512 * 1024 * 1024);
+    expect(STAGED_FACTS_WIDE_TEXT_WEIGHT).toBe(2.5);
+    const atCap = 1.61e9; // 500000 keyed records, short ASCII turns aside
+    expect(atCap + 2.09 * STAGED_FACTS_RECORD_BYTES_CAP).toBeLessThanOrEqual(2.8e9); // ASCII, about 2.73 GB
+    expect(atCap + 4.6 * (STAGED_FACTS_RECORD_BYTES_CAP / STAGED_FACTS_WIDE_TEXT_WEIGHT)).toBeLessThanOrEqual(2.8e9); // wide, about 2.60 GB
+  });
+});
+
 describe("startup with output facts and the staged reconcile", () => {
   const FACTS_ENV = { RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" };
   test("staged flag off: every streaming answer and notice is today's, byte for byte", () => {
@@ -368,6 +464,10 @@ describe("startup with output facts and the staged reconcile", () => {
     for (const e of [Object.assign(new Error("x"), { code: "54000" }), Object.assign(new Error("x"), { code: "53200" }), new RangeError("Invalid string length"), new Error("output_facts_chunk_too_large")])
       expect(unstageable(e)).toMatchObject({ code: OUTPUT_FACTS_CHUNK_UNSTAGEABLE, retryable: false });
     for (const e of [Object.assign(new Error("x"), { code: "RH062" }), Object.assign(new Error("x"), { code: "08006" }), new Error("other")]) expect(unstageable(e)).toBeNull();
+    // The detail names the bound with counts and codes only.
+    expect(unstageable(Object.assign(new Error("secret content"), { code: "54000" }), { seq: 3, items: 120 })?.message).toBe(
+      "staged output facts: item size bound: chunk 3, 120 items, database 54000");
+    expect(unstageable(new Error("output_facts_chunk_too_large"), { seq: 0, items: 7 })?.message).toMatch(/^staged output facts: item size bound: chunk 0, 7 items, send limit \d+ bytes$/);
   });
   test("startup refuses a database without the 062140 writers, naming the migration", async () => {
     const missing = { query: async () => ({ rows: [{ fn: STAGED_OUTPUT_FACTS_FUNCTIONS[0] }] }) } as unknown as SqlExecutor;
