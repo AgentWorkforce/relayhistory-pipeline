@@ -306,11 +306,13 @@ describe("operator recorder (scripts/record-org-s3-cutover.ts)", () => {
     expect(refusal(() => parseOrgS3CutoverArgs(base.map((a) => (a === KEY.orgId ? "" : a)), NOW))).toBe("cutover_org");
   });
 
+  // One pointer-fix time for the whole describe: --correct must repeat the stored value exactly.
+  const FIX = new Date(Date.now() - 6 * 3_600_000).toISOString();
   const client = () => ({ query: <T,>(text: string, params?: unknown[]) => pg.query(text, params) as Promise<{ rows: T[] }> });
   const input = (over: Partial<Parameters<typeof recordOrgS3Cutover>[1]> = {}) => ({
     orgId: KEY.orgId, uploadsCutoverAt: new Date(Date.now() - 4 * 3_600_000).toISOString(), turnsCutoverAt: new Date(Date.now() - 3 * 3_600_000).toISOString(),
     recordedBy: "operator-a", note: null, execute: false, correct: false, approvedLowering: false,
-    pointerFixDeployedAt: new Date(Date.now() - 6 * 3_600_000).toISOString(), ...over,
+    pointerFixDeployedAt: FIX, ...over,
   });
 
   test("dry-run writes nothing and reports counts only; execute inserts one row; a second execute is refused", async () => {
@@ -350,6 +352,38 @@ describe("operator recorder (scripts/record-org-s3-cutover.ts)", () => {
       VALUES ('org-p', now() - interval '3 hours', now() - interval '3 hours', $1, 'op', now() - interval '1 hour')`, [ORG_S3_CUTOVER_ATTESTATION])).rejects.toThrow("org_s3_cutover_after_pointer_fix");
     await expect(pg.query("SELECT sessions.org_s3_cutover_correct_v1($1, now() - interval '5 hours', now() - interval '5 hours', 'op', NULL, true)", [KEY.orgId]))
       .rejects.toThrow("org_s3_cutover_after_pointer_fix");
+  });
+
+  test("--correct: --pointer-fix-deployed-at must equal the stored value (the correction keeps it); a mismatch is refused before any write", async () => {
+    const hours = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+    await recordOrgS3Cutover(client(), input({ execute: true }));
+    const later = { uploadsCutoverAt: hours(4), turnsCutoverAt: hours(1), recordedBy: "operator-b", correct: true };
+    for (const other of [hours(5), new Date(Date.parse(FIX) + 1).toISOString()]) {
+      await expect(recordOrgS3Cutover(client(), input({ ...later, pointerFixDeployedAt: other }))).rejects.toMatchObject({ code: "cutover_pointer_fix_mismatch" });
+      await expect(recordOrgS3Cutover(client(), input({ ...later, pointerFixDeployedAt: other, execute: true }))).rejects.toMatchObject({ code: "cutover_pointer_fix_mismatch" });
+    }
+    expect((await pg.query("SELECT 1 FROM sessions.org_s3_cutover_history")).rows).toHaveLength(0);
+    // The stored value: accepted, and the correction leaves it unchanged.
+    expect(await recordOrgS3Cutover(client(), input({ ...later, execute: true }))).toMatchObject({ direction: "later", corrected: 1 });
+    expect((await pg.query<{ ok: boolean }>("SELECT pointer_fix_deployed_at = $1::timestamptz AS ok FROM sessions.org_s3_cutover", [FIX])).rows[0]!.ok).toBe(true);
+  });
+
+  test("cutover >= pointer fix is compared at microsecond precision, in the parser, the recorder and the database alike", async () => {
+    const at = (us: string) => `2026-11-17T10:00:00.${us}Z`;
+    const args = (cut: string, fix: string) => ["--org", KEY.orgId, "--uploads-cutover-at", cut, "--turns-cutover-at", cut,
+      "--recorded-by", "operator-a", "--pointer-fix-deployed-at", fix, "--attest-uploads-fenced", "--attest-turns-forwarded"];
+    const NOW_ = new Date("2026-11-17T12:00:00Z");
+    // One microsecond before the fix: refused (Date.parse alone would call these equal).
+    expect(refusal(() => parseOrgS3CutoverArgs(args(at("000001"), at("000002")), NOW_))).toBe("cutover_before_pointer_fix");
+    expect(parseOrgS3CutoverArgs(args(at("000002"), at("000002")), NOW_).pointerFixDeployedAt).toBe(at("000002"));
+    expect(parseOrgS3CutoverArgs(args(at("000003"), at("000002")), NOW_).uploadsCutoverAt).toBe(at("000003"));
+    await expect(recordOrgS3Cutover(client(), input({ uploadsCutoverAt: at("000001"), turnsCutoverAt: at("000001"), pointerFixDeployedAt: at("000002") })))
+      .rejects.toMatchObject({ code: "cutover_before_pointer_fix" });
+    // Equal at microsecond precision: the recorder and the database CHECK both accept it.
+    expect(await recordOrgS3Cutover(client(), input({ uploadsCutoverAt: at("000002"), turnsCutoverAt: at("000002"), pointerFixDeployedAt: at("000002"), execute: true })))
+      .toMatchObject({ inserted: 1 });
+    await expect(pg.query(`INSERT INTO sessions.org_s3_cutover (org_id, uploads_cutover_at, turns_cutover_at, attestation, recorded_by, pointer_fix_deployed_at)
+      VALUES ('org-u', $1, $1, $3, 'op', $2)`, [at("000001"), at("000002"), ORG_S3_CUTOVER_ATTESTATION])).rejects.toThrow("org_s3_cutover_after_pointer_fix");
   });
 
   test("--correct: later is applied (prior row to history); lowering is refused without approval, applied with it; no row refuses", async () => {

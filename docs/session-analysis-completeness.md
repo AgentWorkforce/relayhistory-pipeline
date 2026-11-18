@@ -169,8 +169,9 @@ Preconditions, all of which must be true and verified before recording:
 4. Operator margin: record the latest time you can prove for each condition, never an estimate.
    This is in addition to the function's fixed 1 hour margin.
 5. `--pointer-fix-deployed-at` is the operator-attested time the pointer-move fix (blocker 2) was
-   deployed in the org's session pipeline. Verify it from the deploy record, not from memory. It is
-   stored with the row, and the effective cutover must be at or after it.
+   deployed in the org's session pipeline. Verify it from the deploy record, not from memory. The
+   first recording stores it in `org_s3_cutover.pointer_fix_deployed_at`, and the effective cutover
+   must be at or after it. Times are compared at microsecond precision, as Postgres stores them.
 
 Run from a checkout of this repository. The owner URL comes from 1Password into the environment
 only, never into a file:
@@ -199,7 +200,11 @@ It never prints an org, workspace or session id. On error it prints only a fixed
 **Corrections.** A trigger refuses DELETE and TRUNCATE for every role, the owner included, and
 refuses every UPDATE except one made through the owner-only `sessions.org_s3_cutover_correct_v1`.
 That function copies the prior row into the append-only `sessions.org_s3_cutover_history`, then
-writes the new times, `recorded_by`, `recorded_at` and note. The script runs it with `--correct`:
+writes the new times, `recorded_by`, `recorded_at` and note. It never changes the stored
+`pointer_fix_deployed_at`, and the database CHECK still requires the corrected cutover to be at or
+after it. On `--correct`, `--pointer-fix-deployed-at` must equal the stored time exactly; any other
+value is refused (`cutover_pointer_fix_mismatch`), because a correction does not re-attest the
+pointer-fix deploy. The script runs the function with `--correct`:
 
 ```sh
 SUPABASE_MIGRATION_OWNER_URL=... bun scripts/record-org-s3-cutover.ts --correct \

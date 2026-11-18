@@ -251,6 +251,11 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):HoopDbSessionPointerInd
       );
       if (rows[0]?.fenced === true) return { status: "skipped", reason: "operator_erased" };
       const applied = rows[0]?.applied ?? false;
+      // A move whose insert did not apply would leave its delete with no new row (or, on a pooled path
+      // without a transaction, a committed delete). Throw retryably so the move's transaction rolls back
+      // and the old row stays; the pointer writer retries.
+      if (opts.rekeyFrom && !applied)
+        throw Object.assign(new Error("pointer move: the re-keyed row was not applied; retry"), { code: "pointer_move_not_applied", retryable: true });
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.
       const sessionUuid =

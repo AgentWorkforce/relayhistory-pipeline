@@ -67,6 +67,20 @@ export class OrgS3CutoverRefusal extends Error {
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/u;
+/**
+ * An ISO time (ISO above) as microseconds since the epoch, the precision Postgres timestamptz keeps,
+ * so the cutover / pointer-fix comparisons here agree with the database's (Date.parse truncates to
+ * milliseconds, so 10:00:00.000001 and 10:00:00.000002 would compare equal). Null when malformed.
+ */
+export function isoMicros(at: string): bigint | null {
+  const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/u.exec(at);
+  if (!m) return null;
+  const seconds = Date.parse(`${m[1]}${m[3]}`);
+  if (!Number.isFinite(seconds)) return null;
+  return BigInt(seconds) * 1000n + BigInt((m[2] ?? "").padEnd(6, "0"));
+}
+/** The later of two ISO times at microsecond precision (both already validated). */
+const laterOf = (a: string, b: string) => (isoMicros(a)! >= isoMicros(b)! ? a : b);
 const ACTOR = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/u;
 const ORG = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/u;
 
@@ -108,7 +122,7 @@ export function parseOrgS3CutoverArgs(argv: readonly string[], now: Date = new D
   if (!ISO.test(pointerFixDeployedAt) || !Number.isFinite(Date.parse(pointerFixDeployedAt)))
     throw new OrgS3CutoverRefusal("cutover_pointer_fix_time");
   if (Date.parse(pointerFixDeployedAt) > now.getTime()) throw new OrgS3CutoverRefusal("cutover_time_future");
-  if (Math.max(Date.parse(uploadsCutoverAt), Date.parse(turnsCutoverAt)) < Date.parse(pointerFixDeployedAt))
+  if (isoMicros(laterOf(uploadsCutoverAt, turnsCutoverAt))! < isoMicros(pointerFixDeployedAt)!)
     throw new OrgS3CutoverRefusal("cutover_before_pointer_fix");
   if (!ACTOR.test(recordedBy)) throw new OrgS3CutoverRefusal("cutover_recorded_by");
   if (note !== null && (note.length > 1000 || /[\u0000-\u001f]/u.test(note))) throw new OrgS3CutoverRefusal("cutover_note");
@@ -144,9 +158,10 @@ const COUNTS_SQL = `
  * the connection.
  */
 export async function recordOrgS3Cutover(db: Queryable, input: OrgS3CutoverInput): Promise<OrgS3CutoverReceipt> {
-  const effective =
-    Date.parse(input.uploadsCutoverAt) >= Date.parse(input.turnsCutoverAt) ? input.uploadsCutoverAt : input.turnsCutoverAt;
-  if (!(Date.parse(effective) >= Date.parse(input.pointerFixDeployedAt))) throw new OrgS3CutoverRefusal("cutover_before_pointer_fix");
+  const up = isoMicros(input.uploadsCutoverAt), turns = isoMicros(input.turnsCutoverAt), fix = isoMicros(input.pointerFixDeployedAt);
+  if (up === null || turns === null || fix === null) throw new OrgS3CutoverRefusal("cutover_time");
+  const effective = up >= turns ? input.uploadsCutoverAt : input.turnsCutoverAt;
+  if ((up >= turns ? up : turns) < fix) throw new OrgS3CutoverRefusal("cutover_before_pointer_fix");
   await db.query("BEGIN");
   try {
     const existing = (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.org_s3_cutover WHERE org_id = $1", [input.orgId]))
@@ -161,6 +176,16 @@ export async function recordOrgS3Cutover(db: Queryable, input: OrgS3CutoverInput
     };
     if (input.correct) {
       if (existing === 0) throw new OrgS3CutoverRefusal("cutover_not_recorded");
+      // org_s3_cutover_correct_v1 keeps the row's stored pointer_fix_deployed_at (the database CHECK still
+      // compares the corrected cutover with it). The flag must name exactly that stored time: a correction
+      // never re-attests the pointer-fix deploy, and a different value would be a silent, unrecorded claim.
+      const same = (
+        await db.query<{ same: boolean }>(
+          "SELECT c.pointer_fix_deployed_at = $2::timestamptz AS same FROM sessions.org_s3_cutover AS c WHERE c.org_id = $1",
+          [input.orgId, input.pointerFixDeployedAt],
+        )
+      ).rows[0]!.same;
+      if (same !== true) throw new OrgS3CutoverRefusal("cutover_pointer_fix_mismatch");
       const { direction } = (
         await db.query<{ direction: "later" | "unchanged" | "lowered" }>(
           `SELECT CASE WHEN $2::timestamptz < c.cutover_at THEN 'lowered' WHEN $2::timestamptz = c.cutover_at THEN 'unchanged' ELSE 'later' END AS direction
