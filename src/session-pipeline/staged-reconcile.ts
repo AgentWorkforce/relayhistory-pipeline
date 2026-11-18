@@ -103,7 +103,7 @@ export interface StagedReconcileOps<R> {
    * Inside the claim's transaction, after a claim succeeded (this attempt holds the run): e.g.
    * record the scope as owing a pass, so a crash leaves it for the next reconcile tick.
    */
-  claimed?(tx: SqlExecutor): Promise<void>;
+  claimed?(tx: SqlExecutor, run: { attempts: number }): Promise<void>;
   /**
    * Only with `hooks.onBatch`: the facts pass. One source pass handing the whole-read facts input
    * (post-fold records and every projection row) to `emit` in manifest read order, about `chunk` items
@@ -244,6 +244,14 @@ export interface StagedReconcileDeps {
   onHeartbeatError?: (error: unknown) => void;
   /** Tests only: the lease renewal interval during a source read (default a third of the lease, at least 250 ms). */
   heartbeatMs?: number;
+  /**
+   * The attempts cap: a run claimed more than `cap` times since it last finished or was reset is
+   * failed: abandoned with last_error staged_run_failed right after the claim, before any read, except
+   * every `retryEvery`-th claim past the cap, which runs (a slow retry, so a scope heals after an
+   * outage without an operator). A claim that restarts a failed run on a changed source first drops
+   * the run (search_reconcile_erase_scope_v1) and claims a fresh one. Absent: no cap.
+   */
+  attemptsCap?: { cap: number; retryEvery: number };
   /** On an error the run cannot map (thrown to the caller): release the lease first (best effort). */
   releaseOnError?: boolean;
   /** Items per facts chunk (default 5000). */
@@ -253,9 +261,12 @@ export interface StagedReconcileDeps {
 }
 
 export type StagedReconcileOutcome =
-  | { status: "busy"; reason: "run_leased" | "scope_busy" | "canonical_scope_busy" }
-  | { status: "restart"; reason: "source_changed" | StagedRunRestart["reason"] }
-  | { status: "incomplete"; reasons: string[] }
+  | { status: "busy"; reason: "run_leased" }
+  | { status: "busy"; reason: "scope_busy" | "canonical_scope_busy"; attempts: number }
+  | { status: "restart"; reason: "source_changed" | StagedRunRestart["reason"]; attempts: number }
+  | { status: "incomplete"; reasons: string[]; attempts: number }
+  /** Past `attemptsCap.cap` claims, on a claim that is not a slow retry: abandoned before any read. */
+  | { status: "failed"; reason: "staged_run_failed"; attempts: number }
   | {
       status: "done";
       complete: boolean;
@@ -325,20 +336,29 @@ export async function runStagedReconcile<R>(
 
   if (deps.hooks?.onBatch && !ops.factsPass) throw new Error("staged reconcile: onBatch needs ops.factsPass");
   const factsChunk = deps.factsChunk ?? 5000;
-  const claim = await deps.transact(async (tx) => {
-    const { rows } = await tx.query<{
-      run_id: string; lease_nonce: string; phase: StagedPhase; chunk_cursor: string | null;
-      write_wanted: string; write_done: string; attempts: number; restarted: boolean;
-    }>(
-      `SELECT run_id::text, lease_nonce::text, phase, chunk_cursor, write_wanted::text, write_done::text, attempts, restarted
-         FROM sessions.search_reconcile_claim_v1($1,$2,$3,$4,$5,$6::bigint,$7,$8)`,
-      [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint, leaseMs],
-    );
-    const row = rows[0] ?? null;
-    if (row) await ops.claimed?.(tx);
-    return row;
-  });
+  const cap = deps.attemptsCap;
+  const claimOnce = (reset: boolean) =>
+    deps.transact(async (tx) => {
+      // A failed run whose source changed starts over: the erase drops it (and any sibling scope's
+      // run of the same canonical id, leased or not; that holder then gets RH062, writes no state and
+      // retries on its next tick), and the claim below creates a fresh one.
+      if (reset) await eraseStagedReconcileRuns(tx, scope, [...new Set([scope.sessionId, stamp.canonicalId])]);
+      const { rows } = await tx.query<{
+        run_id: string; lease_nonce: string; phase: StagedPhase; chunk_cursor: string | null;
+        write_wanted: string; write_done: string; attempts: number; restarted: boolean;
+      }>(
+        `SELECT run_id::text, lease_nonce::text, phase, chunk_cursor, write_wanted::text, write_done::text, attempts, restarted
+           FROM sessions.search_reconcile_claim_v1($1,$2,$3,$4,$5,$6::bigint,$7,$8)`,
+        [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint, leaseMs],
+      );
+      const row = rows[0] ?? null;
+      if (row && !(cap && !reset && row.restarted && row.attempts > cap.cap)) await ops.claimed?.(tx, { attempts: row.attempts });
+      return row;
+    });
+  let claim = await claimOnce(false);
+  if (claim && cap && claim.restarted && claim.attempts > cap.cap) claim = await claimOnce(true);
   if (!claim) return { status: "busy", reason: "run_leased" };
+  const attempts = claim.attempts;
   const lease: Lease = { runId: claim.run_id, nonce: claim.lease_nonce };
   let phase = claim.phase;
   let cursor = claim.chunk_cursor;
@@ -346,6 +366,12 @@ export async function runStagedReconcile<R>(
   let done = Number(claim.write_done);
   const resumedFrom = claim.attempts > 1 && !claim.restarted && (phase !== "want" || cursor !== null) ? { phase, cursor } : null;
   await boundary("claimed");
+  if (cap && attempts > cap.cap && (attempts - cap.cap) % cap.retryEvery !== 0) {
+    await deps.transact((tx) =>
+      tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "staged_run_failed"]),
+    );
+    return { status: "failed", reason: "staged_run_failed", attempts };
+  }
 
   const advance = (tx: SqlExecutor, to: StagedPhase, at: string | null, extra: { kinds?: string[]; wanted?: number; done?: number; release?: boolean } = {}) =>
     tx.query("SELECT sessions.search_reconcile_advance_v1($1::bigint,$2::uuid,$3,$4,$5::text[],$6::bigint,$7::bigint,$8)", [
@@ -412,7 +438,7 @@ export async function runStagedReconcile<R>(
       const r = await source();
       if (r === null) {
         await abandon("source_incomplete");
-        return { status: "incomplete", reasons: ["source_incomplete"] };
+        return { status: "incomplete", reasons: ["source_incomplete"], attempts };
       }
       const all = [...ops.wanted(r)].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
       const todo = cursor === null ? all : all.filter((w) => w.key > cursor!);
@@ -473,7 +499,7 @@ export async function runStagedReconcile<R>(
         });
         if (step === "truncated") {
           await abandon("search_index_truncated");
-          return { status: "incomplete", reasons: ["search_index_truncated"] };
+          return { status: "incomplete", reasons: ["search_index_truncated"], attempts };
         }
         cursor = step;
         if (step === null) break;
@@ -488,7 +514,7 @@ export async function runStagedReconcile<R>(
         const r = await source();
         if (r === null) {
           await abandon("source_incomplete");
-          return { status: "incomplete", reasons: ["source_incomplete"] };
+          return { status: "incomplete", reasons: ["source_incomplete"], attempts };
         }
         const page = await deps.transact(async (tx) => {
           // Exclusive with a whole read and the erase pass of the scope: the same scope try-lock, and
@@ -521,7 +547,7 @@ export async function runStagedReconcile<R>(
           return { after, wanted: keys.length, written };
         });
         if (page === null) break;
-        if ("gate" in page) return page.gate === "busy" ? { status: "busy", reason: "scope_busy" } : { status: "restart", reason: "source_changed" };
+        if ("gate" in page) return page.gate === "busy" ? { status: "busy", reason: "scope_busy", attempts } : { status: "restart", reason: "source_changed", attempts };
         cursor = page.after;
         wanted += page.wanted;
         done += page.written;
@@ -537,22 +563,22 @@ export async function runStagedReconcile<R>(
       // the run row, held to the end so no takeover can interleave with the final step.
       if (!(await tryLock(tx, scopeLockKey(scope, "search")))) {
         await advance(tx, "final", null, { release: true });
-        return { status: "busy", reason: "scope_busy" };
+        return { status: "busy", reason: "scope_busy", attempts };
       }
       await advance(tx, "final", null);
       if (moved(await ops.currentSource(tx))) {
         await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_changed"]);
-        return { status: "restart", reason: "source_changed" };
+        return { status: "restart", reason: "source_changed", attempts };
       }
       if (!(await tryLock(tx, canonicalLockKey(scope, stamp.canonicalId)))) {
         await advance(tx, "final", null, { release: true });
-        return { status: "busy", reason: "canonical_scope_busy" };
+        return { status: "busy", reason: "canonical_scope_busy", attempts };
       }
       // A run resumed at the final step reads the source here, under the locks.
       const r = await source(false);
       if (r === null) {
         await tx.query("SELECT sessions.search_reconcile_abandon_v1($1::bigint,$2::uuid,$3)", [lease.runId, lease.nonce, "source_incomplete"]);
-        return { status: "incomplete", reasons: ["source_incomplete"] };
+        return { status: "incomplete", reasons: ["source_incomplete"], attempts };
       }
       await boundary("final:locked");
       // As streamedReconcile: a refused write (stale version) deletes nothing and is not current.
@@ -590,7 +616,7 @@ export async function runStagedReconcile<R>(
     // A hook sends the run round again: its step rolled back, the run restarts from nothing.
     if (error instanceof StagedRunRestart) {
       await abandon(error.reason);
-      return { status: "restart", reason: error.reason };
+      return { status: "restart", reason: error.reason, attempts };
     }
     const reason = deps.abandonOn?.(error) ?? null;
     if (reason === null) {
@@ -600,7 +626,7 @@ export async function runStagedReconcile<R>(
       throw error;
     }
     await abandon(reason);
-    return { status: "incomplete", reasons: [reason] };
+    return { status: "incomplete", reasons: [reason], attempts };
   }
 }
 
