@@ -1,5 +1,6 @@
 /** The as-of views: nothing from the future is visible, and the store mirrors the 062000/062070 semantics. */
 import { describe, expect, test } from "bun:test";
+import { SESSION_INTEL_FEATURES } from "../../shared/session-intel-controls.ts";
 import type { AdvisoryRowInput } from "../../coordination-advisor/scan.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
 import { activityAsOf, asOfSession, ReplayAdvisorStore, ReplayView, snapshotCoordinationBackend, snapshotDirectory, summaryAsOf, type SimClock } from "../replay/views.ts";
@@ -14,6 +15,8 @@ const leakSession = session("s1", {
 async function view(sessions: unknown[]) {
   return new ReplayView(await loadSnapshot(writeSnapshot(tmp(), sessions)));
 }
+
+const ALL_ON = Object.fromEntries(SESSION_INTEL_FEATURES.map((f) => [f, true])) as Record<(typeof SESSION_INTEL_FEATURES)[number], boolean>;
 
 describe("as-of session", () => {
   test("before createdAt the session does not exist; facts at or after now are invisible", async () => {
@@ -46,7 +49,7 @@ describe("as-of session", () => {
       session("other-ws", { workspaceId: "ws_other" }),
     ]);
     const clock: SimClock = { now: new Date(at("10:45")) };
-    const store = new ReplayAdvisorStore(v, clock);
+    const store = new ReplayAdvisorStore(v, clock, ALL_ON);
     const c = await store.candidates(new Date(at("08:45")), 100, null);
     expect(c.map((x) => x.sessionId).sort()).toEqual(["other-ws", "s1"]);
     expect(c.find((x) => x.sessionId === "s1")).toMatchObject({ shortSummary: "first", lastActivityAt: at("10:30") });
@@ -86,7 +89,7 @@ const row = (over: Partial<AdvisoryRowInput> = {}): AdvisoryRowInput => ({
 describe("ReplayAdvisorStore", () => {
   test("upsert: insert, same key again is existing, LOW to HIGH upgrades, acked and other tenants are skipped", async () => {
     const clock: SimClock = { now: new Date(at("10:00")) };
-    const store = new ReplayAdvisorStore(await view([leakSession]), clock);
+    const store = new ReplayAdvisorStore(await view([leakSession]), clock, ALL_ON);
     expect(await store.upsert("o", "w", row())).toEqual({ inserted: 1, upgraded: 0, skipped: 0 });
     expect(await store.upsert("o", "w", row())).toEqual({ inserted: 0, upgraded: 0, skipped: 1 });
     expect(await store.upsert("o", "w2", row({ urgency: "high" }))).toEqual({ inserted: 0, upgraded: 0, skipped: 1 });
@@ -102,7 +105,7 @@ describe("ReplayAdvisorStore", () => {
   });
 
   test("upsert refuses what the table refuses: over-long artifact (23514) and more than 10 evidence entries (22023)", async () => {
-    const store = new ReplayAdvisorStore(await view([leakSession]), { now: new Date(at("10:00")) });
+    const store = new ReplayAdvisorStore(await view([leakSession]), { now: new Date(at("10:00")) }, ALL_ON);
     await expect(store.upsert("o", "w", row({ artifact: "x".repeat(513) }))).rejects.toMatchObject({ code: "23514" });
     const ev = { sessionId: "a", eventId: "e", ts: at("10:00"), kind: "k" };
     await expect(store.upsert("o", "w", row({ evidence: Array(11).fill(ev) }))).rejects.toMatchObject({ code: "22023" });
@@ -110,7 +113,7 @@ describe("ReplayAdvisorStore", () => {
 
   test("recent derives the pair and recipient rows by created_at, per tenant", async () => {
     const clock: SimClock = { now: new Date(at("10:00")) };
-    const store = new ReplayAdvisorStore(await view([leakSession]), clock);
+    const store = new ReplayAdvisorStore(await view([leakSession]), clock, ALL_ON);
     await store.upsert("o", "w", row());
     clock.now = new Date(at("10:30"));
     await store.upsert("o", "w", row({ advisory_id: "adv2" }));
