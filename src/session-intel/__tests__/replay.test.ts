@@ -74,6 +74,23 @@ describe("replay of the fixture", () => {
   });
 });
 
+describe("the M3-1 controls in replay", () => {
+  test("controls default ON within the eval, are hashed, and the advisor feature off gives no alerts", async () => {
+    const on = await replaySnapshot(await fixture(), { detectors: [advisorDetector()] });
+    expect(on.detectors[0]!.params.controls).toEqual({ advisor: true, conflicts: true, dm: true, claims: true, regen: true });
+    const off = await replaySnapshot(await fixture(), { detectors: [advisorDetector({ controls: { advisor: false } })] });
+    expect(off.alerts).toEqual([]);
+    expect(off.detectors[0]!.diagnostics).toMatchObject({ workspaces: 0, written: 0, dmSent: 0 });
+    expect(off.detectors[0]!.hash).not.toBe(on.detectors[0]!.hash);
+  });
+
+  test("the dm feature off keeps every alert on the pull path", async () => {
+    const r = await replaySnapshot(await fixture(), { detectors: [advisorDetector({ controls: { dm: false } })] });
+    expect(r.alerts).toHaveLength(6);
+    expect(r.alerts.every((a) => a.channel === "pull")).toBe(true);
+  });
+});
+
 describe("cli", () => {
   test("replay, score dev and held-out (once), packet and verdicts end to end", async () => {
     const out = tmp("si-cli-");
