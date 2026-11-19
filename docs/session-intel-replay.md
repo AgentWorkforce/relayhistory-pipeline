@@ -20,6 +20,7 @@ This harness only reads a snapshot. Producing one from real sessions is M0-2: it
 The loader:
 
 - refuses a snapshot once the clock is past `deleteBy`, before it reads any session;
+- for a harvested snapshot, whose manifest lists `coverage.json` ([session-intel-harvest.md](session-intel-harvest.md)): `replay` refuses it when the receipt says `complete: false`, or when its `sourceAttribution` is not `verified` or `read_worker`. `--allow-incomplete-coverage` replays it anyway, adding the coverage gap to the result's `incomplete` reasons, so the replay exits 1 and held-out scoring refuses it. A snapshot without a coverage receipt (an import, a fixture) is unaffected;
 - verifies every listed file's sha256;
 - refuses unknown fields, so transcript text cannot slip in under a new key;
 - bounds every size: 256 MiB per file, 4 MiB per line, 100,000 sessions, 20,000 facts per list, 4,000-character texts, and a window of at most 120 days;
@@ -130,7 +131,7 @@ The packet never shows the class; the private key records it. The artifact itsel
 ## How to run
 
 ```sh
-bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <eval>/replay [--interval-ms 120000]
+bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <eval>/replay [--interval-ms 120000] [--allow-incomplete-coverage]
 bun run src/session-intel/replay/cli.ts score    --alerts <eval>/replay/alerts.json --labels <labels.json> --out <eval>/score [--split heldout]
 bun run src/session-intel/replay/cli.ts packet   --alerts <eval>/replay/alerts.json [--alerts ...] --seed <seed> --out <eval>/packet
 bun run src/session-intel/replay/cli.ts verdicts --key <eval>/packet/key.json --verdicts <verdicts.jsonl> --out <eval>/verdicts
