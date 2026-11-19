@@ -156,6 +156,32 @@ that is the number that matters.
   - **Searchable handoffs:** finished or idle sessions, with their summaries, decisions and open
     items, searchable through the existing short-summary search, so another agent or a person can
     pick up the work.
+### Priority and the human notice
+
+Khaliq, 2026-11-19, in his own words: "The action item from gathering this data is to alert the human
+via the desktop app and ping the agent based on priority rankings." So each advisory gets one
+`priority`, computed in the pipeline so that the ranking lives in one place. It is added to the pull
+response next to M3-7's delivery state.
+
+| Priority | Advisories | Human (Desktop) | Agent |
+|---|---|---|---|
+| P1 | HIGH `constraint_violation`, HIGH `intent_conflict`, HIGH T1 or T2 collision (`duplicate_work`, `superseded_work`) | A system notification from Desktop's existing notification mechanism, plus the in-app list | DM (once M3-8 exists), plus the turn-end advisory |
+| P2 | HIGH `concurrent_edit` (the 60-minute T3) | In-app list with a badge; no system notification until the row meets its precision bar | Turn-end advisory |
+| P3 | Every LOW (intent-only conflicts, overlap), and any fleet conflict | In-app list only | Turn-end advisory, to the orchestrator for a fleet |
+
+- **Recipients.** The human is the person who owns the session on that Desktop. Desktop already
+  knows its local sessions, and notifies only for advisories addressed to them, so another person's
+  sessions never trigger it. For a fleet, only the orchestrator's owner is notified.
+- **Dedup.** One system notification per advisory id per human per device, recorded so that it
+  survives a restart. Acking in Desktop acks that recipient's row through the existing ack route.
+- **Caps.** At most 3 system notifications per human per hour (the advisor's recipient cap).
+  Desktop's quiet hours and snooze apply. Notifications are batched when several arrive in one poll.
+- **Precision gate.** A tier gets system notifications only once its rows meet the HIGH bars in
+  [Evaluation](#evaluation-the-bar-before-any-flag-is-proposed). Until then, P1 drops to the in-app
+  list.
+- **Gate.** A Desktop setting, off by default, plus the existing advisor flags and kill switch.
+  Advisories made from historical or replayed data never trigger live notifications.
+
 - **Limits.** The existing cooldown (6 h per pair per urgency), the cap of 3 per recipient per hour,
   and never resending an acked alert all apply to every class. New: a cap of 20 DMs per workspace per
   day, and a model budget per workspace per day (see M2).
@@ -316,7 +342,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | codex-relayhistory-pipeline-session | `e2e/pipeline` step green in the CI full lane | none |
 | M3-7 Delivery state on the pull path: an additive `delivery {dm, deliveredAt}` on each GET item; the hook deduplicates by advisory id across restarts | sessions-intel-lead (route), relay-app's agent (hook) | Route and hook tests; at-least-once is documented until both ship | none |
 | M3-8 DM transport contract ([session-intel-dm-transport.md](../session-intel-dm-transport.md)): register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
-| M3-9 Desktop notification to the human for HIGH alerts: a ranked, dismissable notice in Agent Relay Desktop, fed by the same advisories (distinct from the web dashboard) | relay-app's agent, with sessions-intel-lead for the feed | Ranked HIGH first; never blocks a turn; respects the kill switch. **Scope to be confirmed with Khaliq**: his original wording about a human alert has not been found yet | none |
+| M3-9 Desktop notification to the human, ranked by priority (see [Priority and the human notice](#priority-and-the-human-notice)) | relay-app's agent (Desktop), sessions-intel-lead (the `priority` field) | The tiers, dedup and caps as specified; off by default behind a Desktop setting; never blocks a turn | **Live notices in any real install: Khaliq OK** |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
 ### M4: Enterprise trace import
