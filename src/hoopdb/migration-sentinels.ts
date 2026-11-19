@@ -524,6 +524,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.session_intel_controls and function sessions.session_intel_controls_v1",
     sql: "SELECT to_regclass('sessions.session_intel_controls') IS NOT NULL AND to_regprocedure('sessions.session_intel_controls_v1(text,text)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062170_session_intel_workspace.sql": {
+    evidence: "functions sessions.session_intel_workspace_alerts_v1 and sessions.session_intel_workspace_claims_v1",
+    sql: "SELECT to_regprocedure('sessions.session_intel_workspace_alerts_v1(text,text,integer)') IS NOT NULL AND to_regprocedure('sessions.session_intel_workspace_claims_v1(text,text,text[],integer)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
