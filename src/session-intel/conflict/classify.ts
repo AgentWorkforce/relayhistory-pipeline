@@ -16,7 +16,7 @@ import type { AlertUrgency } from "../replay/detector.ts";
 import type { ClaimKind, ClaimScope } from "../replay/snapshot.ts";
 import { refString, textCompare } from "../replay/util.ts";
 import { isLiveClaim, type ConflictCandidate } from "./candidates.ts";
-import { claimPathTopicDirs, claimTopics, pathTopic, writeTopics } from "./topics.ts";
+import { claimKnownDirs, pathTopic, topicsOfClaim, writeTopics } from "./topics.ts";
 
 export const CONFLICT_VERDICTS = ["constraint_violation", "intent_conflict", "overlap", "none"] as const;
 export type ConflictVerdict = typeof CONFLICT_VERDICTS[number];
@@ -89,7 +89,7 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
   const excluded = new Map<string, ExclusionReason>();
   const known = (v: ConflictCandidate["a"]) => {
     const m = new Map(writeTopics(v.writes));
-    for (const cl of v.claims) if (isLiveClaim(cl, nowIso)) for (const [t, d] of claimPathTopicDirs(cl.text)) if (!m.has(t)) m.set(t, d);
+    for (const cl of v.claims) if (isLiveClaim(cl, nowIso)) for (const [t, d] of claimKnownDirs(cl)) if (!m.has(t)) m.set(t, d);
     return m;
   };
   const knownA = known(c.a), knownB = known(c.b);
@@ -102,7 +102,7 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
       const id = claimRef(ref, cl.id);
       if (!isLiveClaim(cl, nowIso)) { if (cl.at < nowIso) excluded.set(id, "superseded"); continue; }
       if (cl.kind === "constraint" && cl.scope === "session") { excluded.set(id, "session_scope"); continue; }
-      const mine = claimTopics(cl.text, otherKnown).filter((t) => topics.has(t)).sort(textCompare);
+      const mine = topicsOfClaim(cl, otherKnown).filter((t) => topics.has(t)).sort(textCompare);
       if (!mine.length) { excluded.set(id, "off_topic"); continue; }
       claims.push({ id, side: name, kind: cl.kind, scope: cl.scope, text: cl.text, at: cl.at, evidenceIds: [...cl.evidenceIds], topics: mine });
     }
@@ -263,6 +263,15 @@ export function constraintOwner(scope: ClaimScope, holderRef: string | null): { 
   if (holderRef) return { owner: holderRef, dm: holderRef };
   if (scope === "repo") return { owner: REPO_POLICY_OWNER, dm: undefined };
   return null;
+}
+
+/**
+ * The artifact an alert or advisory names: the first shared topic (sorted) that a cited claim or the action
+ * names, else the pair's first topic. Shared by the replay detectors and the live advisor.
+ */
+export function alertArtifact(pairTopics: readonly string[], cls: Pick<Classification, "claims">, action: JudgeAction | null): string {
+  const named = new Set([...cls.claims.flatMap((x) => x.topics), ...(action?.topic ? [action.topic] : [])]);
+  return [...pairTopics].filter((t) => named.has(t)).sort(textCompare)[0] ?? pairTopics[0]!;
 }
 
 export interface Decision {

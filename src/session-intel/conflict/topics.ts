@@ -132,6 +132,23 @@ export function claimTopics(text: string, otherKnown: ReadonlyMap<string, readon
   return [...out];
 }
 
+/**
+ * The topics a claim brings to the pair (its path topics, with their directories) and that it names in the
+ * other side's known topics. `topic` is a stored claim's own slug (the M1 extractor's decisionTopic); it
+ * counts like a path topic. `general` (decisionTopic's "no file") is never a topic.
+ */
+export function claimKnownDirs(c: { text: string; topic?: string }): Map<string, string[]> {
+  // A copy of the memoised parse (the caller may add to it).
+  const m = new Map(parseClaimText(c.text).pathDirs);
+  if (c.topic && c.topic !== "general" && !m.has(c.topic)) m.set(c.topic, []);
+  return m;
+}
+export function topicsOfClaim(c: { text: string; topic?: string }, otherKnown: ReadonlyMap<string, readonly string[]>): string[] {
+  const out = new Set(claimTopics(c.text, otherKnown));
+  if (c.topic && c.topic !== "general") out.add(c.topic);
+  return [...out];
+}
+
 /** The write topics of a list of writes, each with its directory segments. */
 export function writeTopics(writes: readonly { path: string }[]): Map<string, string[]> {
   const out = new Map<string, string[]>();

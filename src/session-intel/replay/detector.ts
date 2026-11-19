@@ -74,6 +74,12 @@ export const ADVISOR_SOURCES = [
   "../../coordination-advisor/rubric.ts",
   "../../coordination-advisor/template.ts",
   "../../coordination-advisor/relay-sender.ts",
+  "../../coordination-advisor/conflicts.ts",
+  "../../coordination-advisor/excerpts.ts",
+  "../conflict/candidates.ts",
+  "../conflict/classify.ts",
+  "../conflict/judges.ts",
+  "../conflict/topics.ts",
   "../../shared/session-intel-controls.ts",
   "../../session-read-api/coordination-backend.ts",
   "../../../packages/coordination-detect/src/index.ts",
@@ -100,6 +106,12 @@ export interface AdvisorDetectorOptions {
    * closed. Hashed into the params.
    */
   controls?: Partial<Record<SessionIntelFeature, boolean>>;
+  /**
+   * Run the scan as if SESSION_INTEL_CONFLICTS_ENABLED were "true" (default false): the live conflict wiring
+   * (src/coordination-advisor/conflicts.ts) over the snapshot's claims through the replay store's claims reader.
+   * Hashed into the params.
+   */
+  conflicts?: boolean;
 }
 
 interface AdvisorState {
@@ -115,6 +127,7 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
   const sessionHourlyCap = opts.sessionHourlyCap ?? DEFAULT_SESSION_HOURLY_CAP;
   const workspaces = opts.workspaces === undefined || opts.workspaces === "*" ? "*" as const : [...opts.workspaces].sort(textCompare);
   const dm = opts.dm ?? true;
+  const conflicts = opts.conflicts ?? false;
   const controls = Object.fromEntries(SESSION_INTEL_FEATURES.map((f) => [f, opts.controls?.[f] ?? true])) as ReplayControls;
   const states = new WeakMap<ReplayView, AdvisorState>();
   const stateFor = (view: ReplayView): AdvisorState => {
@@ -131,7 +144,7 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
     name: ADVISOR_DETECTOR_NAME,
     version: `1+${outcomeFacts.name}/${outcomeFacts.version}`,
     params: {
-      pairCooldownMs, sessionHourlyCap, workspaces, dm, controls, candidateWindowMs: CANDIDATE_WINDOW_MS,
+      pairCooldownMs, sessionHourlyCap, workspaces, dm, controls, ...(conflicts ? { conflicts: true } : {}), candidateWindowMs: CANDIDATE_WINDOW_MS,
       detectorParams: ADVISOR_DETECTOR_PARAMS, sourceSha256: sourceSha256(),
     },
     async run(view, now) {
@@ -142,7 +155,7 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
       const dmsBefore = s.sender.sent.length;
       const stats = await scanOnce({
         store: s.store, backend: snapshotCoordinationBackend(view, s.clock), limits: s.limits,
-        workspaces: workspaces === "*" ? "*" : new Set(workspaces), ...(dm ? { sender: s.sender } : {}),
+        workspaces: workspaces === "*" ? "*" : new Set(workspaces), ...(dm ? { sender: s.sender } : {}), ...(conflicts ? { conflicts: true } : {}),
       }, now);
       // As advisorTick does: after the scan, a retention sweep once per hour (of simulated time).
       if (now.getTime() - s.lastSweep >= SWEEP_EVERY_MS) {
