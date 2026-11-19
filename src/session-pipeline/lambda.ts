@@ -145,6 +145,8 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
   skipCurrentEnabled?: boolean;
+  /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
+  pointerPreReadEnabled?: boolean;
   /**
    * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
    * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
@@ -227,6 +229,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipCurrent = searchIndexSkipCurrentFromEnv(env);
   if (skipCurrent && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
+  const pointerPreRead = pointerPreReadFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   return {
@@ -248,6 +252,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
+    ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
@@ -480,6 +485,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       publication:{schemaGeneration,transact:work=>transaction(db,async tx=>{
         await tx.query("SET LOCAL statement_timeout='5s';SET LOCAL lock_timeout='1s'");return work(tx);
       })},
+      // Default off; on, the object-store reads run before the scope lock and the lock holds SQL only.
+      ...(env.pointerPreReadEnabled ? { preRead: true as const } : {}),
     },
     requeue: async (manifestKey) => {
       await awsJsonCall({
@@ -1003,4 +1010,15 @@ export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undef
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/**
+ * SESSION_POINTER_PREREAD_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on; anything
+ * else fails init naming the variable, never the value.
+ */
+export function pointerPreReadFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SESSION_POINTER_PREREAD_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SESSION_POINTER_PREREAD_ENABLED must be true or false");
 }

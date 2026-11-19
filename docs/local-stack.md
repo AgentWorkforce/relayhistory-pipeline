@@ -806,6 +806,31 @@ the flag off (`false`): every event then re-reads its session as before. Any re-
 sessions needs the flag off for its whole run; there is no version to bump instead
 (`event_projection_version` is fixed at 1).
 
+### Hosted Lambda: pointer stage reads before its lock
+
+`SESSION_POINTER_PREREAD_ENABLED` (hosted session-pipeline Lambda only; stack input
+`transcriptStore.sessionPipeline.pointerPreRead`) is **default off**: unset, `""` and `false` change nothing; `true`
+is on; any other value fails Lambda init naming the variable.
+
+Off, the pointer stage takes the session's lock (one transaction holding `pg_advisory_xact_lock`) and then reads
+under it: the manifest, on a delete the 45-day move probe (up to 90 HEADs) and the sibling's manifest, the enrich
+reads, the upsert's own manifest read, and on a move the other key's manifest. The lock transaction sits idle in
+transaction for all of those object-store calls, and under transaction-mode pooling each such lock pins a backend.
+
+On, the stage stamps the session's pointer rows (key, revision, etag, tombstone, `indexed_at` of each machine), makes
+every one of those object-store calls BEFORE taking the lock, then takes the same lock and re-reads the stamp:
+unchanged, it runs exactly as before against what it read (the revision fence still answers a non-newer revision),
+with no object-store call while the lock is held; changed (another pointer stage wrote the session after the reads
+began), it reads again, once; a second change fails the event with the retryable `pointer_scope_changed` (SQS
+retries it). The lock transaction holds SQL only: the stamp, the upsert, the stored-row check, a rekey on a move.
+Connections are unchanged.
+
+Races, with the flag on: a put that read the manifest before an erasure cannot bring the pointer back (the
+tombstone moves the stamp, so the put reads again and sees the delete); a delete that read "gone" before a newer
+put was indexed reads again and indexes it; a move follows today's rule (both keys live: `pointer_move_pending`).
+An object-store write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read
+converges through its own event exactly as before.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.
