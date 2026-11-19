@@ -15,11 +15,11 @@ export const DELETE_BY_MAX_MS = 30 * 24 * 60 * 60 * 1_000;
 /** One replay tick past the last fact, so the driver's last tick can see it (a fact is visible when ts < now). */
 export const WINDOW_TAIL_MS = 120_000;
 
-/** `deleteBy` must be after `now` and at most 30 days out. */
-export function checkDeleteBy(deleteBy: string, now: Date): void {
+/** `deleteBy` must be after `now` and at most `maxDays` out (30 for an import; the harvest passes 14). */
+export function checkDeleteBy(deleteBy: string, now: Date, maxDays = DELETE_BY_MAX_MS / 86_400_000): void {
   const ms = Date.parse(deleteBy);
   if (!(ms > now.getTime())) throw new ImportError("--delete-by must be in the future");
-  if (ms - now.getTime() > DELETE_BY_MAX_MS) throw new ImportError("--delete-by must be at most 30 days from now");
+  if (ms - now.getTime() > maxDays * 86_400_000) throw new ImportError(`--delete-by must be at most ${maxDays} days from now`);
 }
 
 /** The mapping file's path: `<out>.mapping.json`, beside the snapshot directory. */
@@ -58,15 +58,31 @@ export interface WriteInput {
   now: Date;
   /** Tests only: runs between the mapping write and the snapshot write, to prove the mapping is cleaned up. */
   afterMapping?: () => Promise<void> | void;
-  mapping: { inputFiles: string[]; sessions: MappedSession[]; projects: Record<string, string>; tenant: { orgId: string; workspaceId: string }; stats: ImportStats };
+  /**
+   * More files for the snapshot directory, by plain name (the harvest's coverage receipt). Each is written
+   * beside sessions.jsonl, mode 0600, and listed with its sha256 in the manifest, so the loader verifies it.
+   */
+  extraFiles?: Record<string, string>;
+  mapping: {
+    inputFiles: string[]; sessions: MappedSession[]; projects: Record<string, string>; tenant: { orgId: string; workspaceId: string };
+    stats: ImportStats | Record<string, number>;
+    /** The mapping's format and warning (the import's by default), and further private fields (the harvest's). */
+    format?: string; warning?: string; extra?: Record<string, unknown>;
+  };
 }
 
 export async function writeImport(w: WriteInput): Promise<{ manifest: SnapshotManifest; mapping: string }> {
   const body = w.lines.length ? `${w.lines.join("\n")}\n` : "";
   if (Buffer.byteLength(body) > IMPORT_BOUNDS.fileBytes) throw new ImportError(`${SESSIONS_FILE} would exceed ${IMPORT_BOUNDS.fileBytes} bytes; import fewer traces at once`);
+  const extra = Object.entries(w.extraFiles ?? {});
+  for (const [name, data] of extra) {
+    if (name === SESSIONS_FILE || name === MANIFEST_FILE) throw new ImportError("an extra snapshot file may not replace sessions.jsonl or manifest.json");
+    if (Buffer.byteLength(data) > IMPORT_BOUNDS.fileBytes) throw new ImportError("an extra snapshot file is too large");
+  }
+  // parseManifest checks every name: a plain name, no separators, no "..", no dotfiles.
   const manifest = parseManifest({
     format: SNAPSHOT_FORMAT, createdAt: w.now.toISOString(), deleteBy: w.deleteBy, window: w.window,
-    files: { [SESSIONS_FILE]: sha256Hex(body) },
+    files: { [SESSIONS_FILE]: sha256Hex(body), ...Object.fromEntries(extra.map(([name, data]) => [name, sha256Hex(data)])) },
   });
   const existing = await lstat(w.out).catch(() => null);
   if (existing && !existing.isDirectory()) throw new ImportError("--out exists and is not a directory");
@@ -76,8 +92,10 @@ export async function writeImport(w: WriteInput): Promise<{ manifest: SnapshotMa
   // without its map. If the snapshot then fails, the map just created is removed.
   const mapping = mappingPath(w.out);
   await writeNew(mapping, `${JSON.stringify({
-    format: MAPPING_FORMAT,
-    warning: "PRIVATE to the customer: maps the hashed ids and paths in the snapshot back to the source traces. Never share it with the snapshot. Delete it with the snapshot by deleteBy.",
+    // First, so an extra field can never replace the format, deleteBy, tenant or sessions below.
+    ...w.mapping.extra,
+    format: w.mapping.format ?? MAPPING_FORMAT,
+    warning: w.mapping.warning ?? "PRIVATE to the customer: maps the hashed ids and paths in the snapshot back to the source traces. Never share it with the snapshot. Delete it with the snapshot by deleteBy.",
     createdAt: w.now.toISOString(), deleteBy: w.deleteBy, manifestSha256: sha256Hex(`${JSON.stringify(manifest, null, 2)}\n`),
     tenant: w.mapping.tenant, inputFiles: w.mapping.inputFiles, projects: w.mapping.projects, stats: w.mapping.stats, sessions: w.mapping.sessions,
   })}\n`);
@@ -87,6 +105,7 @@ export async function writeImport(w: WriteInput): Promise<{ manifest: SnapshotMa
     await mkdir(tmp, { mode: 0o700 });
     try {
       await writeFile(join(tmp, SESSIONS_FILE), body, { mode: 0o600 });
+      for (const [name, data] of extra) await writeFile(join(tmp, name), data, { mode: 0o600 });
       await writeFile(join(tmp, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
       // rename(2) replaces an empty directory, and fails if one appeared with content meanwhile.
       await rename(tmp, w.out);
