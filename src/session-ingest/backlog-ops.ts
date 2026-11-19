@@ -392,11 +392,16 @@ export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-s
  * concurrency. VERDICT_PAGE's per-stage work (the judged/kept CTEs filter materialized CTEs by
  * stage_token) grows with the page squared, so the whole export grows with the page size: the default 1000-key page
  * ran a scoped export-dry past the 355-min job limit, where 500 keys measured ~5 s a page on production. 250 keys x 16
- * kept the total near an hour; the lower-load 100 x 4 below trades run time for database load (measure it on the dry run).
+ * kept the total near an hour; the lower-load 100-key pages below trade run time for database load (measure it on the dry run).
  */
-// Lower load (2026-11-16): 100-key pages (per-page work grows with the page squared) and concurrency 4. The export must
-// still be created after the refresh and the drain must start within 3 h of the refresh, so run it right after.
-export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "--page-size", "100", "--concurrency", "4"] as const;
+// Lower load (2026-11-16): 100-key pages (per-page work grows with the page squared). The export must still be created
+// after the refresh and the drain must start within 3 h of the refresh, so run it right after.
+// Concurrency 16 (2026-11-19): --concurrency bounds only the export's object-store work (the per-user fence reads and
+// the per-stage sidecar/proof reads and writes, accepted-stage-export.ts mapLimit); its SQL runs on one read-only
+// connection, one VERDICT_PAGE at a time, whatever the concurrency. So the page size alone sets database load, and 4
+// only serialized S3 round trips: a one-org production export ran past 3 h, mostly waiting on S3. 16 is the tool's
+// maximum (MAX_EXPORT_CONCURRENCY).
+export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "--page-size", "100", "--concurrency", "16"] as const;
 
 /**
  * The presence tool's per-statement timeout and total transaction budget. Its statements (the counts, the distinct-org
