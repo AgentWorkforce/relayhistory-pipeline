@@ -96,6 +96,11 @@ export function parseReplayResult(raw: unknown): ReplayResult {
   if (!Array.isArray(r.alerts) || r.alerts.length > 1_000_000) throw new Error("alerts: alerts must be an array of at most 1,000,000");
   if (!Array.isArray(r.incomplete) || !r.incomplete.every((x) => typeof x === "string")) throw new Error("alerts: incomplete must be a list of reasons");
   const known = new Set(r.detectors.map((d) => d.name));
+  if (known.size !== r.detectors.length) throw new Error("alerts: two detectors have the same name");
+  for (const d of r.detectors)
+    if (!d.diagnostics || typeof d.diagnostics !== "object" || !Object.values(d.diagnostics).every((v) => typeof v === "number" && Number.isFinite(v)))
+      throw new Error("alerts: detector diagnostics must be numbers");
+  const ids = new Set<string>();
   for (const a of r.alerts) {
     if (!a || typeof a.detector !== "string" || !known.has(a.detector) || typeof a.alertId !== "string"
       || (a.urgency !== "high" && a.urgency !== "low") || typeof a.kind !== "string" || typeof a.sentAt !== "string"
@@ -104,6 +109,10 @@ export function parseReplayResult(raw: unknown): ReplayResult {
       || (a.alertClass !== undefined && !isAlertClass(a.alertClass)))
       throw new Error("alerts: an alert is malformed");
     try { alertClassOf(a); } catch { throw new Error("alerts: an alert's kind has no class and it sets no alertClass"); }
+    const id = `${a.detector}\u0000${a.alertId}`;
+    if (ids.has(id)) throw new Error("alerts: a (detector, alertId) repeats");
+    ids.add(id);
   }
-  return r;
+  // Completeness is derived from the diagnostics as well as read: an edited flag cannot hide a failed scan.
+  return { ...r, incomplete: [...new Set([...r.incomplete, ...incompleteReasons(r.detectors)])] };
 }

@@ -13,17 +13,22 @@
  * count against the split, so precision is a lower bound until adjudicated.
  */
 import { existsSync, readFileSync } from "node:fs";
+import { mkdir, open, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { ALERT_CLASSES, alertClassOf, CLASS_MAP_SHA256, classOfHardNegative, classOfIncidentKind, type AlertClass } from "./classes.ts";
 import type { ReplayAlert } from "./detector.ts";
 import type { HardNegative, Incident, Labels, Split } from "./labels.ts";
 import type { ReplayResult } from "./replay.ts";
-import { median, pairId, sha256Hex, textCompare, writeAtomic } from "./util.ts";
+import { isoTime, median, pairId, sha256Hex, textCompare, writeAtomic } from "./util.ts";
 
 export const DEFAULT_BUDGET_PER_100 = 5;
 export const LEDGER_FILE = "scored-hashes.json";
 export const LEDGER_FORMAT = "session-intel-scored-hashes/1";
 export const SCORE_FORMAT = "session-intel-score/2";
+
+/** sha256 of the scorer's code (score.ts, classes.ts, labels.ts): recorded in every report and ledger entry. */
+export const SCORER_SHA256 = sha256Hex(["./score.ts", "./classes.ts", "./labels.ts"]
+  .map((f) => sha256Hex(readFileSync(new URL(f, import.meta.url)))).join("\n"));
 
 /** pair-match: the pair only (the M0 behaviour). class-match: the pair and the class. */
 export type ScoreMode = "pair" | "class";
@@ -93,13 +98,19 @@ export type ConfusionColumn = typeof CONFUSION_COLUMNS[number];
 /** In-scope alerts by alert class (rows) against what their pair is labeled (columns). */
 export interface Confusion { rows: AlertClass[]; columns: readonly ConfusionColumn[]; counts: Record<AlertClass, Record<ConfusionColumn, number>> }
 
-export interface DetectorScore { detector: string; hash: string; pairMatch: ModeScore; classMatch: ModeScore; confusion: Confusion }
+export interface DetectorScore {
+  detector: string; hash: string; pairMatch: ModeScore; classMatch: ModeScore; confusion: Confusion;
+  /** The replay's diagnostics for the detector (for the advisor: dmSent, written, ...), so the true DM volume is visible. */
+  diagnostics: Record<string, number>;
+}
 
 export interface ScoreReport {
   format: typeof SCORE_FORMAT;
   split: Split;
   /** sha256 of classes.ts: the class map every class-match number here depends on. */
   classMapSha256: string;
+  /** sha256 of score.ts, classes.ts and labels.ts. */
+  scorerSha256: string;
   sessions: number;
   manifestSha256: string;
   labelsSha256: string;
@@ -261,10 +272,11 @@ export function scoreReplay(result: ReplayResult, labels: Labels, opts: { split:
       pairMatch: modeScore(d.name, mine, labels, opts.split, sessions, "pair", budgetPer100),
       classMatch: modeScore(d.name, mine, labels, opts.split, sessions, "class", budgetPer100),
       confusion: confusion(mine, labels, opts.split),
+      diagnostics: { ...d.diagnostics },
     };
   });
   return {
-    format: SCORE_FORMAT, split: opts.split, classMapSha256: CLASS_MAP_SHA256, sessions, manifestSha256: result.snapshot.manifestSha256, labelsSha256: opts.labelsSha256,
+    format: SCORE_FORMAT, split: opts.split, classMapSha256: CLASS_MAP_SHA256, scorerSha256: SCORER_SHA256, sessions, manifestSha256: result.snapshot.manifestSha256, labelsSha256: opts.labelsSha256,
     incidents: labels.incidents.filter((x) => x.split === opts.split).length, incomplete: [...result.incomplete], detectors,
   };
 }
@@ -279,46 +291,95 @@ export interface LedgerEntry {
   detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string;
   /** The class map the held-out score used (absent on entries written before class maps). Recorded, never part of the repeat key. */
   classMapSha256?: string;
+  /** The scorer's code (absent on older entries). */
+  scorerSha256?: string;
   /** A repeat that --force let through. */
   forced: boolean;
-  /** Why it was forced (--reason), when given. */
+  /** The --reason text, when given (on a forced repeat or a first score). */
   reason?: string;
 }
 
 export const MAX_FORCE_REASON = 500;
 export interface Ledger { format: typeof LEDGER_FORMAT; entries: LedgerEntry[] }
 
+const SHA = /^[0-9a-f]{64}$/;
+
+/** Reads and validates the ledger. A damaged entry is an error naming the file, never skipped. */
 export function readLedger(outDir: string): Ledger {
   const path = join(outDir, LEDGER_FILE);
   if (!existsSync(path)) return { format: LEDGER_FORMAT, entries: [] };
-  const raw = JSON.parse(readFileSync(path, "utf8")) as Ledger;
-  if (raw?.format !== LEDGER_FORMAT || !Array.isArray(raw.entries)) throw new Error(`score: ${LEDGER_FILE} is not a ${LEDGER_FORMAT} ledger`);
+  const bad = (why: string) => new Error(`score: ${path} is damaged: ${why}; fix or restore it before scoring held-out`);
+  let raw: Ledger;
+  try { raw = JSON.parse(readFileSync(path, "utf8")) as Ledger; } catch { throw bad("not valid JSON"); }
+  if (raw?.format !== LEDGER_FORMAT || !Array.isArray(raw.entries)) throw bad(`not a ${LEDGER_FORMAT} ledger`);
+  raw.entries.forEach((e, i) => {
+    const where = `entry ${i}`;
+    if (!e || typeof e !== "object") throw bad(`${where} is not an object`);
+    if (e.split !== "heldout") throw bad(`${where}.split must be heldout`);
+    if (typeof e.detector !== "string" || !e.detector) throw bad(`${where}.detector must be a name`);
+    for (const k of ["detectorHash", "labelsSha256", "manifestSha256"] as const) if (typeof e[k] !== "string" || !SHA.test(e[k])) throw bad(`${where}.${k} must be a sha256`);
+    for (const k of ["classMapSha256", "scorerSha256"] as const) if (e[k] !== undefined && (typeof e[k] !== "string" || !SHA.test(e[k]!))) throw bad(`${where}.${k} must be a sha256`);
+    try { isoTime(e.scoredAt, `${where}.scoredAt`); } catch { throw bad(`${where}.scoredAt must be an ISO timestamp`); }
+    if (typeof e.forced !== "boolean") throw bad(`${where}.forced must be a boolean`);
+    if (e.reason !== undefined && (typeof e.reason !== "string" || e.reason.length > MAX_FORCE_REASON)) throw bad(`${where}.reason must be at most ${MAX_FORCE_REASON} characters`);
+  });
   return raw;
 }
 
+export const LOCK_FILE = `${LEDGER_FILE}.lock`;
+
+/** Runs `work` holding an exclusive lock file next to the ledger; a lock already there (running or stale) is refused. */
+export async function withLedgerLock<T>(outDir: string, work: () => Promise<T>): Promise<T> {
+  await mkdir(outDir, { recursive: true });
+  const lockPath = join(outDir, LOCK_FILE);
+  let handle;
+  try {
+    handle = await open(lockPath, "wx");
+  } catch (err) {
+    if ((err as { code?: string }).code === "EEXIST")
+      throw new Error(`score: ${lockPath} exists: another held-out scoring is running, or it crashed and left a stale lock; remove the file only once no scoring is running`);
+    throw err;
+  }
+  try {
+    await handle.writeFile(`${process.pid}\n`);
+    return await work();
+  } finally {
+    await handle.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
+  }
+}
+
 /**
- * The held-out-once rule: refuses (before anything is written) when a detector hash in `result` was already
- * scored on held-out, whatever the class map: re-scoring after a class-map edit is tuning on held-out. `force`
- * lets the repeat through and records it as forced, with the reason when given. Every entry records both the
- * detector hash and the class map. Dev scoring never touches the ledger.
+ * The held-out-once rule, under the ledger lock: refuses (before anything is written) when a detector hash in
+ * `result` was already scored on held-out, whatever the class map: re-scoring after a class-map edit is tuning
+ * on held-out. `force` lets the repeat through and records it as forced. `beforeRecord` (the report writer)
+ * runs after the check and before the entry is written, so a failed report write never burns the hash. Every
+ * entry records the detector hash, the class map, the scorer hash, and the reason when given. Dev scoring
+ * never touches the ledger.
  */
 export async function recordHeldoutScoring(outDir: string, result: ReplayResult, labelsSha256: string,
-  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string } = {}): Promise<Ledger> {
+  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string; beforeRecord?: (forced: boolean) => Promise<void> } = {}): Promise<Ledger> {
   assertScorable(result, "heldout");
   if (opts.reason !== undefined && (!opts.reason.trim() || opts.reason.length > MAX_FORCE_REASON))
     throw new Error(`score: --reason must be 1..${MAX_FORCE_REASON} characters`);
+  return withLedgerLock(outDir, () => recordLocked(outDir, result, labelsSha256, opts));
+}
+
+async function recordLocked(outDir: string, result: ReplayResult, labelsSha256: string,
+  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string; beforeRecord?: (forced: boolean) => Promise<void> }): Promise<Ledger> {
   const classMapSha256 = opts.classMapSha256 ?? CLASS_MAP_SHA256;
   const ledger = readLedger(outDir);
   const done = new Set(ledger.entries.filter((e) => e.split === "heldout").map((e) => e.detectorHash));
   const repeat = result.detectors.filter((d) => done.has(d.hash));
   if (repeat.length && !opts.force)
     throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")}; a detector is scored on held-out once, whatever the class map (--force overrides and is recorded)`);
+  await opts.beforeRecord?.(repeat.length > 0);
   const scoredAt = (opts.now ?? new Date()).toISOString();
   const next: Ledger = {
     format: LEDGER_FORMAT,
     entries: [...ledger.entries, ...result.detectors.map((d): LedgerEntry => ({
       detector: d.name, detectorHash: d.hash, split: "heldout", labelsSha256, manifestSha256: result.snapshot.manifestSha256, scoredAt, classMapSha256,
-      forced: done.has(d.hash), ...(done.has(d.hash) && opts.reason !== undefined ? { reason: opts.reason } : {}),
+      scorerSha256: SCORER_SHA256, forced: done.has(d.hash), ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
     }))],
   };
   await writeAtomic(join(outDir, LEDGER_FILE), `${JSON.stringify(next, null, 2)}\n`);
@@ -336,14 +397,16 @@ const rowLine = (row: RowScore) => `| ${row.urgency} | ${row.kind} | ${row.alert
 export function scoreMarkdown(r: ScoreReport): string {
   const lines = [
     `# Replay score (${r.split})`, "",
-    `Snapshot manifest ${r.manifestSha256.slice(0, 16)}, labels ${r.labelsSha256.slice(0, 16)}, class map ${r.classMapSha256.slice(0, 16)}, ${r.sessions} sessions, ${r.incidents} ${r.split} incidents.`,
+    `Snapshot manifest ${r.manifestSha256.slice(0, 16)}, labels ${r.labelsSha256.slice(0, 16)}, class map ${r.classMapSha256.slice(0, 16)}, scorer ${r.scorerSha256.slice(0, 16)}, ${r.sessions} sessions, ${r.incidents} ${r.split} incidents.`,
     "Unlabeled alerts count as false positives, so precision is a lower bound until they are adjudicated.",
     "pair-match needs the pair only. class-match also needs the class; a pair match of another class is misclassified, not a true positive.",
-    "Precision per alert counts every alert; precision per pair counts each (detector, pair) once.",
+    "Precision per alert counts every alert; precision per pair counts each (detector, pair) once. The spec's precision bars use precision per pair.",
     ...(r.incomplete.length ? ["", `INCOMPLETE replay: ${r.incomplete.join("; ")}. Alerts may be missing.`] : []), "",
   ];
   for (const d of r.detectors) {
     lines.push(`## ${d.detector} (${d.hash.slice(0, 12)})`, "");
+    if (d.diagnostics.dmSent !== undefined || d.diagnostics.written !== undefined)
+      lines.push(`DM volume: ${d.diagnostics.dmSent ?? 0} DMs sent and ${d.diagnostics.written ?? 0} rows written over the replay. Re-alerts after the 7-day sweep are counted here, not in the alert rows.`, "");
     for (const m of [d.pairMatch, d.classMatch]) {
       lines.push(`### ${m.mode === "pair" ? "pair-match" : "class-match"}`, "", HEADER, RULE, ...[...m.rows, ...m.classRows, m.total].map(rowLine), "",
         "Per class and urgency:", "", HEADER, RULE, ...m.classUrgencyRows.map(rowLine), "",

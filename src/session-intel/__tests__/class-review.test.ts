@@ -12,7 +12,7 @@ import { main } from "../replay/cli.ts";
 import type { ReplayAlert, ReplayDetector } from "../replay/detector.ts";
 import { parseLabels } from "../replay/labels.ts";
 import { parseReplayResult, replaySnapshot, type ReplayResult } from "../replay/replay.ts";
-import { confusion, LEDGER_FILE, recordHeldoutScoring, scoreReplay } from "../replay/score.ts";
+import { confusion, LEDGER_FILE, recordHeldoutScoring, SCORER_SHA256, scoreReplay } from "../replay/score.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
 import { sha256Hex } from "../replay/util.ts";
 import { at, FIXTURE_DIR, tmp } from "./helpers.ts";
@@ -131,8 +131,8 @@ describe("G3: the class-map hash", () => {
     await recordHeldoutScoring(out, r, H, { classMapSha256: "c".repeat(64), force: true, reason: "class map fix after review", now: new Date(at("10:00")) });
     const entries = JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries;
     expect(entries).toEqual([
-      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("09:00"), classMapSha256: CLASS_MAP_SHA256, forced: false },
-      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("10:00"), classMapSha256: "c".repeat(64), forced: true, reason: "class map fix after review" },
+      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("09:00"), classMapSha256: CLASS_MAP_SHA256, scorerSha256: SCORER_SHA256, forced: false },
+      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("10:00"), classMapSha256: "c".repeat(64), scorerSha256: SCORER_SHA256, forced: true, reason: "class map fix after review" },
     ]);
     // A forced repeat without a reason is recorded as forced, with no reason.
     await recordHeldoutScoring(out, r, H, { force: true });
@@ -147,7 +147,7 @@ describe("G3: the class-map hash", () => {
     await expect(recordHeldoutScoring(legacy, r, H, { classMapSha256: "d".repeat(64) })).rejects.toThrow("already scored");
   });
 
-  test("the CLI takes --reason only with --force and writes it to the ledger", async () => {
+  test("the CLI records --reason on a first held-out score and on a forced repeat, and refuses both flags on dev", async () => {
     const dir = tmp();
     const file = join(dir, "alerts.json");
     writeFileSync(file, JSON.stringify(result([])));
@@ -155,12 +155,14 @@ describe("G3: the class-map hash", () => {
     writeFileSync(labelsFile, JSON.stringify({ incidents: [], hardNegatives: [] }));
     const io = { out: () => {}, err: () => {} };
     const args = ["score", "--alerts", file, "--labels", labelsFile, "--out", join(dir, "s"), "--split", "heldout"];
-    expect(await main(args, io)).toBe(0);
-    await expect(main([...args, "--reason", "x"], io)).rejects.toThrow("only for a --force");
+    const dev = ["score", "--alerts", file, "--labels", labelsFile, "--out", join(dir, "s")];
+    await expect(main([...dev, "--force"], io)).rejects.toThrow("held-out scoring only");
+    await expect(main([...dev, "--reason", "x"], io)).rejects.toThrow("held-out scoring only");
+    expect(await main([...args, "--reason", "first look, frozen at review"], io)).toBe(0);
     await expect(main(args, io)).rejects.toThrow("already scored");
     expect(await main([...args, "--force", "--reason", "relabel of inc-7"], io)).toBe(0);
     expect(JSON.parse(readFileSync(join(dir, "s", LEDGER_FILE), "utf8")).entries.map((e: { forced: boolean; reason?: string }) => [e.forced, e.reason ?? null]))
-      .toEqual([[false, null], [true, "relabel of inc-7"]]);
+      .toEqual([[false, "first look, frozen at review"], [true, "relabel of inc-7"]]);
   });
 });
 

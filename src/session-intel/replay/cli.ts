@@ -5,11 +5,12 @@
  * Outputs carry session ids, so --out must be outside this repository (a synthetic run may pass --allow-repo-out).
  *
  *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N]
- *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force [--reason <text>]] [--budget N]
+ *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force] [--reason <text>] [--budget N]
  *   bun run src/session-intel/replay/cli.ts packet   --alerts <alerts.json> [--alerts ...] --seed <s> --out <dir> [--budget N]
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -19,7 +20,7 @@ import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
 import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay } from "./score.ts";
 import { loadSnapshot } from "./snapshot.ts";
-import { writeAtomic } from "./util.ts";
+import { writeAtomic, writeNew } from "./util.ts";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const USAGE = `usage: cli.ts <replay|score|packet|verdicts> [options]; see docs/session-intel-replay.md`;
@@ -118,13 +119,36 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const labelBytes = readFileSync(resolve(values.labels));
     const labels = parseLabels(JSON.parse(labelBytes.toString("utf8")));
     const labelsSha256 = labelsDigest(labelBytes);
+    if (split === "dev" && (values.force !== undefined || values.reason !== undefined))
+      throw new Error("--force and --reason apply to held-out scoring only");
     const report = scoreReplay(result, labels, { split, labelsSha256, budgetPer100: budget });
-    // The ledger is checked and written before the held-out numbers are written or shown anywhere.
-    if (values.reason !== undefined && values.force !== true) throw new Error("--reason is only for a --force held-out re-score");
-    if (split === "heldout") await recordHeldoutScoring(out, result, labelsSha256, { force: values.force === true, reason: values.reason, now: io.now });
-    // Split-named reports: a dev run never overwrites the held-out report, which cannot be recomputed.
-    await writeAtomic(join(out, `report.${split}.json`), json(report));
-    await writeAtomic(join(out, `report.${split}.md`), scoreMarkdown(report));
+    if (split === "heldout") {
+      // Under the ledger lock: the check, then the reports (never overwriting one), then the ledger entry. A
+      // refused repeat writes nothing; a failed report write leaves the hash unspent.
+      await recordHeldoutScoring(out, result, labelsSha256, {
+        force: values.force === true, reason: values.reason, now: io.now,
+        beforeRecord: async (forced) => {
+          let base = "report.heldout";
+          if (forced) {
+            let n = 1;
+            while (existsSync(join(out, `report.heldout.forced-${n}.json`)) || existsSync(join(out, `report.heldout.forced-${n}.md`))) n++;
+            base = `report.heldout.forced-${n}`;
+          }
+          await writeNew(join(out, `${base}.json`), json(report));
+          try {
+            await writeNew(join(out, `${base}.md`), scoreMarkdown(report));
+          } catch (err) {
+            // Leave no half-written pair: the hash is unspent, and a retry must find the name free.
+            await rm(join(out, `${base}.json`), { force: true });
+            throw err;
+          }
+        },
+      });
+    } else {
+      // Split-named reports: a dev run never touches the held-out reports, which cannot be recomputed.
+      await writeAtomic(join(out, "report.dev.json"), json(report));
+      await writeAtomic(join(out, "report.dev.md"), scoreMarkdown(report));
+    }
     if (report.incomplete.length) io.err(`score: the replay is incomplete (${report.incomplete.join("; ")}); alerts may be missing`);
     io.out(scoreMarkdown(report));
     return 0;
