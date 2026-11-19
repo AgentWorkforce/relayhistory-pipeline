@@ -330,7 +330,17 @@ describe("snapshot claim fields (format /1, optional fields)", () => {
     [{ claims: [claim("x", "09:10", "intent", "a", { supersededAt: at("09:05") })] }, "supersededAt is before"],
     [{ claims: [claim("x", "09:10", "intent", "a", { supersededAt: "soon" })] }, "supersededAt"],
     [{ claims: [claim("x", "09:10", "intent", "a", { owner: "me" })] }, "unknown field"],
+    [{ claims: [claim("x", "09:10", "intent", "a", { topic: "Not A Slug" })] }, "topic must be a topic slug"],
   ];
+
+  test("a stored claim's topic slug counts like a path it names; general never does", () => {
+    const withTopic = (topic: string) => cands([
+      view("s-a", NOW, { claims: [claim("i1", "09:10", "intent", "Tidy things up.", { topic })] }),
+      view("s-b", NOW, { writes: [write("src/pager/x.ts", "09:40", "w1")] }),
+    ]).candidates.map((c) => c.topics);
+    expect(withTopic("src-pager")).toEqual([["src-pager"]]);
+    expect(withTopic("general")).toEqual([]);
+  });
   for (const [over, msg] of bad) test(`refused: ${msg}`, () => {
     expect(() => snap("s1", over)).toThrow(SnapshotError);
     expect(() => snap("s1", over)).toThrow(msg);

@@ -10,7 +10,7 @@ import type { ReplayView } from "../replay/views.ts";
 import { canonicalJson, sha256Hex, textCompare } from "../replay/util.ts";
 import { conflictCandidates, CONFLICT_WINDOW_MS, MAX_PAIRS_PER_WORKSPACE, MAX_SESSIONS_PER_WORKSPACE, type CandidateOptions } from "./candidates.ts";
 import {
-  buildJudgeInput, citable, decide, validateCitations, type ConflictDelivery, type JudgeAction, type JudgeClaim, type JudgeOutput, type PairJudge, type SideName,
+  alertArtifact, buildJudgeInput, citable, decide, validateCitations, type ConflictDelivery, type JudgeAction, type JudgeClaim, type JudgeOutput, type PairJudge, type SideName,
 } from "./classify.ts";
 import { modelJudge, ruleJudge, type ModelJudgeOptions } from "./judges.ts";
 
@@ -149,8 +149,7 @@ export function conflictDetector(name: string, judge: PairJudge, opts: ConflictD
         if (s.raised.has(alertId)) continue;
         s.raised.add(alertId);
         if (d.urgency === "high") c.alertsHigh!++; else c.alertsLow!++;
-        const claimTopics = new Set([...v.c.claims.flatMap((x) => x.topics), ...(d.action?.topic ? [d.action.topic] : [])]);
-        const artifact = cand.topics.filter((t) => claimTopics.has(t)).sort(textCompare)[0] ?? cand.topics[0]!;
+        const artifact = alertArtifact(cand.topics, v.c, d.action);
         const evidence = evidenceOf(v.c.claims, (side) => cand[side].session.sessionId, d.action);
         const sentAt = now.toISOString();
         const times = [...v.c.claims.map((x) => x.at), ...(d.action ? [d.action.ts] : [])].sort(textCompare);

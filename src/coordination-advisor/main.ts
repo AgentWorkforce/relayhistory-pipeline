@@ -52,7 +52,8 @@ export async function advisorMain(env: Record<string, string | undefined>, io: A
     service: ADVISOR_SERVICE,
     stages: [],
     handlers: () => ({}),
-    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces }), { intervalMs: cfg.intervalMs }),
+    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces,
+      ...(cfg.conflicts ? { conflicts: true } : {}) }), { intervalMs: cfg.intervalMs }),
   });
   return "ran";
 }

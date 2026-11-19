@@ -47,6 +47,8 @@ export const CLAIM_SCOPES: readonly ClaimScope[] = ["session", "project", "repo"
  */
 export interface SnapshotClaim {
   id: string; at: string; kind: ClaimKind; scope: ClaimScope; text: string; confidence: number; evidenceIds: string[]; supersededAt?: string;
+  /** The stored claim's topic slug (relayfacts claims carry one); optional. */
+  topic?: string;
 }
 export interface SummaryEntry { at: string; text: string }
 
@@ -142,6 +144,8 @@ const optId = (v: unknown, field: string) => boundedString(v, field, SNAPSHOT_BO
 const HARNESS = /^[A-Za-z0-9_.-]{1,64}$/;
 /** A claim id: no `#`, `:`, `/` or whitespace, so `<harness>:<sessionId>#<id>` names it unambiguously. */
 const CLAIM_ID = /^[A-Za-z0-9_.-]{1,128}$/;
+/** A topic slug, as relayfacts stores it (062080/062150 topic CHECK). */
+const TOPIC_SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 function list(v: unknown, field: string, max: number): unknown[] {
   if (v === undefined) return [];
@@ -238,7 +242,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
     const claims = list(raw.claims, `${where}.claims`, SNAPSHOT_BOUNDS.claims).map((c, i): SnapshotClaim => {
       const f = `${where}.claims[${i}]`;
       if (!isRecord(c)) throw new SnapshotError(`${f} must be an object`);
-      onlyKeys(c, ["id", "at", "kind", "scope", "text", "confidence", "evidenceIds", "supersededAt"], f);
+      onlyKeys(c, ["id", "at", "kind", "scope", "text", "confidence", "evidenceIds", "supersededAt", "topic"], f);
       const at = isoTime(c.at, `${f}.at`);
       if (at < createdAt) throw new SnapshotError(`${f}.at is before createdAt`);
       if (c.kind !== "intent" && c.kind !== "constraint" && c.kind !== "decision") throw new SnapshotError(`${f}.kind must be intent, constraint or decision`);
@@ -248,6 +252,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
       if (!CLAIM_ID.test(claimId)) throw new SnapshotError(`${f}.id must match ${CLAIM_ID.source}`);
       if (claimIds.has(claimId)) throw new SnapshotError(`${f}.id repeats a claim id of this session`);
       claimIds.add(claimId);
+      if (c.topic !== undefined && (typeof c.topic !== "string" || !TOPIC_SLUG.test(c.topic))) throw new SnapshotError(`${f}.topic must be a topic slug`);
       let supersededAt: string | undefined;
       if (c.supersededAt !== undefined) {
         supersededAt = isoTime(c.supersededAt, `${f}.supersededAt`);
@@ -258,6 +263,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
         text: boundedString(c.text, `${f}.text`, SNAPSHOT_BOUNDS.text)!, confidence: c.confidence,
         evidenceIds: list(c.evidenceIds, `${f}.evidenceIds`, SNAPSHOT_BOUNDS.evidenceIds).map((e, j) => id(e, `${f}.evidenceIds[${j}]`)),
         ...(supersededAt === undefined ? {} : { supersededAt }),
+        ...(c.topic === undefined ? {} : { topic: c.topic as string }),
       };
     });
 

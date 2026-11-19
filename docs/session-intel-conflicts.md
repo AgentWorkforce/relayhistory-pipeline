@@ -1,8 +1,8 @@
 # Session Intelligence conflict detectors (M2-1, M2-2)
 
-Two replay detectors for the conflict classes of the alert taxonomy, `constraint_violation` and `intent_conflict`, plus the informational `overlap`. The taxonomy is in [proposals/session-intelligence.md](proposals/session-intelligence.md), "Alert taxonomy" and "M2". They run **offline only**, under the M0 replay harness ([session-intel-replay.md](session-intel-replay.md)), over a frozen snapshot and a simulated clock.
+Two replay detectors for the conflict classes of the alert taxonomy, `constraint_violation` and `intent_conflict`, plus the informational `overlap`. The taxonomy is in [proposals/session-intelligence.md](proposals/session-intelligence.md), "Alert taxonomy" and "M2". As detectors they run offline, under the M0 replay harness ([session-intel-replay.md](session-intel-replay.md)), over a frozen snapshot and a simulated clock. The rule judge also runs inside the live advisor, behind a default-off flag and control (see "Live wiring").
 
-**Nothing here is wired or flagged.** No `SESSION_INTEL_CONFLICTS_ENABLED` flag exists. The coordination advisor does not call these detectors, and no DM, pull row or dashboard entry is produced. That is M2-4, which comes after the held-out replay (M2-3) and needs its own review. No model is called either: the model judge takes an injected transport, and this branch ships none. It reads no key and no environment.
+**Live wiring (M2-4), default off.** `SESSION_INTEL_CONFLICTS_ENABLED` (exactly `"true"`) together with the M3-1 `conflicts` control runs the rule judge inside the live coordination advisor. With either off, the advisor is byte-identical to before. The live path maps its inputs onto the same as-of structures and calls the same `candidates.ts`, `classify.ts` and `ruleClassify`; it has no second copy. Rows, DMs, the claims read and its fail-open rules are in [coordination-live-advisories.md](coordination-live-advisories.md), "Conflict rows". Enabling the flag or the control anywhere real needs Khaliq's explicit OK, after M2-3's held-out replay. No model is called: the model judge takes an injected transport, and none is wired. It reads no key and no environment.
 
 Code: `src/session-intel/conflict/`. Tests and the synthetic fixture: `src/session-intel/__tests__/conflict*.test.ts` and `src/session-intel/__tests__/fixtures/conflict/`.
 
@@ -125,10 +125,14 @@ The params hash covers:
 These are recorded on the alert only. Nothing is sent.
 
 - `constraint_violation`: the **violator** (the acting session) and the constraint's **owner**, the session holding it. HIGH DMs both; LOW puts it on both pull paths.
-- A `repo`-scope constraint with no holding session (the M1-4 policy pack, which this snapshot format cannot yet express) has the owner `repo-policy` and **no DM recipient**. No recipient is invented for it. TODO(M2-4): the lander requires a definition of "repo owner" before any DM code goes in.
+- A `repo`-scope constraint with no holding session (the M1-4 policy pack, which neither this snapshot format nor the live claims express yet) has the owner `repo-policy`, **no DM recipient and, live, no row**. No recipient is invented for it. TODO: the lander requires a definition of "repo owner" before any DM to it.
 - `intent_conflict`: both sessions, as DMs at HIGH and on the pull path.
 - `overlap`: both pull paths, never a DM.
 - Fleet conflicts: the orchestrator only.
+
+## Replay parity with the live wiring
+
+`advisorDetector({ conflicts: true })` runs the real `scanOnce` with the conflict rows on. Its replay store answers the 062150 claims reader from the snapshot's claims as of the clock (current claims only), and its `controls` option (every feature ON within the eval, hashed) stands in for M3-1. On the conflict fixture its conflict rows give the same classes, urgencies and times as `conflict-rule`, case by case. Only the fleet case differs, and only in its pair: the live row goes to the orchestrator (`src/session-intel/__tests__/conflict-live-parity.test.ts`). Snapshot claims may carry an optional `topic` slug, as stored claims do; it counts like a path the claim names.
 
 ## The synthetic fixture
 
