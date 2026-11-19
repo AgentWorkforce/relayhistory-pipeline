@@ -1,0 +1,8 @@
+{"sessionId": "gen-1", "ts": "2026-11-01T09:00:00Z", "kind": "start", "projectId": "fixture-proj", "repo": "fixture-co/widgets", "branch": "main", "cwd": "/Users/fixture-user/widgets"}
+{"sessionId": "gen-1", "ts": "2026-11-01T09:05:00Z", "kind": "write", "files": ["/Users/fixture-user/widgets/src/a.ts", "src/b.ts"], "tokens": 100}
+{"sessionId": "gen-1", "ts": "2026-11-01T09:06:00Z", "kind": "commit", "commit": "deadbee"}
+{"sessionId": "gen-2", "ts": "2026-11-01T09:10:00+00:00", "kind": "write", "parentSessionId": "gen-1", "projectId": "fixture-proj", "repo": "fixture-co/widgets", "files": ["src/c.ts"], "text": "FIXTURE_SECRET_GENERIC_TEXT"}
+{"sessionId": "gen-2", "ts": "2026-11-01T09:20:00Z", "kind": "outcome", "outcome": {"key": "deadbee", "reverted": true}}
+{"sessionId": "gen-3", "ts": "2026-11-01 09:00", "kind": "write", "files": ["src/x.ts"]}
+{"sessionId": "gen-3", "ts": "2026-11-01T09:30:00Z", "kind": "write", "files": "src/x.ts"}
+not json
