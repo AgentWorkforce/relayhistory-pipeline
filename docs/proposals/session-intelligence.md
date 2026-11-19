@@ -132,6 +132,11 @@ that is the number that matters.
 - **Dashboard → "Session intelligence" view**, which extends the dashboard's Overlaps tab. It shows
   live alerts by class, each with its two claims and evidence links, plus a daily digest per
   workspace. Adjudication buttons (real / planned / wrong) feed the labelled set.
+  - **Live status and progress:** per workspace, each active session's latest short summary, its
+    current intents, and its state, built from the live summaries and claims. No transcript text.
+  - **Searchable handoffs:** finished or idle sessions, with their summaries, decisions and open
+    items, searchable through the existing short-summary search, so another agent or a person can
+    pick up the work.
 - **Limits.** The existing cooldown (6 h per pair per urgency), the cap of 3 per recipient per hour,
   and never resending an acked alert all apply to every class. New: a cap of 20 DMs per workspace per
   day, and a model budget per workspace per day (see M2).
@@ -287,7 +292,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM), with a per-feature workspace allowlist that denies by default; fail-closed for alerting; its slot comes from the lander | sessions-intel-lead | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
 | M3-2 Per-workspace DM cap and model budget, durable | sessions-intel-lead | Tests; metrics emitted | none |
 | M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-app's agent (Khaliq, 2026-11-19); sessions-intel-lead briefs it with the hook contract | Hook treats 501 as none; never blocks a turn | none |
-| M3-4 Dashboard "Session intelligence" view, with adjudication buttons | sessions-intel-lead (Khaliq, 2026-11-19) | Behind a setting; no transcript text | none |
+| M3-4 Dashboard "Session intelligence" view: alerts with adjudication buttons, live status and progress per workspace, and searchable handoffs | sessions-intel-lead (Khaliq, 2026-11-19) | Behind a setting; no transcript text | none |
 | M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | sessions-intel-lead | `e2e/pipeline` step green in the CI full lane | none |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
