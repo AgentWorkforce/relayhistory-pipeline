@@ -222,6 +222,7 @@ describe("flag off: byte-identical to decisions only", () => {
 function fakePort(rows: CurrentClaim[], over: Partial<ClaimsPort> = {}) {
   const calls: string[] = [];
   const port: ClaimsPort = {
+    enabled: async () => { calls.push("enabled"); return true; },
     insert: async (_s, records) => { calls.push(`insert:${records.length}`); return { inserted: records.length, merged: 0, evidence_added: records.length }; },
     current: async (_s, f) => { calls.push(`current:${f.kind}:${f.topic}`); return rows.filter((r) => r.kind === f.kind); },
     supersede: async (_s, o, n) => { calls.push(`supersede:${o}->${n}`); return true; },
@@ -283,10 +284,11 @@ describe("claimsHook", () => {
     await claimsHook(port, counts)(job, out(snap));
     expect(scopes).toEqual([{ orgId: "org-j", workspaceId: "ws-j" }]);
     expect(counts).toEqual({ claim_records: 1 });
-    expect(calls).toEqual(["current:intent:src-session-read-api"]);
+    expect(calls).toEqual(["enabled", "current:intent:src-session-read-api"]);
     const empty: Record<string, number> = {};
     const { port: p2, calls: c2 } = fakePort([]);
     await claimsHook(p2, empty)(job, out(snapshot({})));
+    // No claims: the control is not even read.
     expect([empty, c2]).toEqual([{}, []]);
   });
   test("a fenced or failed write is counted on its own keys, and supersession is skipped", async () => {
@@ -295,7 +297,7 @@ describe("claimsHook", () => {
       const counts: Record<string, number> = {};
       await claimsHook(port, counts)(job, out(snap));
       expect(counts).toEqual({ [key]: 1 });
-      expect(calls).toEqual([]);
+      expect(calls).toEqual(["enabled"]);
     }
   });
   test("a supersession failure after the write is contained and counted", async () => {
@@ -306,11 +308,41 @@ describe("claimsHook", () => {
   });
 });
 
+describe("claimsHook: the M3-1 claims control, fail-closed", () => {
+  const job = { orgId: "org-j", workspaceId: "ws-j" } as AnalysisJob;
+  const out = (s: SessionAnalysisSnapshot) => ({ result: { analysis: s } }) as unknown as AnalysisJobOutput;
+  const snap = snapshot({ constraints: [claim("Never push main.", ["h0"])] });
+  const cases: [string, ClaimsPort["enabled"]][] = [
+    ["off", async () => false],
+    ["the read throws", async () => { throw new Error("db down"); }],
+  ];
+  for (const [name, enabled] of cases)
+    test(`${name}: nothing is written, nothing superseded, the miss is counted`, async () => {
+      const { port, calls } = fakePort([], { enabled });
+      const counts: Record<string, number> = {};
+      await claimsHook(port, counts)(job, out(snap));
+      expect(counts).toEqual({ claim_records_control_off: 1 });
+      expect(calls.filter((c) => c !== "enabled")).toEqual([]);
+    });
+  test("the postgres port reads the shared controls reader and fails closed on a malformed, missing or failed read", async () => {
+    const db = { query: async () => ({ rows: [] }) } as never;
+    const reader = (m: Map<string, boolean> | Error) => ({ read: async () => { if (m instanceof Error) throw m; return m; } });
+    expect(await postgresClaimsPort(db, reader(new Map([["claims", true]])) as never).enabled(SCOPE)).toBe(true);
+    expect(await postgresClaimsPort(db, reader(new Map([["claims", false]])) as never).enabled(SCOPE)).toBe(false);
+    expect(await postgresClaimsPort(db, reader(new Map()) as never).enabled(SCOPE)).toBe(false);
+    expect(await postgresClaimsPort(db, reader(new Error("x")) as never).enabled(SCOPE)).toBe(false);
+    // The real reader: a failed query is off.
+    const { sessionIntelControls } = await import("../../shared/session-intel-controls.ts");
+    const failing = sessionIntelControls({ query: async () => { throw new Error("down"); } }, { warn: () => {} });
+    expect(await postgresClaimsPort(db, failing).enabled(SCOPE)).toBe(false);
+  });
+});
+
 describe("postgresClaimsPort", () => {
   test("the claims writer, the claims reader and the claims supersede, bound parameters only", async () => {
     const calls: [string, unknown[]][] = [];
     const db = { query: async (text: string, params: unknown[]) => { calls.push([text, params]); return { rows: [{ inserted: 1, merged: 0, evidence_added: 1, ok: true }] }; } } as never;
-    const port = postgresClaimsPort(db);
+    const port = postgresClaimsPort(db, { read: async () => new Map([["claims", true]]) } as never);
     expect(await port.insert(SCOPE, [])).toBeNull();
     const records = extractClaimRecords(snapshot({ intents: [claim("Add the reader.", ["a0"])] }));
     await port.insert(SCOPE, records);

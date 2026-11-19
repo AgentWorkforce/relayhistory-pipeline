@@ -11,6 +11,7 @@ import { PGlite, type Transaction } from "../../../packages/pipeline/node_module
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { claimsHook, postgresClaimsPort } from "../../session-analysis/claims.ts";
+import { sessionIntelControls } from "../../shared/session-intel-controls.ts";
 import { decisionRecordsHook, postgresDecisionRecordsSink } from "../../session-analysis/decision-records.ts";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { AnalysisJob, AnalysisJobOutput } from "../../session-analysis/processor.ts";
@@ -53,6 +54,9 @@ const LATER_STEP = "upstream:20261105062160_session_intel_controls.sql";
 const LATER_DOWN = sqlFile("supabase/rollbacks/20261105062160_session_intel_controls.down.sql");
 const TOP_STEP = "upstream:20261105062170_session_intel_workspace.sql";
 const TOP_DOWN = sqlFile("supabase/rollbacks/20261105062170_session_intel_workspace.down.sql");
+/** 20261105062180 (claims scheduler) sits above 062170: its down runs before it. */
+const SCHEDULER_STEP = "upstream:20261105062180_claims_scheduler.sql";
+const SCHEDULER_DOWN = sqlFile("supabase/rollbacks/20261105062180_claims_scheduler.down.sql");
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await runMigrations(client(db), { profile: LOCAL });
@@ -310,7 +314,9 @@ describe("20261105062150 relayfacts claims", () => {
   test("the extractor through the real functions: decisions through v1 as before, claims through the claims writer; a dropped claim is superseded", async () => {
     await reset();
     const exec = { query: <R,>(text: string, params?: unknown[]) => as("service_role", async (tx) => (await tx.query<R>(text, params)) as { rows: R[] }) } as never;
-    const port = postgresClaimsPort(exec);
+    // The workspace's 'claims' control on (062160), read through the shared reader as the worker does.
+    await db.exec("INSERT INTO sessions.session_intel_controls (scope, org_id, workspace_id, feature, enabled, updated_by) VALUES ('global', NULL, NULL, 'claims', true, 'test'), ('workspace', 'org-a', 'ws-a', 'claims', true, 'test') ON CONFLICT DO NOTHING");
+    const port = postgresClaimsPort(exec, sessionIntelControls(exec));
     const sink = postgresDecisionRecordsSink(exec);
     const refs = [
       { id: "h0", source: "claude", kind: "human-message", sessionId: "sess-root", at: "2026-11-18T10:05:00Z" },
@@ -351,6 +357,14 @@ describe("20261105062150 relayfacts claims", () => {
     // An older analysis whose hook runs late supersedes nothing.
     await hook(snap(["Never apply migrations to a real database."], new Date(Date.now() - 3_600_000).toISOString()), counts);
     expect(counts.claim_records_superseded).toBe(1);
+    // The workspace control off: decisions still go through v1; no claim is written.
+    await db.exec("UPDATE sessions.session_intel_controls SET enabled = false WHERE scope = 'workspace' AND feature = 'claims'");
+    const before = await claims();
+    const off: Record<string, number> = {};
+    await hook(snap(["A brand new rule for everyone."], new Date(Date.now() + 60_000).toISOString()), off);
+    expect(off).toEqual({ decision_records: 1, claim_records_control_off: 1 });
+    expect(await claims()).toEqual(before);
+    await db.exec("UPDATE sessions.session_intel_controls SET enabled = true WHERE scope = 'workspace' AND feature = 'claims'");
   });
 });
 
@@ -486,13 +500,16 @@ describe("20261105062150 rollback", () => {
     const { decide, claim } = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      // 20261105062160 (session intel controls) and 20261105062170 (session intel workspace readers) are the later steps;
-      // they come off first (062170, then 062160), and this down refuses under either.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP]);
+      // 20261105062160 (session intel controls), 20261105062170 (session intel workspace readers) and 20261105062180
+      // (claims scheduler) are the later steps; they come off first (062180, 062170, then 062160), each down refusing
+      // under a later one, and this down refuses under any.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP, SCHEDULER_STEP]);
+      expect(await message(TOP_DOWN)).toContain("a later migration is applied");
       expect(await message(DOWN)).toContain("a later migration is applied");
       expect(await message(LATER_DOWN)).toContain("a later migration is applied");
+      await db.exec(SCHEDULER_DOWN);
+      expect(await message(LATER_DOWN)).toContain("a later migration is applied");
       await db.exec(TOP_DOWN);
-      expect(await message(DOWN)).toContain("a later migration is applied");
       await db.exec(LATER_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062140_staged_output_facts.down.sql"))).toContain("a later migration is applied");
       await decide("org-a", "ws-a", [rec()]);
@@ -526,6 +543,7 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
+      await db.exec(SCHEDULER_DOWN);
       await db.exec(TOP_DOWN);
       await db.exec(LATER_DOWN);
       await db.exec(DOWN);
