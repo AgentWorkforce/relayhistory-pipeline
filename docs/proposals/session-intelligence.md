@@ -71,7 +71,7 @@ Every pair of sessions that the scan considers ends in exactly one class:
 
 | Class | Definition | Example | Urgency | Delivery |
 |---|---|---|---|---|
-| `constraint_violation` | B acts, or states an intent to act, against a constraint in force for B's scope. The constraint comes from repository policy (AGENTS.md, CLAUDE.md and the like) or from a *project-scoped* constraint a human gave in session A | A was told "no new migrations until the 062 renumber lands"; B writes `supabase/migrations/…` | HIGH when B has acted (a write, commit or command); LOW when it is only an intent | DM to B, cc A's owner; pull; dashboard |
+| `constraint_violation` | B acts, or states an intent to act, against a constraint in force for B's scope. The constraint comes from repository policy (AGENTS.md, CLAUDE.md and the like) or from a *project-scoped* constraint a human gave in session A | A was told "no new migrations until the 062 renumber lands"; B writes `supabase/migrations/…` | HIGH when B has acted (a write, commit or command); LOW when it is only an intent | DM to both B and the constraint's owner (session A, or the repo owner for a policy constraint); pull; dashboard |
 | `intent_conflict` | A's current decision or intent and B's current intent or decision cannot both hold, on the same topic | A decided "advisories use 501 when off"; B intends "return 404 when off" in the same route | HIGH when both are current (neither superseded) and B is writing in the topic; else LOW | DM to both; pull; dashboard |
 | `collision` | Existing T1 and T2 duplicate or superseded work, and T3 within 60 minutes (`outcome-facts`) | Two roots write migration `062130` | HIGH (existing rubric) | DM to both; pull; dashboard |
 | `overlap` | Same project and shared topic or files, with no conflicting claims | Two agents both editing `src/session-read-api` on different routes | LOW, informational | Turn-end pull advisory and dashboard. Never a DM |
@@ -256,6 +256,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M0-2 Snapshot harvester for our own workspace, writing the M0-1 format from the shared-session tools and the read API | sessions-intel-lead | Writes outside the repo; manifest; delete-by ≤ 14 days | **Reading session data: Khaliq OK** |
 | M0-3 Labelling kit: outcome mining (reverts, duplicate migrations and PRs) and correction mining, with a split by workstream | sessions-intel-lead | Labels file in the M0-1 format; ≥ 30 incidents across the classes, or an honest count | follows M0-2 |
 | M0-4 **Advisor replay report**: the existing HIGH and LOW rows scored against the bars | sessions-intel-lead | A report per row: pass, fail or insufficient | follows M0-3 |
+| M0-5 Class-aware scoring: map detector kinds, incident kinds and verdicts onto the taxonomy classes; score in pair-match and class-match modes; rows per class × urgency, which are the rows the bars apply to; a confusion table; the class map's hash recorded in reports and the held-out ledger | sessions-intel-lead (M0 builder) | Tests: mapping, misclassification, confusion counts, benign overlap and planned fleet as correct classes, verdict agreement on class sets | none |
 
 ### M1: Intent and constraint extraction into facts
 
@@ -282,8 +283,8 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 |---|---|---|---|
 | M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM), with a per-feature workspace allowlist that denies by default; fail-closed for alerting; its slot comes from the lander | sessions-intel-lead | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
 | M3-2 Per-workspace DM cap and model budget, durable | sessions-intel-lead | Tests; metrics emitted | none |
-| M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-desktop owner (to be confirmed with Khaliq) | Hook treats 501 as none; never blocks a turn | none |
-| M3-4 Dashboard "Session intelligence" view, with adjudication buttons | relay-webapp owner (to be confirmed) | Behind a setting; no transcript text | none |
+| M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-app's agent (Khaliq, 2026-11-19); sessions-intel-lead briefs it with the hook contract | Hook treats 501 as none; never blocks a turn | none |
+| M3-4 Dashboard "Session intelligence" view, with adjudication buttons | sessions-intel-lead (Khaliq, 2026-11-19) | Behind a setting; no transcript text | none |
 | M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | sessions-intel-lead | `e2e/pipeline` step green in the CI full lane | none |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
@@ -303,11 +304,21 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M5-1 Scripted live demo: two agents in our workspace, one given a project constraint, the other told to break it, then the DM and the dashboard entry within the latency target | sessions-intel-lead | A recorded run with timings | stage 0 enabled (M3-6) |
 | M5-2 Batch demo: the M4 report over a synthetic "enterprise" import, plus our own snapshot's replay numbers, honestly stated | sessions-intel-lead | A shareable page; no production identifiers | none |
 
-## Open questions for Khaliq
+## Decisions and open questions
 
-1. Who owns the desktop turn-end hook (M3-3) and the dashboard view (M3-4)?
-2. Is DM-to-the-violator with a cc to the constraint owner right, or should a constraint violation DM
-   both, like a conflict?
-3. Model choice and the daily budget for the claims pass and the classifier in hosted.
-4. Approval to harvest a new frozen snapshot of our own workspace (M0-2). The previous one was
-   deleted on 2026-11-17.
+Khaliq answered the first open questions on 2026-11-19, in his own words, to layered-sessions-pipeline:
+
+1. **Owners.** relay-app's agent builds the desktop turn-end hook (M3-3). sessions-intel-lead builds
+   the dashboard view (M3-4).
+2. **Constraint violations DM both sessions**: the violator and the constraint's owner, the same as a
+   conflict.
+3. **Still open: model and daily spend cap** for the claims pass and the classifier in hosted. The
+   proposed default is the same model as summaries, with the cap set from the replay's measured cost.
+   No model, provider key or budget is approved yet.
+4. **M0-2 approved**, scoped to our own workspace's existing session data:
+   - the snapshot is written outside the repository, with a manifest of hashes and a delete-by date at
+     most 14 days out;
+   - nothing from it reaches the public repository: no transcript text, ids or names;
+   - it does not cover any customer workspace or the M4 import.
+
+Hosted default-on for any `SESSION_INTEL_*` flag is not approved. Code lands default-off.
