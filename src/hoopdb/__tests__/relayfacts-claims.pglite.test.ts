@@ -48,9 +48,10 @@ function client(db: PGlite): MigrationClient {
 }
 const code = async (p: Promise<unknown>) =>
   ((await p.then(() => null, (e: unknown) => e)) as { code?: string } | null)?.code ?? null;
-/** 20261105062160 (session intel controls) sits above this step: its down runs first. */
+/** 20261105062160 (session intel controls) is the first upstream step above this one; every later step's down runs first, newest first. */
 const LATER_STEP = "upstream:20261105062160_session_intel_controls.sql";
-const LATER_DOWN = sqlFile("supabase/rollbacks/20261105062160_session_intel_controls.down.sql");
+/** The rollback of a later upstream step, by its ledger name. */
+const laterDown = (name: string) => sqlFile(`supabase/rollbacks/${name.slice("upstream:".length).replace(/\.sql$/u, ".down.sql")}`);
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await runMigrations(client(db), { profile: LOCAL });
@@ -484,10 +485,15 @@ describe("20261105062150 rollback", () => {
     const { decide, claim } = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      // 20261105062160 (session intel controls) is the only later step; it comes off first, and this down refuses under it.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP]);
+      // Every later upstream step (062160 first) comes off first, newest first. While any is applied this down refuses
+      // ("a later migration is applied", 55000), and so does each later step's down while a step above it is applied.
+      const later = (await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name);
+      expect(later[0]).toBe(LATER_STEP);
       expect(await message(DOWN)).toContain("a later migration is applied");
-      await db.exec(LATER_DOWN);
+      for (let i = later.length - 1; i >= 0; i--) {
+        if (i > 0) expect(await message(laterDown(later[i - 1]!))).toContain("a later migration is applied");
+        await db.exec(laterDown(later[i]!));
+      }
       expect(await message(read("supabase/rollbacks/20261105062140_staged_output_facts.down.sql"))).toContain("a later migration is applied");
       await decide("org-a", "ws-a", [rec()]);
       await claim("org-a", "ws-a", [claimRec(), claimRec({ kind: "intent", title: "I" })]);
@@ -520,7 +526,8 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
-      await db.exec(LATER_DOWN);
+      const later = (await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name);
+      for (const name of [...later].reverse()) await db.exec(laterDown(name));
       await db.exec(DOWN);
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
     } finally { await db.close(); }
