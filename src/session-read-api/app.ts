@@ -317,6 +317,11 @@ export interface ReadApiDeps {
    * is read.
    */
   sessionIntel?: { enabled: boolean; source: SessionIntelSource };
+  /**
+   * READ_API_ADVISORY_NOTIFY_ROWS, parsed (advisory-priority.ts parseAdvisoryNotifyRows): the (kind, urgency) rows
+   * whose advisories carry `notifyEligible: true` on both advisory routes. Absent = empty: none.
+   */
+  advisoryNotifyRows?: ReadonlySet<string>;
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -2132,7 +2137,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (status !== "pending") throw bad("status must be pending");
       const rows = await advisories.source.pending(recipient);
       log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
-      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map(advisoryItem), nextCursor: null });
+      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map((row) => advisoryItem(row, deps.advisoryNotifyRows)), nextCursor: null });
     } catch (error) {
       return fail(c, error);
     }
@@ -2187,6 +2192,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const correlationId = c.get("correlationId");
       const view = await workspaceView({
         orgId: identity.orgId, workspaceId: identity.workspaceId, now: Date.now(), source: intel.source, directory: deps.directory,
+        ...(deps.advisoryNotifyRows ? { notifyRows: deps.advisoryNotifyRows } : {}),
         log: (fields) => log({ route: c.req.routePath, ...fields, correlation_id: correlationId }),
       });
       // Counts only, never an id or a title.
