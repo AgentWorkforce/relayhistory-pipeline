@@ -3,7 +3,7 @@
  * output-directory refusals, and import followed by the unchanged replay CLI. Synthetic fixtures only.
  */
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { main, readSaltFile, readSaltStdin } from "../import/cli.ts";
@@ -51,12 +51,16 @@ describe("import cli", () => {
     expect(snap.manifest.deleteBy).toBe(DELETE_BY);
     expect(snap.manifest.createdAt).toBe(NOW.toISOString());
     for (const s of snap.sessions) {
-      expect(s).toMatchObject({ orgId: "org_fx", workspaceId: "ws_fx", summaryTimeline: [], claims: [], title: null, userId: null, taskRef: null });
+      // The tenant ids are hashed too (F4); the raw ones are only in the private mapping.
+      expect(s).toMatchObject({ orgId: new Hasher(SALT).org("org_fx"), workspaceId: new Hasher(SALT).workspace("ws_fx"), summaryTimeline: [], claims: [], title: null, userId: null, taskRef: null });
       expect(s.sessionId).toMatch(/^s_[0-9a-f]{32}$/u);
       expect(snap.manifest.window.since <= s.createdAt && s.lastActivityAt < snap.manifest.window.until).toBe(true);
     }
     expect(readdirSync(out).sort()).toEqual(["manifest.json", "sessions.jsonl"]);
     expect(statSync(join(out, "sessions.jsonl")).mode & 0o077).toBe(0);
+    const text = allText(out);
+    for (const raw of ["org_fx", "ws_fx"]) expect(text).not.toContain(raw);
+    expect(JSON.parse(readFileSync(mappingPath(out), "utf8")).tenant).toEqual({ orgId: "org_fx", workspaceId: "ws_fx" });
   });
 
   test("no message text, raw id, home path, user name, project name or salt reaches the snapshot or stdout", async () => {
@@ -67,7 +71,9 @@ describe("import cli", () => {
       const secrets = new Set(fixtureText(dir).flatMap((t) => t.match(/FIXTURE_SECRET_[A-Za-z0-9_]+/gu) ?? []));
       expect(secrets.size).toBeGreaterThan(0);
       for (const s of secrets) expect(text).not.toContain(s);
-      for (const raw of ["00000000-0000-4000-8000", "gen-1", "fx-claude-main", "fixture-user", "/Users/", "/home/", "acme-api", "fixture-co", "widgets", "fixture-proj", "feat/", SALT, "please add an index"])
+      for (const raw of ["00000000-0000-4000-8000", "gen-1", "fx-claude-main", "fixture-user", "/Users/", "/home/", "acme-api", "fixture-co", "widgets", "fixture-proj", "feat/", SALT, "please add an index",
+        // Path segments outside the closed clear set are hashed (F1).
+        "add_index", "strings", "util", "notebooks", "explore", "guide", "schema", "\"src/a.ts\""])
         expect(text).not.toContain(raw);
       const mapping = readFileSync(mappingPath(out), "utf8");
       for (const s of secrets) expect(mapping).not.toContain(s);
@@ -112,25 +118,70 @@ describe("import cli", () => {
     const base = ["--in", join(FIX, "generic"), "--out", out, "--delete-by", DELETE_BY];
     await expect(main(["--format", "generic", ...base], quiet().io)).rejects.toThrow("exactly one of --salt-stdin");
     // The salt is never taken from argv.
-    await expect(main(["--format", "generic", ...base, "--salt", SALT], quiet().io)).rejects.toThrow("Unknown option '--salt'");
+    await expect(main(["--format", "generic", ...base, "--salt", SALT], quiet().io)).rejects.toThrow("invalid arguments");
     await expect(main(["--format", "otel", ...base, "--salt-file", SALT_FILE], quiet().io)).rejects.toThrow("--format");
     await expect(main(["--format", "generic", ...base, "--salt-file", SALT_FILE, "--org", "../x"], quiet().io)).rejects.toThrow("--org");
     await expect(main(["--format", "generic", ...base, "--salt-file", SALT_FILE, "--token", "x"], quiet().io)).rejects.toThrow();
     expect(existsSync(out)).toBe(false);
   });
 
-  test("refuses --out inside the repository, including through a symlink and a `..`-prefixed directory name", async () => {
-    const q = quiet();
-    await expect(main(args("generic", "generic", join(FIX, "out")), q.io)).rejects.toThrow("inside the repository");
+  test("a mistyped argument, such as a salt pasted as a positional, is never echoed (F5)", async () => {
+    const secret = "pasted-salt-value-0123456789";
+    const base = ["--format", "generic", "--in", join(FIX, "generic"), "--out", join(tmp("si-imp-"), "snap"), "--salt-file", SALT_FILE, "--delete-by", DELETE_BY];
+    for (const argv of [[...base, secret], [...base, `--${secret}`], [...base, "--salt-stdin", secret], [...base.slice(0, -1)]]) {
+      const err = await main(argv, quiet().io).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain("invalid arguments");
+      expect((err as Error).message).not.toContain(secret.slice(0, 10));
+    }
+    // The CLI process prints the same fixed message on stderr.
+    const proc = Bun.spawn([process.execPath, "run", join(REPO, "src", "session-intel", "import", "cli.ts"), "--format", "generic", secret], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "" } });
+    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(code).toBe(1);
+    expect(stderr).toContain("invalid arguments");
+    expect(`${stdout}${stderr}`).not.toContain(secret.slice(0, 10));
+  });
+
+  test("refuses --out inside the repository, through a symlink and as a `..`-prefixed directory name (a temporary repository)", async () => {
+    // The guard is pointed at a throwaway "repository", so a regression can never write into the real one.
+    const repo = tmp("si-imp-fake-repo-");
+    mkdirSync(join(repo, "fixtures"));
+    const q = { ...quiet().io, repoRoot: repo };
+    await expect(main(args("generic", "generic", join(repo, "fixtures", "out")), q)).rejects.toThrow("inside the repository");
     // A directory named "..cache" inside the repository is still inside it.
-    const dotdot = join(REPO, "..si-import-test-out", "snap");
-    await expect(main(args("generic", "generic", dotdot), q.io)).rejects.toThrow("inside the repository");
-    expect(existsSync(join(REPO, "..si-import-test-out"))).toBe(false);
+    await expect(main(args("generic", "generic", join(repo, "..cache", "snap")), q)).rejects.toThrow("inside the repository");
     const link = join(tmp("si-imp-link-"), "into-repo");
-    symlinkSync(join(REPO, "src", "session-intel", "__tests__", "fixtures"), link);
-    await expect(main(args("generic", "generic", join(link, "snap")), q.io)).rejects.toThrow("inside the repository");
-    await expect(main(args("generic", "generic", link), q.io)).rejects.toThrow("inside the repository");
-    expect(existsSync(join(FIX, "..", "snap"))).toBe(false);
+    symlinkSync(join(repo, "fixtures"), link);
+    await expect(main(args("generic", "generic", join(link, "snap")), q)).rejects.toThrow("inside the repository");
+    await expect(main(args("generic", "generic", link), q)).rejects.toThrow("inside the repository");
+    await expect(readSaltFile(join(repo, "salt"), repo)).rejects.toThrow("inside the repository");
+    expect(readdirSync(repo)).toEqual(["fixtures"]);
+    expect(readdirSync(join(repo, "fixtures"))).toEqual([]);
+  });
+
+  test("refuses --in inside --out, and a dangling-symlink --out (into the repository or not)", async () => {
+    const root = tmp("si-imp-");
+    const outer = join(root, "out");
+    mkdirSync(join(outer, "in"), { recursive: true });
+    writeFileSync(join(outer, "in", "events.jsonl"), readFileSync(join(FIX, "generic", "events.jsonl")));
+    await expect(main(["--format", "generic", "--in", join(outer, "in"), "--out", outer, "--salt-file", SALT_FILE, "--delete-by", DELETE_BY], quiet().io)).rejects.toThrow("contain each other");
+    const repo = tmp("si-imp-fake-repo-");
+    for (const target of [join(root, "nowhere"), join(repo, "nowhere")]) {
+      const dangling = join(tmp("si-imp-dangle-"), "snap");
+      symlinkSync(target, dangling);
+      await expect(main(args("generic", "generic", dangling), { ...quiet().io, repoRoot: repo })).rejects.toThrow("not a directory");
+      expect(existsSync(target)).toBe(false);
+      expect(existsSync(mappingPath(dangling))).toBe(false);
+    }
+  });
+
+  test("the mapping is created, never replaced: an earlier reverse map blocks a new import beside it", async () => {
+    const { out } = await runImport("generic", "generic");
+    const before = readFileSync(mappingPath(out), "utf8");
+    rmSync(out, { recursive: true });
+    await expect(main(args("generic", "generic", out), quiet().io)).rejects.toThrow("never replaced");
+    expect(readFileSync(mappingPath(out), "utf8")).toBe(before);
+    expect(existsSync(out)).toBe(false);
   });
 
   test("the shared M0 isInside counts only '..', '..' + sep or an absolute relative path as outside", () => {
