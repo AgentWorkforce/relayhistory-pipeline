@@ -13,8 +13,8 @@ build against. It replaces the unverified payload in `src/coordination-advisor/r
 
 | Step | Owner | Mechanism |
 |---|---|---|
-| Resolve a (harness kind, session id) to an agent | Cloud | `desktop_relay_identities` holds the native session kind and id next to the agent name and address, written by Desktop's identity sync. Relaycast cannot resolve a session. The read path for a service is **not confirmed**; its owner is Khaliq's call |
-| Register the sender | Relaycast | `POST /v1/agents` with the customer workspace's key. There is no separate service-identity path, so whoever holds the workspace key registers it. That needs Khaliq's OK, or the customer's |
+| Resolve a (harness kind, session id) to an agent | Cloud | Cloud's Desktop identity records hold the native session kind and id next to the agent name and address, written by Desktop's identity sync. Relaycast cannot resolve a session. The read path for a service is **not confirmed**; its owner is Khaliq's call |
+| Register the sender | Relaycast | `POST /v1/agents` with the customer workspace's key. There is no separate service-identity path, so whoever holds the workspace key registers it. That needs Khaliq's OK, and for a customer workspace also the customer's |
 | Send | Relaycast | `POST /v1/dm` with the sender's own agent token |
 | Check delivery | Relaycast | `GET /v1/messages/:id/deliveries` with the **sender's own** token (another agent gets `404 message_not_found`); the response is `{message_id, deliveries: [...]}`. It is rate limited like any read, so poll a few times per advisory, never in a tight loop |
 
