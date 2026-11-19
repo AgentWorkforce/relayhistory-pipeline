@@ -10,7 +10,6 @@
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -18,9 +17,9 @@ import { buildPacket, parsePacketKey, parseVerdicts, verdictMarkdown, verdictRep
 import { advisorDetector } from "./detector.ts";
 import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
-import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay } from "./score.ts";
+import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay, writeHeldoutReports } from "./score.ts";
 import { loadSnapshot } from "./snapshot.ts";
-import { writeAtomic, writeNew } from "./util.ts";
+import { writeAtomic } from "./util.ts";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const USAGE = `usage: cli.ts <replay|score|packet|verdicts> [options]; see docs/session-intel-replay.md`;
@@ -124,25 +123,10 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const report = scoreReplay(result, labels, { split, labelsSha256, budgetPer100: budget });
     if (split === "heldout") {
       // Under the ledger lock: the check, then the reports (never overwriting one), then the ledger entry. A
-      // refused repeat writes nothing; a failed report write leaves the hash unspent.
+      // refused repeat writes nothing; a failed report or ledger write leaves no report and the hash unspent.
       await recordHeldoutScoring(out, result, labelsSha256, {
         force: values.force === true, reason: values.reason, now: io.now,
-        beforeRecord: async (forced) => {
-          let base = "report.heldout";
-          if (forced) {
-            let n = 1;
-            while (existsSync(join(out, `report.heldout.forced-${n}.json`)) || existsSync(join(out, `report.heldout.forced-${n}.md`))) n++;
-            base = `report.heldout.forced-${n}`;
-          }
-          await writeNew(join(out, `${base}.json`), json(report));
-          try {
-            await writeNew(join(out, `${base}.md`), scoreMarkdown(report));
-          } catch (err) {
-            // Leave no half-written pair: the hash is unspent, and a retry must find the name free.
-            await rm(join(out, `${base}.json`), { force: true });
-            throw err;
-          }
-        },
+        beforeRecord: async (forced) => (await writeHeldoutReports(out, result, forced, json(report), scoreMarkdown(report))).remove,
       });
     } else {
       // Split-named reports: a dev run never touches the held-out reports, which cannot be recomputed.

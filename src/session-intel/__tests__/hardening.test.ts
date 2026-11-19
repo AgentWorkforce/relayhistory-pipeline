@@ -13,7 +13,7 @@ import { parseReplayResult, replaySnapshot, type ReplayResult } from "../replay/
 import { recordHeldoutScoring, scoreReplay } from "../replay/score.ts";
 import { loadSnapshot, type Snapshot } from "../replay/snapshot.ts";
 import { ReplayView, snapshotCoordinationBackend, snapshotDirectory, type SimClock } from "../replay/views.ts";
-import { at, FIXTURE_DIR, FIXTURE_LABELS, session, tmp, writeSnapshot } from "./helpers.ts";
+import { at, FIXTURE_DIR, FIXTURE_LABELS, heldoutName, session, tmp, writeSnapshot } from "./helpers.ts";
 
 const H = "a".repeat(64);
 const REPO = join(FIXTURE_DIR, "..", "..", "..", "..", "..");
@@ -105,9 +105,9 @@ describe("F3: split-named score reports", () => {
     await main(["replay", "--snapshot", FIXTURE_DIR, "--out", join(out, "r")], io);
     const alerts = join(out, "r", "alerts.json");
     await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "s"), "--split", "heldout"], io);
-    const held = readFileSync(join(out, "s", "report.heldout.json"), "utf8");
+    const held = readFileSync(join(out, "s", heldoutName(alerts)), "utf8");
     await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "s")], io);
-    expect(readFileSync(join(out, "s", "report.heldout.json"), "utf8")).toBe(held);
+    expect(readFileSync(join(out, "s", heldoutName(alerts)), "utf8")).toBe(held);
     expect(JSON.parse(readFileSync(join(out, "s", "report.dev.json"), "utf8")).split).toBe("dev");
   });
 });

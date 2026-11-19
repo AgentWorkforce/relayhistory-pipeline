@@ -13,21 +13,26 @@
  * count against the split, so precision is a lower bound until adjudicated.
  */
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, open, unlink } from "node:fs/promises";
+import { mkdir, open, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { ALERT_CLASSES, alertClassOf, CLASS_MAP_SHA256, classOfHardNegative, classOfIncidentKind, type AlertClass } from "./classes.ts";
 import type { ReplayAlert } from "./detector.ts";
 import type { HardNegative, Incident, Labels, Split } from "./labels.ts";
 import type { ReplayResult } from "./replay.ts";
-import { isoTime, median, pairId, sha256Hex, textCompare, writeAtomic } from "./util.ts";
+import { isoTime, median, pairId, sha256Hex, textCompare, writeAtomic, writeNew } from "./util.ts";
 
 export const DEFAULT_BUDGET_PER_100 = 5;
 export const LEDGER_FILE = "scored-hashes.json";
 export const LEDGER_FORMAT = "session-intel-scored-hashes/1";
 export const SCORE_FORMAT = "session-intel-score/2";
 
-/** sha256 of the scorer's code (score.ts, classes.ts, labels.ts): recorded in every report and ledger entry. */
-export const SCORER_SHA256 = sha256Hex(["./score.ts", "./classes.ts", "./labels.ts"]
+/**
+ * sha256 of the scorer's code (score.ts, classes.ts, labels.ts, and util.ts, whose pair identity, median and
+ * timestamp helpers decide scores): recorded in every report and ledger entry. util.ts also holds the atomic
+ * writers, so an edit to them changes this hash too; that only over-reports a scorer change, never hides one.
+ */
+export const SCORER_SOURCES = ["./score.ts", "./classes.ts", "./labels.ts", "./util.ts"] as const;
+export const SCORER_SHA256 = sha256Hex(SCORER_SOURCES
   .map((f) => sha256Hex(readFileSync(new URL(f, import.meta.url)))).join("\n"));
 
 /** pair-match: the pair only (the M0 behaviour). class-match: the pair and the class. */
@@ -287,6 +292,45 @@ export function assertScorable(result: Pick<ReplayResult, "incomplete">, split: 
     throw new Error(`score: the replay is incomplete (${result.incomplete.join("; ")}); held-out is never scored from an incomplete replay`);
 }
 
+/**
+ * The detector-hash part of a held-out report's name: the first 12 hex of the detector's hash, or, for a
+ * replay of several detectors, of the sha256 of their sorted hashes. A second detector, never scored, can then
+ * be scored into the same --out (and so the same ledger) without a name clash.
+ */
+export function heldoutHash12(result: Pick<ReplayResult, "detectors">): string {
+  const hashes = result.detectors.map((d) => d.hash).sort(textCompare);
+  return (hashes.length === 1 ? hashes[0]! : sha256Hex(hashes.join("\n"))).slice(0, 12);
+}
+
+/**
+ * Writes a held-out report pair, `report.heldout.<hash12>.{json,md}`, or for a forced repeat the first free
+ * `report.heldout.<hash12>.forced-<n>.{json,md}`. Never overwrites a file; a half-written pair is removed. Returns
+ * the base name and a function that removes the pair (run when the ledger entry then cannot be written).
+ */
+export async function writeHeldoutReports(outDir: string, result: Pick<ReplayResult, "detectors">, forced: boolean, json: string, md: string)
+  : Promise<{ base: string; remove: () => Promise<void> }> {
+  let base = `report.heldout.${heldoutHash12(result)}`;
+  if (forced) {
+    let n = 1;
+    while (existsSync(join(outDir, `${base}.forced-${n}.json`)) || existsSync(join(outDir, `${base}.forced-${n}.md`))) n++;
+    base = `${base}.forced-${n}`;
+  }
+  const remove = async () => {
+    await rm(join(outDir, `${base}.json`), { force: true });
+    await rm(join(outDir, `${base}.md`), { force: true });
+  };
+  await writeNew(join(outDir, `${base}.json`), json);
+  try {
+    await writeNew(join(outDir, `${base}.md`), md);
+  } catch (err) {
+    // Leave no half-written pair: the hash is unspent, and a retry must find the name free. Only our own json
+    // is removed: the md that made writeNew fail was not ours.
+    await rm(join(outDir, `${base}.json`), { force: true });
+    throw err;
+  }
+  return { base, remove };
+}
+
 export interface LedgerEntry {
   detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string;
   /** The class map the held-out score used (absent on entries written before class maps). Recorded, never part of the repeat key. */
@@ -353,27 +397,37 @@ export async function withLedgerLock<T>(outDir: string, work: () => Promise<T>):
  * The held-out-once rule, under the ledger lock: refuses (before anything is written) when a detector hash in
  * `result` was already scored on held-out, whatever the class map: re-scoring after a class-map edit is tuning
  * on held-out. `force` lets the repeat through and records it as forced. `beforeRecord` (the report writer)
- * runs after the check and before the entry is written, so a failed report write never burns the hash. Every
+ * runs after the check and before the entry is written, so a failed report write never burns the hash. It may
+ * return a cleanup, run when the ledger write then fails, so no report exists for a score the ledger does not
+ * record (the report pair is removed and the hash stays unspent). The ledger is read inside the lock. Every
  * entry records the detector hash, the class map, the scorer hash, and the reason when given. Dev scoring
  * never touches the ledger.
  */
 export async function recordHeldoutScoring(outDir: string, result: ReplayResult, labelsSha256: string,
-  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string; beforeRecord?: (forced: boolean) => Promise<void> } = {}): Promise<Ledger> {
+  opts: RecordOptions = {}): Promise<Ledger> {
   assertScorable(result, "heldout");
   if (opts.reason !== undefined && (!opts.reason.trim() || opts.reason.length > MAX_FORCE_REASON))
     throw new Error(`score: --reason must be 1..${MAX_FORCE_REASON} characters`);
   return withLedgerLock(outDir, () => recordLocked(outDir, result, labelsSha256, opts));
 }
 
+export interface RecordOptions {
+  force?: boolean; reason?: string; now?: Date; classMapSha256?: string;
+  /** Writes the reports; may return a cleanup that removes them if the ledger write then fails. */
+  beforeRecord?: (forced: boolean) => Promise<void | (() => Promise<void>)>;
+  /** The ledger writer (tests inject a failing one); default the atomic writer. */
+  writeLedger?: (path: string, data: string) => Promise<void>;
+}
+
 async function recordLocked(outDir: string, result: ReplayResult, labelsSha256: string,
-  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string; beforeRecord?: (forced: boolean) => Promise<void> }): Promise<Ledger> {
+  opts: RecordOptions): Promise<Ledger> {
   const classMapSha256 = opts.classMapSha256 ?? CLASS_MAP_SHA256;
   const ledger = readLedger(outDir);
   const done = new Set(ledger.entries.filter((e) => e.split === "heldout").map((e) => e.detectorHash));
   const repeat = result.detectors.filter((d) => done.has(d.hash));
   if (repeat.length && !opts.force)
     throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")}; a detector is scored on held-out once, whatever the class map (--force overrides and is recorded)`);
-  await opts.beforeRecord?.(repeat.length > 0);
+  const cleanup = await opts.beforeRecord?.(repeat.length > 0);
   const scoredAt = (opts.now ?? new Date()).toISOString();
   const next: Ledger = {
     format: LEDGER_FORMAT,
@@ -382,7 +436,16 @@ async function recordLocked(outDir: string, result: ReplayResult, labelsSha256: 
       scorerSha256: SCORER_SHA256, forced: done.has(d.hash), ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
     }))],
   };
-  await writeAtomic(join(outDir, LEDGER_FILE), `${JSON.stringify(next, null, 2)}\n`);
+  try {
+    await (opts.writeLedger ?? writeAtomic)(join(outDir, LEDGER_FILE), `${JSON.stringify(next, null, 2)}\n`);
+  } catch (err) {
+    if (typeof cleanup === "function") {
+      try { await cleanup(); } catch (cleanErr) {
+        throw new Error(`score: the ledger write failed (${(err as Error).message}) and the reports could not be removed (${(cleanErr as Error).message}); remove them by hand, the hash is unspent`);
+      }
+    }
+    throw err;
+  }
   return next;
 }
 

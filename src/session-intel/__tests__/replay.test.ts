@@ -6,7 +6,7 @@ import { main } from "../replay/cli.ts";
 import { advisorDetector, detectorHash, type ReplayDetector } from "../replay/detector.ts";
 import { replaySnapshot } from "../replay/replay.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
-import { at, FIXTURE_DIR, FIXTURE_LABELS, tmp } from "./helpers.ts";
+import { at, FIXTURE_DIR, FIXTURE_LABELS, heldoutName, tmp } from "./helpers.ts";
 
 const EXPECTED = [
   { sentAt: at("09:32"), urgency: "high", kind: "duplicate_work", pair: ["claude:sess-a", "codex:sess-b"], artifact: "number:0042", channel: "dm", alertAt: at("09:31") },
@@ -97,7 +97,7 @@ describe("cli", () => {
     expect(existsSync(join(out, "score", "scored-hashes.json"))).toBe(false);
 
     expect(await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout"], io)).toBe(0);
-    const held = JSON.parse(readFileSync(join(out, "score", "report.heldout.json"), "utf8"));
+    const held = JSON.parse(readFileSync(join(out, "score", heldoutName(alerts)), "utf8"));
     expect(held.detectors[0].pairMatch.total).toMatchObject({ alerts: 1, truePositives: 1, alertPrecision: 1, recall: 1, beforeHarm: 0, afterHarm: 1, medianLeadMs: -16 * 60_000 });
     await expect(main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout"], io)).rejects.toThrow("already scored");
     expect(await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout", "--force"], io)).toBe(0);
