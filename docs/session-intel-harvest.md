@@ -16,7 +16,7 @@ op read 'op://<vault>/<item>/salt' | op run -- bun run src/session-intel/harvest
   --read-api https://<read-api host> --workspace <id> \
   --since <iso> --until <iso> --out <dir outside the repo> \
   --salt-stdin --delete-by <iso, at most 14 days out> \
-  --require-list-backend union,supabase \
+  --require-list-backend union \
   [--org <label>] [--concurrency 2] [--max-requests 20000] [--partial]
 bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/replay
 ```
@@ -32,7 +32,7 @@ bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/rep
 - **`--max-requests`** is 1 to 1,000,000 (default 20000). It caps every request, retries included, across the whole harvest (all runs of one `--out`).
 - **`--partial`**: when the cap is reached, write a snapshot of what was read instead of stopping. Its receipt says `complete: false`.
 
-- **`--require-list-backend <csv>`**: the History API list stores every frame page must have been served by, from `neon`, `supabase`, `union` and `clickhouse` (see Source attribution). **This is the default for every History API harvest**: `union,supabase`. It may be omitted only when `--read-api` is the 96Bulls read API itself. It is bound to the harvest like `--since` and `--until`: a resume with another setting, or with none, is refused.
+- **`--require-list-backend <csv>`**: the History API list stores every frame page must have been served by, from `neon`, `supabase`, `union` and `clickhouse` (see Source attribution). **This is the default for every History API harvest: `--require-list-backend union`.** Only a `union` page is the whole frame (the directory plus Neon). A `supabase`-only page is not, so it is not accepted for the merged-list proof. The flag may be omitted only when `--read-api` is the 96Bulls read API itself. It is bound to the harvest like `--since` and `--until`: a resume with another setting, or with none, is refused.
 
 Exit codes:
 - 0: the snapshot is written;
@@ -44,15 +44,17 @@ Exit codes:
 
 **Source attribution is part of acceptance, not optional.** A History API list page served by `neon` lacks native Claude and Codex sessions: that is the coverage bug this harvest exists to avoid. Every `GET /v1/sessions` page from the History API carries `X-Relayhistory-List-Served-By` (`neon`, `supabase`, `union` or `clickhouse`).
 
-- **Recording.** The harvest records each frame page's value, and the 96Bulls read API's own `X-Sessions-Read-Backend`, separately. Every page counts, including an empty page (zero rows and a cursor) and an empty last page. A missing header is recorded as `missing`. The markers are checked page by page, never inferred from the aggregate header counts. They are persisted in the state log with each page, so a resume keeps them.
+- **Recording.** For each frame page the harvest records three values separately: `X-Relayhistory-List-Served-By`, the 96Bulls read API's own `X-Sessions-Read-Backend`, and `X-Relayhistory-List-Mode`. List-Mode is provenance only and never gates. Every page counts, including an empty page (zero rows and a cursor) and an empty last page. A missing header is recorded as `missing`. The markers are checked page by page, never inferred from the aggregate header counts. They are persisted in the state log with each page, so a resume keeps them.
 - **Gating.** With `--require-list-backend`, any page whose header is missing, unknown or outside the set is offending. The frame is then `complete: false`, with reason `frame_backend_unverified` and the offending page count, and the harvest exits 4. The setting is fixed when the harvest starts. A harvest started record-only can never be resumed as strict and then report itself verified; the resume is refused.
 - **The 96Bulls read API.** It has no list store to name. Its pages carry `X-Sessions-Read-Backend: 96bulls`. Without the flag, a frame in which every page carries that marker is attributed `read_worker`.
 - **Record only.** Without the flag, and without that marker on every page, the tallies are still recorded, but nothing is gated and the attribution is `unverified`. **A record-only run is never accepted as representative proof.** The replay refuses its snapshot unless `--allow-incomplete-coverage` is given, and then the replay is incomplete and never held-out scored. Record-only runs are for exploration.
+- **Parity is a separate check.** A `verified` frame says which store served each page. It does not prove that the frame holds every session. The merged-list proof still requires an **independent canonical-key parity check against the directory**: the frame's `(source, sessionId)` keys compared with the directory's own for the same workspace and window, by a reader other than this harvest. The harvest does not perform that check and cannot replace it.
+- **Server values are data.** Header values and reason codes become keys in the receipt's tallies. They are held in prototype-free counters and Maps, so a value such as `__proto__`, `constructor`, `toString` or `hasOwnProperty` is an ordinary key: it is counted and written like any other, and can never read or write an inherited property.
 
 The receipt carries `sourceAttribution` (`verified`, `read_worker` or `unverified`) and `frame.sources`. `frame.sources` holds:
 - the required set, and whether the frame was gated;
 - the offending page count;
-- per provider, for both headers: the page count, and the first and last page number (1-based).
+- per value, for each of the three headers (`listServedBy`, `readBackend`, `listMode`): the page count, and the first and last page number (1-based).
 
 ## What it reads
 
@@ -90,7 +92,7 @@ It never calls the turns, summary, titles, metadata, digest, search or users rou
 - **The branch of each write.** Events carry no branch, so the session's `catalog.gitBranch` is used.
 - **The session's cwd.** An absolute `filesTouched` path is kept only when it can be anchored at a source root; otherwise it is dropped and counted.
 - **The org id**: see `--org`.
-- **A contract version or readiness field.** The read routes carry none (`/health` answers `{ok: true}` only and is not called). Instead, the receipt records the `X-Sessions-Read-Backend`, `X-Relayhistory-List-Served-By`, `X-Relayhistory-Buffered`, `X-Sessions-Read-Incomplete` and `X-Sessions-Read-Continuation` values it saw. Those of each frame page are recorded per page (see Source attribution).
+- **A contract version or readiness field.** The read routes carry none (`/health` answers `{ok: true}` only and is not called). Instead, the receipt records the `X-Sessions-Read-Backend`, `X-Relayhistory-List-Served-By`, `X-Relayhistory-List-Mode`, `X-Relayhistory-Buffered`, `X-Sessions-Read-Incomplete` and `X-Sessions-Read-Continuation` values it saw. Those of each frame page are recorded per page (see Source attribution).
 
 So a harvested snapshot cannot raise `superseded_work` (it needs reverts) or duplicate-cost evidence (it needs usage). Score those rows as insufficient for a harvested cohort.
 

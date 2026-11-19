@@ -74,6 +74,10 @@ interface ServerOptions {
   readBackend?: string | null;
   /** An empty first page (zero rows and a cursor), and an empty last page (zero rows, no cursor). */
   leadingEmpty?: boolean; trailingEmpty?: boolean;
+  /** X-Relayhistory-List-Mode for the n-th frame page served; null or absent sends none. */
+  listMode?: (page: number) => string | null;
+  /** X-Relayhistory-Buffered on every response. */
+  buffered?: string;
 }
 interface LoggedRequest { path: string; params: URLSearchParams; authorization: string | null }
 
@@ -85,7 +89,8 @@ function fakeReadApi(opts: ServerOptions = {}) {
   const json = (body: unknown, status = 200, headers: Record<string, string> = {}) => Response.json(body, {
     status, headers: {
       "x-relayhistory-workspace-id": opts.workspaceHeader ?? WS,
-      ...(opts.readBackend === null ? {} : { "x-sessions-read-backend": opts.readBackend ?? "96bulls" }), ...headers,
+      ...(opts.readBackend === null ? {} : { "x-sessions-read-backend": opts.readBackend ?? "96bulls" }),
+      ...(opts.buffered === undefined ? {} : { "x-relayhistory-buffered": opts.buffered }), ...headers,
     },
   });
   const server = Bun.serve({
@@ -104,8 +109,12 @@ function fakeReadApi(opts: ServerOptions = {}) {
         expect(url.searchParams.get("limit")).toBe("200");
         const after = url.searchParams.get("lastTsAfter")!, before = url.searchParams.get("firstTsBefore")!;
         const rows = (opts.sessions ?? SESSIONS).filter((s) => s.lastTs >= after && s.firstTs < before).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));
-        const served = opts.servedBy?.(++framePages) ?? null;
-        const listHeader: Record<string, string> = served === null ? {} : { "x-relayhistory-list-served-by": served };
+        const n = ++framePages;
+        const served = opts.servedBy?.(n) ?? null, mode = opts.listMode?.(n) ?? null;
+        const listHeader: Record<string, string> = {
+          ...(served === null ? {} : { "x-relayhistory-list-served-by": served }),
+          ...(mode === null ? {} : { "x-relayhistory-list-mode": mode }),
+        };
         const cursor = url.searchParams.get("cursor");
         if (opts.leadingEmpty && cursor === null) return json({ sessions: [], nextCursor: "0", correlationId: "fx" }, 200, listHeader);
         const offset = Number(cursor ?? "0");
@@ -734,5 +743,64 @@ describe("frame source attribution (X-Relayhistory-List-Served-By)", () => {
     const rq = io();
     await expect(replayMain(["replay", "--snapshot", out, "--out", join(evalDir, "replay")], { out: rq.io.out, err: rq.io.err, now: NOW }))
       .rejects.toThrow("source attribution is unverified");
+  });
+});
+
+describe("server-supplied keys never hit inherited properties", () => {
+  const INHERITED = ["__proto__", "constructor", "toString", "hasOwnProperty"] as const;
+  /** Own entries in order, from the parsed receipt: what was actually written, inherited keys excluded. */
+  const own = (o: object) => Object.entries(o);
+  const pristine = () => {
+    for (const k of ["pages", "firstPage", "lastPage"]) expect(Object.hasOwn(Object.prototype, k)).toBe(false);
+    expect(({} as Record<string, unknown>).pages).toBeUndefined();
+    expect(typeof Object.prototype.toString).toBe("function");
+    expect(typeof Object.prototype.hasOwnProperty).toBe("function");
+  };
+
+  test.each(INHERITED)("%s as served-by, read backend, list mode and buffered value, across a crash and a resume", async (value) => {
+    // Page 1 union, page 2 the key, a crash on page 3, then a resume serving union: three one-row pages.
+    const api = fakeReadApi({
+      sessions: COMPLETE, pageSize: 1, failAfter: 2, servedBy: (n) => (n === 2 ? value : "union"),
+      readBackend: value, listMode: () => value, buffered: value,
+    });
+    const out = newOut();
+    await expect(main(argv(api.url, out, ["--require-list-backend", "union", "--concurrency", "1"]), io().io)).rejects.toThrow("answered 400");
+    pristine();
+    api.opts.failAfter = undefined;
+    expect(await main(argv(api.url, out, ["--require-list-backend", "union", "--concurrency", "1"]), io().io)).toBe(4);
+    pristine();
+    const text = readFileSync(join(out, RECEIPT_FILE), "utf8");
+    const r = JSON.parse(text);
+    expect(r).toMatchObject({ complete: false, incompleteReasons: ["frame_backend_unverified"], sourceAttribution: "unverified" });
+    const s = r.frame.sources;
+    expect(s.offendingPages).toBe(1);
+    expect(own(s.listServedBy)).toEqual([[value, { pages: 1, firstPage: 2, lastPage: 2 }], ["union", { pages: 2, firstPage: 1, lastPage: 3 }]]
+      .sort(([a], [b]) => ((a as string) < (b as string) ? -1 : 1)));
+    expect(own(s.readBackend)).toEqual([[value, { pages: 3, firstPage: 1, lastPage: 3 }]]);
+    expect(own(s.listMode)).toEqual([[value, { pages: 3, firstPage: 1, lastPage: 3 }]]);
+    // The header counts cover every 2xx response across both runs (all but the one failed 400), restored on resume.
+    const headers = r.server.headers;
+    const ok = (h: string) => own(headers[h]);
+    expect(ok("x-sessions-read-backend")).toEqual([[value, api.log.length - 1]]);
+    expect(ok("x-relayhistory-buffered")).toEqual([[value, api.log.length - 1]]);
+    expect(ok("x-relayhistory-list-mode")).toEqual([[value, 3]]);
+    expect(own(r.requests.byRoute).map(([k]) => k)).toEqual(["/v1/sessions", "/v1/sessions/:sessionId/events", "/v1/sessions/output"]);
+    expect(r.requests.partial).toBe(false);
+    // Raw JSON: the key is written like any other key.
+    expect(text).toContain(`"${value}": {`);
+  });
+
+  test.each(INHERITED)("%s as a refusal reason, and a harness named constructor, are ordinary counts", async (value) => {
+    const sessions: FxSession[] = [...COMPLETE,
+      { source: "constructor", sessionId: "fx-h-k", firstTs: at("02", "10:00"), lastTs: at("02", "11:00"), projectId: null, eventsUnsupported: value }];
+    const api = fakeReadApi({ sessions });
+    const out = newOut();
+    expect(await main(argv(api.url, out), io().io)).toBe(0);
+    pristine();
+    const r = receipt(out);
+    expect(own(r.frame.bySource)).toEqual([["claude", 2], ["codex", 1], ["constructor", 1]]);
+    expect(own(r.frame.byDay["2026-11-02"])).toEqual([["claude", 1], ["constructor", 1]]);
+    expect(own(r.facts.sessionsWithoutEvents)).toEqual([[value, 1]]);
+    expect(r.incompleteReasons).toEqual(["events_not_served"]);
   });
 });

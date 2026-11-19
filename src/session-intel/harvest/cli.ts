@@ -5,7 +5,7 @@
  *
  *   op read 'op://<vault>/<item>/salt' | op run -- bun run src/session-intel/harvest/cli.ts \
  *     --read-api <https url> --workspace <id> --since <iso> --until <iso> --out <dir> \
- *     --salt-stdin --delete-by <iso> [--require-list-backend union,supabase] [--org <label>] [--concurrency 2] \
+ *     --salt-stdin --delete-by <iso> [--require-list-backend union] [--org <label>] [--concurrency 2] \
  *     [--max-requests 20000] [--partial]
  *
  * --require-list-backend is the default for a History API harvest: every frame page must say which store
@@ -75,7 +75,7 @@ function listBackends(raw: string | undefined): string[] | null {
   if (raw === undefined) return null;
   const values = [...new Set(raw.split(",").map((v) => v.trim()).filter(Boolean))].sort();
   if (!values.length || values.some((v) => !(LIST_BACKENDS as readonly string[]).includes(v)))
-    throw new HarvestError(`--require-list-backend must be a comma list of ${LIST_BACKENDS.join(", ")} (for example union,supabase)`);
+    throw new HarvestError(`--require-list-backend must be a comma list of ${LIST_BACKENDS.join(", ")} (for example union)`);
   return values;
 }
 const strictIso = (raw: string | undefined, name: string): string => {
