@@ -127,7 +127,11 @@ export interface SessionPipelineInputs {
    * lands and is reviewed (docs/session-desktop-catalog.md); SESSION_DESKTOP_CATALOG_ENABLED stays "0".
    */
   desktopCatalog?: boolean;
-  /** Lambda concurrency cap from the queue (2-10). Default 4. */
+  /**
+   * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
+   * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
+   * 20 means up to 80 connections from this function alone.
+   */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
@@ -314,8 +318,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
-  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
-    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
+  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
+    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
   if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;

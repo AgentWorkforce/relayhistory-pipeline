@@ -231,6 +231,9 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
+    for (const ok of [2, 10, 20]) expect(() => validate(withPipeline({ maxConcurrency: ok }))).not.toThrow(/sessionPipeline/);
+    for (const bad of [1, 21, 4.5, "4", 0, -4, Number.NaN])
+      expect(() => validate(withPipeline({ maxConcurrency: bad }))).toThrow("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
     expect(() => validate(withPipeline([]))).toThrow(/plain object/);
   });

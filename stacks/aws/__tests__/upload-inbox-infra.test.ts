@@ -161,10 +161,14 @@ describe("flag off renders the stack byte-identical", () => {
       if(store.sessionPipeline) res[k].onIssuer=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true}});
       if(store.sessionPipeline) res[k].onIssuerOnly=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true}});
     }
+    res.maxConcurrency20=await render({...base,transcriptStore:{bufferedGcRoleArn:gc,sessionPipeline:{searchIndex:true,maxConcurrency:20}}});
     console.log(JSON.stringify(res));`;
   const result = spawnSync(process.execPath, ["--eval", script], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000 });
   if (result.status !== 0) throw new Error(result.stderr);
-  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; admissionOnly: string; issuerOnly: string; on?: string; onIssuer?: string; onIssuerOnly?: string }>;
+  const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+  const maxConcurrency20 = parsed.maxConcurrency20 as string;
+  delete parsed.maxConcurrency20;
+  const renders = parsed as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; admissionOnly: string; issuerOnly: string; on?: string; onIssuer?: string; onIssuerOnly?: string }>;
   const uploadSids = ["DenyUploadInbox", "UploadInboxOnlyItsRoles", "UploadInboxOnlyEraserOrConsumerDeletes", "DesktopUploadEncryptsInboxViaS3", "UploadAdmissionEncryptsAndReadsViaS3",
     "UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin", "UploadAdmissionReads"];
 
@@ -187,6 +191,16 @@ describe("flag off renders the stack byte-identical", () => {
   it("off: the session-pipeline notification carries only the manifests rule", () => {
     const off = JSON.parse(renders.full!.absent);
     expect(off.ret.sessionPipeline.notification.QueueConfigurations.map((q: any) => q.Id)).toEqual(["96bulls-session-pipeline-manifests"]);
+  });
+
+  it("session-events-mapping: MaximumConcurrency is 4 when maxConcurrency is omitted and carries an input of 20", () => {
+    const mapping = (render: string) => JSON.parse(render).resources.filter((r: any) => r.type === "EventSourceMapping" && r.name === "session-events-mapping");
+    for (const omitted of [renders.full!.absent, renders.noAnalysis!.absent]) {
+      expect(mapping(omitted)).toHaveLength(1);
+      expect(mapping(omitted)[0].props.scalingConfig).toEqual({ MaximumConcurrency: 4 });
+    }
+    expect(mapping(maxConcurrency20)).toHaveLength(1);
+    expect(mapping(maxConcurrency20)[0].props.scalingConfig).toEqual({ MaximumConcurrency: 20 });
   });
 
   it("on: declares exactly the upload resources, and the notification owns both Ids", () => {
