@@ -94,9 +94,10 @@ function conflictMessage(m: AdvisoryMessageInput): string {
   if (ids.length && fits(`Claims: ${ids.join(", ")}`)) lines.push(`Claims: ${ids.join(", ")}`);
   for (const e of (m.excerpts ?? []).slice(0, 4)) {
     const label = clip(e.label, 16);
-    const room = ADVISORY_MESSAGE_MAX - [...lines, `${label}: ""`].join("\n").length;
+    // Marked as quoted peer text: scrub-clean, but another session's words, never the pipeline's.
+    const room = ADVISORY_MESSAGE_MAX - [...lines, `Quoted ${label} claim: ""`].join("\n").length;
     if (room < 24) break;
-    const line = `${label}: "${clip(e.text, Math.min(EXCERPT_MESSAGE_MAX, room))}"`;
+    const line = `Quoted ${label} claim: "${clip(e.text, Math.min(EXCERPT_MESSAGE_MAX, room))}"`;
     if (fits(line)) lines.push(line);
   }
   const text = lines.join("\n");

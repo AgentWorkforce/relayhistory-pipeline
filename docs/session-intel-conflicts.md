@@ -48,6 +48,7 @@ They are deterministic, and they apply whichever judge answers.
 Before the judge, in the input builder:
 
 - **A superseded claim is never used.** It is left out of the input, and citing it gives `none` (`superseded`).
+- **A shared claim is agreement.** A claim with the same `recordId` on both sides (one stored claim whose evidence spans both sessions) is left out of both sides (`shared`), and citing it gives `none`.
 - **A `session`-scope constraint never propagates.** It is left out (`session_scope`). Only `project` and `repo` constraints reach the judge.
 - Claims that name none of the pair's shared topics are left out (`off_topic`).
 - Actions are the visible writes in a shared topic. A commit or an outcome carries no path, so it counts only in the event of such a write (and is then that same action); any other commit or outcome of the side is never an action.
@@ -132,7 +133,7 @@ These are recorded on the alert only. Nothing is sent.
 
 ## Replay parity with the live wiring
 
-`advisorDetector({ conflicts: true })` runs the real `scanOnce` with the conflict rows on. Its replay store answers the 062150 claims reader from the snapshot's claims as of the clock (current claims only), and its `controls` option (every feature ON within the eval, hashed) stands in for M3-1. On the conflict fixture its conflict rows give the same classes, urgencies and times as `conflict-rule`, case by case. Only the fleet case differs, and only in its pair: the live row goes to the orchestrator (`src/session-intel/__tests__/conflict-live-parity.test.ts`). Snapshot claims may carry an optional `topic` slug, as stored claims do; it counts like a path the claim names.
+`advisorDetector({ conflicts: true })` runs the real `scanOnce` with the conflict rows on. Its replay store answers the 062150 claims reader from the snapshot's claims as of the clock (current claims only), and its `controls` option (every feature ON within the eval, hashed) stands in for M3-1. On the conflict fixture its conflict rows give the same classes, urgencies and times as `conflict-rule`, case by case. Only the fleet case differs, and only in its pair: the live row goes to the orchestrator (`src/session-intel/__tests__/conflict-live-parity.test.ts`). Snapshot claims may carry an optional `topic` slug, as stored claims do; it counts like a path the claim names. They may also carry a `recordId`: the replay store then serves one row per record, with evidence for each session that holds it, as relayfacts does.
 
 ## The synthetic fixture
 

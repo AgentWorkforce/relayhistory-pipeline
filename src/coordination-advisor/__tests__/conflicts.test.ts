@@ -75,6 +75,23 @@ describe("the live mapping onto the shared classifier", () => {
   });
 });
 
+describe("a claim shared by both sessions (live)", () => {
+  test("its evidence spans both: agreement, excluded from both sides as shared, never cited", () => {
+    const both = row("c1", "constraint", CV, "owner", { evidence: [
+      { id: 1, source: "claude", session_id: "owner", created_at: at(-60) }, { id: 2, source: "claude", session_id: "actor", created_at: at(-55) },
+    ] });
+    const sessions = liveSessions([cand("owner"), cand("actor")], [lane("actor", [["supabase/migrations/1.sql", -20]])], parseClaimRows([both]), NOW);
+    expect(sessions.map((s) => s.claims.map((c) => c.recordId))).toEqual([["c1"], ["c1"]]);
+    const [c] = conflictCandidates(sessions, NOW).candidates;
+    const built = buildJudgeInput(c!, NOW);
+    expect([...built.excluded.values()]).toEqual(["shared", "shared"]);
+    expect([...built.input.a.claims, ...built.input.b.claims]).toEqual([]);
+    expect(validateCitations(built, { verdict: "constraint_violation", claimIds: ["claude:owner#c1"], actionId: "claude:actor@actor--20" }))
+      .toEqual({ ok: false, reason: "shared" });
+    expect(liveConflictAdvisories("ws", sessions, NOW).advisories).toEqual([]);
+  });
+});
+
 describe("rows per decision", () => {
   const sessions = (scope = "project") => liveSessions([cand("owner"), cand("actor")], [lane("actor", [["supabase/migrations/1.sql", -20]])],
     parseClaimRows([row("c1", "constraint", CV, "owner", { scope })]), NOW);
@@ -102,14 +119,14 @@ describe("merging with the advisor's rows", () => {
   const a = { harness: "claude", sessionId: "a" }, b = { harness: "claude", sessionId: "b" }, c = { harness: "claude", sessionId: "c" };
   const adv = (kind: string, urgency: "high" | "low", lanes: [typeof a, typeof a]): Advisory => ({ advisoryId: kind, urgency, kind, artifact: "x", lanes, evidence: [], alertAt: at(0) });
   const conflict = (kind: ConflictAdvisory["kind"], lanes: [typeof a, typeof a]) => ({ ...adv(kind, "low", lanes), kind, rows: [], claimTexts: [], claimIds: [] }) as ConflictAdvisory;
-  test("a conflict outranks the pair's collision and overlap; other pairs keep theirs; a conflict overlap yields to the advisor", () => {
+  test("a conflict never drops a collision; it drops the pair's LOW overlap; a conflict overlap yields to the advisor", () => {
     const merged = mergeConflicts(
       [adv("concurrent_edit", "high", [a, b]), adv("duplicate_work", "high", [a, c])],
       [adv("nearby_work", "low", [a, b]), adv("similar_summary", "low", [b, c])],
       [conflict("intent_conflict", [a, b]), conflict("overlap", [b, c]), conflict("overlap", [a, { harness: "claude", sessionId: "d" }])],
     );
     expect(merged.map((m) => `${m.kind}:${m.lanes.map((l) => l.sessionId).join("")}`)).toEqual([
-      "duplicate_work:ac", "similar_summary:bc", "intent_conflict:ab", "overlap:ad",
+      "concurrent_edit:ab", "duplicate_work:ac", "similar_summary:bc", "intent_conflict:ab", "overlap:ad",
     ]);
   });
 });
@@ -121,7 +138,7 @@ describe("the conflict template", () => {
     const text = advisoryMessage({ ...base, claimIds: ["c1", "i1"], excerpts: [{ label: "constraint", text: CV }] });
     expect(text).toContain("possible constraint violation.");
     expect(text).toContain("Claims: c1, i1");
-    expect(text).toContain(`constraint: "${CV}"`);
+    expect(text).toContain(`Quoted constraint claim: "${CV}"`);
     for (const over of [
       { excerpts: Array.from({ length: 6 }, () => ({ label: "intent", text: "x".repeat(400) })) },
       { claimIds: Array.from({ length: 8 }, (_, i) => `${"c".repeat(120)}${i}`), excerpts: [{ label: "constraint", text: "y".repeat(500) }] },
@@ -131,7 +148,7 @@ describe("the conflict template", () => {
       const m = advisoryMessage({ ...base, ...over });
       expect(m.length).toBeLessThanOrEqual(ADVISORY_MESSAGE_MAX);
       expect(m.split("\n").every((l) => !l.startsWith("Forged"))).toBe(true);
-      for (const l of m.split("\n").filter((x) => /^(intent|constraint|decision)/.test(x))) expect(l.length).toBeLessThanOrEqual(16 + 4 + 200);
+      for (const l of m.split("\n").filter((x) => x.startsWith("Quoted "))) expect(l.length).toBeLessThanOrEqual("Quoted ".length + 16 + " claim: ".length + 2 + 200);
     }
     for (const kind of ["intent_conflict", "overlap"]) expect(advisoryMessage({ ...base, kind, urgency: "low" }).length).toBeLessThanOrEqual(ADVISORY_MESSAGE_MAX);
     // The read API's message for the same row (no ids, no excerpts) is the same head and lines without the extras.

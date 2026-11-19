@@ -108,7 +108,7 @@ export function liveSessions(candidates: readonly CandidateLane[], facts: readon
       const mine = row.evidence.filter((x) => x.source === e.source && x.sessionId === e.sessionId).map((x) => x.id).filter(Boolean);
       claimsOf.set(k, [...(claimsOf.get(k) ?? []), {
         id: row.id, at: row.observedAt ?? row.createdAt, kind: row.kind, scope: row.scope ?? "session", text: row.statement,
-        confidence: 1, evidenceIds: mine.slice(0, 64), topic: row.topic,
+        confidence: 1, evidenceIds: mine.slice(0, 64), topic: row.topic, recordId: row.id,
       }]);
     }
   }
@@ -216,21 +216,18 @@ export function liveConflictAdvisories(workspaceId: string, sessions: readonly A
 }
 
 /**
- * One tick's advisories for a workspace: a conflict outranks an overlap or a collision for the same pair. A pair
- * with a constraint_violation or intent_conflict this tick gets only the conflict: its collision (HIGH) and its LOW
- * overlap rows (nearby_work, similar_summary) are not written this tick. Writing them too would only start the
- * pair's cooldown first and hold the conflict back. A conflict-detector `overlap` is dropped when the advisor
- * already has a row for the pair.
+ * One tick's advisories for a workspace. A conflict never suppresses a collision: the advisor's HIGH rows (T1, T2,
+ * the 60-minute T3) are always kept, and a pair with both gets both rows (deliver's start-of-tick cooldown lets two
+ * sources through for one pair in one tick). A pair with a constraint_violation or intent_conflict loses its LOW
+ * overlap rows (nearby_work, similar_summary). A conflict-detector `overlap` is dropped when the advisor already has
+ * a row for the pair.
  */
 export function mergeConflicts(high: Advisory[], low: Advisory[], conflicts: ConflictAdvisory[]): Array<Advisory | ConflictAdvisory> {
   const conflictPairs = new Set(conflicts.filter((c) => CONFLICT_CLASSES.has(c.kind)).map((c) => pairKey(c.lanes[0], c.lanes[1])));
-  const outranked = (a: Advisory) => conflictPairs.has(pairKey(a.lanes[0], a.lanes[1]))
-    && (a.urgency === "high" || a.kind === LOW_KIND_NEARBY || a.kind === LOW_KIND_SUMMARY);
-  const keptHigh = high.filter((a) => !outranked(a));
-  const keptLow = low.filter((a) => !outranked(a));
-  const advisorPairs = new Set([...keptHigh, ...keptLow].map((a) => pairKey(a.lanes[0], a.lanes[1])));
+  const keptLow = low.filter((a) => !((a.kind === LOW_KIND_NEARBY || a.kind === LOW_KIND_SUMMARY) && conflictPairs.has(pairKey(a.lanes[0], a.lanes[1]))));
+  const advisorPairs = new Set([...high, ...keptLow].map((a) => pairKey(a.lanes[0], a.lanes[1])));
   const keptConflicts = conflicts.filter((c) => c.kind !== "overlap" || !advisorPairs.has(pairKey(c.lanes[0], c.lanes[1])));
-  return [...keptHigh, ...keptLow, ...keptConflicts];
+  return [...high, ...keptLow, ...keptConflicts];
 }
 
 export const claimsSince = (windowSince: Date) => new Date(windowSince.getTime() - CLAIMS_LOOKBACK_MS);
