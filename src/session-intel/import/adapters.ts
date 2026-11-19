@@ -15,7 +15,14 @@ export const FORMATS: readonly ImportFormat[] = ["claude-code", "codex", "generi
 /** Every session of one import, keyed by harness and the source session id. */
 export class SessionSet {
   readonly byKey = new Map<string, SessionBuilder>();
-  constructor(readonly stats: ImportStats) {}
+  /** `notAfter`: a record stamped after it (the import's clock plus a day of skew) is an outlier, dropped and counted. */
+  constructor(readonly stats: ImportStats, readonly notAfter: string | null = null) {}
+  /** The record's timestamp if it is usable: null (counted) when it is missing, not strict ISO, or in the future. */
+  accept(ts: string | null): string | null {
+    if (!ts) { this.stats.untimedRecords++; return null; }
+    if (this.notAfter && ts > this.notAfter) { this.stats.futureTimestamps++; return null; }
+    return ts;
+  }
   get(harness: ImportHarness, id: string): SessionBuilder {
     const k = `${harness}\u0000${id}`;
     let b = this.byKey.get(k);
@@ -73,8 +80,8 @@ export async function readClaudeCode(file: string, fileIndex: number, set: Sessi
   };
   await readJsonl(file, set.stats, (r, line) => {
     if (!isRecord(r)) { set.stats.malformedLines++; return; }
-    const ts = strictTs(r.timestamp);
-    if (!ts) { set.stats.untimedRecords++; return; }
+    const ts = set.accept(strictTs(r.timestamp));
+    if (!ts) return;
     const at: LineRef = { file: fileIndex, line };
     const sid = cleanId(r.sessionId) ?? fallbackId;
     // A subagent (sidechain) transcript carries its parent's sessionId and its own agentId.
@@ -171,8 +178,8 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     const enveloped = isRecord(r.payload);
     const type = enveloped ? str(r.type) : r.record_type === "state" ? null : "response_item";
     const p = enveloped ? r.payload as Record<string, unknown> : r;
-    const ts = strictTs(r.timestamp) ?? (enveloped ? null : lastTs);
-    if (!ts) { set.stats.untimedRecords++; return; }
+    const ts = set.accept(strictTs(r.timestamp) ?? (enveloped ? null : lastTs));
+    if (!ts) return;
     lastTs = ts;
     b.touch(ts, at);
     if (type === "session_meta" || (!enveloped && typeof r.id === "string" && r.type === undefined)) {
@@ -236,6 +243,8 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
   });
   if (!b.first) return;
   b.sourceId = id ?? /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.exec(stem(file))?.[1] ?? stem(file);
+  // The id is known only now: a session naming itself as its parent is not a fleet.
+  b.parents.delete(b.sourceId);
   set.add(b);
 }
 
@@ -255,6 +264,7 @@ export async function readGeneric(file: string, fileIndex: number, set: SessionS
     const sid = cleanId(r.sessionId);
     const ts = strictTs(r.ts);
     if (!sid || !ts || typeof r.kind !== "string" || !GENERIC_KIND.test(r.kind)) return bad();
+    if (set.notAfter && ts > set.notAfter) { set.stats.futureTimestamps++; return; }
     const opt = (v: unknown, max: number = IMPORT_BOUNDS.id) => v === undefined || v === null ? undefined : cleanId(v, max);
     const project = opt(r.projectId), repo = opt(r.repo, IMPORT_BOUNDS.path), branch = opt(r.branch), cwd = opt(r.cwd, IMPORT_BOUNDS.path);
     const parent = opt(r.parentSessionId), commit = opt(r.commit);

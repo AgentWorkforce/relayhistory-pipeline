@@ -27,29 +27,51 @@ bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/rep
     - its content, trimmed, is not 16 to 1024 characters (at most 4,096 bytes are read).
 
   The salt is never written to the snapshot, the mapping file, stdout, stderr or an error message. Use a new salt for each customer and each import.
-- **`--delete-by`** is required: a strict ISO-8601 time with a zone, after now and at most 30 days out. It goes into the manifest, and the M0 loader refuses the snapshot after it.
-- **`--org` and `--workspace`** set the tenant fields (defaults `org_import` and `ws_import`). They must match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`.
+- **`--delete-by`** is required: a strict ISO-8601 time with a zone, after now and at most 30 days out. It goes into the manifest, and the M0 loader refuses the snapshot after it. **It covers the mapping file too.** The loader cannot enforce that, so the operator deletes both the snapshot directory and `<out>.mapping.json` by that date.
+- **`--org` and `--workspace`** name the tenant (defaults `org_import` and `ws_import`). They must match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`. The snapshot stores them hashed (see Privacy rules); the raw values are only in the mapping file.
 
-On stdout the CLI prints counts only: files, lines, malformed and oversize lines, untimed records, dropped paths, truncated facts, sessions, and facts by kind. It prints no ids, paths or text.
+What the CLI prints:
+- **stdout:**
+  - a line of counts: files, lines, malformed and oversize lines, untimed records, future timestamps, dropped paths, truncated facts, sessions and facts dropped outside the window, sessions, and facts by kind;
+  - a line with the two output paths, the snapshot directory and the mapping file. These are the paths the operator chose with `--out`.
+- **stderr:** a warning when outliers were dropped (see Times below).
+
+It prints no session ids, source paths, salt or text. A bad command line gets a fixed message that never echoes argv, so a salt pasted as an argument by mistake is not printed.
 
 ## Output
 
 - **`<out>/manifest.json` and `<out>/sessions.jsonl`** are the M0 snapshot. `files` holds the sha256 of `sessions.jsonl`. The window runs from the earliest session start to two minutes after the latest activity (one replay tick, so the last fact is visible), and is refused past 120 days. The directory is built under a temporary sibling name and renamed into place, so a reader never sees a partial snapshot. Files are mode 0600.
-- **`<out>.mapping.json`**, beside the snapshot and never inside it, is **private to the customer** and written with mode 0600 (atomically, through a temporary file). It maps each hashed session id to its source session id, source parent ids and source project name, and each event id to its input file (relative to `--in`) and line. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
+- **`<out>.mapping.json`**, beside the snapshot and never inside it, is **private to the customer**. It maps:
+  - each hashed session id to its source session id, source parent ids and source project name;
+  - each hashed path to its repo-relative source path;
+  - each event id to its input file (relative to `--in`) and line;
+  - the hashed tenant back to the raw `--org` and `--workspace`.
+
+  It is written first, with mode 0600, and is create-only: a temporary file hard-linked into place, so it never replaces an earlier reverse map. An import beside an existing mapping file is refused. If the snapshot write then fails, the new mapping is removed, so a snapshot never exists without its map. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
 
 ## Privacy rules
 
 1. **No content.** The snapshot holds only ids, timestamps, repo-relative paths, shas and token counts. Message text, tool inputs (patch bodies, commands, commit messages) and tool outputs are read only to find a path or a sha, and are dropped there. `title`, `userId`, `taskRef` and `shortSummary` are null, and `claims` is empty; M1 fills claims later. Each line is built from explicit fields alone and checked by the M0 loader's own `parseSession`, which refuses unknown fields.
-2. **Opaque ids.** Session ids and parent ids are salted HMAC-SHA256 values with a per-kind domain: `s_` plus 32 hex. Project, repository and branch names are hashed the same way: `p_` and `r_` plus 24 hex, `b_` plus 16 hex. A branch is first put into git's spelling (`refs/heads/` and `origin/` dropped, lowercased), so the detectors' branch comparisons still hold. Event ids are per-session counters (`w1`, `c1`, `o1`, `u1`) and carry nothing from the source. A parent outside the import is still hashed, so its children stay one fleet.
+2. **Opaque ids.** Session ids and parent ids are salted HMAC-SHA256 values with a per-kind domain: `s_` plus 32 hex. Project, repository and branch names are hashed the same way: `p_` and `r_` plus 24 hex, `b_` plus 16 hex. So are the tenant ids from `--org` and `--workspace`: `o_` and `w_` plus 24 hex. A branch is first put into git's spelling (`refs/heads/` and `origin/` dropped, lowercased), so the detectors' branch comparisons still hold. Event ids are per-session counters (`w1`, `c1`, `o1`, `u1`) and carry nothing from the source. A parent outside the import is still hashed, so its children stay one fleet.
 3. **Repo-relative paths.** Backslashes become `/` and repeated slashes collapse. Then:
+   - A path containing `://` is a URL, not a file, and may carry credentials: it is dropped.
    - A path with a `..` or `~` segment is dropped.
-   - An absolute path under the session's cwd loses that prefix.
-   - Any other absolute path is anchored at its first source-root segment, the same set as `decisionTopic` in `src/session-analysis/decision-records.ts` (`src`, `packages`, `apps`, `lib`, `libs`, `services`, `crates`, `cmd`, `internal`, `scripts`, `docs`, `supabase`, `flows`, `test`, `tests`, `e2e`, `infra`), or dropped.
+   - **Home directories.** These spellings are recognized: `/Users/<u>`, `/home/<u>`, `/var/home/<u>`, `/export/home/<u>`, `/mnt/<drive>/Users/<u>`, `C:/Users/<u>` (also written `C:\Users\<u>`), and `/root`.
+   - **When the cwd is a home directory itself,** it is not a checkout. Stripping it would keep home-relative paths (`Documents/`, `Desktop/`, dot-directories). So every path, relative or absolute, must be anchored at a source root, or is dropped.
+   - **Otherwise,** an absolute path under the session's cwd loses that prefix. Any other absolute path is anchored at its first source-root segment, or dropped. The source roots are the same set as `decisionTopic` in `src/session-analysis/decision-records.ts`: `src`, `packages`, `apps`, `lib`, `libs`, `services`, `crates`, `cmd`, `internal`, `scripts`, `docs`, `supabase`, `flows`, `test`, `tests`, `e2e`, `infra`.
    - A result that starts with a drive letter, `Users`, `home` or `root` is dropped.
-   - A result with any segment equal to the user name of a home directory in the path or the cwd (`/Users/<u>`, `/home/<u>`, `C:/Users/<u>`) is dropped.
+   - A result with any segment equal to a home directory's user name, from the path or the cwd, is dropped.
    - A path with control characters is dropped, and so is one longer than 4,096 characters.
 
    No home directory or user name survives. Dropped paths are counted.
+
+   **Every segment is then hashed** with the salt (HMAC-SHA256, 12 hex, after lowercasing, since the detectors compare paths lowercased). Only a closed set stays in clear, so equal paths still match and the detectors still work:
+   - the source roots above, and the migration directory names `migrations`, `migration`, `db` and `migrate`, as directory segments;
+   - the hot-path file names the detectors know, by exact name: `bun.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `cargo.lock`, `poetry.lock`, `composer.lock`, `gemfile.lock`, `_journal.json` and `package.json`;
+   - a file's extension, only when it is 1 to 10 characters of `[a-z0-9]` after lowercasing. Anything else after the last dot, such as `notes.this is a sentence`, `.tar-gz` or an 11-character tail, is hashed with the rest of the name;
+   - in a migration directory, a number prefix that is all digits and at least 3 long, with its `_` or `-` (`0042_`, `20261105062150_`). The rest of the name is hashed, and so is a "prefix" with a non-digit in it.
+
+   Depth is kept. A sentence used as a file name, a key-shaped name, a name with whitespace or `@`, and a patch header holding a sentence all come out hashed. For example, `supabase/migrations/0042_add_index.sql` becomes `supabase/migrations/0042_<12 hex>.sql`, so the duplicate-migration detector still keys on `0042`. The private mapping file maps each hashed path back.
 4. **Projects.** The project key is the repository name: the last segment of the remote URL with `.git` dropped, or else the cwd's basename, lowercased. A home directory itself is never a key. `projectId` and `repo` are hashes of that key, so a Claude Code session in a checkout named `acme-api` and a Codex session whose remote ends in `acme-api` line up. In the generic format an explicit `projectId` becomes the project key, and `repo` the repository key.
 5. **Bounds.** These are the M0 loader's limits:
    - 100,000 sessions;
@@ -60,8 +82,13 @@ On stdout the CLI prints counts only: files, lines, malformed and oversize lines
    - 256 MiB for `sessions.jsonl`;
    - a 120-day window.
 
-   On input: 100,000 files, 2 GiB per file, a 32-level walk, 16 MiB per line, and 5,000,000 facts held across the import. Each file is opened with `O_NOFOLLOW` and checked on the open handle, so a file swapped for a symlink after the walk is refused. An oversize line is skipped without being buffered. A line that is not JSON, or that breaks the format, is skipped and counted. No error message carries line content.
-6. **Times.** Every timestamp must be strict ISO-8601 with a zone, or the record is skipped. `createdAt` and `lastActivityAt` are the earliest and latest timestamped record of the session, so every fact lies between them, as the M0 loader requires.
+   On input: 100,000 files, 2 GiB per file, a 32-level walk, 16 MiB per line, and 5,000,000 facts held across the import. Each file is opened with `O_NOFOLLOW | O_NONBLOCK` and checked on the open handle. A file swapped for a symlink after the walk is refused, and a FIFO is refused at once instead of blocking the import. The walk skips FIFOs and symlinks. An oversize line is skipped without being buffered. A line that is not JSON, or that breaks the format, is skipped and counted. No error message carries line content.
+6. **Times.** `createdAt` and `lastActivityAt` are the earliest and latest timestamped record of the session, so every fact lies between them, as the M0 loader requires. Outlier timestamps are dropped and counted rather than aborting the import:
+   - A timestamp that is not strict ISO-8601 with a zone means the record is skipped.
+   - A record stamped more than a day after the import's clock is dropped.
+   - When the sessions span more than the 120-day window, the import keeps the latest 120 days in which the most sessions end. A session ending outside them is dropped. A session that started before them loses its earlier facts, and its `createdAt` moves to the window start.
+
+   Each of these is counted, and a warning goes to stderr.
 
 ## Formats
 
@@ -124,6 +151,12 @@ The adapters were written from public documentation and general knowledge of the
   - The shell tool names (`shell`, `shell_command`, `exec_command`, `container.exec`) have changed across versions. The `function_call_output` body is sometimes a JSON string `{output, metadata}` and sometimes plain text; both are handled.
 - **The repository root** is not in either trace format; only the cwd is. A session started in a subdirectory of the repository (`<repo>/packages/x`) gets paths relative to that subdirectory and the project key `x`, so it may not line up with a session started at the root.
 - **Git parsing** is a rough tokenizer. A `git commit` quoted inside another command's argument can be miscounted. Commits made outside the agent's shell are not seen.
+
+## Known limits
+
+- **`O_NOFOLLOW`** guards only the last component of a path: of each input file, and of `--salt-file`. A symlinked parent directory is followed. The repository checks on `--out` and `--salt-file` resolve the real path, so a symlink cannot point either into the repository. A symlink under `--in` is skipped by the walk.
+- **`--salt-stdin`** reads until stdin closes. A pipe whose writer never closes it blocks the import. `op read` closes it.
+- **Directories in the path.** Kept-in-clear directory names come only from the fixed lists above. A project's own top-level directory, such as `server/`, is hashed: consistent across sessions, but no longer readable without the mapping file.
 
 ## Follow-ups
 
