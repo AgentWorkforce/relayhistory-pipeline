@@ -296,11 +296,11 @@ export async function stageOutputFactsChunk(
       recordBytes.used += WIDE_TEXT.test(e.b) ? bytes * recordBytes.wideWeight : bytes;
     }
     if (recordBytes.used > recordBytes.cap)
-      throw new PipelineError(
+      throw deterministic(new PipelineError(
         OUTPUT_FACTS_CHUNK_UNSTAGEABLE,
         `staged output facts: run bytes bound: ${recordBytes.counted} record bytes (${Math.ceil(recordBytes.used)} weighted) staged this attempt, bound ${recordBytes.cap} (chunk ${chunk.seq})`,
         false,
-      );
+      ));
   }
   try {
     return await stageEntries(tx, run, entries, chunk);
@@ -316,13 +316,28 @@ const WIDE_TEXT = /[^\u0000-\u00ff]/;
 export const OUTPUT_FACTS_CHUNK_UNSTAGEABLE = "output_facts_chunk_unstageable";
 
 /**
- * A chunk that cannot be staged as sent and will not be on the next attempt either: the database
- * refuses its size (54000 program_limit_exceeded, 54001 statement_too_complex, 53200 out_of_memory),
- * the client cannot build it (a RangeError: string or array length), or it has more items than one
- * call takes. As a non-retryable
- * PipelineError the staged run abandons with OUTPUT_FACTS_CHUNK_UNSTAGEABLE (stagedSearchScope's
- * abandonOn) instead of failing the same chunk on every tick. Anything else (a lost lease, a
- * connection error) is returned as null and rethrown as it is.
+ * The size refusals that will recur for the same source and this process's bounds (54000, 54001, a
+ * RangeError, the send limit, the run's record bytes): marked where they are built, so the G2 fast-fail
+ * (search-index.ts StagedRefusals) caches only these. 53200 out_of_memory abandons the run the same way
+ * but is not marked: the database may have room on the next tick.
+ */
+const deterministicRefusals = new WeakSet<object>();
+function deterministic<E extends object>(error: E): E {
+  deterministicRefusals.add(error);
+  return error;
+}
+/** Whether this abandon reason's error is a refusal that recurs for the same source (see deterministic). */
+export function isDeterministicRefusal(error: unknown): boolean {
+  return typeof error === "object" && error !== null && deterministicRefusals.has(error);
+}
+
+/**
+ * A chunk that cannot be staged as sent: the database refuses its size (54000 program_limit_exceeded,
+ * 54001 statement_too_complex, 53200 out_of_memory), the client cannot build it (a RangeError: string or
+ * array length), or it is over the send limit. As a non-retryable PipelineError the staged run abandons
+ * with OUTPUT_FACTS_CHUNK_UNSTAGEABLE (stagedSearchScope's abandonOn) instead of failing the same chunk on
+ * every tick; all but 53200 are also marked deterministic (cached by the G2 fast-fail). Anything else (a
+ * lost lease, a connection error) is returned as null and rethrown as it is.
  */
 export function unstageable(error: unknown, at: { seq: number; items: number } = { seq: -1, items: -1 }): PipelineError | null {
   const code = (error as { code?: unknown } | null)?.code;
@@ -332,7 +347,8 @@ export function unstageable(error: unknown, at: { seq: number; items: number } =
   // Counts and codes only, never content: which bound (item size), where, and why.
   const why = sized ? `database ${String(code)}` : error instanceof RangeError ? "client RangeError" : `send limit ${stagedFactsSendLimit.bytes} bytes`;
   const where = at.seq < 0 ? "final step" : `chunk ${at.seq}, ${at.items} items`;
-  return new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, `staged output facts: item size bound: ${where}, ${why}`, false);
+  const refusal = new PipelineError(OUTPUT_FACTS_CHUNK_UNSTAGEABLE, `staged output facts: item size bound: ${where}, ${why}`, false);
+  return code === "53200" ? refusal : deterministic(refusal);
 }
 
 /** The want phase ended (onWantDone, in the advance transaction). Returns whether the stage is whole. */
