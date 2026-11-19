@@ -143,14 +143,15 @@ Every event extends the session's time range. A line with a wrong type in any li
 
 ## What I was not sure of
 
-The adapters were written from public documentation and general knowledge of the formats, and tested only on synthetic fixtures. No real transcript was read. These points are unconfirmed:
+The adapters were initially written from public documentation and general knowledge of the formats. A later authorized local native-format audit confirmed the Codex parent field and copied-context boundary below. Tests and committed fixtures remain synthetic; no real transcript is committed. Other format/version limits remain:
 
 - **Claude Code.**
   - Older versions keep subagent (sidechain) records in the parent's file, with no `agentId`. Those records then count as part of the parent session.
   - The `toolUseResult` shape for Bash (`{stdout, stderr}`) may differ between versions.
   - The usage total includes cache reads. A cost-weighted total may need to exclude them.
 - **Codex.**
-  - The subagent parent link is read from `session_meta.payload.source.subagent.thread_spawn.parent_thread_id`. That field path is not confirmed.
+  - The subagent parent link is read from `session_meta.payload.source.subagent.thread_spawn.parent_thread_id`, confirmed in the audited format. A modern child starts with its own metadata, followed by copied parent history whose timestamps have been rewritten to the child's start. When that metadata supplies `agent_path`, facts are suppressed until `thread_settings_applied` names the child's exact thread id and a subsequent native `agent_message` addressed to that exact path carries the `Message Type: NEW_TASK` header. A parent task addressed elsewhere or ordinary message text cannot open the boundary; the encrypted task body is never read. This also keeps copied metadata from replacing the child's cwd. `codexPrefixRecordsDropped` counts discarded pre-task records (including setup), not independently verified duplicate actions.
+  - A child explicitly carrying copied-history metadata but lacking a usable path or matching task boundary contributes no facts after its metadata; `codexChildrenWithoutTaskBoundary` and a CLI warning expose that loss. Legacy children without either marker retain their existing behavior, so this does not establish provenance for every older format.
   - Older rollouts had no `{type, payload}` envelope and no per-line timestamp. Such lines take the last timestamp seen (the session metadata's), so their facts can bunch at the start.
   - The shell tool names (`shell`, `shell_command`, `exec_command`, `container.exec`) have changed across versions. The `function_call_output` body is sometimes a JSON string `{output, metadata}` and sometimes plain text; both are handled.
 - **The repository root** is not in either trace format; only the cwd is. A session started in a subdirectory of the repository (`<repo>/packages/x`) gets paths relative to that subdirectory and the project key `x`, so it may not line up with a session started at the root.

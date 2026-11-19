@@ -212,6 +212,9 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (stats.untimedRecords || stats.futureTimestamps || stats.outOfWindowSessions || stats.outOfWindowFacts || stats.clampedSessions)
     io.err(`import: warning: dropped ${stats.untimedRecords} records without a strict ISO-8601 timestamp and ${stats.futureTimestamps} stamped in the future; `
       + `kept a 120-day window, dropping ${stats.outOfWindowSessions} sessions and ${stats.outOfWindowFacts} facts outside it and clamping ${stats.clampedSessions} sessions to its start`);
+  if (stats.codexPrefixRecordsDropped || stats.codexChildrenWithoutTaskBoundary)
+    io.err(`import: warning: dropped ${stats.codexPrefixRecordsDropped} Codex child prefix records; `
+      + `${stats.codexChildrenWithoutTaskBoundary} children had no verified own task boundary`);
   // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);
