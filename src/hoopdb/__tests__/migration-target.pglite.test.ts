@@ -1078,6 +1078,27 @@ test("real tree: the 062170 workspace-view readers are read-API functions only, 
   expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fns[0]}: `))).toBe(true);
 });
 
+test("real tree: the 062190 priority-first advisories reader is a read-API function only, never a runtime one, and an extra grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const step = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
+  expect(s.split.held).toContain(step);
+  const last = s.split.held.at(-1)!;
+  const tail = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tail.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(step);
+  const fn = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn);
+  for (const role of ["history_rt", "service_role"])
+    expect([role, (await s.db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok]).toEqual([role, false]);
+  expect((await s.db.query<{ ok: boolean }>("SELECT has_function_privilege('bulls96_read_api', $1, 'EXECUTE') ok", [fn])).rows[0]!.ok).toBe(true);
+  await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO service_role`);
+  expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+});
+
 test("real tree: the live gate excuses only absent signatures a held, unledgered step creates", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);
