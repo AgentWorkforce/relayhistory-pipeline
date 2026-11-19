@@ -38,6 +38,8 @@ const SUMMARY_INPUT_FIELDS = [
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
 export const ALLOWED_LOG_FIELDS = new Set([
+  // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).
+  "cached_refusal",
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
   "tenant_id", "org_id", "workspace_id", "machine_id", "harness", "session_id",

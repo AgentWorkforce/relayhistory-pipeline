@@ -77,6 +77,7 @@ import {
   clickhouseOutputFactsStore,
   finishStagedOutputFacts,
   MAX_FACTS_CHUNK_INPUTS,
+  OUTPUT_FACTS_CHUNK_UNSTAGEABLE,
   sealOutputFactsWant,
   stageOutputFactsChunk,
   type OutputFactsStore,
@@ -201,6 +202,11 @@ export interface StagedReconcile {
   run?: Partial<Pick<StagedReconcileDeps, "leaseMs" | "stageBatch" | "scanPage" | "writeKeys" | "deletePage" | "boundary" | "factsChunk" | "hooks" | "releaseOnError" | "heartbeatMs" | "attemptsCap">>;
   /** Tests only: the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP in production). */
   factsRecordBytesCap?: number;
+  /**
+   * This indexer instance's cached size refusals (StagedRefusals): searchIndexStagedStartup gives each
+   * start a fresh one. Absent: one per StagedReconcile object.
+   */
+  refusals?: StagedRefusals;
 }
 
 /**
@@ -763,7 +769,7 @@ const STAGED_BUDGETS = new Set<string>([STREAM_READ_BYTES_BUDGET, STREAM_READ_EV
  *   staged_run_interrupted  a step failed after the claim (logged: class and code); lease released
  */
 async function stagedSearchScopeRun(
-  scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff, seen: { attempts?: number },
+  scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff, seen: { attempts?: number; cachedRefusal?: boolean },
 ): Promise<SearchIndexResult> {
   const binding = deps.adapter!;
   const budget = deps.stream!;
@@ -870,6 +876,18 @@ async function stagedSearchScopeRun(
   const factsHooks = deps.outputFactsStore
     ? stagedOutputFactsHooks(scope, canonicalId, h, staged.factsRecordBytesCap ?? STAGED_FACTS_RECORD_BYTES_CAP, (r) => (facts = r))
     : undefined;
+  // A size refusal this instance saw for the same source stamp: skip the claim and the source read (G2
+  // fast-fail; StagedRefusals). The earlier run's claim already recorded the search and facts state
+  // owing, so owing() answers as that abandon did.
+  const refusals = stagedRefusalsOf(staged);
+  const refusalKey = stagedRefusalKey(scope, canonicalId);
+  const refusalStamp = stagedRefusalStamp(h.stamp);
+  const nowMs = (deps.now?.() ?? new Date()).getTime();
+  const refused = refusals.hit(refusalKey, refusalStamp, nowMs);
+  if (refused !== null) {
+    seen.cachedRefusal = true;
+    return owing([refused], false);
+  }
   let outcome: Awaited<ReturnType<typeof runStagedReconcile>>;
   try {
     outcome = await runStagedReconcile(scope, h.stamp, ops, {
@@ -924,12 +942,16 @@ async function stagedSearchScopeRun(
         return owing(r.reasons.length ? r.reasons : ["canonical_metadata_incomplete"], r.partial);
       }
       if (reason && STAGED_BUDGETS.has(reason)) return owing(["scope_too_large", reason], true);
+      // A deterministic size refusal (a chunk, or the run's record bytes): the next pass of the same
+      // source skips the claim and the read until it expires (StagedRefusals).
+      if (reason === OUTPUT_FACTS_CHUNK_UNSTAGEABLE) refusals.set(refusalKey, refusalStamp, reason, nowMs);
       return owing(outcome.reasons, false);
     }
     case "failed":
       // Past the attempts cap: abandoned before any read; owing, and retried every Nth claim only.
       return owing([STAGED_RUN_FAILED], false);
     case "done":
+      refusals.clear(refusalKey);
       return {
         manifests: h.manifests,
         rows: read?.inWindow ?? 0,
@@ -966,7 +988,7 @@ function stagedOutcome(r: SearchIndexResult): "done" | "busy" | "restart" | "fai
  */
 async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits, h: StagedHandoff): Promise<SearchIndexResult> {
   const started = Date.now();
-  const seen: { attempts?: number } = {};
+  const seen: { attempts?: number; cachedRefusal?: boolean } = {};
   const scopeFields = { stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId };
   let out: SearchIndexResult;
   try {
@@ -982,10 +1004,60 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
   log[outcome === "incomplete" || outcome === "failed" ? "warn" : "info"]("search index staged run", {
     ...scopeFields,
     outcome, ...(out.reasons[0] ? { reason: out.reasons[0] } : {}), ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }),
+    ...(seen.cachedRefusal ? { cached_refusal: true } : {}),
     count: out.rows, inserted: out.inserted, deleted: out.deleted, duration_ms: Date.now() - started,
   });
   return out;
 }
+
+/** How long a cached size refusal holds before the scope is claimed and run again (StagedRefusals). */
+export const STAGED_REFUSAL_TTL_MS = 24 * 60 * 60 * 1000;
+/** The most scopes one instance keeps a size refusal for; past it the oldest entry goes (it then costs one more pass). */
+export const STAGED_REFUSAL_MAX_ENTRIES = 10_000;
+
+/**
+ * The G2 fast-fail: per indexer instance (in memory, lost on restart, each replica its own), the scopes
+ * whose staged run was abandoned as output_facts_chunk_unstageable, with the source stamp it ran on. A
+ * later pass of the same scope and stamp skips the claim and the source read and answers as that abandon
+ * did, until the entry is STAGED_REFUSAL_TTL_MS old (a hedge against a refusal that was not deterministic:
+ * a finished session never changes its stamp) or the stamp changes. A finished run clears the scope's
+ * entry. Not durable on purpose: the refusal depends on this process's bounds, so a restart or an
+ * upgrade that raises them retries by itself.
+ */
+export class StagedRefusals {
+  private readonly entries = new Map<string, { stamp: string; reason: string; at: number }>();
+  constructor(readonly maxEntries = STAGED_REFUSAL_MAX_ENTRIES, readonly ttlMs = STAGED_REFUSAL_TTL_MS) {}
+  /** The cached reason for this scope and stamp, or null (no entry, another stamp, or expired: then dropped). */
+  hit(key: string, stamp: string, now: number): string | null {
+    const e = this.entries.get(key);
+    if (!e) return null;
+    if (e.stamp !== stamp || now - e.at >= this.ttlMs) {
+      this.entries.delete(key);
+      return null;
+    }
+    return e.reason;
+  }
+  set(key: string, stamp: string, reason: string, now: number): void {
+    this.entries.delete(key);
+    while (this.entries.size >= this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
+    this.entries.set(key, { stamp, reason, at: now });
+  }
+  clear(key: string): void {
+    this.entries.delete(key);
+  }
+  get size(): number {
+    return this.entries.size;
+  }
+}
+const stagedRefusalsByStaged = new WeakMap<StagedReconcile, StagedRefusals>();
+function stagedRefusalsOf(staged: StagedReconcile): StagedRefusals {
+  if (staged.refusals) return staged.refusals;
+  let r = stagedRefusalsByStaged.get(staged);
+  if (!r) stagedRefusalsByStaged.set(staged, (r = new StagedRefusals()));
+  return r;
+}
+const stagedRefusalKey = (scope: SessionScope, canonicalId: string) => JSON.stringify([scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, canonicalId]);
+const stagedRefusalStamp = (stamp: SourceStamp) => JSON.stringify([stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint]);
 
 /** Inputs per facts chunk of a staged run (the module's default; clamped to MAX_FACTS_CHUNK_INPUTS). */
 export const STAGED_FACTS_CHUNK = 5000;
@@ -1494,7 +1566,7 @@ export function searchIndexStagedStartup(
   if (!stream)
     throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)");
   return {
-    staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP },
+    staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: new StagedRefusals() },
     notice: {
       level: "info",
       // Allowlisted log fields only (src/shared/log.ts): the cap is a constant, so it rides in the message.

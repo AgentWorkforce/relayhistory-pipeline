@@ -728,6 +728,13 @@ With it on:
   as a staged run (migration 20261105062110, required at startup), see "Staged reconcile (Phase 3), staged runs"
   in docs/local-stack.md, with its own reason codes (`staged_run_leased`, `staged_run_interrupted`,
   `staged_lease_lost`, `output_facts_stage_incomplete`, `staged_run_failed`).
+- **Cached size refusals.** A staged run abandoned as `output_facts_chunk_unstageable` (a facts chunk, or the run's
+  record bytes, over its bound) is remembered by the consumer process for that scope and source stamp: the next
+  passes of the same, unchanged source skip the claim and the source read and answer the same way (the scope stays
+  partial and its facts state owing; the summary line carries `cached_refusal`). It is held in memory per process:
+  lost on restart (one more full pass), each replica keeps its own, at most 10000 scopes (the oldest goes first).
+  An entry lasts 24 hours, then the scope is claimed and run again; a new upload (a new stamp) or a finished run
+  ends it at once. No setting; the attempts cap (`staged_run_failed`) stays the backstop.
 
 What it does not change yet: at the default settings (`SEARCH_INDEX_MAX_ROWS` = the cap = 500000) the paged scan
 reads no more index rows than the bounded scan did; only the reason code past that point changes. A
