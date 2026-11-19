@@ -90,6 +90,37 @@ export interface Snapshot {
   /** sha256 of manifest.json's bytes: it pins every file through their hashes. */
   manifestSha256: string;
   sessions: SnapshotSession[];
+  /** The other listed files (the harvest's coverage.json), as the loader verified them against the manifest. */
+  extraFiles?: Record<string, string>;
+}
+
+/** The harvest's coverage receipt (docs/session-intel-harvest.md). */
+export const COVERAGE_FILE = "coverage.json";
+const REASON_CODE = /^[a-z0-9_]{1,64}$/u;
+
+/**
+ * The coverage gap a snapshot declares, as one incomplete-replay reason, or null when it declares none.
+ * A snapshot without a coverage receipt (an import, a fixture) declares none. A receipt that is not
+ * `complete: true`, or cannot be read, is a gap: the replay refuses it unless told otherwise, and then
+ * carries the reason in ReplayResult.incomplete, so held-out scoring refuses it.
+ */
+export function coverageGap(snapshot: Pick<Snapshot, "extraFiles">): string | null {
+  const text = snapshot.extraFiles?.[COVERAGE_FILE];
+  if (text === undefined) return null;
+  let receipt: unknown;
+  try { receipt = JSON.parse(text); } catch { return "coverage: the coverage receipt is not valid JSON"; }
+  if (!isRecord(receipt)) return "coverage: the coverage receipt is not an object";
+  if (receipt.complete === true) {
+    // A record-only harvest is complete but not representative: only a verified History API frame or the
+    // 96Bulls read API's own marker on every page is. A receipt without the field predates it: unverified.
+    const a = receipt.sourceAttribution;
+    if (a === "verified" || a === "read_worker") return null;
+    return "coverage: the harvest's source attribution is unverified (no --require-list-backend, and not every frame page carried the read API's marker)";
+  }
+  const reasons = Array.isArray(receipt.incompleteReasons)
+    ? receipt.incompleteReasons.filter((x): x is string => typeof x === "string" && REASON_CODE.test(x))
+    : [];
+  return `coverage: the harvest's coverage receipt says complete:false (${reasons.length ? reasons.join(", ") : "no reason given"})`;
 }
 
 export class SnapshotError extends Error {
@@ -315,5 +346,7 @@ export async function loadSnapshot(dir: string, opts: LoadOptions = {}): Promise
     sessions.push(s);
   }
   sessions.sort((a, b) => textCompare(a.harness, b.harness) || textCompare(a.sessionId, b.sessionId));
-  return { dir, manifest, manifestSha256: sha256Hex(manifestBytes), sessions };
+  const extraFiles: Record<string, string> = {};
+  for (const [name, buf] of contents) if (name !== SESSIONS_FILE) extraFiles[name] = buf.toString("utf8");
+  return { dir, manifest, manifestSha256: sha256Hex(manifestBytes), sessions, extraFiles };
 }

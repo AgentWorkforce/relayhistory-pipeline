@@ -8,7 +8,7 @@
 import { createReadStream } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { HarvestError, RequestCapReached, type ClientStats, type ReadApiClient } from "./client.ts";
+import { HarvestError, LIST_SERVED_BY_HEADER, READ_BACKEND_HEADER, RequestCapReached, type ClientStats, type ReadApiClient } from "./client.ts";
 import { IMPORT_BOUNDS, projectKey, repoRelativePath } from "../import/normalize.ts";
 import { isoTime } from "../replay/util.ts";
 
@@ -27,7 +27,50 @@ const HARNESS = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const KIND = /^[A-Za-z0-9_.:-]{1,64}$/u;
 const MAX_ID = IMPORT_BOUNDS.id;
 
-export interface HarvestParams { readApi: string; workspace: string; since: string; until: string; deleteBy: string }
+export interface HarvestParams {
+  readApi: string; workspace: string; since: string; until: string; deleteBy: string;
+  /**
+   * --require-list-backend, sorted, or null (record only). Resume-bound: stored at the start and compared on
+   * every resume, so a record-only harvest can never be resumed as strict and then report verified.
+   */
+  requireListBackend: string[] | null;
+}
+
+/** Which source attribution a frame earned (docs/session-intel-harvest.md, "Source attribution"). */
+export type Attribution = "verified" | "read_worker" | "unverified";
+
+/** One provider's tally over the frame pages: how many, and the first and last page number (1-based). */
+interface Tally { pages: number; firstPage: number; lastPage: number }
+const tally = (values: string[]) => {
+  const out: Record<string, Tally> = {};
+  values.forEach((v, i) => {
+    const t = (out[v] ??= { pages: 0, firstPage: i + 1, lastPage: i + 1 });
+    t.pages++;
+    t.lastPage = i + 1;
+  });
+  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+};
+
+/**
+ * The frame's source attribution, checked page by page (empty pages included). With --require-list-backend,
+ * any page whose X-Relayhistory-List-Served-By is missing, unknown or outside the set is offending, and the
+ * frame is unverified. Without it, nothing is gated; the frame is `read_worker` only when every page carries
+ * the 96Bulls read API's own marker (X-Sessions-Read-Backend: 96bulls), and otherwise unverified.
+ */
+export function frameAttribution(pages: PageSource[], required: string[] | null) {
+  const offendingPages = required === null ? 0 : pages.filter((p) => !required.includes(p.listServedBy)).length;
+  const attribution: Attribution = required !== null
+    ? (offendingPages === 0 && pages.length > 0 ? "verified" : "unverified")
+    : (pages.length > 0 && pages.every((p) => p.readBackend === "96bulls") ? "read_worker" : "unverified");
+  return {
+    attribution,
+    required,
+    gated: required !== null,
+    offendingPages,
+    listServedBy: tally(pages.map((p) => p.listServedBy)),
+    readBackend: tally(pages.map((p) => p.readBackend)),
+  };
+}
 
 /** One directory row, reduced to what the snapshot needs. Raw ids: this lives only in the 0600 state and the mapping. */
 export interface FrameRow {
@@ -68,6 +111,8 @@ export interface FactsRecord {
   droppedWrites: number | null;
 }
 export type OutputCounts = { counts: Record<string, number> } | { unavailable: string };
+export interface PageSource { listServedBy: string; readBackend: string }
+export const MISSING = "missing";
 
 export interface HarvestState {
   params: HarvestParams;
@@ -78,7 +123,11 @@ export interface HarvestState {
   stats: ClientStats | null;
   /** Set when a run ended without recording its final counts (a hard crash): the counts are lower bounds. */
   statsPartial: string | null;
-  frame: { pages: number; cursor: string | null; done: boolean; rows: FrameRow[]; duplicates: number; outsideWindow: number };
+  frame: {
+    pages: number; cursor: string | null; done: boolean; rows: FrameRow[]; duplicates: number; outsideWindow: number;
+    /** Per frame page, in order: which store served it (X-Relayhistory-List-Served-By) and the read API's own marker (X-Sessions-Read-Backend); `missing` when absent. */
+    pageSources: PageSource[];
+  };
   facts: Map<string, FactsRecord>;
   output: OutputCounts | null;
 }
@@ -143,6 +192,12 @@ export async function readState(path: string): Promise<HarvestState & { goodByte
       state.frame.done = l.cursor === null;
       state.frame.duplicates += Number(l.duplicates ?? 0);
       state.frame.outsideWindow += Number(l.outsideWindow ?? 0);
+      // A page line without its markers (never written so by this version) counts as missing, never as verified.
+      const s = isRecord(l.source) ? l.source : {};
+      state.frame.pageSources.push({
+        listServedBy: typeof s.listServedBy === "string" ? s.listServedBy : MISSING,
+        readBackend: typeof s.readBackend === "string" ? s.readBackend : MISSING,
+      });
       for (const r of l.rows as FrameRow[]) if (!seen.has(rowKey(r))) { seen.add(rowKey(r)); state.frame.rows.push(r); }
     } else if (l.t === "facts") {
       const f = l.record as FactsRecord;
@@ -161,7 +216,7 @@ export const progress = (client: ReadApiClient) => ({ requests: client.stats.req
 
 export const newState = (params: HarvestParams, startedAt: string): HarvestState => ({
   params, startedAt, runs: 0, requests: 0, stats: null, statsPartial: null,
-  frame: { pages: 0, cursor: null, done: false, rows: [], duplicates: 0, outsideWindow: 0 }, facts: new Map(), output: null,
+  frame: { pages: 0, cursor: null, done: false, rows: [], duplicates: 0, outsideWindow: 0, pageSources: [] }, facts: new Map(), output: null,
 });
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -235,7 +290,11 @@ export async function runFrame({ client, state, log }: RunOptions): Promise<void
     state.frame.done = body.nextCursor === null;
     state.frame.duplicates += duplicates;
     state.frame.outsideWindow += outsideWindow;
-    await log.write({ t: "frame", cursor: state.frame.cursor, rows, duplicates, outsideWindow, ...progress(client) });
+    // Every page, an empty one included, records its own markers: attribution is checked per page, never
+    // inferred from the aggregate header counts.
+    const source: PageSource = { listServedBy: a.headers[LIST_SERVED_BY_HEADER] ?? MISSING, readBackend: a.headers[READ_BACKEND_HEADER] ?? MISSING };
+    state.frame.pageSources.push(source);
+    await log.write({ t: "frame", cursor: state.frame.cursor, rows, duplicates, outsideWindow, source, ...progress(client) });
   }
 }
 
@@ -372,6 +431,8 @@ export interface ReceiptInput {
   workspaceHash: string;
   complete: boolean;
   notes: string[];
+  /** Machine-readable codes for every reason `complete` is false (empty when complete). */
+  incompleteReasons: string[];
   /** Per session: the clamped first activity (for the per-day counts). */
   createdAt: Map<string, string>;
   snapshot: { sessions: number; writes: number; droppedPaths: number; oversizeSessions: number };
@@ -401,6 +462,9 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
   return {
     format: RECEIPT_FORMAT,
     complete: r.complete,
+    incompleteReasons: r.incompleteReasons,
+    // Part of acceptance: only `verified` (History API, --require-list-backend) or `read_worker` is representative proof.
+    sourceAttribution: frameAttribution(state.frame.pageSources, state.params.requireListBackend).attribution,
     workspaceId: r.workspaceHash,
     window: { since: state.params.since, until: state.params.until },
     startedAt: state.startedAt,
@@ -423,6 +487,7 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
       duplicateRows: state.frame.duplicates,
       rowsOutsideWindow: state.frame.outsideWindow,
       sessionsWithoutCatalog: withoutCatalog,
+      sources: frameAttribution(state.frame.pageSources, state.params.requireListBackend),
     },
     facts: {
       route: "/v1/sessions/:sessionId/events",
