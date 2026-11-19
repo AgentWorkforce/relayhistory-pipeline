@@ -48,9 +48,11 @@ function client(db: PGlite): MigrationClient {
 }
 const code = async (p: Promise<unknown>) =>
   ((await p.then(() => null, (e: unknown) => e)) as { code?: string } | null)?.code ?? null;
-/** 20261105062160 (session intel controls) sits above this step: its down runs first. */
+/** 20261105062160 (session intel controls) and 20261105062170 (session intel workspace readers) sit above this step: their downs run first, 062170 first. */
 const LATER_STEP = "upstream:20261105062160_session_intel_controls.sql";
 const LATER_DOWN = sqlFile("supabase/rollbacks/20261105062160_session_intel_controls.down.sql");
+const TOP_STEP = "upstream:20261105062170_session_intel_workspace.sql";
+const TOP_DOWN = sqlFile("supabase/rollbacks/20261105062170_session_intel_workspace.down.sql");
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await runMigrations(client(db), { profile: LOCAL });
@@ -432,8 +434,12 @@ describe("20261105062150 rollback", () => {
     const { decide, claim } = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      // 20261105062160 (session intel controls) is the only later step; it comes off first, and this down refuses under it.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP]);
+      // 20261105062160 (session intel controls) and 20261105062170 (session intel workspace readers) are the later steps;
+      // they come off first (062170, then 062160), and this down refuses under either.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP]);
+      expect(await message(DOWN)).toContain("a later migration is applied");
+      expect(await message(LATER_DOWN)).toContain("a later migration is applied");
+      await db.exec(TOP_DOWN);
       expect(await message(DOWN)).toContain("a later migration is applied");
       await db.exec(LATER_DOWN);
       expect(await message(read("supabase/rollbacks/20261105062140_staged_output_facts.down.sql"))).toContain("a later migration is applied");
@@ -468,6 +474,7 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
+      await db.exec(TOP_DOWN);
       await db.exec(LATER_DOWN);
       await db.exec(DOWN);
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);

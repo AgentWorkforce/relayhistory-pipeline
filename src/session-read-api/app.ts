@@ -58,7 +58,10 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *   GET /v1/coordination/overlaps   deterministic overlap findings from those same facts, off
  *                                   unless READ_API_COORDINATION_OVERLAPS_ENABLED=true, same
  *                                   auth, workspace/project scope, readiness and allowlist.
- *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
+ *   GET /v1/session-intel/workspace the Session Intelligence workspace view (alerts, status,
+ *                                   handoffs, coverage), off unless READ_API_SESSION_INTEL_ENABLED
+ *                                   =true (501 `session_intel_disabled`); the advisories' auth and canary.
+ *   GET /v1/sessions/titles        cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
  *                                   "*" = all): 501 `brief_titles_workspace_not_enabled`, and 501
@@ -99,6 +102,7 @@ import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { ADVISORIES_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
+import { SessionIntelUnsupported, workspaceView, type SessionIntelSource } from "./session-intel-workspace.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import {
@@ -305,6 +309,13 @@ export interface ReadApiDeps {
    * `advisories_disabled`, and nothing is read or written.
    */
   coordinationAdvisories?: { enabled: boolean; source: AdvisoriesSource };
+  /**
+   * READ_API_SESSION_INTEL_ENABLED=true (session-intel-workspace.ts): GET /v1/session-intel/workspace, the
+   * workspace's Session Intelligence view (contract session-intel-workspace/1), with `directory`. Absent or not
+   * enabled: the standard 501 `unsupported_by_backend` envelope with reason `session_intel_disabled`, and nothing
+   * is read.
+   */
+  sessionIntel?: { enabled: boolean; source: SessionIntelSource };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -2150,6 +2161,38 @@ export function createReadApi(deps: ReadApiDeps) {
         return fail(c, error);
       }
     });
+
+  /**
+   * Session Intelligence, the workspace view (docs/session-intel-workspace-api.md): open advisories, active
+   * sessions with their current intents, and recent handoffs, with a coverage object. Auth and scope as the
+   * advisories GET: the workspace attested from the token, the `coordination` canary, no other parameter. A
+   * failed claims read degrades the view (the coverage says so); every other failure fails it.
+   */
+  app.get("/v1/session-intel/workspace", async (c) => {
+    const intel = deps.sessionIntel;
+    if (intel?.enabled !== true) return fail(c, unsupported("session_intel_disabled"));
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "coordination");
+      rejectUnsupported(c);
+      for (const name of Object.keys(c.req.query())) if (name !== "workspace") throw unsupported(`param_${name}`);
+      const correlationId = c.get("correlationId");
+      const view = await workspaceView({
+        orgId: identity.orgId, workspaceId: identity.workspaceId, now: Date.now(), source: intel.source, directory: deps.directory,
+        log: (fields) => log({ route: c.req.routePath, ...fields, correlation_id: correlationId }),
+      });
+      // Counts only, never an id or a title.
+      log({
+        route: c.req.routePath, reason: "session_intel_served", alerts: view.alerts.length, status_sessions: view.status.length,
+        handoffs: view.handoffs.length, claims_available: view.coverage.sessionsWithClaims !== null, correlation_id: correlationId,
+      });
+      return c.json(view);
+    } catch (error) {
+      if (error instanceof SessionIntelUnsupported) return fail(c, unsupported(error.reason));
+      return directoryFail(c, error);
+    }
+  });
 
   // Babysitter evidence (Neon GET /v1/delivery/records parity for session_lineage /
   // turn_receipt; babysitter-evidence.ts). Tenant from the verified identity, as Neon's

@@ -228,3 +228,33 @@ describe("relayfacts flag (READ_API_RELAYFACTS_ENABLED)", () => {
     }
   });
 });
+
+describe("session intelligence workspace wiring (READ_API_SESSION_INTEL_ENABLED)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("neither entry wires it unless the flag is exactly \"true\"; on, both wire the SQL source", async () => {
+    for (const value of [undefined, "", "1", "TRUE", "yes", " true"]) {
+      const env = value === undefined ? {} : { READ_API_SESSION_INTEL_ENABLED: value };
+      for (const built of [await buildLambda(env), await build({ ...ENV, ...env })]) {
+        try {
+          expect([value, built.deps.sessionIntel]).toEqual([value, undefined]);
+        } finally {
+          await built.close();
+        }
+      }
+    }
+    for (const built of [await buildLambda({ READ_API_SESSION_INTEL_ENABLED: "true" }), await build({ ...ENV, READ_API_SESSION_INTEL_ENABLED: "true" })]) {
+      try {
+        expect(built.deps.sessionIntel?.enabled).toBe(true);
+        expect(typeof built.deps.sessionIntel?.source.alerts).toBe("function");
+        expect(typeof built.deps.sessionIntel?.source.claims).toBe("function");
+      } finally {
+        await built.close();
+      }
+    }
+  });
+});
