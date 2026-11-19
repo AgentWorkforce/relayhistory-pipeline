@@ -470,6 +470,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
   if (deps.outputFacts && deps.outputFactsStore) throw new Error("output facts: choose the ClickHouse or the Postgres store, not both");
   if (deps.outputFacts && deps.staged) throw new Error("output facts: the staged reconcile stages the Postgres store's facts only");
+  // The skip checks the facts state only for the ClickHouse facts (outputFactsComplete); a Postgres facts
+  // store would be skipped with its facts unchecked.
+  if (deps.skipCurrent && deps.outputFactsStore) throw new Error("skip current: not supported with the Postgres output facts store");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   // Staged (SEARCH_INDEX_STAGED_RECONCILE_ENABLED, adapter binding): a scope that would stream

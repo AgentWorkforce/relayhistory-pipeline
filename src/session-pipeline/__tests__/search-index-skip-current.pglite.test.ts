@@ -148,6 +148,20 @@ describe("skip-current on (hosted ClickHouse binding)", () => {
     expect(r.fake.calls.map((c) => String(c.query))).toEqual([expect.stringContaining("output_facts_session_state")]);
   }, 120_000);
 
+  test("output facts on: an unreadable facts state is not proof; the pass runs", async () => {
+    const r = await indexed();
+    r.fake.facts.complete = 1;
+    r.fake.facts.fail = true;
+    const p = await pass(r, { outputFacts: true });
+    expect(p.result.skipped).toBeUndefined();
+    expect(p.reads).toBeGreaterThan(0);
+  }, 120_000);
+
+  test("skipCurrent with the Postgres output facts store is refused (its facts are never checked)", async () => {
+    const r = await indexed();
+    await expect(indexSearchScope(SCOPE, r.search({ ...ON, outputFactsStore: (() => ({})) as never }))).rejects.toThrow("skip current: not supported with the Postgres output facts store");
+  }, 120_000);
+
   test("busy still requeues before the check: a held scope lock answers busy, never skipped", async () => {
     const r = await indexed();
     const held = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>

@@ -131,6 +131,10 @@ export interface SessionPipelineInputs {
    * Default off. `true` renders SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: a search pass returns before any
    * object read or ClickHouse query when the session directory proves a complete pass already covered the
    * scope's live pointer set at its current revisions (search-index.ts alreadyCurrent). Needs `searchIndex: true`.
+   * Not detected while on (docs/local-stack.md): rows re-fingerprinted without a pointer change, index rows lost
+   * on the ClickHouse side while Postgres says ready (duplicate events, DLQ redrives and the scheduled reconcile
+   * no longer repair them), a search backend switch, a wider index window. The way back is `false`; any
+   * re-projection or backfill of old sessions needs it off.
    */
   skipCurrent?: boolean;
   /**
