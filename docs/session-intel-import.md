@@ -10,14 +10,20 @@ It runs offline and stays contained. It uses no network, database or credentials
 
 ```sh
 bun run src/session-intel/import/cli.ts --format claude-code|codex|generic --in <file-or-dir> --out <dir> \
-  --salt <secret> --delete-by <iso> [--org <id> --workspace <id>]
+  --salt-file <path> --delete-by <iso> [--org <id> --workspace <id>]
 bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/replay
 ```
 
-- **`--format`** picks one adapter for every `*.jsonl` file under `--in`. To combine harnesses, import each one with the same `--salt`; their projects and repositories hash alike (see Projects below).
+- **`--format`** picks one adapter for every `*.jsonl` file under `--in`. To combine harnesses, import each one with the same salt file; their projects and repositories hash alike (see Projects below).
 - **`--in`** is a file, or a directory walked recursively. The walk skips dot entries, never follows a symlink, and reads `*.jsonl` regular files only.
-- **`--out`** must not exist, or must be an empty directory. It must sit outside this repository, and must neither contain `--in` nor sit inside it. The check runs on the real path: the nearest existing ancestor is realpath'd, so a symlink into the repository is refused. A path counts as outside only when its path relative to the repository is `..`, starts with `..` plus a separator, or is absolute, so a directory named `..cache` inside the repository is still inside it.
-- **`--salt`** (16 to 1024 characters) keys every id hash. Keep it private, and use a new salt for each customer and each import. The salt is never written anywhere. It does appear in the process list and the shell history.
+- **`--out`** must not exist, or must be an empty directory. It must sit outside this repository, and must neither contain `--in` nor sit inside it. The check is the M0 replay CLI's own guard (`realPathOf` and `isInside` in `src/session-intel/replay/cli.ts`). It runs on the real path: the nearest existing ancestor is realpath'd, so a symlink into the repository is refused. A path counts as outside only when its path relative to the repository is `..`, starts with `..` plus a separator, or is absolute, so a directory named `..cache` inside the repository is still inside it.
+- **`--salt-file`** names a file that holds the salt, which keys every id hash. With the salt, anyone holding a candidate customer id can confirm which hash it is, so the salt is what de-anonymizes the ids. It is therefore never taken from argv, where it would land in the process list and the shell history. There is no `--salt` flag. The file is refused when:
+  - it is a symlink (it is opened with `O_NOFOLLOW`) or not a regular file;
+  - it is readable or writable by group or others (`mode & 0o077` is not 0);
+  - it sits inside this repository, where it could be committed;
+  - its content, trimmed, is not 16 to 1024 characters (the file itself is at most 4,096 bytes).
+
+  The salt is never written to the snapshot, the mapping file, stdout, stderr or an error message. Use a new salt for each customer and each import. The salt is customer key material, so 1Password is its system of record (AGENTS.md: nothing credential-like left on disk). Write it to a private 0600 file outside the repository for the run, for example `umask 077; op read <ref> > "$TMPDIR/import-salt"`, and delete the file afterwards.
 - **`--delete-by`** is required: a strict ISO-8601 time with a zone, after now and at most 30 days out. It goes into the manifest, and the M0 loader refuses the snapshot after it.
 - **`--org` and `--workspace`** set the tenant fields (defaults `org_import` and `ws_import`). They must match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`.
 
@@ -26,7 +32,7 @@ On stdout the CLI prints counts only: files, lines, malformed and oversize lines
 ## Output
 
 - **`<out>/manifest.json` and `<out>/sessions.jsonl`** are the M0 snapshot. `files` holds the sha256 of `sessions.jsonl`. The window runs from the earliest session start to two minutes after the latest activity (one replay tick, so the last fact is visible), and is refused past 120 days. The directory is built under a temporary sibling name and renamed into place, so a reader never sees a partial snapshot. Files are mode 0600.
-- **`<out>.mapping.json`**, beside the snapshot and never inside it, is **private to the customer**. It maps each hashed session id to its source session id, source parent ids and source project name, and each event id to its input file (relative to `--in`) and line. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
+- **`<out>.mapping.json`**, beside the snapshot and never inside it, is **private to the customer** and written with mode 0600 (atomically, through a temporary file). It maps each hashed session id to its source session id, source parent ids and source project name, and each event id to its input file (relative to `--in`) and line. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
 
 ## Privacy rules
 
