@@ -75,6 +75,12 @@ export interface PointerDeps {
   fanout: PipelineQueue;
   publication?:{schemaGeneration:string;transact:Transact};
   now?: () => Date;
+  /**
+   * SESSION_POINTER_PREREAD_ENABLED=true only (the hosted Lambda): every object-store call of the stage runs
+   * BEFORE the scope lock, and the lock transaction holds SQL only (indexPreRead). Absent: as before, the
+   * manifest is re-read under the lock.
+   */
+  preRead?: boolean;
 }
 
 /** A fan-out queue that drops messages: no summary or state consumer runs in production yet. */
@@ -111,7 +117,109 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
     sessionId: location.sessionId,
   };
 
+  if (deps.preRead) return indexPreRead(landed, orgId, scope, deps);
   return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
+}
+
+/**
+ * The scope's pointer rows as one comparable value: every pointer write to the scope (an insert, a newer
+ * revision, a tombstone, a rekey) changes it, because each moves indexed_at (and revision, deleted_at or
+ * manifest_key). Read before the object-store reads and again under the lock.
+ */
+async function scopeStamp(db: HoopDb, scope: SessionScope): Promise<string> {
+  const { rows } = await db.query<{ stamp: string }>(
+    `SELECT coalesce(jsonb_agg(jsonb_build_array(machine_id, manifest_key, revision::text, manifest_etag, deleted_at, indexed_at)
+              ORDER BY machine_id), '[]'::jsonb)::text AS stamp
+       FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`,
+    [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
+  );
+  return rows[0]?.stamp ?? "[]";
+}
+
+/** The object-store results of one attempt, by key: a manifest read (null: gone) and a HEAD. */
+interface PreReadCache {
+  reads: Map<string, Awaited<ReturnType<ManifestReader["read"]>>>;
+  heads: Map<string, boolean>;
+}
+
+/**
+ * Every object-store call indexLocked would make for this event, made now (outside the lock) in the same
+ * order: the manifest; if it is gone, the move probe and the sibling's manifest; then, for a live manifest,
+ * the stored row of its machine and, when that row names another live key, that key's manifest. The
+ * enrich and upsert reads are of the same keys.
+ */
+async function preReadEvent(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps): Promise<PreReadCache> {
+  const cache: PreReadCache = { reads: new Map(), heads: new Map() };
+  const read = async (key: string) => {
+    if (!cache.reads.has(key)) cache.reads.set(key, await deps.reader.read(key));
+    return cache.reads.get(key)!;
+  };
+  const exists = async (key: string) => {
+    if (!cache.heads.has(key)) cache.heads.set(key, await deps.exists(key));
+    return cache.heads.get(key)!;
+  };
+  let key = landed.key;
+  let got = await read(key);
+  if (!got) {
+    const sibling = await findMovedSibling(key, exists);
+    if (sibling) {
+      key = sibling;
+      got = await read(sibling);
+    }
+  }
+  if (got) {
+    const stored = (
+      await deps.db.query<{ manifest_key: string; deleted: boolean }>(
+        `SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index
+          WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5`,
+        [orgId, scope.workspaceId, scope.harness, scope.sessionId, got.manifest.session.machine_id],
+      )
+    ).rows[0];
+    if (stored && stored.manifest_key !== key && !stored.deleted) await read(stored.manifest_key);
+  }
+  return cache;
+}
+
+/** Under the lock, object-store calls answer only from the attempt's pre-read; anything else is a bug. */
+function replayDeps(deps: PointerDeps, cache: PreReadCache): PointerDeps {
+  const miss = (key: string) => new PipelineError("pointer_preread_miss", `no pre-read for ${key}`, true);
+  return {
+    ...deps,
+    reader: {
+      ...deps.reader,
+      read: async (key: string) => {
+        if (!cache.reads.has(key)) throw miss(key);
+        return cache.reads.get(key)!;
+      },
+    },
+    exists: async (key: string) => {
+      if (!cache.heads.has(key)) throw miss(key);
+      return cache.heads.get(key)!;
+    },
+  };
+}
+
+const SCOPE_CHANGED = Symbol("scope_changed");
+
+/**
+ * SESSION_POINTER_PREREAD_ENABLED: the object-store reads before the scope lock, a short lock that holds
+ * SQL only. The scope's pointer rows are stamped before the reads and re-read under the lock: unchanged
+ * means no other pointer stage wrote this scope since the reads began, so indexLocked runs exactly as
+ * before against the pre-read (the revision fence still answers a non-newer revision); changed means the
+ * reads may be stale (the put whose read raced an erasure), so they are made again, once. A second change
+ * throws the retryable pointer_scope_changed (the event is retried, as pointer_move_pending is).
+ */
+async function indexPreRead(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps): Promise<PointerOutcome> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const stamp = await scopeStamp(deps.db, scope);
+    const cache = await preReadEvent(landed, orgId, scope, deps);
+    const out = await deps.lock(scope, async () => {
+      if ((await scopeStamp(deps.db, scope)) !== stamp) return SCOPE_CHANGED;
+      return indexLocked(landed, orgId, scope, replayDeps(deps, cache));
+    });
+    if (out !== SCOPE_CHANGED) return out;
+  }
+  throw new PipelineError("pointer_scope_changed", "the session's pointers changed during the read twice; retry", true);
 }
 
 /** How far either side of a deleted key's date the same session is looked for (an exporter date move). */

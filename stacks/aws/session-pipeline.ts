@@ -138,6 +138,12 @@ export interface SessionPipelineInputs {
    */
   skipCurrent?: boolean;
   /**
+   * Default off. `true` renders SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage makes its object-store
+   * reads (manifest, move probe) before taking the session's lock and re-validates under it, so the lock
+   * transaction holds SQL only (pointer.ts indexPreRead).
+   */
+  pointerPreRead?: boolean;
+  /**
    * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
    * 20 means up to 80 connections from this function alone. It is also capped in practice by the
@@ -310,7 +316,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "pointerPreRead") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -330,6 +336,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
   if (v.skipCurrent !== undefined && typeof v.skipCurrent !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrent must be a boolean");
   if (v.skipCurrent === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrent requires searchIndex: true");
+  if (v.pointerPreRead !== undefined && typeof v.pointerPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.pointerPreRead must be a boolean");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
@@ -682,6 +689,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
     // Only when armed: a stage without skipCurrent: true renders nothing and never skips.
     ...(i.p.skipCurrent === true ? { SEARCH_INDEX_SKIP_CURRENT_ENABLED: "true" } : {}),
+    // Only when armed: a stage without pointerPreRead: true renders nothing and reads under the lock as before.
+    ...(i.p.pointerPreRead === true ? { SESSION_POINTER_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),

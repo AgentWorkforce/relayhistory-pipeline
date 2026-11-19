@@ -59,7 +59,7 @@ export async function pointerRig() {
     return (await store.head(objectKey(key))) !== undefined;
   };
   /** Hooks a test sets: runs right before the first pool statement inside the lock, once. */
-  const hooks: { atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void> } = {};
+  const hooks: { beforeLock?: () => Promise<void>; atLock?: () => Promise<void>; beforeUpsert?: () => Promise<void> } = {};
   const db = {
     pool: undefined,
     end: async () => {},
@@ -77,6 +77,11 @@ export async function pointerRig() {
   // The Lambda's lock shape (lambda.ts runtimeFromSecret), recorded: its statements are the lock connection's.
   const held = new Map<string, Promise<void>>();
   const lock: ScopeLock = async (scope, work) => {
+    if (hooks.beforeLock) {
+      const h = hooks.beforeLock;
+      hooks.beforeLock = undefined;
+      await h();
+    }
     const key = scopeLockKey(scope);
     while (held.has(key)) await held.get(key);
     let release!: () => void;

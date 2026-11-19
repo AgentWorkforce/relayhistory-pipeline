@@ -39,7 +39,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { lambdaEnv, pointerPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -975,6 +975,27 @@ describe("session pipeline: skip a search pass already current (SEARCH_INDEX_SKI
     for (const bad of ["1", "TRUE", " true", "on", "yes"])
       expect(() => searchIndexSkipCurrentFromEnv({ SEARCH_INDEX_SKIP_CURRENT_ENABLED: bad })).toThrow("SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
     expect(searchIndexSkipCurrentFromEnv({ SEARCH_INDEX_SKIP_CURRENT_ENABLED: "" })).toBe(false);
+  });
+});
+
+describe("session pipeline: pointer pre-read (SESSION_POINTER_PREREAD_ENABLED)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  it("unset or false renders nothing; true renders exactly the flag; the Lambda parses both", () => {
+    const base = Object.keys(envOf({})).sort();
+    expect(base).not.toContain("SESSION_POINTER_PREREAD_ENABLED");
+    for (const cfg of [{}, { pointerPreRead: false }, { searchIndex: true, pointerPreRead: false }] as SessionPipelineInputs[]) {
+      expect(refusedBy(cfg)).toBe("");
+      expect(Object.keys(envOf(cfg)).sort()).toEqual(Object.keys(envOf({ ...cfg, pointerPreRead: undefined } as SessionPipelineInputs)).sort());
+      expect(pointerPreReadFromEnv(envOf(cfg))).toBe(false);
+    }
+    const env = envOf({ pointerPreRead: true });
+    expect(Object.keys(env).sort()).toEqual([...base, "SESSION_POINTER_PREREAD_ENABLED"].sort());
+    expect(env.SESSION_POINTER_PREREAD_ENABLED).toBe("true");
+    expect(pointerPreReadFromEnv(env)).toBe(true);
+  });
+  it("a non-boolean is refused", () => {
+    for (const bad of ["true", 1, null, {}]) expect(refusedBy({ pointerPreRead: bad })).toMatch(/pointerPreRead must be a boolean/);
   });
 });
 
