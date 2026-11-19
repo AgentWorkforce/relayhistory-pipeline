@@ -1,0 +1,332 @@
+{
+ "log": [
+  [
+   "candidates",
+   "2026-11-17T10:00:00.000Z",
+   2001,
+   null
+  ],
+  [
+   "controls",
+   "org",
+   "ws"
+  ],
+  [
+   "directory"
+  ],
+  [
+   "readFacts",
+   "org",
+   "ws",
+   "2026-11-17T10:00:00.000Z",
+   "2026-11-17T12:00:00.000Z",
+   {
+    "timeoutMs": 30000
+   }
+  ],
+  [
+   "recent",
+   "org",
+   "ws",
+   "2026-11-17T06:00:00.000Z"
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "f71f2eda07a86d86",
+    "harness": "claude",
+    "session_id": "a",
+    "peer_harness": "claude",
+    "peer_session_id": "b",
+    "urgency": "high",
+    "kind": "concurrent_edit",
+    "artifact": "src/x/shared.ts",
+    "evidence": [
+     {
+      "sessionId": "a",
+      "eventId": "a--40",
+      "ts": "2026-11-17T11:20:00.000Z",
+      "kind": "tool"
+     },
+     {
+      "sessionId": "b",
+      "eventId": "b--20",
+      "ts": "2026-11-17T11:40:00.000Z",
+      "kind": "tool"
+     }
+    ]
+   }
+  ],
+  [
+   "send",
+   {
+    "orgId": "org",
+    "workspaceId": "ws",
+    "to": {
+     "harness": "claude",
+     "sessionId": "a"
+    },
+    "text": "relayhistory-coordination: possible duplicate work.\nYour session claude:a and claude:b both wrote src/x/shared.ts\n(concurrent_edit, first seen 2026-11-17T11:20:00.000Z). Please check with the other agent before continuing.\nAdvisory f71f2eda07a86d86; ack it at the end of your turn.",
+    "advisoryId": "f71f2eda07a86d86"
+   }
+  ],
+  [
+   "markDelivered",
+   "org",
+   "ws",
+   "f71f2eda07a86d86",
+   {
+    "harness": "claude",
+    "sessionId": "a"
+   }
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "f71f2eda07a86d86",
+    "harness": "claude",
+    "session_id": "b",
+    "peer_harness": "claude",
+    "peer_session_id": "a",
+    "urgency": "high",
+    "kind": "concurrent_edit",
+    "artifact": "src/x/shared.ts",
+    "evidence": [
+     {
+      "sessionId": "a",
+      "eventId": "a--40",
+      "ts": "2026-11-17T11:20:00.000Z",
+      "kind": "tool"
+     },
+     {
+      "sessionId": "b",
+      "eventId": "b--20",
+      "ts": "2026-11-17T11:40:00.000Z",
+      "kind": "tool"
+     }
+    ]
+   }
+  ],
+  [
+   "send",
+   {
+    "orgId": "org",
+    "workspaceId": "ws",
+    "to": {
+     "harness": "claude",
+     "sessionId": "b"
+    },
+    "text": "relayhistory-coordination: possible duplicate work.\nYour session claude:b and claude:a both wrote src/x/shared.ts\n(concurrent_edit, first seen 2026-11-17T11:20:00.000Z). Please check with the other agent before continuing.\nAdvisory f71f2eda07a86d86; ack it at the end of your turn.",
+    "advisoryId": "f71f2eda07a86d86"
+   }
+  ],
+  [
+   "markDelivered",
+   "org",
+   "ws",
+   "f71f2eda07a86d86",
+   {
+    "harness": "claude",
+    "sessionId": "b"
+   }
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "0c8ca747a007283f",
+    "harness": "claude",
+    "session_id": "c",
+    "peer_harness": "claude",
+    "peer_session_id": "d",
+    "urgency": "low",
+    "kind": "nearby_work",
+    "artifact": "docs/guide",
+    "evidence": [
+     {
+      "sessionId": "c",
+      "eventId": "c--30",
+      "ts": "2026-11-17T11:30:00.000Z",
+      "kind": "tool"
+     },
+     {
+      "sessionId": "d",
+      "eventId": "d--25",
+      "ts": "2026-11-17T11:35:00.000Z",
+      "kind": "tool"
+     }
+    ]
+   }
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "0c8ca747a007283f",
+    "harness": "claude",
+    "session_id": "d",
+    "peer_harness": "claude",
+    "peer_session_id": "c",
+    "urgency": "low",
+    "kind": "nearby_work",
+    "artifact": "docs/guide",
+    "evidence": [
+     {
+      "sessionId": "c",
+      "eventId": "c--30",
+      "ts": "2026-11-17T11:30:00.000Z",
+      "kind": "tool"
+     },
+     {
+      "sessionId": "d",
+      "eventId": "d--25",
+      "ts": "2026-11-17T11:35:00.000Z",
+      "kind": "tool"
+     }
+    ]
+   }
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "6d2b3fe9316190db",
+    "harness": "claude",
+    "session_id": "e",
+    "peer_harness": "claude",
+    "peer_session_id": "f",
+    "urgency": "low",
+    "kind": "similar_summary",
+    "artifact": "similar short summaries",
+    "evidence": []
+   }
+  ],
+  [
+   "upsert",
+   "org",
+   "ws",
+   {
+    "advisory_id": "6d2b3fe9316190db",
+    "harness": "claude",
+    "session_id": "f",
+    "peer_harness": "claude",
+    "peer_session_id": "e",
+    "urgency": "low",
+    "kind": "similar_summary",
+    "artifact": "similar short summaries",
+    "evidence": []
+   }
+  ],
+  [
+   "candidates",
+   "2026-11-17T10:02:00.000Z",
+   2001,
+   null
+  ],
+  [
+   "controls",
+   "org",
+   "ws"
+  ],
+  [
+   "directory"
+  ],
+  [
+   "readFacts",
+   "org",
+   "ws",
+   "2026-11-17T10:02:00.000Z",
+   "2026-11-17T12:02:00.000Z",
+   {
+    "timeoutMs": 30000
+   }
+  ],
+  [
+   "recent",
+   "org",
+   "ws",
+   "2026-11-17T06:02:00.000Z"
+  ],
+  [
+   "candidates",
+   "2026-11-17T10:04:00.000Z",
+   2001,
+   null
+  ],
+  [
+   "controls",
+   "org",
+   "ws"
+  ],
+  [
+   "directory"
+  ],
+  [
+   "readFacts",
+   "org",
+   "ws",
+   "2026-11-17T10:04:00.000Z",
+   "2026-11-17T12:04:00.000Z",
+   {
+    "timeoutMs": 30000
+   }
+  ],
+  [
+   "recent",
+   "org",
+   "ws",
+   "2026-11-17T06:04:00.000Z"
+  ]
+ ],
+ "stats": [
+  {
+   "candidates": 9,
+   "workspaces": 1,
+   "findings": 3,
+   "written": 6,
+   "existing": 0,
+   "cooldown": 0,
+   "capped": 0,
+   "dmSent": 2,
+   "dmFailed": 0,
+   "truncated": 0,
+   "failed": 0,
+   "rejected": 0
+  },
+  {
+   "candidates": 9,
+   "workspaces": 1,
+   "findings": 3,
+   "written": 0,
+   "existing": 0,
+   "cooldown": 3,
+   "capped": 0,
+   "dmSent": 0,
+   "dmFailed": 0,
+   "truncated": 0,
+   "failed": 0,
+   "rejected": 0
+  },
+  {
+   "candidates": 9,
+   "workspaces": 1,
+   "findings": 3,
+   "written": 0,
+   "existing": 0,
+   "cooldown": 3,
+   "capped": 0,
+   "dmSent": 0,
+   "dmFailed": 0,
+   "truncated": 0,
+   "failed": 0,
+   "rejected": 0
+  }
+ ]
+}

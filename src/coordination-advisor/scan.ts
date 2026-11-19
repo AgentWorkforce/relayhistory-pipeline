@@ -17,6 +17,11 @@ import {
   ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS, highAdvisories, lowAdvisories, orderAdvisories,
   pairKey, refKey, truncatedStreams, type Advisory, type CandidateLane, type RecentAdvisory, type SessionRef,
 } from "./rubric.ts";
+import {
+  CLAIMS_LIMIT, CLAIMS_SQL, claimsSince, liveConflictAdvisories, liveSessions, mergeConflicts, parseClaimRows,
+  type ClaimRow, type ConflictAdvisory,
+} from "./conflicts.ts";
+import { conflictExcerpts } from "./excerpts.ts";
 import { advisoryMessage } from "./template.ts";
 
 /** Directory rows read per scan; more is logged and the newest are kept. */
@@ -110,6 +115,11 @@ export interface AdvisorStore {
   sweep(): Promise<{ expired: number; deleted: number }>;
   /** Durable cooldown and cap state for one tenant (062070). */
   recent(orgId: string, workspaceId: string, pairSince: Date): Promise<RecentAdvisory[]>;
+  /**
+   * The workspace's current claims and decisions (062150 relayfacts_claims_v1), for the conflict rows. Called only
+   * with SESSION_INTEL_CONFLICTS_ENABLED and the `conflicts` control on; a store without it skips conflicts.
+   */
+  claims?(orgId: string, workspaceId: string, since: Date, limit: number): Promise<ClaimRow[]>;
 }
 
 export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
@@ -141,6 +151,10 @@ export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
       const { rows } = await db.query<{ expired: number; deleted: number }>(SWEEP_SQL);
       return { expired: Number(rows[0]?.expired ?? 0), deleted: Number(rows[0]?.deleted ?? 0) };
     },
+    async claims(orgId, workspaceId, since, limit) {
+      const { rows } = await db.query<Record<string, unknown>>(CLAIMS_SQL, [orgId, workspaceId, since, limit]);
+      return parseClaimRows(rows);
+    },
     async recent(orgId, workspaceId, pairSince) {
       const { rows } = await db.query<Record<string, unknown>>(RECENT_SQL, [orgId, workspaceId, pairSince]);
       const ms = (v: unknown) => new Date(v as Date | string).getTime();
@@ -163,6 +177,8 @@ export interface ScanDeps {
   workspaces: ReadonlySet<string> | "*";
   /** Absent: DMs are off; HIGH rows stay pending for the pull path. */
   sender?: RelaySender;
+  /** SESSION_INTEL_CONFLICTS_ENABLED. Absent or false: the scan is exactly as before (no claims read, no conflict code). */
+  conflicts?: boolean;
 }
 
 export interface ScanStats {
@@ -170,6 +186,9 @@ export interface ScanStats {
   cooldown: number; capped: number; dmSent: number; dmFailed: number; truncated: number; failed: number;
   /** Rows the database refused (a data or constraint error); the scan goes on with the next row. */
   rejected: number;
+  /** Conflicts on only: conflict advisories found, and workspaces whose conflicts were skipped (fail-open). */
+  conflicts?: number;
+  conflictsSkipped?: number;
 }
 
 const emptyStats = (): ScanStats => ({
@@ -211,12 +230,16 @@ function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryR
 }
 
 /** Applies the limits and writes one workspace's advisories; DMs HIGH rows that were newly written. */
-async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Advisory[], now: number, stats: ScanStats) {
+async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Array<Advisory | ConflictAdvisory>, now: number, stats: ScanStats) {
   for (const a of orderAdvisories(advisories)) {
     const pair = pairKey(a.lanes[0], a.lanes[1]);
     if (deps.limits.inCooldown(pair, a.urgency, now)) { stats.cooldown++; continue; }
     let attempted = false;
-    for (const [recipient, peer] of [[a.lanes[0], a.lanes[1]], [a.lanes[1], a.lanes[0]]] as const) {
+    // A conflict advisory names its own rows (a fleet conflict: the orchestrator only; a repo-policy owner: none).
+    const rows: ReadonlyArray<readonly [SessionRef, SessionRef]> = "rows" in a
+      ? (a as ConflictAdvisory).rows.map((r) => [r.recipient, r.peer] as const)
+      : [[a.lanes[0], a.lanes[1]], [a.lanes[1], a.lanes[0]]];
+    for (const [recipient, peer] of rows) {
       if (!deps.limits.underCap(recipient, now)) { stats.capped++; continue; }
       attempted = true;
       let result: UpsertResult;
@@ -238,6 +261,7 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
         advisoryId: a.advisoryId, urgency: a.urgency, kind: a.kind, artifact: a.artifact,
         harness: recipient.harness, sessionId: recipient.sessionId, peerHarness: peer.harness, peerSessionId: peer.sessionId,
         firstSeen: a.evidence.map((e) => e.ts).sort()[0] ?? new Date(now).toISOString(),
+        ...("rows" in a ? { claimIds: (a as ConflictAdvisory).claimIds, excerpts: conflictExcerpts(a as ConflictAdvisory) } : {}),
       });
       try {
         await deps.sender.send({ orgId, workspaceId, to: recipient, text, advisoryId: a.advisoryId });
@@ -268,9 +292,42 @@ async function seedLimits(deps: ScanDeps, orgId: string, workspaceId: string, no
   }
 }
 
+/**
+ * The workspace's conflict advisories, or null when they are skipped. Fail-open for the advisor: a claims read
+ * that fails (any error, including 42883 when 062150 is not applied), a read that may be cut (CLAIMS_LIMIT rows),
+ * truncated facts, or any error in the conflict code skips conflicts for this workspace with a counted warning;
+ * the collision and overlap rows go on.
+ */
+async function workspaceConflicts(deps: ScanDeps, orgId: string, workspaceId: string, since: Date, now: Date,
+  lanes: CandidateLane[], live: Parameters<typeof liveSessions>[1], factsTruncated: boolean, stats: ScanStats): Promise<ConflictAdvisory[] | null> {
+  const skip = (why: string, err?: unknown) => {
+    stats.conflictsSkipped = (stats.conflictsSkipped ?? 0) + 1;
+    // The reason is fixed text; ids only in the allowlisted fields.
+    log.warn(`coordination advisor conflicts skipped: ${why}`, { org_id: orgId, workspace_id: workspaceId, count: 1, ...(err ? errorFields(err) : {}) });
+    return null;
+  };
+  if (factsTruncated) return skip("facts truncated");
+  if (!deps.store.claims) return skip("no claims reader");
+  let claims: ClaimRow[];
+  try {
+    claims = await deps.store.claims(orgId, workspaceId, claimsSince(since), CLAIMS_LIMIT);
+  } catch (err) {
+    return skip((err as { code?: unknown } | null)?.code === "42883" ? "claims reader missing (20261105062150 not applied)" : "claims read failed", err);
+  }
+  if (claims.length >= CLAIMS_LIMIT) return skip(`claims read truncated at ${CLAIMS_LIMIT}`);
+  try {
+    const { advisories } = liveConflictAdvisories(workspaceId, liveSessions(lanes, live, claims, now), now);
+    stats.conflicts = (stats.conflicts ?? 0) + advisories.length;
+    return advisories;
+  } catch (err) {
+    return skip("conflict detection failed", err);
+  }
+}
+
 /** One full scan at `now`. A failing workspace is logged and does not stop the others. */
 export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
-  const stats = emptyStats();
+  // With conflicts off the stats keep exactly their old keys (the scan log line is unchanged).
+  const stats: ScanStats = deps.conflicts === true ? { ...emptyStats(), conflicts: 0, conflictsSkipped: 0 } : emptyStats();
   const nowMs = now.getTime();
   deps.limits.prune(nowMs);
   // No workspace enabled: nothing is read.
@@ -313,8 +370,14 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
       const low = lowAdvisories(workspaceId, live, candidates, new Set(high.map((a) => pairKey(a.lanes[0], a.lanes[1]))),
         since.toISOString(), truncated);
       stats.findings += high.length + low.length;
-      if (high.length + low.length) await seedLimits(deps, orgId, workspaceId, nowMs);
-      await deliver({ ...deps, sender: controls.get("dm") === true ? deps.sender : undefined }, orgId, workspaceId, [...high, ...low], nowMs, stats);
+      let advisories: Array<Advisory | ConflictAdvisory> = [...high, ...low];
+      if (deps.conflicts === true && controls.get("conflicts") === true) {
+        const conflicts = await workspaceConflicts(deps, orgId, workspaceId, since, now, lanes, live,
+          Boolean(facts.sessionsTruncated) || truncated.writes || truncated.outputs, stats);
+        if (conflicts) advisories = mergeConflicts(high, low, conflicts);
+      }
+      if (advisories.length) await seedLimits(deps, orgId, workspaceId, nowMs);
+      await deliver({ ...deps, sender: controls.get("dm") === true ? deps.sender : undefined }, orgId, workspaceId, advisories, nowMs, stats);
     } catch (err) {
       stats.failed++;
       log.warn("coordination advisor workspace scan failed", { org_id: orgId, workspace_id: workspaceId, ...errorFields(err) });

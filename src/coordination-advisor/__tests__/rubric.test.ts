@@ -196,7 +196,7 @@ describe("config and sender", () => {
     expect(advisorEnabled({ COORDINATION_ADVISOR_ENABLED: "true" })).toBe(true);
   });
   test("defaults", () => {
-    expect(advisorConfig({})).toEqual({ intervalMs: 120_000, pairCooldownMs: 21_600_000, sessionHourlyCap: 3, factsBackend: "clickhouse", relayDm: { enabled: false }, workspaces: new Set() });
+    expect(advisorConfig({})).toEqual({ intervalMs: 120_000, pairCooldownMs: 21_600_000, sessionHourlyCap: 3, factsBackend: "clickhouse", relayDm: { enabled: false }, workspaces: new Set(), conflicts: false });
   });
   test("workspaces: the routes' canary allowlist; absent or empty scans none", () => {
     expect(advisorConfig({ READ_API_DIRECTORY_WORKSPACES: "*" }).workspaces).toBe("*");

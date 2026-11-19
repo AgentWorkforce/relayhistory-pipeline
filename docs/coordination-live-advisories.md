@@ -159,8 +159,50 @@ SQL and the next-tick stop contract.
 | `COORDINATION_ADVISOR_ENABLED` | off | The worker's scan and its writes |
 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | off | The GET and ack routes |
 | `COORDINATION_ADVISOR_RELAY_DM_ENABLED` | off | HIGH Relay DMs (also needs the sender credential) |
+| `SESSION_INTEL_CONFLICTS_ENABLED` | off | The conflict rows (see "Conflict rows"); also needs the workspace's `conflicts` control |
 
 Enabling any of them in production, provisioning the relay credential, and deploying the worker each need Khaliq's own explicit OK. Merging this document or the implementation PRs enables nothing.
+
+## Conflict rows (M2-4)
+
+With `SESSION_INTEL_CONFLICTS_ENABLED` exactly `"true"` **and** the M3-1 `conflicts` control on (global and workspace), each workspace scan also runs the conflict detectors of [session-intel-conflicts.md](session-intel-conflicts.md). With either off, the scan is byte-identical to the scan without M2-4: no claims query, no conflict code, the same stats keys. A recorded golden of every store, backend and sender call proves it (`src/coordination-advisor/__tests__/conflicts-gate.test.ts`).
+
+**The claims read.** One read per scanned workspace: `sessions.relayfacts_claims_v1(org, workspace, NULL, NULL, since, 500)` (062150). `since` is the candidate window's start minus the facts' 7-day lookback, compared with each claim's `updated_at`. A claim gains evidence and a new `updated_at` each time a session restates it, so a long-lived constraint is read while it is still in use. It is **fail-open for the advisor**: any of these skips conflicts for the workspace with a counted warning (`conflictsSkipped`), and the collision and overlap rows go on:
+
+- a failed read, including `42883` when 062150 is not applied;
+- a full read (500 rows, so it may be cut);
+- truncated facts;
+- any error in the conflict code.
+
+**Live inputs, shared logic.** The candidate lanes, the facts the scan already read, and the claims are mapped onto the replay harness's as-of sessions (`src/coordination-advisor/conflicts.ts`). The decisions come from the same `candidates.ts`, `classify.ts` and rule judge as the replay detectors. There is no second copy of the logic. A claim is attached to every session its evidence names; its time is `observed_at`, else `created_at`. Only the rule judge runs live. The model judge is not wired: no transport, model or budget is approved.
+
+**Rows.**
+
+| Decision | Kind | Urgency | Rows |
+|---|---|---|---|
+| A propagating constraint broken by an action of the other session | `constraint_violation` | HIGH | The violator and the constraint's holder, each naming the other; DMed (HIGH) |
+| The same, by a stated intent only | `constraint_violation` | LOW | The same two rows, pull only |
+| A decision or intent against one of the other session, with the acting side writing in the topic | `intent_conflict` | HIGH | Both sessions; DMed |
+| The same without the action | `intent_conflict` | LOW | Both sessions, pull only |
+| Compatible claims on a shared topic | `overlap` | LOW | Both sessions, pull only; dropped when the advisor already has a row for the pair |
+| A conflict inside a planned fleet | the conflict kind | LOW | Only the orchestrating sessions, pull only, naming the acting worker as the peer; never the workers, never a DM |
+| An overlap inside a planned fleet | | SILENT | none |
+
+A `repo`-policy owner with no holding session gets no row and no DM. Until M2-4's follow-up defines "repo owner", no recipient is invented for it.
+
+- **Kind.** 062000 bounds `kind` by format only, so no migration is needed for the new kinds.
+- **Artifact.** The topic slug.
+- **Evidence.** The cited claim ids (`kind` `claim_constraint`, `claim_intent` or `claim_decision`) and the action event, within the existing bounds.
+- **Id.** 32 hex digits, hashed from the workspace, kind, pair and deciding claims. A constraint violation is keyed by its constraint, so its LOW (an intent) and its HIGH (a write) are one advisory, and the upsert upgrades LOW to HIGH.
+- **Limits.** The cooldown, the cap and the no-downgrade rule apply unchanged.
+- **Precedence.** A conflict outranks an overlap or a collision for the same pair in one tick. The pair's collision and LOW overlap rows are not written that tick, because writing them would only start the pair's cooldown and hold the conflict back.
+
+**DMs.** HIGH conflict rows use the existing DM path, behind `COORDINATION_ADVISOR_RELAY_DM_ENABLED` and the `dm` control. The template names the class:
+- "possible constraint violation", "may be acting against a constraint on";
+- "possible conflicting plans", "have conflicting claims about";
+- "possible nearby work".
+
+It may add the cited claim ids and claim excerpts while the message stays within 600 characters. An excerpt is at most 200 characters and is included only when the scrubber leaves it unchanged (the decision-records rule); otherwise the message carries ids only. The read API's `message` for the same row has neither extra. The sender itself (`relay-sender.ts`) is unchanged. Its Relaycast contract is M3-8 (docs/session-intel-dm-transport.md): an advisory counts as delivered when its state is in the set {`delivered`, `consumed`, `replied`} or `accepted_at` is set, never by an ordered chain. The tests' fake sender models exactly that.
 
 ## Open questions for Khaliq
 
