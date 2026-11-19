@@ -20,7 +20,7 @@ op read 'op://<vault>/<item>/salt' | op run -- bun run src/session-intel/harvest
 bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/replay
 ```
 
-- **`--read-api`** is the base URL: `https`, or `http` only for a loopback host (`127.0.0.1`, `localhost`, `[::1]`). It may carry no credentials, query or fragment. A path prefix is kept.
+- **`--read-api`** is the base URL: `https`, or `http` only for a loopback host (`127.0.0.1`, `localhost`, `[::1]`). It may carry no credentials, query or fragment. A path prefix is kept: repeated and trailing slashes are dropped, so every route joins with exactly one slash (`https://h/` gives `/v1/sessions`, `https://h/api/` gives `/api/v1/sessions`).
 - **The token** comes only from `SESSION_INTEL_READ_TOKEN`, injected at runtime by `op run`. There is no flag or file for it. It must be 16 to 8192 characters with no whitespace. Once read, it is deleted from the process environment.
 - **`--workspace`** is the workspace the token is bound to. It is sent as `workspace=` on every request, and every answered response must attest it (see The client).
 - **`--since` and `--until`** are strict ISO-8601 times with a zone. `--until` must be after `--since`, at most 120 days later (the M0 window), and at most a day in the future.
@@ -79,10 +79,10 @@ So a harvested snapshot cannot raise `superseded_work` (it needs reverts) or dup
 
 The receipt is the point of the harvest. `coverage.json` (`session-intel-harvest-receipt/1`) sits in the snapshot directory and is listed with its sha256 in the manifest, so the loader verifies it. It records:
 
-- **`complete`**: true only when the frame was exhausted, every session's events were read, none was refused, and no session was dropped for size;
+- **`complete`**: true only when the frame was exhausted, every session's events were read, none was refused or censored, and no session was dropped for size;
 - **`workspaceId`** (hashed) and the **`window`**;
 - **`startedAt`, `finishedAt` and `runs`**: the first run's start, the last run's end, and how many runs it took;
-- **`requests`**: the total, the count per route, the retries, how many waits honoured a `Retry-After`, and the time waited;
+- **`requests`**: the total, the count per route, the retries, how many waits honoured a `Retry-After`, and the time waited, cumulative over every run (see Resume). `partial: true`, with a `partialReason`, marks them as lower bounds when a run ended without recording them;
 - **`frame`**:
   - the route and its parameters, the pages, and whether it was exhausted;
   - the sessions, **per source** and **per UTC day** (the day of each session's first activity in the window);
@@ -93,6 +93,7 @@ The receipt is the point of the harvest. `coverage.json` (`session-intel-harvest
   - sessions whose events were not served, per reason (a 501 reason such as `session_partial`, or `not_found`);
   - event pages and events, events with files, and events outside the window;
   - writes read, writes truncated at 20,000 per session, and paths dropped;
+  - **censored sessions**: `sessionsCensored`, `censoredByReason`, `droppedWritesKnown` and `sessionsWithUnknownDrops`. A session's events are read until the cursor is exhausted; events outside the window are counted and skipped, and never stop the paging. The one early stop is the 20,000-write bound with pages left: the session is censored (`writes_bound_reached_cursor_remaining`, or `writes_bound_exceeded_cursor_remaining` when the page itself went over), its drop count is unknown (null), and later pages are never read. Over the bound on the last page is `writes_bound_exceeded`, with the exact drop count. Any censored session makes the harvest `complete: false`;
 - **`snapshot`**: the sessions and writes written;
 - **`output`**: the workspace counts from `/v1/sessions/output`, or the reason it was not served;
 - **`server`**: the header values seen;
@@ -131,7 +132,7 @@ The harvest reuses the M4 import's normalizer and writer (`src/session-intel/imp
 - the output counts;
 - each session's facts.
 
-A rerun with the same `--read-api`, `--workspace`, `--since`, `--until` and `--delete-by` continues from the last frame cursor and reads only the sessions that have no facts line yet. Other parameters are refused. A torn last line (a crash mid-write) is cut off before appending. The request count is carried over, so the cap covers the whole harvest. On success the state is removed. It moves aside while the writer runs, and comes back if the write fails.
+A rerun with the same `--read-api`, `--workspace`, `--since`, `--until` and `--delete-by` continues from the last frame cursor and reads only the sessions that have no facts line yet. Other parameters are refused. A torn last line (a crash mid-write) is cut off before appending. Every line carries the client's cumulative counts (total, per route, retries, waits and header values), and each run ends with a `runEnd` line holding its final counts, written on success, on the cap and on an error. A resume restores them, so the receipt's counts cover every run and the cap covers the whole harvest. A run without a `runEnd` line (killed, or the machine went down) cannot be fully reconstructed: requests after its last line are lost, so the receipt marks the request counts `partial` and says why, rather than reporting a smaller number as exact. On success the state is removed. It moves aside while the writer runs, and comes back if the write fails.
 
 The state holds raw read-API session ids, cursors, project ids, repository names (never the remote URL, which may carry credentials) and repo-relative paths (made so as each event is read, so no home directory or user name is kept). That is the same class of data as the mapping file, and never text, the token or the salt. Delete `--out` by `--delete-by` if a harvest is abandoned. A resume past `--delete-by` is refused.
 
@@ -141,4 +142,5 @@ The state holds raw read-API session ids, cursors, project ids, repository names
 - **`filesTouched` paths.** Whether production records them absolute or repo-relative is a harness detail. Absolute paths outside a source root are dropped and counted, so a cohort with many of them loses writes. The receipt's `facts.droppedPaths` shows how many.
 - **`op run` and stdin.** The usage pipes the salt into `op run`, which is expected to pass stdin through to the command. If it does not on some version, run `op run` around a shell that does the `op read` pipe itself.
 - **Two harvests on one `--out` at once** are not locked against each other. Run one at a time.
-- **The request count across a crash.** Requests made after the last state line, before a crash, are not counted on resume. That is at most a few per worker.
+- **The request count across a hard crash.** Requests made after the last state line, before a kill, are not counted on resume; the receipt then says `partial`. That is at most a few per worker.
+- **Long sessions past `--until`.** Paging no longer stops at the first event past `--until`, so a session that runs long after the window costs its remaining pages in requests. Being correct regardless of the order the events are served in was preferred over saving those requests.
