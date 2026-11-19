@@ -177,7 +177,8 @@ real ingest next.
 
 ## OpenSearch and Elasticsearch backend proof
 
-`.github/workflows/opensearch-proof.yml` (on pull requests and `workflow_dispatch`)
+`.github/workflows/opensearch-proof.yml` (on pull requests, on pushes to `main` that touch
+the search-index paths, and `workflow_dispatch`)
 proves the `opensearch` search backend on real servers, one matrix entry per dialect.
 Each entry starts one disposable single-node container bound to `127.0.0.1:9200`, with
 security off and no credential anywhere, and uses no hosted service:

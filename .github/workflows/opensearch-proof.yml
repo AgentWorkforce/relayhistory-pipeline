@@ -4,10 +4,27 @@ name: opensearch-proof
 # conformance suite against the opensearch backend in each dialect, then the in-process
 # upload -> scrub -> index -> search -> erase proof (scripts/opensearch-proof/e2e.ts).
 # Each run uploads a machine-verifiable JSON (head SHA, server, each case) and its log.
-# Runs only when search-index paths change, and skips the proof steps when the proof
-# files are absent on the head (a PR branched before #315).
+# Runs only when search-index paths change (pull requests, and pushes to main), and skips
+# the proof steps when the proof files are absent on the head (a PR branched before #315).
 on:
   pull_request:
+    paths:
+      - .github/workflows/opensearch-proof.yml
+      - packages/pipeline/src/search-index/**
+      - packages/pipeline/test/search-index-opensearch*
+      - packages/pipeline/package.json
+      - packages/object-store/src/**
+      - scripts/opensearch-proof/**
+      - src/session-pipeline/search-adapter*
+      - src/session-pipeline/pointer.ts
+      - src/concourse/seed.ts
+      - package.json
+      - bun.lock
+  # Pushes to main: pull requests are off in this repository, so the pull_request trigger
+  # above no longer fires. Same paths, so a landing that touches the search index runs the
+  # real-server proof on the landed commit.
+  push:
+    branches: [main]
     paths:
       - .github/workflows/opensearch-proof.yml
       - packages/pipeline/src/search-index/**
