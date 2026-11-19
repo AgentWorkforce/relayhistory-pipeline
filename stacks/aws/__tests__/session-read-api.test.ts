@@ -249,6 +249,7 @@ describe("session read api: Function URL (public by design, application auth)", 
       "/v1/delivery/records",
       "/v1/digest/daily",
       "/v1/events",
+      "/v1/session-intel/workspace",
       "/v1/sessions",
       // Lane F1: GET and POST (rth:sync + the admission principal), both behind the bearer auth.
       "/v1/sessions/:sessionId/analysis",
