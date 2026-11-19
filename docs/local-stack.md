@@ -791,10 +791,20 @@ was partial or incomplete, a new revision, a sibling manifest added or removed, 
 (busy is answered before the check and still requeues). Replay pages and large-read delegation are separate stages
 and are not affected.
 
-Not detected: a change that re-fingerprints index rows without any pointer change (`READER_MAX_RULESET`,
-`MESSAGE_ORIGIN_LABELS_ENABLED`, a projection code change). With the flag on, an unchanged session keeps its old rows
-until its source next changes; turn the flag off for as long as such a change should reach sessions through their
-events.
+Not detected, because the proof reads only Postgres and the pointer set:
+
+- a change that re-fingerprints index rows without any pointer change (`READER_MAX_RULESET`,
+  `MESSAGE_ORIGIN_LABELS_ENABLED`, a projection code change);
+- index rows lost on the ClickHouse side while Postgres still says ready: with the flag on, neither duplicate
+  events, DLQ redrives nor the scheduled reconcile repair them, since each of those reaches the same check;
+- a search backend switch (`SEARCH_INDEX_BACKEND`): the new backend's index starts empty while the directory still
+  says ready;
+- a wider index window (`STATE_WINDOW_START`): rows that now fall inside it are never added.
+
+With the flag on, an unchanged session keeps whatever its index holds until its source next changes. The way back is
+the flag off (`false`): every event then re-reads its session as before. Any re-projection or backfill of old
+sessions needs the flag off for its whole run; there is no version to bump instead
+(`event_projection_version` is fixed at 1).
 
 ## Known limits
 
