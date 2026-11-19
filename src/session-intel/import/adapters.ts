@@ -4,6 +4,7 @@
  * outputs are read only to find a file path or a commit sha, and are never kept.
  */
 import { basename } from "node:path";
+import { relayhistoryActivityEvent } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { commitShaFromOutput, gitOps } from "./git.ts";
 import { readJsonl } from "./io.ts";
 import { cleanId, IMPORT_BOUNDS, ImportError, SessionBuilder, strictTs, type ImportHarness, type ImportStats, type LineRef } from "./normalize.ts";
@@ -221,7 +222,20 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     };
     if (kind === "function_call" || kind === "custom_tool_call") {
       const name = str(p.name) ?? "";
-      if (name === "apply_patch") {
+      if (name === "exec") {
+        // Code mode captures the outer exec, not its nested tool calls. Use
+        // the production projection's bounded static-patch parser unchanged.
+        const input = kind === "custom_tool_call" ? str(p.input) : str(parseArgs(p.arguments).input);
+        if (input) {
+          const event = relayhistoryActivityEvent({
+            kind: "tool_call", origin_id: "import", record_id: callId,
+            revision: "1", operation: "upsert", received_at: ts,
+            payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: p.is_error },
+          }, { workspaceId: "import", source: "codex", sessionId: "import", machineId: "import", userId: "import" });
+          if (Array.isArray(event?.files_touched))
+            write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd);
+        }
+      } else if (name === "apply_patch") {
         const input = kind === "custom_tool_call" ? str(p.input) : (str(parseArgs(p.arguments).input) ?? str(p.arguments));
         write(patchPaths(input ?? ""), cwd);
       } else if (SHELL_TOOLS.has(name)) {
