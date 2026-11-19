@@ -1,7 +1,7 @@
 /**
  * M3-5 foundation: real worker + migrated Postgres + authenticated HTTP pull/ack.
  * Synthetic directory and tool facts are inserted atomically at the facts boundary;
- * this does not claim to prove extraction, conflict classification or Relay DMs.
+ * this does not claim to prove extraction, conflict classification or real Relay routing.
  */
 import { createHash } from "node:crypto";
 import { TENANT_A, TENANT_B } from "../selfhost/stack.ts";
@@ -111,6 +111,8 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
   // route's own workspace attestation (which separately returns 403).
   check(mismatch.status === 401, `workspace mismatch status=${mismatch.status}`);
   const ackPath = `/v1/coordination/advisories/${items[0].advisoryId}/ack?workspace=${encodeURIComponent(a.workspace)}`;
+  const missingWorkspace = await request(ackPath.split("?")[0]!, stack.tokens.a, { source: "claude", sessionId: session("high-a") });
+  check(missingWorkspace.status === 501 && missingWorkspace.body?.error?.reason === "org_scope", "missing workspace ack did not refuse org scope");
   const otherAck = await request(ackPath.replace(`workspace=${a.workspace}`, `workspace=${TENANT_B.workspace}`), stack.tokens.b, { source: "claude", sessionId: session("high-a") });
   check(otherAck.status === 404, `foreign ack status=${otherAck.status}`);
   for (let i = 0; i < 2; i++) {
@@ -169,5 +171,58 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
     WHERE scope='workspace' AND org_id=${q(a.org)} AND workspace_id=${q(a.workspace)} AND feature='advisor'`);
   await scanAfter(before, /written=2\s/u);
   check(switchRows().length === 2, "control flip was not applied by the next scan");
-  return "HIGH collision + LOW overlap; fleet silent; allowlist and tenant isolation; pull citations; idempotent recipient ack; cooldown and cap survive restarts; control flip on the next tick; no DMs";
+
+  // The configured sender uses a recording HTTP endpoint, never an actual agent.
+  // Earlier scans had no dm controls: the runtime flag alone must send nothing.
+  const relay = async (path: string, body?: unknown, bearer = stack.env.E2E_COORDINATION_RELAY_TOKEN!) => {
+    const response = await fetch(stack.urls.coordinationRelay + path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: { authorization: `Bearer ${bearer}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5_000),
+    });
+    return { status: response.status, body: await response.json() as { messages?: any[] } };
+  };
+  check((await relay("/messages", undefined, "wrong-token")).status === 401, "recording transport admitted a bad token");
+  check((await relay("/messages")).body.messages?.length === 0, "missing dm controls sent a message");
+  stack.sql(`BEGIN;
+    INSERT INTO sessions.session_intel_controls(scope,feature,enabled,updated_by) VALUES ('global','dm',true,'fixture');
+    INSERT INTO sessions.session_intel_controls(scope,org_id,workspace_id,feature,enabled,updated_by)
+      VALUES ('workspace',${q(a.org)},${q(a.workspace)},'dm',true,'fixture');
+    ${directory("dm-high-a", "dm-high")}${directory("dm-high-b", "dm-high")}
+    ${fact("dm-high-a", ["src/dm-high/shared.ts"])}${fact("dm-high-b", ["src/dm-high/shared.ts"])}
+    ${directory("dm-low-a", "dm-low")}${directory("dm-low-b", "dm-low")}
+    ${fact("dm-low-a", ["src/dm-low/a.ts"])}${fact("dm-low-b", ["src/dm-low/b.ts"])} COMMIT;`);
+  await waitFor("recorded HIGH sends and delivered rows", async () => {
+    const high = rows().filter((r) => r[0].startsWith(session("dm-high-")));
+    return high.length === 2 && high.every((r) => r[5] === "delivered") ? true : undefined;
+  });
+  const recorded = (await relay("/messages")).body.messages!;
+  check(recorded.length === 2, `expected two HIGH sends, got ${recorded.length}`);
+  check(new Set(recorded.map((m) => m.to.sessionId)).size === 2 && recorded.every((m) => [session("dm-high-a"), session("dm-high-b")].includes(m.to.sessionId)), "wrong recorded recipients");
+  check(recorded.every((m) => m.text.includes("concurrent_edit") && m.advisoryId && m.orgId === a.org && m.workspaceId === a.workspace), "sender lost bounded message or tenant fields");
+  const dmLow = rows().filter((r) => r[0].startsWith(session("dm-low-")));
+  check(dmLow.length === 2 && dmLow.every((r) => r[5] === "pending"), "LOW missing or pushed");
+
+  // A refused HTTP send remains available to pull, never marked delivered.
+  check((await relay("/mode", { rejectSends: true })).status === 200, "failed to set refusal mode");
+  before = scanLines().length;
+  stack.sql(`BEGIN; ${directory("dm-fail-a", "dm-fail")}${directory("dm-fail-b", "dm-fail")}
+    ${fact("dm-fail-a", ["src/dm-fail/shared.ts"])}${fact("dm-fail-b", ["src/dm-fail/shared.ts"])} COMMIT;`);
+  await scanAfter(before, /dmFailed=2\s/u);
+  const failed = rows().filter((r) => r[0].startsWith(session("dm-fail-")));
+  check(failed.length === 2 && failed.every((r) => r[5] === "pending"), "refused send was marked delivered");
+  check((await request(path("dm-fail-a"))).body.advisories.length === 1, "refused send disappeared from pull");
+  check((await relay("/messages")).body.messages?.length === 2, "refusal recorded a delivered message");
+  check((await relay("/mode", { rejectSends: false })).status === 200, "failed to reset refusal mode");
+  before = scanLines().length;
+  stack.sql(`BEGIN;
+    UPDATE sessions.session_intel_controls SET enabled=false,updated_at=now(),updated_by='fixture'
+      WHERE scope='workspace' AND org_id=${q(a.org)} AND workspace_id=${q(a.workspace)} AND feature='dm';
+    ${directory("dm-off-a", "dm-off")}${directory("dm-off-b", "dm-off")}
+    ${fact("dm-off-a", ["src/dm-off/shared.ts"])}${fact("dm-off-b", ["src/dm-off/shared.ts"])} COMMIT;`);
+  await scanAfter(before, /written=2\s/u);
+  const dmOff = rows().filter((r) => r[0].startsWith(session("dm-off-")));
+  check(dmOff.length === 2 && dmOff.every((r) => r[5] === "pending"), "disabled DM control still pushed");
+  check((await relay("/messages")).body.messages?.length === 2, "DM control flip was not observed");
+  return "HIGH collision + LOW overlap; fleet silent; tenant isolation; cited pull; missing-workspace refusal; idempotent recipient ack; durable cooldown/cap; uncached controls; recorded HTTP sender authenticates and delivers HIGH only, refusals stay pending (no real Relay routing)";
 }

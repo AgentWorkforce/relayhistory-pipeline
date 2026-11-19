@@ -25,7 +25,7 @@ export interface PipelineStack extends StackSession {
   image: string;
   keys: LocalKeys;
   summaryMasterKeys: string;
-  urls: { ingestS3: string; minio: string; alleyoop: string };
+  urls: { ingestS3: string; minio: string; alleyoop: string; coordinationRelay: string };
   store(bucket: string): ReturnType<typeof createS3Store>;
   /** psql as the database owner inside the db container: tab-separated rows. */
   sql(query: string): string[][];
@@ -42,7 +42,9 @@ export function createPipelineStack(project = `rh-pipe-${randomBytes(4).toString
   const base = createStack({
     files: [fileURLToPath(new URL("compose.yaml", import.meta.url))],
     project,
-    extraEnv: { E2E_JWKS_JSON: JSON.stringify(keys.jwks), E2E_SUMMARY_MASTER_KEYS: summaryMasterKeys, E2E_IMAGE: image },
+    extraEnv: { E2E_JWKS_JSON: JSON.stringify(keys.jwks), E2E_SUMMARY_MASTER_KEYS: summaryMasterKeys, E2E_IMAGE: image,
+      E2E_COORDINATION_RELAY_TOKEN: randomBytes(32).toString("hex"),
+      E2E_COORDINATION_RELAY_FIXTURE: fileURLToPath(new URL("coordination-relay.ts", import.meta.url)) },
   });
   const hostPort = (service: string, port: string) => {
     const out = base.compose(["port", service, port], { quiet: true, allowFail: true }).stdout.trim();
@@ -56,12 +58,13 @@ export function createPipelineStack(project = `rh-pipe-${randomBytes(4).toString
   stack.image = image;
   stack.keys = keys;
   stack.summaryMasterKeys = summaryMasterKeys;
-  stack.urls = { ingestS3: "", minio: "", alleyoop: "" };
+  stack.urls = { ingestS3: "", minio: "", alleyoop: "", coordinationRelay: "" };
   stack.resolvePipelineUrls = (services) => {
     stack.urls.minio = hostPort("minio", "9000");
     if (services.includes("session-ingest")) stack.resolveUrls();
     if (services.includes("session-ingest-s3")) stack.urls.ingestS3 = hostPort("session-ingest-s3", "8081");
     if (services.includes("alleyoop-ingest")) stack.urls.alleyoop = hostPort("alleyoop-ingest", "8080");
+    if (services.includes("coordination-advisor")) stack.urls.coordinationRelay = hostPort("coordination-relay", "3123");
   };
   stack.store = (bucket) => createS3Store({
     bucket, region: "us-east-1", endpoint: stack.urls.minio,
