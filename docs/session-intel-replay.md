@@ -15,7 +15,9 @@ This harness only reads a snapshot. Producing one from real sessions is M0-2: it
   - **Directory fields:** `orgId`, `workspaceId`, `harness`, `sessionId`, `projectId`, `repo`, `branch`, `title`, `userId`, `taskRef`, `parentSessionIds`, `createdAt`, `lastActivityAt`.
   - **`shortSummary`:** a string, or `{"text"}`, or `{"timeline": [{"at", "text"}]}`.
   - **Facts shaped like `LaneFacts`:** `writes` `[{path, ts, eventId, kind, branch}]`, `commits` `[{sha, ts, eventId}]`, `outcomes` `[{key, ts, eventId, reverted}]` and `usage` `[{ts, eventId, tokens, costUsdMicros}]`.
-  - **`claims`:** `[{at, kind: intent|constraint|decision, text, confidence, evidenceIds}]`, reserved for the M1/M2 detectors. The advisor never reads them.
+  - **`claims`:** `[{id?, at, kind: intent|constraint|decision, scope?: session|project|repo, text, confidence, evidenceIds, supersededAt?}]`, read by the M2 conflict detectors ([session-intel-conflicts.md](session-intel-conflicts.md)). The advisor never reads them. `id` is unique within the session; it matches `[A-Za-z0-9_.-]{1,128}`, and when absent it is `c<index>`, the claim's position in the list. `scope` defaults to `session`. `supersededAt`, when set, is not before `at`.
+
+The format stays `session-intel-snapshot/1`: `id`, `scope` and `supersededAt` are optional, so a snapshot written without them still loads, with the same meaning. A loader from before them refuses a snapshot that uses them (unknown field), so the fields are never silently dropped. Because `snapshot.ts` and `views.ts` are hashed into the advisor's detector params, this change gave every advisor detector a new hash. No held-out score exists yet, so no score is affected.
 
 The loader:
 
@@ -32,6 +34,7 @@ At a simulated `now`:
 
 - A session exists once `createdAt <= now`.
 - A fact is visible only when `ts < now`. That is the production readers' `ts < until` bound.
+- A claim is visible only when `at < now`. Its `supersededAt` appears only once `supersededAt < now`; before that, the view leaves the field out, so a detector cannot learn that a supersession is coming.
 - Directory `last_activity_at` is the latest visible fact. The final `lastActivityAt` is used only once `now` reaches it.
 - The short summary is the latest timeline entry at or before `now`. A summary with no timeline is visible only from `lastActivityAt`, so it never leaks early.
 - `parentSessionIds`, `projectId`, `repo` and `title` are treated as known from creation.
@@ -59,7 +62,7 @@ The parts the scan calls:
 - **sentAt.** For HIGH it is the tick of the recorded DM; for LOW it is the tick the row became available to the pull path.
 - **Incomplete replays.** Its diagnostics are the summed `ScanStats`. A replay where any workspace scan `failed` or any row was `rejected` is incomplete. `alerts.json` (format `session-intel-replay/2`) records the reasons in `incomplete`, and the CLI exits 1. Dev scoring reports the reasons. Held-out scoring refuses an incomplete replay, before anything is recorded.
 
-The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). Fix the interval for a study: a different `--interval-ms` is a new detector hash, and would buy another held-out score. It keeps each alert's first `sentAt` and orders alerts deterministically. M2's intent and constraint detectors plug in behind the same interface.
+The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). Fix the interval for a study: a different `--interval-ms` is a new detector hash, and would buy another held-out score. It keeps each alert's first `sentAt` and orders alerts deterministically. M2's conflict detectors (`conflict-rule`, `conflict-model`) plug in behind the same interface. `--detectors` picks them by name: `coordination-advisor` (the default) and `conflict-rule`. The CLI refuses `conflict-model`, because it has no model transport.
 
 ## Classes
 
@@ -146,7 +149,7 @@ The packet never shows the class; the private key records it. The artifact itsel
 ## How to run
 
 ```sh
-bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <eval>/replay [--interval-ms 120000]
+bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <eval>/replay [--interval-ms 120000] [--detectors coordination-advisor,conflict-rule]
 bun run src/session-intel/replay/cli.ts score    --alerts <eval>/replay/alerts.json --labels <labels.json> --out <eval>/score [--split heldout]
 bun run src/session-intel/replay/cli.ts packet   --alerts <eval>/replay/alerts.json [--alerts ...] --seed <seed> --out <eval>/packet
 bun run src/session-intel/replay/cli.ts verdicts --key <eval>/packet/key.json --verdicts <verdicts.jsonl> --out <eval>/verdicts
