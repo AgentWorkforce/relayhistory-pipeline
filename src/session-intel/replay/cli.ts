@@ -5,7 +5,7 @@
  * Outputs carry session ids, so --out must be outside this repository (a synthetic run may pass --allow-repo-out).
  *
  *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N]
- *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force] [--budget N]
+ *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force [--reason <text>]] [--budget N]
  *   bun run src/session-intel/replay/cli.ts packet   --alerts <alerts.json> [--alerts ...] --seed <s> --out <dir> [--budget N]
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
  */
@@ -83,7 +83,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     args: rest, strict: true, allowPositionals: false,
     options: {
       snapshot: { type: "string" }, out: { type: "string" }, "interval-ms": { type: "string" },
-      alerts: { type: "string", multiple: true }, labels: { type: "string" }, split: { type: "string" }, force: { type: "boolean" },
+      alerts: { type: "string", multiple: true }, labels: { type: "string" }, split: { type: "string" }, force: { type: "boolean" }, reason: { type: "string" },
       budget: { type: "string" }, seed: { type: "string" }, key: { type: "string" }, verdicts: { type: "string" },
       "allow-repo-out": { type: "boolean" },
     },
@@ -120,7 +120,8 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const labelsSha256 = labelsDigest(labelBytes);
     const report = scoreReplay(result, labels, { split, labelsSha256, budgetPer100: budget });
     // The ledger is checked and written before the held-out numbers are written or shown anywhere.
-    if (split === "heldout") await recordHeldoutScoring(out, result, labelsSha256, { force: values.force === true, now: io.now });
+    if (values.reason !== undefined && values.force !== true) throw new Error("--reason is only for a --force held-out re-score");
+    if (split === "heldout") await recordHeldoutScoring(out, result, labelsSha256, { force: values.force === true, reason: values.reason, now: io.now });
     // Split-named reports: a dev run never overwrites the held-out report, which cannot be recomputed.
     await writeAtomic(join(out, `report.${split}.json`), json(report));
     await writeAtomic(join(out, `report.${split}.md`), scoreMarkdown(report));

@@ -84,7 +84,7 @@ Scoring is class-aware, using the alert taxonomy (docs/proposals/session-intelli
 
 Two verdicts agree when the classes they confirm intersect (`real_overlap` and `collision` agree), or when neither confirms a class and they are the same verdict. Consensus and agreement use this rule, so mixing the M0 vocabulary with the precise one is not counted as disagreement.
 
-`classes.ts` is hashed (`classMapSha256`). The hash is in every score report and in each held-out ledger entry. The held-out repeat check is per (detector hash, class map). A ledger entry from before class maps blocks every map.
+`classes.ts` is hashed (`classMapSha256`). The hash is in every score report and in each held-out ledger entry. It is never part of the held-out repeat check: a detector hash scored on held-out is refused again whatever the class map, because re-scoring after a class-map edit is tuning on held-out. `--force` lets a repeat through; the ledger entry records both hashes, `forced: true`, and the `--reason` text when one is given.
 
 ## Labels, scoring and adjudication
 
@@ -118,7 +118,7 @@ For each mode, the scorer reports per detector: per (urgency, kind) row, per ale
 
 It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, `planned_fleet` or `none`; or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both reports.
 
-Scoring uses `dev` unless you pass `--split heldout`. Reports are split-named (`report.dev.{json,md}`, `report.heldout.{json,md}`), so a dev run never overwrites the held-out report. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused unless `--force`, which is recorded as forced. A different `--out` or an edited `alerts.json` gets round the ledger: it is a protocol aid, not a control. Keep one evaluation directory per study.
+Scoring uses `dev` unless you pass `--split heldout`. Reports are split-named (`report.dev.{json,md}`, `report.heldout.{json,md}`), so a dev run never overwrites the held-out report. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused, whatever the class map, unless `--force`. A forced repeat is recorded as forced, with the optional `--reason` text. A different `--out` or an edited `alerts.json` gets round the ledger: it is a protocol aid, not a control. Keep one evaluation directory per study.
 
 `packet` pools each detector's top K and merges the same (pair, artifact) across detectors, keeping one member per detector. The same replay given twice is refused: the same file, or the same detector hash on the same snapshot. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `collision`, `overlap`, `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa (with 0/1 weights from the agreement rule above), and takes the majority verdict for each alert by class (a tie is `unclear`). The report format is `session-intel-verdicts/2`. It reports precision two ways, both excluding `unclear`:
 
