@@ -102,12 +102,34 @@ export function claimKeywordTopics(text: string, known: ReadonlyMap<string, read
   return out;
 }
 
+/** A claim's text, parsed once: its path topics (with directories) and its candidate keywords. */
+export interface ParsedClaimText { pathDirs: Map<string, string[]>; keywords: string[] }
+const PARSED_MAX = 20_000;
+const parsed = new Map<string, ParsedClaimText>();
+/**
+ * Memoised per claim text (bounded; the oldest entry is dropped first). Pair matching asks for the same claim's
+ * topics once per pair, so without this every live claim was re-parsed for every pair.
+ */
+export function parseClaimText(text: string): ParsedClaimText {
+  let p = parsed.get(text);
+  if (!p) {
+    p = { pathDirs: claimPathTopicDirs(text), keywords: words(text).filter((w) => w.length >= 4 && !GENERIC_DIRS.has(w)) };
+    if (parsed.size >= PARSED_MAX) parsed.delete(parsed.keys().next().value!);
+    parsed.set(text, p);
+  }
+  return p;
+}
+
 /**
  * All of a claim's topics in the context of the other side: the paths it names, and the other side's known
  * topics (its write topics and its claims' path topics) that it names by a word.
  */
 export function claimTopics(text: string, otherKnown: ReadonlyMap<string, readonly string[]>): string[] {
-  return [...new Set([...claimPathTopics(text), ...claimKeywordTopics(text, otherKnown)])];
+  const p = parseClaimText(text);
+  const out = new Set(p.pathDirs.keys());
+  for (const [topic, dirs] of otherKnown)
+    if (dirs.some((d) => !GENERIC_DIRS.has(d) && p.keywords.some((w) => sameWord(w, d)))) out.add(topic);
+  return [...out];
 }
 
 /** The write topics of a list of writes, each with its directory segments. */

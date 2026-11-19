@@ -7,7 +7,7 @@ import { conflictCandidates, fleetOf, MAX_PAIRS_PER_WORKSPACE } from "../conflic
 import {
   buildJudgeInput, citable, constraintOwner, decide, REPO_POLICY_OWNER, validateCitations, type BuiltInput, type JudgeOutput,
 } from "../conflict/classify.ts";
-import { oppositeOf, parseConstraint, pathMatches, ruleClassify } from "../conflict/judges.ts";
+import { oppositeOf, parseConstraint, pathMatches, ruleClassify, segmentMatches } from "../conflict/judges.ts";
 import { claimPathTopics, claimTopics, pathTopic, writeTopics } from "../conflict/topics.ts";
 import { parseSession, SnapshotError } from "../replay/snapshot.ts";
 import { asOfSession, type AsOfSession } from "../replay/views.ts";
@@ -198,6 +198,41 @@ describe("M2-2 vetoes (deterministic, before and after the judge)", () => {
   });
 });
 
+describe("which actions may make an alert HIGH", () => {
+  const commit = (eventId: string, hm: string) => ({ sha: `sha-${eventId}`, ts: at(hm), eventId });
+  test("a commit or outcome counts only in an in-topic write's event; an off-topic commit is never an action", () => {
+    const b = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project" })] },
+      actor("09:40", { commits: [commit("w1", "09:40"), commit("other", "09:45")], outcomes: [{ key: "k", ts: at("09:46"), eventId: "other2", reverted: false }] }));
+    // The commit in the write's own event is the same action (one event id); the other commit and outcome are not actions.
+    expect(b.input.b.actions.map((x) => [x.kind, x.eventId, x.topic])).toEqual([["write", "w1", "supabase-migrations"]]);
+    // A side whose only in-topic action is elsewhere: its unrelated commit does not make a violation HIGH.
+    const off = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project" })] },
+      { writes: [write("src/elsewhere/a.ts", "09:20", "wx")], commits: [commit("cx", "09:50")],
+        claims: [claim("i1", "09:30", "intent", "Add a migration in supabase/migrations.")] });
+    expect(off.input.b.actions).toEqual([]);
+    const v = validateCitations(off, ruleClassify(off.input));
+    if (!v.ok || v.verdict === "none") throw new Error("expected a violation");
+    expect(decide(off.input, v.c, { fleet: false, orchestratorSessionIds: [] })).toMatchObject({ urgency: "low", action: null });
+    expect(validateCitations(off, { verdict: "constraint_violation", claimIds: ["claude:s-a#k1"], actionId: "claude:s-b@cx" })).toEqual({ ok: false, reason: "unknown_id" });
+  });
+
+  test("an action earlier than the acting claim never makes an intent conflict HIGH; the earliest later one is chosen", () => {
+    const decision = { claims: [claim("d1", "09:15", "decision", "Advisories return 501 when the flag is off in src/advisories.")] };
+    const intent = (writes: ReturnType<typeof write>[]) => ({ writes, claims: [claim("i1", "09:40", "intent", "Return 404 when the flag is off in src/advisories.")] });
+    const early = built(decision, intent([write("src/advisories/a.ts", "09:20", "w-early")]));
+    const v = validateCitations(early, ruleClassify(early.input));
+    if (!v.ok || v.verdict === "none") throw new Error("expected a conflict");
+    expect(v.verdict).toBe("intent_conflict");
+    expect(decide(early.input, v.c, { fleet: false, orchestratorSessionIds: [] })).toMatchObject({ urgency: "low", action: null });
+    expect(validateCitations(early, { verdict: "intent_conflict", claimIds: ["claude:s-a#d1", "claude:s-b#i1"], actionId: "claude:s-b@w-early" }))
+      .toEqual({ ok: false, reason: "action_before_claim" });
+    const mixed = built(decision, intent([write("src/advisories/a.ts", "09:20", "w-early"), write("src/advisories/c.ts", "09:50", "w-late2"), write("src/advisories/b.ts", "09:45", "w-late1")]));
+    const m = validateCitations(mixed, ruleClassify(mixed.input));
+    if (!m.ok || m.verdict === "none") throw new Error("expected a conflict");
+    expect(decide(mixed.input, m.c, { fleet: false, orchestratorSessionIds: [] })).toMatchObject({ urgency: "high", action: { eventId: "w-late1" } });
+  });
+});
+
 describe("the rule judge (conservative lexical baseline)", () => {
   test("constraint parsing: negation, verb, target", () => {
     expect(parseConstraint(CONSTRAINT)).toEqual({ verb: null, writeish: true, paths: ["supabase/migrations"], head: null });
@@ -222,6 +257,23 @@ describe("the rule judge (conservative lexical baseline)", () => {
     expect(pathMatches(`${"*a".repeat(60)}`, `${"a".repeat(300)}b`)).toBe(false);
     expect(pathMatches("**/**/**/migrations/*", "db/migrations/1.sql")).toBe(true);
     expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("the lander's pattern: x/*a*a*a*a*a*a*a*b against 80 a's finishes in under 50 ms (no regex backtracking)", () => {
+    const started = performance.now();
+    expect(pathMatches("x/*a*a*a*a*a*a*a*b", `x/${"a".repeat(80)}`)).toBe(false);
+    expect(pathMatches("x/*a*a*a*a*a*a*a*b", `x/${"a".repeat(4_000)}`)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(50);
+    expect(pathMatches("x/*a*a*a*a*a*a*a*b", `x/${"a".repeat(80)}b`)).toBe(true);
+    expect(pathMatches("x/*", "x".repeat(5_000))).toBe(false); // the subject cap
+  });
+
+  test("segment star match", () => {
+    const table: Array<[string, string, boolean]> = [
+      ["*", "", true], ["*", "abc", true], ["a*c", "abc", true], ["a*c", "abd", false], ["*.sql", "1.sql", true], ["*.sql", "1.sq", false],
+      ["a*b*c", "aXbYc", true], ["a*b*c", "acb", false], ["", "", true], ["", "a", false], ["abc", "abc", true], ["*a*", "bbb", false],
+    ];
+    for (const [p, s, want] of table) expect([p, s, segmentMatches(p, s)]).toEqual([p, s, want]);
   });
 
   test("an action id present on both sides is ambiguous and refused", () => {
