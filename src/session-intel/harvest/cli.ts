@@ -5,7 +5,11 @@
  *
  *   op read 'op://<vault>/<item>/salt' | op run -- bun run src/session-intel/harvest/cli.ts \
  *     --read-api <https url> --workspace <id> --since <iso> --until <iso> --out <dir> \
- *     --salt-stdin --delete-by <iso> [--org <label>] [--concurrency 2] [--max-requests 20000] [--partial]
+ *     --salt-stdin --delete-by <iso> [--require-list-backend union,supabase] [--org <label>] [--concurrency 2] \
+ *     [--max-requests 20000] [--partial]
+ *
+ * --require-list-backend is the default for a History API harvest: every frame page must say which store
+ * served it (X-Relayhistory-List-Served-By), and any page outside the set exits 4 (EXIT_UNVERIFIED).
  *
  * The bearer token comes only from SESSION_INTEL_READ_TOKEN (injected by `op run`); it is removed from this
  * process's environment once read and is never written, logged or echoed. The salt comes only from stdin.
@@ -17,9 +21,9 @@ import { basename, dirname, join } from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { HarvestError, parseReadApi, ReadApiClient, readToken, redact, RequestCapReached, TOKEN_ENV } from "./client.ts";
+import { HarvestError, LIST_BACKENDS, parseReadApi, ReadApiClient, readToken, redact, RequestCapReached, TOKEN_ENV } from "./client.ts";
 import {
-  buildReceipt, newState, progress, readState, RECEIPT_FILE, rowKey, runFacts, runFrame, runOutput, STATE_FILE, STATE_FORMAT,
+  buildReceipt, frameAttribution, newState, progress, readState, RECEIPT_FILE, rowKey, runFacts, runFrame, runOutput, STATE_FILE, STATE_FORMAT,
   StateLog, type HarvestParams, type HarvestState,
 } from "./harvest.ts";
 import { buildRows, readSaltStdin, type SaltInput } from "../import/cli.ts";
@@ -33,6 +37,8 @@ export const HARVEST_MAPPING_FORMAT = "session-intel-harvest-mapping/1";
 export const DELETE_BY_MAX_DAYS = 14;
 /** Exit code when the request cap stopped the harvest: the state is kept and a rerun resumes. */
 export const EXIT_CAPPED = 3;
+/** Exit code when --require-list-backend is set and a frame page was not verified: the receipt and snapshot are still written. */
+export const EXIT_UNVERIFIED = 4;
 const TENANT_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const REPO_ROOT = realpathSync(fileURLToPath(new URL("../../..", import.meta.url)));
 const DAY_MS = 86_400_000;
@@ -54,7 +60,7 @@ const defaultIo: HarvestIo = { out: (l) => console.log(l), err: (l) => console.e
 const OPTIONS = {
   "read-api": { type: "string" }, workspace: { type: "string" }, since: { type: "string" }, until: { type: "string" },
   out: { type: "string" }, "salt-stdin": { type: "boolean" }, "delete-by": { type: "string" }, org: { type: "string" },
-  concurrency: { type: "string" }, "max-requests": { type: "string" }, partial: { type: "boolean" },
+  concurrency: { type: "string" }, "max-requests": { type: "string" }, partial: { type: "boolean" }, "require-list-backend": { type: "string" },
 } as const;
 
 function int(raw: string | undefined, name: string, fallback: number, min: number, max: number): number {
@@ -63,6 +69,14 @@ function int(raw: string | undefined, name: string, fallback: number, min: numbe
   const n = Number(raw);
   if (n < min || n > max) throw new HarvestError(`${name} must be an integer from ${min} to ${max}`);
   return n;
+}
+/** --require-list-backend: a comma list of History API list stores (LIST_BACKENDS), sorted and deduplicated; null when absent. */
+function listBackends(raw: string | undefined): string[] | null {
+  if (raw === undefined) return null;
+  const values = [...new Set(raw.split(",").map((v) => v.trim()).filter(Boolean))].sort();
+  if (!values.length || values.some((v) => !(LIST_BACKENDS as readonly string[]).includes(v)))
+    throw new HarvestError(`--require-list-backend must be a comma list of ${LIST_BACKENDS.join(", ")} (for example union,supabase)`);
+  return values;
 }
 const strictIso = (raw: string | undefined, name: string): string => {
   if (!raw) throw new HarvestError(`${name} is required (ISO-8601 with a zone)`);
@@ -121,6 +135,7 @@ export async function main(argv: string[], io: HarvestIo = defaultIo): Promise<n
   checkDeleteBy(deleteBy, now, DELETE_BY_MAX_DAYS);
   const concurrency = int(values.concurrency, "--concurrency", 2, 1, 8);
   const maxRequests = int(values["max-requests"], "--max-requests", 20_000, 1, 1_000_000);
+  const requireListBackend = listBackends(values["require-list-backend"]);
   if (values["salt-stdin"] !== true) throw new HarvestError("--salt-stdin is required: pipe the salt from `op read`");
   if (!values.out) throw new HarvestError("--out is required");
   const out = realPathOf(values.out);
@@ -132,7 +147,7 @@ export async function main(argv: string[], io: HarvestIo = defaultIo): Promise<n
   // Out of this process's environment once read, so nothing loaded later can see it.
   if (env === process.env) delete process.env[TOKEN_ENV];
   try {
-    return await harvest({ io, clock, base, workspace, org, since, until, deleteBy, concurrency, maxRequests, out, token, partial: values.partial === true });
+    return await harvest({ io, clock, base, workspace, org, since, until, deleteBy, concurrency, maxRequests, out, token, partial: values.partial === true, requireListBackend });
   } catch (err) {
     // Every message leaving here is redacted against the token, whatever built it.
     if (err instanceof Error) err.message = redact(err.message, token);
@@ -142,12 +157,12 @@ export async function main(argv: string[], io: HarvestIo = defaultIo): Promise<n
 
 interface Run {
   io: HarvestIo; clock: () => Date; base: URL; workspace: string; org: string; since: string; until: string; deleteBy: string;
-  concurrency: number; maxRequests: number; out: string; token: string; partial: boolean;
+  concurrency: number; maxRequests: number; out: string; token: string; partial: boolean; requireListBackend: string[] | null;
 }
 
 async function harvest(r: Run): Promise<number> {
   const salt = await readSaltStdin(r.io.stdin ?? process.stdin);
-  const params: HarvestParams = { readApi: r.base.href, workspace: r.workspace, since: r.since, until: r.until, deleteBy: r.deleteBy };
+  const params: HarvestParams = { readApi: r.base.href, workspace: r.workspace, since: r.since, until: r.until, deleteBy: r.deleteBy, requireListBackend: r.requireListBackend };
   const { state, log } = await openState(r.out, params, r.clock());
   const client = new ReadApiClient({
     base: r.base, token: r.token, workspace: r.workspace, maxRequests: r.maxRequests, spent: state.requests, initial: state.stats,
@@ -218,10 +233,26 @@ async function harvest(r: Run): Promise<number> {
   if (censored.length) notes.push(`${censored.length} sessions' writes were cut at ${IMPORT_BOUNDS.facts} per session (facts.censoredByReason); `
     + `${censored.filter((f) => f.droppedWrites === null).length} of them stopped with pages unread, so their drop count is unknown`);
   if (state.statsPartial) notes.push(`request counts are partial: ${state.statsPartial}`);
-  const complete = !capped && state.frame.done && factsRead === state.frame.rows.length && failed === 0 && stats.oversizeSessions === 0 && censored.length === 0;
+  const sources = frameAttribution(state.frame.pageSources, state.params.requireListBackend);
+  if (sources.gated && sources.offendingPages)
+    notes.push(`frame_backend_unverified: ${sources.offendingPages} of ${state.frame.pages} frame pages were not served by ${sources.required!.join(" or ")} `
+      + "(X-Relayhistory-List-Served-By missing, unknown or outside --require-list-backend; frame.sources has the per-provider pages)");
+  if (sources.attribution === "unverified" && !sources.gated)
+    notes.push("source attribution is unverified: no --require-list-backend, and not every frame page carried the 96Bulls read API's marker; this receipt is not representative proof");
+  const incompleteReasons = [
+    ...(capped ? ["request_cap"] : []),
+    ...(!state.frame.done ? ["frame_not_exhausted"] : []),
+    ...(factsRead < state.frame.rows.length ? ["facts_not_read"] : []),
+    ...(failed ? ["events_not_served"] : []),
+    ...(stats.oversizeSessions ? ["oversize_sessions"] : []),
+    ...(censored.length ? ["writes_censored"] : []),
+    // Only a gated harvest is held incomplete by attribution; a record-only one says `unverified` instead.
+    ...(sources.gated && sources.attribution !== "verified" ? ["frame_backend_unverified"] : []),
+  ];
+  const complete = incompleteReasons.length === 0;
   const finishedAt = r.clock().toISOString();
   const receipt = buildReceipt({
-    state, stats: client.stats, finishedAt, workspaceHash: hasher.workspace(r.workspace), complete, notes, createdAt,
+    state, stats: client.stats, finishedAt, workspaceHash: hasher.workspace(r.workspace), complete, notes, incompleteReasons, createdAt,
     snapshot: { sessions: rows.length, writes: stats.writes, droppedPaths: stats.droppedPaths, oversizeSessions: stats.oversizeSessions },
   });
   const projects: Record<string, string> = {};
@@ -252,8 +283,14 @@ async function harvest(r: Run): Promise<number> {
   }
   await unlink(aside).catch(() => {});
   const frame = receipt.frame as { sessions: number; bySource: Record<string, number> };
-  r.io.out(`harvest: ${JSON.stringify({ complete, sessions: rows.length, frameSessions: frame.sessions, bySource: frame.bySource, writes: stats.writes, droppedPaths: stats.droppedPaths, requests: client.stats.requests })}`);
+  r.io.out(`harvest: ${JSON.stringify({ complete, incompleteReasons, sourceAttribution: sources.attribution, sessions: rows.length, frameSessions: frame.sessions, bySource: frame.bySource, writes: stats.writes, droppedPaths: stats.droppedPaths, requests: client.stats.requests })}`);
   r.io.out(`harvest: snapshot -> ${r.out}; private mapping -> ${mapping}`);
+  // Strict mode fails closed: the diagnostic receipt and snapshot are written, and the exit code says the
+  // frame's source could not be verified (the replay refuses the snapshot unless told otherwise).
+  if (sources.gated && sources.attribution !== "verified") {
+    r.io.err(`harvest: frame_backend_unverified: ${sources.offendingPages} of ${state.frame.pages} frame pages were not served by ${sources.required!.join(" or ")}; the snapshot is not representative`);
+    return EXIT_UNVERIFIED;
+  }
   return 0;
 }
 

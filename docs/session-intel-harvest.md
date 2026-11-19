@@ -16,6 +16,7 @@ op read 'op://<vault>/<item>/salt' | op run -- bun run src/session-intel/harvest
   --read-api https://<read-api host> --workspace <id> \
   --since <iso> --until <iso> --out <dir outside the repo> \
   --salt-stdin --delete-by <iso, at most 14 days out> \
+  --require-list-backend union,supabase \
   [--org <label>] [--concurrency 2] [--max-requests 20000] [--partial]
 bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/replay
 ```
@@ -31,7 +32,27 @@ bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/rep
 - **`--max-requests`** is 1 to 1,000,000 (default 20000). It caps every request, retries included, across the whole harvest (all runs of one `--out`).
 - **`--partial`**: when the cap is reached, write a snapshot of what was read instead of stopping. Its receipt says `complete: false`.
 
-Exit codes: 0 when the snapshot is written; 3 when the request cap stopped the harvest and its state was kept; 1 on any error.
+- **`--require-list-backend <csv>`**: the History API list stores every frame page must have been served by, from `neon`, `supabase`, `union` and `clickhouse` (see Source attribution). **This is the default for every History API harvest**: `union,supabase`. It may be omitted only when `--read-api` is the 96Bulls read API itself. It is bound to the harvest like `--since` and `--until`: a resume with another setting, or with none, is refused.
+
+Exit codes:
+- 0: the snapshot is written;
+- 3: the request cap stopped the harvest, and its state was kept;
+- 4: `--require-list-backend` is set and a frame page was not verified. The diagnostic receipt and snapshot are still written, and the replay refuses them;
+- 1: any error.
+
+## Source attribution
+
+**Source attribution is part of acceptance, not optional.** A History API list page served by `neon` lacks native Claude and Codex sessions: that is the coverage bug this harvest exists to avoid. Every `GET /v1/sessions` page from the History API carries `X-Relayhistory-List-Served-By` (`neon`, `supabase`, `union` or `clickhouse`).
+
+- **Recording.** The harvest records each frame page's value, and the 96Bulls read API's own `X-Sessions-Read-Backend`, separately. Every page counts, including an empty page (zero rows and a cursor) and an empty last page. A missing header is recorded as `missing`. The markers are checked page by page, never inferred from the aggregate header counts. They are persisted in the state log with each page, so a resume keeps them.
+- **Gating.** With `--require-list-backend`, any page whose header is missing, unknown or outside the set is offending. The frame is then `complete: false`, with reason `frame_backend_unverified` and the offending page count, and the harvest exits 4. The setting is fixed when the harvest starts. A harvest started record-only can never be resumed as strict and then report itself verified; the resume is refused.
+- **The 96Bulls read API.** It has no list store to name. Its pages carry `X-Sessions-Read-Backend: 96bulls`. Without the flag, a frame in which every page carries that marker is attributed `read_worker`.
+- **Record only.** Without the flag, and without that marker on every page, the tallies are still recorded, but nothing is gated and the attribution is `unverified`. **A record-only run is never accepted as representative proof.** The replay refuses its snapshot unless `--allow-incomplete-coverage` is given, and then the replay is incomplete and never held-out scored. Record-only runs are for exploration.
+
+The receipt carries `sourceAttribution` (`verified`, `read_worker` or `unverified`) and `frame.sources`. `frame.sources` holds:
+- the required set, and whether the frame was gated;
+- the offending page count;
+- per provider, for both headers: the page count, and the first and last page number (1-based).
 
 ## What it reads
 
@@ -69,7 +90,7 @@ It never calls the turns, summary, titles, metadata, digest, search or users rou
 - **The branch of each write.** Events carry no branch, so the session's `catalog.gitBranch` is used.
 - **The session's cwd.** An absolute `filesTouched` path is kept only when it can be anchored at a source root; otherwise it is dropped and counted.
 - **The org id**: see `--org`.
-- **A contract version or readiness field.** The read routes carry none (`/health` answers `{ok: true}` only and is not called). The receipt records the `X-Sessions-Read-Backend`, `X-Relayhistory-Buffered`, `X-Sessions-Read-Incomplete` and `X-Sessions-Read-Continuation` values it saw instead.
+- **A contract version or readiness field.** The read routes carry none (`/health` answers `{ok: true}` only and is not called). Instead, the receipt records the `X-Sessions-Read-Backend`, `X-Relayhistory-List-Served-By`, `X-Relayhistory-Buffered`, `X-Sessions-Read-Incomplete` and `X-Sessions-Read-Continuation` values it saw. Those of each frame page are recorded per page (see Source attribution).
 
 So a harvested snapshot cannot raise `superseded_work` (it needs reverts) or duplicate-cost evidence (it needs usage). Score those rows as insufficient for a harvested cohort.
 
@@ -79,7 +100,9 @@ So a harvested snapshot cannot raise `superseded_work` (it needs reverts) or dup
 
 The receipt is the point of the harvest. `coverage.json` (`session-intel-harvest-receipt/1`) sits in the snapshot directory and is listed with its sha256 in the manifest, so the loader verifies it. It records:
 
-- **`complete`**: true only when the frame was exhausted, every session's events were read, none was refused or censored, and no session was dropped for size;
+- **`complete`**: true only when the frame was exhausted, every session's events were read, none was refused or censored, no session was dropped for size, and (with `--require-list-backend`) every frame page was verified;
+- **`incompleteReasons`**: a code for each reason `complete` is false. The codes are `request_cap`, `frame_not_exhausted`, `facts_not_read`, `events_not_served`, `oversize_sessions`, `writes_censored` and `frame_backend_unverified`;
+- **`sourceAttribution`** and **`frame.sources`**: see Source attribution;
 - **`workspaceId`** (hashed) and the **`window`**;
 - **`startedAt`, `finishedAt` and `runs`**: the first run's start, the last run's end, and how many runs it took;
 - **`requests`**: the total, the count per route, the retries, how many waits honoured a `Retry-After`, and the time waited, cumulative over every run (see Resume). `partial: true`, with a `partialReason`, marks them as lower bounds when a run ended without recording them;
@@ -132,7 +155,7 @@ The harvest reuses the M4 import's normalizer and writer (`src/session-intel/imp
 - the output counts;
 - each session's facts.
 
-A rerun with the same `--read-api`, `--workspace`, `--since`, `--until` and `--delete-by` continues from the last frame cursor and reads only the sessions that have no facts line yet. Other parameters are refused. A torn last line (a crash mid-write) is cut off before appending. Every line carries the client's cumulative counts (total, per route, retries, waits and header values), and each run ends with a `runEnd` line holding its final counts, written on success, on the cap and on an error. A resume restores them, so the receipt's counts cover every run and the cap covers the whole harvest. A run without a `runEnd` line (killed, or the machine went down) cannot be fully reconstructed: requests after its last line are lost, so the receipt marks the request counts `partial` and says why, rather than reporting a smaller number as exact. On success the state is removed. It moves aside while the writer runs, and comes back if the write fails.
+A rerun with the same `--read-api`, `--workspace`, `--since`, `--until`, `--delete-by` and `--require-list-backend` continues from the last frame cursor and reads only the sessions that have no facts line yet. Other parameters are refused. A torn last line (a crash mid-write) is cut off before appending. Every line carries the client's cumulative counts (total, per route, retries, waits and header values), and each run ends with a `runEnd` line holding its final counts, written on success, on the cap and on an error. A resume restores them, so the receipt's counts cover every run and the cap covers the whole harvest. A run without a `runEnd` line (killed, or the machine went down) cannot be fully reconstructed: requests after its last line are lost, so the receipt marks the request counts `partial` and says why, rather than reporting a smaller number as exact. On success the state is removed. It moves aside while the writer runs, and comes back if the write fails.
 
 The state holds raw read-API session ids, cursors, project ids, repository names (never the remote URL, which may carry credentials) and repo-relative paths (made so as each event is read, so no home directory or user name is kept). That is the same class of data as the mapping file, and never text, the token or the salt. Delete `--out` by `--delete-by` if a harvest is abandoned. A resume past `--delete-by` is refused.
 
