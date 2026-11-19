@@ -39,6 +39,7 @@ GET /v1/session-intel/workspace?workspace=<id>
       "urgency": "high",
       "kind": "duplicate_work",
       "class": "collision",
+      "priority": 1,
       "artifact": "supabase/migrations/062130_x.sql",
       "sessions": [{ "source": "claude", "sessionId": "<id>" }, { "source": "codex", "sessionId": "<id>" }],
       "createdAt": "2026-11-19T10:04:00.000Z",
@@ -82,6 +83,10 @@ id**, newest first (the earliest `created_at` of its rows), at most **100**.
 - `sessions`: the distinct recipient and peer sessions of its rows, byte-ordered. Two for a pair; at most 4 when the
   recipients name different peers (a planned-fleet conflict sent to two orchestrators).
 - `acked`: one entry per recipient row, with whether that recipient acked.
+- `priority`: 1, 2 or 3, from the same shared function as `GET /v1/coordination/advisories`
+  (`src/session-read-api/advisory-priority.ts`; see [the advisories doc](coordination-live-advisories.md), "Priority
+  and delivery"), applied to the advisory's urgency and kind. Desktop dedupes system notifications by `advisoryId`
+  per human per device (M3-9); until then the pull path is at-least-once.
 - `urgency`: `high` if any recipient row is HIGH. `deliveredAt`: the earliest delivery of any recipient (an ack also
   sets it). `evidence`: the distinct `{sessionId, eventId, ts, kind}` entries of its rows, at most 20.
 - `class`: the alert taxonomy's class of the kind at its urgency, as `src/session-intel/replay/classes.ts`

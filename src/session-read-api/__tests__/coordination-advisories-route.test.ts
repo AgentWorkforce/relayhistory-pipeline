@@ -31,7 +31,7 @@ function row(i: number, over: Partial<AdvisoryRow> = {}): AdvisoryRow {
     advisoryId: `${ADV.slice(0, 15)}${i.toString(16)}`, harness: "codex", sessionId: "s-1", peerHarness: "claude", peerSessionId: `p-${i}`,
     urgency: "high", kind: "concurrent_edit", artifact: "src/shared.ts",
     evidence: [{ sessionId: "s-1", eventId: `e-${i}`, ts: "2026-11-12T09:58:12.000Z", kind: "tool" }],
-    createdAt: new Date(Date.UTC(2026, 10, 12, 10, i)).toISOString(), ...over,
+    createdAt: new Date(Date.UTC(2026, 10, 12, 10, i)).toISOString(), deliveredAt: null, ...over,
   };
 }
 
@@ -131,13 +131,34 @@ describe("GET /v1/coordination/advisories", () => {
     expect(body.advisories).toHaveLength(10);
     expect(body.advisories.map((a: any) => a.advisoryId)).toEqual(rows.slice(0, 10).map((a) => a.advisoryId));
     const first = body.advisories[0];
-    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence"]);
+    // M3-7 appends priority and delivery; the eight original keys keep their order (additive, same contract).
+    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence", "priority", "delivery"]);
+    expect(first.priority).toBe(2);
+    expect(first.delivery).toEqual({ dm: false, deliveredAt: null });
     expect(first.peer).toEqual({ source: "claude", sessionId: "p-0" });
     expect(first.evidence).toEqual([{ sessionId: "s-1", eventId: "e-0", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }]);
     expect(first.message.length).toBeLessThanOrEqual(ADVISORY_MESSAGE_MAX);
     expect(first.message).toContain("codex:s-1 and claude:p-0 both wrote src/shared.ts");
     expect(first.message).toContain("first seen 2026-11-12T09:58:12.000Z");
     expect(mem.calls).toEqual([{ op: "pending", recipient: { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" } }]);
+  });
+
+  test("M3-7: priority by urgency and kind, and delivery from delivered_at (dm true only once the DM set it)", async () => {
+    const cases: Array<[Partial<AdvisoryRow>, number, { dm: boolean; deliveredAt: string | null }]> = [
+      [{ urgency: "high", kind: "duplicate_work", deliveredAt: "2026-11-12T10:05:00.000Z" }, 1, { dm: true, deliveredAt: "2026-11-12T10:05:00.000Z" }],
+      [{ urgency: "high", kind: "superseded_work" }, 1, { dm: false, deliveredAt: null }],
+      [{ urgency: "high", kind: "constraint_violation" }, 1, { dm: false, deliveredAt: null }],
+      [{ urgency: "high", kind: "intent_conflict" }, 1, { dm: false, deliveredAt: null }],
+      [{ urgency: "high", kind: "concurrent_edit" }, 2, { dm: false, deliveredAt: null }],
+      [{ urgency: "high", kind: "stale_base" }, 2, { dm: false, deliveredAt: null }],
+      [{ urgency: "low", kind: "intent_conflict" }, 3, { dm: false, deliveredAt: null }],
+      [{ urgency: "low", kind: "nearby_work" }, 3, { dm: false, deliveredAt: null }],
+    ];
+    const rows = cases.map(([over], i) => row(i, over));
+    const body = await (await api(true, memorySource(rows).source).request(base, { headers: auth })).json() as any;
+    expect(body.contract).toBe("coordination-advisories/1");
+    expect(body.advisories.map((a: any) => [a.kind, a.urgency, a.priority, a.delivery])).toEqual(
+      cases.map(([over, p, d]) => [over.kind, over.urgency, p, d]));
   });
 
   test("without evidence the message's first-seen is the row's createdAt", async () => {
@@ -244,7 +265,22 @@ describe("sqlCoordinationAdvisories", () => {
     const rows = await src.pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
     expect(seen).toEqual(["org/ws"]);
     expect(p.log).toEqual([expect.stringContaining('sessions.coordination_advisories_pending_for_v1 ["org","ws","codex","s-1"]')]);
-    expect(rows).toEqual([{ advisoryId: ADV, harness: "codex", sessionId: "s-1", peerHarness: "claude", peerSessionId: "p", urgency: "low", kind: "concurrent_edit", artifact: "src", evidence: [{ sessionId: "s-1", eventId: "e", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }], createdAt: "2026-11-12T10:04:00.000Z" }]);
+    expect(rows).toEqual([{ advisoryId: ADV, harness: "codex", sessionId: "s-1", peerHarness: "claude", peerSessionId: "p", urgency: "low", kind: "concurrent_edit", artifact: "src", evidence: [{ sessionId: "s-1", eventId: "e", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }], createdAt: "2026-11-12T10:04:00.000Z", deliveredAt: null }]);
+  });
+
+  test("pending selects the reader's delivered_at and maps it (M3-7); no reader change", async () => {
+    const p = pool((t) => t.includes("pending_for_v1") ? [{
+      advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "high",
+      kind: "duplicate_work", artifact: "m.sql", evidence: [], created_at: new Date("2026-11-12T10:04:00Z"), delivered_at: new Date("2026-11-12T10:05:00Z"),
+    }] : []);
+    const read = async <T,>(_org: string, _ws: string, work: (q: any) => Promise<T>) => {
+      const c = await p.pool.connect();
+      return work({ query: async (text: string, params?: unknown[]) => c.query(text, params) });
+    };
+    const rows = await sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never)
+      .pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
+    expect(p.log[0]).toMatch(/created_at, delivered_at\s+FROM sessions\.coordination_advisories_pending_for_v1/);
+    expect(rows[0]!.deliveredAt).toBe("2026-11-12T10:05:00.000Z");
   });
 
   test("ack runs in one READ WRITE transaction with the tenant bound, and rolls back on error", async () => {
