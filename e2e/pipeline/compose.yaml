@@ -24,6 +24,30 @@ x-hoop-env: &hoop-env
   ENVIRONMENT: local
   WORKER_HEALTH_PORT: "8081"
 services:
+  # Local synthetic proof only; production defaults remain off.
+  session-read-api:
+    environment:
+      READ_API_COORDINATION_ADVISORIES_ENABLED: "true"
+  coordination-advisor:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: coordination-advisor
+      SESSION_POSTGRES_TLS_PROFILE: custom-ca
+      SESSION_POSTGRES_CA_FILE: /certs/ca.crt
+      SESSION_POSTGRES_CA_SHA256: ${E2E_CA_SHA256:?}
+      COORDINATION_ADVISOR_ENABLED: "true"
+      COORDINATION_ADVISOR_FACTS_BACKEND: postgres
+      COORDINATION_ADVISOR_INTERVAL_SECONDS: "1"
+      COORDINATION_ADVISOR_PAIR_COOLDOWN_SECONDS: "21600"
+      COORDINATION_ADVISOR_SESSION_HOURLY_CAP: "3"
+      COORDINATION_ADVISOR_RELAY_DM_ENABLED: "false"
+      READ_API_DIRECTORY_WORKSPACES: ws_a
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    depends_on:
+      roles: { condition: service_completed_successfully }
+    restart: on-failure:5
   minio:
     ports: ["127.0.0.1::9000"]
   session-ingest-s3:

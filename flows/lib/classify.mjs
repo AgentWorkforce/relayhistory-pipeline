@@ -70,9 +70,10 @@ export const TARGETED_RULES = [
   [/^src\/(alleyoop|concourse)\//, COURIER],
   [/^src\/bob-costas\//, COURIER],
   [/^src\/referee\//, ["upload.courier", "index.hoop"]],
+  [/^packages\/coordination-detect\//, ["coordination.advisories"]],
   // Unit lanes only: no e2e step drives these.
   [/^src\/(session-brief|amp|canonical-project-events|session-analysis|search-features|history-db|proof|smoke|cli)\//, []],
-  [/^packages\/(session-read-worker|coordination-detect)\//, []],
+  [/^packages\/session-read-worker\//, []],
   [/^(scripts|benchmarks|runbooks|integration|certs|bin|agent)\//, []],
 ];
 
