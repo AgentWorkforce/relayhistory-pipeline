@@ -39,7 +39,8 @@ export function parseReadApi(raw: string | undefined): URL {
   if (url.protocol === "http:") {
     if (!LOOPBACK.has(url.hostname.toLowerCase())) throw new HarvestError("--read-api must be https (http is allowed for a loopback host only)");
   } else if (url.protocol !== "https:") throw new HarvestError("--read-api must be https (http is allowed for a loopback host only)");
-  url.pathname = url.pathname.replace(/\/+$/u, "");
+  // Repeated slashes collapse and a trailing one goes: the route join (ReadApiClient.url) adds exactly one.
+  url.pathname = url.pathname.replace(/\/{2,}/gu, "/").replace(/\/+$/u, "");
   return url;
 }
 
@@ -80,6 +81,8 @@ export interface ClientOptions {
   maxRequests: number;
   /** Requests already spent by earlier runs of the same harvest (the cap covers the whole harvest). */
   spent?: number;
+  /** The cumulative counts of earlier runs, restored from the state log, so a resume continues them. */
+  initial?: ClientStats | null;
   concurrency: number;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
@@ -118,7 +121,16 @@ export class ReadApiClient {
   private readonly clock: () => number;
 
   constructor(private readonly o: ClientOptions) {
-    this.stats = { requests: o.spent ?? 0, byRoute: {}, retries: 0, retryAfterHonoured: 0, waitedMs: 0, headers: {} };
+    const i = o.initial;
+    const n = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+    const counts = (v: unknown): Record<string, number> =>
+      v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, n(x)])) : {};
+    this.stats = {
+      // The total is the larger of the two records: `spent` is the state's maximum over every line.
+      requests: Math.max(o.spent ?? 0, n(i?.requests)),
+      byRoute: counts(i?.byRoute), retries: n(i?.retries), retryAfterHonoured: n(i?.retryAfterHonoured), waitedMs: n(i?.waitedMs),
+      headers: i?.headers && typeof i.headers === "object" ? Object.fromEntries(Object.entries(i.headers).map(([h, v]) => [h, counts(v)])) : {},
+    };
     this.f = o.fetch ?? fetch;
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.clock = o.clock ?? Date.now;
@@ -138,7 +150,8 @@ export class ReadApiClient {
     if (!(HARVEST_ROUTES as readonly string[]).includes(route)) throw new HarvestError("refused a route outside the harvest's list");
     const path = route === "/v1/sessions/:sessionId/events" ? `/v1/sessions/${encodeURIComponent(sessionId ?? "")}/events` : route;
     const url = new URL(this.o.base.href);
-    const want = `${this.o.base.pathname}${path}`;
+    // A host-root base has pathname "/": strip trailing slashes so the join has exactly one ("/v1/...", "/api/v1/...").
+    const want = `${this.o.base.pathname.replace(/\/+$/u, "")}${path}`;
     url.pathname = want;
     // The URL parser resolves dot segments (a session id of `..` or `%2e%2e` would climb to another
     // route): the path must come out exactly as built. And whatever built it, never a coordination route.
