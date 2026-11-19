@@ -130,7 +130,9 @@ export interface SessionPipelineInputs {
   /**
    * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
-   * 20 means up to 80 connections from this function alone.
+   * 20 means up to 80 connections from this function alone. It is also capped in practice by the
+   * account's Lambda concurrent-executions quota: this function has no reserved concurrency and
+   * also serves every schedule, so a value at or above the quota lets the queue starve them.
    */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
