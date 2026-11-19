@@ -31,11 +31,11 @@ import { CONSUMER_WORKER, outputFactsDeps } from "../consumer-service.ts";
 import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
 import {
-  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK, STAGED_FACTS_RECORD_BYTES_CAP, STAGED_FACTS_WIDE_TEXT_WEIGHT,
+  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK, STAGED_FACTS_RECORD_BYTES_CAP, STAGED_FACTS_WIDE_TEXT_WEIGHT, STAGED_REFUSAL_MAX_ENTRIES, STAGED_REFUSAL_TTL_MS, StagedRefusals,
   type SearchIndexDeps, type SearchIndexResult, type StagedReconcile,
 } from "../search-index.ts";
 import {
-  MAX_FACTS_CHUNK_INPUTS, OUTPUT_FACTS_CHUNK_UNSTAGEABLE, STAGED_OUTPUT_FACTS_FUNCTIONS, assertStagedOutputFactsSchema,
+  MAX_FACTS_CHUNK_INPUTS, MAX_STAGE_CALL_BYTES, OUTPUT_FACTS_CHUNK_UNSTAGEABLE, STAGED_OUTPUT_FACTS_FUNCTIONS, assertStagedOutputFactsSchema,
   postgresOutputFactsStore, stagedFactsSendLimit, unstageable,
 } from "../output-facts-store.ts";
 import { OUTPUT_FACTS_MAX_ITEMS_PER_INPUT } from "../output-facts.ts";
@@ -369,6 +369,179 @@ describe("staged output facts through the consumer wiring", () => {
     await checkFactsChunks(x);
     expect(FACTS_CHUNK_MAX_BYTES).toBe(16 * 1024 * 1024);
   }, 180_000);
+});
+
+/** The staged run summary lines a block of work logs (as staged-search-wiring.pglite.test.ts captures them). */
+async function summaries<T>(work: () => Promise<T>): Promise<{ value: T; lines: Array<Record<string, unknown>> }> {
+  const raw: string[] = [];
+  const stdout = process.stdout.write, stderr = process.stderr.write;
+  const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
+    ((chunk: unknown, ...rest: unknown[]) => {
+      raw.push(String(chunk));
+      return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
+    }) as typeof process.stdout.write;
+  process.stdout.write = tap(stdout, process.stdout);
+  process.stderr.write = tap(stderr, process.stderr);
+  try {
+    const value = await work();
+    const lines = raw.flatMap((l) => l.split("\n")).filter((l) => l.startsWith("{")).map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.message === "search index staged run");
+    return { value, lines };
+  } finally {
+    process.stdout.write = stdout;
+    process.stderr.write = stderr;
+  }
+}
+
+describe("G2 fast-fail: a cached size refusal skips the claim and the source read (StagedRefusals)", () => {
+  let x: ExportedScope;
+  beforeAll(async () => {
+    x = await exportStreamScope(generate(31), 1200);
+    cleanup.length = 0;
+  }, 180_000);
+  afterAll(() => x?.dispose());
+  afterEach(() => {
+    stagedFactsSendLimit.bytes = MAX_STAGE_CALL_BYTES;
+  });
+
+  /** A rig with the scope's facts reconciled whole, and a store that counts its object reads. */
+  const setup = async () => {
+    const r = await rig(x);
+    await r.tick(FACTS);
+    let reads = 0;
+    const counting = new Proxy(x.store, {
+      get(target, prop, receiver) {
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === "function" && String(prop).startsWith("get") ? (...a: unknown[]) => { reads += 1; return (v as (...b: unknown[]) => unknown).apply(target, a); } : v;
+      },
+    });
+    const attempts = async () => (await r.hoop.pg.query<{ a: number }>("SELECT attempts a FROM sessions.search_reconcile_runs_v1")).rows.map((q) => q.a);
+    const states = async () => (await r.hoop.pg.query<{ complete: boolean }>("SELECT complete FROM sessions.output_facts_session_state")).rows.map((q) => q.complete);
+    const pass = async (staged: StagedReconcile, extra: Partial<SearchIndexDeps> = {}) => {
+      reads = 0;
+      const out = await r.pass({ ...FACTS, store: counting as never, limits: STAGED_LIMITS, stream: UNLIMITED, staged, ...extra });
+      return { out, reads };
+    };
+    return { r, pass, attempts, states };
+  };
+  /** One pass abandoned by a size refusal (every chunk over the send limit). */
+  const refusedPass = async (t: Awaited<ReturnType<typeof setup>>, staged: StagedReconcile, extra: Partial<SearchIndexDeps> = {}) => {
+    stagedFactsSendLimit.bytes = 64;
+    try {
+      return await t.pass(staged, extra);
+    } finally {
+      stagedFactsSendLimit.bytes = MAX_STAGE_CALL_BYTES;
+    }
+  };
+
+  test("the next pass of the same stamp: no claim, no source read, the abandon's result and state, one summary line marked cached_refusal", async () => {
+    const t = await setup();
+    const staged = stagedOn();
+    const first = await refusedPass(t, staged);
+    expect(first.out).toMatchObject({ complete: false, reasons: [OUTPUT_FACTS_CHUNK_UNSTAGEABLE] });
+    expect(staged.refusals!.size).toBe(1);
+    const claimed = await t.attempts();
+    // With room again, the cached refusal still answers: nothing is claimed or read.
+    const { value: hit, lines } = await summaries(() => t.pass(staged));
+    expect(hit.out).toEqual({ ...first.out, ...(first.out.stream ? { stream: undefined } : {}) } as never);
+    expect(hit.out.reasons).toEqual([OUTPUT_FACTS_CHUNK_UNSTAGEABLE]);
+    expect(hit.out.partial).toBeUndefined();
+    expect(hit.out.stream).toBeUndefined();
+    expect(await t.attempts()).toEqual(claimed);
+    expect(hit.reads).toBeLessThan(first.reads);
+    // The search state and the facts state stay owing.
+    expect(t.r.recorded.at(-1)?.complete).toBe(false);
+    expect((await t.states()).every((c) => !c)).toBe(true);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ outcome: "incomplete", reason: OUTPUT_FACTS_CHUNK_UNSTAGEABLE, cached_refusal: true });
+    expect(lines[0]!.attempt).toBeUndefined();
+  }, 180_000);
+
+  test("a new stamp claims and runs again; a finished run clears the entry", async () => {
+    const t = await setup();
+    const staged = stagedOn();
+    await refusedPass(t, staged);
+    const before = await t.attempts();
+    await t.r.hoop.pg.exec("UPDATE sessions.session_directory SET event_projection_epoch = event_projection_epoch + 1");
+    const again = await t.pass(staged);
+    expect(again.out).toMatchObject({ complete: true });
+    expect(again.out.stream).toBeDefined();
+    expect(staged.refusals!.size).toBe(0);
+    expect(before.length).toBe(1);
+    expect(await t.attempts()).toEqual([]); // finished: the run row is gone
+    expect((await t.states()).every((c) => c)).toBe(true);
+  }, 180_000);
+
+  test("a fresh instance (a restart) does one full pass, then caches again", async () => {
+    const t = await setup();
+    await refusedPass(t, stagedOn());
+    const fresh = stagedOn();
+    const full = await refusedPass(t, fresh);
+    expect(full.out.reasons).toEqual([OUTPUT_FACTS_CHUNK_UNSTAGEABLE]);
+    expect(full.out.stream).toBeDefined(); // it read
+    expect(fresh.refusals!.size).toBe(1);
+    const n = await t.attempts();
+    expect((await t.pass(fresh)).out.stream).toBeUndefined();
+    expect(await t.attempts()).toEqual(n);
+  }, 180_000);
+
+  test("expiry: past 24 hours the next pass claims and runs again", async () => {
+    const t = await setup();
+    const staged = stagedOn();
+    await refusedPass(t, staged);
+    const day = new Date(NOW.getTime() + STAGED_REFUSAL_TTL_MS - 1);
+    expect((await t.pass(staged, { now: () => day })).out.stream).toBeUndefined();
+    const later = new Date(NOW.getTime() + STAGED_REFUSAL_TTL_MS);
+    const run = await t.pass(staged, { now: () => later });
+    expect(run.out).toMatchObject({ complete: true });
+    expect(run.out.stream).toBeDefined();
+    expect(staged.refusals!.size).toBe(0);
+  }, 180_000);
+
+  test("no entry for a stream budget, the attempts cap, a lost lease, a restart, or a thrown error", async () => {
+    const t = await setup();
+    const cases: Array<[string, StagedReconcile, Partial<SearchIndexDeps>]> = [
+      ["budget", stagedOn(), { stream: { maxReadBytes: 1, maxReadEvents: 1 } }],
+      ["attempts cap", stagedOn({ attemptsCap: { cap: 0, retryEvery: 1000 } }), {}],
+      ["lost lease", stagedOn({ boundary: async (p) => { if (p === "want:done") await t.r.hoop.pg.exec("DELETE FROM sessions.search_reconcile_runs_v1"); } }), {}],
+      ["restart", stagedOn({ boundary: async (p) => { if (p === "write:done") await t.r.hoop.pg.exec("UPDATE sessions.session_directory SET event_projection_epoch = event_projection_epoch + 1"); } }), {}],
+      ["thrown", stagedOn({ releaseOnError: false, boundary: (p) => { if (p === "want:done") throw new Kill(p); } }), {}],
+    ];
+    const seenReasons: string[] = [];
+    for (const [name, staged, extra] of cases) {
+      const out = (await t.pass(staged, extra)).out;
+      seenReasons.push(`${name}:${out.reasons.join(",")}`);
+      expect(staged.refusals!.size, name).toBe(0);
+      await t.r.hoop.pg.exec("DELETE FROM sessions.search_reconcile_runs_v1");
+    }
+    expect(seenReasons).toEqual([
+      "budget:scope_too_large,stream_read_bytes_budget",
+      "attempts cap:staged_run_failed",
+      "lost lease:staged_lease_lost",
+      "restart:stream_source_changed",
+      "thrown:staged_run_interrupted",
+    ]);
+  }, 180_000);
+
+  test("StagedRefusals: a new stamp replaces the entry, expiry drops it, the bound evicts the oldest", () => {
+    const c = new StagedRefusals(2, 1000);
+    c.set("a", "s1", "r", 0);
+    expect(c.hit("a", "s1", 999)).toBe("r");
+    expect(c.hit("a", "s2", 999)).toBeNull(); // another stamp (epoch or manifest fingerprint): dropped
+    expect(c.size).toBe(0);
+    c.set("a", "s1", "r", 0);
+    expect(c.hit("a", "s1", 1000)).toBeNull(); // expired
+    c.set("a", "s1", "r", 0);
+    c.set("b", "s1", "r", 1);
+    c.set("c", "s1", "r", 2); // over the bound: "a" goes
+    expect([c.size, c.hit("a", "s1", 3), c.hit("b", "s1", 3), c.hit("c", "s1", 3)]).toEqual([2, null, "r", "r"]);
+    c.set("b", "s1", "r", 4); // re-set moves it to the newest
+    c.set("d", "s1", "r", 5);
+    expect([c.hit("c", "s1", 6), c.hit("b", "s1", 6)]).toEqual([null, "r"]);
+    c.clear("b");
+    expect(c.hit("b", "s1", 6)).toBeNull();
+    expect([STAGED_REFUSAL_TTL_MS, STAGED_REFUSAL_MAX_ENTRIES]).toEqual([24 * 60 * 60 * 1000, 10_000]);
+  });
 });
 
 describe("the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP, wide text weighted)", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STAGED_KEYED_RECORDS_CAP, STREAM_READ_CEILING, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamChFromEnv, searchIndexStreamFromEnv } from "../search-index.ts";
+import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STAGED_KEYED_RECORDS_CAP, STREAM_READ_CEILING, StagedRefusals, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamChFromEnv, searchIndexStreamFromEnv } from "../search-index.ts";
 
 const MiB = 1024 * 1024;
 const NAMES = ["SEARCH_INDEX_MAX_SCOPE_BYTES", "SEARCH_INDEX_MAX_SCOPE_EVENTS", "SEARCH_INDEX_MAX_ROWS"] as const;
@@ -164,12 +164,12 @@ describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Pha
     // The cap never asks for more key memory than the default streaming budgets already stream.
     expect(STAGED_KEYED_RECORDS_CAP).toBeLessThanOrEqual(STREAM_READ_CEILING.maxReadEvents / 4);
     expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, false)).toEqual({
-      staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP },
+      staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) },
       notice: { level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", fields: { state: "on" } },
     });
     // Streaming resolved on by default (SEARCH_INDEX_STREAMING_ENABLED unset) is enough.
     const defaultOn = searchIndexStreamFromEnv({}, {}, false);
-    expect(searchIndexStagedStartup({ [VAR]: "true" }, defaultOn, false)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP });
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, defaultOn, false)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) });
   });
 
   test("true needs streaming on, naming the variables; with output facts it starts (slice 2c stages them)", () => {
@@ -179,7 +179,12 @@ describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Pha
     // Streaming explicitly off resolves to no budgets: refused the same way.
     expect(refusal({ [VAR]: "true" }, searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, false), false)).toContain("requires the streaming reconcile on");
     // Output facts on: started with streaming on, refused without it, as without facts.
-    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, true)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP });
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, true)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) });
+    // Each start holds its own (empty) cached size refusals.
+    const a = searchIndexStagedStartup({ [VAR]: "true" }, stream, true)!.staged.refusals;
+    const b = searchIndexStagedStartup({ [VAR]: "true" }, stream, true)!.staged.refusals;
+    expect(a).not.toBe(b);
+    expect([a!.size, b!.size]).toEqual([0, 0]);
     expect(refusal({ [VAR]: "true" }, undefined, true)).toBe(
       "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
     );
