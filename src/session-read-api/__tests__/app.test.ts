@@ -564,6 +564,9 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     expect(eventQueries()).toHaveLength(1);
     const statePages = queries.map((query, i) => ({ query, params: params[i]! })).filter(({ query }) => query.includes("in_workspace"));
     expect(statePages).toHaveLength(2);
+    expect(statePages.every(({ query }) => query.includes("HAVING argMax(needs_full, synced_at) = 1"))).toBe(true);
+    expect(statePages.every(({ query }) => query.includes("WHERE session_id > {after:String}"))).toBe(true);
+    expect(statePages.every(({ query }) => query.includes("WHERE org_id = {org:String} AND workspace_id = {ws:String} AND session_id IN"))).toBe(true);
     expect(statePages.map(({ params }) => params.after)).toEqual(["", [...many].sort()[PARTIAL_SESSIONS_CAP - 1]]);
     expect(statePages.map(({ params }) => params.page)).toEqual([PARTIAL_SESSIONS_CAP, PARTIAL_SESSIONS_CAP]);
     expect(calls.livePointerSessions.map((ids) => ids.length)).toEqual([PARTIAL_SESSIONS_CAP, 1]);
