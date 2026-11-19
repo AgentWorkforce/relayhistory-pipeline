@@ -227,6 +227,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105062160_session_intel_controls.sql",
       // Session intelligence workspace view: two read-API readers; no G4 function names them, no ingest path calls them.
       "20261105062170_session_intel_workspace.sql",
+      // Claims scheduler: a ledger table, two service-role functions, two owner-only admission helpers and the
+      // replaced analysis_request_v1; no G4 function names them, no ingest path calls them.
+      "20261105062180_claims_scheduler.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

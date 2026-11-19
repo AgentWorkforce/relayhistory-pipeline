@@ -11,6 +11,7 @@ import { PGlite, type Transaction } from "../../../packages/pipeline/node_module
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { claimsHook, postgresClaimsPort } from "../../session-analysis/claims.ts";
+import { sessionIntelControls } from "../../shared/session-intel-controls.ts";
 import { decisionRecordsHook, postgresDecisionRecordsSink } from "../../session-analysis/decision-records.ts";
 import type { SessionAnalysisSnapshot } from "../../session-analysis/engine/session-analysis-result.ts";
 import type { AnalysisJob, AnalysisJobOutput } from "../../session-analysis/processor.ts";
@@ -309,7 +310,9 @@ describe("20261105062150 relayfacts claims", () => {
   test("the extractor through the real functions: decisions through v1 as before, claims through the claims writer; a dropped claim is superseded", async () => {
     await reset();
     const exec = { query: <R,>(text: string, params?: unknown[]) => as("service_role", async (tx) => (await tx.query<R>(text, params)) as { rows: R[] }) } as never;
-    const port = postgresClaimsPort(exec);
+    // The workspace's 'claims' control on (062160), read through the shared reader as the worker does.
+    await db.exec("INSERT INTO sessions.session_intel_controls (scope, org_id, workspace_id, feature, enabled, updated_by) VALUES ('global', NULL, NULL, 'claims', true, 'test'), ('workspace', 'org-a', 'ws-a', 'claims', true, 'test') ON CONFLICT DO NOTHING");
+    const port = postgresClaimsPort(exec, sessionIntelControls(exec));
     const sink = postgresDecisionRecordsSink(exec);
     const refs = [
       { id: "h0", source: "claude", kind: "human-message", sessionId: "sess-root", at: "2026-11-18T10:05:00Z" },
@@ -350,6 +353,14 @@ describe("20261105062150 relayfacts claims", () => {
     // An older analysis whose hook runs late supersedes nothing.
     await hook(snap(["Never apply migrations to a real database."], new Date(Date.now() - 3_600_000).toISOString()), counts);
     expect(counts.claim_records_superseded).toBe(1);
+    // The workspace control off: decisions still go through v1; no claim is written.
+    await db.exec("UPDATE sessions.session_intel_controls SET enabled = false WHERE scope = 'workspace' AND feature = 'claims'");
+    const before = await claims();
+    const off: Record<string, number> = {};
+    await hook(snap(["A brand new rule for everyone."], new Date(Date.now() + 60_000).toISOString()), off);
+    expect(off).toEqual({ decision_records: 1, claim_records_control_off: 1 });
+    expect(await claims()).toEqual(before);
+    await db.exec("UPDATE sessions.session_intel_controls SET enabled = true WHERE scope = 'workspace' AND feature = 'claims'");
   });
 });
 
