@@ -137,6 +137,33 @@ describe("claimScope: table-driven, ambiguity is session", () => {
   });
 });
 
+describe("N1: a bad timestamp drops its claim, never the batch", () => {
+  const NOW = Date.parse("2026-11-18T12:00:00Z");
+  const r = (at: string | null) => ({ source: "claude", sessionId: "s", index: 0, kind: null, at });
+  test("before 1970 or more than a day ahead is a bad time (undefined); the bounds themselves are kept", () => {
+    expect(claimObservedAt([r("1969-12-31T23:59:59Z")], NOW)).toBeUndefined();
+    expect(claimObservedAt([r("-000500-01-01T00:00:00Z")], NOW)).toBeUndefined();
+    expect(claimObservedAt([r("+275760-09-13T00:00:00Z")], NOW)).toBeUndefined();
+    expect(claimObservedAt([r("2026-11-19T12:00:00.001Z")], NOW)).toBeUndefined();
+    expect(claimObservedAt([r("1970-01-01T00:00:00Z")], NOW)).toBe("1970-01-01T00:00:00.000Z");
+    expect(claimObservedAt([r("2026-11-19T12:00:00Z")], NOW)).toBe("2026-11-19T12:00:00.000Z");
+    // The earliest decides: a good later time does not rescue a bad earlier one.
+    expect(claimObservedAt([r("2026-11-18T10:00:00Z"), r("1900-01-01T00:00:00Z")], NOW)).toBeUndefined();
+  });
+  test("the hook drops only the bad claim, writes the rest and counts the drop", async () => {
+    const refs = [ref("h0", "human-message", "sess-root", "2026-11-18T10:05:00Z"), ref("bad", "assistant-message", "sess-root", "1900-01-01T00:00:00Z")];
+    const s = snapshot({ constraints: [claim("Never push main.", ["h0"]), claim("A claim from 1900.", ["bad"])] }, { refs });
+    const { extractClaims } = await import("../claims.ts");
+    expect(extractClaims(s, NOW)).toMatchObject({ badTime: 1, records: [{ title: "Never push main." }] });
+    const sent: number[] = [];
+    const { port } = fakePort([], { insert: async (_s, recs) => { sent.push(recs.length); return { inserted: recs.length, merged: 0, evidence_added: recs.length }; } });
+    const counts: Record<string, number> = {};
+    await claimsHook(port, counts)({ orgId: "o", workspaceId: "w" } as AnalysisJob, { result: { analysis: s } } as unknown as AnalysisJobOutput);
+    expect(sent).toEqual([1]);
+    expect(counts).toEqual({ claim_records: 1, claim_records_bad_time: 1 });
+  });
+});
+
 describe("claimObservedAt", () => {
   test("the earliest parseable time among the cited references, else null", () => {
     const r = (at: string | null) => ({ source: "claude", sessionId: "s", index: 0, kind: null, at });

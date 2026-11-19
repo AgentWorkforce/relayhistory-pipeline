@@ -17,6 +17,7 @@
  * onCompleted). Its failures are counted and contained.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
+import { log } from "../shared/log.ts";
 import type { SessionAnalysisSnapshot } from "./engine/session-analysis-result.ts";
 import type { AnalysisJob, AnalysisJobOutput } from "./processor.ts";
 import {
@@ -108,15 +109,25 @@ export function claimScope(input: ScopeInput): ClaimScope {
   return SCOPE_RULES.find((rule) => rule.test(input))?.scope ?? "session";
 }
 
-/** The earliest parseable `at` among the cited references, as ISO 8601; null if none. */
-export function claimObservedAt(cited: readonly CitedReference[]): string | null {
+/** The earliest an observed_at may be (1970-01-01T00:00:00Z) and how far ahead of now it may run (one day). */
+export const OBSERVED_AT_MIN_MS = 0;
+export const OBSERVED_AT_MAX_AHEAD_MS = 24 * 3600 * 1000;
+
+/**
+ * The earliest parseable `at` among the cited references, as ISO 8601; null if none parses. `undefined` when that
+ * earliest time is outside 1970-01-01 .. now + 1 day (a bad timestamp): the caller drops the claim, so one bad
+ * reference never fails the batch.
+ */
+export function claimObservedAt(cited: readonly CitedReference[], nowMs: number = Date.now()): string | null | undefined {
   let earliest: number | null = null;
   for (const r of cited) {
     if (r.at === null) continue;
     const ms = Date.parse(r.at);
     if (Number.isFinite(ms) && (earliest === null || ms < earliest)) earliest = ms;
   }
-  return earliest === null ? null : new Date(earliest).toISOString();
+  if (earliest === null) return null;
+  if (earliest < OBSERVED_AT_MIN_MS || earliest > nowMs + OBSERVED_AT_MAX_AHEAD_MS) return undefined;
+  return new Date(earliest).toISOString();
 }
 
 /**
@@ -124,7 +135,13 @@ export function claimObservedAt(cited: readonly CitedReference[]): string | null
  * (kind, topic, title key). A repeated claim widens its evidence as decision-records.ts does, its
  * scope only widens and its observed_at only moves earlier.
  */
-export function extractClaimRecords(snapshot: SessionAnalysisSnapshot): ClaimRecordInput[] {
+export function extractClaimRecords(snapshot: SessionAnalysisSnapshot, nowMs: number = Date.now()): ClaimRecordInput[] {
+  return extractClaims(snapshot, nowMs).records;
+}
+
+/** extractClaimRecords, plus the number of claims dropped for a bad timestamp (claimObservedAt undefined). */
+export function extractClaims(snapshot: SessionAnalysisSnapshot, nowMs: number = Date.now()): { records: ClaimRecordInput[]; badTime: number } {
+  let badTime = 0;
   const position = referencePositions(snapshot);
   const topic = decisionTopic(snapshot.metrics?.filesChanged ?? []);
   const root = { source: snapshot.source, sessionId: snapshot.sessionId };
@@ -135,7 +152,8 @@ export function extractClaimRecords(snapshot: SessionAnalysisSnapshot): ClaimRec
       const cut = cutClaim(claim, position);
       if (!cut) continue;
       const scope = claimScope({ text: cut.statement, cited: cut.cited, root });
-      const observed = claimObservedAt(cut.cited);
+      const observed = claimObservedAt(cut.cited, nowMs);
+      if (observed === undefined) { badTime += 1; continue; }
       const dedupe = `${kind}\u0000${topic}\u0000${decisionTitleKey(cut.title)}`;
       const existing = records.get(dedupe);
       if (existing) {
@@ -149,7 +167,7 @@ export function extractClaimRecords(snapshot: SessionAnalysisSnapshot): ClaimRec
       });
     }
   }
-  return [...records.values()];
+  return { records: [...records.values()], badTime };
 }
 
 /** One current record from relayfacts_claims_v1, as the supersession step reads it. */
@@ -253,7 +271,8 @@ export async function supersedeDroppedClaims(
 /**
  * The claims part of the analysis tick's completion hook with SESSION_INTEL_CLAIMS_ENABLED (the worker runs
  * it after decisionRecordsHook, which is unchanged): writes the job's claims in the job's own workspace,
- * then supersedes dropped claims. Counts `claim_records` (claims sent), `claim_records_fenced` (RH016, an
+ * then supersedes dropped claims. A claim whose earliest cited time is out of range is dropped alone
+ * (`claim_records_bad_time`, one warning line with the count). Counts `claim_records` (claims sent), `claim_records_fenced` (RH016, an
  * erased session), `claim_records_failed`, `claim_records_superseded` and `claim_supersede_failed`; never
  * throws, never logs.
  */
@@ -266,7 +285,12 @@ export function claimsHook(
     const snapshot = output.result.analysis;
     let records: ClaimRecordInput[];
     try {
-      records = extractClaimRecords(snapshot);
+      const extracted = extractClaims(snapshot);
+      records = extracted.records;
+      if (extracted.badTime > 0) {
+        counts.claim_records_bad_time = (counts.claim_records_bad_time ?? 0) + extracted.badTime;
+        log.warn("claim records dropped", { stage: "claims", reason: "observed_at_out_of_range", count: extracted.badTime });
+      }
       if (records.length === 0) return;
       await port.insert(scope, records);
       counts.claim_records = (counts.claim_records ?? 0) + records.length;
