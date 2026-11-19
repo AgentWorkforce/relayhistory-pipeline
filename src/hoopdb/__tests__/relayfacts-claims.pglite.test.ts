@@ -170,7 +170,9 @@ describe("20261105062150 relayfacts claims", () => {
     expect(await bad({ kind: "decision" })).toBe("22023");
     expect(await bad({ scope: "global" })).toBe("22023");
     expect(await bad({ observed_at: 12 })).toBe("22023");
-    expect(await bad({ observed_at: "not a time" })).toBe("22007");
+    // observed_at: a finite ISO 8601 timestamp with a zone only; keywords and zone-less or date-only values refuse.
+    for (const t of ["not a time", "now", "infinity", "-infinity", "epoch", "today", "2026-11-18", "2026-11-18 10:00:00", "2026-11-18T10:00:00"])
+      expect([t, await bad({ observed_at: t })]).toEqual([t, "22023"]);
     expect(await bad({ status: "superseded" })).toBe("22023");
     expect(await bad({ evidence: [] })).toBe("22023");
     expect(await bad({ evidence: Array.from({ length: 11 }, (_, i) => ev(`s${i}`)) })).toBe("22023");
@@ -194,12 +196,17 @@ describe("20261105062150 relayfacts claims", () => {
     // Narrower scope, later time, no new evidence: nothing changes.
     expect(await claim("org-a", "ws-a", [claimRec({ scope: "session", observed_at: "2026-11-18T11:00:00Z" })])).toEqual({ inserted: 0, merged: 1, evidence_added: 0 });
     expect(await stamp()).toBe(before);
-    // Wider scope and an earlier time: both move, and updated_at with them; a null time never clears one.
+    // Wider scope and an earlier time without new evidence: nothing moves either (only a merge that adds evidence
+    // moves them, so a write whose evidence is all known, or dropped at the cap, cannot widen a claim).
     expect(await claim("org-a", "ws-a", [claimRec({ scope: "repo", observed_at: "2026-11-18T09:00:00Z" })])).toEqual({ inserted: 0, merged: 1, evidence_added: 0 });
+    expect(await stamp()).toBe(before);
+    expect((await claims()).filter((r) => r.kind === "constraint").map((r) => [r.scope, r.observed_at])).toEqual([["project", "2026-11-18 10:00:00+00"]]);
+    // With a new evidence row: both move, and updated_at with them; a null time never clears one.
+    expect(await claim("org-a", "ws-a", [claimRec({ scope: "repo", observed_at: "2026-11-18T09:00:00Z", evidence: [ev("sess-8")] })])).toEqual({ inserted: 0, merged: 1, evidence_added: 1 });
     expect(await stamp()).not.toBe(before);
     await claim("org-a", "ws-a", [claimRec({ observed_at: null, evidence: [ev("sess-9")] })]);
     expect((await claims()).map((r) => [r.kind, r.scope, r.observed_at, r.title, r.evidence])).toEqual([
-      ["constraint", "repo", "2026-11-18 09:00:00+00", "Use keyset paging", ["claude/sess-1", "claude/sess-2", "claude/sess-3", "claude/sess-9"]],
+      ["constraint", "repo", "2026-11-18 09:00:00+00", "Use keyset paging", ["claude/sess-1", "claude/sess-2", "claude/sess-3", "claude/sess-8", "claude/sess-9"]],
       ["intent", "session", null, "Use keyset paging", ["claude/sess-1"]],
     ]);
     // The decision is untouched by any of this.
@@ -407,6 +414,51 @@ describe("20261105062150 erases reach the claims", () => {
     expect(await code(claim("org-u", "ws-u", [claimRec({ title: "Late", evidence: [ev("u-1", "Late.")] })]))).toBe("RH016");
     expect((await db.query<{ r: Record<string, number> }>("SELECT sessions.relayfacts_user_erase_v1('req-u','org-u','ws-u','user-u') AS r")).rows[0]!.r)
       .toEqual({ sessions: 1, fencesAdded: 0, evidenceRows: 0, recordsDeleted: 0, recordsRewritten: 0 });
+  });
+
+  test("F1: at the 50-row cap a late write from a fenced session is refused before any write; it cannot widen scope or move observed_at", async () => {
+    // 50 evidence rows from other sessions, so a merge would add none and never reach the row guard.
+    await claim("org-u", "ws-u", [claimRec({ title: "Full", scope: "session", observed_at: "2026-11-18T10:00:00Z", evidence: [ev("seed-0")] })]);
+    for (let i = 0; i < 5; i++) await claim("org-u", "ws-u", [claimRec({ title: "Full", evidence: Array.from({ length: 10 }, (_, j) => ev(`seed-${1 + i * 10 + j}`)) })]);
+    const full = async () => (await db.query<{ scope: string; observed_at: string; n: number }>(
+      "SELECT c.scope, c.observed_at::text observed_at, (SELECT count(*)::int FROM sessions.relayfacts_claim_evidence_v1 e WHERE e.claim_id = c.id) n FROM sessions.relayfacts_claims_v1 c WHERE c.org_id='org-u' AND c.title='Full'")).rows[0]!;
+    expect(await full()).toEqual({ scope: "session", observed_at: "2026-11-18 10:00:00+00", n: 50 });
+    // u-1 is fenced by the per-user erase (062100), the earlier test's; a probe of each fence table.
+    expect((await db.query("SELECT 1 FROM sessions.relayfacts_erasure_fences WHERE org_id='org-u' AND session_id='u-1'")).rows).toHaveLength(1);
+    const late = claimRec({ title: "Full", scope: "repo", observed_at: "2000-01-01T00:00:00Z", evidence: [ev("u-1", "Late.")] });
+    expect(await code(claim("org-u", "ws-u", [late]))).toBe("RH016");
+    // A batch mixing a clean record with the fenced one is refused as a whole.
+    expect(await code(claim("org-u", "ws-u", [claimRec({ title: "Clean", evidence: [ev("clean-1")] }), late]))).toBe("RH016");
+    expect(await full()).toEqual({ scope: "session", observed_at: "2026-11-18 10:00:00+00", n: 50 });
+    expect((await db.query("SELECT 1 FROM sessions.relayfacts_claims_v1 WHERE title='Clean'")).rows).toHaveLength(0);
+    // The per-session fence (062090, session_erasure_fences) is checked the same way.
+    await db.query("INSERT INTO sessions.relayfacts_claims_v1 (org_id, workspace_id, kind, topic, title, statement) VALUES ('org-a','ws-a','constraint','src-session-read-api','Cap A','s')");
+    const capId = (await db.query<{ id: string }>("SELECT id FROM sessions.relayfacts_claims_v1 WHERE title='Cap A'")).rows[0]!.id;
+    await db.query("INSERT INTO sessions.relayfacts_claim_evidence_v1 (claim_id, source, session_id, turn_start, turn_end, claim) SELECT $1, 'claude', 'cap-' || g, 0, 1, 'c' FROM generate_series(1, 50) g", [capId]);
+    expect((await db.query("SELECT 1 FROM sessions.session_erasure_fences WHERE org_id='org-a' AND workspace_id='ws-a' AND source='claude' AND session_id='s-1'")).rows.length).toBeGreaterThan(0);
+    expect(await code(claim("org-a", "ws-a", [claimRec({ title: "Cap A", scope: "repo", observed_at: "2000-01-01T00:00:00Z", evidence: [ev("s-1", "Late.")] })]))).toBe("RH016");
+    expect((await db.query<{ scope: string; o: string | null }>("SELECT scope, observed_at::text o FROM sessions.relayfacts_claims_v1 WHERE id=$1", [capId])).rows[0]).toEqual({ scope: "session", o: null });
+    // An unfenced session at the cap merges but moves nothing (no evidence row was added).
+    expect(await claim("org-a", "ws-a", [claimRec({ title: "Cap A", scope: "repo", observed_at: "2000-01-01T00:00:00Z", evidence: [ev("other-1")] })])).toEqual({ inserted: 0, merged: 1, evidence_added: 0 });
+    expect((await db.query<{ scope: string; o: string | null }>("SELECT scope, observed_at::text o FROM sessions.relayfacts_claims_v1 WHERE id=$1", [capId])).rows[0]).toEqual({ scope: "session", o: null });
+  });
+
+  test("N2: supersede takes the 062100 shared lock before its row locks", async () => {
+    await claim("org-l", "ws-l", [claimRec({ title: "Old L", evidence: [ev("l-9")] }), claimRec({ title: "New L", evidence: [ev("l-9")] })]);
+    const id = async (t: string) => (await db.query<{ id: string }>("SELECT id FROM sessions.relayfacts_claims_v1 WHERE title=$1", [t])).rows[0]!.id;
+    const [o, n] = [await id("Old L"), await id("New L")];
+    const shared = await db.transaction(async (tx) => {
+      await tx.exec("SET LOCAL ROLE service_role");
+      expect((await tx.query<{ ok: boolean }>("SELECT sessions.relayfacts_claims_supersede_v1('org-l','ws-l',$1,$2) ok", [o, n])).rows[0]!.ok).toBe(true);
+      return (await tx.query<{ n: number }>("SELECT count(*)::int n FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND mode='ShareLock'")).rows[0]!.n;
+    });
+    expect(shared).toBe(1);
+    const src = bodyOf(SQL, "relayfacts_claims_supersede_v1", "$relayfacts_claims_supersede$");
+    expect(src.indexOf("pg_advisory_xact_lock_shared")).toBeGreaterThan(-1);
+    expect(src.indexOf("pg_advisory_xact_lock_shared")).toBeLessThan(src.indexOf("FOR UPDATE"));
+    const ins = bodyOf(SQL, "relayfacts_claims_insert_v1", "$relayfacts_claims_insert$");
+    expect(ins.indexOf("pg_advisory_xact_lock_shared")).toBeLessThan(ins.indexOf("relayfacts_erasure_fences"));
+    expect(ins.indexOf("relayfacts_erasure_fences")).toBeLessThan(ins.indexOf("INSERT INTO sessions.relayfacts_claims_v1"));
   });
 
   test("062100 lock: claim writes take the shared lock the per-user erase takes exclusively", async () => {
