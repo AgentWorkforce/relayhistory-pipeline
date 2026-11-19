@@ -119,21 +119,48 @@ describe("G3: the class-map hash", () => {
     expect(scoreReplay(result([]), labels, { split: "dev", labelsSha256: H }).classMapSha256).toBe(CLASS_MAP_SHA256);
   });
 
-  test("the held-out ledger records it; a repeat is refused for the same map and for a legacy entry without one", async () => {
+  test("held-out once is per detector hash whatever the class map; a forced re-score records both hashes and the reason", async () => {
     const out = tmp();
     const r = result([]);
-    await recordHeldoutScoring(out, r, H);
-    expect(JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries[0].classMapSha256).toBe(CLASS_MAP_SHA256);
-    await expect(recordHeldoutScoring(out, r, H)).rejects.toThrow("with this class map");
-    // Another class map is another scoring configuration.
-    await recordHeldoutScoring(out, r, H, { classMapSha256: "c".repeat(64) });
+    await recordHeldoutScoring(out, r, H, { now: new Date(at("09:00")) });
+    // The same detector with the same map, and with an edited map: both refused (editing the map is tuning on held-out).
+    await expect(recordHeldoutScoring(out, r, H)).rejects.toThrow("whatever the class map");
     await expect(recordHeldoutScoring(out, r, H, { classMapSha256: "c".repeat(64) })).rejects.toThrow("already scored");
-    // A legacy entry (no class map) blocks every map.
+    // The refusals wrote nothing.
+    expect(JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries).toHaveLength(1);
+    await recordHeldoutScoring(out, r, H, { classMapSha256: "c".repeat(64), force: true, reason: "class map fix after review", now: new Date(at("10:00")) });
+    const entries = JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries;
+    expect(entries).toEqual([
+      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("09:00"), classMapSha256: CLASS_MAP_SHA256, forced: false },
+      { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("10:00"), classMapSha256: "c".repeat(64), forced: true, reason: "class map fix after review" },
+    ]);
+    // A forced repeat without a reason is recorded as forced, with no reason.
+    await recordHeldoutScoring(out, r, H, { force: true });
+    expect(JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries[2]).toMatchObject({ forced: true, classMapSha256: CLASS_MAP_SHA256 });
+    expect(JSON.parse(readFileSync(join(out, LEDGER_FILE), "utf8")).entries[2].reason).toBeUndefined();
+    await expect(recordHeldoutScoring(out, r, H, { force: true, reason: " " })).rejects.toThrow("--reason");
+    // A legacy entry (no class map) also blocks.
     const legacy = tmp();
     writeFileSync(join(legacy, LEDGER_FILE), JSON.stringify({ format: "session-intel-scored-hashes/1", entries: [
       { detector: "d1", detectorHash: H, split: "heldout", labelsSha256: H, manifestSha256: H, scoredAt: at("09:00"), forced: false },
     ] }));
     await expect(recordHeldoutScoring(legacy, r, H, { classMapSha256: "d".repeat(64) })).rejects.toThrow("already scored");
+  });
+
+  test("the CLI takes --reason only with --force and writes it to the ledger", async () => {
+    const dir = tmp();
+    const file = join(dir, "alerts.json");
+    writeFileSync(file, JSON.stringify(result([])));
+    const labelsFile = join(dir, "labels.json");
+    writeFileSync(labelsFile, JSON.stringify({ incidents: [], hardNegatives: [] }));
+    const io = { out: () => {}, err: () => {} };
+    const args = ["score", "--alerts", file, "--labels", labelsFile, "--out", join(dir, "s"), "--split", "heldout"];
+    expect(await main(args, io)).toBe(0);
+    await expect(main([...args, "--reason", "x"], io)).rejects.toThrow("only for a --force");
+    await expect(main(args, io)).rejects.toThrow("already scored");
+    expect(await main([...args, "--force", "--reason", "relabel of inc-7"], io)).toBe(0);
+    expect(JSON.parse(readFileSync(join(dir, "s", LEDGER_FILE), "utf8")).entries.map((e: { forced: boolean; reason?: string }) => [e.forced, e.reason ?? null]))
+      .toEqual([[false, null], [true, "relabel of inc-7"]]);
   });
 });
 

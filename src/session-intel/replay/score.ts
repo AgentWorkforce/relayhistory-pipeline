@@ -276,10 +276,16 @@ export function assertScorable(result: Pick<ReplayResult, "incomplete">, split: 
 }
 
 export interface LedgerEntry {
-  detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string; forced: boolean;
-  /** The class map the held-out score used. An entry without one (written before classes) matches every class map. */
+  detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string;
+  /** The class map the held-out score used (absent on entries written before class maps). Recorded, never part of the repeat key. */
   classMapSha256?: string;
+  /** A repeat that --force let through. */
+  forced: boolean;
+  /** Why it was forced (--reason), when given. */
+  reason?: string;
 }
+
+export const MAX_FORCE_REASON = 500;
 export interface Ledger { format: typeof LEDGER_FORMAT; entries: LedgerEntry[] }
 
 export function readLedger(outDir: string): Ledger {
@@ -292,24 +298,27 @@ export function readLedger(outDir: string): Ledger {
 
 /**
  * The held-out-once rule: refuses (before anything is written) when a detector hash in `result` was already
- * scored on held-out with this class map, unless `force`; then records every hash with the class map. Dev
- * scoring never touches the ledger.
+ * scored on held-out, whatever the class map: re-scoring after a class-map edit is tuning on held-out. `force`
+ * lets the repeat through and records it as forced, with the reason when given. Every entry records both the
+ * detector hash and the class map. Dev scoring never touches the ledger.
  */
 export async function recordHeldoutScoring(outDir: string, result: ReplayResult, labelsSha256: string,
-  opts: { force?: boolean; now?: Date; classMapSha256?: string } = {}): Promise<Ledger> {
+  opts: { force?: boolean; reason?: string; now?: Date; classMapSha256?: string } = {}): Promise<Ledger> {
   assertScorable(result, "heldout");
+  if (opts.reason !== undefined && (!opts.reason.trim() || opts.reason.length > MAX_FORCE_REASON))
+    throw new Error(`score: --reason must be 1..${MAX_FORCE_REASON} characters`);
   const classMapSha256 = opts.classMapSha256 ?? CLASS_MAP_SHA256;
   const ledger = readLedger(outDir);
-  const done = new Set(ledger.entries.filter((e) => e.split === "heldout" && (e.classMapSha256 === undefined || e.classMapSha256 === classMapSha256))
-    .map((e) => e.detectorHash));
+  const done = new Set(ledger.entries.filter((e) => e.split === "heldout").map((e) => e.detectorHash));
   const repeat = result.detectors.filter((d) => done.has(d.hash));
   if (repeat.length && !opts.force)
-    throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")} with this class map; a detector is scored on held-out once (--force overrides and is recorded)`);
+    throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")}; a detector is scored on held-out once, whatever the class map (--force overrides and is recorded)`);
   const scoredAt = (opts.now ?? new Date()).toISOString();
   const next: Ledger = {
     format: LEDGER_FORMAT,
     entries: [...ledger.entries, ...result.detectors.map((d): LedgerEntry => ({
-      detector: d.name, detectorHash: d.hash, split: "heldout", labelsSha256, manifestSha256: result.snapshot.manifestSha256, scoredAt, forced: done.has(d.hash), classMapSha256,
+      detector: d.name, detectorHash: d.hash, split: "heldout", labelsSha256, manifestSha256: result.snapshot.manifestSha256, scoredAt, classMapSha256,
+      forced: done.has(d.hash), ...(done.has(d.hash) && opts.reason !== undefined ? { reason: opts.reason } : {}),
     }))],
   };
   await writeAtomic(join(outDir, LEDGER_FILE), `${JSON.stringify(next, null, 2)}\n`);
