@@ -95,6 +95,7 @@ import {
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
+import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
@@ -617,6 +618,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
   const advisoriesEnabled = exactTrueFlag(env[READ_API_COORDINATION_ADVISORIES_ENABLED]);
+  // Strict: a malformed allowlist fails startup (AdvisoryNotifyRowsError names the entry, never the whole value).
+  const advisoryNotifyRows = parseAdvisoryNotifyRows(env[READ_API_ADVISORY_NOTIFY_ROWS]);
   // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
@@ -748,6 +751,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...digestDeps,
     ...coordinationDeps,
     ...advisoriesDeps,
+    ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
     // The Session Intelligence workspace view: the 062170 readers and the directory, READ ONLY on the read-role pool.
     ...(exactTrueFlag(env[READ_API_SESSION_INTEL_ENABLED]) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(poolTenantRunner(pool as never)) } } : {}),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),

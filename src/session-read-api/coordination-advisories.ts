@@ -10,7 +10,7 @@
  */
 import { advisoryMessage } from "../coordination-advisor/template.ts";
 import { TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "./liveness.ts";
-import { advisoryPriority } from "./advisory-priority.ts";
+import { advisoryNotifyEligible, advisoryPriority } from "./advisory-priority.ts";
 
 export const ADVISORIES_CONTRACT = "coordination-advisories/1";
 /** pending_for_v1 returns at most 10 rows; the route never serves more. */
@@ -125,8 +125,9 @@ export function sqlCoordinationAdvisories(read: TenantRunner, write: TenantRunne
  * additively under the same contract: `priority` (advisory-priority.ts) and `delivery`. `delivery.dm` is true
  * when delivered_at is set: on a listed row (pending or delivered, never acked) only the DM path
  * (coordination_advisories_mark_delivered_v1) sets it, the ack sets it only on rows this GET no longer lists.
+ * `notifyEligible` (also additive): the row's (kind, urgency) is on READ_API_ADVISORY_NOTIFY_ROWS (default empty).
  */
-export function advisoryItem(row: AdvisoryRow) {
+export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> = new Set()) {
   const firstSeen = row.evidence.map((e) => e.ts).filter((ts) => ts !== "").sort()[0] ?? row.createdAt;
   return {
     advisoryId: row.advisoryId,
@@ -141,6 +142,7 @@ export function advisoryItem(row: AdvisoryRow) {
     }),
     evidence: row.evidence,
     priority: advisoryPriority(row),
+    notifyEligible: advisoryNotifyEligible(row, notifyRows),
     delivery: { dm: row.deliveredAt !== null, deliveredAt: row.deliveredAt },
   };
 }
