@@ -14,6 +14,7 @@ import {
 import { TENANT_SETTINGS_SQL, type TenantRunner } from "../liveness.ts";
 import { classOfKind } from "../../session-intel/replay/classes.ts";
 import { memoryLiveness } from "./support.ts";
+import { parseAdvisoryNotifyRows } from "../advisory-priority.ts";
 
 const ID: VerifiedIdentity = { userId: "u", orgId: "org", workspaceId: "ws", scopes: ["rth:read"] };
 const auth = { authorization: "Bearer good" };
@@ -86,7 +87,9 @@ function memorySource(init: { alerts?: SessionIntelAlertRow[]; claims?: SessionI
 
 const api = (opts: {
   enabled?: boolean; source?: SessionIntelSource; directory?: Directory | null; canary?: ReadonlySet<string> | "*"; logs?: Record<string, unknown>[];
+  notifyRows?: ReadonlySet<string>;
 } = {}) => createReadApi({
+  ...(opts.notifyRows ? { advisoryNotifyRows: opts.notifyRows } : {}),
   verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0,
   directoryWorkspaces: opts.canary ?? new Set([ID.workspaceId]),
   ...(opts.directory === null ? {} : { directory: opts.directory ?? memoryDirectory([dirRow(1)]).directory }),
@@ -184,7 +187,7 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     expect(body.contract).toBe(SESSION_INTEL_CONTRACT);
     expect(body.nextCursor).toBeNull();
     expect(body.alerts).toEqual([
-      { advisoryId: "0000000000000001", urgency: "high", kind: "duplicate_work", class: "collision", priority: 1, artifact: "supabase/migrations/062130_x.sql",
+      { advisoryId: "0000000000000001", urgency: "high", kind: "duplicate_work", class: "collision", priority: 1, notifyEligible: false, artifact: "supabase/migrations/062130_x.sql",
         sessions: [{ source: "claude", sessionId: "s-1" }, { source: "codex", sessionId: "s-2" }], createdAt: minutesAgo(1).toISOString(), deliveredAt: null,
         acked: [{ source: "claude", sessionId: "s-1", acked: false }, { source: "codex", sessionId: "s-2", acked: true }],
         evidence: [{ sessionId: "s-1", eventId: "e-1", ts: "2026-11-12T09:58:12.000Z", kind: "tool_result" }] },
@@ -283,6 +286,16 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     const mem = memorySource({ alerts: kinds.map(([kind, urgency], i) => alertRow(i + 1, { kind, urgency })) });
     const { body } = await get(api({ enabled: true, source: mem.source }));
     expect(body.alerts.map((a: any) => [a.kind, a.urgency, a.priority])).toEqual(kinds);
+  });
+
+  test("notifyEligible on alerts: all false by default, true only for an allowed (kind, urgency); flag off unchanged", async () => {
+    const alerts = [alertRow(1), alertRow(2, { urgency: "low" }), alertRow(3, { kind: "superseded_work" })];
+    const eligible = async (notifyRows?: ReadonlySet<string>) =>
+      (await get(api({ enabled: true, source: memorySource({ alerts }).source, ...(notifyRows ? { notifyRows } : {}) }))).body.alerts.map((a: any) => a.notifyEligible);
+    expect(await eligible()).toEqual([false, false, false]);
+    expect(await eligible(parseAdvisoryNotifyRows("duplicate_work:high"))).toEqual([true, false, false]);
+    const off = await get(api({ enabled: false, notifyRows: parseAdvisoryNotifyRows("duplicate_work:high") }));
+    expect([off.status, off.body.error.reason]).toEqual([501, "session_intel_disabled"]);
   });
 
   test("an unmapped alert kind has class null and a note, never a silent none", async () => {
