@@ -184,11 +184,11 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     expect(body.contract).toBe(SESSION_INTEL_CONTRACT);
     expect(body.nextCursor).toBeNull();
     expect(body.alerts).toEqual([
-      { advisoryId: "0000000000000001", urgency: "high", kind: "duplicate_work", class: "collision", artifact: "supabase/migrations/062130_x.sql",
+      { advisoryId: "0000000000000001", urgency: "high", kind: "duplicate_work", class: "collision", priority: 1, artifact: "supabase/migrations/062130_x.sql",
         sessions: [{ source: "claude", sessionId: "s-1" }, { source: "codex", sessionId: "s-2" }], createdAt: minutesAgo(1).toISOString(), deliveredAt: null,
         acked: [{ source: "claude", sessionId: "s-1", acked: false }, { source: "codex", sessionId: "s-2", acked: true }],
         evidence: [{ sessionId: "s-1", eventId: "e-1", ts: "2026-11-12T09:58:12.000Z", kind: "tool_result" }] },
-      expect.objectContaining({ advisoryId: "0000000000000002", urgency: "low", kind: "concurrent_edit", class: "overlap" }),
+      expect.objectContaining({ advisoryId: "0000000000000002", urgency: "low", kind: "concurrent_edit", class: "overlap", priority: 3 }),
     ]);
     // Status: within 2 hours and not ended, newest first.
     expect(body.status.map((s: any) => s.sessionId)).toEqual(["s-5", "s-20"]);
@@ -273,6 +273,16 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     expect(mem.calls.find((c) => c.op === "claims")!.keys).toEqual([{ source: "claude", sessionId: "s-1" }]);
     expect(body.status.map((s: any) => s.hasClaims)).toEqual([true, false, false]);
     expect(body.coverage.sessionsWithClaims).toBe(1);
+  });
+
+  test("alert priority comes from the shared advisoryPriority (the same ranking as the advisories GET)", async () => {
+    const kinds: Array<[string, "high" | "low", number]> = [
+      ["constraint_violation", "high", 1], ["intent_conflict", "high", 1], ["superseded_work", "high", 1],
+      ["concurrent_edit", "high", 2], ["stale_base", "high", 2], ["planned_fleet", "high", 3], ["duplicate_work", "low", 3],
+    ];
+    const mem = memorySource({ alerts: kinds.map(([kind, urgency], i) => alertRow(i + 1, { kind, urgency })) });
+    const { body } = await get(api({ enabled: true, source: mem.source }));
+    expect(body.alerts.map((a: any) => [a.kind, a.urgency, a.priority])).toEqual(kinds);
   });
 
   test("an unmapped alert kind has class null and a note, never a silent none", async () => {
