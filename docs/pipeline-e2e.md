@@ -6,6 +6,7 @@ pipeline on a fresh, isolated stack and asserts each piece on its own line:
 ```sh
 bun run e2e:pipeline                                  # every step, a fresh compose project on this machine
 bun run e2e:pipeline --steps upload.courier,index.hoop,summary.extractive
+bun run e2e:pipeline --steps coordination.advisories   # M3-5 live advisor foundation
 op run -- bun run e2e:pipeline --target sandbox       # the same assertions in a throwaway Blaxel microVM
 flows/node_modules/.bin/flows run --local-agent flows/pipeline-e2e.flow.ts --input '{}'   # the same, as a flow
 ```
@@ -40,6 +41,9 @@ MinIO, migrations, the operator role step, `session-ingest`, the
 - `session-ingest-s3`: the same ingest with `INGEST_LEDGER=s3` (decision 0005);
 - `alleyoop-ingest`, `hoopdb-indexer`, `referee`, `bob-costas` on their own
   bucket: the courier pipeline of the local stack (docs/local-stack.md);
+- `coordination-advisor`, when selected: a one-second scan over PostgreSQL facts,
+  scoped to the synthetic workspace, with DMs disabled. Only this e2e's read API
+  enables the pull and ack routes;
 - MinIO and AlleyOop on ephemeral loopback ports so the driver can read
   storage back. Postgres is read with `psql` inside its container.
 
@@ -49,6 +53,7 @@ Only the services the selected steps need are started.
 
 | Step | Proves |
 | --- | --- |
+| `coordination.advisories` | M3-5 foundation: synthetic directory and tool facts produce HIGH shared-file collision and LOW nearby-work rows through the running advisor; a planned fleet stays silent; the workspace allowlist and HTTP tenant boundary hold; authenticated pull carries both citations; ack is recipient-specific and idempotent; pair cooldown and the hourly cap survive real worker restarts; workspace controls stop writes and a flip is observed on the next tick without a restart. Facts are seeded at the projection boundary: this does not prove extraction, conflict classification, or Relay DM delivery |
 | `upload.http` | a. upload over HTTP on the SQL ledger: no token 401, read-only token 403, then admitted (ingest log: `accepted`, one manifest written) |
 | `upload.s3_ledger` | a. upload over the S3 ledger: refused 503 `ledger_fence_authority_missing` until the test fence-authority marker is written, then admitted; the S3 batch record is `committed` with the receipt; no SQL `ingest_batches` row |
 | `canonical.objects` | b. both sessions' canonical `manifest.json`; every chunk it names, at the key the reader derives (`chunkKeys`), is stored and sealed (the marker is not readable in its bytes) |

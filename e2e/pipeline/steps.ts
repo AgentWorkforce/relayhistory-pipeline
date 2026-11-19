@@ -25,6 +25,7 @@ import { chunkKeys, manifestKey, objectKey, readAll, type ObjectStore } from "..
 import { TENANT_A, TENANT_B, type Tenant } from "../selfhost/stack.ts";
 import { COURIER_SESSION, FENCE_AUTHORITY, FIXTURES, SOURCE, STARTED_MS, courierTranscript, deliveryBatch, type Fixture } from "./fixtures.ts";
 import { CANONICAL_BUCKET, HOOP_BUCKET, HOOP_SERVICES, HOOP_TENANT, KEY_ROOT, SELFHOST_SERVICES, type PipelineStack } from "./stack.ts";
+import { proveCoordinationAdvisories } from "./coordination.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 export type Result = "PASS" | "FAIL" | "SKIP";
@@ -40,6 +41,8 @@ export interface Step {
   title: string;
   /** Which half of the stack the step needs: the self-host canonical path or the courier (AlleyOop) path. */
   leg: "selfhost" | "hoop" | "none";
+  /** Additional workers required only by this step. */
+  services?: readonly string[];
   run(ctx: Ctx): Promise<string>;
 }
 
@@ -135,6 +138,11 @@ const listed = (r: { json: any }, id: string) => (r.json?.sessions ?? []).some((
 const ws = (t: Tenant) => `workspace=${t.workspace}`;
 
 export const STEPS: readonly Step[] = [
+  {
+    id: "coordination.advisories", title: "live collision and overlap advisories: pull, ack, isolation and durable limits", leg: "selfhost",
+    services: ["coordination-advisor"],
+    run: ({ stack }) => proveCoordinationAdvisories(stack),
+  },
   {
     id: "upload.http", title: "a. upload over HTTP (SQL ledger): auth refusals, then admitted", leg: "selfhost",
     async run({ stack }) {
@@ -431,7 +439,8 @@ export const STEP_IDS = STEPS.map((s) => s.id);
 /** The services a selection of steps needs (compose starts their dependencies). */
 export function servicesFor(steps: readonly Step[]): string[] {
   const legs = new Set(steps.map((s) => s.leg));
-  return [...(legs.has("selfhost") ? SELFHOST_SERVICES : []), ...(legs.has("hoop") ? HOOP_SERVICES : [])];
+  return [...new Set([...(legs.has("selfhost") ? SELFHOST_SERVICES : []), ...(legs.has("hoop") ? HOOP_SERVICES : []),
+    ...steps.flatMap((s) => s.services ?? [])])];
 }
 
 export async function runSteps(ctx: Ctx, steps: readonly Step[], log: (r: StepResult) => void): Promise<StepResult[]> {
