@@ -115,7 +115,20 @@ export const LIST_SERVED_BY_HEADER = "x-relayhistory-list-served-by";
 /** The 96Bulls read API's own backend marker (src/session-read-api/app.ts sets `96bulls`). */
 export const READ_BACKEND_HEADER = "x-sessions-read-backend";
 export const LIST_BACKENDS = ["neon", "supabase", "union", "clickhouse"] as const;
-const RECORDED_HEADERS = [READ_BACKEND_HEADER, LIST_SERVED_BY_HEADER, "x-relayhistory-buffered", "x-sessions-read-incomplete", "x-sessions-read-continuation"];
+/** The History API list's mode for a page: provenance only, recorded per page, never gated on. */
+export const LIST_MODE_HEADER = "x-relayhistory-list-mode";
+const RECORDED_HEADERS = [READ_BACKEND_HEADER, LIST_SERVED_BY_HEADER, LIST_MODE_HEADER, "x-relayhistory-buffered", "x-sessions-read-incomplete", "x-sessions-read-continuation"];
+
+/**
+ * Counts keyed by server-supplied codes. Prototype-free, so a key such as `__proto__`, `constructor`,
+ * `toString` or `hasOwnProperty` is an ordinary own key: it never reads an inherited value, and never
+ * writes to Object.prototype. Serializes with JSON.stringify as a plain object.
+ */
+export type Counts = Record<string, number>;
+export const counter = (): Counts => Object.create(null) as Counts;
+export function bump(c: Counts, key: string, by = 1): void {
+  c[key] = (Object.hasOwn(c, key) ? c[key]! : 0) + by;
+}
 const RETRYABLE = new Set([429, 502, 503, 504]);
 
 export class ReadApiClient {
@@ -129,13 +142,19 @@ export class ReadApiClient {
   constructor(private readonly o: ClientOptions) {
     const i = o.initial;
     const n = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0);
-    const counts = (v: unknown): Record<string, number> =>
-      v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, n(x)])) : {};
+    // Restored into prototype-free counters, own keys only: a value such as `__proto__` stays an ordinary key.
+    const counts = (v: unknown): Counts => {
+      const out = counter();
+      if (v && typeof v === "object") for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[k] = n(x);
+      return out;
+    };
+    const headers: Record<string, Counts> = Object.create(null);
+    if (i?.headers && typeof i.headers === "object") for (const [h, v] of Object.entries(i.headers)) headers[h] = counts(v);
     this.stats = {
       // The total is the larger of the two records: `spent` is the state's maximum over every line.
       requests: Math.max(o.spent ?? 0, n(i?.requests)),
       byRoute: counts(i?.byRoute), retries: n(i?.retries), retryAfterHonoured: n(i?.retryAfterHonoured), waitedMs: n(i?.waitedMs),
-      headers: i?.headers && typeof i.headers === "object" ? Object.fromEntries(Object.entries(i.headers).map(([h, v]) => [h, counts(v)])) : {},
+      headers,
     };
     this.f = o.fetch ?? fetch;
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -176,7 +195,7 @@ export class ReadApiClient {
     for (let attempt = 0; ; attempt++) {
       if (this.stats.requests >= this.o.maxRequests) throw new RequestCapReached(this.o.maxRequests);
       this.stats.requests++;
-      this.stats.byRoute[route] = (this.stats.byRoute[route] ?? 0) + 1;
+      bump(this.stats.byRoute, route);
       let res: Response;
       try {
         res = await this.slot(() => this.f(url, {
@@ -203,7 +222,7 @@ export class ReadApiClient {
         await this.wait(after ?? Math.min(maxWait, 1_000 * 2 ** attempt), after !== null);
         continue;
       }
-      const recorded: Record<string, string> = {};
+      const recorded: Record<string, string> = Object.create(null);
       if (res.ok) {
         if (res.headers.get(WORKSPACE_HEADER) !== this.o.workspace) {
           await res.body?.cancel().catch(() => {});
@@ -212,9 +231,9 @@ export class ReadApiClient {
         for (const h of RECORDED_HEADERS) {
           const v = res.headers.get(h);
           if (v === null) continue;
-          const seen = (this.stats.headers[h] ??= {});
+          if (!Object.hasOwn(this.stats.headers, h)) this.stats.headers[h] = counter();
           const k = safeCode(v, this.o.token);
-          seen[k] = (seen[k] ?? 0) + 1;
+          bump(this.stats.headers[h]!, k);
           recorded[h] = k;
         }
       }

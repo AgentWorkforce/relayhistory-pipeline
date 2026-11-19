@@ -8,7 +8,7 @@
 import { createReadStream } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { HarvestError, LIST_SERVED_BY_HEADER, READ_BACKEND_HEADER, RequestCapReached, type ClientStats, type ReadApiClient } from "./client.ts";
+import { bump, counter, HarvestError, LIST_MODE_HEADER, LIST_SERVED_BY_HEADER, READ_BACKEND_HEADER, RequestCapReached, type ClientStats, type ReadApiClient } from "./client.ts";
 import { IMPORT_BOUNDS, projectKey, repoRelativePath } from "../import/normalize.ts";
 import { isoTime } from "../replay/util.ts";
 
@@ -41,14 +41,28 @@ export type Attribution = "verified" | "read_worker" | "unverified";
 
 /** One provider's tally over the frame pages: how many, and the first and last page number (1-based). */
 interface Tally { pages: number; firstPage: number; lastPage: number }
+
+/**
+ * Entries as a prototype-free object in key order, for the receipt. Keys come from the server (header values,
+ * reason codes, harness names), so a key such as `__proto__` or `constructor` must be an ordinary own key:
+ * on a prototype-free object, assigning it defines it, and JSON.stringify writes it like any other.
+ */
+export function sortedRecord<T>(entries: Iterable<[string, T]>): Record<string, T> {
+  const out = Object.create(null) as Record<string, T>;
+  for (const [k, v] of [...entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) out[k] = v;
+  return out;
+}
+
+/** Per value: the page count and the first and last page number. A Map, so no value can hit an inherited key. */
 const tally = (values: string[]) => {
-  const out: Record<string, Tally> = {};
+  const out = new Map<string, Tally>();
   values.forEach((v, i) => {
-    const t = (out[v] ??= { pages: 0, firstPage: i + 1, lastPage: i + 1 });
+    const t = out.get(v) ?? { pages: 0, firstPage: i + 1, lastPage: i + 1 };
     t.pages++;
     t.lastPage = i + 1;
+    out.set(v, t);
   });
-  return Object.fromEntries(Object.entries(out).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  return sortedRecord(out);
 };
 
 /**
@@ -69,6 +83,8 @@ export function frameAttribution(pages: PageSource[], required: string[] | null)
     offendingPages,
     listServedBy: tally(pages.map((p) => p.listServedBy)),
     readBackend: tally(pages.map((p) => p.readBackend)),
+    // Provenance only: X-Relayhistory-List-Mode per page, never gated on.
+    listMode: tally(pages.map((p) => p.listMode)),
   };
 }
 
@@ -111,7 +127,7 @@ export interface FactsRecord {
   droppedWrites: number | null;
 }
 export type OutputCounts = { counts: Record<string, number> } | { unavailable: string };
-export interface PageSource { listServedBy: string; readBackend: string }
+export interface PageSource { listServedBy: string; readBackend: string; listMode: string }
 export const MISSING = "missing";
 
 export interface HarvestState {
@@ -197,6 +213,7 @@ export async function readState(path: string): Promise<HarvestState & { goodByte
       state.frame.pageSources.push({
         listServedBy: typeof s.listServedBy === "string" ? s.listServedBy : MISSING,
         readBackend: typeof s.readBackend === "string" ? s.readBackend : MISSING,
+        listMode: typeof s.listMode === "string" ? s.listMode : MISSING,
       });
       for (const r of l.rows as FrameRow[]) if (!seen.has(rowKey(r))) { seen.add(rowKey(r)); state.frame.rows.push(r); }
     } else if (l.t === "facts") {
@@ -292,7 +309,9 @@ export async function runFrame({ client, state, log }: RunOptions): Promise<void
     state.frame.outsideWindow += outsideWindow;
     // Every page, an empty one included, records its own markers: attribution is checked per page, never
     // inferred from the aggregate header counts.
-    const source: PageSource = { listServedBy: a.headers[LIST_SERVED_BY_HEADER] ?? MISSING, readBackend: a.headers[READ_BACKEND_HEADER] ?? MISSING };
+    const source: PageSource = {
+      listServedBy: a.headers[LIST_SERVED_BY_HEADER] ?? MISSING, readBackend: a.headers[READ_BACKEND_HEADER] ?? MISSING, listMode: a.headers[LIST_MODE_HEADER] ?? MISSING,
+    };
     state.frame.pageSources.push(source);
     await log.write({ t: "frame", cursor: state.frame.cursor, rows, duplicates, outsideWindow, source, ...progress(client) });
   }
@@ -441,24 +460,27 @@ export interface ReceiptInput {
 /** The coverage receipt: what the frame saw, per source and per day, and what the facts could and could not hold. */
 export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
   const { state, stats } = r;
-  const bySource: Record<string, number> = {};
-  const byDay: Record<string, Record<string, number>> = {};
+  // Every count keyed by server data (harness names, reason codes, header values) is prototype-free (counter/bump):
+  // a harness named `constructor` or a reason `__proto__` is an ordinary key, never an inherited one.
+  const bySource = counter();
+  const byDay = new Map<string, ReturnType<typeof counter>>();
   let withoutCatalog = 0;
   for (const row of state.frame.rows) {
-    bySource[row.source] = (bySource[row.source] ?? 0) + 1;
+    bump(bySource, row.source);
     const day = (r.createdAt.get(rowKey(row)) ?? row.firstTs).slice(0, 10);
-    const d = (byDay[day] ??= {});
-    d[row.source] = (d[row.source] ?? 0) + 1;
+    if (!byDay.has(day)) byDay.set(day, counter());
+    bump(byDay.get(day)!, row.source);
     if (!row.catalog) withoutCatalog++;
   }
   const facts = [...state.facts.values()];
-  const failures: Record<string, number> = {};
-  for (const f of facts) if (f.failure) failures[f.failure] = (failures[f.failure] ?? 0) + 1;
+  const failures = counter();
+  for (const f of facts) if (f.failure) bump(failures, f.failure);
   const censored = facts.filter((f) => f.writesCensored);
-  const censoredBy: Record<string, number> = {};
-  for (const f of censored) censoredBy[f.censorReason ?? "unknown"] = (censoredBy[f.censorReason ?? "unknown"] ?? 0) + 1;
+  const censoredBy = counter();
+  for (const f of censored) bump(censoredBy, f.censorReason ?? "unknown");
   const sum = (k: keyof FactsRecord) => facts.reduce((n, f) => n + (typeof f[k] === "number" ? f[k] as number : 0), 0);
-  const sortObj = <T>(o: Record<string, T>) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  // Own keys only, in order, into a prototype-free object (see sortedRecord).
+  const sortObj = <T>(o: Record<string, T>) => sortedRecord(Object.entries(o));
   return {
     format: RECEIPT_FORMAT,
     complete: r.complete,
@@ -483,7 +505,7 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
       exhausted: state.frame.done,
       sessions: state.frame.rows.length,
       bySource: sortObj(bySource),
-      byDay: sortObj(Object.fromEntries(Object.entries(byDay).map(([d, v]) => [d, sortObj(v)]))),
+      byDay: sortedRecord([...byDay].map(([d, v]) => [d, sortObj(v)] as [string, Record<string, number>])),
       duplicateRows: state.frame.duplicates,
       rowsOutsideWindow: state.frame.outsideWindow,
       sessionsWithoutCatalog: withoutCatalog,
@@ -509,7 +531,7 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
     },
     snapshot: { sessions: r.snapshot.sessions, writes: r.snapshot.writes, oversizeSessions: r.snapshot.oversizeSessions },
     output: state.output ?? { unavailable: "not_read" },
-    server: { headers: Object.fromEntries(Object.entries(stats.headers).map(([h, v]) => [h, sortObj(v)])) },
+    server: { headers: sortedRecord(Object.entries(stats.headers).map(([h, v]) => [h, sortObj(v)] as [string, Record<string, number>])) },
     unavailable: UNAVAILABLE_FIELDS,
     withheld: WITHHELD_FIELDS,
     notes: r.notes,
