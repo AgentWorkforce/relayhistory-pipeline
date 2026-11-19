@@ -267,7 +267,7 @@ export async function partialSessions(deps: PageDeps, orgId: string, sessionId?:
 export interface WorkspacePartials {
   /** Partial sessions that may hold this workspace's rows. */
   sessions: string[];
-  /** The org has more partial sessions than one check lists: not decided. */
+  /** The workspace has more partial sessions than one check lists: not decided. */
   overflow: boolean;
 }
 
@@ -288,8 +288,9 @@ export interface WorkspacePartials {
  * here, where the erasure filter drops its rows anyway. Candidate rows alone
  * would not do: the events a partial session is missing are not candidates.
  *
- * The check stops at the first finding: an in-workspace row decides without
- * asking Supabase.
+ * Org-wide state is keyset-paged so sibling workspaces cannot consume this
+ * workspace's bound. Each page is attributed by existing event rows and then
+ * live pointers; only attributed sessions count toward the cap.
  */
 export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, workspaceId: string): Promise<WorkspacePartials> {
   if (deps.adapter) {
@@ -297,18 +298,33 @@ export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, 
     return { sessions: [...result.sessions], overflow: result.overflow };
   }
   if (!deps.ch) throw new Error("read search binding missing");
-  const q = buildWorkspacePartialSessionsQuery(deps.ch.database, orgId, workspaceId);
-  const rows = await deps.ch.select<{ session_id: string; in_workspace: number | string }>(q.query, {
-    settings: { ...READ_SETTINGS },
-    timeoutMs: deps.timeoutMs ?? 3_000,
-    params: q.params,
+  return deadline(deps, async (signal) => {
+    const sessions = new Set<string>();
+    let after = "";
+    while (true) {
+      if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+      const q = buildWorkspacePartialSessionsQuery(deps.ch!.database, orgId, workspaceId, after);
+      const rows = await deps.ch!.select<{ session_id: string; in_workspace: number | string }>(q.query, {
+        settings: { ...READ_SETTINGS },
+        timeoutMs: deps.timeoutMs ?? 3_000,
+        params: q.params,
+      });
+      if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+      for (const row of rows) {
+        if (!row.session_id || row.session_id <= after) throw new SearchIndexError("unavailable", true);
+        if (Number(row.in_workspace) === 1) sessions.add(row.session_id);
+      }
+      const withoutRows = rows.filter((row) => Number(row.in_workspace) !== 1).map((row) => row.session_id);
+      if (withoutRows.length > 0) {
+        const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, withoutRows);
+        if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+        for (const id of withoutRows) if (pointed.has(id)) sessions.add(id);
+      }
+      if (sessions.size > PARTIAL_SESSIONS_CAP) return { sessions: [], overflow: true };
+      if (rows.length < PARTIAL_SESSIONS_CAP) return { sessions: [...sessions], overflow: false };
+      after = rows[rows.length - 1]!.session_id;
+    }
   });
-  if (rows.length > PARTIAL_SESSIONS_CAP) return { sessions: [], overflow: true };
-  const inWorkspace = rows.filter((r) => Number(r.in_workspace) === 1).map((r) => r.session_id);
-  if (inWorkspace.length > 0) return { sessions: inWorkspace, overflow: false };
-  if (rows.length === 0) return { sessions: [], overflow: false };
-  const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, rows.map((r) => r.session_id));
-  return { sessions: rows.map((r) => r.session_id).filter((id) => pointed.has(id)), overflow: false };
 }
 
 async function deadline<T>(deps: PageDeps, work: (signal: AbortSignal) => Promise<T>): Promise<T> {

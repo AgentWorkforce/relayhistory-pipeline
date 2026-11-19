@@ -30,9 +30,9 @@ export const EVENTS_TABLE = "transcript_events";
 export const SESSION_STATE_TABLE = "search_ingest_session_state";
 /**
  * At most this many partial sessions are listed per check. A session check
- * asks about one id. A search check lists the org's partial sessions to
- * attribute them to workspaces, so a list longer than this is not decided
- * (queries return cap + 1 rows to tell) and the search falls back whole.
+ * asks about one id. A search check pages the org's partial sessions to
+ * attribute them to the requested workspace; only that workspace's sessions
+ * count toward this cap.
  */
 export const PARTIAL_SESSIONS_CAP = 1000;
 /** Legacy search semantics: q matches the first 4096 characters of content, or the task title. */
@@ -120,27 +120,33 @@ LIMIT {cap:UInt32}`;
 
 /**
  * A workspace search's partial-session check. The state table has no
- * workspace, so the org's partial sessions are listed (at most cap + 1, so an
- * overflow is visible) with `in_workspace = 1` for each one that has any row,
+ * workspace, so the org's partial sessions are listed in keyset pages with
+ * `in_workspace = 1` for each one that has any row,
  * any version, in this workspace's `transcript_events`. The ones without such
  * a row may still belong to this workspace (a session whose first pass was
  * partial has no row at all), so the caller checks those against this
  * workspace's live `session_index` pointers (page.ts
- * partialSessionsInWorkspace). In-workspace sessions sort first.
+ * partialSessionsInWorkspace). The caller counts only sessions attributed to
+ * the requested workspace; sibling workspaces therefore cannot exhaust its
+ * bound.
  */
-export function buildWorkspacePartialSessionsQuery(database: string, orgId: string, workspaceId: string): Built {
+export function buildWorkspacePartialSessionsQuery(database: string, orgId: string, workspaceId: string, after = "", limit = PARTIAL_SESSIONS_CAP): Built {
   const partial = `SELECT session_id FROM ${qualifiedTable(database, SESSION_STATE_TABLE)}
 WHERE org_id = {org:String}
 GROUP BY session_id
 HAVING argMax(needs_full, synced_at) = 1`;
+  const page = `SELECT session_id FROM (${partial})
+WHERE session_id > {after:String}
+ORDER BY session_id
+LIMIT {page:UInt32}`;
   const query = `SELECT session_id, toUInt8(session_id IN (
   SELECT DISTINCT session_id FROM ${qualifiedTable(database)}
-  WHERE org_id = {org:String} AND workspace_id = {ws:String} AND session_id IN (${partial})
+  WHERE org_id = {org:String} AND workspace_id = {ws:String} AND session_id IN (${page})
 )) AS in_workspace
-FROM (${partial})
-ORDER BY in_workspace DESC, session_id
-LIMIT {cap:UInt32}`;
-  return { query, params: { org: orgId, ws: workspaceId, cap: PARTIAL_SESSIONS_CAP + 1 } };
+FROM (${page})
+ORDER BY session_id
+`;
+  return { query, params: { org: orgId, ws: workspaceId, after, page: limit } };
 }
 
 /** Sort-key predicates shared by both round trips. */
