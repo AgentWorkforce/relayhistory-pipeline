@@ -153,8 +153,12 @@ that is the number that matters.
       human notice (M3-9);
     - priorities 2 and 3 stay at turn end.
 
-    This needs no service identity, no token and no resolver. If relay-app confirms Desktop can
-    inject outside turn end, M3-8 becomes unnecessary.
+    relay-app confirmed the mechanism on 2026-11-19. The core gets a new hook that injects a labelled
+    notice from the coordination service, never `inject_native`; only sessions registered on the
+    relay can be injected, and some harnesses queue the notice until turn end. Desktop-core does the
+    poll and the dedupe. codex-relayhistory-pipeline-session owns it after M3-3. M3-8's
+    server-side DM is dropped. **Hosted is blocked by M3-10:** Desktop cannot get a read token from
+    hosted today.
   - **Delivery is at least once.** A DM and the turn-end pull can show the same advisory. M3-7 adds
     the delivery state to the GET response, so the hook can tell them apart.
 - **LOW → turn-end advisory** through `GET /v1/coordination/advisories`, which the desktop hook polls
@@ -354,6 +358,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-7 Delivery state on the pull path: an additive `delivery {dm, deliveredAt}` on each GET item; the hook deduplicates by advisory id across restarts | sessions-intel-lead (route), relay-app's agent (hook) | Route and hook tests; at-least-once is documented until both ship | none |
 | M3-8 DM transport contract ([session-intel-dm-transport.md](../session-intel-dm-transport.md)): register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
 | M3-9 Desktop notification to the human, ranked by priority (see [Priority and the human notice](#priority-and-the-human-notice)) | relay-app's agent (Desktop), sessions-intel-lead (the `priority` field) | The tiers, dedup and caps as specified; off by default behind a Desktop setting; never blocks a turn | **Live notices in any real install: Khaliq OK** |
+| M3-10 Hosted client read token for Desktop: Desktop's token code returns nothing for the hosted site today (`tokens.rs` `hosted_site()`), so the Desktop pull path, and with it turn-end delivery, P1 injection and the human notice, works on self-host only | Cloud owner (Khaliq to name), with layered-control and relay-app | A reviewed hosted route that issues a read-scoped token to Desktop, reused until expiry | **New credential path: Khaliq OK** |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
 ### M4: Enterprise trace import
