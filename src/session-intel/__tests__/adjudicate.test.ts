@@ -8,10 +8,10 @@ import { at } from "./helpers.ts";
 const alert = (detector: string, n: number, over: Partial<ReplayAlert> = {}): ReplayAlert => ({
   detector, alertId: `${detector}-secret-${n}`, kind: "secret_kind", urgency: "high", orgId: "o", workspaceId: "w",
   pair: [`c:${n}`, `c:${n + 100}`], artifact: `src/f${n}.ts`, sentAt: at(`1${n % 10}:00`), alertAt: at(`1${n % 10}:00`), channel: "dm",
-  evidence: [{ sessionId: `${n}`, eventId: `e${n}`, ts: at("09:00"), kind: "secret_event_kind" }], ...over,
+  evidence: [{ sessionId: `${n}`, eventId: `e${n}`, ts: at("09:00"), kind: "secret_event_kind" }], alertClass: "collision", ...over,
 });
 const result = (alerts: ReplayAlert[], names: string[]): ReplayResult => ({
-  format: "session-intel-replay/1", snapshot: { manifestSha256: "f".repeat(64), createdAt: at("00:00"), window: { since: at("09:00"), until: at("13:00") }, sessions: 100 },
+  format: "session-intel-replay/2", incomplete: [], snapshot: { manifestSha256: "f".repeat(64), createdAt: at("00:00"), window: { since: at("09:00"), until: at("13:00") }, sessions: 100 },
   intervalMs: 120_000, ticks: 121, detectors: names.map((name, i) => ({ name, version: "1", params: {}, hash: String(i).repeat(64), diagnostics: {} })), alerts,
 });
 const pooled = () => result([

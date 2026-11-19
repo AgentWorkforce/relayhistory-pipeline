@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { outcomeFacts } from "../../../packages/coordination-detect/src/index.ts";
 import { DEFAULT_PAIR_COOLDOWN_SECONDS, DEFAULT_SESSION_HOURLY_CAP } from "../../coordination-advisor/config.ts";
 import { ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS } from "../../coordination-advisor/rubric.ts";
-import { scanOnce, type ScanStats } from "../../coordination-advisor/scan.ts";
+import { scanOnce, SWEEP_EVERY_MS, type ScanStats } from "../../coordination-advisor/scan.ts";
 import {
   RecordingRelaySender, ReplayAdvisorStore, snapshotCoordinationBackend, type RecordedWrite, type ReplayView, type SimClock,
 } from "./views.ts";
@@ -54,18 +54,30 @@ export interface ReplayDetector {
   diagnostics?(view: ReplayView): Record<string, number>;
 }
 
-/** sha256 of name, version and params (canonical JSON): the identity the held-out ledger freezes. */
-export const detectorHash = (d: { name: string; version: string; params: Record<string, unknown> }) =>
-  sha256Hex(canonicalJson([d.name, d.version, d.params]));
+/** The replay settings that change a detector's alerts, hashed with it. */
+export interface ReplayHashParams { intervalMs: number }
 
-/** The advisor's code, hashed into its params: editing the scan, the rubric or the detector changes its hash. */
-const ADVISOR_SOURCES = [
+/**
+ * sha256 of name, version, params and the replay settings (canonical JSON): the identity the held-out ledger
+ * freezes. The same detector replayed at another interval is another hash.
+ */
+export const detectorHash = (d: { name: string; version: string; params: Record<string, unknown> }, replay: ReplayHashParams) =>
+  sha256Hex(canonicalJson([d.name, d.version, d.params, { intervalMs: replay.intervalMs }]));
+
+/**
+ * The code that decides the advisor's replay alerts, hashed into its params: editing any of it changes the
+ * hash. The scorer, labels and adjudication code are not here: they do not change which alerts exist.
+ */
+export const ADVISOR_SOURCES = [
   "../../coordination-advisor/scan.ts",
   "../../coordination-advisor/rubric.ts",
   "../../coordination-advisor/template.ts",
+  "../../coordination-advisor/relay-sender.ts",
   "../../session-read-api/coordination-backend.ts",
   "../../../packages/coordination-detect/src/index.ts",
   "./views.ts",
+  "./detector.ts",
+  "./replay.ts",
 ];
 function sourceSha256(): string {
   return sha256Hex(ADVISOR_SOURCES.map((p) => sha256Hex(readFileSync(new URL(p, import.meta.url)))).join("\n"));
@@ -80,7 +92,11 @@ export interface AdvisorDetectorOptions {
   dm?: boolean;
 }
 
-interface AdvisorState { clock: SimClock; store: ReplayAdvisorStore; sender: RecordingRelaySender; limits: AdvisorLimits; stats: ScanStats | null }
+interface AdvisorState {
+  clock: SimClock; store: ReplayAdvisorStore; sender: RecordingRelaySender; limits: AdvisorLimits; stats: ScanStats | null;
+  /** advisorTick's hourly retention sweep, in simulated time. */
+  lastSweep: number; expired: number; deleted: number;
+}
 
 export const ADVISOR_DETECTOR_NAME = "coordination-advisor";
 
@@ -94,7 +110,8 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
     let s = states.get(view);
     if (!s) {
       const clock: SimClock = { now: new Date(view.window.since) };
-      s = { clock, store: new ReplayAdvisorStore(view, clock), sender: new RecordingRelaySender(clock), limits: new AdvisorLimits({ pairCooldownMs, sessionHourlyCap }), stats: null };
+      s = { clock, store: new ReplayAdvisorStore(view, clock), sender: new RecordingRelaySender(clock), limits: new AdvisorLimits({ pairCooldownMs, sessionHourlyCap }), stats: null,
+        lastSweep: Number.NEGATIVE_INFINITY, expired: 0, deleted: 0 };
       states.set(view, s);
     }
     return s;
@@ -116,6 +133,13 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
         store: s.store, backend: snapshotCoordinationBackend(view, s.clock), limits: s.limits,
         workspaces: workspaces === "*" ? "*" : new Set(workspaces), ...(dm ? { sender: s.sender } : {}),
       }, now);
+      // As advisorTick does: after the scan, a retention sweep once per hour (of simulated time).
+      if (now.getTime() - s.lastSweep >= SWEEP_EVERY_MS) {
+        s.lastSweep = now.getTime();
+        const swept = await s.store.sweep();
+        s.expired += swept.expired;
+        s.deleted += swept.deleted;
+      }
       s.stats = s.stats ? Object.fromEntries(Object.entries(s.stats).map(([k, v]) => [k, v + stats[k as keyof ScanStats]])) as unknown as ScanStats : stats;
       const dmed = new Set(s.sender.sent.slice(dmsBefore).map((d) => d.advisoryId));
       const fresh = s.store.writes.slice(writesBefore).filter((w) => w.result !== "skipped");
@@ -140,7 +164,7 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
     },
     diagnostics(view) {
       const s = states.get(view);
-      return { ...(s?.stats ?? {}), dmRecorded: s?.sender.sent.length ?? 0 };
+      return { ...(s?.stats ?? {}), dmRecorded: s?.sender.sent.length ?? 0, sweptExpired: s?.expired ?? 0, sweptDeleted: s?.deleted ?? 0 };
     },
   };
 }

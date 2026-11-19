@@ -2,11 +2,13 @@
 
 The offline harness that the last section of [coordination-live-advisories.md](coordination-live-advisories.md) requires before any advisor flag is proposed for enablement. It steps a simulated clock over a frozen session snapshot and runs the **real** advisor scan (`scanOnce` in `src/coordination-advisor/scan.ts`) at each tick. It records every advisory the worker would have sent, and when. It then scores the alerts per urgency row against labeled incidents and hard negatives, and builds blind adjudication packets.
 
-It runs offline. It uses no network, database or credentials, and reads no environment. It enables nothing. Code: `src/session-intel/replay/`. Tests and the synthetic fixture: `src/session-intel/__tests__/`.
+It runs offline. It uses no network, database or credentials, and it enables nothing. The harness reads no environment itself, but the log module it loads with the scan (`src/shared/log.ts`) reads `OTEL_SERVICE_NAME`, `DEPLOYMENT` and `DEPLOYMENT_ID`. Scan warnings, such as a refused row or a failed workspace, print org and workspace ids to stderr, so keep that output as private as the snapshot. Code: `src/session-intel/replay/`. Tests and the synthetic fixture: `src/session-intel/__tests__/`.
 
 ## Snapshot format
 
 A snapshot is a directory kept **outside this repository**, with a delete-by date (as in [coordination-overlap-detection.md](coordination-overlap-detection.md), "Harvest"). Only synthetic fixtures are committed.
+
+This harness only reads a snapshot. Producing one from real sessions is M0-2: it reads session data, so it needs Khaliq's own OK each time.
 
 - `manifest.json`: `{"format": "session-intel-snapshot/1", "createdAt", "deleteBy", "window": {"since", "until"}, "files": {"<name>": "<sha256>"}}`. `files` must list `sessions.jsonl`. File names are plain names: no separators, no `..`, no dotfiles. Symlinks are refused.
 - `sessions.jsonl` holds one session per line:
@@ -32,7 +34,14 @@ At a simulated `now`:
 - A fact is visible only when `ts < now`. That is the production readers' `ts < until` bound.
 - Directory `last_activity_at` is the latest visible fact. The final `lastActivityAt` is used only once `now` reaches it.
 - The short summary is the latest timeline entry at or before `now`. A summary with no timeline is visible only from `lastActivityAt`, so it never leaks early.
-- `parentSessionIds`, `repo` and `title` are treated as known from creation.
+- `parentSessionIds`, `projectId`, `repo` and `title` are treated as known from creation.
+
+Four of these assumptions can flatter lead time (make alerts look earlier than production would send them):
+
+- At `now == lastActivityAt` the directory already shows the final time, while a fact stamped at that same time is still hidden (`ts < now`).
+- A plain summary appears at `lastActivityAt`, with no summarisation lag.
+- A timeline entry's `at` is not bounded by `lastActivityAt`.
+- `projectId`, `title` and `repo` are known from creation, although production may learn them later.
 
 The parts the scan calls:
 
@@ -42,13 +51,13 @@ The parts the scan calls:
 
 ## Detectors and replay
 
-`ReplayDetector` is `{name, version, params, run(view, now), diagnostics?}`. Each alert carries `{detector, alertId, kind, urgency, pair, artifact, sentAt, alertAt, channel, evidence}`. A detector's **hash** is the sha256 of its name, version and params.
+`ReplayDetector` is `{name, version, params, run(view, now), diagnostics?}`. Each alert carries `{detector, alertId, kind, urgency, pair, artifact, sentAt, alertAt, channel, evidence}`. A detector's **hash** is the sha256 of its name, version, params and the replay's `intervalMs`.
 
-`advisorDetector()` wraps `scanOnce` with the real `AdvisorLimits` at the config defaults: a 6-hour pair cooldown and 3 advisories per recipient per hour. Its params include a sha256 of the advisor, rubric, template, backend, detector and view sources, so a code change is a new detector hash.
+`advisorDetector()` wraps `scanOnce` with the real `AdvisorLimits` at the config defaults: a 6-hour pair cooldown and 3 advisories per recipient per hour. Its params include a sha256 of the source files that decide which alerts exist: the scan, rubric, template, relay sender, facts backend and detector package, and this harness's views, detector adapter and replay driver. A change to any of them is a new detector hash. Like `advisorTick`, it runs the store's retention sweep once an hour of simulated time, so a row older than 7 days expires and the same finding can be written and DMed again. Only the first `sentAt` appears among the alerts; the diagnostics count every write.
 
 - **Alert id.** Its `alertId` is `<advisoryId>/<urgency>`, so a LOW-to-HIGH upgrade counts as its own HIGH alert.
 - **sentAt.** For HIGH it is the tick of the recorded DM; for LOW it is the tick the row became available to the pull path.
-- **Incomplete replays.** Its diagnostics are the summed `ScanStats`. The CLI marks a replay incomplete, and exits 1, when any workspace scan `failed` or any row was `rejected`.
+- **Incomplete replays.** Its diagnostics are the summed `ScanStats`. A replay where any workspace scan `failed` or any row was `rejected` is incomplete. `alerts.json` (format `session-intel-replay/2`) records the reasons in `incomplete`, and the CLI exits 1. Dev scoring reports the reasons. Held-out scoring refuses an incomplete replay, before anything is recorded.
 
 The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). It keeps each alert's first `sentAt` and orders alerts deterministically. M2's intent and constraint detectors plug in behind the same interface.
 
@@ -58,18 +67,24 @@ Scoring is class-aware, using the alert taxonomy (docs/proposals/session-intelli
 
 - **A detector kind, with its urgency:**
   - `duplicate_work` and `superseded_work` are `collision`;
-  - `concurrent_edit` is `collision` at HIGH (the 60-minute row) and `overlap` otherwise;
+  - `concurrent_edit` is `collision` at HIGH (the 60-minute row). At LOW it is `overlap`. That is this harness's choice, not the rubric's: the rubric never emits `concurrent_edit` at LOW;
   - `nearby_work` and `similar_summary` are `overlap`;
   - a kind that names a class is that class;
-  - anything else is `none`.
+  - any other kind is an error, never a silent `none`.
 
-  A detector can set `alertClass` on an alert itself; M2's claim detectors will. The advisor leaves it unset.
+  A detector can set `alertClass` on an alert itself; M2's claim detectors will, and a detector with a new kind must. The advisor leaves it unset. The replay driver, the `alerts.json` reader and the `key.json` reader all refuse an alert whose class cannot be resolved.
 - **A label incident kind:** `duplicate_work` and `superseded_work` are `collision`, `overlap` is `overlap`, and the conflict kinds are themselves.
+- **A hard-negative reason:** `benign_overlap` is `overlap`, `planned_fleet` is `planned_fleet`, and `unrelated` is `none`. By the taxonomy, a benign overlap is still an overlap: the same project and shared files, with no conflicting claims. So an `overlap` alert on it is class-correct, and so is a `planned_fleet` alert on a planned fleet. In class-match, such an alert is a true positive with no incident to credit: it raises precision but not recall or lead time. An alert of any other class on that pair stays a false positive, and a `none` alert is never correct. In pair-match every hard negative stays a false positive. In the confusion table, each reason lands in its class's column.
 - **An adjudication verdict:**
   - `collision` and `overlap` confirm their own class;
   - `real_overlap` (the M0 verdict) confirms either, because it does not say which;
   - `intent_conflict` and `constraint_violation` confirm themselves;
-  - `planned`, `unrelated` and `unclear` confirm none.
+  - `planned` confirms `planned_fleet`;
+  - `unrelated` and `unclear` confirm none.
+
+Two verdicts agree when the classes they confirm intersect (`real_overlap` and `collision` agree), or when neither confirms a class and they are the same verdict. Consensus and agreement use this rule, so mixing the M0 vocabulary with the precise one is not counted as disagreement.
+
+`classes.ts` is hashed (`classMapSha256`). The hash is in every score report and in each held-out ledger entry. The held-out repeat check is per (detector hash, class map). A ledger entry from before class maps blocks every map.
 
 ## Labels, scoring and adjudication
 
@@ -93,20 +108,21 @@ It scores in two modes and reports both:
 - **pair-match**: a pair match is a true positive (the M0 behaviour);
 - **class-match**: a true positive needs the pair and the class (see Classes). A pair match whose class differs is counted as `misclassified`. It is not a true positive, but it stays in the precision denominator.
 
-For each mode, the scorer reports per detector, per (urgency, kind) row and per alert class:
+For each mode, the scorer reports per detector: per (urgency, kind) row, per alert class, and per (alert class, urgency). The (alert class, urgency) rows are the ones the spec's bars apply to. For each row it reports:
 
-- alerts, true and false positives, misclassified, precision and recall. A class row's class-match recall is over the incidents of that class;
+- alerts, true and false positives, misclassified, and recall. A class row's class-match recall is over the incidents of that class;
+- precision two ways, both named. **Per alert** counts every alert. **Per pair** counts each (detector, pair) once, so a LOW upgraded to HIGH, or two artifacts on one pair, cannot count as two true positives;
 - lead time (`harmAt` minus the first `sentAt` per detected incident): the counts before and after harm, and the median;
-- alerts per 100 sessions;
+- alerts per 100 sessions (the rate the budget is measured against);
 - the top K at 5 per 100 sessions (`--budget`), ranked HIGH first, then the earliest.
 
-It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, `planned_fleet` or `none`; or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both `report.md` and `report.json`.
+It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, `planned_fleet` or `none`; or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both reports.
 
-Scoring uses `dev` unless you pass `--split heldout`. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused unless `--force`, which is recorded as forced. The ledger is a protocol aid, not a security boundary: keep one evaluation directory per study.
+Scoring uses `dev` unless you pass `--split heldout`. Reports are split-named (`report.dev.{json,md}`, `report.heldout.{json,md}`), so a dev run never overwrites the held-out report. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused unless `--force`, which is recorded as forced. A different `--out` or an edited `alerts.json` gets round the ledger: it is a protocol aid, not a control. Keep one evaluation directory per study.
 
-`packet` pools each detector's top K and merges the same (pair, artifact) across detectors. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `collision`, `overlap`, `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa, and takes the majority verdict for each alert (a tie is `unclear`). It reports precision two ways, both excluding `unclear`:
+`packet` pools each detector's top K and merges the same (pair, artifact) across detectors, keeping one member per detector. The same replay given twice is refused: the same file, or the same detector hash on the same snapshot. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `collision`, `overlap`, `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa (with 0/1 weights from the agreement rule above), and takes the majority verdict for each alert by class (a tie is `unclear`). The report format is `session-intel-verdicts/2`. It reports precision two ways, both excluding `unclear`:
 
-- **per detector:** any real verdict is positive;
+- **per detector:** any real verdict is positive. It is reported per pooled entry and per (detector, pair);
 - **per (detector, alert class):** the verdict must confirm the alert's class. A real verdict of another class is misclassified, and counts against precision.
 
 The packet never shows the class; the private key records it. The artifact itself can hint at a tier (a migration number, the "similar short summaries" text); that is the evidence the adjudicators need.
@@ -120,7 +136,7 @@ bun run src/session-intel/replay/cli.ts packet   --alerts <eval>/replay/alerts.j
 bun run src/session-intel/replay/cli.ts verdicts --key <eval>/packet/key.json --verdicts <verdicts.jsonl> --out <eval>/verdicts
 ```
 
-Each command writes `report.md` and `report.json` to its `--out`. Outputs carry session ids, so `--out` inside this repository is refused; `--allow-repo-out` is for synthetic runs only.
+Each command writes its reports to its `--out`: `report.md` and `report.json`, or the split-named pair for `score`. Outputs carry session ids, so `--out` inside this repository is refused. The check resolves symlinks through the nearest existing ancestor, and it counts a path as outside only when it climbs out of the repository (so `..cache` inside the repository is inside). `--allow-repo-out` is for synthetic runs only.
 
 ## How it implements the evaluation method
 

@@ -1,18 +1,19 @@
 /**
- * The replay harness CLI (docs/session-intel-replay.md). Offline only: no network, no database, no
- * credentials and no environment reads. Outputs carry session ids, so --out must be outside this repository
- * (a synthetic run may pass --allow-repo-out).
+ * The replay harness CLI (docs/session-intel-replay.md). Offline only: no network, no database and no
+ * credentials. The harness reads no environment itself; src/shared/log.ts (loaded with the advisor scan) reads
+ * OTEL_SERVICE_NAME, DEPLOYMENT and DEPLOYMENT_ID, and a scan warning prints org and workspace ids to stderr.
+ * Outputs carry session ids, so --out must be outside this repository (a synthetic run may pass --allow-repo-out).
  *
  *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N]
  *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force] [--budget N]
  *   bun run src/session-intel/replay/cli.ts packet   --alerts <alerts.json> [--alerts ...] --seed <s> --out <dir> [--budget N]
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
  */
-import { readFileSync } from "node:fs";
-import { join, relative, resolve, isAbsolute } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { buildPacket, parseVerdicts, verdictMarkdown, verdictReport, type PacketKey } from "./adjudicate.ts";
+import { buildPacket, parsePacketKey, parseVerdicts, verdictMarkdown, verdictReport } from "./adjudicate.ts";
 import { advisorDetector } from "./detector.ts";
 import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
@@ -26,11 +27,30 @@ const USAGE = `usage: cli.ts <replay|score|packet|verdicts> [options]; see docs/
 export interface CliIo { out(line: string): void; err(line: string): void; now?: Date }
 const defaultIo: CliIo = { out: (l) => console.log(l), err: (l) => console.error(l) };
 
-function outDir(value: string | undefined, allowRepo: boolean): string {
+/** The path with symlinks resolved: realpath of its nearest existing ancestor, then the parts not yet created. */
+export function realPathOf(path: string): string {
+  let head = resolve(path);
+  const tail: string[] = [];
+  while (!existsSync(head)) {
+    const up = dirname(head);
+    if (up === head) break;
+    tail.unshift(basename(head));
+    head = up;
+  }
+  return join(realpathSync(head), ...tail);
+}
+
+/** Inside `root` unless the relative path climbs out (exactly "..", or ".." then a separator) or is absolute. */
+export function isInside(root: string, path: string): boolean {
+  const rel = relative(realPathOf(root), realPathOf(path));
+  return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+}
+
+export function outDir(value: string | undefined, allowRepo: boolean, repoRoot = REPO_ROOT): string {
   if (!value) throw new Error("--out is required");
   const dir = resolve(value);
-  const rel = relative(REPO_ROOT, dir);
-  if (!allowRepo && (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))))
+  // Symlinks are resolved first, so a link outside the repository that points into it is still inside.
+  if (!allowRepo && isInside(repoRoot, dir))
     throw new Error("--out is inside the repository; replay outputs carry session ids and belong outside it (--allow-repo-out for synthetic runs)");
   return dir;
 }
@@ -39,7 +59,8 @@ const readJson = (path: string): unknown => JSON.parse(readFileSync(path, "utf8"
 const readAlerts = (path: string): ReplayResult => parseReplayResult(readJson(path));
 const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
 
-function replayMarkdown(r: ReplayResult, incomplete: string[]): string {
+function replayMarkdown(r: ReplayResult): string {
+  const incomplete = r.incomplete;
   const lines = [
     "# Replay", "",
     `Snapshot manifest ${r.snapshot.manifestSha256.slice(0, 16)}, ${r.snapshot.sessions} sessions, window ${r.snapshot.window.since} to ${r.snapshot.window.until}, ${r.ticks} ticks every ${r.intervalMs / 1_000}s.`,
@@ -77,11 +98,11 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const intervalMs = values["interval-ms"] === undefined ? DEFAULT_INTERVAL_MS : Number(values["interval-ms"]);
     const snapshot = await loadSnapshot(resolve(values.snapshot), { now: io.now });
     const result = await replaySnapshot(snapshot, { detectors: [advisorDetector()], intervalMs });
-    // A workspace scan that failed or a row the store refused means alerts may be missing.
-    const incomplete = result.detectors.flatMap((d) => ["failed", "rejected"].filter((k) => (d.diagnostics[k] ?? 0) > 0).map((k) => `${d.name} ${k}=${d.diagnostics[k]}`));
+    // A workspace scan that failed or a row the store refused means alerts may be missing; alerts.json says so.
+    const incomplete = result.incomplete;
     await writeAtomic(join(out, "alerts.json"), json(result));
     await writeAtomic(join(out, "report.json"), json({ ...result, alerts: undefined, alertCount: result.alerts.length, incomplete }));
-    await writeAtomic(join(out, "report.md"), replayMarkdown(result, incomplete));
+    await writeAtomic(join(out, "report.md"), replayMarkdown(result));
     io.out(`replay: ${result.alerts.length} alerts over ${result.ticks} ticks -> ${out}`);
     if (incomplete.length) { io.err(`replay incomplete: ${incomplete.join("; ")}`); return 1; }
     return 0;
@@ -100,8 +121,10 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const report = scoreReplay(result, labels, { split, labelsSha256, budgetPer100: budget });
     // The ledger is checked and written before the held-out numbers are written or shown anywhere.
     if (split === "heldout") await recordHeldoutScoring(out, result, labelsSha256, { force: values.force === true, now: io.now });
-    await writeAtomic(join(out, "report.json"), json(report));
-    await writeAtomic(join(out, "report.md"), scoreMarkdown(report));
+    // Split-named reports: a dev run never overwrites the held-out report, which cannot be recomputed.
+    await writeAtomic(join(out, `report.${split}.json`), json(report));
+    await writeAtomic(join(out, `report.${split}.md`), scoreMarkdown(report));
+    if (report.incomplete.length) io.err(`score: the replay is incomplete (${report.incomplete.join("; ")}); alerts may be missing`);
     io.out(scoreMarkdown(report));
     return 0;
   }
@@ -110,7 +133,9 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     if (!values.alerts?.length) throw new Error("--alerts is required");
     if (!values.seed) throw new Error("--seed is required");
     const out = outDir(values.out, allowRepo);
-    const { packet, key } = buildPacket(values.alerts.map((p) => readAlerts(resolve(p))), { seed: values.seed, budgetPer100: budget });
+    const paths = values.alerts.map((p) => realPathOf(p));
+    if (new Set(paths).size !== paths.length) throw new Error("packet: the same --alerts file is given twice");
+    const { packet, key } = buildPacket(paths.map(readAlerts), { seed: values.seed, budgetPer100: budget });
     await writeAtomic(join(out, "packet.jsonl"), packet.map((p) => JSON.stringify(p)).join("\n") + (packet.length ? "\n" : ""));
     await writeAtomic(join(out, "key.json"), json(key));
     const summary = { pooled: packet.length, sources: key.sources };
@@ -123,8 +148,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (command === "verdicts") {
     if (!values.key || !values.verdicts) throw new Error("--key and --verdicts are required");
     const out = outDir(values.out, allowRepo);
-    const key = readJson(resolve(values.key)) as PacketKey;
-    if (key?.format !== "session-intel-adjudication-key/1" || !Array.isArray(key.entries)) throw new Error("--key is not an adjudication key");
+    const key = parsePacketKey(readJson(resolve(values.key)));
     const text = readFileSync(resolve(values.verdicts), "utf8");
     const raw = text.trimStart().startsWith("[") ? JSON.parse(text) as unknown[] : text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as unknown);
     const report = verdictReport(key, parseVerdicts(raw, key));

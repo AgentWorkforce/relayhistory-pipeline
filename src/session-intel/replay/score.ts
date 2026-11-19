@@ -5,14 +5,16 @@
  *
  * For a split S, an alert whose pair (order-insensitive) is an S incident is a pair match. In pair-match mode
  * that is a true positive; in class-match mode it is one only when an S incident on the pair has the alert's
- * class (classes.ts), and otherwise `misclassified`. Anything else in scope is a false positive, counted as a
- * hard-negative hit or as unlabeled. Held-out scoring puts alerts on dev-labeled pairs out of scope; dev
+ * class (classes.ts), and otherwise `misclassified`. A hard negative is a false positive in pair-match; in
+ * class-match it is a true positive (with no incident to credit) for an alert of the negative's own class (an
+ * `overlap` alert on a benign overlap, a `planned_fleet` alert on a planned fleet), and a false positive for
+ * every other class. Anything else in scope is a false positive, counted as a hard-negative hit or as unlabeled. Held-out scoring puts alerts on dev-labeled pairs out of scope; dev
  * scoring never reads held-out labels, so an alert on a held-out pair is unlabeled there. Unlabeled alerts
  * count against the split, so precision is a lower bound until adjudicated.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ALERT_CLASSES, alertClassOf, classOfIncidentKind, type AlertClass } from "./classes.ts";
+import { ALERT_CLASSES, alertClassOf, CLASS_MAP_SHA256, classOfHardNegative, classOfIncidentKind, type AlertClass } from "./classes.ts";
 import type { ReplayAlert } from "./detector.ts";
 import type { HardNegative, Incident, Labels, Split } from "./labels.ts";
 import type { ReplayResult } from "./replay.ts";
@@ -42,8 +44,16 @@ export interface RowScore {
   unlabeled: number;
   /** class-match only: the pair is an incident of the split, but none of those incidents has the alert's class. */
   misclassified: number;
-  /** truePositives / alerts, so misclassified alerts are in the denominator. */
-  precision: number | null;
+  /** Per alert: truePositives / alerts, so misclassified alerts are in the denominator. */
+  alertPrecision: number | null;
+  /**
+   * Per (detector, pair): several alerts on one pair (a LOW then a HIGH, two artifacts) count once. A pair is a
+   * true positive when any of its alerts in the row is; otherwise misclassified when any is; otherwise false.
+   */
+  pairs: number;
+  truePositivePairs: number;
+  misclassifiedPairs: number;
+  pairPrecision: number | null;
   incidents: number;
   detected: number;
   recall: number | null;
@@ -58,7 +68,8 @@ export interface RowScore {
 
 export interface TopKScore {
   budgetPer100: number; k: number; alerts: number; truePositives: number; misclassified: number;
-  precision: number | null; detected: number; recall: number | null; beforeHarm: number;
+  alertPrecision: number | null; pairs: number; truePositivePairs: number; pairPrecision: number | null;
+  detected: number; recall: number | null; beforeHarm: number;
 }
 
 export interface ModeScore {
@@ -71,6 +82,8 @@ export interface ModeScore {
    * of the split's incidents.
    */
   classRows: RowScore[];
+  /** Per (alert class, urgency): the rows the spec's bars apply to. Recall as for classRows. */
+  classUrgencyRows: RowScore[];
   topK: TopKScore;
 }
 
@@ -85,10 +98,14 @@ export interface DetectorScore { detector: string; hash: string; pairMatch: Mode
 export interface ScoreReport {
   format: typeof SCORE_FORMAT;
   split: Split;
+  /** sha256 of classes.ts: the class map every class-match number here depends on. */
+  classMapSha256: string;
   sessions: number;
   manifestSha256: string;
   labelsSha256: string;
   incidents: number;
+  /** The replay's incomplete reasons (dev scoring reports them; held-out scoring refuses them). */
+  incomplete: string[];
   detectors: DetectorScore[];
 }
 
@@ -131,7 +148,11 @@ export type Outcome =
 
 export function outcome(alert: Pick<ReplayAlert, "pair" | "kind" | "urgency" | "alertClass">, labels: Labels, split: Split, mode: ScoreMode): Outcome {
   const v = classify(alert, labels, split);
-  if (v.scope === "hard_negative") return { scope: "hard_negative" };
+  if (v.scope === "hard_negative") {
+    // class-match: the negative says what the pair is; an alert of exactly that class is correct (never `none`).
+    const cls = mode === "class" ? alertClassOf(alert) : null;
+    return cls && cls !== "none" && v.reasons.some((r) => classOfHardNegative(r) === cls) ? { scope: "tp", incidents: [] } : { scope: "hard_negative" };
+  }
   if (v.scope !== "tp" || mode === "pair") return v;
   const cls = alertClassOf(alert);
   const same = v.incidents.filter((x) => classOfIncidentKind(x.kind) === cls);
@@ -145,13 +166,17 @@ interface RowKey { urgency: RowScore["urgency"]; kind: string; alertClass: RowSc
 function scoreRow(detector: string, key: RowKey, alerts: ReplayAlert[], labels: Labels, split: Split, sessions: number, mode: ScoreMode, recallOver: Incident[]): RowScore {
   let tp = 0, hn = 0, un = 0, out = 0, mis = 0;
   const firstSent = new Map<string, number>();
+  // The best outcome per pair: tp over misclassified over a false positive.
+  const pairRank = new Map<string, number>();
+  const rankPair = (a: ReplayAlert, rank: number) => { const k = pairId(a.pair); pairRank.set(k, Math.max(pairRank.get(k) ?? 0, rank)); };
   for (const a of alerts) {
     const v = outcome(a, labels, split, mode);
     if (v.scope === "out") { out++; continue; }
-    if (v.scope === "hard_negative") { hn++; continue; }
-    if (v.scope === "unlabeled") { un++; continue; }
-    if (v.scope === "misclassified") { mis++; continue; }
+    if (v.scope === "hard_negative") { hn++; rankPair(a, 0); continue; }
+    if (v.scope === "unlabeled") { un++; rankPair(a, 0); continue; }
+    if (v.scope === "misclassified") { mis++; rankPair(a, 1); continue; }
     tp++;
+    rankPair(a, 2);
     const at = Date.parse(a.sentAt);
     for (const x of v.incidents) firstSent.set(x.id, Math.min(firstSent.get(x.id) ?? at, at));
   }
@@ -159,7 +184,10 @@ function scoreRow(detector: string, key: RowKey, alerts: ReplayAlert[], labels: 
   const inScope = tp + hn + un + mis;
   return {
     detector, ...key, alerts: inScope, outOfScope: out, truePositives: tp, falsePositives: hn + un, hardNegativeHits: hn, unlabeled: un,
-    misclassified: mis, precision: ratio(tp, inScope), incidents: recallOver.length, detected: leads.length, recall: ratio(leads.length, recallOver.length),
+    misclassified: mis, alertPrecision: ratio(tp, inScope),
+    pairs: pairRank.size, truePositivePairs: [...pairRank.values()].filter((r) => r === 2).length,
+    misclassifiedPairs: [...pairRank.values()].filter((r) => r === 1).length,
+    pairPrecision: ratio([...pairRank.values()].filter((r) => r === 2).length, pairRank.size), incidents: recallOver.length, detected: leads.length, recall: ratio(leads.length, recallOver.length),
     beforeHarm: leads.filter((l) => l > 0).length, afterHarm: leads.filter((l) => l <= 0).length,
     leadTimesMs: leads, medianLeadMs: median(leads), alertsPer100Sessions: sessions > 0 ? (inScope * 100) / sessions : 0,
   };
@@ -187,21 +215,27 @@ function modeScore(detector: string, alerts: ReplayAlert[], labels: Labels, spli
   const classRows = ALERT_CLASSES.filter((c) => alerts.some((a) => alertClassOf(a) === c)).map((c) =>
     scoreRow(detector, { urgency: "all", kind: "all", alertClass: c }, alerts.filter((a) => alertClassOf(a) === c), labels, split, sessions, mode,
       mode === "class" ? inSplit.filter((x) => classOfIncidentKind(x.kind) === c) : inSplit));
+  const classUrgencyRows = ALERT_CLASSES.flatMap((c) => (["high", "low"] as const).flatMap((u) => {
+    const mine = alerts.filter((a) => alertClassOf(a) === c && a.urgency === u);
+    return mine.length ? [scoreRow(detector, { urgency: u, kind: "all", alertClass: c }, mine, labels, split, sessions, mode,
+      mode === "class" ? inSplit.filter((x) => classOfIncidentKind(x.kind) === c) : inSplit)] : [];
+  }));
   const k = budgetK(sessions, budgetPer100);
   const scoped = rankAlerts(alerts).filter((a) => classify(a, labels, split).scope !== "out");
   const top = scoreRow(detector, { urgency: "all", kind: "top-k", alertClass: "all" }, scoped.slice(0, k), labels, split, sessions, mode, inSplit);
   return {
-    mode, total: scoreRow(detector, { urgency: "all", kind: "all", alertClass: "all" }, alerts, labels, split, sessions, mode, inSplit), rows, classRows,
+    mode, total: scoreRow(detector, { urgency: "all", kind: "all", alertClass: "all" }, alerts, labels, split, sessions, mode, inSplit), rows, classRows, classUrgencyRows,
     topK: {
       budgetPer100, k, alerts: top.alerts, truePositives: top.truePositives, misclassified: top.misclassified,
-      precision: top.precision, detected: top.detected, recall: top.recall, beforeHarm: top.beforeHarm,
+      alertPrecision: top.alertPrecision, pairs: top.pairs, truePositivePairs: top.truePositivePairs, pairPrecision: top.pairPrecision, detected: top.detected, recall: top.recall, beforeHarm: top.beforeHarm,
     },
   };
 }
 
 /**
  * Each in-scope alert counts once per distinct class its pair is labeled with: an incident's class; a hard
- * negative's `planned_fleet`, or `none` for the other reasons; or `unlabeled`.
+ * negative's class (benign_overlap is `overlap`, planned_fleet is `planned_fleet`, unrelated is `none`); or
+ * `unlabeled`.
  */
 export function confusion(alerts: ReplayAlert[], labels: Labels, split: Split): Confusion {
   const counts = Object.fromEntries(ALERT_CLASSES.map((c) => [c, Object.fromEntries(CONFUSION_COLUMNS.map((col) => [col, 0]))])) as Confusion["counts"];
@@ -209,7 +243,7 @@ export function confusion(alerts: ReplayAlert[], labels: Labels, split: Split): 
     const v = classify(a, labels, split);
     if (v.scope === "out") continue;
     const cols = new Set<ConfusionColumn>(v.scope === "tp" ? v.incidents.map((x) => classOfIncidentKind(x.kind))
-      : v.scope === "hard_negative" ? v.reasons.map((r) => r === "planned_fleet" ? "planned_fleet" : "none") : ["unlabeled"]);
+      : v.scope === "hard_negative" ? v.reasons.map(classOfHardNegative) : ["unlabeled"]);
     for (const col of cols) counts[alertClassOf(a)][col]++;
   }
   return { rows: [...ALERT_CLASSES], columns: CONFUSION_COLUMNS, counts };
@@ -218,6 +252,7 @@ export function confusion(alerts: ReplayAlert[], labels: Labels, split: Split): 
 export function scoreReplay(result: ReplayResult, labels: Labels, opts: { split: Split; labelsSha256: string; budgetPer100?: number }): ScoreReport {
   const budgetPer100 = opts.budgetPer100 ?? DEFAULT_BUDGET_PER_100;
   if (!(budgetPer100 > 0 && budgetPer100 <= 100)) throw new Error("score: the budget must be in (0, 100] alerts per 100 sessions");
+  assertScorable(result, opts.split);
   const sessions = result.snapshot.sessions;
   const detectors = result.detectors.map((d): DetectorScore => {
     const mine = result.alerts.filter((a) => a.detector === d.name);
@@ -229,12 +264,22 @@ export function scoreReplay(result: ReplayResult, labels: Labels, opts: { split:
     };
   });
   return {
-    format: SCORE_FORMAT, split: opts.split, sessions, manifestSha256: result.snapshot.manifestSha256, labelsSha256: opts.labelsSha256,
-    incidents: labels.incidents.filter((x) => x.split === opts.split).length, detectors,
+    format: SCORE_FORMAT, split: opts.split, classMapSha256: CLASS_MAP_SHA256, sessions, manifestSha256: result.snapshot.manifestSha256, labelsSha256: opts.labelsSha256,
+    incidents: labels.incidents.filter((x) => x.split === opts.split).length, incomplete: [...result.incomplete], detectors,
   };
 }
 
-export interface LedgerEntry { detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string; forced: boolean }
+/** Held-out is scored only from a complete replay: a missing alert would be scored as a miss, once and for good. */
+export function assertScorable(result: Pick<ReplayResult, "incomplete">, split: Split): void {
+  if (split === "heldout" && result.incomplete.length)
+    throw new Error(`score: the replay is incomplete (${result.incomplete.join("; ")}); held-out is never scored from an incomplete replay`);
+}
+
+export interface LedgerEntry {
+  detector: string; detectorHash: string; split: "heldout"; labelsSha256: string; manifestSha256: string; scoredAt: string; forced: boolean;
+  /** The class map the held-out score used. An entry without one (written before classes) matches every class map. */
+  classMapSha256?: string;
+}
 export interface Ledger { format: typeof LEDGER_FORMAT; entries: LedgerEntry[] }
 
 export function readLedger(outDir: string): Ledger {
@@ -247,19 +292,24 @@ export function readLedger(outDir: string): Ledger {
 
 /**
  * The held-out-once rule: refuses (before anything is written) when a detector hash in `result` was already
- * scored on held-out, unless `force`; then records every hash. Dev scoring never touches the ledger.
+ * scored on held-out with this class map, unless `force`; then records every hash with the class map. Dev
+ * scoring never touches the ledger.
  */
-export async function recordHeldoutScoring(outDir: string, result: ReplayResult, labelsSha256: string, opts: { force?: boolean; now?: Date } = {}): Promise<Ledger> {
+export async function recordHeldoutScoring(outDir: string, result: ReplayResult, labelsSha256: string,
+  opts: { force?: boolean; now?: Date; classMapSha256?: string } = {}): Promise<Ledger> {
+  assertScorable(result, "heldout");
+  const classMapSha256 = opts.classMapSha256 ?? CLASS_MAP_SHA256;
   const ledger = readLedger(outDir);
-  const done = new Set(ledger.entries.filter((e) => e.split === "heldout").map((e) => e.detectorHash));
+  const done = new Set(ledger.entries.filter((e) => e.split === "heldout" && (e.classMapSha256 === undefined || e.classMapSha256 === classMapSha256))
+    .map((e) => e.detectorHash));
   const repeat = result.detectors.filter((d) => done.has(d.hash));
   if (repeat.length && !opts.force)
-    throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")}; a detector is scored on held-out once (--force overrides and is recorded)`);
+    throw new Error(`score: held-out was already scored for ${repeat.map((d) => `${d.name} (${d.hash.slice(0, 12)})`).join(", ")} with this class map; a detector is scored on held-out once (--force overrides and is recorded)`);
   const scoredAt = (opts.now ?? new Date()).toISOString();
   const next: Ledger = {
     format: LEDGER_FORMAT,
     entries: [...ledger.entries, ...result.detectors.map((d): LedgerEntry => ({
-      detector: d.name, detectorHash: d.hash, split: "heldout", labelsSha256, manifestSha256: result.snapshot.manifestSha256, scoredAt, forced: done.has(d.hash),
+      detector: d.name, detectorHash: d.hash, split: "heldout", labelsSha256, manifestSha256: result.snapshot.manifestSha256, scoredAt, forced: done.has(d.hash), classMapSha256,
     }))],
   };
   await writeAtomic(join(outDir, LEDGER_FILE), `${JSON.stringify(next, null, 2)}\n`);
@@ -270,22 +320,25 @@ export const labelsDigest = (bytes: string | Uint8Array) => sha256Hex(bytes);
 
 const pct = (v: number | null) => v === null ? "n/a" : `${(v * 100).toFixed(1)}%`;
 const mins = (ms: number | null) => ms === null ? "n/a" : `${(ms / 60_000).toFixed(1)}m`;
-const HEADER = "| Urgency | Kind | Class | Alerts | TP | Misclassified | FP (hard neg / unlabeled) | Precision | Recall | Before / after harm | Median lead | Alerts per 100 sessions |";
-const RULE = "|---|---|---|---|---|---|---|---|---|---|---|---|";
-const rowLine = (row: RowScore) => `| ${row.urgency} | ${row.kind} | ${row.alertClass} | ${row.alerts} | ${row.truePositives} | ${row.misclassified} | ${row.falsePositives} (${row.hardNegativeHits} / ${row.unlabeled}) | ${pct(row.precision)} | ${pct(row.recall)} | ${row.beforeHarm} / ${row.afterHarm} | ${mins(row.medianLeadMs)} | ${row.alertsPer100Sessions.toFixed(2)} |`;
+const HEADER = "| Urgency | Kind | Class | Alerts | TP | Misclassified | FP (hard neg / unlabeled) | Precision per alert | Pairs (TP) | Precision per pair | Recall | Before / after harm | Median lead | Alerts per 100 sessions |";
+const RULE = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|";
+const rowLine = (row: RowScore) => `| ${row.urgency} | ${row.kind} | ${row.alertClass} | ${row.alerts} | ${row.truePositives} | ${row.misclassified} | ${row.falsePositives} (${row.hardNegativeHits} / ${row.unlabeled}) | ${pct(row.alertPrecision)} | ${row.pairs} (${row.truePositivePairs}) | ${pct(row.pairPrecision)} | ${pct(row.recall)} | ${row.beforeHarm} / ${row.afterHarm} | ${mins(row.medianLeadMs)} | ${row.alertsPer100Sessions.toFixed(2)} |`;
 
 export function scoreMarkdown(r: ScoreReport): string {
   const lines = [
     `# Replay score (${r.split})`, "",
-    `Snapshot manifest ${r.manifestSha256.slice(0, 16)}, labels ${r.labelsSha256.slice(0, 16)}, ${r.sessions} sessions, ${r.incidents} ${r.split} incidents.`,
+    `Snapshot manifest ${r.manifestSha256.slice(0, 16)}, labels ${r.labelsSha256.slice(0, 16)}, class map ${r.classMapSha256.slice(0, 16)}, ${r.sessions} sessions, ${r.incidents} ${r.split} incidents.`,
     "Unlabeled alerts count as false positives, so precision is a lower bound until they are adjudicated.",
-    "pair-match needs the pair only. class-match also needs the class; a pair match of another class is misclassified, not a true positive.", "",
+    "pair-match needs the pair only. class-match also needs the class; a pair match of another class is misclassified, not a true positive.",
+    "Precision per alert counts every alert; precision per pair counts each (detector, pair) once.",
+    ...(r.incomplete.length ? ["", `INCOMPLETE replay: ${r.incomplete.join("; ")}. Alerts may be missing.`] : []), "",
   ];
   for (const d of r.detectors) {
     lines.push(`## ${d.detector} (${d.hash.slice(0, 12)})`, "");
     for (const m of [d.pairMatch, d.classMatch]) {
       lines.push(`### ${m.mode === "pair" ? "pair-match" : "class-match"}`, "", HEADER, RULE, ...[...m.rows, ...m.classRows, m.total].map(rowLine), "",
-        `Top ${m.topK.k} at ${m.topK.budgetPer100} per 100 sessions: ${m.topK.truePositives} of ${m.topK.alerts} true (${pct(m.topK.precision)}), ${m.topK.misclassified} misclassified, recall ${pct(m.topK.recall)}, ${m.topK.beforeHarm} before harm.`, "");
+        "Per class and urgency:", "", HEADER, RULE, ...m.classUrgencyRows.map(rowLine), "",
+        `Top ${m.topK.k} at ${m.topK.budgetPer100} per 100 sessions: ${m.topK.truePositives} of ${m.topK.alerts} alerts true (${pct(m.topK.alertPrecision)}), ${m.topK.truePositivePairs} of ${m.topK.pairs} pairs (${pct(m.topK.pairPrecision)}), ${m.topK.misclassified} misclassified, recall ${pct(m.topK.recall)}, ${m.topK.beforeHarm} before harm.`, "");
     }
     const c = d.confusion;
     const rows = c.rows.filter((cls) => c.columns.some((col) => c.counts[cls][col] > 0));

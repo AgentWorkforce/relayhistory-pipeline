@@ -20,10 +20,15 @@ describe("mappings", () => {
     ["intent_conflict", "high", "intent_conflict"],
     ["constraint_violation", "low", "constraint_violation"],
     ["planned_fleet", "low", "planned_fleet"],
-    ["repeated_investigation", "low", "none"],
-    ["something_new", "high", "none"],
+    ["none", "low", "none"],
   ];
   for (const [kind, urgency, cls] of kinds) test(`kind ${kind} at ${urgency} is ${cls}`, () => expect(classOfKind(kind, urgency)).toBe(cls));
+  for (const kind of ["repeated_investigation", "stale_base", "something_new", ""])
+    test(`unmapped kind ${JSON.stringify(kind)} throws unless the detector sets alertClass`, () => {
+      expect(() => classOfKind(kind, "high")).toThrow("has no class");
+      expect(() => alertClassOf({ kind, urgency: "low" })).toThrow("has no class");
+      expect(alertClassOf({ kind, urgency: "low", alertClass: "intent_conflict" })).toBe("intent_conflict");
+    });
 
   const incidents: Array<[string, string]> = [
     ["duplicate_work", "collision"], ["superseded_work", "collision"], ["overlap", "overlap"],
@@ -34,7 +39,7 @@ describe("mappings", () => {
   const verdicts: Array<[string, string[]]> = [
     ["real_overlap", ["collision", "overlap"]], ["collision", ["collision"]], ["overlap", ["overlap"]],
     ["intent_conflict", ["intent_conflict"]], ["constraint_violation", ["constraint_violation"]],
-    ["planned", []], ["unrelated", []], ["unclear", []],
+    ["planned", ["planned_fleet"]], ["unrelated", []], ["unclear", []],
   ];
   for (const [v, cls] of verdicts) test(`verdict ${v} confirms ${cls.join(", ") || "nothing"}`, () => expect([...classesOfVerdict(v)]).toEqual(cls));
 
@@ -51,7 +56,7 @@ const alert = (pair: [string, string], kind: string, urgency: "high" | "low", ov
   sentAt: at("10:00"), alertAt: at("10:00"), channel: "pull", evidence: [], ...over,
 });
 const result = (alerts: ReplayAlert[]): ReplayResult => ({
-  format: "session-intel-replay/1", snapshot: { manifestSha256: H, createdAt: at("00:00"), window: { since: at("09:00"), until: at("13:00") }, sessions: 100 },
+  format: "session-intel-replay/2", incomplete: [], snapshot: { manifestSha256: H, createdAt: at("00:00"), window: { since: at("09:00"), until: at("13:00") }, sessions: 100 },
   intervalMs: 120_000, ticks: 121, detectors: [{ name: "d1", version: "1", params: {}, hash: H, diagnostics: {} }], alerts,
 });
 const labels = parseLabels({
@@ -74,7 +79,10 @@ describe("class-match", () => {
     ["a detector-set intent_conflict on it", alert(["c:3", "c:4"], "claim_pair", "low", { alertClass: "intent_conflict" }), "tp", "tp"],
     ["overlap on an overlap + constraint pair", alert(["c:5", "c:6"], "similar_summary", "low"), "tp", "tp"],
     ["collision on an overlap + constraint pair", alert(["c:5", "c:6"], "duplicate_work", "high"), "tp", "misclassified"],
-    ["a hard negative", alert(["c:9", "c:10"], "concurrent_edit", "high"), "hard_negative", "hard_negative"],
+    ["a collision on a planned_fleet hard negative", alert(["c:9", "c:10"], "concurrent_edit", "high"), "hard_negative", "hard_negative"],
+    ["a planned_fleet alert on a planned_fleet hard negative", alert(["c:9", "c:10"], "fleet", "low", { alertClass: "planned_fleet" }), "hard_negative", "tp"],
+    ["an overlap alert on a benign_overlap hard negative", alert(["c:11", "c:12"], "nearby_work", "low"), "hard_negative", "tp"],
+    ["a collision on a benign_overlap hard negative", alert(["c:11", "c:12"], "duplicate_work", "high"), "hard_negative", "hard_negative"],
     ["an unlabeled pair", alert(["c:1", "c:3"], "nearby_work", "low"), "unlabeled", "unlabeled"],
     ["a held-out pair on dev", alert(["c:7", "c:8"], "nearby_work", "low"), "unlabeled", "unlabeled"],
   ];
@@ -90,13 +98,13 @@ describe("class-match", () => {
       alert(["c:5", "c:6"], "similar_summary", "low", { sentAt: at("10:50") }), // overlap TP (credits "ov" only)
       alert(["c:9", "c:10"], "concurrent_edit", "high"), // hard negative
     ]), labels, { split: "dev", labelsSha256: H }).detectors[0]!;
-    expect(d(r.pairMatch.total)).toEqual({ alerts: 4, truePositives: 3, misclassified: 0, falsePositives: 1, precision: 0.75, detected: 4, recall: 1 });
-    expect(d(r.classMatch.total)).toEqual({ alerts: 4, truePositives: 2, misclassified: 1, falsePositives: 1, precision: 0.5, detected: 2, recall: 0.5 });
+    expect(d(r.pairMatch.total)).toEqual({ alerts: 4, truePositives: 3, misclassified: 0, falsePositives: 1, alertPrecision: 0.75, detected: 4, recall: 1 });
+    expect(d(r.classMatch.total)).toEqual({ alerts: 4, truePositives: 2, misclassified: 1, falsePositives: 1, alertPrecision: 0.5, detected: 2, recall: 0.5 });
     const byClass = Object.fromEntries(r.classMatch.classRows.map((row) => [row.alertClass, d(row)]));
     // collision: 2 alerts (1 TP, 1 hard negative) against the 1 collision incident; overlap: 2 alerts (1 TP, 1 misclassified) against 1.
     expect(byClass).toEqual({
-      collision: { alerts: 2, truePositives: 1, misclassified: 0, falsePositives: 1, precision: 0.5, detected: 1, recall: 1 },
-      overlap: { alerts: 2, truePositives: 1, misclassified: 1, falsePositives: 0, precision: 0.5, detected: 1, recall: 1 },
+      collision: { alerts: 2, truePositives: 1, misclassified: 0, falsePositives: 1, alertPrecision: 0.5, detected: 1, recall: 1 },
+      overlap: { alerts: 2, truePositives: 1, misclassified: 1, falsePositives: 0, alertPrecision: 0.5, detected: 1, recall: 1 },
     });
     expect(r.classMatch.rows.map((row) => `${row.urgency}/${row.kind}/${row.alertClass}`)).toEqual([
       "high/concurrent_edit/collision", "high/duplicate_work/collision", "low/nearby_work/overlap", "low/similar_summary/overlap",
@@ -110,7 +118,7 @@ describe("class-match", () => {
       alert(["c:3", "c:4"], "nearby_work", "low"),
       alert(["c:5", "c:6"], "similar_summary", "low"), // both "overlap" and "constraint_violation"
       alert(["c:9", "c:10"], "concurrent_edit", "high"), // planned_fleet negative
-      alert(["c:11", "c:12"], "nearby_work", "low"), // benign_overlap negative: none
+      alert(["c:11", "c:12"], "nearby_work", "low"), // benign_overlap negative: overlap
       alert(["c:1", "c:3"], "nearby_work", "low"), // unlabeled
       alert(["c:7", "c:8"], "claim_pair", "high", { alertClass: "intent_conflict" }), // held-out: unlabeled on dev
     ], labels, "dev");
@@ -118,7 +126,8 @@ describe("class-match", () => {
     expect(nonzero).toEqual({
       constraint_violation: {}, planned_fleet: {}, none: {},
       collision: { collision: 1, planned_fleet: 1 },
-      overlap: { intent_conflict: 1, overlap: 1, constraint_violation: 1, none: 1, unlabeled: 1 },
+      // The benign_overlap hard negative lands in the overlap column (G1).
+      overlap: { intent_conflict: 1, overlap: 2, constraint_violation: 1, unlabeled: 1 },
       intent_conflict: { unlabeled: 1 },
     });
     // On held-out the dev pairs are out of scope and the held-out incident is matched.
@@ -133,8 +142,8 @@ describe("class-match", () => {
   });
 });
 
-const d = (row: { alerts: number; truePositives: number; misclassified: number; falsePositives: number; precision: number | null; detected: number; recall: number | null }) =>
-  ({ alerts: row.alerts, truePositives: row.truePositives, misclassified: row.misclassified, falsePositives: row.falsePositives, precision: row.precision, detected: row.detected, recall: row.recall });
+const d = (row: { alerts: number; truePositives: number; misclassified: number; falsePositives: number; alertPrecision: number | null; detected: number; recall: number | null }) =>
+  ({ alerts: row.alerts, truePositives: row.truePositives, misclassified: row.misclassified, falsePositives: row.falsePositives, alertPrecision: row.alertPrecision, detected: row.detected, recall: row.recall });
 
 describe("verdict precision per class", () => {
   test("a verdict must confirm the alert's class; another real class is misclassified", () => {
