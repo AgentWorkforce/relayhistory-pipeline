@@ -295,7 +295,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 
 | Ticket | Owner | Acceptance | Gate |
 |---|---|---|---|
-| M4-1a Offline converter: Claude Code JSONL, Codex rollouts and generic JSONL into the replay snapshot format | M4 builder | Synthetic fixtures; no message text; salted HMAC of ids and of each path segment (depth, extension, source roots and migration number prefixes in clear); salt from stdin; replay runs unchanged on the output | none |
+| M4-1a Offline converter: Claude Code JSONL, Codex rollouts and generic JSONL into the replay snapshot format | M4 builder | Synthetic fixtures; no message text; salted HMAC of ids and of each path segment (depth, extension, source roots and migration number prefixes in clear); salt from stdin or a 0600 file, never argv; replay runs unchanged on the output | none |
 | M4-1b Upload-path import: the same adapters into canonical sessions through the upload path, plus OTel GenAI spans | M4 builder | Scrubbing via relayscrubber; idempotent re-import | none |
 | M4-2 Batch runner: backfill the analysis and claims for an imported tenant under budget, then replay, then report | M4 builder | Runs on a synthetic import end to end | none |
 | M4-3 Customer report template (confirmed conflicts, lead time, cost) | sessions-intel-lead | Rendered from the M0 report JSON | none |
