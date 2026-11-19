@@ -144,6 +144,17 @@ that is the number that matters.
     identity sync. Until the contract is confirmed with Relaycast and Cloud, alerts are delivered
     through the pull path only, and a session with no attached agent has an explicit "not attached"
     outcome.
+  - **Proposed: Desktop-local delivery instead of a pipeline DM.** layered-control confirmed on
+    2026-11-19 that nothing verified resolves another user's session to its live agent, and that a
+    resolver would be a new trust boundary in Control. So the recipient's own Desktop delivers
+    instead:
+    - it polls the pull route for its own local sessions, every 30 s for priority 1;
+    - it injects a priority-1 advisory into the local agent session immediately, and raises the
+      human notice (M3-9);
+    - priorities 2 and 3 stay at turn end.
+
+    This needs no service identity, no token and no resolver. If relay-app confirms Desktop can
+    inject outside turn end, M3-8 becomes unnecessary.
   - **Delivery is at least once.** A DM and the turn-end pull can show the same advisory. M3-7 adds
     the delivery state to the GET response, so the hook can tell them apart.
 - **LOW → turn-end advisory** through `GET /v1/coordination/advisories`, which the desktop hook polls
