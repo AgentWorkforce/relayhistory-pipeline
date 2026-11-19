@@ -130,6 +130,7 @@ import { masterKeyring, parseMasterKeys } from "../../../src/shared/keyring.ts";
 import type { WorkspaceKeyring } from "../../../src/bob-costas/summary-objects.ts";
 import { sqlRelayfacts } from "../../../src/session-read-api/relayfacts.ts";
 import { sqlSessionIntel } from "../../../src/session-read-api/session-intel-workspace.ts";
+import { parseAdvisoryNotifyRows } from "../../../src/session-read-api/advisory-priority.ts";
 import { perRequestAdmitPool, sqlAnalysisSource, type AdmitPool } from "../../../src/session-read-api/analysis-source.ts";
 import type { AnalysisDeps } from "../../../src/session-read-api/app.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
@@ -193,6 +194,8 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_ADVISORIES_ENABLED?: string;
   /** Exactly "true": serve GET /v1/session-intel/workspace (sqlSessionIntel and the directory). */
   READ_API_SESSION_INTEL_ENABLED?: string;
+  /** `<kind>:<urgency>` rows whose advisories are notifyEligible (advisory-priority.ts); default empty; malformed = 503. */
+  READ_API_ADVISORY_NOTIFY_ROWS?: string;
   /**
    * Exactly "true": serve GET and POST /v1/sessions/:sessionId/analysis (analysisDeps); anything
    * else = GET 501 analysis_not_configured and POST 405, as before the flag.
@@ -486,6 +489,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   let completeSinceMs: number;
   let authConfig: AuthConfig;
   let analyticsSelection: AnalyticsConfig;
+  let advisoryNotifyRows: ReadonlySet<string>;
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
     try {
@@ -516,6 +520,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
       ownerBufferedStatementTimeoutMs(env.READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS);
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS");
+    }
+    // The notify allowlist is parsed strictly; a malformed list is a misconfigured deploy.
+    try {
+      advisoryNotifyRows = parseAdvisoryNotifyRows(env.READ_API_ADVISORY_NOTIFY_ROWS);
+    } catch {
+      throw new ConfigError("READ_API_ADVISORY_NOTIFY_ROWS");
     }
     // The index verify flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
     try {
@@ -562,6 +572,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
       ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(tenant.run, workerAckRefused) } }
       : {}),
+    ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
     ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),

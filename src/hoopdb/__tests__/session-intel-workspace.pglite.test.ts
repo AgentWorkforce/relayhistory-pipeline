@@ -151,14 +151,14 @@ describe("20261105062170 session intelligence workspace readers", () => {
     }), [org, ws]);
     const source = sqlCoordinationAdvisories(run, (() => { throw new Error("no write"); }) as never);
     const recipient = { orgId: "org-a", workspaceId: "ws-a", source: "claude", sessionId: "s-a" };
-    const before = (await source.pending(recipient)).map(advisoryItem);
+    const before = (await source.pending(recipient)).map((r) => advisoryItem(r));
     expect(before.map((i) => [i.advisoryId, i.priority, i.delivery])).toEqual([[hex(7), 1, { dm: false, deliveredAt: null }]]);
     await as("service_role", (tx) => tx.query("SELECT sessions.coordination_advisories_mark_delivered_v1('org-a','ws-a',$1,'claude','s-a')", [hex(7)]));
-    const after = (await source.pending(recipient)).map(advisoryItem);
+    const after = (await source.pending(recipient)).map((r) => advisoryItem(r));
     expect(after[0]!.delivery.dm).toBe(true);
     expect(Date.parse(after[0]!.delivery.deliveredAt!)).toBeGreaterThan(Date.now() - 60_000);
     // The peer's row was not DMed: still dm false. The workspace view ranks the advisory the same.
-    expect((await source.pending({ ...recipient, source: "codex", sessionId: "s-b" })).map(advisoryItem)[0]!.delivery).toEqual({ dm: false, deliveredAt: null });
+    expect((await source.pending({ ...recipient, source: "codex", sessionId: "s-b" })).map((r) => advisoryItem(r))[0]!.delivery).toEqual({ dm: false, deliveredAt: null });
   });
 
   test("alerts and claims refuse an org or workspace outside the read scope (42501) and out-of-bound arguments (22023)", async () => {

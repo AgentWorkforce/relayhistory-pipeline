@@ -14,6 +14,7 @@ import { startReadApiService, type ReadApiService } from "../server.ts";
 import { TENANT_SETTINGS_SQL } from "../liveness.ts";
 import { ADVISORY_MESSAGE_MAX } from "../../coordination-advisor/template.ts";
 import { memoryLiveness } from "./support.ts";
+import { parseAdvisoryNotifyRows } from "../advisory-priority.ts";
 
 const ID: VerifiedIdentity = { userId: "u", orgId: "org", workspaceId: "ws", scopes: ["rth:read"] };
 const auth = { authorization: "Bearer good" };
@@ -55,8 +56,9 @@ function memorySource(rows: AdvisoryRow[] = [row(0)]) {
   return { source, calls, acked };
 }
 
-const api = (enabled: boolean | undefined, source = memorySource().source, cors?: ReadonlySet<string>, canary: ReadonlySet<string> = new Set([ID.workspaceId])) => createReadApi({
+const api = (enabled: boolean | undefined, source = memorySource().source, cors?: ReadonlySet<string>, canary: ReadonlySet<string> = new Set([ID.workspaceId]), notifyRows?: ReadonlySet<string>) => createReadApi({
   verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0, directoryWorkspaces: canary,
+  ...(notifyRows ? { advisoryNotifyRows: notifyRows } : {}),
   ...(enabled === undefined ? {} : { coordinationAdvisories: { enabled, source } }),
   ...(cors ? { corsAllowedOrigins: cors } : {}),
 });
@@ -132,8 +134,9 @@ describe("GET /v1/coordination/advisories", () => {
     expect(body.advisories.map((a: any) => a.advisoryId)).toEqual(rows.slice(0, 10).map((a) => a.advisoryId));
     const first = body.advisories[0];
     // M3-7 appends priority and delivery; the eight original keys keep their order (additive, same contract).
-    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence", "priority", "delivery"]);
+    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence", "priority", "notifyEligible", "delivery"]);
     expect(first.priority).toBe(2);
+    expect(first.notifyEligible).toBe(false);
     expect(first.delivery).toEqual({ dm: false, deliveredAt: null });
     expect(first.peer).toEqual({ source: "claude", sessionId: "p-0" });
     expect(first.evidence).toEqual([{ sessionId: "s-1", eventId: "e-0", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }]);
@@ -159,6 +162,23 @@ describe("GET /v1/coordination/advisories", () => {
     expect(body.contract).toBe("coordination-advisories/1");
     expect(body.advisories.map((a: any) => [a.kind, a.urgency, a.priority, a.delivery])).toEqual(
       cases.map(([over, p, d]) => [over.kind, over.urgency, p, d]));
+  });
+
+  test("notifyEligible: default empty allowlist means every item false; one allowed row makes exactly its (kind, urgency) true", async () => {
+    const rows = [
+      row(0, { urgency: "high", kind: "duplicate_work" }), row(1, { urgency: "low", kind: "duplicate_work" }),
+      row(2, { urgency: "high", kind: "superseded_work" }), row(3, { urgency: "high", kind: "concurrent_edit" }),
+    ];
+    const read = async (notifyRows?: ReadonlySet<string>) =>
+      ((await (await api(true, memorySource(rows).source, undefined, undefined, notifyRows).request(base, { headers: auth })).json()) as any).advisories.map((a: any) => a.notifyEligible);
+    expect(await read()).toEqual([false, false, false, false]);
+    expect(await read(parseAdvisoryNotifyRows(""))).toEqual([false, false, false, false]);
+    expect(await read(parseAdvisoryNotifyRows("duplicate_work:high"))).toEqual([true, false, false, false]);
+    expect(await read(parseAdvisoryNotifyRows(" duplicate_work:high , concurrent_edit:high "))).toEqual([true, false, false, true]);
+    // Flag off stays the 501 envelope whatever the allowlist says.
+    const off = await api(false, memorySource(rows).source, undefined, undefined, parseAdvisoryNotifyRows("duplicate_work:high")).request(base, { headers: auth });
+    expect(off.status).toBe(501);
+    expect(((await off.json()) as any).error.reason).toBe("advisories_disabled");
   });
 
   test("without evidence the message's first-seen is the row's createdAt", async () => {
