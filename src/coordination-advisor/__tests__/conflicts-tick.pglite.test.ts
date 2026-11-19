@@ -119,7 +119,7 @@ describe("conflict rows in the advisor tick (pglite, 062150 and 062160 applied)"
       c("intent", "session", "src-flags", "Return 404 flags", "Return 404 when the flag is off in src/flags.", "id-b", -16),
       c("intent", "session", "src-retry", "Disable retry", "Disable the retry queue in src/retry.", "fl-2", -16),
       c("intent", "session", "src-catalog", "Pagination", "Add pagination to the list route in src/catalog.", "cat-a", -40),
-      c("intent", "session", "src-shared", "Disable x", "Disable the shared x helper in src/shared.", "col-b", -16),
+      c("intent", "session", "src-shared", "Disable x", "Disable the shared x helper in src/shared.", "col-b", -25),
     ]);
     const d = (topic: string, title: string, statement: string, session: string) => ({ topic, title, statement, evidence: [ev(session)] });
     await decide([
