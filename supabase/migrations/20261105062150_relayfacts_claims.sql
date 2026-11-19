@@ -11,8 +11,10 @@
 --
 -- Deduplication: one claim per (org, workspace, kind, topic, title_key), title_key as in 062080; the unique index
 -- relayfacts_claims_v1_dedupe enforces it and the writer merges ON CONFLICT. A known claim keeps its title and
--- statement and gains only evidence it does not hold (at most 50 rows); its scope only widens (session < project <
--- repo) and its observed_at only moves earlier.
+-- statement and gains only evidence it does not hold (at most 50 rows); only when it gains a row, its scope widens
+-- (session < project < repo) and its observed_at moves earlier. The writer refuses (RH016) a batch any of whose
+-- evidence sessions is fenced by either erase, before any write, and an observed_at that is not a finite ISO 8601
+-- timestamp (22023).
 --
 -- Status: open | decided (current) -> superseded (relayfacts_claims_supersede_v1 only, same kind and workspace).
 --
@@ -123,6 +125,28 @@ BEGIN
                  OR EXISTS (SELECT 1 FROM jsonb_array_elements(a.v -> 'evidence') AS e(v) WHERE jsonb_typeof(e.v) <> 'object')) THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'claim records: each record needs kind intent or constraint, scope session, project or repo, status open or decided, observed_at a timestamp or null and 1 to 10 evidence objects';
   END IF;
+  -- observed_at: an ISO 8601 timestamp with a zone, finite; never a keyword ('now', 'infinity', 'epoch').
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(p_records) AS a(v)
+              WHERE jsonb_typeof(a.v -> 'observed_at') = 'string'
+                AND CASE WHEN (a.v ->> 'observed_at') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+                         THEN NOT isfinite((a.v ->> 'observed_at')::timestamptz) ELSE true END) THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'claim records: observed_at must be a finite ISO 8601 timestamp with a zone';
+  END IF;
+  -- The 062100 shared lock first (the per-user erase takes it exclusively), so the fence read below sees every
+  -- fence committed before it, and no erase can commit a new one until this batch commits.
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('96bulls:relayfacts-user-erase-v1', 0));
+  -- Every incoming evidence session, against both fences (062090 per-session, 062100 per-user), before any write:
+  -- a merge that adds no evidence row (at the 50-row cap) never reaches the row guard, so it is refused here.
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(p_records) AS a(v)
+              CROSS JOIN LATERAL jsonb_to_recordset(a.v -> 'evidence') AS e(source text, session_id text)
+              WHERE EXISTS (SELECT 1 FROM sessions.session_erasure_fences AS f
+                             WHERE f.org_id = p_org_id AND f.workspace_id = p_workspace_id
+                               AND f.source = e.source AND f.session_id = e.session_id)
+                 OR EXISTS (SELECT 1 FROM sessions.relayfacts_erasure_fences AS f
+                             WHERE f.org_id = p_org_id AND f.workspace_id = p_workspace_id
+                               AND f.source = e.source AND f.session_id = e.session_id)) THEN
+    RAISE EXCEPTION USING ERRCODE = 'RH016', MESSAGE = 'claim records: evidence session is erased';
+  END IF;
   FOR r IN SELECT a.v FROM jsonb_array_elements(p_records) AS a(v) LOOP
     v_scope := coalesce(r ->> 'scope', 'session');
     v_observed := (r ->> 'observed_at')::timestamptz;
@@ -160,16 +184,14 @@ BEGIN
     )
     SELECT count(*)::integer INTO v_add FROM ins;
     v_ev := v_ev + v_add;
-    IF NOT v_fresh THEN
+    -- A merge moves scope and observed_at only together with new evidence (rows the fence guard has checked).
+    IF NOT v_fresh AND v_add > 0 THEN
       UPDATE sessions.relayfacts_claims_v1 AS t
          SET scope = CASE WHEN array_position(ARRAY['session','project','repo'], v_scope)
                                > array_position(ARRAY['session','project','repo'], t.scope) THEN v_scope ELSE t.scope END,
              observed_at = least(t.observed_at, v_observed),
              updated_at = now()
-       WHERE t.id = v_id
-         AND (v_add > 0
-              OR array_position(ARRAY['session','project','repo'], v_scope) > array_position(ARRAY['session','project','repo'], t.scope)
-              OR (v_observed IS NOT NULL AND (t.observed_at IS NULL OR v_observed < t.observed_at)));
+       WHERE t.id = v_id;
     END IF;
   END LOOP;
   RETURN QUERY SELECT v_ins, v_merged, v_ev;
@@ -185,6 +207,9 @@ SET search_path = pg_catalog, sessions, pg_temp AS $relayfacts_claims_supersede$
 DECLARE v_n integer; v_kinds integer;
 BEGIN
   IF p_old IS NULL OR p_new IS NULL OR p_old = p_new THEN RETURN false; END IF;
+  -- The 062100 shared lock before the row locks (its UPDATEs would otherwise take it after them, and a per-user
+  -- erase holding it exclusively while waiting for these rows would deadlock).
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('96bulls:relayfacts-user-erase-v1', 0));
   SELECT count(*)::integer, count(DISTINCT locked.kind)::integer INTO v_n, v_kinds FROM (
     SELECT t.kind FROM sessions.relayfacts_claims_v1 AS t
      WHERE t.id IN (p_old, p_new) AND t.org_id = p_org_id AND t.workspace_id = p_workspace_id
