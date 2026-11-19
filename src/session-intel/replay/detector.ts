@@ -10,8 +10,9 @@ import { DEFAULT_PAIR_COOLDOWN_SECONDS, DEFAULT_SESSION_HOURLY_CAP } from "../..
 import { ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS } from "../../coordination-advisor/rubric.ts";
 import { scanOnce, SWEEP_EVERY_MS, type ScanStats } from "../../coordination-advisor/scan.ts";
 import {
-  RecordingRelaySender, ReplayAdvisorStore, snapshotCoordinationBackend, type RecordedWrite, type ReplayView, type SimClock,
+  RecordingRelaySender, ReplayAdvisorStore, snapshotCoordinationBackend, type RecordedWrite, type ReplayControls, type ReplayView, type SimClock,
 } from "./views.ts";
+import { SESSION_INTEL_FEATURES, type SessionIntelFeature } from "../../shared/session-intel-controls.ts";
 import type { AlertClass } from "./classes.ts";
 import { canonicalJson, refString, sha256Hex, sortedPair, textCompare } from "./util.ts";
 
@@ -73,6 +74,7 @@ export const ADVISOR_SOURCES = [
   "../../coordination-advisor/rubric.ts",
   "../../coordination-advisor/template.ts",
   "../../coordination-advisor/relay-sender.ts",
+  "../../shared/session-intel-controls.ts",
   "../../session-read-api/coordination-backend.ts",
   "../../../packages/coordination-detect/src/index.ts",
   "./views.ts",
@@ -92,6 +94,12 @@ export interface AdvisorDetectorOptions {
   workspaces?: "*" | string[];
   /** Record HIGH DMs as if COORDINATION_ADVISOR_RELAY_DM_ENABLED were on (default true). */
   dm?: boolean;
+  /**
+   * The M3-1 controls the replay assumes for every workspace. Within the eval every feature defaults ON (an
+   * unlisted feature is on); this default exists only here, never in a production store, whose reader fails
+   * closed. Hashed into the params.
+   */
+  controls?: Partial<Record<SessionIntelFeature, boolean>>;
 }
 
 interface AdvisorState {
@@ -107,12 +115,13 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
   const sessionHourlyCap = opts.sessionHourlyCap ?? DEFAULT_SESSION_HOURLY_CAP;
   const workspaces = opts.workspaces === undefined || opts.workspaces === "*" ? "*" as const : [...opts.workspaces].sort(textCompare);
   const dm = opts.dm ?? true;
+  const controls = Object.fromEntries(SESSION_INTEL_FEATURES.map((f) => [f, opts.controls?.[f] ?? true])) as ReplayControls;
   const states = new WeakMap<ReplayView, AdvisorState>();
   const stateFor = (view: ReplayView): AdvisorState => {
     let s = states.get(view);
     if (!s) {
       const clock: SimClock = { now: new Date(view.window.since) };
-      s = { clock, store: new ReplayAdvisorStore(view, clock), sender: new RecordingRelaySender(clock), limits: new AdvisorLimits({ pairCooldownMs, sessionHourlyCap }), stats: null,
+      s = { clock, store: new ReplayAdvisorStore(view, clock, controls), sender: new RecordingRelaySender(clock), limits: new AdvisorLimits({ pairCooldownMs, sessionHourlyCap }), stats: null,
         lastSweep: Number.NEGATIVE_INFINITY, expired: 0, deleted: 0 };
       states.set(view, s);
     }
@@ -122,7 +131,7 @@ export function advisorDetector(opts: AdvisorDetectorOptions = {}): ReplayDetect
     name: ADVISOR_DETECTOR_NAME,
     version: `1+${outcomeFacts.name}/${outcomeFacts.version}`,
     params: {
-      pairCooldownMs, sessionHourlyCap, workspaces, dm, candidateWindowMs: CANDIDATE_WINDOW_MS,
+      pairCooldownMs, sessionHourlyCap, workspaces, dm, controls, candidateWindowMs: CANDIDATE_WINDOW_MS,
       detectorParams: ADVISOR_DETECTOR_PARAMS, sourceSha256: sourceSha256(),
     },
     async run(view, now) {
