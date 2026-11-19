@@ -4,7 +4,7 @@
  * OTEL_SERVICE_NAME, DEPLOYMENT and DEPLOYMENT_ID, and a scan warning prints org and workspace ids to stderr.
  * Outputs carry session ids, so --out must be outside this repository (a synthetic run may pass --allow-repo-out).
  *
- *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N] [--detectors coordination-advisor,conflict-rule]
+ *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N] [--detectors coordination-advisor,conflict-rule] [--allow-incomplete-coverage]
  *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force] [--reason <text>] [--budget N]
  *   bun run src/session-intel/replay/cli.ts packet   --alerts <alerts.json> [--alerts ...] --seed <s> --out <dir> [--budget N]
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
@@ -20,7 +20,7 @@ import { ADVISOR_DETECTOR_NAME, advisorDetector, type ReplayDetector } from "./d
 import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
 import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay } from "./score.ts";
-import { loadSnapshot } from "./snapshot.ts";
+import { coverageGap, loadSnapshot } from "./snapshot.ts";
 import { writeAtomic, writeNew } from "./util.ts";
 
 const REPO_ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
@@ -102,7 +102,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
       snapshot: { type: "string" }, out: { type: "string" }, "interval-ms": { type: "string" },
       alerts: { type: "string", multiple: true }, labels: { type: "string" }, split: { type: "string" }, force: { type: "boolean" }, reason: { type: "string" },
       budget: { type: "string" }, seed: { type: "string" }, key: { type: "string" }, verdicts: { type: "string" },
-      "allow-repo-out": { type: "boolean" }, detectors: { type: "string" },
+      "allow-repo-out": { type: "boolean" }, detectors: { type: "string" }, "allow-incomplete-coverage": { type: "boolean" },
     },
   });
   const allowRepo = values["allow-repo-out"] === true;
@@ -114,7 +114,13 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const out = outDir(values.out, allowRepo);
     const intervalMs = values["interval-ms"] === undefined ? DEFAULT_INTERVAL_MS : Number(values["interval-ms"]);
     const snapshot = await loadSnapshot(resolve(values.snapshot), { now: io.now });
+    // A harvested snapshot whose coverage receipt is not complete is refused before any replay; with the
+    // explicit flag it replays, but as an incomplete replay, which held-out scoring then refuses.
+    const gap = coverageGap(snapshot);
+    if (gap && values["allow-incomplete-coverage"] !== true)
+      throw new Error(`${gap}; refused. Pass --allow-incomplete-coverage to replay it anyway (the replay is then incomplete and never held-out scored)`);
     const result = await replaySnapshot(snapshot, { detectors: replayDetectors(values.detectors), intervalMs });
+    if (gap) result.incomplete = [...result.incomplete, gap];
     // A workspace scan that failed or a row the store refused means alerts may be missing; alerts.json says so.
     const incomplete = result.incomplete;
     await writeAtomic(join(out, "alerts.json"), json(result));
