@@ -65,6 +65,51 @@ describe("claude code adapter, hostile records", () => {
 });
 
 describe("codex adapter", () => {
+  test("code-mode exec imports nested static apply_patch writes like the production projection", async () => {
+    const dir = tmp("si-imp-code-mode-");
+    const file = join(dir, "code-mode.jsonl");
+    const patch = "*** Begin Patch\n*** Update File: /work/acme-api/src/db/schema.ts\n@@\n-old\n+new\n*** End Patch";
+    writeFileSync(file, [
+      { timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } },
+      { timestamp: at("09:01"), type: "response_item", payload: { type: "custom_tool_call", name: "exec", call_id: "code-1", input: `const patch = ${JSON.stringify(patch)}; text(await tools.apply_patch(patch));` } },
+    ].map((row) => JSON.stringify(row)).join("\n"));
+    const set = await read(dir, readCodex);
+    expect(facts([...set.byKey.values()][0]!).writes).toEqual([["src/db/schema.ts", at("09:01")]]);
+  });
+
+  test("function-call exec arguments use the same projection and never execute JavaScript", async () => {
+    const dir = tmp("si-imp-code-mode-function-");
+    const patch = "*** Begin Patch\n*** Add File: src/new.ts\n+example\n*** End Patch";
+    const key = "__sessionIntelImportMustNotExecute";
+    writeFileSync(join(dir, "exec.jsonl"), [
+      { timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } },
+      { timestamp: at("09:01"), type: "response_item", payload: { type: "function_call", name: "exec", arguments: JSON.stringify({ input: `globalThis.${key} = true; text(await tools.apply_patch(${JSON.stringify(patch)}));` }) } },
+    ].map((row) => JSON.stringify(row)).join("\n"));
+    const set = await read(dir, readCodex);
+    expect(facts([...set.byKey.values()][0]!).writes).toEqual([["src/new.ts", at("09:01")]]);
+    expect((globalThis as Record<string, unknown>)[key]).toBeUndefined();
+  });
+
+  test("code-mode comments, quoted code, dynamic templates, oversize input and failed calls give no paths", async () => {
+    const dir = tmp("si-imp-code-mode-negative-");
+    const patch = "*** Begin Patch\n*** Add File: src/ignored.ts\n+example\n*** End Patch";
+    const call = `tools.apply_patch(${JSON.stringify(patch)})`;
+    const inputs = [
+      { input: `// ${call}` },
+      { input: `/* ${call} */` },
+      { input: JSON.stringify(call) },
+      { input: "tools.apply_patch(`*** Begin Patch\n*** Add File: ${path}\n*** End Patch`)" },
+      { input: " ".repeat(1024 * 1024 + 1) + call },
+      { input: call, is_error: true },
+    ];
+    writeFileSync(join(dir, "exec.jsonl"), [
+      { timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } },
+      ...inputs.map(({ input, ...extra }) => ({ timestamp: at("09:01"), type: "response_item", payload: { type: "custom_tool_call", name: "exec", input, ...extra } })),
+    ].map((row) => JSON.stringify(row)).join("\n"));
+    const set = await read(dir, readCodex);
+    expect(facts([...set.byKey.values()][0]!).writes).toEqual([]);
+  });
+
   test("apply_patch paths (custom tool and shell form), the shell commit sha, token counts", async () => {
     const set = await read(join(FIX, "codex"), readCodex);
     expect(set.byKey.size).toBe(1);
