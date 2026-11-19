@@ -217,6 +217,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.coordination_advisories_recent_v1(text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
