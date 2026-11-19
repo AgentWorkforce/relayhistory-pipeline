@@ -78,6 +78,7 @@ import {
   finishStagedOutputFacts,
   MAX_FACTS_CHUNK_INPUTS,
   OUTPUT_FACTS_CHUNK_UNSTAGEABLE,
+  isDeterministicRefusal,
   sealOutputFactsWant,
   stageOutputFactsChunk,
   type OutputFactsStore,
@@ -886,8 +887,13 @@ async function stagedSearchScopeRun(
   const refused = refusals.hit(refusalKey, refusalStamp, nowMs);
   if (refused !== null) {
     seen.cachedRefusal = true;
+    // owing() writes the scope's search state owing and invalidates its directory events, as the abandoned
+    // run's pass did. Equivalent, except while a peer holds a live lease on the run: the old path then
+    // answered staged_run_leased and wrote nothing; this one marks the scope owing (the peer's final step
+    // records it current again).
     return owing([refused], false);
   }
+  let deterministicAbandon = false;
   let outcome: Awaited<ReturnType<typeof runStagedReconcile>>;
   try {
     outcome = await runStagedReconcile(scope, h.stamp, ops, {
@@ -895,7 +901,11 @@ async function stagedSearchScopeRun(
       scanPage: Math.min(limits.insertBatch, MAX_SCAN_PAGE),
       deletePage: Math.min(limits.insertBatch, MAX_SCAN_PAGE),
       keepFingerprintPrefix: BUFFERED_FINGERPRINT_PREFIX,
-      abandonOn: (error) => (error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null),
+      abandonOn: (error) => {
+        // The G2 fast-fail caches only a refusal that recurs for the same source (not 53200 out_of_memory).
+        if (isDeterministicRefusal(error)) deterministicAbandon = true;
+        return error instanceof StreamBudgetError ? error.budget : error instanceof PipelineError && !error.retryable ? error.code : null;
+      },
       releaseOnError: true,
       attemptsCap: { cap: STAGED_RUN_MAX_ATTEMPTS, retryEvery: STAGED_RUN_RETRY_EVERY },
       onHeartbeatError: (error) =>
@@ -944,7 +954,7 @@ async function stagedSearchScopeRun(
       if (reason && STAGED_BUDGETS.has(reason)) return owing(["scope_too_large", reason], true);
       // A deterministic size refusal (a chunk, or the run's record bytes): the next pass of the same
       // source skips the claim and the read until it expires (StagedRefusals).
-      if (reason === OUTPUT_FACTS_CHUNK_UNSTAGEABLE) refusals.set(refusalKey, refusalStamp, reason, nowMs);
+      if (reason === OUTPUT_FACTS_CHUNK_UNSTAGEABLE && deterministicAbandon) refusals.set(refusalKey, refusalStamp, reason, nowMs);
       return owing(outcome.reasons, false);
     }
     case "failed":
@@ -996,7 +1006,8 @@ async function stagedSearchScope(scope: SessionScope, deps: SearchIndexDeps, lim
   } catch (error) {
     // Thrown (before the claim, in the reset, in owing()): still one line, then the error goes on.
     log.warn("search index staged run", {
-      ...scopeFields, outcome: "incomplete", ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }), duration_ms: Date.now() - started,
+      ...scopeFields, outcome: "incomplete", ...(seen.attempts === undefined ? {} : { attempt: seen.attempts }),
+      ...(seen.cachedRefusal ? { cached_refusal: true } : {}), duration_ms: Date.now() - started,
     });
     throw error;
   }
@@ -1026,7 +1037,11 @@ export const STAGED_REFUSAL_MAX_ENTRIES = 10_000;
  */
 export class StagedRefusals {
   private readonly entries = new Map<string, { stamp: string; reason: string; at: number }>();
-  constructor(readonly maxEntries = STAGED_REFUSAL_MAX_ENTRIES, readonly ttlMs = STAGED_REFUSAL_TTL_MS) {}
+  readonly maxEntries: number;
+  constructor(maxEntries = STAGED_REFUSAL_MAX_ENTRIES, readonly ttlMs = STAGED_REFUSAL_TTL_MS) {
+    // At least one entry: set() evicts until there is room.
+    this.maxEntries = Math.max(1, Math.floor(maxEntries));
+  }
   /** The cached reason for this scope and stamp, or null (no entry, another stamp, or expired: then dropped). */
   hit(key: string, stamp: string, now: number): string | null {
     const e = this.entries.get(key);
@@ -1039,7 +1054,7 @@ export class StagedRefusals {
   }
   set(key: string, stamp: string, reason: string, now: number): void {
     this.entries.delete(key);
-    while (this.entries.size >= this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
+    while (this.entries.size > 0 && this.entries.size >= this.maxEntries) this.entries.delete(this.entries.keys().next().value!);
     this.entries.set(key, { stamp, reason, at: now });
   }
   clear(key: string): void {
@@ -1056,7 +1071,8 @@ function stagedRefusalsOf(staged: StagedReconcile): StagedRefusals {
   if (!r) stagedRefusalsByStaged.set(staged, (r = new StagedRefusals()));
   return r;
 }
-const stagedRefusalKey = (scope: SessionScope, canonicalId: string) => JSON.stringify([scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, canonicalId]);
+/** The cache key of a scope (exported for tests). */
+export const stagedRefusalKey = (scope: SessionScope, canonicalId: string) => JSON.stringify([scope.orgId, scope.workspaceId, scope.harness, scope.sessionId, canonicalId]);
 const stagedRefusalStamp = (stamp: SourceStamp) => JSON.stringify([stamp.canonicalId, stamp.epoch, stamp.manifestFingerprint]);
 
 /** Inputs per facts chunk of a staged run (the module's default; clamped to MAX_FACTS_CHUNK_INPUTS). */

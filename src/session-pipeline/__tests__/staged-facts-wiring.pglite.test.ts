@@ -31,7 +31,7 @@ import { CONSUMER_WORKER, outputFactsDeps } from "../consumer-service.ts";
 import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
 import {
-  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK, STAGED_FACTS_RECORD_BYTES_CAP, STAGED_FACTS_WIDE_TEXT_WEIGHT, STAGED_REFUSAL_MAX_ENTRIES, STAGED_REFUSAL_TTL_MS, StagedRefusals,
+  indexSearchScope, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStreamStartup, STAGED_FACTS_CHUNK, STAGED_FACTS_RECORD_BYTES_CAP, STAGED_FACTS_WIDE_TEXT_WEIGHT, STAGED_REFUSAL_MAX_ENTRIES, STAGED_REFUSAL_TTL_MS, StagedRefusals, stagedRefusalKey,
   type SearchIndexDeps, type SearchIndexResult, type StagedReconcile,
 } from "../search-index.ts";
 import {
@@ -72,7 +72,7 @@ function stagedOn(run: StagedReconcile["run"] = {}): StagedReconcile {
 
 const ROLE_CALLS = ["sessions.search_reconcile_", "sessions.staged_facts_", "sessions.output_facts_"];
 
-async function rig(x: ExportedScope) {
+async function rig(x: ExportedScope, opts: { fault?: (sql: string) => unknown } = {}) {
   const hoop = await clonedReplayDatabase();
   cleanup.push(() => hoop.pg.close());
   await hoop.pg.exec(`GRANT USAGE ON SCHEMA sessions TO ${RUNTIME}`); // as session_consumer_role.sql does
@@ -99,6 +99,8 @@ async function rig(x: ExportedScope) {
     hoop.pg.transaction((tx) =>
       work({
         query: async (sql: string, params?: unknown[]) => {
+          const fault = opts.fault?.(sql);
+          if (fault) throw fault;
           if (!ROLE_CALLS.some((p) => sql.includes(p))) return tx.query(sql, params) as never;
           await tx.exec(`SET LOCAL ROLE ${RUNTIME}`);
           const result = await tx.query(sql, params); // a failure aborts the transaction: no RESET then
@@ -405,8 +407,8 @@ describe("G2 fast-fail: a cached size refusal skips the claim and the source rea
   });
 
   /** A rig with the scope's facts reconciled whole, and a store that counts its object reads. */
-  const setup = async () => {
-    const r = await rig(x);
+  const setup = async (opts: Parameters<typeof rig>[1] = {}) => {
+    const r = await rig(x, opts);
     await r.tick(FACTS);
     let reads = 0;
     const counting = new Proxy(x.store, {
@@ -448,6 +450,11 @@ describe("G2 fast-fail: a cached size refusal skips the claim and the source rea
     expect(hit.out.partial).toBeUndefined();
     expect(hit.out.stream).toBeUndefined();
     expect(await t.attempts()).toEqual(claimed);
+    // Exactly the whole read of the first transaction (it still runs up to the whole-read bound) and nothing
+    // more: the same pass with no staged run reads the same objects and stops there.
+    const wholeOnly = await t.pass(undefined as never);
+    expect(wholeOnly.out.reasons).toEqual(["scope_too_large"]);
+    expect(hit.reads).toBe(wholeOnly.reads);
     expect(hit.reads).toBeLessThan(first.reads);
     // The search state and the facts state stay owing.
     expect(t.r.recorded.at(-1)?.complete).toBe(false);
@@ -523,6 +530,36 @@ describe("G2 fast-fail: a cached size refusal skips the claim and the source rea
     ]);
   }, 180_000);
 
+  test("53200 out_of_memory abandons the run by name but is not cached: the next pass claims and runs again", async () => {
+    let oom = true;
+    const t = await setup({ fault: (sql) => (oom && sql.includes("sessions.staged_facts_stage_v1") ? Object.assign(new Error("out of memory"), { code: "53200" }) : null) });
+    const staged = stagedOn();
+    const first = await t.pass(staged);
+    expect(first.out).toMatchObject({ complete: false, reasons: [OUTPUT_FACTS_CHUNK_UNSTAGEABLE] });
+    expect(staged.refusals!.size).toBe(0);
+    const claims = (await t.attempts())[0]!;
+    oom = false;
+    const again = await t.pass(staged);
+    expect(again.out).toMatchObject({ complete: true });
+    expect(again.out.stream).toBeDefined();
+    expect(claims).toBe(1); // the abandoned run was claimed once; the second pass claimed it again and finished
+    expect(await t.attempts()).toEqual([]);
+  }, 180_000);
+
+  test("a run that finishes with the same stamp clears the scope's entry (clear, not the stamp check)", async () => {
+    const t = await setup();
+    const staged = stagedOn({
+      // An entry for this very scope appears while the run is past its hit check (as a concurrent pass of
+      // the scope in this process would set it); the run then finishes.
+      boundary: (p) => {
+        if (p === "final:committed") staged.refusals!.set(stagedRefusalKey(SCOPE, x.canonicalId), "any-stamp", OUTPUT_FACTS_CHUNK_UNSTAGEABLE, 0);
+      },
+    });
+    const out = await t.pass(staged);
+    expect(out.out).toMatchObject({ complete: true });
+    expect(staged.refusals!.size).toBe(0);
+  }, 180_000);
+
   test("StagedRefusals: a new stamp replaces the entry, expiry drops it, the bound evicts the oldest", () => {
     const c = new StagedRefusals(2, 1000);
     c.set("a", "s1", "r", 0);
@@ -541,6 +578,14 @@ describe("G2 fast-fail: a cached size refusal skips the claim and the source rea
     c.clear("b");
     expect(c.hit("b", "s1", 6)).toBeNull();
     expect([STAGED_REFUSAL_TTL_MS, STAGED_REFUSAL_MAX_ENTRIES]).toEqual([24 * 60 * 60 * 1000, 10_000]);
+    // A bound of 0 or less is held at 1: set() never loops.
+    for (const bound of [0, -5]) {
+      const one = new StagedRefusals(bound);
+      expect(one.maxEntries).toBe(1);
+      one.set("a", "s", "r", 0);
+      one.set("b", "s", "r", 0);
+      expect([one.size, one.hit("a", "s", 0), one.hit("b", "s", 0)]).toEqual([1, null, "r"]);
+    }
   });
 });
 
