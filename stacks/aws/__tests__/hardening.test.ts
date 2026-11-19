@@ -17,6 +17,7 @@ import {
   hoopdbInCluster,
   denyInsecureTransport,
   ecrPushPolicy,
+  GITHUB_OIDC_SUB_PREFIX,
   githubImagePublishTrust,
   lockerLifecycleRules,
   podIdentityTrust,
@@ -275,12 +276,24 @@ describe("GitHub image publisher", () => {
   });
 
   it("is assumable only from this repository's image-publish environment", () => {
-    const t = githubImagePublishTrust("arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com", "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333");
+    const t = githubImagePublishTrust("arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com", "repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333");
     expect(t.Statement).toHaveLength(1);
     expect(t.Statement[0]!.Condition.StringEquals).toEqual({
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333:environment:image-publish",
+      "token.actions.githubusercontent.com:sub": "repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333:environment:image-publish",
     });
+  });
+
+  it("the stack's publish trust carries the renamed repository's subject (one prefix for every trust)", () => {
+    // GitHub's token subject carries the current name; the old sessions-pipeline subject is refused by STS.
+    expect(GITHUB_OIDC_SUB_PREFIX).toBe("repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333");
+    const t = githubImagePublishTrust("arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com", GITHUB_OIDC_SUB_PREFIX);
+    expect(t.Statement[0]!.Condition.StringEquals["token.actions.githubusercontent.com:sub"])
+      .toBe("repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333:environment:image-publish");
+    const stack = readFileSync(`${ROOT}/stacks/aws/alchemy.aws.run.ts`, "utf8");
+    expect(stack).toContain("githubImagePublishTrust(oidc.openIDConnectProviderArn as unknown as string, OIDC_SUB_PREFIX)");
+    expect(stack).toContain("const OIDC_SUB_PREFIX = GITHUB_OIDC_SUB_PREFIX;");
+    expect(stack).not.toMatch(/"repo:[^"]*"/);
   });
 });
 

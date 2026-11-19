@@ -40,6 +40,7 @@ import * as Effect from "effect/Effect";
 import { BACKLOG_OPS_DRY_ENVIRONMENT, BACKLOG_OPS_EXECUTE_ENVIRONMENT, BACKLOG_OPS_SESSION_SECONDS } from "../../src/session-ingest/backlog-ops.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { presignIssuerUserName, uploadPresignIssuerPolicy } from "./upload-inbox.ts";
+import { GITHUB_OIDC_SUB_PREFIX } from "./hardening.ts";
 
 export const GITHUB_OIDC_HOST = "token.actions.githubusercontent.com";
 export const GITHUB_OIDC_URL = `https://${GITHUB_OIDC_HOST}`;
@@ -48,7 +49,7 @@ export const GITHUB_OIDC_AUDIENCE = "sts.amazonaws.com";
  * This repository's immutable-id OIDC subject prefix (docs/backlog-ops-workflow.md "IAM"): the owner and repository
  * ids are fixed, the name segment follows the repository's current name.
  */
-export const BACKLOG_OPS_OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333";
+export const BACKLOG_OPS_OIDC_SUB_PREFIX = GITHUB_OIDC_SUB_PREFIX;
 
 /** The Alchemy ids, per input group. A group's resources are declared (and must be planned) together. */
 export const ADOPTED_IDENTITY_GROUPS = {

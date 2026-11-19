@@ -470,6 +470,16 @@ export function ecrPushPolicy(region: string, accountId: string) {
 }
 
 /**
+ * This repository's GitHub OIDC subject prefix. The repo has immutable OIDC subjects on, so the
+ * owner and repository ids are fixed and the name segment follows the repository's current name
+ * (AgentWorkforce/relayhistory-pipeline since the rename from sessions-pipeline):
+ * `repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333:environment:<env>`.
+ * The single source for every trust policy in this stack (image publish here, backlog ops in
+ * adopt-identities.ts).
+ */
+export const GITHUB_OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333";
+
+/**
  * Trusted only for jobs of this repository (immutable numeric subject) running
  * in the `image-publish` environment. No per-stage deploy subject: no workflow
  * deploys the stage. The environment's branch policy (main only) is a GitHub

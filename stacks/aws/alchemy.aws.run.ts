@@ -32,7 +32,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PIPPEN_PROOF_SANDBOX, pippenProofSandboxCallerArn, SANDBOX_RULES, assertRegion } from "./sandbox-rules.ts";
 import { eksStage } from "./eks.ts";
-import { denyInsecureTransport, ecrPushPolicy, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
+import { denyInsecureTransport, ecrPushPolicy, GITHUB_OIDC_SUB_PREFIX, githubImagePublishTrust, lockerLifecycleRules, trailKeyPolicy } from "./hardening.ts";
 import { ecrPullPolicy, sharedServicesRepository, validateAwsInputs, type ApprovedServicesImage, type AwsInputs } from "./inputs.ts";
 import { assertApprovalBinding, assertAwsDeploymentTarget, assertClearance, awsMode, type AwsMode } from "./deploy-guard.ts";
 import { snapshotStateLayer } from "./state-snapshot.ts";
@@ -52,11 +52,11 @@ import { parseHistoryUploadDirectInfra } from "./upload-inbox.ts";
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
 /**
- * The repo has GitHub immutable OIDC subjects on, so the sub carries numeric ids:
- * `repo:AgentWorkforce@252050005/sessions-pipeline@1437714333:environment:<env>`
- * (checked with `gh api repos/AgentWorkforce/sessions-pipeline/actions/oidc/customization/sub`).
+ * The repo has GitHub immutable OIDC subjects on, so the sub carries numeric ids and the current
+ * repository name: `repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333:environment:<env>`
+ * (hardening.ts GITHUB_OIDC_SUB_PREFIX; the old sessions-pipeline name no longer matches the token).
  */
-const OIDC_SUB_PREFIX = "repo:AgentWorkforce@252050005/sessions-pipeline@1437714333";
+const OIDC_SUB_PREFIX = GITHUB_OIDC_SUB_PREFIX;
 
 /** Written by hand (not by the CLI) once Khaliq clears the account: see docs/aws-stage.md and stacks/aws/inputs.ts. */
 function readInputs(stage: string): AwsInputs & { mode: AwsMode } {

@@ -16,6 +16,7 @@ import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE, transcriptNames } from "../transcript-store.ts";
 import { uploadPresignIssuerPolicy } from "../upload-inbox.ts";
 import { alchemyStatePrefix } from "../preflight.ts";
+import { GITHUB_OIDC_SUB_PREFIX } from "../hardening.ts";
 import { assertCleanPreApply, canonicalJson, preApplyReport, type Run } from "../adopt-identities-live.ts";
 
 // Synthetic placeholders only (public repo), except the production stage constants the contract is pinned to.
@@ -404,6 +405,9 @@ describe("adopt identities: rendered with stage values", () => {
         Action: ["sts:AssumeRoleWithWebIdentity"], Condition: { StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": `${BACKLOG_OPS_OIDC_SUB_PREFIX}:environment:${env}` } } }] });
     }
+    // One prefix for every trust in the stack: the image-publish role uses the same constant.
+    expect(BACKLOG_OPS_OIDC_SUB_PREFIX).toBe(GITHUB_OIDC_SUB_PREFIX);
+    expect(BACKLOG_OPS_OIDC_SUB_PREFIX).toBe("repo:AgentWorkforce@252050005/relayhistory-pipeline@1437714333");
     expect(by("adopted-backlog-ops-read").description).toBeUndefined();
     expect(by("adopted-backlog-ops-write").description).toBe("synthetic description");
     // The read role never trusts the execute environment's subject.
