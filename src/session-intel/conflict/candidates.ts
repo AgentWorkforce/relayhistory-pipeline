@@ -12,7 +12,7 @@ import { CANDIDATE_WINDOW_MS } from "../../coordination-advisor/rubric.ts";
 import type { SnapshotClaim, SnapshotSession } from "../replay/snapshot.ts";
 import type { AsOfSession } from "../replay/views.ts";
 import { refString, sortedPair, textCompare } from "../replay/util.ts";
-import { claimPathTopicDirs, claimTopics, writeTopics } from "./topics.ts";
+import { claimTopics, parseClaimText, writeTopics } from "./topics.ts";
 
 export const CONFLICT_WINDOW_MS = CANDIDATE_WINDOW_MS;
 export const MAX_PAIRS_PER_WORKSPACE = 50;
@@ -76,7 +76,7 @@ function sideOf(view: AsOfSession, nowIso: string): Side {
   const live = view.claims.filter((c) => isLiveClaim(c, nowIso));
   const writes = writeTopics(view.writes);
   const known = new Map(writes);
-  for (const c of live) for (const [t, dirs] of claimPathTopicDirs(c.text)) if (!known.has(t)) known.set(t, dirs);
+  for (const c of live) for (const [t, dirs] of parseClaimText(c.text).pathDirs) if (!known.has(t)) known.set(t, dirs);
   return { view, ref: refString(view.session), live, writes, known };
 }
 
