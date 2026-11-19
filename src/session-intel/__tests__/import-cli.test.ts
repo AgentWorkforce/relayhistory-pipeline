@@ -3,9 +3,10 @@
  * output-directory refusals, and import followed by the unchanged replay CLI. Synthetic fixtures only.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { isInside, main } from "../import/cli.ts";
+import { main, readSaltFile } from "../import/cli.ts";
+import { isInside } from "../replay/cli.ts";
 import { Hasher } from "../import/normalize.ts";
 import { mappingPath } from "../import/writer.ts";
 import { main as replayMain } from "../replay/cli.ts";
@@ -18,10 +19,18 @@ const FIX = join(import.meta.dir, "fixtures", "import");
 const REPO = resolve(import.meta.dir, "..", "..", "..");
 const NOW = new Date("2026-11-18T00:00:00.000Z");
 const SALT = "fixture-salt-0123456789";
+/** A salt file outside the repository, owner-only unless `mode` says otherwise. */
+function saltFile(content: string, mode = 0o600): string {
+  const path = join(tmp("si-imp-salt-"), "salt");
+  writeFileSync(path, content, { mode });
+  chmodSync(path, mode);
+  return path;
+}
+const SALT_FILE = saltFile(`${SALT}\n`);
 const DELETE_BY = "2026-12-01T00:00:00.000Z";
 const quiet = () => { const lines: string[] = []; return { lines, io: { out: (l: string) => lines.push(l), err: (l: string) => lines.push(l), now: NOW } }; };
 const args = (format: string, dir: string, out: string, extra: string[] = []) =>
-  ["--format", format, "--in", join(FIX, dir), "--out", out, "--salt", SALT, "--delete-by", DELETE_BY, ...extra];
+  ["--format", format, "--in", join(FIX, dir), "--out", out, "--salt-file", SALT_FILE, "--delete-by", DELETE_BY, ...extra];
 
 async function runImport(format: string, dir: string, extra: string[] = []) {
   const out = join(tmp("si-imp-"), "snap");
@@ -83,12 +92,12 @@ describe("import cli", () => {
     const a = await runImport("claude-code", "claude"), b = await runImport("claude-code", "claude");
     expect(readFileSync(join(b.out, "sessions.jsonl"), "utf8")).toBe(readFileSync(join(a.out, "sessions.jsonl"), "utf8"));
     const out = join(tmp("si-imp-"), "snap");
-    expect(await main(["--format", "claude-code", "--in", join(FIX, "claude"), "--out", out, "--salt", "another-salt-0123456789", "--delete-by", DELETE_BY], quiet().io)).toBe(0);
+    expect(await main(["--format", "claude-code", "--in", join(FIX, "claude"), "--out", out, "--salt-file", saltFile("another-salt-0123456789"), "--delete-by", DELETE_BY], quiet().io)).toBe(0);
     expect(readFileSync(join(out, "sessions.jsonl"), "utf8")).not.toBe(readFileSync(join(a.out, "sessions.jsonl"), "utf8"));
   });
 
   test("deleteBy: required, ISO with a zone, in the future, at most 30 days out", async () => {
-    const run = (deleteBy: string | null) => main(["--format", "generic", "--in", join(FIX, "generic"), "--out", join(tmp("si-imp-"), "snap"), "--salt", SALT,
+    const run = (deleteBy: string | null) => main(["--format", "generic", "--in", join(FIX, "generic"), "--out", join(tmp("si-imp-"), "snap"), "--salt-file", SALT_FILE,
       ...(deleteBy === null ? [] : ["--delete-by", deleteBy])], quiet().io);
     await expect(run(null)).rejects.toThrow("--delete-by is required");
     await expect(run("2026-12-01")).rejects.toThrow("ISO-8601");
@@ -100,11 +109,12 @@ describe("import cli", () => {
   test("refuses a missing or short salt, a bad format, bad tenant ids and unknown flags", async () => {
     const out = join(tmp("si-imp-"), "snap");
     const base = ["--in", join(FIX, "generic"), "--out", out, "--delete-by", DELETE_BY];
-    await expect(main(["--format", "generic", ...base], quiet().io)).rejects.toThrow("--salt is required");
-    await expect(main(["--format", "generic", ...base, "--salt", "short"], quiet().io)).rejects.toThrow("--salt is required");
-    await expect(main(["--format", "otel", ...base, "--salt", SALT], quiet().io)).rejects.toThrow("--format");
-    await expect(main(["--format", "generic", ...base, "--salt", SALT, "--org", "../x"], quiet().io)).rejects.toThrow("--org");
-    await expect(main(["--format", "generic", ...base, "--salt", SALT, "--token", "x"], quiet().io)).rejects.toThrow();
+    await expect(main(["--format", "generic", ...base], quiet().io)).rejects.toThrow("--salt-file is required");
+    // The salt is never taken from argv.
+    await expect(main(["--format", "generic", ...base, "--salt", SALT], quiet().io)).rejects.toThrow("Unknown option '--salt'");
+    await expect(main(["--format", "otel", ...base, "--salt-file", SALT_FILE], quiet().io)).rejects.toThrow("--format");
+    await expect(main(["--format", "generic", ...base, "--salt-file", SALT_FILE, "--org", "../x"], quiet().io)).rejects.toThrow("--org");
+    await expect(main(["--format", "generic", ...base, "--salt-file", SALT_FILE, "--token", "x"], quiet().io)).rejects.toThrow();
     expect(existsSync(out)).toBe(false);
   });
 
@@ -122,13 +132,14 @@ describe("import cli", () => {
     expect(existsSync(join(FIX, "..", "snap"))).toBe(false);
   });
 
-  test("isInside counts only '..', '..' + sep or an absolute relative path as outside", () => {
-    expect(isInside("/r/..cache/x", "/r")).toBe(true);
-    expect(isInside("/r", "/r")).toBe(true);
-    expect(isInside("/r/a", "/r")).toBe(true);
-    expect(isInside("/", "/r")).toBe(false);
-    expect(isInside("/rx", "/r")).toBe(false);
-    expect(isInside(`/r${sep}..${sep}s`, "/r")).toBe(false);
+  test("the shared M0 isInside counts only '..', '..' + sep or an absolute relative path as outside", () => {
+    const r = tmp("si-imp-root-");
+    expect(isInside(r, join(r, "..cache", "x"))).toBe(true);
+    expect(isInside(r, r)).toBe(true);
+    expect(isInside(r, join(r, "a"))).toBe(true);
+    expect(isInside(r, resolve(r, ".."))).toBe(false);
+    expect(isInside(r, `${r}x`)).toBe(false);
+    expect(isInside(r, `${r}${sep}..${sep}s`)).toBe(false);
   });
 
   test("refuses a non-empty --out, --out inside --in, and an --in with no traces; never follows symlinks under --in", async () => {
@@ -140,16 +151,55 @@ describe("import cli", () => {
     expect(readdirSync(busy)).toEqual(["keep.txt"]);
     const input = join(root, "in");
     mkdirSync(input);
-    await expect(main(["--format", "generic", "--in", input, "--out", join(input, "snap"), "--salt", SALT, "--delete-by", DELETE_BY], quiet().io)).rejects.toThrow("contain each other");
+    await expect(main(["--format", "generic", "--in", input, "--out", join(input, "snap"), "--salt-file", SALT_FILE, "--delete-by", DELETE_BY], quiet().io)).rejects.toThrow("contain each other");
     // The only trace is a symlink: it is not read, so there is nothing to import.
     symlinkSync(join(FIX, "generic", "events.jsonl"), join(input, "linked.jsonl"));
-    await expect(main(["--format", "generic", "--in", input, "--out", join(root, "snap"), "--salt", SALT, "--delete-by", DELETE_BY], quiet().io)).rejects.toThrow("no .jsonl files");
+    await expect(main(["--format", "generic", "--in", input, "--out", join(root, "snap"), "--salt-file", SALT_FILE, "--delete-by", DELETE_BY], quiet().io)).rejects.toThrow("no .jsonl files");
     // An empty existing --out is fine: the snapshot replaces it.
     const empty = join(root, "empty");
     mkdirSync(empty);
     expect(await main(args("generic", "generic", empty), quiet().io)).toBe(0);
     expect(readdirSync(empty).sort()).toEqual(["manifest.json", "sessions.jsonl"]);
     expect(readdirSync(root).filter((f) => f.includes(".import-"))).toEqual([]);
+  });
+});
+
+describe("salt file", () => {
+  test("a trimmed 0600 file outside the repository gives the same ids as its content", async () => {
+    expect(await readSaltFile(saltFile(`  ${SALT}\n\n`))).toBe(SALT);
+    const a = await runImport("generic", "generic");
+    const out = join(tmp("si-imp-"), "snap");
+    expect(await main(["--format", "generic", "--in", join(FIX, "generic"), "--out", out, "--salt-file", saltFile(`\t${SALT}  \n`), "--delete-by", DELETE_BY], quiet().io)).toBe(0);
+    expect(readFileSync(join(out, "sessions.jsonl"), "utf8")).toBe(readFileSync(join(a.out, "sessions.jsonl"), "utf8"));
+  });
+
+  test("refuses group- or world-accessible modes, symlinks, non-files, bad lengths and files in the repository", async () => {
+    for (const mode of [0o640, 0o604, 0o660, 0o602, 0o644]) await expect(readSaltFile(saltFile(SALT, mode))).rejects.toThrow("group or others");
+    const link = join(tmp("si-imp-salt-link-"), "salt");
+    symlinkSync(SALT_FILE, link);
+    await expect(readSaltFile(link)).rejects.toThrow("must not be a symlink");
+    await expect(readSaltFile(tmp("si-imp-salt-dir-"))).rejects.toThrow("regular file");
+    await expect(readSaltFile(join(tmp("si-imp-"), "missing"))).rejects.toThrow("could not be opened");
+    await expect(readSaltFile(saltFile("short-salt \n"))).rejects.toThrow("16 to 1024");
+    await expect(readSaltFile(saltFile("   \n"))).rejects.toThrow("16 to 1024");
+    await expect(readSaltFile(saltFile("x".repeat(1_025)))).rejects.toThrow("16 to 1024");
+    await expect(readSaltFile(join(FIX, "salt"))).rejects.toThrow("inside the repository");
+    expect(existsSync(join(FIX, "salt"))).toBe(false);
+  });
+
+  test("the salt never reaches an error, stdout or stderr", async () => {
+    const secret = "never-echo-this-salt-0123456789";
+    const seen: string[] = [];
+    const io = { out: (l: string) => seen.push(l), err: (l: string) => seen.push(l), now: NOW };
+    for (const path of [saltFile(secret, 0o644), saltFile(`${secret}${"y".repeat(1_100)}`)]) {
+      const err = await main(["--format", "generic", "--in", join(FIX, "generic"), "--out", join(tmp("si-imp-"), "snap"), "--salt-file", path, "--delete-by", DELETE_BY], io).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(Error);
+      seen.push((err as Error).message);
+    }
+    const out = join(tmp("si-imp-"), "snap");
+    expect(await main(["--format", "generic", "--in", join(FIX, "generic"), "--out", out, "--salt-file", saltFile(secret), "--delete-by", DELETE_BY], io)).toBe(0);
+    for (const line of seen) expect(line).not.toContain(secret.slice(0, 12));
+    expect(`${allText(out)}${readFileSync(mappingPath(out), "utf8")}`).not.toContain(secret);
   });
 });
 
@@ -166,6 +216,7 @@ describe("import, then the unchanged replay", () => {
       urgency: "high", kind: "duplicate_work", artifact: "number:0042", pair: [`claude:${a}`, `claude:${b}`].sort(), channel: "dm",
       alertAt: "2026-11-01T09:31:00.000Z", sentAt: "2026-11-01T09:33:00.000Z",
     }]);
+    expect(r.format).toBe("session-intel-replay/2");
     expect(r.detectors[0].diagnostics).toMatchObject({ failed: 0, rejected: 0 });
   });
 
