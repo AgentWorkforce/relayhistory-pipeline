@@ -10,6 +10,7 @@
  */
 import { advisoryMessage } from "../coordination-advisor/template.ts";
 import { TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "./liveness.ts";
+import { advisoryPriority } from "./advisory-priority.ts";
 
 export const ADVISORIES_CONTRACT = "coordination-advisories/1";
 /** pending_for_v1 returns at most 10 rows; the route never serves more. */
@@ -34,6 +35,8 @@ export interface AdvisoryRow {
   artifact: string;
   evidence: AdvisoryEvidence[];
   createdAt: string;
+  /** Set once the HIGH DM was sent (mark_delivered_v1); a listed row is never acked, so only the DM sets it. */
+  deliveredAt: string | null;
 }
 
 export interface AdvisoryRecipient {
@@ -77,7 +80,7 @@ export function poolTenantWriter(pool: { connect(): Promise<PoolClient> }): Tena
 }
 
 const PENDING_SQL = `SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
-       evidence, created_at
+       evidence, created_at, delivered_at
   FROM sessions.coordination_advisories_pending_for_v1($1, $2, $3, $4)`;
 const ACK_SQL = "SELECT sessions.coordination_advisories_ack_v1($1, $2, $3, $4, $5) AS ok";
 
@@ -106,6 +109,7 @@ export function sqlCoordinationAdvisories(read: TenantRunner, write: TenantRunne
           artifact: String(row.artifact),
           evidence: evidenceOf(row.evidence),
           createdAt: iso(row.created_at),
+          deliveredAt: row.delivered_at === null || row.delivered_at === undefined ? null : iso(row.delivered_at),
         }));
       }),
     ack: (r, advisoryId) =>
@@ -116,7 +120,12 @@ export function sqlCoordinationAdvisories(read: TenantRunner, write: TenantRunne
   };
 }
 
-/** The wire item: the stored row plus the same templated message the HIGH DM carries. */
+/**
+ * The wire item: the stored row plus the same templated message the HIGH DM carries. M3-7 adds two fields,
+ * additively under the same contract: `priority` (advisory-priority.ts) and `delivery`. `delivery.dm` is true
+ * when delivered_at is set: on a listed row (pending or delivered, never acked) only the DM path
+ * (coordination_advisories_mark_delivered_v1) sets it, the ack sets it only on rows this GET no longer lists.
+ */
 export function advisoryItem(row: AdvisoryRow) {
   const firstSeen = row.evidence.map((e) => e.ts).filter((ts) => ts !== "").sort()[0] ?? row.createdAt;
   return {
@@ -131,5 +140,7 @@ export function advisoryItem(row: AdvisoryRow) {
       harness: row.harness, sessionId: row.sessionId, peerHarness: row.peerHarness, peerSessionId: row.peerSessionId, firstSeen,
     }),
     evidence: row.evidence,
+    priority: advisoryPriority(row),
+    delivery: { dm: row.deliveredAt !== null, deliveredAt: row.deliveredAt },
   };
 }
