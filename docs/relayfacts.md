@@ -88,6 +88,9 @@ Both tables have row-level security enabled and no table privileges for any role
 | `sessions.relayfacts_list_v1` | `bulls96_read_api` | List one topic's records with evidence for one workspace, oldest first, keyset paginated. |
 | `sessions.relayfacts_evidence_erase_session_v1` | `bulls96_session_ingest` | Operator per-session erase (`20261105062090`, see Retention). |
 | `sessions.relayfacts_user_erase_v1` | owner only (the per-user erase job) | Hosted operator per-user erase (`20261105062100`, see Retention). |
+| `sessions.relayfacts_claims_insert_v1` | `service_role` | `20261105062150`: insert or merge intent and constraint claims (see Claims). |
+| `sessions.relayfacts_claims_supersede_v1` | `service_role` | `20261105062150`: mark one claim superseded by another of the same kind. |
+| `sessions.relayfacts_claims_v1` | `service_role` | `20261105062150`: current claims and decisions of a workspace, for the extractor and the coordination advisor (see Claims). |
 
 Writes go to the worker role. The task asked for service_role only; the read API runs as `bulls96_read_api`, so the two read functions are granted to that role instead, following the coordination advisories template (`20261105062000`). Both read functions refuse with SQLSTATE `42501` unless `sessions.session_directory_read_api_scope(workspace)` equals the requested org, so a read-API caller cannot read another workspace even with a forged org.
 
@@ -109,7 +112,34 @@ The extractor runs in the session-analysis tick (`src/session-analysis/worker.ts
 | `SUMMARY_DECISION_RECORDS_ENABLED` | session-analysis worker | off | After an analysis job completes, extract decisions and call `relayfacts_insert_v1`. Off: no extractor call, no DB call and no log line. |
 | `SUMMARY_DECISION_RECORDS_ENABLED` | self-host ingest (operator erase worker) | off | The operator per-session erase also calls `relayfacts_evidence_erase_session_v1` before its purge, and startup requires that function. Off: the erase pass makes the same calls as before. |
 | `SUMMARY_DECISION_RECORDS_ENABLED` | operator user-erase job (`src/session-erase/user-erase-main.ts`) | off | Before `operator_user_erase_begin`, the job calls `relayfacts_user_erase_v1` for the user, and logs and returns its counts. Off: the job makes the same calls as before, with no `relayfacts` result key and no relayfacts log line. |
+| `SESSION_INTEL_CLAIMS_ENABLED` | session-analysis worker, inside `SUMMARY_DECISION_RECORDS_ENABLED=true` | off | After the unchanged decisions step, record the analysis's constraints and intents as claims through `relayfacts_claims_insert_v1` (migration `20261105062150`), and supersede dropped claims (see Claims). Off: no claims call; decisions exactly as before. It never touches the decision tables or the read API. |
 | `READ_API_RELAYFACTS_ENABLED` | read API (Lambda, Cloudflare worker, self-host) | off | Serve `GET /v1/relayfacts` and `GET /v1/relayfacts/{topic}`. Off: both routes answer `501 {"error":"relayfacts_disabled"}`. |
+
+## Claims
+
+Session Intelligence M1 (`docs/proposals/session-intelligence.md`). Migration slot `20261105062150` (`supabase/migrations/20261105062150_relayfacts_claims.sql`), with a checksum-pinned rollback. Code only: applying it to any real database needs Khaliq's explicit OK.
+
+Intents and constraints live in two new tables; `relayfacts_v1`, `relayfacts_evidence_v1` and the 062080 functions are untouched, so decisions, `GET /v1/relayfacts`, `GET /v1/relayfacts/{topic}`, their counts and markdown, and everything built on them stay decisions only by construction.
+
+- **`sessions.relayfacts_claims_v1`**: the 062080 record columns and bounds, plus `kind` (`intent` or `constraint`), `scope` (`session`, `project`, `repo`; default `session`) and `observed_at` (nullable), without `decided_at` and the `implemented_*` columns. Status `open` or `decided` (current), then `superseded`. A unique index on (`org_id`, `workspace_id`, `kind`, `topic`, `title_key`), with the 062080 `title_key` expression, enforces deduplication: a constraint and an intent with the same title are two claims.
+- **`sessions.relayfacts_claim_evidence_v1`** mirrors `relayfacts_evidence_v1` (unique on claim, source, session and range; at most 50 rows per claim).
+- Both have row-level security and no table privilege for any role; the three functions are SECURITY DEFINER with `search_path` pinned and PUBLIC revoked, EXECUTE to `service_role` (and the runtime role).
+- **Merge.** A known claim keeps its title and statement and gains only new evidence; its scope only widens (`session` < `project` < `repo`) and its `observed_at` only moves earlier.
+- **Reader.** `relayfacts_claims_v1(org, workspace, topic?, kind?, since?, limit 1..500)` returns current claims and current decisions (from `relayfacts_v1`, with kind `decision` and scope and `observed_at` null), newest first, with the stored scrub-clean statement cut to 200 characters and evidence pointers (no evidence claim text).
+- **Extractor** (`src/session-analysis/claims.ts`, with the flag): `understanding.constraints`, then `understanding.intents`, under every rule above (confidence, a cited reference, scrub-clean text, bounds, topic); at most 100 claims. Decisions keep going through `relayfacts_insert_v1`, first, exactly as with the flag off. Counts: `claim_records`, `claim_records_fenced`, `claim_records_failed`, `claim_records_superseded`, `claim_supersede_failed`.
+- **Scope**, first rule wins (`SCOPE_RULES`), else `session`:
+
+  | Scope | When |
+  |---|---|
+  | `session` | no cited reference is from the analysed (root) session; or one is a `delegated-instruction`; or the text limits itself ("this session", "this task", "my branch", "for now", "temporarily", ...) |
+  | `repo` | the text names an instruction file (`AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `.cursor/rules`, `copilot-instructions.md`) or calls itself a repository or project rule or policy |
+  | `project` | a cited root `human-message` and the text says it applies beyond the session ("in this repo", "for everyone", "always", "never", "from now on", "going forward", ...) |
+
+  The references carry no file path the extractor may read (their `summary` and `detail` are never read), so an instruction file a session only loaded is not seen (M1-4). Scope comes from session text and is untrusted downstream.
+- **observed_at** is the earliest parseable `at` among the references the claim's evidence rows cite, else null.
+- **Supersession**, deliberately narrow. For each (kind, topic) of the snapshot with exactly one claim R, the one current claim O of that kind and topic whose evidence is all from this snapshot's own source and session, all written before the snapshot's `analyzedAt`, and whose title the snapshot no longer has, is superseded by R (`relayfacts_claims_supersede_v1`). Anything else supersedes nothing. Limits: the model never says which claim replaces which, so a re-analysis that drops one claim and adds an unrelated one of the same kind supersedes the first; claims citing child sessions are never superseded; the `analyzedAt` check compares the worker's clock with the database's. Decisions are never superseded here.
+- **Erase.** `20261105062150` replaces the 062090 per-session erase and the 062100 per-user erase (same signatures, result keys and ACLs) so they also delete claim evidence and claims by the same rules, rewrite a kept claim's statement from its oldest remaining evidence with `observed_at` null and scope `session`, and count claim rows in the same totals. `relayfacts_claims_fence_guard_v1` refuses (`RH016`) claim evidence for a session fenced by either erase, and the 062100 statement lock triggers also sit on the two claims tables.
+- **Rollback.** It refuses while any claim exists, unless `SET relayfacts.rollback_drop_claims = 'true'` runs in the same session first; then the tables go with every claim. It restores the 062090 and 062100 erase bodies exactly and does not touch the decision tables. Turn the flag off first.
 
 ## Retention
 
@@ -188,3 +218,5 @@ Rollback: unset the flags, then run the rollback files if the tables must go, `2
    Implemented: the migration and rollback, the `relayfacts-erase` lane, `decisionRecords` in `src/session-erase/runtime.ts` and `selfhost-runtime.ts`; tests in `relayfacts.pglite.test.ts`, `runtime.test.ts` and `selfhost-runtime.test.ts`.
 7. Hosted operator per-user erase (`20261105062100`), behind `SUMMARY_DECISION_RECORDS_ENABLED` on the user-erase job.
    Implemented: the migration and rollback, the `relayfacts-user-erase` lane, the pre-begin relayfacts step in `src/session-erase/user-erase.ts` and `user-erase-main.ts`; tests in `relayfacts.pglite.test.ts`, `user-erase-main.test.ts`, `migration-profile.test.ts` and `migration-target.pglite.test.ts`.
+8. Claims (Session Intelligence M1-1, M1-2, `20261105062150`), behind `SESSION_INTEL_CLAIMS_ENABLED` inside `SUMMARY_DECISION_RECORDS_ENABLED`.
+   Implemented: the migration and rollback, the `relayfacts-claims` lane, `src/session-analysis/claims.ts` (wired in `worker.ts` and `runtime-deps.ts`); tests in `src/hoopdb/__tests__/relayfacts-claims.pglite.test.ts` and `src/session-analysis/__tests__/claims.test.ts`.
