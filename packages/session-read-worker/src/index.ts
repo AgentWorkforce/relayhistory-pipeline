@@ -37,6 +37,9 @@
  * through the 20261105062000 read functions; every other value = 501 unsupported_by_backend,
  * reason advisories_disabled). The POST ack is never served here: its tenant transactions are
  * READ ONLY, so the ack is a 405 and is served by the self-host service),
+ * READ_API_SESSION_INTEL_ENABLED (exactly "true": GET /v1/session-intel/workspace through the
+ * 20261105062170 read functions and the directory; every other value = 501 unsupported_by_backend,
+ * reason session_intel_disabled),
  * READ_API_ANALYSIS_ENABLED (exactly "true": GET and POST /v1/sessions/:sessionId/analysis, lane
  * F1, migration 20261105046000, src/session-read-api/analysis-source.ts; see analysisDeps below;
  * every other value = GET 501 analysis_not_configured and POST 405, exactly as before the flag),
@@ -126,6 +129,7 @@ import { pointerSummaryFallback, type SummaryFallback } from "../../../src/sessi
 import { masterKeyring, parseMasterKeys } from "../../../src/shared/keyring.ts";
 import type { WorkspaceKeyring } from "../../../src/bob-costas/summary-objects.ts";
 import { sqlRelayfacts } from "../../../src/session-read-api/relayfacts.ts";
+import { sqlSessionIntel } from "../../../src/session-read-api/session-intel-workspace.ts";
 import { perRequestAdmitPool, sqlAnalysisSource, type AdmitPool } from "../../../src/session-read-api/analysis-source.ts";
 import type { AnalysisDeps } from "../../../src/session-read-api/app.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
@@ -187,6 +191,8 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
   /** Exactly "true": serve GET /v1/coordination/advisories (the ack stays 405 on this GET-only Worker). */
   READ_API_COORDINATION_ADVISORIES_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/session-intel/workspace (sqlSessionIntel and the directory). */
+  READ_API_SESSION_INTEL_ENABLED?: string;
   /**
    * Exactly "true": serve GET and POST /v1/sessions/:sessionId/analysis (analysisDeps); anything
    * else = GET 501 analysis_not_configured and POST 405, as before the flag.
@@ -556,6 +562,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
       ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(tenant.run, workerAckRefused) } }
       : {}),
+    ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)

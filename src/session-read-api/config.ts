@@ -26,6 +26,8 @@ export const READ_API_COORDINATION_OVERLAPS_BACKEND = "READ_API_COORDINATION_OVE
 export const READ_API_COORDINATION_OVERLAPS_ENABLED = "READ_API_COORDINATION_OVERLAPS_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/coordination/advisories and its ack; anything else = 501 `unsupported_by_backend`, reason `advisories_disabled`. */
 export const READ_API_COORDINATION_ADVISORIES_ENABLED = "READ_API_COORDINATION_ADVISORIES_ENABLED";
+/** Exactly "true" (exactTrueFlag): GET /v1/session-intel/workspace; anything else = 501 `unsupported_by_backend`, reason `session_intel_disabled`. */
+export const READ_API_SESSION_INTEL_ENABLED = "READ_API_SESSION_INTEL_ENABLED";
 
 /**
  * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND: unset or "" = "clickhouse" (the default,

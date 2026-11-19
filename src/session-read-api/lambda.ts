@@ -40,7 +40,8 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * fails startup, see sessionQueryEnabled). READ_API_COORDINATION_OVERLAPS_ENABLED (exactly
  * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_ADVISORIES_ENABLED (exactly
  * "true") exposes GET /v1/coordination/advisories and its POST ack (the ack only through the
- * self-host service: the Function URL handler is GET-only); READ_API_COORDINATION_OVERLAPS_BACKEND selects
+ * self-host service: the Function URL handler is GET-only); READ_API_SESSION_INTEL_ENABLED (exactly "true")
+ * exposes GET /v1/session-intel/workspace (migration 20261105062170 and the directory); READ_API_COORDINATION_OVERLAPS_BACKEND selects
  * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
  * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
  * /v1/sessions/summaries/activity) on this entry too; unset/any other value = 501
@@ -90,9 +91,10 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
+import { sqlSessionIntel } from "./session-intel-workspace.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
@@ -746,6 +748,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...digestDeps,
     ...coordinationDeps,
     ...advisoriesDeps,
+    // The Session Intelligence workspace view: the 062170 readers and the directory, READ ONLY on the read-role pool.
+    ...(exactTrueFlag(env[READ_API_SESSION_INTEL_ENABLED]) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(poolTenantRunner(pool as never)) } } : {}),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
