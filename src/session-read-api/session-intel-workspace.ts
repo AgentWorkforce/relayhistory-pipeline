@@ -16,6 +16,7 @@ import type { AdvisoryEvidence } from "./coordination-advisories.ts";
 import type { Directory, DirectoryListRow } from "./directory.ts";
 import type { SqlQuery, TenantRunner } from "./liveness.ts";
 import { TenantMismatchError } from "./page.ts";
+import { advisoryPriority } from "./advisory-priority.ts";
 
 export const SESSION_INTEL_CONTRACT = "session-intel-workspace/1";
 export const SESSION_INTEL_ALERTS_MAX = 100;
@@ -274,6 +275,7 @@ export async function workspaceView(a: WorkspaceViewArgs) {
       urgency: row.urgency,
       kind: row.kind,
       class: cls,
+      priority: advisoryPriority(row),
       artifact: row.artifact,
       sessions: row.pair,
       createdAt: row.createdAt,
