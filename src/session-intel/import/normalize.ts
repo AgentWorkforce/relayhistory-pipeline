@@ -182,7 +182,8 @@ export class Hasher {
   private h(domain: string, value: string, hex: number) {
     return createHmac("sha256", this.salt).update(`${domain}\u0000${value}`).digest("hex").slice(0, hex);
   }
-  session(harness: ImportHarness, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
+  /** `harness` is an import format's harness, or a read-API source name (the harvest, src/session-intel/harvest). */
+  session(harness: string, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
   project(key: string) { return `p_${this.h("project", key, 24)}`; }
   repo(key: string) { return `r_${this.h("repo", key, 24)}`; }
   branch(b: string | null) { return b ? `b_${this.h("branch", canonicalBranch(b), 16)}` : null; }
@@ -283,7 +284,7 @@ export class SessionBuilder {
   readonly outcomes: Outcome[] = [];
   readonly usage: Usage[] = [];
 
-  constructor(readonly harness: ImportHarness, public sourceId: string, private readonly stats: ImportStats) {}
+  constructor(readonly harness: string, public sourceId: string, private readonly stats: ImportStats) {}
 
   touch(ts: string, at: LineRef) {
     if (!this.first || ts < this.first) this.first = ts;
@@ -353,7 +354,7 @@ export class SessionBuilder {
 export interface Tenant { orgId: string; workspaceId: string }
 
 export interface MappedSession {
-  harness: ImportHarness;
+  harness: string;
   sessionId: string;
   sourceSessionId: string;
   sourceParentIds: string[];
