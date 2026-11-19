@@ -229,6 +229,28 @@ describe("relayfacts flag (READ_API_RELAYFACTS_ENABLED)", () => {
   });
 });
 
+describe("advisory notify allowlist wiring (READ_API_ADVISORY_NOTIFY_ROWS)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("unset or empty wires nothing (all false); a list is parsed on both entries; a malformed list fails startup naming the entry only", async () => {
+    for (const env of [{}, { READ_API_ADVISORY_NOTIFY_ROWS: "" }, { READ_API_ADVISORY_NOTIFY_ROWS: "  " }])
+      for (const built of [await buildLambda(env), await build({ ...ENV, ...env })]) {
+        try { expect(built.deps.advisoryNotifyRows).toBeUndefined(); } finally { await built.close(); }
+      }
+    for (const built of [await buildLambda({ READ_API_ADVISORY_NOTIFY_ROWS: "duplicate_work:high" }), await build({ ...ENV, READ_API_ADVISORY_NOTIFY_ROWS: "duplicate_work:high" })]) {
+      try { expect([...built.deps.advisoryNotifyRows!]).toEqual(["duplicate_work:high"]); } finally { await built.close(); }
+    }
+    for (const make of [buildLambda, (env: NodeJS.ProcessEnv) => build({ ...ENV, ...env })]) {
+      const error = await make({ READ_API_ADVISORY_NOTIFY_ROWS: "duplicate_work:high,nope" }).then(() => null, (e: Error) => e);
+      expect(error?.message).toBe("READ_API_ADVISORY_NOTIFY_ROWS: entry 2 is not <kind>:<urgency>");
+    }
+  });
+});
+
 describe("session intelligence workspace wiring (READ_API_SESSION_INTEL_ENABLED)", () => {
   const LAMBDA_SECRET = JSON.stringify({
     supabase_url: PG_URL,

@@ -40,6 +40,7 @@ GET /v1/session-intel/workspace?workspace=<id>
       "kind": "duplicate_work",
       "class": "collision",
       "priority": 1,
+      "notifyEligible": false,
       "artifact": "supabase/migrations/062130_x.sql",
       "sessions": [{ "source": "claude", "sessionId": "<id>" }, { "source": "codex", "sessionId": "<id>" }],
       "createdAt": "2026-11-19T10:04:00.000Z",
@@ -87,6 +88,10 @@ id**, newest first (the earliest `created_at` of its rows), at most **100**.
   (`src/session-read-api/advisory-priority.ts`; see [the advisories doc](coordination-live-advisories.md), "Priority
   and delivery"), applied to the advisory's urgency and kind. Desktop dedupes system notifications by `advisoryId`
   per human per device (M3-9); until then the pull path is at-least-once.
+- `notifyEligible`: true only when the advisory's exact `<kind>:<urgency>` is on `READ_API_ADVISORY_NOTIFY_ROWS`, the
+  same server allowlist and parser as the advisories GET. Desktop raises an OS notification only when it is true and
+  its local setting allows. Empty by default (nothing eligible); a row is added only with its eval result and
+  Khaliq's OK.
 - `urgency`: `high` if any recipient row is HIGH. `deliveredAt`: the earliest delivery of any recipient (an ack also
   sets it). `evidence`: the distinct `{sessionId, eventId, ts, kind}` entries of its rows, at most 20.
 - `class`: the alert taxonomy's class of the kind at its urgency, as `src/session-intel/replay/classes.ts`
@@ -172,6 +177,7 @@ The `bulls96_read_api` role's transactions are read-only by default; these reade
 
 | Flag | Default | Turns on |
 |---|---|---|
+| `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible` rows, shared with the advisories GET |
 | `READ_API_SESSION_INTEL_ENABLED` | off | `GET /v1/session-intel/workspace` on the self-host service, the hosted Lambda and the read Worker |
 
 Applying migration `062170` to any real database, and enabling the flag in production, each need Khaliq's own

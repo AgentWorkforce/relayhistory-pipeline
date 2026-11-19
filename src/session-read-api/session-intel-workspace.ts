@@ -16,7 +16,7 @@ import type { AdvisoryEvidence } from "./coordination-advisories.ts";
 import type { Directory, DirectoryListRow } from "./directory.ts";
 import type { SqlQuery, TenantRunner } from "./liveness.ts";
 import { TenantMismatchError } from "./page.ts";
-import { advisoryPriority } from "./advisory-priority.ts";
+import { advisoryNotifyEligible, advisoryPriority } from "./advisory-priority.ts";
 
 export const SESSION_INTEL_CONTRACT = "session-intel-workspace/1";
 export const SESSION_INTEL_ALERTS_MAX = 100;
@@ -178,6 +178,8 @@ export interface WorkspaceViewArgs {
   now: number;
   source: SessionIntelSource;
   directory: Directory | undefined;
+  /** READ_API_ADVISORY_NOTIFY_ROWS, parsed; absent = empty (no alert is notify-eligible). */
+  notifyRows?: ReadonlySet<string>;
   /** Counts and reason codes only. */
   log: (fields: Record<string, unknown>) => void;
 }
@@ -276,6 +278,7 @@ export async function workspaceView(a: WorkspaceViewArgs) {
       kind: row.kind,
       class: cls,
       priority: advisoryPriority(row),
+      notifyEligible: advisoryNotifyEligible(row, a.notifyRows ?? new Set()),
       artifact: row.artifact,
       sessions: row.pair,
       createdAt: row.createdAt,

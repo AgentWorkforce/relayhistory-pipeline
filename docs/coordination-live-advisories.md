@@ -108,6 +108,7 @@ GET /v1/coordination/advisories?workspace=<id>&source=<harness>&sessionId=<id>&s
       "message": "<templated, at most 600 characters, no transcript text>",
       "evidence": [{ "sessionId": "<id>", "eventId": "<id>", "ts": "2026-11-12T09:58:12.000Z", "kind": "tool_result" }],
       "priority": 3,
+      "notifyEligible": false,
       "delivery": { "dm": false, "deliveredAt": null }
     }
   ],
@@ -129,6 +130,15 @@ names, meaning and order.
   062000, so no migration), and `dm` is true when it is set. On a listed row only the HIGH DM path
   (`coordination_advisories_mark_delivered_v1`) sets it; the ack also sets it, but an acked row is no longer listed.
   A client that saw `dm: true` already had the DM and can skip a second notice for that advisory.
+- `notifyEligible` (boolean, also additive): whether Desktop may raise an OS notification for this advisory. It is
+  true only when the item's exact `<kind>:<urgency>` is on the server allowlist `READ_API_ADVISORY_NOTIFY_ROWS`
+  (for example `duplicate_work:high,superseded_work:high`), and Desktop then notifies only if its own local
+  setting allows; every other item stays in the in-app list. The allowlist is the precision gate: it is **empty by
+  default**, so nothing is eligible, and adding a row needs that row's eval result against the HIGH bars plus
+  Khaliq's OK. Parsing is strict (`advisory-priority.ts` `parseAdvisoryNotifyRows`): spaces around entries and the
+  colon are ignored; kinds and urgencies are lowercase and must be known (the advisor's kinds; `high` or `low`); an
+  empty entry, a bad shape, an unknown or uppercase token fails startup on the self-host service and the Lambda, and
+  answers 503 on the read Worker, with an error naming the entry and at most the one bad token.
 - **Dedup.** Desktop dedupes system notifications by `advisoryId` per human per device, recorded across restarts
   (M3-9); until it ships, the pull path is at-least-once and the same advisory can show again on a later turn.
 
@@ -178,6 +188,7 @@ SQL and the next-tick stop contract.
 | `COORDINATION_ADVISOR_ENABLED` | off | The worker's scan and its writes |
 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | off | The GET and ack routes |
 | `COORDINATION_ADVISOR_RELAY_DM_ENABLED` | off | HIGH Relay DMs (also needs the sender credential) |
+| `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible: true` for the listed `<kind>:<urgency>` rows (see "Priority and delivery"); each row needs its eval result and Khaliq's OK |
 | `SESSION_INTEL_CONFLICTS_ENABLED` | off | The conflict rows (see "Conflict rows"); also needs the workspace's `conflicts` control |
 
 Enabling any of them in production, provisioning the relay credential, and deploying the worker each need Khaliq's own explicit OK. Merging this document or the implementation PRs enables nothing.
