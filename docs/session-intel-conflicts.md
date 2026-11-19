@@ -10,7 +10,7 @@ Code: `src/session-intel/conflict/`. Tests and the synthetic fixture: `src/sessi
 
 The P5 model judge was asked whether two 50k-token transcripts collided. It found 0 of 4 held-out incidents, and its classifier called every planned pair an overlap. These detectors change the question in three ways:
 
-1. **Structured claims, not transcripts.** The judge sees only claims (`intent`, `constraint`, `decision`, each with a scope, a time and evidence ids) and action ids. A claim's text is the snapshot's scrub-clean claim text, cut to 200 characters. Session ids, org ids and paths never reach the model prompt: it uses short aliases (`A.c1`, `B.e2`) and topic slugs.
+1. **Structured claims, not transcripts.** The judge sees only claims (`intent`, `constraint`, `decision`, each with a scope, a time and evidence ids) and action ids. A claim's text is the snapshot's scrub-clean claim text, cut to 200 characters; it may contain paths. Session ids, org ids and the written paths never reach the model prompt: it uses short aliases (`A.c1`, `B.e2`) and, for actions, topic slugs.
 2. **Citations or nothing.** A verdict must cite one claim id from each side, or a constraint claim id and an action event id of the other side. The ids are checked against the judge's own input, and a reply that fails any check is `none`. So the judge cannot assert a conflict it cannot point at.
 3. **Small, local candidate sets.** Instead of ranking about 300,000 pairs, it asks about the pairs active in the same project within the advisor's 2-hour window that share a topic, at most 50 per workspace per tick. Inputs that cannot be cited are never sent to a judge.
 
@@ -50,7 +50,7 @@ Before the judge, in the input builder:
 - **A superseded claim is never used.** It is left out of the input, and citing it gives `none` (`superseded`).
 - **A `session`-scope constraint never propagates.** It is left out (`session_scope`). Only `project` and `repo` constraints reach the judge.
 - Claims that name none of the pair's shared topics are left out (`off_topic`).
-- Actions are the visible writes in a shared topic. A side's commits and outcomes are included only when that side has such a write, because they carry no path.
+- Actions are the visible writes in a shared topic. A commit or an outcome carries no path, so it counts only in the event of such a write (and is then that same action); any other commit or outcome of the side is never an action.
 
 After the judge, in `validateCitations`:
 
@@ -62,7 +62,7 @@ After the judge, in `validateCitations`:
 
 ### Urgency
 
-- **HIGH needs action evidence in the topic by the acting side.** For `constraint_violation`, the acting side is the violator, and it needs a write, commit or outcome at or after the constraint. For `intent_conflict`, it is the intent's side (with two intents or two decisions, the later claim's side), and it needs any action in the topic. An intent alone is LOW.
+- **HIGH needs action evidence in the topic by the acting side.** For `constraint_violation`, the acting side is the violator, and it needs an in-topic action at or after the constraint. For `intent_conflict`, it is the intent's side (with two intents or two decisions, the later claim's side), and it needs an in-topic action at or after its own claim. The earliest qualifying action is cited, and a judge citing an earlier one is vetoed (`action_before_constraint`, `action_before_claim`). An intent alone is LOW.
 - `overlap` is LOW and never a DM.
 - **Fleets:** a conflict inside a planned fleet is LOW, addressed to the orchestrator only (`recipient: "orchestrator"`, with no DM or pull recipients among the workers). An overlap inside a fleet is SILENT: no alert.
 
@@ -74,7 +74,7 @@ A `PairJudge` is `{ name, version, params, metered, estimateTokens?, judge(input
 
 A deterministic, conservative lexical baseline. In order:
 
-1. **A constraint against a write.** The constraint must be negated: `never`, `don't`, `do not`, `no`, `not`, `must not`, `stop` or `avoid`. Its clause runs to `until`, `unless`, `,`, `.` or the like. The target is the clause's path tokens and globs (`supabase/migrations`, `*/migrations/*`, `src/**/*.sql`), or else the head word of its object (`"no new migrations"` gives `migrations`). The rule matches when the other side has a write at or after the constraint whose path matches the glob, or whose directories contain the word. A glob with more than 8 wildcards never matches, so the pattern built from claim text cannot backtrack badly.
+1. **A constraint against a write.** The constraint must be negated: `never`, `don't`, `do not`, `no`, `not`, `must not`, `stop` or `avoid`. Its clause runs to `until`, `unless`, `,`, `.` or the like. The target is the clause's path tokens and globs (`supabase/migrations`, `*/migrations/*`, `src/**/*.sql`), or else the head word of its object (`"no new migrations"` gives `migrations`). The rule matches when the other side has a write at or after the constraint whose path matches the glob, or whose directories contain the word. The glob matcher uses no regex. It matches segment by segment with a two-pointer star match inside each segment, so its cost is bounded by the pattern and path lengths and never grows exponentially. A glob with more than 8 wildcards or over 512 characters, or a path over 4,096 characters, never matches.
 
    Only write-ish or verbless constraints match writes: `touch`, `edit`, `change`, `modify`, `add`, `write`, `create`, `"no new X"`. `"Never apply migrations to a real DB"` does not match a migration file: this baseline cannot see commands.
 2. **The same constraint against a stated intent or decision of the other side.** The claim must not itself be negated, and it must name the target and the verb.

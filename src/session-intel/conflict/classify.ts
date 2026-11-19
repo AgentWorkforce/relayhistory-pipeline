@@ -80,8 +80,8 @@ export const actionRef = (sessionRef: string, eventId: string) => `${sessionRef}
 /**
  * The judge's input for a candidate as of `now`, with the pre-judge vetoes applied: a superseded claim and a
  * `session`-scope constraint are excluded (recorded in `excluded`), as is a claim that names none of the
- * shared topics. Actions are the visible writes in a shared topic, and the commits and outcomes of a side
- * that has such a write (they carry no path, so they are in the topic only through it).
+ * shared topics. Actions are the visible writes in a shared topic, and the commits and outcomes in such a
+ * write's event (they carry no path, so they are in the topic only through it).
  */
 export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
   const nowIso = now.toISOString();
@@ -111,10 +111,14 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
       const t = pathTopic(w.path);
       if (t && topics.has(t)) actions.push({ id: actionRef(ref, w.eventId), side: name, eventId: w.eventId, kind: "write", ts: w.ts, path: w.path, topic: t });
     }
-    if (actions.length) {
-      for (const f of v.commits) actions.push({ id: actionRef(ref, f.eventId), side: name, eventId: f.eventId, kind: "commit", ts: f.ts, path: null, topic: null });
-      for (const f of v.outcomes) actions.push({ id: actionRef(ref, f.eventId), side: name, eventId: f.eventId, kind: "outcome", ts: f.ts, path: null, topic: null });
-    }
+    // A commit or an outcome carries no path, so it is in the topic only when an in-topic write shares its event
+    // (the event that wrote the file also committed it). Any other commit or outcome of the side is not an action
+    // here, wherever else it touched.
+    const topicEvents = new Map(actions.map((x) => [x.eventId, x.topic]));
+    for (const f of v.commits) if (topicEvents.has(f.eventId))
+      actions.push({ id: actionRef(ref, f.eventId), side: name, eventId: f.eventId, kind: "commit", ts: f.ts, path: null, topic: topicEvents.get(f.eventId)! });
+    for (const f of v.outcomes) if (topicEvents.has(f.eventId))
+      actions.push({ id: actionRef(ref, f.eventId), side: name, eventId: f.eventId, kind: "outcome", ts: f.ts, path: null, topic: topicEvents.get(f.eventId)! });
     const seen = new Set<string>();
     const unique = actions.filter((x) => !seen.has(x.id) && (seen.add(x.id), true))
       .sort((x, y) => textCompare(x.ts, y.ts) || textCompare(x.id, y.id));
@@ -136,7 +140,7 @@ export function citable(input: JudgeInput): boolean {
 
 export type VetoReason =
   | "invalid_reply" | "invalid_verdict" | "bad_ids" | "duplicate_id" | "unknown_id" | "superseded" | "session_scope" | "off_topic"
-  | "self_conflict" | "bad_citation" | "action_before_constraint";
+  | "self_conflict" | "bad_citation" | "action_before_constraint" | "action_before_claim";
 
 export interface Classification {
   verdict: Exclude<ConflictVerdict, "none">;
@@ -147,6 +151,14 @@ export interface Classification {
 }
 
 export type Validated = { ok: true; verdict: "none" } | { ok: true; verdict: Classification["verdict"]; c: Classification } | { ok: false; reason: VetoReason };
+
+/** The acting side's cited claim (the constraint's counterpart for a violation, the intent for a conflict). */
+export function actingClaim(cls: Pick<Classification, "verdict" | "claims" | "constraint">): JudgeClaim | null {
+  const side = actingSide(cls);
+  if (!side) return null;
+  if (cls.verdict === "constraint_violation") return cls.constraint;
+  return cls.claims.find((c) => c.side === side) ?? null;
+}
 
 /** The side whose claim or action a conflict acts through (docs/session-intel-conflicts.md, "Urgency"). */
 export function actingSide(cls: Pick<Classification, "verdict" | "claims" | "constraint">): SideName | null {
@@ -214,6 +226,8 @@ export function validateCitations(built: BuiltInput, out: JudgeOutput): Validate
     if (claims.some((c) => c.kind === "constraint")) return { ok: false, reason: "bad_citation" };
     const cls: Classification = { verdict: out.verdict, claims, action: null, constraint: null };
     if (action && action.side !== actingSide(cls)) return { ok: false, reason: "bad_citation" };
+    // An action before the acting claim was made is not that claim being acted on.
+    if (action && action.ts < actingClaim(cls)!.at) return { ok: false, reason: "action_before_claim" };
     return { ok: true, verdict: out.verdict, c: { ...cls, action } };
   }
   if (action) return { ok: false, reason: "bad_citation" };
@@ -275,10 +289,11 @@ export function decide(input: JudgeInput, cls: Classification, fleet: { fleet: b
     return { verdict: "overlap", urgency: "low", action: null, acting: null, delivery: { recipient: "sessions", dm: [], pull: [input.a.ref, input.b.ref] } };
   }
   const acting = actingSide(cls)!;
-  const actingActions = input[acting].actions;
-  const action = cls.action ?? (cls.verdict === "constraint_violation"
-    ? actingActions.find((x) => x.ts >= cls.constraint!.at) ?? null
-    : actingActions[0] ?? null);
+  // Only an action in the topic (an in-topic write, or a commit or outcome in such a write's event) at or after
+  // the relevant claim may make it HIGH: the constraint for a violation, the acting side's claim for a conflict.
+  // The earliest such action is chosen (actions are sorted by time).
+  const since = cls.verdict === "constraint_violation" ? cls.constraint!.at : actingClaim(cls)!.at;
+  const action = cls.action ?? input[acting].actions.find((x) => x.ts >= since) ?? null;
   if (fleet.fleet) {
     return { verdict: cls.verdict, urgency: "low", action, acting,
       delivery: { recipient: "orchestrator", dm: [], pull: [], orchestratorSessionIds: [...fleet.orchestratorSessionIds] } };

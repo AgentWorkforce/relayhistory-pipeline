@@ -66,20 +66,62 @@ export function parseConstraint(text: string): ParsedConstraint | null {
 }
 
 const MAX_WILDCARDS = 8;
-const escapeRe = (s: string) => s.replace(/[.+?^${}()|[\]\\]/gu, "\\$&");
-/** A path or glob from a claim against a written path, at the start or at any directory boundary. */
+/** Longer patterns or subjects never match (claim path tokens are at most 512 characters, snapshot paths 4096). */
+export const MAX_GLOB_CHARS = 512;
+export const MAX_SUBJECT_CHARS = 4_096;
+
+/**
+ * One path segment against a segment pattern where `*` is any run of characters (no `/`). The classic two-pointer
+ * star match: on a mismatch it only moves back to the last star, so the cost is at most
+ * pattern length x segment length, never exponential (a regex of several `[^/]*` backtracks catastrophically).
+ */
+export function segmentMatches(p: string, s: string): boolean {
+  let i = 0, j = 0, star = -1, mark = 0;
+  while (j < s.length) {
+    if (i < p.length && p[i] !== "*" && p[i] === s[j]) { i++; j++; }
+    else if (i < p.length && p[i] === "*") { star = i++; mark = j; }
+    else if (star >= 0) { i = star + 1; j = ++mark; }
+    else return false;
+  }
+  while (i < p.length && p[i] === "*") i++;
+  return i === p.length;
+}
+
+/**
+ * A path or glob from a claim against a written path, at the start or at any directory boundary (a leading `**`
+ * is implied); a pattern without a glob also matches everything under it (a trailing `**`). `**` as a whole
+ * segment is any number of segments; `*` is any run within one segment. Segment lists are matched by a
+ * row-by-row dynamic programme, so the cost is bounded by pattern segments x path segments x segment cost.
+ */
 export function pathMatches(pattern: string, path: string): boolean {
+  if (pattern.length > MAX_GLOB_CHARS || path.length > MAX_SUBJECT_CHARS) return false;
   const norm = (p: string) => p.replace(/\\/gu, "/").replace(/^\.\//u, "").replace(/\/+$/u, "").toLowerCase();
-  // Consecutive `**` segments collapse to one, and a pattern with more than MAX_WILDCARDS wildcards never
-  // matches: the regex built from claim text stays linear (no `.*.*.*` backtracking).
-  const pat = norm(pattern).replace(/(?:\*\*\/)+/gu, "**/").replace(/\*{3,}/gu, "**"), target = norm(path);
+  const pat = norm(pattern), target = norm(path);
   if (!pat || (pat.match(/\*/gu)?.length ?? 0) > MAX_WILDCARDS) return false;
-  let body: string;
-  if (pat.includes("*")) {
-    body = pat.split(/(\*\*\/?|\*)/u).map((part) => part === "**" || part === "**/" ? ".*" : part === "*" ? "[^/]*" : escapeRe(part)).join("");
-    body = body.replace(/^\[\^\/\]\*\//u, "(?:[^/]*/)*");
-  } else body = `${escapeRe(pat)}(?:/.*)?`;
-  return new RegExp(`(?:^|/)${body}$`, "u").test(target);
+  // Segments: a whole-segment `**` is a globstar; runs of `*` inside a segment are one `*`; repeated globstars collapse.
+  const segs: string[] = [];
+  for (const raw of pat.split("/").filter(Boolean)) {
+    const seg = /^\*{2,}$/u.test(raw) ? "**" : raw.replace(/\*{2,}/gu, "*");
+    if (seg === "**" && segs.at(-1) === "**") continue;
+    segs.push(seg);
+  }
+  if (!segs.length) return false;
+  if (segs[0] !== "**") segs.unshift("**");
+  if (!pat.includes("*")) segs.push("**");
+  const subject = target.split("/").filter(Boolean);
+  // ok[j]: the pattern segments so far match the first j subject segments.
+  let ok: boolean[] = Array.from({ length: subject.length + 1 }, (_, j) => j === 0);
+  for (const seg of segs) {
+    const next: boolean[] = new Array(subject.length + 1).fill(false);
+    if (seg === "**") {
+      let any = false;
+      for (let j = 0; j <= subject.length; j++) { any = any || ok[j]!; next[j] = any; }
+    } else {
+      for (let j = 1; j <= subject.length; j++) next[j] = ok[j - 1]! && segmentMatches(seg, subject[j - 1]!);
+    }
+    ok = next;
+  }
+  return ok[subject.length]!;
 }
 
 const dirSegments = (path: string) => path.replace(/\\/gu, "/").split("/").slice(0, -1).map((s) => s.toLowerCase());
