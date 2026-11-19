@@ -56,6 +56,8 @@ export interface WriteInput {
   window: { since: string; until: string };
   deleteBy: string;
   now: Date;
+  /** Tests only: runs between the mapping write and the snapshot write, to prove the mapping is cleaned up. */
+  afterMapping?: () => Promise<void> | void;
   mapping: { inputFiles: string[]; sessions: MappedSession[]; projects: Record<string, string>; tenant: { orgId: string; workspaceId: string }; stats: ImportStats };
 }
 
@@ -81,6 +83,7 @@ export async function writeImport(w: WriteInput): Promise<{ manifest: SnapshotMa
   })}\n`);
   const tmp = join(dirname(w.out), `.${basename(w.out)}.import-${process.pid}-${Math.random().toString(16).slice(2)}`);
   try {
+    await w.afterMapping?.();
     await mkdir(tmp, { mode: 0o700 });
     try {
       await writeFile(join(tmp, SESSIONS_FILE), body, { mode: 0o600 });

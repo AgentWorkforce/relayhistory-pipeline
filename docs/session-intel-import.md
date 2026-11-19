@@ -33,10 +33,12 @@ bun run src/session-intel/replay/cli.ts replay --snapshot <dir> --out <eval>/rep
 What the CLI prints:
 - **stdout:**
   - a line of counts: files, lines, malformed and oversize lines, untimed records, future timestamps, dropped paths, truncated facts, sessions and facts dropped outside the window, sessions, and facts by kind;
-  - a line with the two output paths, the snapshot directory and the mapping file. These are the paths the operator chose with `--out`.
+  - a line with the two output paths, the snapshot directory and the mapping file. These are the resolved real paths: `--out` after its symlinks are resolved, which can differ from what was typed.
 - **stderr:** a warning when outliers were dropped (see Times below).
 
-It prints no session ids, source paths, salt or text. A bad command line gets a fixed message that never echoes argv, so a salt pasted as an argument by mistake is not printed.
+It prints no session ids, source paths, salt or text.
+- A bad command line gets a fixed message that never echoes argv, so a salt pasted as an argument by mistake is not printed.
+- A failure prints the import's own message, which names flags, bounds and error codes only. Any other error, such as a Node filesystem error whose message would carry a full source path, prints its code alone (for example `failed (EACCES)`).
 
 ## Output
 
@@ -47,7 +49,7 @@ It prints no session ids, source paths, salt or text. A bad command line gets a 
   - each event id to its input file (relative to `--in`) and line;
   - the hashed tenant back to the raw `--org` and `--workspace`.
 
-  It is written first, with mode 0600, and is create-only: a temporary file hard-linked into place, so it never replaces an earlier reverse map. An import beside an existing mapping file is refused. If the snapshot write then fails, the new mapping is removed, so a snapshot never exists without its map. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
+  It is written first, with mode 0600, and is create-only: a temporary file hard-linked into place, so it never replaces an earlier reverse map. An import beside an existing mapping file is refused. If the snapshot write then fails, the new mapping is removed, so a snapshot never exists without its map. A crash between the two writes leaves a 0600 mapping with no snapshot. The rerun then fails closed on it, and the operator deletes the mapping before retrying. With it the customer can find the trace behind an alert, so it is never shared with the snapshot. It holds no message text.
 
 ## Privacy rules
 
@@ -67,9 +69,10 @@ It prints no session ids, source paths, salt or text. A bad command line gets a 
 
    **Every segment is then hashed** with the salt (HMAC-SHA256, 12 hex, after lowercasing, since the detectors compare paths lowercased). Only a closed set stays in clear, so equal paths still match and the detectors still work:
    - the source roots above, and the migration directory names `migrations`, `migration`, `db` and `migrate`, as directory segments;
-   - the hot-path file names the detectors know, by exact name: `bun.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `cargo.lock`, `poetry.lock`, `composer.lock`, `gemfile.lock`, `_journal.json` and `package.json`;
-   - a file's extension, only when it is 1 to 10 characters of `[a-z0-9]` after lowercasing. Anything else after the last dot, such as `notes.this is a sentence`, `.tar-gz` or an 11-character tail, is hashed with the rest of the name;
-   - in a migration directory, a number prefix that is all digits and at least 3 long, with its `_` or `-` (`0042_`, `20261105062150_`). The rest of the name is hashed, and so is a "prefix" with a non-digit in it.
+   - the hot-path file names, by exact name, plus `package.json`. These are exactly the names `KNOWN_HOT_PATH` in `packages/coordination-detect/src/index.ts` matches: `bun.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `cargo.lock`, `poetry.lock`, `composer.lock`, `gemfile.lock`, `_journal.json`, `generated-manifest.json` and `manifest.generated.json`. A test parses `KNOWN_HOT_PATH` and fails if the lists drift. Kept in clear, the detector still skips these files, so a replay raises no false duplicate-work alert on them;
+   - `KNOWN_HOT_PATH`'s other form, `generated/*manifest*.json`. The directory `generated` stays in clear only right above a `*manifest*.json` file. That file becomes `<12 hex>.manifest.json`, so it still matches. Anywhere else, `generated` is hashed;
+   - a file's extension, only when it is on this fixed allow-list (after lowercasing): `ts` `tsx` `js` `jsx` `mjs` `cjs` `json` `jsonc` `jsonl` `md` `mdx` `rst` `sql` `py` `rb` `go` `rs` `java` `kt` `kts` `scala` `swift` `c` `h` `cc` `cpp` `hpp` `cs` `php` `lua` `dart` `ex` `exs` `sh` `bash` `zsh` `ps1` `yml` `yaml` `toml` `ini` `cfg` `lock` `txt` `html` `css` `scss` `sass` `less` `vue` `svelte` `proto` `graphql` `gql` `tf` `hcl` `dockerfile` `xml` `csv` `ipynb` `svg` `png` `jpg` `gif` `gradle` `mod` `sum`. Any other extension (`.initech`, `.production`, `notes.this is a sentence`) is hashed with the rest of the name;
+   - in a migration directory, an all-digit file name of at most 14 digits (`0042.sql`), or a number prefix of 3 to 14 digits with its `_` or `-` (`0042_`, `20261105062150_`, a `YYYYMMDDHHMMSS` stamp). The rest of the name is hashed. So is a longer digit run, and so is a "prefix" with a non-digit in it.
 
    Depth is kept. A sentence used as a file name, a key-shaped name, a name with whitespace or `@`, and a patch header holding a sentence all come out hashed. For example, `supabase/migrations/0042_add_index.sql` becomes `supabase/migrations/0042_<12 hex>.sql`, so the duplicate-migration detector still keys on `0042`. The private mapping file maps each hashed path back.
 4. **Projects.** The project key is the repository name: the last segment of the remote URL with `.git` dropped, or else the cwd's basename, lowercased. A home directory itself is never a key. `projectId` and `repo` are hashes of that key, so a Claude Code session in a checkout named `acme-api` and a Codex session whose remote ends in `acme-api` line up. In the generic format an explicit `projectId` becomes the project key, and `repo` the repository key.
@@ -88,7 +91,7 @@ It prints no session ids, source paths, salt or text. A bad command line gets a 
    - A record stamped more than a day after the import's clock is dropped.
    - When the sessions span more than the 120-day window, the import keeps the latest 120 days in which the most sessions end. A session ending outside them is dropped. A session that started before them loses its earlier facts, and its `createdAt` moves to the window start.
 
-   Each of these is counted, and a warning goes to stderr.
+   Each of these is counted, and a warning on stderr names every count: records without a strict ISO-8601 timestamp, records in the future, sessions and facts dropped outside the window, and sessions clamped to its start.
 
 ## Formats
 
@@ -157,6 +160,8 @@ The adapters were written from public documentation and general knowledge of the
 - **`O_NOFOLLOW`** guards only the last component of a path: of each input file, and of `--salt-file`. A symlinked parent directory is followed. The repository checks on `--out` and `--salt-file` resolve the real path, so a symlink cannot point either into the repository. A symlink under `--in` is skipped by the walk.
 - **`--salt-stdin`** reads until stdin closes. A pipe whose writer never closes it blocks the import. `op read` closes it.
 - **Directories in the path.** Kept-in-clear directory names come only from the fixed lists above. A project's own top-level directory, such as `server/`, is hashed: consistent across sessions, but no longer readable without the mapping file.
+- **Segment hash collisions.** The 12-hex segment hash has no collision check. At a million distinct segments, the chance of one silent false match is about 0.2%.
+- **Case variants.** The mapping's `paths` keeps only the last raw spelling seen for paths that differ only in case, since those hash alike.
 
 ## Follow-ups
 

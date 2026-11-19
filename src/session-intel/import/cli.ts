@@ -19,6 +19,7 @@ import { ImportError, listInputFiles } from "./io.ts";
 import { emptyStats, Hasher, IMPORT_BOUNDS, toSnapshotSession, type ImportStats, type MappedSession, type SessionBuilder, type Tenant } from "./normalize.ts";
 import { checkDeleteBy, WINDOW_TAIL_MS, writeImport } from "./writer.ts";
 import { isInside, realPathOf } from "../replay/cli.ts";
+import { SnapshotError } from "../replay/snapshot.ts";
 import { isoTime, textCompare } from "../replay/util.ts";
 
 /** The salt source for --salt-stdin: process.stdin by default; tests inject a stream. */
@@ -207,19 +208,33 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     out, lines: rows.map((r) => r.line), window: { since, until }, deleteBy, now,
     mapping: { inputFiles: files.map((f) => relative(input, f) || basename(f)), sessions: rows.map((r) => r.mapped), projects, tenant, stats },
   });
-  if (stats.outOfWindowSessions || stats.outOfWindowFacts || stats.futureTimestamps)
-    io.err(`import: warning: kept a 120-day window; dropped ${stats.outOfWindowSessions} sessions and ${stats.outOfWindowFacts} facts outside it, and ${stats.futureTimestamps} records stamped in the future`);
-  // Counts, then the two output paths the operator chose (no ids, source paths or text).
+  // Every dropped or clamped count gets a warning, not only the window's.
+  if (stats.untimedRecords || stats.futureTimestamps || stats.outOfWindowSessions || stats.outOfWindowFacts || stats.clampedSessions)
+    io.err(`import: warning: dropped ${stats.untimedRecords} records without a strict ISO-8601 timestamp and ${stats.futureTimestamps} stamped in the future; `
+      + `kept a 120-day window, dropping ${stats.outOfWindowSessions} sessions and ${stats.outOfWindowFacts} facts outside it and clamping ${stats.clampedSessions} sessions to its start`);
+  // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);
   return 0;
+}
+
+/**
+ * The one line printed for a failed import. An ImportError's (or the M0 loader's SnapshotError's) message is
+ * built to be safe; any other error
+ * (a Node filesystem error names the full source path in its message) prints only its code.
+ */
+export function failureMessage(err: unknown): string {
+  // The M0 loader's own validation errors name fields, bounds and hashed ids only.
+  if (err instanceof ImportError || err instanceof SnapshotError) return `session-intel import: ${err.message}`;
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return `session-intel import: failed (${typeof code === "string" && /^[A-Z0-9_]{1,32}$/u.test(code) ? code : "internal error"}); details withheld, as they can name source paths`;
 }
 
 if (import.meta.main) {
   try {
     process.exitCode = await main(process.argv.slice(2));
   } catch (err) {
-    console.error(`session-intel import: ${(err as Error).message}`);
+    console.error(failureMessage(err));
     process.exitCode = 1;
   }
 }

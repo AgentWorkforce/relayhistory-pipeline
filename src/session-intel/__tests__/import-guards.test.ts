@@ -5,13 +5,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { readCodex, readGeneric, SessionSet } from "../import/adapters.ts";
-import { buildRows, keepWindow, main, readSaltFile } from "../import/cli.ts";
+import { readClaudeCode, readCodex, readGeneric, SessionSet } from "../import/adapters.ts";
+import { buildRows, failureMessage, keepWindow, main, readSaltFile } from "../import/cli.ts";
+import { mappingPath, writeImport } from "../import/writer.ts";
 import { listInputFiles, readJsonl } from "../import/io.ts";
-import { emptyStats, Hasher, IMPORT_BOUNDS, isHomeRoot, repoRelativePath, scrubPath, SessionBuilder } from "../import/normalize.ts";
-import { loadSnapshot } from "../replay/snapshot.ts";
+import { CLEAR_EXTENSIONS, emptyStats, Hasher, HOT_PATH_FILES, IMPORT_BOUNDS, ImportError, isHomeRoot, repoRelativePath, scrubPath, SessionBuilder } from "../import/normalize.ts";
+import { loadSnapshot, SnapshotError } from "../replay/snapshot.ts";
 import { tmp } from "./helpers.ts";
 
 const SALT = "fixture-salt-0123456789";
@@ -51,7 +52,24 @@ describe("F1: path segments are hashed; only a closed set stays in clear", () =>
     ["docs/notes.this is a secret sentence", () => `docs/${seg("notes.this is a secret sentence")}`],
     ["docs/notes.abcdefghijk", () => `docs/${seg("notes.abcdefghijk")}`],
     ["docs/notes.tar-gz", () => `docs/${seg("notes.tar-gz")}`],
-    ["docs/notes.ABCDEFGHIJ", () => `docs/${seg("notes")}.abcdefghij`],
+    // Only extensions on the fixed allow-list stay in clear; a real word after the dot is hashed.
+    ["docs/notes.ABCDEFGHIJ", () => `docs/${seg("notes.abcdefghij")}`],
+    ["src/config.initech", () => `src/${seg("config.initech")}`],
+    ["src/settings.production", () => `src/${seg("settings.production")}`],
+    ["src/App.TSX", () => `src/${seg("app")}.tsx`],
+    ["infra/main.tf", () => `infra/${seg("main")}.tf`],
+    // A migration number, as a name or a prefix, stays in clear only up to 14 digits.
+    ["supabase/migrations/20261105062150.sql", () => "supabase/migrations/20261105062150.sql"],
+    ["supabase/migrations/202611050621501.sql", () => `supabase/migrations/${seg("202611050621501")}.sql`],
+    ["supabase/migrations/202611050621501_add.sql", () => `supabase/migrations/${seg("202611050621501_add")}.sql`],
+    // Hot-path names the detector skips stay in clear, so a replay does not raise false duplicate work.
+    ["generated-manifest.json", () => "generated-manifest.json"],
+    ["src/x/manifest.generated.json", () => `src/${seg("x")}/manifest.generated.json`],
+    ["generated/routes-manifest.json", () => `generated/${seg("routes-manifest")}.manifest.json`],
+    ["src/generated/manifest.json", () => `src/generated/${seg("manifest")}.manifest.json`],
+    // `generated` is kept only right above a *manifest*.json file.
+    ["src/generated/types.ts", () => `src/${seg("generated")}/${seg("types")}.ts`],
+    ["generated/deep/manifest.json", () => `${seg("generated")}/${seg("deep")}/${seg("manifest")}.json`],
     ["src/AKIAFIXTUREKEYSHAPE0/config.json", () => `src/${seg("akiafixturekeyshape0")}/${seg("config")}.json`],
     ["src/my private plan for acquisition.md", () => `src/${seg("my private plan for acquisition")}.md`],
     ["node_modules/@scope/pkg/index.js", () => `${seg("node_modules")}/${seg("@scope")}/${seg("pkg")}/${seg("index")}.js`],
@@ -61,6 +79,33 @@ describe("F1: path segments are hashed; only a closed set stays in clear", () =>
     ["Makefile", () => seg("makefile")],
   ])("%s", (path, want) => {
     expect(scrubPath(path, h)).toBe(want());
+  });
+
+  test("the hot-path list matches the detector's KNOWN_HOT_PATH, so the two cannot drift", () => {
+    const src = readFileSync(join(import.meta.dir, "..", "..", "..", "packages", "coordination-detect", "src", "index.ts"), "utf8");
+    const literal = /const KNOWN_HOT_PATH = \/(.+)\/(\w*);/u.exec(src);
+    expect(literal).not.toBeNull();
+    const hot = new RegExp(literal![1]!, literal![2]);
+    const names = /\(\?:\^\|\\\/\)\(\?:([^)]+)\)\$/u.exec(literal![1]!)![1]!.split("|").map((n) => n.replace(/\\/gu, ""));
+    expect(new Set(names)).toEqual(new Set(HOT_PATH_FILES));
+    // Every kept name, and the generated-manifest form after scrubbing, still matches the detector's regex.
+    for (const name of HOT_PATH_FILES) expect(hot.test(scrubPath(`src/x/${name}`, h))).toBe(true);
+    expect(hot.test(scrubPath("generated/routes-manifest.json", h))).toBe(true);
+    expect(hot.test(scrubPath("apps/web/generated/build-manifest.v2.json", h))).toBe(true);
+    // A file the detector does not treat as hot is not made hot by scrubbing.
+    expect(hot.test(scrubPath("src/generated/types.ts", h))).toBe(false);
+  });
+
+  test("the path hash domain is separate from every id domain", () => {
+    const v = "shared-value";
+    const pathHash = h.segment(v);
+    for (const id of [h.session("generic", v), h.session("claude", v), h.project(v), h.repo(v), h.org(v), h.workspace(v), h.branch(v)!])
+      expect(id.slice(2, 14)).not.toBe(pathHash);
+  });
+
+  test("the extension allow-list is fixed and lowercase", () => {
+    for (const ext of CLEAR_EXTENSIONS) expect(ext).toMatch(/^[a-z0-9]{1,10}$/u);
+    for (const word of ["initech", "production", "secret", "env"]) expect(CLEAR_EXTENSIONS.has(word)).toBe(false);
   });
 
   test("equal paths still match (case-insensitively, as the detectors compare them); another salt hashes differently", () => {
@@ -176,8 +221,27 @@ describe("outlier timestamps: dropped and counted, never an abort", () => {
     expect(snap.sessions.flatMap((s) => s.writes.map((w) => w.ts)).sort()).toEqual(["2026-11-01T09:00:00.000Z", "2026-11-01T10:00:00.000Z", "2026-11-02T09:00:00.000Z"]);
     expect(Date.parse(snap.manifest.window.until) - Date.parse(snap.manifest.window.since)).toBeLessThanOrEqual(IMPORT_BOUNDS.windowMs);
     const stats = JSON.parse(lines.find((l) => l.startsWith("import: {"))!.slice("import: ".length));
-    expect(stats).toMatchObject({ outOfWindowSessions: 1, outOfWindowFacts: 1, futureTimestamps: 1 });
-    expect(lines.some((l) => l.includes("warning: kept a 120-day window"))).toBe(true);
+    expect(stats).toMatchObject({ outOfWindowSessions: 1, outOfWindowFacts: 1, futureTimestamps: 1, clampedSessions: 1 });
+    const warning = lines.find((l) => l.startsWith("import: warning:"))!;
+    expect(warning).toContain("1 stamped in the future");
+    expect(warning).toContain("dropping 1 sessions and 1 facts outside it and clamping 1 sessions");
+  });
+
+  test("untimed (non-ISO) records get the warning too", async () => {
+    const dir = tmp("si-imp-untimed-");
+    writeFileSync(join(dir, "fx.jsonl"), jsonl([
+      { type: "user", sessionId: "u", timestamp: "2026-11-01T09:00:00Z", message: { role: "user", content: "x" } },
+      { type: "user", sessionId: "u", timestamp: "yesterday", message: { role: "user", content: "x" } },
+    ]));
+    const out = join(tmp("si-imp-"), "snap");
+    const q = quiet();
+    expect(await main(["--format", "claude-code", "--in", dir, "--out", out, "--salt-file", saltFile(), "--delete-by", DELETE_BY], q.io)).toBe(0);
+    expect(q.lines.find((l) => l.startsWith("import: warning:"))).toContain("dropped 1 records without a strict ISO-8601 timestamp");
+  });
+
+  test("a clean import prints no warning", async () => {
+    const { lines } = await importGeneric([{ sessionId: "c", ts: "2026-11-01T09:00:00Z", kind: "write", files: ["src/a.ts"] }]);
+    expect(lines.some((l) => l.includes("warning"))).toBe(false);
   });
 
   test("keepWindow keeps the 120 days in which the most sessions end, and leaves a short import alone", () => {
@@ -192,6 +256,95 @@ describe("outlier timestamps: dropped and counted, never an abort", () => {
     const late = [mk("x", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"), mk("y", "2026-01-03T00:00:00Z", "2026-01-04T00:00:00Z"), mk("z", "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z")];
     expect(keepWindow(late, stats).map((b) => b.sourceId)).toEqual(["x", "y"]);
     expect(stats.outOfWindowSessions).toBe(1);
+  });
+});
+
+describe("future timestamps in the Claude Code and Codex adapters", () => {
+  const NOT_AFTER = "2026-11-19T00:00:00.000Z";
+  test("a Claude Code record past the clock gives no fact and is counted", async () => {
+    const dir = tmp("si-imp-claude-future-");
+    const rec = (ts: string, id: string, path: string) => ({ type: "assistant", sessionId: "cf", timestamp: ts, cwd: "/work/acme",
+      message: { id, role: "assistant", content: [{ type: "tool_use", id: `t-${id}`, name: "Write", input: { file_path: path } }], usage: { input_tokens: 5 } } });
+    writeFileSync(join(dir, "cf.jsonl"), jsonl([rec("2026-11-01T09:00:00Z", "m1", "src/a.ts"), rec("2027-02-01T09:00:00Z", "m2", "src/future.ts")]));
+    const set = new SessionSet(emptyStats(), NOT_AFTER);
+    await readClaudeCode(join(dir, "cf.jsonl"), 0, set);
+    const b = set.byKey.get("claude\u0000cf")!;
+    expect(b.writes.map((w) => w.path)).toEqual(["src/a.ts"]);
+    expect(b.usage).toHaveLength(1);
+    expect(b.last).toBe("2026-11-01T09:00:00.000Z");
+    expect(set.stats.futureTimestamps).toBe(1);
+  });
+  test("a Codex record past the clock gives no fact and is counted", async () => {
+    const dir = tmp("si-imp-codex-future-");
+    writeFileSync(join(dir, "rollout.jsonl"), jsonl([
+      { timestamp: "2026-11-01T09:00:00Z", type: "session_meta", payload: { id: "xf", cwd: "/work/acme" } },
+      { timestamp: "2026-11-01T09:01:00Z", type: "response_item", payload: { type: "custom_tool_call", name: "apply_patch", call_id: "a", input: "*** Begin Patch\n*** Add File: src/a.ts\n*** End Patch\n" } },
+      { timestamp: "2027-02-01T09:00:00Z", type: "response_item", payload: { type: "custom_tool_call", name: "apply_patch", call_id: "b", input: "*** Begin Patch\n*** Add File: src/future.ts\n*** End Patch\n" } },
+      { timestamp: "2027-02-01T09:00:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { total_tokens: 9 } } } },
+    ]));
+    const set = new SessionSet(emptyStats(), NOT_AFTER);
+    await readCodex(join(dir, "rollout.jsonl"), 0, set);
+    const b = set.byKey.get("codex\u0000xf")!;
+    expect(b.writes.map((w) => w.path)).toEqual(["src/a.ts"]);
+    expect(b.usage).toHaveLength(0);
+    expect(set.stats.futureTimestamps).toBe(2);
+  });
+});
+
+describe("failures never print a source path", () => {
+  test("a mode-000 subdirectory under --in: the error names no path, in-process or on the CLI's stderr", async () => {
+    const root = tmp("si-imp-locked-");
+    const input = join(root, "fixture-private-dir");
+    const locked = join(input, "locked-subdir-name");
+    mkdirSync(locked, { recursive: true });
+    writeFileSync(join(input, "a.jsonl"), jsonl([{ sessionId: "s", ts: "2026-11-01T09:00:00Z", kind: "write" }]));
+    chmodSync(locked, 0o000);
+    try {
+      const out = join(tmp("si-imp-"), "snap");
+      const argv = ["--format", "generic", "--in", input, "--out", out, "--salt-file", saltFile(), "--delete-by", DELETE_BY];
+      const err = await main(argv, quiet().io).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(ImportError);
+      for (const text of [(err as Error).message, failureMessage(err)]) {
+        expect(text).toContain("could not be read (EACCES)");
+        for (const part of [root, "fixture-private-dir", "locked-subdir-name"]) expect(text).not.toContain(part);
+      }
+      const deleteBy = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+      const proc = Bun.spawn([process.execPath, "run", join(import.meta.dir, "..", "import", "cli.ts"), ...argv.slice(0, -1), deleteBy],
+        { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "" } });
+      const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      expect(code).toBe(1);
+      expect(stderr).toContain("EACCES");
+      for (const part of ["fixture-private-dir", "locked-subdir-name"]) expect(`${stdout}${stderr}`).not.toContain(part);
+      expect(existsSync(out)).toBe(false);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
+
+  test("any other error prints only its code", () => {
+    const raw = Object.assign(new Error("EACCES: permission denied, scandir '/Users/fixture-user/secret-project'"), { code: "EACCES" });
+    expect(failureMessage(raw)).toBe("session-intel import: failed (EACCES); details withheld, as they can name source paths");
+    expect(failureMessage(new TypeError("x of /Users/fixture-user/secret-project"))).not.toContain("fixture-user");
+    expect(failureMessage(new ImportError("--in is required"))).toBe("session-intel import: import: --in is required");
+    expect(failureMessage(new SnapshotError("manifest.window must have since < until"))).toContain("manifest.window");
+  });
+});
+
+describe("mapping cleanup", () => {
+  test("a snapshot write that fails after the mapping is written removes the mapping and leaves nothing behind", async () => {
+    const root = tmp("si-imp-cleanup-");
+    const out = join(root, "snap");
+    mkdirSync(out);
+    const write = writeImport({
+      out, lines: [], window: { since: "2026-11-01T09:00:00.000Z", until: "2026-11-01T10:00:00.000Z" }, deleteBy: DELETE_BY, now: NOW,
+      // A writer racing into --out after the checks: the rename onto a non-empty directory fails.
+      afterMapping: () => { expect(existsSync(mappingPath(out))).toBe(true); writeFileSync(join(out, "intruder"), "x"); },
+      mapping: { inputFiles: [], sessions: [], projects: {}, tenant: { orgId: "o", workspaceId: "w" }, stats: emptyStats() },
+    });
+    await expect(write).rejects.toThrow();
+    expect(existsSync(mappingPath(out))).toBe(false);
+    expect(readdirSync(root).sort()).toEqual(["snap"]);
+    expect(readdirSync(out)).toEqual(["intruder"]);
   });
 });
 

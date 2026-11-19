@@ -56,13 +56,20 @@ export interface ImportStats {
   outOfWindowSessions: number;
   /** Facts dropped because they fell before the start of that window. */
   outOfWindowFacts: number;
+  /** Sessions kept but clamped to start at that window (their earlier records or facts dropped). */
+  clampedSessions: number;
 }
 
 export const emptyStats = (): ImportStats => ({
   files: 0, lines: 0, malformedLines: 0, oversizeLines: 0, untimedRecords: 0, droppedPaths: 0, truncatedFacts: 0,
   oversizeSessions: 0, sessions: 0, writes: 0, commits: 0, outcomes: 0, usage: 0, heldFacts: 0,
-  futureTimestamps: 0, outOfWindowSessions: 0, outOfWindowFacts: 0,
+  futureTimestamps: 0, outOfWindowSessions: 0, outOfWindowFacts: 0, clampedSessions: 0,
 });
+
+/** An error whose message is safe to print: it names flags, bounds and codes, never a path, id, salt or text. */
+export class ImportError extends Error {
+  constructor(message: string) { super(`import: ${message}`); this.name = "ImportError"; }
+}
 
 /** A strict ISO-8601 timestamp with a zone, normalized, or null. */
 export function strictTs(v: unknown): string | null {
@@ -182,12 +189,33 @@ export class Hasher {
 
 /** Directory names the migration detector keys on (`migrations/`, `db/migrate/`), kept in clear with the source roots. */
 const MIGRATION_DIRS: ReadonlySet<string> = new Set(["migrations", "migration", "migrate", "db"]);
-/** Lockfiles, the migration journal and package.json, which the detectors treat as hot paths, by exact (lowercased) name. */
-const KNOWN_FILES: ReadonlySet<string> = new Set([
+/**
+ * The file names KNOWN_HOT_PATH in packages/coordination-detect/src/index.ts matches by exact name. The
+ * detector skips hot paths; hashed, they would raise false duplicate-work alerts in a replay. A test parses
+ * KNOWN_HOT_PATH and fails if the two lists drift.
+ */
+export const HOT_PATH_FILES: ReadonlySet<string> = new Set([
   "bun.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "cargo.lock", "poetry.lock",
-  "composer.lock", "gemfile.lock", "_journal.json", "package.json",
+  "composer.lock", "gemfile.lock", "_journal.json", "generated-manifest.json", "manifest.generated.json",
 ]);
-const EXTENSION = /^[a-z0-9]{1,10}$/u;
+/** File names kept in clear by exact (lowercased) name: the hot paths and package.json. */
+const KNOWN_FILES: ReadonlySet<string> = new Set([...HOT_PATH_FILES, "package.json"]);
+/** KNOWN_HOT_PATH's other form, `generated/*manifest*.json`. */
+const GENERATED_MANIFEST = /^[^/]*manifest[^/]*\.json$/u;
+/**
+ * The extensions kept in clear: a fixed allow-list of common code, config and doc extensions. Any other
+ * extension (`.initech`, `.production`, a sentence after the last dot) is hashed with the name.
+ */
+export const CLEAR_EXTENSIONS: ReadonlySet<string> = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "jsonc", "jsonl", "md", "mdx", "rst", "sql", "py", "rb", "go", "rs",
+  "java", "kt", "kts", "scala", "swift", "c", "h", "cc", "cpp", "hpp", "cs", "php", "lua", "dart", "ex", "exs", "sh",
+  "bash", "zsh", "ps1", "yml", "yaml", "toml", "ini", "cfg", "lock", "txt", "html", "css", "scss", "sass", "less",
+  "vue", "svelte", "proto", "graphql", "gql", "tf", "hcl", "dockerfile", "xml", "csv", "ipynb", "svg", "png", "jpg",
+  "gif", "gradle", "mod", "sum",
+]);
+/** At most 14 digits stay in clear (a `YYYYMMDDHHMMSS` migration stamp), as a name or as a prefix. */
+const MIGRATION_NUMBER = /^\d{1,14}$/u;
+const MIGRATION_PREFIX = /^(\d{3,14})([_-])(.+)$/u;
 const isMigrationDir = (parts: string[], i: number) => {
   const d = parts[i - 1]?.toLowerCase();
   return d === "migrations" || d === "migration" || (d === "migrate" && parts[i - 2]?.toLowerCase() === "db");
@@ -195,25 +223,32 @@ const isMigrationDir = (parts: string[], i: number) => {
 
 /**
  * The path as the snapshot stores it: every segment hashed with the import salt, except a closed set kept in
- * clear so equal paths still match and the detectors still work. In clear: the source roots and the migration
- * directory names (fixed lists), the hot-path file names (a fixed list), a file's extension when it is 1 to 10
- * of [a-z0-9] after lowercasing, and in a migration directory the all-digit number prefix (`0042_`,
- * `20261105062150_`). The depth is kept. Everything else, a sentence, a key-shaped name, a name with `@` or
+ * clear so equal paths still match and the detectors still work. In clear, from fixed lists only: the source
+ * roots and the migration directory names, the hot-path file names (and `generated/` above a *manifest*.json),
+ * an extension in CLEAR_EXTENSIONS, and in a migration directory an all-digit name or number prefix of at
+ * most 14 digits (`0042_`, `20261105062150_`). The depth is kept. Everything else, a sentence, a key-shaped name, a name with `@` or
  * whitespace, is hashed.
  */
 export function scrubPath(path: string, hasher: Hasher): string {
   const parts = path.split("/");
+  const lastLower = parts[parts.length - 1]!.toLowerCase();
   return parts.map((seg, i) => {
     const lower = seg.toLowerCase();
     const last = i === parts.length - 1;
-    if (!last) return SOURCE_ROOTS.has(lower) || MIGRATION_DIRS.has(lower) ? lower : hasher.segment(seg);
+    if (!last) {
+      if (SOURCE_ROOTS.has(lower) || MIGRATION_DIRS.has(lower)) return lower;
+      // `generated` stays in clear only as the directory right above a *manifest*.json file.
+      if (lower === "generated" && i === parts.length - 2 && GENERATED_MANIFEST.test(lastLower)) return lower;
+      return hasher.segment(seg);
+    }
     if (KNOWN_FILES.has(lower)) return lower;
     const dot = lower.lastIndexOf(".");
-    const ext = dot > 0 && EXTENSION.test(lower.slice(dot + 1)) ? lower.slice(dot) : "";
+    const ext = dot > 0 && CLEAR_EXTENSIONS.has(lower.slice(dot + 1)) ? lower.slice(dot) : "";
     const stem = ext ? lower.slice(0, dot) : lower;
+    if (parts[i - 1]?.toLowerCase() === "generated" && GENERATED_MANIFEST.test(lower)) return `${hasher.segment(stem)}.manifest.json`;
     if (isMigrationDir(parts, i)) {
-      if (/^\d+$/u.test(stem)) return `${stem}${ext}`;
-      const m = /^(\d{3,})([_-])(.+)$/u.exec(stem);
+      if (MIGRATION_NUMBER.test(stem)) return `${stem}${ext}`;
+      const m = MIGRATION_PREFIX.exec(stem);
       if (m) return `${m[1]}${m[2]}${hasher.segment(m[3]!)}${ext}`;
     }
     return `${hasher.segment(stem)}${ext}`;
@@ -252,7 +287,7 @@ export class SessionBuilder {
   }
   private push<T>(list: T[], v: T) {
     if (list.length >= IMPORT_BOUNDS.facts) { this.stats.truncatedFacts++; return; }
-    if (++this.stats.heldFacts > IMPORT_BOUNDS.totalFacts) throw new Error(`import: more than ${IMPORT_BOUNDS.totalFacts} facts; import fewer traces at a time`);
+    if (++this.stats.heldFacts > IMPORT_BOUNDS.totalFacts) throw new ImportError(`more than ${IMPORT_BOUNDS.totalFacts} facts; import fewer traces at a time`);
     list.push(v);
   }
   /** `raw` is normalized here; a path that cannot be made repo-relative safely is dropped and counted. */
@@ -287,6 +322,7 @@ export class SessionBuilder {
    */
   clampFrom(since: string) {
     if (!this.first || this.first >= since) return;
+    this.stats.clampedSessions++;
     for (const list of [this.writes, this.commits, this.outcomes, this.usage] as { ts: string }[][]) {
       const keep = list.filter((x) => x.ts >= since);
       this.stats.outOfWindowFacts += list.length - keep.length;
