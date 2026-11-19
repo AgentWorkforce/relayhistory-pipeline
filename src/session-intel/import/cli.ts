@@ -4,7 +4,10 @@
  * replay snapshot with hashed ids and no message text, plus a private mapping file beside it.
  *
  *   bun run src/session-intel/import/cli.ts --format claude-code|codex|generic --in <path> --out <dir> \
- *     --salt-file <path> --delete-by <iso> [--org <id> --workspace <id>]
+ *     --salt-stdin --delete-by <iso> [--org <id> --workspace <id>]
+ *
+ * The salt comes from stdin (`op read 'op://...' | bun run ... --salt-stdin ...`), so it is never on disk,
+ * in argv or in the shell history. `--salt-file <path>` is a fallback; exactly one of the two is required.
  */
 import { constants, existsSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
@@ -18,7 +21,9 @@ import { checkDeleteBy, WINDOW_TAIL_MS, writeImport } from "./writer.ts";
 import { isInside, realPathOf } from "../replay/cli.ts";
 import { isoTime, textCompare } from "../replay/util.ts";
 
-export interface CliIo { out(line: string): void; err(line: string): void; now?: Date }
+/** The salt source for --salt-stdin: process.stdin by default; tests inject a stream. */
+export interface SaltInput extends AsyncIterable<Buffer | string> { isTTY?: boolean }
+export interface CliIo { out(line: string): void; err(line: string): void; now?: Date; stdin?: SaltInput }
 const defaultIo: CliIo = { out: (l) => console.log(l), err: (l) => console.error(l) };
 
 const REPO_ROOT = realpathSync(resolve(fileURLToPath(new URL("../../..", import.meta.url))));
@@ -60,11 +65,33 @@ export async function readSaltFile(path: string, repoRoot = REPO_ROOT): Promise<
   }
 }
 
+/**
+ * Reads the import salt from stdin: refused when stdin is a terminal (a typed salt would echo and could be
+ * logged by the terminal), read up to 4 KiB, trimmed, 16 to 1024 characters. No message carries the salt.
+ */
+export async function readSaltStdin(input: SaltInput): Promise<string> {
+  if (input.isTTY) throw new ImportError("--salt-stdin needs the salt piped in (for example from `op read`), not a terminal");
+  const parts: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of input) {
+    const b = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+    size += b.length;
+    if (size > SALT_FILE_MAX_BYTES) { for (const x of parts) x.fill(0); throw new ImportError(`--salt-stdin exceeds ${SALT_FILE_MAX_BYTES} bytes`); }
+    parts.push(Buffer.from(b));
+  }
+  const buf = Buffer.concat(parts);
+  for (const x of parts) x.fill(0);
+  const salt = buf.toString("utf8").trim();
+  buf.fill(0);
+  if (salt.length < SALT_MIN || salt.length > SALT_MAX) throw new ImportError(`--salt-stdin must carry ${SALT_MIN} to ${SALT_MAX} characters`);
+  return salt;
+}
+
 export async function main(argv: string[], io: CliIo = defaultIo): Promise<number> {
   const { values } = parseArgs({
     args: argv, strict: true, allowPositionals: false,
     options: {
-      format: { type: "string" }, in: { type: "string" }, out: { type: "string" }, "salt-file": { type: "string" },
+      format: { type: "string" }, in: { type: "string" }, out: { type: "string" }, "salt-file": { type: "string" }, "salt-stdin": { type: "boolean" },
       "delete-by": { type: "string" }, org: { type: "string" }, workspace: { type: "string" },
     },
   });
@@ -72,13 +99,15 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (!format || !FORMATS.includes(format)) throw new ImportError(`--format must be one of ${FORMATS.join(", ")}`);
   if (!values.in) throw new ImportError("--in is required");
   if (!values.out) throw new ImportError("--out is required");
-  if (!values["salt-file"]) throw new ImportError("--salt-file is required (a 0600 file holding 16 to 1024 characters)");
+  const fromStdin = values["salt-stdin"] === true;
+  if (fromStdin === (values["salt-file"] !== undefined))
+    throw new ImportError("exactly one of --salt-stdin (preferred: pipe the salt from `op read`) or --salt-file is required");
   if (!values["delete-by"]) throw new ImportError("--delete-by is required (at most 30 days out)");
   const now = io.now ?? new Date();
   let deleteBy: string;
   try { deleteBy = isoTime(values["delete-by"], "--delete-by"); } catch { throw new ImportError("--delete-by must be an ISO-8601 timestamp with a zone"); }
   checkDeleteBy(deleteBy, now);
-  const salt = await readSaltFile(values["salt-file"]);
+  const salt = fromStdin ? await readSaltStdin(io.stdin ?? process.stdin) : await readSaltFile(values["salt-file"]!);
   const tenant = { orgId: values.org ?? "org_import", workspaceId: values.workspace ?? "ws_import" };
   if (!TENANT_ID.test(tenant.orgId) || !TENANT_ID.test(tenant.workspaceId)) throw new ImportError(`--org and --workspace must match ${TENANT_ID.source}`);
 

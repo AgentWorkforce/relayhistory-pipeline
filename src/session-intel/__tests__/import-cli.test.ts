@@ -5,7 +5,8 @@
 import { describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { main, readSaltFile } from "../import/cli.ts";
+import { Readable } from "node:stream";
+import { main, readSaltFile, readSaltStdin } from "../import/cli.ts";
 import { isInside } from "../replay/cli.ts";
 import { Hasher } from "../import/normalize.ts";
 import { mappingPath } from "../import/writer.ts";
@@ -109,7 +110,7 @@ describe("import cli", () => {
   test("refuses a missing or short salt, a bad format, bad tenant ids and unknown flags", async () => {
     const out = join(tmp("si-imp-"), "snap");
     const base = ["--in", join(FIX, "generic"), "--out", out, "--delete-by", DELETE_BY];
-    await expect(main(["--format", "generic", ...base], quiet().io)).rejects.toThrow("--salt-file is required");
+    await expect(main(["--format", "generic", ...base], quiet().io)).rejects.toThrow("exactly one of --salt-stdin");
     // The salt is never taken from argv.
     await expect(main(["--format", "generic", ...base, "--salt", SALT], quiet().io)).rejects.toThrow("Unknown option '--salt'");
     await expect(main(["--format", "otel", ...base, "--salt-file", SALT_FILE], quiet().io)).rejects.toThrow("--format");
@@ -161,6 +162,57 @@ describe("import cli", () => {
     expect(await main(args("generic", "generic", empty), quiet().io)).toBe(0);
     expect(readdirSync(empty).sort()).toEqual(["manifest.json", "sessions.jsonl"]);
     expect(readdirSync(root).filter((f) => f.includes(".import-"))).toEqual([]);
+  });
+});
+
+describe("salt from stdin", () => {
+  const CLI = join(REPO, "src", "session-intel", "import", "cli.ts");
+  const genericArgs = (out: string, salt: string[]) => ["--format", "generic", "--in", join(FIX, "generic"), "--out", out, ...salt, "--delete-by", DELETE_BY];
+  const piped = (...chunks: (string | Buffer)[]) => Readable.from(chunks);
+
+  test("a piped salt gives the same ids as the same salt from a file", async () => {
+    const a = await runImport("generic", "generic");
+    const out = join(tmp("si-imp-"), "snap");
+    const q = quiet();
+    expect(await main(genericArgs(out, ["--salt-stdin"]), { ...q.io, stdin: piped("fixture-salt-", Buffer.from("0123456789\n")) })).toBe(0);
+    expect(readFileSync(join(out, "sessions.jsonl"), "utf8")).toBe(readFileSync(join(a.out, "sessions.jsonl"), "utf8"));
+    expect(q.lines.join("\n")).not.toContain(SALT);
+  });
+
+  test("a real pipe into the CLI process (the `op read ... |` path)", async () => {
+    const out = join(tmp("si-imp-"), "snap");
+    // --delete-by is relative to the real clock here, not the test's NOW.
+    const deleteBy = new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+    const proc = Bun.spawn([process.execPath, "run", CLI, "--format", "generic", "--in", join(FIX, "generic"), "--out", out, "--salt-stdin", "--delete-by", deleteBy], {
+      stdin: new Blob([`${SALT}\n`]), stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "" },
+    });
+    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(`${stdout}${stderr}`).not.toContain(SALT);
+    const h = new Hasher(SALT);
+    expect(readFileSync(join(out, "sessions.jsonl"), "utf8")).toContain(h.session("generic", "gen-1"));
+  });
+
+  test("exactly one salt source: both flags, or neither, is refused before any output", async () => {
+    const out = join(tmp("si-imp-"), "snap");
+    await expect(main(genericArgs(out, ["--salt-stdin", "--salt-file", SALT_FILE]), { ...quiet().io, stdin: piped(SALT) })).rejects.toThrow("exactly one of --salt-stdin");
+    await expect(main(genericArgs(out, []), { ...quiet().io, stdin: piped(SALT) })).rejects.toThrow("exactly one of --salt-stdin");
+    expect(existsSync(out)).toBe(false);
+  });
+
+  test("refuses a terminal, over 4 KiB, and too short or too long once trimmed; never echoes the salt", async () => {
+    const tty = Object.assign(piped(SALT), { isTTY: true });
+    await expect(readSaltStdin(tty)).rejects.toThrow("not a terminal");
+    await expect(main(genericArgs(join(tmp("si-imp-"), "snap"), ["--salt-stdin"]), { ...quiet().io, stdin: tty })).rejects.toThrow("not a terminal");
+    await expect(readSaltStdin(piped("x".repeat(4_000), "y".repeat(200)))).rejects.toThrow("exceeds 4096 bytes");
+    await expect(readSaltStdin(piped("short-salt\n"))).rejects.toThrow("16 to 1024");
+    await expect(readSaltStdin(piped(" \n\t"))).rejects.toThrow("16 to 1024");
+    await expect(readSaltStdin(piped("z".repeat(1_025)))).rejects.toThrow("16 to 1024");
+    expect(await readSaltStdin(piped(`\n  ${SALT}  \r\n`))).toBe(SALT);
+    const secret = "never-echo-stdin-salt-0123";
+    const err = await readSaltStdin(piped(secret.repeat(200))).catch((e: Error) => e);
+    expect((err as Error).message).not.toContain(secret.slice(0, 10));
   });
 });
 
