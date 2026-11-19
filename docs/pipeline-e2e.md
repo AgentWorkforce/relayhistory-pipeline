@@ -22,8 +22,11 @@ whenever the classifier says `full` (every step) or `targeted` with steps
   from a fresh compose project with fresh volumes, never from random ids.
 - **No model calls.** Bob Costas runs the extractive summariser
   (`BOB_COSTAS_MODEL=off`); the session-brief worker is not started.
-- **No network beyond the stack** once the images are built: the only stub is
-  `control-stub`, Control's token introspection endpoint (e2e/selfhost).
+- **No network beyond the stack** once the images are built: `control-stub`
+  supplies Control's token introspection (e2e/selfhost), and
+  `coordination-relay` records the advisor's authenticated HTTP sends in memory.
+  It shares a network namespace with the advisor so the sender uses loopback
+  HTTP; its host port is bound to loopback only. It never routes to an agent.
 - **Bounded waits**: every poll has a deadline (at most 240 s, for the
   consumer's one-minute reconcile); the lane has a 45-minute ceiling in the CI
   flow, the sandbox run 40 minutes.
@@ -53,7 +56,7 @@ Only the services the selected steps need are started.
 
 | Step | Proves |
 | --- | --- |
-| `coordination.advisories` | M3-5 foundation: synthetic directory and tool facts produce HIGH shared-file collision and LOW nearby-work rows through the running advisor; a planned fleet stays silent; the workspace allowlist and HTTP tenant boundary hold; authenticated pull carries both citations; ack is recipient-specific and idempotent; pair cooldown and the hourly cap survive real worker restarts; workspace controls stop writes and a flip is observed on the next tick without a restart. Facts are seeded at the projection boundary: this does not prove extraction, conflict classification, or Relay DM delivery |
+| `coordination.advisories` | Synthetic directory and tool facts produce HIGH shared-file collision and LOW nearby-work rows through the running advisor; a planned fleet stays silent; the workspace allowlist and HTTP tenant boundary hold; authenticated pull carries both citations; missing-workspace ack refuses org scope; ack is recipient-specific and idempotent; pair cooldown and the hourly cap survive real worker restarts; workspace controls stop writes and a flip is observed on the next tick without a restart. The real HTTP sender authenticates to a recording endpoint: missing DM controls send nothing, enabled controls deliver HIGH only, and a refused send stays pending and available on pull. Facts are seeded at the projection boundary: this does not prove extraction, conflict classification, or real Relay routing |
 | `upload.http` | a. upload over HTTP on the SQL ledger: no token 401, read-only token 403, then admitted (ingest log: `accepted`, one manifest written) |
 | `upload.s3_ledger` | a. upload over the S3 ledger: refused 503 `ledger_fence_authority_missing` until the test fence-authority marker is written, then admitted; the S3 batch record is `committed` with the receipt; no SQL `ingest_batches` row |
 | `canonical.objects` | b. both sessions' canonical `manifest.json`; every chunk it names, at the key the reader derives (`chunkKeys`), is stored and sealed (the marker is not readable in its bytes) |

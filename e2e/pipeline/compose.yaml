@@ -30,6 +30,8 @@ services:
       READ_API_COORDINATION_ADVISORIES_ENABLED: "true"
   coordination-advisor:
     <<: *services-image
+    # Share only this fixture's network namespace so the sender uses permitted loopback HTTP.
+    network_mode: service:coordination-relay
     environment:
       <<: *hoop-env
       SERVICE: coordination-advisor
@@ -41,13 +43,24 @@ services:
       COORDINATION_ADVISOR_INTERVAL_SECONDS: "1"
       COORDINATION_ADVISOR_PAIR_COOLDOWN_SECONDS: "21600"
       COORDINATION_ADVISOR_SESSION_HOURLY_CAP: "3"
-      COORDINATION_ADVISOR_RELAY_DM_ENABLED: "false"
+      COORDINATION_ADVISOR_RELAY_DM_ENABLED: "true"
+      COORDINATION_ADVISOR_RELAY_URL: http://127.0.0.1:3123/relay
+      COORDINATION_ADVISOR_RELAY_TOKEN: ${E2E_COORDINATION_RELAY_TOKEN:?}
       READ_API_DIRECTORY_WORKSPACES: ws_a
     volumes:
       - ${E2E_CERTS_DIR:?}:/certs:ro
     depends_on:
       roles: { condition: service_completed_successfully }
+      coordination-relay: { condition: service_started }
     restart: on-failure:5
+  coordination-relay:
+    <<: *services-image
+    entrypoint: ["bun", "/fixture/coordination-relay.ts"]
+    environment:
+      E2E_COORDINATION_RELAY_TOKEN: ${E2E_COORDINATION_RELAY_TOKEN:?}
+    volumes:
+      - ${E2E_COORDINATION_RELAY_FIXTURE:?}:/fixture/coordination-relay.ts:ro
+    ports: ["127.0.0.1::3123"]
   minio:
     ports: ["127.0.0.1::9000"]
   session-ingest-s3:
