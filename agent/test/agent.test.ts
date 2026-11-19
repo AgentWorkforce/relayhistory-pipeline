@@ -40,7 +40,7 @@ test("names: the module's defaults for a new agent, except the platform prefix (
   });
   assert.deepEqual(agent.tags, { "layered-agent:name": "sessions-pipeline", "layered-agent:stage": "dev", "layered-agent:repo": "AgentWorkforce/sessions-pipeline" });
   const props = hostTemplate(agent, "X").Resources.AgentHost.Properties;
-  assert.equal(props.InstanceType, "m7i.xlarge");
+  assert.equal(props.InstanceType, "t3.large");
   assert.equal(props.BlockDeviceMappings[0]?.Ebs.VolumeSize, 100);
   // Pinned to the AMI the host runs; the unpinned pointer stays the amd64 one.
   assert.equal(String(hostTemplate(agent, "X").Parameters.AmiId.Default), "ami-08cf17e3856f70154");

@@ -30,7 +30,7 @@ export default defineLayeredAgent({
   // 4 vCPU / 16 GiB: one Fable lead plus a few subagents running bun install,
   // tsc and vitest (PGlite, in process) over two TypeScript repos. Nothing
   // here compiles native code or runs containers.
-  instanceType: "m7i.xlarge",
+  instanceType: "t3.large",
   rootVolumeGiB: 100,
   laneFiles: ["lead-prompt.md", "setup-lane.sh", "share-lead-session.sh"],
   // Relay workers (module 0.1.7): long-running parallel work, e.g. one worker
