@@ -12,6 +12,7 @@ import { alertClassOf } from "../replay/classes.ts";
 import { advisorDetector, detectorHash } from "../replay/detector.ts";
 import { replaySnapshot } from "../replay/replay.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
+import { session, tmp, writeSnapshot } from "./helpers.ts";
 
 const fixture = () => loadSnapshot(join(import.meta.dir, "fixtures", "conflict", "snapshot"), { now: new Date("2026-11-18T00:00:00Z") });
 /** The fixture case of a pair: the shared session-id prefix (cv, ic, fl, ...). */
@@ -44,5 +45,22 @@ describe("live wiring in replay", () => {
     expect(detectorHash(advisorDetector({ conflicts: true }), { intervalMs: 120_000 })).not.toBe(off.detectors[0]!.hash);
     const ctlOff = await replaySnapshot(await fixture(), { detectors: [advisorDetector({ conflicts: true, controls: { conflicts: false } })] });
     expect(ctlOff.alerts.some((a) => isConflictKind(a.kind))).toBe(false);
+  });
+
+  test("a claim shared by both sessions (one recordId) is agreement: no conflict, live or offline", async () => {
+    const t = (hm: string) => `2026-11-01T${hm}:00.000Z`;
+    const constraint = (recordId: string) => ({ id: "k1", at: t("09:10"), kind: "constraint", scope: "project", recordId,
+      text: "No new migrations under supabase/migrations until the 062 renumber lands.", confidence: 1, evidenceIds: ["e1"] });
+    const mk = (recordB: string) => loadSnapshot(writeSnapshot(tmp(), [
+      session("own", { usage: [{ ts: t("09:05"), eventId: "u1", tokens: 1, costUsdMicros: 1 }], claims: [constraint("rec-1")] }),
+      session("act", { writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }],
+        claims: [{ ...constraint(recordB), at: t("09:12") }] }),
+    ]), { now: new Date("2026-11-18T00:00:00Z") });
+    const conflicts = (r: Awaited<ReturnType<typeof replaySnapshot>>) => r.alerts.filter((a) => isConflictKind(a.kind)).map((a) => `${a.detector} ${a.kind}`);
+    const shared = await replaySnapshot(await mk("rec-1"), { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
+    expect(conflicts(shared)).toEqual([]);
+    // Control: the same claims as two different records do conflict (the holder's constraint, the other's write).
+    const apart = await replaySnapshot(await mk("rec-2"), { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
+    expect(conflicts(apart)).toEqual(expect.arrayContaining(["conflict-rule constraint_violation", "coordination-advisor constraint_violation"]));
   });
 });

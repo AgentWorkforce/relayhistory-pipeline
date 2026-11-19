@@ -162,18 +162,18 @@ describe("conflict rows in the advisor tick (pglite, 062150 and 062160 applied)"
     expect([...by("fl-1"), ...by("fl-2")]).toEqual([]);
     // (g) compatible claims, one side writing: overlap LOW, never a DM.
     expect(by("cat-a")).toEqual(["overlap/low/pending/cat-b"]);
-    // A conflict on a collision pair outranks the collision: only the conflict is written this tick.
-    expect(by("col-a")).toEqual(["intent_conflict/high/delivered/col-b"]);
-    expect(by("col-b")).toEqual(["intent_conflict/high/delivered/col-a"]);
+    // A conflict never suppresses a collision: the pair gets both rows in one tick.
+    expect(by("col-a")).toEqual(["concurrent_edit/high/delivered/col-b", "intent_conflict/high/delivered/col-b"]);
+    expect(by("col-b")).toEqual(["concurrent_edit/high/delivered/col-a", "intent_conflict/high/delivered/col-a"]);
     // The DMs: HIGH only, to sessions; every one delivered under the contract's set rule.
-    expect(sender.sent.map((d) => d.to.sessionId).sort()).toEqual(["col-a", "col-b", "cv-actor", "cv-owner", "ic-a", "ic-b"].sort());
+    expect(sender.sent.map((d) => d.to.sessionId).sort()).toEqual(["col-a", "col-a", "col-b", "col-b", "cv-actor", "cv-owner", "ic-a", "ic-b"].sort());
     // Evidence: cited claim ids and the action event id, as 062000 strings.
     const cv = all.find((r) => r.session_id === "cv-actor")!;
     expect((cv.evidence as Array<{ kind: string; eventId: string }>).map((e) => e.kind)).toEqual(["claim_constraint", "write"]);
     expect(cv.artifact).toBe("supabase-migrations");
     const text = sender.sent.find((d) => d.to.sessionId === "cv-actor")!.text;
     expect(text).toContain("possible constraint violation");
-    expect(text).toContain(`constraint: "${CV}"`);
+    expect(text).toContain(`Quoted constraint claim: "${CV}"`);
     expect(text.length).toBeLessThanOrEqual(600);
   });
 
@@ -220,6 +220,28 @@ describe("conflict rows in the advisor tick (pglite, 062150 and 062160 applied)"
       expect(stats).toMatchObject({ failed: 0, conflictsSkipped: 1, conflicts: 0 });
       expect((await rows()).map((r) => r.kind)).toEqual(["concurrent_edit", "concurrent_edit"]);
     }
+  });
+
+  test("a duplicate_work and a constraint_violation for one pair in one tick: both rows; the next tick is cooled down", async () => {
+    for (const s of ["dup-a", "dup-b"]) await db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, project_id)
+       VALUES ('org',$1,'claude',$2,$3,$4,'proj-dup')`, [WS, s, at(-120), at(-5)]);
+    await claim([{ kind: "constraint", scope: "project", topic: "supabase-migrations", title: "Hold migrations", statement: CV,
+      observed_at: at(-50), evidence: [ev("dup-a")] }]);
+    const withDup = () => [...facts(), lane("dup-a", "proj-dup", [["supabase/migrations/062170_a.sql", -40]]),
+      lane("dup-b", "proj-dup", [["supabase/migrations/062170_b.sql", -20]])];
+    const limits = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 10 });
+    const run = (now: Date) => scanOnce({ workspaces: "*", store: sqlAdvisorStore(asService(db)), backend: backend(withDup), conflicts: true, limits,
+      sender: new ContractRelayFake() }, now);
+    await run(NOW);
+    const dup = async () => (await rows()).filter((r) => r.session_id.startsWith("dup-")).map((r) => `${r.session_id}/${r.kind}/${r.urgency}`);
+    expect(await dup()).toEqual([
+      "dup-a/constraint_violation/high", "dup-a/duplicate_work/high", "dup-b/constraint_violation/high", "dup-b/duplicate_work/high",
+    ]);
+    const next = await run(new Date(NOW.getTime() + 2 * 60_000));
+    expect(next.written).toBe(0);
+    expect(next.cooldown).toBeGreaterThanOrEqual(2);
+    expect(await dup()).toHaveLength(4);
   });
 
   test("the cooldown and the per-recipient cap hold for conflict rows", async () => {
