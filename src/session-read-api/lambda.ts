@@ -725,7 +725,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // Advisories on the read-role pool: the GET READ ONLY, the ack in its own READ WRITE transaction.
   // The Function URL handler is GET-only, so on the hosted Lambda the ack is a 405; the self-host service serves it.
   const advisoriesDeps = advisoriesEnabled
-    ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(poolTenantRunner(pool as never), poolTenantWriter(pool as never)) } }
+    ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(poolTenantRunner(pool as never), poolTenantWriter(pool as never), { warn: (fields) => log.warn("coordination advisories pull fell back to v1", fields) }) } }
     : {};
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),

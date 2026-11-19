@@ -53,6 +53,9 @@ const LATER_STEP = "upstream:20261105062160_session_intel_controls.sql";
 const LATER_DOWN = sqlFile("supabase/rollbacks/20261105062160_session_intel_controls.down.sql");
 const TOP_STEP = "upstream:20261105062170_session_intel_workspace.sql";
 const TOP_DOWN = sqlFile("supabase/rollbacks/20261105062170_session_intel_workspace.down.sql");
+/** 20261105062190 (the priority-first advisories reader) sits above 062170: its down runs first of all. */
+const PRIORITY_STEP = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
+const PRIORITY_DOWN = sqlFile("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql");
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await runMigrations(client(db), { profile: LOCAL });
@@ -488,9 +491,11 @@ describe("20261105062150 rollback", () => {
     try {
       // 20261105062160 (session intel controls) and 20261105062170 (session intel workspace readers) are the later steps;
       // they come off first (062170, then 062160), and this down refuses under either.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP, PRIORITY_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
       expect(await message(LATER_DOWN)).toContain("a later migration is applied");
+      expect(await message(TOP_DOWN)).toContain("a later migration is applied");
+      await db.exec(PRIORITY_DOWN);
       await db.exec(TOP_DOWN);
       expect(await message(DOWN)).toContain("a later migration is applied");
       await db.exec(LATER_DOWN);
@@ -526,6 +531,7 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
+      await db.exec(PRIORITY_DOWN);
       await db.exec(TOP_DOWN);
       await db.exec(LATER_DOWN);
       await db.exec(DOWN);

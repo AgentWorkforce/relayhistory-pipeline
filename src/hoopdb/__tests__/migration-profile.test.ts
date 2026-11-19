@@ -2652,6 +2652,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const RFC = "upstream:20261105062150_relayfacts_claims.sql";
     const SIC = "upstream:20261105062160_session_intel_controls.sql";
     const SIW = "upstream:20261105062170_session_intel_workspace.sql";
+    const CAP = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2713,6 +2714,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062190 is newest: 062170's down refuses (55000) while it is applied; its checksum-pinned down drops only
+    // the priority-first reader (v1 stays) and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(CAP);
+    expect((await failure(rollback("20261105062170_session_intel_workspace.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062190_coordination_advisories_pending_priority.down.sql");
+    expect(await names()).not.toContain(CAP);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)'))")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.coordination_advisories_pending_for_v1(text,text,text,text)'))")).rows[0]!.n).toBe(1);
+    expect((await failure(rollback("20261105062190_coordination_advisories_pending_priority.down.sql")))?.code).toBe("55000");
     // 20261105062170 is newest: 062160's down refuses (55000) while it is applied; its checksum-pinned down drops the
     // two workspace-view readers and its ledger row, touches no table, and refuses on a rerun.
     expect(await names()).toContain(SIW);
