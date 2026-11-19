@@ -39,7 +39,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv } from "../../../src/session-pipeline/lambda.ts";
+import { lambdaEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -944,6 +944,37 @@ describe("session pipeline: SUMMARY_DECISION_RECORDS_ENABLED (relayfacts, defaul
   it("refuses a non-boolean", () => {
     for (const bad of ["true", 1, null, {}, "on"])
       expect(() => validate(withPipeline({ relayfacts: bad }))).toThrow("transcriptStore.sessionPipeline.relayfacts must be a boolean");
+  });
+});
+
+describe("session pipeline: skip a search pass already current (SEARCH_INDEX_SKIP_CURRENT_ENABLED)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  const base = Object.keys(envOf({ searchIndex: true })).sort();
+
+  it("unset or false renders nothing new, and the Lambda reads it as off", () => {
+    expect(base).not.toContain("SEARCH_INDEX_SKIP_CURRENT_ENABLED");
+    for (const cfg of [{ searchIndex: true }, { searchIndex: true, skipCurrent: false }, { skipCurrent: false }] as SessionPipelineInputs[]) {
+      expect(refusedBy(cfg)).toBe("");
+      expect(Object.keys(envOf(cfg)).sort()).toEqual(Object.keys(envOf({ ...cfg, skipCurrent: undefined } as SessionPipelineInputs)).sort());
+      expect(searchIndexSkipCurrentFromEnv(envOf(cfg))).toBe(false);
+    }
+  });
+
+  it("true renders exactly the flag, and the Lambda parses it as on", () => {
+    const env = envOf({ searchIndex: true, skipCurrent: true });
+    expect(Object.keys(env).sort()).toEqual([...base, "SEARCH_INDEX_SKIP_CURRENT_ENABLED"].sort());
+    expect(env.SEARCH_INDEX_SKIP_CURRENT_ENABLED).toBe("true");
+    expect(searchIndexSkipCurrentFromEnv(env)).toBe(true);
+  });
+
+  it("invalid shapes are refused, by the stack and by the Lambda", () => {
+    expect(refusedBy({ skipCurrent: true })).toMatch(/skipCurrent requires searchIndex: true/);
+    expect(refusedBy({ searchIndex: false, skipCurrent: true })).toMatch(/skipCurrent requires searchIndex: true/);
+    for (const bad of ["true", 1, null, {}]) expect(refusedBy({ searchIndex: true, skipCurrent: bad })).toMatch(/skipCurrent must be a boolean/);
+    for (const bad of ["1", "TRUE", " true", "on", "yes"])
+      expect(() => searchIndexSkipCurrentFromEnv({ SEARCH_INDEX_SKIP_CURRENT_ENABLED: bad })).toThrow("SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+    expect(searchIndexSkipCurrentFromEnv({ SEARCH_INDEX_SKIP_CURRENT_ENABLED: "" })).toBe(false);
   });
 });
 

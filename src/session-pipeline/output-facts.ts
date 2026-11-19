@@ -640,6 +640,28 @@ export async function previousOutputFactsState(ch: ClickHouseClient, scope: Outp
   return { range: r && Number(r.n) > 0 && r.lo && r.hi ? { min: r.lo, max: r.hi } : null, version: Number(r?.v ?? 0) };
 }
 
+/**
+ * Is the facts state of one session id complete (the search skip-current check)? One point read of
+ * the state table; no state row (never written, or the table missing) is not complete.
+ */
+export async function outputFactsComplete(
+  ch: ClickHouseClient,
+  id: { orgId: string; workspaceId: string; harness: string; sessionId: string },
+): Promise<boolean> {
+  try {
+    const rows = await ch.select<{ complete: string | number }>(
+      `SELECT complete FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+        WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND source = {source:String} AND session_id = {session:String}
+        LIMIT 1`,
+      { params: { org: id.orgId, workspace: id.workspaceId, source: id.harness, session: id.sessionId }, timeoutMs: 20_000 },
+    );
+    return Number(rows[0]?.complete ?? 0) === 1;
+  } catch {
+    // An unreadable or missing state table proves nothing: run the pass.
+    return false;
+  }
+}
+
 /** A pass's base version: even, at least 2 x its ms, and above every earlier state of the scope. */
 export function passVersion(at: Date, previous: number): number {
   const base = Math.max(at.getTime() * 2, previous + 1);

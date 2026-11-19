@@ -31,6 +31,8 @@ export function fakeClickHouse() {
   const state: Array<Record<string, unknown>> = [];
   const other: Array<{ table: string; rows: unknown[] }> = [];
   const calls: Array<Record<string, unknown>> = [];
+  /** What the facts state answers for `complete` (undefined: no row). */
+  const facts: { complete?: number } = {};
   const tsMs = (r: IndexRow) => Date.parse(`${r.ts.replace(" ", "T")}Z`);
   const identity = (r: IndexRow) => [r.org_id, r.workspace_id, tsMs(r), r.session_id, r.source, r.machine_id, r.kind, r.event_id].join("|");
   const final = () => {
@@ -68,6 +70,8 @@ export function fakeClickHouse() {
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       calls.push({ ch: "select", query: squash(query), params: plain(options?.params ?? {}) });
       if (query.includes("search_ingest_state") || query.includes("FROM system.columns")) return [] as T[];
+      // The output facts state of one session id (skip-current with output facts on).
+      if (query.includes("output_facts_session_state")) return (facts.complete === undefined ? [] : [{ complete: facts.complete }]) as T[];
       if (!query.includes(`FROM ${EVENTS_TABLE} FINAL`)) throw new Error(`unexpected select ${query.slice(0, 40)}`);
       const p = options!.params!;
       const found = final()
@@ -83,7 +87,7 @@ export function fakeClickHouse() {
     },
   };
   const dump = () => final().map((r) => JSON.stringify([r.session_id, r.machine_id, r.kind, r.event_id, tsMs(r), r.fingerprint])).sort();
-  return { ch, rows, state, other, calls, dump };
+  return { ch, rows, state, other, calls, dump, facts };
 }
 
 /** One hosted consumer over `x`: a migrated HoopDb clone, the fake ClickHouse, a read-counting store. */
