@@ -1475,6 +1475,12 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_analysis_admit_job_v1(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_admit_live_v1(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_analysis_admit_scope(text,text)": [
       "<owner>:EXECUTE"
     ],
@@ -1497,6 +1503,14 @@
     ],
     "sessions.session_analysis_require_caller(text[])": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_schedule_candidates_v1(integer,integer,integer)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
     ],
     "sessions.session_analysis_source_revision(text,text,text)": [
       "<owner>:EXECUTE",
