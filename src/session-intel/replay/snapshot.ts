@@ -33,8 +33,21 @@ export const SNAPSHOT_BOUNDS = {
 } as const;
 
 export type ClaimKind = "intent" | "constraint" | "decision";
-/** Reserved for the M1/M2 detectors (intent and constraint conflict); the advisor never reads claims. */
-export interface SnapshotClaim { at: string; kind: ClaimKind; text: string; confidence: number; evidenceIds: string[] }
+/**
+ * Who a claim binds (docs/proposals/session-intelligence.md, "Rules that make the classes sharp"): a `session`
+ * claim never propagates to another session; `project` and `repo` ones can. Absent, it is `session`.
+ */
+export type ClaimScope = "session" | "project" | "repo";
+export const CLAIM_SCOPES: readonly ClaimScope[] = ["session", "project", "repo"];
+/**
+ * Read by the M2 conflict detectors (src/session-intel/conflict/); the advisor never reads claims. `id` is
+ * unique within its session (absent, it is `c<index>`, the claim's position in its line). `supersededAt`, when
+ * set, is when a later claim or a decision record retired it; an as-of view shows it only once it is past.
+ * `scope`, `id` and `supersededAt` are optional in the file, so a snapshot without them still loads as /1.
+ */
+export interface SnapshotClaim {
+  id: string; at: string; kind: ClaimKind; scope: ClaimScope; text: string; confidence: number; evidenceIds: string[]; supersededAt?: string;
+}
 export interface SummaryEntry { at: string; text: string }
 
 export interface SnapshotSession {
@@ -127,6 +140,8 @@ async function readBounded(path: string, max: number, what: string): Promise<Buf
 const id = (v: unknown, field: string) => boundedString(v, field, SNAPSHOT_BOUNDS.id)!;
 const optId = (v: unknown, field: string) => boundedString(v, field, SNAPSHOT_BOUNDS.id, { nullable: true });
 const HARNESS = /^[A-Za-z0-9_.-]{1,64}$/;
+/** A claim id: no `#`, `:`, `/` or whitespace, so `<harness>:<sessionId>#<id>` names it unambiguously. */
+const CLAIM_ID = /^[A-Za-z0-9_.-]{1,128}$/;
 
 function list(v: unknown, field: string, max: number): unknown[] {
   if (v === undefined) return [];
@@ -219,17 +234,30 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
     } else if (s !== null && s !== undefined) throw new SnapshotError(`${where}.shortSummary must be a string, an object or null`);
     summaryTimeline.sort((a, b) => textCompare(a.at, b.at));
 
+    const claimIds = new Set<string>();
     const claims = list(raw.claims, `${where}.claims`, SNAPSHOT_BOUNDS.claims).map((c, i): SnapshotClaim => {
       const f = `${where}.claims[${i}]`;
       if (!isRecord(c)) throw new SnapshotError(`${f} must be an object`);
-      onlyKeys(c, ["at", "kind", "text", "confidence", "evidenceIds"], f);
+      onlyKeys(c, ["id", "at", "kind", "scope", "text", "confidence", "evidenceIds", "supersededAt"], f);
       const at = isoTime(c.at, `${f}.at`);
       if (at < createdAt) throw new SnapshotError(`${f}.at is before createdAt`);
       if (c.kind !== "intent" && c.kind !== "constraint" && c.kind !== "decision") throw new SnapshotError(`${f}.kind must be intent, constraint or decision`);
+      if (c.scope !== undefined && !CLAIM_SCOPES.includes(c.scope as ClaimScope)) throw new SnapshotError(`${f}.scope must be session, project or repo`);
       if (typeof c.confidence !== "number" || !(c.confidence >= 0 && c.confidence <= 1)) throw new SnapshotError(`${f}.confidence must be in [0, 1]`);
+      const claimId = c.id === undefined ? `c${i}` : id(c.id, `${f}.id`);
+      if (!CLAIM_ID.test(claimId)) throw new SnapshotError(`${f}.id must match ${CLAIM_ID.source}`);
+      if (claimIds.has(claimId)) throw new SnapshotError(`${f}.id repeats a claim id of this session`);
+      claimIds.add(claimId);
+      let supersededAt: string | undefined;
+      if (c.supersededAt !== undefined) {
+        supersededAt = isoTime(c.supersededAt, `${f}.supersededAt`);
+        if (supersededAt < at) throw new SnapshotError(`${f}.supersededAt is before its at`);
+      }
       return {
-        at, kind: c.kind, text: boundedString(c.text, `${f}.text`, SNAPSHOT_BOUNDS.text)!, confidence: c.confidence,
+        id: claimId, at, kind: c.kind, scope: (c.scope as ClaimScope | undefined) ?? "session",
+        text: boundedString(c.text, `${f}.text`, SNAPSHOT_BOUNDS.text)!, confidence: c.confidence,
         evidenceIds: list(c.evidenceIds, `${f}.evidenceIds`, SNAPSHOT_BOUNDS.evidenceIds).map((e, j) => id(e, `${f}.evidenceIds[${j}]`)),
+        ...(supersededAt === undefined ? {} : { supersededAt }),
       };
     });
 

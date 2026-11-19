@@ -63,7 +63,13 @@ export function asOfSession(s: SnapshotSession, now: Date): AsOfSession | null {
     commits: s.commits.filter((f) => visible(f.ts, nowIso)),
     outcomes: s.outcomes.filter((f) => visible(f.ts, nowIso)),
     usage: s.usage.filter((f) => visible(f.ts, nowIso)),
-    claims: s.claims.filter((c) => visible(c.at, nowIso)),
+    // A supersession is a fact like any other: until it is visible the claim is live, and the view does not
+    // show that one is coming (no future leak through supersededAt).
+    claims: s.claims.filter((c) => visible(c.at, nowIso)).map((c) => {
+      if (c.supersededAt === undefined || visible(c.supersededAt, nowIso)) return c;
+      const { supersededAt: _hidden, ...live } = c;
+      return live;
+    }),
   };
 }
 
