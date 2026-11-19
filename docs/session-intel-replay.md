@@ -8,7 +8,7 @@ It runs offline. It uses no network, database or credentials, and it enables not
 
 A snapshot is a directory kept **outside this repository**, with a delete-by date (as in [coordination-overlap-detection.md](coordination-overlap-detection.md), "Harvest"). Only synthetic fixtures are committed.
 
-This harness only reads a snapshot. Producing one from real sessions is M0-2: it reads session data, so it needs Khaliq's own OK each time.
+This harness only reads a snapshot. Producing one from real sessions is M0-2: it reads session data, so it needs Khaliq's own OK each time. The read-API harvest ([session-intel-harvest.md](session-intel-harvest.md)) is one producer.
 
 - `manifest.json`: `{"format": "session-intel-snapshot/1", "createdAt", "deleteBy", "window": {"since", "until"}, "files": {"<name>": "<sha256>"}}`. `files` must list `sessions.jsonl`. File names are plain names: no separators, no `..`, no dotfiles. Symlinks are refused.
 - `sessions.jsonl` holds one session per line:
