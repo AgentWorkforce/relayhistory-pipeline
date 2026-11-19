@@ -269,8 +269,8 @@ describe("sqlCoordinationAdvisories", () => {
     return { log, released: () => released, pool: { connect: async () => client } };
   }
 
-  test("pending reads the 062000 function in the given READ ONLY runner with the recipient", async () => {
-    const p = pool((t) => t.includes("pending_for_v1") ? [{
+  test("pending reads the 062190 priority-first function in the given READ ONLY runner with the recipient and the page bound", async () => {
+    const p = pool((t) => t.includes("pending_for_v2") ? [{
       advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "low",
       kind: "concurrent_edit", artifact: "src", evidence: [{ sessionId: "s-1", eventId: "e", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }],
       created_at: new Date("2026-11-12T10:04:00Z"),
@@ -284,12 +284,12 @@ describe("sqlCoordinationAdvisories", () => {
     const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never);
     const rows = await src.pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
     expect(seen).toEqual(["org/ws"]);
-    expect(p.log).toEqual([expect.stringContaining('sessions.coordination_advisories_pending_for_v1 ["org","ws","codex","s-1"]')]);
+    expect(p.log).toEqual([expect.stringContaining('sessions.coordination_advisories_pending_for_v2 ["org","ws","codex","s-1",10]')]);
     expect(rows).toEqual([{ advisoryId: ADV, harness: "codex", sessionId: "s-1", peerHarness: "claude", peerSessionId: "p", urgency: "low", kind: "concurrent_edit", artifact: "src", evidence: [{ sessionId: "s-1", eventId: "e", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }], createdAt: "2026-11-12T10:04:00.000Z", deliveredAt: null }]);
   });
 
-  test("pending selects the reader's delivered_at and maps it (M3-7); no reader change", async () => {
-    const p = pool((t) => t.includes("pending_for_v1") ? [{
+  test("pending selects the reader's delivered_at and maps it (M3-7)", async () => {
+    const p = pool((t) => t.includes("pending_for_v2") ? [{
       advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "high",
       kind: "duplicate_work", artifact: "m.sql", evidence: [], created_at: new Date("2026-11-12T10:04:00Z"), delivered_at: new Date("2026-11-12T10:05:00Z"),
     }] : []);
@@ -299,8 +299,43 @@ describe("sqlCoordinationAdvisories", () => {
     };
     const rows = await sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never)
       .pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
-    expect(p.log[0]).toMatch(/created_at, delivered_at\s+FROM sessions\.coordination_advisories_pending_for_v1/);
+    expect(p.log[0]).toMatch(/created_at, delivered_at\s+FROM sessions\.coordination_advisories_pending_for_v2/);
     expect(rows[0]!.deliveredAt).toBe("2026-11-12T10:05:00.000Z");
+  });
+
+  test("062190 not applied (42883): v1 in a fresh transaction, oldest first, with a counted warning; any other error is not a fallback", async () => {
+    const calls: string[] = [];
+    const warns: Record<string, unknown>[] = [];
+    let missing = true;
+    const read = async <T,>(_org: string, _ws: string, work: (q: any) => Promise<T>) => {
+      calls.push("BEGIN");
+      return work({ query: async (text: string) => {
+        if (text.includes("pending_for_v2")) {
+          calls.push("v2");
+          if (missing) throw Object.assign(new Error("function sessions.coordination_advisories_pending_for_v2 does not exist"), { code: "42883" });
+          throw Object.assign(new Error("boom"), { code: "57014" });
+        }
+        calls.push("v1");
+        return { rows: [{ advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "high",
+          kind: "duplicate_work", artifact: "m.sql", evidence: [], created_at: new Date(0), delivered_at: null }] };
+      } });
+    };
+    const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { warn: (f) => { warns.push(f); } });
+    const r = { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" };
+    expect((await src.pending(r)).map((a) => a.advisoryId)).toEqual([ADV]);
+    expect((await src.pending(r)).length).toBe(1);
+    expect(calls).toEqual(["BEGIN", "v2", "BEGIN", "v1", "BEGIN", "v2", "BEGIN", "v1"]);
+    expect(warns).toEqual([
+      { reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 1 },
+      { reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 2 },
+    ]);
+    missing = false;
+    await expect(src.pending(r)).rejects.toThrow("boom");
+    expect(warns.length).toBe(2);
+    // Through the route: the fallback still answers 200 with the same item shape.
+    missing = true;
+    const body = await (await api(true, src).request(base, { headers: auth })).json() as any;
+    expect(body.advisories.map((a: any) => [a.advisoryId, a.priority])).toEqual([[ADV, 1]]);
   });
 
   test("ack runs in one READ WRITE transaction with the tenant bound, and rolls back on error", async () => {

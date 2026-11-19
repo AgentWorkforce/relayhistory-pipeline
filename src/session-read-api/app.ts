@@ -2103,7 +2103,8 @@ export function createReadApi(deps: ReadApiDeps) {
   /**
    * Live coordination advisories, pull side (docs/coordination-live-advisories.md). The workspace
    * comes from the verified identity; `source` and `sessionId` select the recipient's rows. The GET
-   * serves pending or delivered rows (oldest first, at most 10); the ack is the only write.
+   * serves pending or delivered rows (priority first, then oldest, at most 10; 062190, with the oldest-first v1 as the
+   * fallback); the ack is the only write.
    */
   const advisoriesDisabled = (c: Context) => fail(c, unsupported("advisories_disabled"));
   const recipientOf = (identity: VerifiedIdentity, source: unknown, sessionId: unknown) => {

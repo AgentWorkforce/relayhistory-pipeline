@@ -57,6 +57,9 @@ const TOP_DOWN = sqlFile("supabase/rollbacks/20261105062170_session_intel_worksp
 /** 20261105062180 (claims scheduler) sits above 062170: its down runs before it. */
 const SCHEDULER_STEP = "upstream:20261105062180_claims_scheduler.sql";
 const SCHEDULER_DOWN = sqlFile("supabase/rollbacks/20261105062180_claims_scheduler.down.sql");
+/** 20261105062190 (the priority-first advisories reader) sits above 062180: its down runs first of all. */
+const PRIORITY_STEP = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
+const PRIORITY_DOWN = sqlFile("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql");
 async function migrated() {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await runMigrations(client(db), { profile: LOCAL });
@@ -500,13 +503,16 @@ describe("20261105062150 rollback", () => {
     const { decide, claim } = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      // 20261105062160 (session intel controls), 20261105062170 (session intel workspace readers) and 20261105062180
-      // (claims scheduler) are the later steps; they come off first (062180, 062170, then 062160), each down refusing
-      // under a later one, and this down refuses under any.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP, SCHEDULER_STEP]);
+      // 20261105062160 (session intel controls), 20261105062170 (session intel workspace readers), 20261105062180
+      // (claims scheduler) and 20261105062190 (the priority-first advisories reader) are the later steps; they come off
+      // first (062190, 062180, 062170, then 062160), each down refusing under a later one, and this down refuses under any.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual([LATER_STEP, TOP_STEP, SCHEDULER_STEP, PRIORITY_STEP]);
+      expect(await message(SCHEDULER_DOWN)).toContain("a later migration is applied");
       expect(await message(TOP_DOWN)).toContain("a later migration is applied");
       expect(await message(DOWN)).toContain("a later migration is applied");
       expect(await message(LATER_DOWN)).toContain("a later migration is applied");
+      await db.exec(PRIORITY_DOWN);
+      expect(await message(TOP_DOWN)).toContain("a later migration is applied");
       await db.exec(SCHEDULER_DOWN);
       expect(await message(LATER_DOWN)).toContain("a later migration is applied");
       await db.exec(TOP_DOWN);
@@ -543,6 +549,7 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
+      await db.exec(PRIORITY_DOWN);
       await db.exec(SCHEDULER_DOWN);
       await db.exec(TOP_DOWN);
       await db.exec(LATER_DOWN);

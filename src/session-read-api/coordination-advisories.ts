@@ -79,8 +79,13 @@ export function poolTenantWriter(pool: { connect(): Promise<PoolClient> }): Tena
   };
 }
 
-const PENDING_SQL = `SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
-       evidence, created_at, delivered_at
+const PENDING_COLUMNS = `SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
+       evidence, created_at, delivered_at`;
+/** 20261105062190: priority-first (P1, other HIGH, LOW, then oldest), so a new P1 is never hidden behind 10 LOW rows. */
+const PENDING_V2_SQL = `${PENDING_COLUMNS}
+  FROM sessions.coordination_advisories_pending_for_v2($1, $2, $3, $4, $5)`;
+/** 062000's oldest-first reader: the fallback while 062190 is not applied (42883). */
+const PENDING_SQL = `${PENDING_COLUMNS}
   FROM sessions.coordination_advisories_pending_for_v1($1, $2, $3, $4)`;
 const ACK_SQL = "SELECT sessions.coordination_advisories_ack_v1($1, $2, $3, $4, $5) AS ok";
 
@@ -92,26 +97,48 @@ function evidenceOf(raw: unknown): AdvisoryEvidence[] {
   return list.map((e) => ({ sessionId: String(e?.sessionId ?? ""), eventId: String(e?.eventId ?? ""), ts: String(e?.ts ?? ""), kind: String(e?.kind ?? "") }));
 }
 
-/** The source over the 062000 read-API functions: `read` READ ONLY, `write` READ WRITE. */
-export function sqlCoordinationAdvisories(read: TenantRunner, write: TenantRunner): AdvisoriesSource {
+/**
+ * The source over the read-API functions: `read` READ ONLY, `write` READ WRITE. The GET reads 062190's
+ * pending_for_v2 (priority-first, limit ADVISORIES_PAGE_MAX); when that function does not exist (42883: 062190 not
+ * applied, or rolled back) it reads 062000's pending_for_v1 (oldest first) in a fresh transaction, and counts the
+ * fallback through `warn` (counts only, never an id).
+ */
+export function sqlCoordinationAdvisories(
+  read: TenantRunner, write: TenantRunner, opts: { warn?: (fields: Record<string, unknown>) => void } = {},
+): AdvisoriesSource {
+  let fallbacks = 0;
+  const pendingWith = (r: AdvisoryRecipient, v2: boolean) =>
+    read(r.orgId, r.workspaceId, async (q: SqlQuery) => {
+      const { rows } = v2
+        ? await q.query<Record<string, unknown>>(PENDING_V2_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId, ADVISORIES_PAGE_MAX])
+        : await q.query<Record<string, unknown>>(PENDING_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId]);
+      return rows;
+    });
   return {
-    pending: (r) =>
-      read(r.orgId, r.workspaceId, async (q: SqlQuery) => {
-        const { rows } = await q.query<Record<string, unknown>>(PENDING_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId]);
-        return rows.slice(0, ADVISORIES_PAGE_MAX).map((row) => ({
-          advisoryId: String(row.advisory_id),
-          harness: String(row.harness),
-          sessionId: String(row.session_id),
-          peerHarness: String(row.peer_harness),
-          peerSessionId: String(row.peer_session_id),
-          urgency: row.urgency === "high" ? "high" as const : "low" as const,
-          kind: String(row.kind),
-          artifact: String(row.artifact),
-          evidence: evidenceOf(row.evidence),
-          createdAt: iso(row.created_at),
-          deliveredAt: row.delivered_at === null || row.delivered_at === undefined ? null : iso(row.delivered_at),
-        }));
-      }),
+    pending: async (r) => {
+      let rows: Record<string, unknown>[];
+      try {
+        rows = await pendingWith(r, true);
+      } catch (error) {
+        if ((error as { code?: string })?.code !== "42883") throw error;
+        fallbacks += 1;
+        opts.warn?.({ reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks });
+        rows = await pendingWith(r, false);
+      }
+      return rows.slice(0, ADVISORIES_PAGE_MAX).map((row) => ({
+        advisoryId: String(row.advisory_id),
+        harness: String(row.harness),
+        sessionId: String(row.session_id),
+        peerHarness: String(row.peer_harness),
+        peerSessionId: String(row.peer_session_id),
+        urgency: row.urgency === "high" ? "high" as const : "low" as const,
+        kind: String(row.kind),
+        artifact: String(row.artifact),
+        evidence: evidenceOf(row.evidence),
+        createdAt: iso(row.created_at),
+        deliveredAt: row.delivered_at === null || row.delivered_at === undefined ? null : iso(row.delivered_at),
+      }));
+    },
     ack: (r, advisoryId) =>
       write(r.orgId, r.workspaceId, async (q: SqlQuery) => {
         const { rows } = await q.query<{ ok: boolean }>(ACK_SQL, [r.orgId, r.workspaceId, advisoryId, r.source, r.sessionId]);
