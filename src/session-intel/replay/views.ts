@@ -215,20 +215,26 @@ export class ReplayAdvisorStore implements AdvisorStore {
   async claims(orgId: string, workspaceId: string, since: Date, limit: number): Promise<ClaimRow[]> {
     const nowIso = this.clock.now.toISOString();
     const sinceIso = since.toISOString();
-    const rows: ClaimRow[] = [];
+    // One row per stored claim: a claim with a recordId held by several sessions is one row whose evidence names
+    // each of them (as relayfacts stores it); without a recordId, one row per session claim.
+    const byId = new Map<string, ClaimRow>();
     for (const v of this.view.sessionsAsOf(this.clock.now)) {
       const s = v.session;
       if (s.orgId !== orgId || s.workspaceId !== workspaceId) continue;
       for (const c of v.claims) {
         if (!(c.at < nowIso) || (c.supersededAt !== undefined && c.supersededAt < nowIso) || c.at < sinceIso) continue;
         const ids = c.evidenceIds.length ? c.evidenceIds : [""];
-        rows.push({
-          id: sha256Hex(`${s.harness}\u0000${s.sessionId}\u0000${c.id}`).slice(0, 32), kind: c.kind, scope: c.kind === "decision" ? null : c.scope,
-          topic: c.topic ?? "general", statement: c.text.slice(0, 200), observedAt: c.kind === "decision" ? null : c.at, createdAt: c.at,
-          evidence: ids.map((id) => ({ id, source: s.harness, sessionId: s.sessionId, createdAt: c.at })),
+        const id = sha256Hex(c.recordId !== undefined ? `record\u0000${c.recordId}` : `${s.harness}\u0000${s.sessionId}\u0000${c.id}`).slice(0, 32);
+        const evidence = ids.map((e) => ({ id: e, source: s.harness, sessionId: s.sessionId, createdAt: c.at }));
+        const have = byId.get(id);
+        if (have) { have.evidence.push(...evidence); continue; }
+        byId.set(id, {
+          id, kind: c.kind, scope: c.kind === "decision" ? null : c.scope,
+          topic: c.topic ?? "general", statement: c.text.slice(0, 200), observedAt: c.kind === "decision" ? null : c.at, createdAt: c.at, evidence,
         });
       }
     }
+    const rows = [...byId.values()];
     return rows.sort((a, b) => textCompare(b.createdAt, a.createdAt) || textCompare(a.id, b.id)).slice(0, limit);
   }
 

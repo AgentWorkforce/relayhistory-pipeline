@@ -224,6 +224,16 @@ export class AdvisorLimits {
   underCap(recipient: SessionRef, now: number): boolean {
     return this.recent(refKey(recipient), now).length < this.cfg.sessionHourlyCap;
   }
+  /**
+   * The pair cooldown state as it is now, frozen: a later touchPair does not change it. scan.ts's deliver uses it
+   * when conflict rows are on, so one tick's advisories from two sources (the advisor's and the conflict
+   * detector's) for one pair are each checked against the state the tick started with.
+   */
+  cooldownSnapshot(): { inCooldown(pair: string, urgency: Urgency, now: number): boolean } {
+    const frozen = new AdvisorLimits(this.cfg);
+    for (const [k, at] of this.pairs) frozen.pairs.set(k, at);
+    return { inCooldown: (pair, urgency, now) => frozen.inCooldown(pair, urgency, now) };
+  }
   /** Any write attempt for the pair (inserted, upgraded or skipped) starts or re-seeds its cooldown. */
   touchPair(pair: string, urgency: Urgency, at: number): void {
     const k = levelKey(pair, urgency);

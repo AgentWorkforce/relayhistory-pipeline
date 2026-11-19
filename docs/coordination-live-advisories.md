@@ -167,7 +167,11 @@ Enabling any of them in production, provisioning the relay credential, and deplo
 
 With `SESSION_INTEL_CONFLICTS_ENABLED` exactly `"true"` **and** the M3-1 `conflicts` control on (global and workspace), each workspace scan also runs the conflict detectors of [session-intel-conflicts.md](session-intel-conflicts.md). With either off, the scan is byte-identical to the scan without M2-4: no claims query, no conflict code, the same stats keys. A recorded golden of every store, backend and sender call proves it (`src/coordination-advisor/__tests__/conflicts-gate.test.ts`).
 
-**The claims read.** One read per scanned workspace: `sessions.relayfacts_claims_v1(org, workspace, NULL, NULL, since, 500)` (062150). `since` is the candidate window's start minus the facts' 7-day lookback, compared with each claim's `updated_at`. A claim gains evidence and a new `updated_at` each time a session restates it, so a long-lived constraint is read while it is still in use. It is **fail-open for the advisor**: any of these skips conflicts for the workspace with a counted warning (`conflictsSkipped`), and the collision and overlap rows go on:
+**The claims read.** One read per scanned workspace: `sessions.relayfacts_claims_v1(org, workspace, NULL, NULL, since, 500)` (062150). `since` is the candidate window's start minus the facts' 7-day lookback, compared with each claim's `updated_at`. A claim gains evidence and a new `updated_at` each time a session restates it.
+
+Claims not updated within the window (7 days plus 2 hours, by `updated_at`) drop out of the live read. A long-lived constraint must be restated, or captured by the M1-4 policy pack.
+
+The read is **fail-open for the advisor**: any of these skips conflicts for the workspace with a counted warning (`conflictsSkipped`), and the collision and overlap rows go on:
 
 - a failed read, including `42883` when 062150 is not applied;
 - a full read (500 rows, so it may be cut);
@@ -195,14 +199,17 @@ A `repo`-policy owner with no holding session gets no row and no DM. Until M2-4'
 - **Evidence.** The cited claim ids (`kind` `claim_constraint`, `claim_intent` or `claim_decision`) and the action event, within the existing bounds.
 - **Id.** 32 hex digits, hashed from the workspace, kind, pair and deciding claims. A constraint violation is keyed by its constraint, so its LOW (an intent) and its HIGH (a write) are one advisory, and the upsert upgrades LOW to HIGH.
 - **Limits.** The cooldown, the cap and the no-downgrade rule apply unchanged.
-- **Precedence.** A conflict outranks an overlap or a collision for the same pair in one tick. The pair's collision and LOW overlap rows are not written that tick, because writing them would only start the pair's cooldown and hold the conflict back.
+- **Precedence.** A conflict never suppresses a collision: a pair with both in one tick gets both rows. With conflicts on, `deliver` checks each advisory's cooldown against the pair state the tick started with, plus what its own source (the advisor, or the conflict detector) touched that tick. So a collision and a conflict for one pair both go through, and within a source the check is exactly as before. Every write touches the pair as before, so across ticks the cooldown is unchanged. With conflicts off, the live state is used, as before. The per-recipient cap still applies, HIGH first. A conflict does suppress the pair's LOW overlap rows that tick.
+- **Shared claims.** A stored claim whose evidence names both sessions is agreement. It is left out of both sides' judge input (`shared`), so it can never be cited.
 
 **DMs.** HIGH conflict rows use the existing DM path, behind `COORDINATION_ADVISOR_RELAY_DM_ENABLED` and the `dm` control. The template names the class:
 - "possible constraint violation", "may be acting against a constraint on";
 - "possible conflicting plans", "have conflicting claims about";
 - "possible nearby work".
 
-It may add the cited claim ids and claim excerpts while the message stays within 600 characters. An excerpt is at most 200 characters and is included only when the scrubber leaves it unchanged (the decision-records rule); otherwise the message carries ids only. The read API's `message` for the same row has neither extra. The sender itself (`relay-sender.ts`) is unchanged. Its Relaycast contract is M3-8 (docs/session-intel-dm-transport.md): an advisory counts as delivered when its state is in the set {`delivered`, `consumed`, `replied`} or `accepted_at` is set, never by an ordered chain. The tests' fake sender models exactly that.
+It may add the cited claim ids and claim excerpts while the message stays within 600 characters. An excerpt is at most 200 characters and is included only when the scrubber leaves it unchanged (the decision-records rule); otherwise the message carries ids only.
+
+Excerpts are scrub-clean but untrusted peer text. The template marks each one as quoted: `Quoted <kind> claim: "..."`. The read API's `message` for the same row has neither extra. The sender itself (`relay-sender.ts`) is unchanged. Its Relaycast contract is M3-8 (docs/session-intel-dm-transport.md): an advisory counts as delivered when its state is in the set {`delivered`, `consumed`, `replied`} or `accepted_at` is set, never by an ordered chain. The tests' fake sender models exactly that.
 
 ## Open questions for Khaliq
 
