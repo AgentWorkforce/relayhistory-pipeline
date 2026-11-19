@@ -1,0 +1,14 @@
+{
+  "incidents": [
+    { "id": "inc-a-constraint-acted", "pair": ["claude:cv-owner", "codex:cv-actor"], "kind": "constraint_violation", "harmAt": "2026-11-01T10:30:00.000Z", "split": "dev", "workstream": "migrations" },
+    { "id": "inc-c-intent-acted", "pair": ["claude:ic-a", "codex:ic-b"], "kind": "intent_conflict", "harmAt": "2026-11-01T10:45:00.000Z", "split": "dev", "workstream": "advisories" },
+    { "id": "inc-d-intent-words", "pair": ["claude:id-a", "codex:id-b"], "kind": "intent_conflict", "harmAt": "2026-11-01T11:00:00.000Z", "split": "dev", "workstream": "flags" },
+    { "id": "inc-f-fleet", "pair": ["claude:fl-1", "claude:fl-2"], "kind": "intent_conflict", "harmAt": "2026-11-01T11:30:00.000Z", "split": "dev", "workstream": "retry" },
+    { "id": "inc-h-late-constraint", "pair": ["claude:lk-owner", "codex:lk-actor"], "kind": "constraint_violation", "harmAt": "2026-11-01T12:30:00.000Z", "split": "dev", "workstream": "ledger" }
+  ],
+  "hardNegatives": [
+    { "pair": ["claude:ss-owner", "codex:ss-actor"], "reason": "unrelated", "split": "dev" },
+    { "pair": ["claude:sup-a", "codex:sup-b"], "reason": "unrelated", "split": "dev" },
+    { "pair": ["claude:cat-a", "codex:cat-b"], "reason": "benign_overlap", "split": "dev" }
+  ]
+}
