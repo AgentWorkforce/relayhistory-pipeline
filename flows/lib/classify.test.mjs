@@ -61,6 +61,10 @@ test("targeted selects the e2e steps the paths reach, and only known steps", () 
   const scripts = classifyPaths(["scripts/aws-hardening-mutations.ts"]);
   assert.equal(scripts.verdict, "targeted");
   assert.deepEqual(scripts.steps, [], "unit lanes only");
+  const coordination = classifyPaths(["packages/coordination-detect/src/index.ts"]);
+  assert.equal(coordination.verdict, "targeted");
+  assert.deepEqual(coordination.steps, ["coordination.advisories"]);
+  assert.ok(knownSteps.has(coordination.steps[0]));
   assert.equal(lanesFor("targeted", ["flows/README.md", "flows/adversarial-review.flow.ts"]).flows, true);
 });
 

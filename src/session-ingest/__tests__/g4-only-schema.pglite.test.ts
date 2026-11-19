@@ -223,6 +223,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Relayfacts claims: two new tables, four functions, three triggers and the two replaced relayfacts erase
       // functions; no G4 function names them, no ingest path calls them.
       "20261105062150_relayfacts_claims.sql",
+      // Optional intelligence controls: owner-written table and service-role getter; no ingest path calls them.
+      "20261105062160_session_intel_controls.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

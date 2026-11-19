@@ -1705,6 +1705,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.session_intel_controls_v1(text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.session_publication_is_managed(text,text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",

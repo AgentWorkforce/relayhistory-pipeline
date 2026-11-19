@@ -71,6 +71,11 @@ describe("coordination advisor tick (pglite)", () => {
   beforeAll(async () => {
     db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(`INSERT INTO sessions.session_intel_controls(scope,feature,enabled,updated_by)
+      SELECT 'global', f, true, 'fixture' FROM unnest(ARRAY['advisor','dm']) AS f;
+      INSERT INTO sessions.session_intel_controls(scope,org_id,workspace_id,feature,enabled,updated_by)
+      SELECT 'workspace','org',w,f,true,'fixture' FROM unnest(ARRAY['ws1','ws2','ws3']) AS w
+      CROSS JOIN unnest(ARRAY['advisor','dm']) AS f;`);
   });
   afterAll(async () => { await db?.close(); });
   beforeEach(async () => {

@@ -148,6 +148,12 @@ Advisory <advisoryId>; ack it at the end of your turn.
 
 Every new behaviour is default off:
 
+M3-1 also requires an enabled global **and** workspace `advisor` control row
+before a scan writes, and both `dm` rows before it sends. Missing rows or a
+failed control read mean off. These controls supplement the flags below;
+see [session intelligence controls](session-intel-controls.md) for operator
+SQL and the next-tick stop contract.
+
 | Flag | Default | Turns on |
 |---|---|---|
 | `COORDINATION_ADVISOR_ENABLED` | off | The worker's scan and its writes |
