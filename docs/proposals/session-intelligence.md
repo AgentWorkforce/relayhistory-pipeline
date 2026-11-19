@@ -6,6 +6,17 @@ Design only. Nothing is applied, deployed or turned on from this document.
 
 ## The ask
 
+Khaliq's original request (Claude session, 2026-11-12 21:42Z, found by codex-relayhistory-pipeline-session)
+was a continuous pipeline job that looks for overlapping or adjacent work and sends proactive messages
+at two urgencies:
+
+1. a peer message;
+2. a message inserted at the natural end of a turn.
+
+On 2026-11-13 he moved detection away from the SessionStart teammate-context hook, which asked agents
+to read their teammates' summaries, to the pipeline. That changes where detection happens. It does not
+change the turn-end delivery of advisories the pipeline has already classified.
+
 > We need to get the sessions pipeline working: real-time analysis and summaries of chats, with
 > alerts that distinguish conflicting intents and constraints from overlapping work. ... a strong
 > path into enterprise: running analysis on their existing session traces.
@@ -305,6 +316,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | codex-relayhistory-pipeline-session | `e2e/pipeline` step green in the CI full lane | none |
 | M3-7 Delivery state on the pull path: an additive `delivery {dm, deliveredAt}` on each GET item; the hook deduplicates by advisory id across restarts | sessions-intel-lead (route), relay-app's agent (hook) | Route and hook tests; at-least-once is documented until both ship | none |
 | M3-8 DM transport contract ([session-intel-dm-transport.md](../session-intel-dm-transport.md)): register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
+| M3-9 Desktop notification to the human for HIGH alerts: a ranked, dismissable notice in Agent Relay Desktop, fed by the same advisories (distinct from the web dashboard) | relay-app's agent, with sessions-intel-lead for the feed | Ranked HIGH first; never blocks a turn; respects the kill switch. **Scope to be confirmed with Khaliq**: his original wording about a human alert has not been found yet | none |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
 ### M4: Enterprise trace import
