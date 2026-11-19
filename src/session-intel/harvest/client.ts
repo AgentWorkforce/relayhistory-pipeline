@@ -95,7 +95,8 @@ export interface ClientOptions {
 }
 
 export type Answer =
-  | { kind: "ok"; body: unknown }
+  /** `headers`: the RECORDED_HEADERS this response carried, each value a sanitized code (see safeCode). */
+  | { kind: "ok"; body: unknown; headers: Record<string, string> }
   | { kind: "unsupported"; reason: string }
   | { kind: "not_found" };
 
@@ -109,7 +110,12 @@ export interface ClientStats {
   headers: Record<string, Record<string, number>>;
 }
 
-const RECORDED_HEADERS = ["x-sessions-read-backend", "x-relayhistory-buffered", "x-sessions-read-incomplete", "x-sessions-read-continuation"];
+/** The History API list's store for a `GET /v1/sessions` page (relayhistory-cloud): neon, supabase, union or clickhouse. */
+export const LIST_SERVED_BY_HEADER = "x-relayhistory-list-served-by";
+/** The 96Bulls read API's own backend marker (src/session-read-api/app.ts sets `96bulls`). */
+export const READ_BACKEND_HEADER = "x-sessions-read-backend";
+export const LIST_BACKENDS = ["neon", "supabase", "union", "clickhouse"] as const;
+const RECORDED_HEADERS = [READ_BACKEND_HEADER, LIST_SERVED_BY_HEADER, "x-relayhistory-buffered", "x-sessions-read-incomplete", "x-sessions-read-continuation"];
 const RETRYABLE = new Set([429, 502, 503, 504]);
 
 export class ReadApiClient {
@@ -197,6 +203,7 @@ export class ReadApiClient {
         await this.wait(after ?? Math.min(maxWait, 1_000 * 2 ** attempt), after !== null);
         continue;
       }
+      const recorded: Record<string, string> = {};
       if (res.ok) {
         if (res.headers.get(WORKSPACE_HEADER) !== this.o.workspace) {
           await res.body?.cancel().catch(() => {});
@@ -208,10 +215,11 @@ export class ReadApiClient {
           const seen = (this.stats.headers[h] ??= {});
           const k = safeCode(v, this.o.token);
           seen[k] = (seen[k] ?? 0) + 1;
+          recorded[h] = k;
         }
       }
       const body = await this.body(res, route);
-      if (res.ok) return { kind: "ok", body };
+      if (res.ok) return { kind: "ok", body, headers: recorded };
       const err = (body && typeof body === "object" ? (body as { error?: { code?: unknown; reason?: unknown } }).error : undefined) ?? {};
       const code = safeCode(err.code, this.o.token);
       if (res.status === 501) return { kind: "unsupported", reason: safeCode(err.reason ?? err.code, this.o.token) };

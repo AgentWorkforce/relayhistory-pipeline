@@ -15,7 +15,7 @@ import { Hasher, IMPORT_BOUNDS } from "../import/normalize.ts";
 import { mappingPath } from "../import/writer.ts";
 import { main as replayMain } from "../replay/cli.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
-import { tmp } from "./helpers.ts";
+import { FIXTURE_LABELS, tmp } from "./helpers.ts";
 
 const WS = "ws_fx_harvest";
 const TOKEN = "rth_st_read_FIXTURETOKENabcdefghijklmnopqrstuvwxyz0123456789";
@@ -61,10 +61,19 @@ const SESSIONS: FxSession[] = [
   { source: "claude", sessionId: "fx-h-old", firstTs: "2026-10-20T09:00:00.000Z", lastTs: "2026-10-20T10:00:00.000Z", projectId: "fixture-proj", events: [] },
 ];
 
+/** The fixture without fx-h-d (whose events are 501), so a harvest of it can be complete. */
+const COMPLETE = SESSIONS.filter((s) => s.sessionId !== "fx-h-d");
+
 interface ServerOptions {
   pageSize?: number; eventPageSize?: number; workspaceHeader?: string; catalogWorkspace?: string;
   retryAfter?: { times: number; value: string; status?: number }; redirect?: boolean; failAfter?: number;
   errorCode?: string; status?: number; outputUnsupported?: boolean; sessions?: FxSession[];
+  /** X-Relayhistory-List-Served-By for the n-th frame page served (1-based); null or absent sends none. */
+  servedBy?: (page: number) => string | null;
+  /** X-Sessions-Read-Backend on every response: `96bulls` by default (the 96Bulls read API); null sends none. */
+  readBackend?: string | null;
+  /** An empty first page (zero rows and a cursor), and an empty last page (zero rows, no cursor). */
+  leadingEmpty?: boolean; trailingEmpty?: boolean;
 }
 interface LoggedRequest { path: string; params: URLSearchParams; authorization: string | null }
 
@@ -72,8 +81,12 @@ function fakeReadApi(opts: ServerOptions = {}) {
   const log: LoggedRequest[] = [];
   let retries = opts.retryAfter?.times ?? 0;
   const pageSize = opts.pageSize ?? 2, eventPageSize = opts.eventPageSize ?? 2;
+  let framePages = 0;
   const json = (body: unknown, status = 200, headers: Record<string, string> = {}) => Response.json(body, {
-    status, headers: { "x-relayhistory-workspace-id": opts.workspaceHeader ?? WS, "x-sessions-read-backend": "96bulls", ...headers },
+    status, headers: {
+      "x-relayhistory-workspace-id": opts.workspaceHeader ?? WS,
+      ...(opts.readBackend === null ? {} : { "x-sessions-read-backend": opts.readBackend ?? "96bulls" }), ...headers,
+    },
   });
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
@@ -91,8 +104,13 @@ function fakeReadApi(opts: ServerOptions = {}) {
         expect(url.searchParams.get("limit")).toBe("200");
         const after = url.searchParams.get("lastTsAfter")!, before = url.searchParams.get("firstTsBefore")!;
         const rows = (opts.sessions ?? SESSIONS).filter((s) => s.lastTs >= after && s.firstTs < before).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));
-        const offset = Number(url.searchParams.get("cursor") ?? "0");
+        const served = opts.servedBy?.(++framePages) ?? null;
+        const listHeader: Record<string, string> = served === null ? {} : { "x-relayhistory-list-served-by": served };
+        const cursor = url.searchParams.get("cursor");
+        if (opts.leadingEmpty && cursor === null) return json({ sessions: [], nextCursor: "0", correlationId: "fx" }, 200, listHeader);
+        const offset = Number(cursor ?? "0");
         const page = rows.slice(offset, offset + pageSize);
+        const more = offset + pageSize < rows.length || (opts.trailingEmpty === true && offset < rows.length);
         return json({
           sessions: page.map((s) => ({
             title: TEXT(`title_${s.sessionId}`), taskTitle: TEXT(`task_${s.sessionId}`), shortSummary: TEXT(`summary_${s.sessionId}`),
@@ -100,8 +118,8 @@ function fakeReadApi(opts: ServerOptions = {}) {
             firstTs: s.firstTs, lastTs: s.lastTs, workState: null, eventCount: s.events?.length ?? 0, kinds: [], models: ["fixture-model"],
             ...(s.catalog ? { catalog: { workspaceId: opts.catalogWorkspace ?? WS, title: TEXT(`ctitle_${s.sessionId}`), projectKey: "acme-api", ...s.catalog } } : {}),
           })),
-          nextCursor: offset + pageSize < rows.length ? String(offset + pageSize) : null, correlationId: "fx",
-        });
+          nextCursor: more ? String(offset + pageSize) : null, correlationId: "fx",
+        }, 200, listHeader);
       }
       const m = /^\/v1\/sessions\/([^/]+)\/events$/u.exec(p);
       if (m) {
@@ -388,10 +406,12 @@ describe("harvest", () => {
     expect(r.notes.join(" ")).toContain("commits, outcomes and usage are not exposed");
   });
 
-  test("end to end: harvest, then the unchanged replay CLI raises the duplicate migration", async () => {
-    const api = fakeReadApi();
+  test("end to end: a complete harvest, then the replay CLI raises the duplicate migration", async () => {
+    // Without fx-h-d (its events are 501) the harvest is complete, and every page carries the read API's marker.
+    const api = fakeReadApi({ sessions: COMPLETE });
     const out = newOut();
     expect(await main(argv(api.url, out), io().io)).toBe(0);
+    expect(receipt(out)).toMatchObject({ complete: true, incompleteReasons: [], sourceAttribution: "read_worker" });
     const evalDir = tmp("si-harvest-eval-");
     const q = io();
     expect(await replayMain(["replay", "--snapshot", out, "--out", join(evalDir, "replay")], { out: q.io.out, err: q.io.err, now: NOW })).toBe(0);
@@ -452,7 +472,7 @@ function recordingClient(base: string, pages: unknown[] = []) {
 
 describe("censoring at the per-session write bound", () => {
   const BOUND = IMPORT_BOUNDS.facts;
-  const P = { readApi: "x", workspace: WS, since: SINCE, until: UNTIL, deleteBy: DELETE_BY };
+  const P = { readApi: "x", workspace: WS, since: SINCE, until: UNTIL, deleteBy: DELETE_BY, requireListBackend: null };
   const row: FrameRow = { source: "claude", sessionId: "fx-big", firstTs: at("01", "09:00"), lastTs: at("01", "10:00"), projectId: null, repo: null, gitBranch: null, parentSessionIds: [], catalog: false, eventCount: null };
   /** One page of `events` events with `files` paths each, all inside the window. */
   const page = (events: number, files: number, nextCursor: string | null, from = 0) => ({
@@ -585,5 +605,134 @@ describe("request paths", () => {
       `https://example.invalid${prefix}/v1/sessions/fx-h-a/events?workspace=${WS}`,
     ]);
     for (const u of urls) expect(new URL(u).pathname).not.toContain("//");
+  });
+});
+
+describe("frame source attribution (X-Relayhistory-List-Served-By)", () => {
+  const strict = (set: string) => ["--require-list-backend", set];
+  const sources = (out: string) => receipt(out).frame.sources;
+
+  test("strict, every page union: complete and verified, with the per-provider page tally", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: () => "union", readBackend: null });
+    const out = newOut();
+    const q = io();
+    expect(await main(argv(api.url, out, strict("union,supabase")), q.io)).toBe(0);
+    expect(receipt(out)).toMatchObject({ complete: true, incompleteReasons: [], sourceAttribution: "verified" });
+    expect(sources(out)).toMatchObject({ attribution: "verified", required: ["supabase", "union"], gated: true, offendingPages: 0,
+      listServedBy: { union: { pages: 2, firstPage: 1, lastPage: 2 } }, readBackend: { missing: { pages: 2, firstPage: 1, lastPage: 2 } } });
+    expect(q.lines.join("\n")).toContain("\"sourceAttribution\":\"verified\"");
+  });
+
+  test("strict, mixed union and supabase, both allowed: complete", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 1 ? "union" : "supabase") });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union,supabase")), io().io)).toBe(0);
+    expect(receipt(out).complete).toBe(true);
+    expect(sources(out).listServedBy).toEqual({ supabase: { pages: 1, firstPage: 2, lastPage: 2 }, union: { pages: 1, firstPage: 1, lastPage: 1 } });
+  });
+
+  test("strict, one neon page: exits non-zero with the diagnostic receipt and snapshot written; the replay refuses it", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 2 ? "neon" : "union") });
+    const out = newOut();
+    const q = io();
+    expect(await main(argv(api.url, out, strict("union")), q.io)).toBe(4);
+    expect(q.lines.join("\n")).toContain("frame_backend_unverified: 1 of 2 frame pages");
+    const r = receipt(out);
+    expect(r).toMatchObject({ complete: false, incompleteReasons: ["frame_backend_unverified"], sourceAttribution: "unverified" });
+    expect(r.frame.sources).toMatchObject({ offendingPages: 1, listServedBy: { neon: { pages: 1, firstPage: 2, lastPage: 2 }, union: { pages: 1, firstPage: 1, lastPage: 1 } } });
+    expect(r.notes.join(" ")).toContain("frame_backend_unverified");
+    expect((await loadSnapshot(out, { now: NOW })).sessions).toHaveLength(3);
+    const evalDir = tmp("si-harvest-eval-");
+    const rq = io();
+    await expect(replayMain(["replay", "--snapshot", out, "--out", join(evalDir, "replay")], { out: rq.io.out, err: rq.io.err, now: NOW }))
+      .rejects.toThrow("complete:false (frame_backend_unverified); refused");
+    expect(existsSync(join(evalDir, "replay", "alerts.json"))).toBe(false);
+  });
+
+  test("--allow-incomplete-coverage replays it as incomplete, and held-out scoring refuses that replay", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 2 ? "neon" : "union") });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    const evalDir = tmp("si-harvest-eval-");
+    const rq = io();
+    const rio = { out: rq.io.out, err: rq.io.err, now: NOW };
+    // Incomplete: exit 1, with the coverage gap named in alerts.json.
+    expect(await replayMain(["replay", "--snapshot", out, "--out", join(evalDir, "replay"), "--allow-incomplete-coverage"], rio)).toBe(1);
+    const alerts = JSON.parse(readFileSync(join(evalDir, "replay", "alerts.json"), "utf8"));
+    expect(alerts.incomplete).toEqual(["coverage: the harvest's coverage receipt says complete:false (frame_backend_unverified)"]);
+    await expect(replayMain(["score", "--alerts", join(evalDir, "replay", "alerts.json"), "--labels", FIXTURE_LABELS, "--out", join(evalDir, "score"), "--split", "heldout"], rio))
+      .rejects.toThrow("held-out is never scored from an incomplete replay");
+    expect(existsSync(join(evalDir, "score", "scored-hashes.json"))).toBe(false);
+  });
+
+  test("strict, a page with no header: incomplete, counted as missing", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 1 ? "union" : null) });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    expect(receipt(out).complete).toBe(false);
+    expect(sources(out)).toMatchObject({ offendingPages: 1, listServedBy: { missing: { pages: 1, firstPage: 2, lastPage: 2 }, union: { pages: 1 } } });
+  });
+
+  test("strict, an unknown store name is offending; an unknown name in the flag is refused before any request", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: () => "mystery" });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    expect(sources(out)).toMatchObject({ offendingPages: 2, listServedBy: { mystery: { pages: 2 } } });
+    const none = fakeReadApi();
+    await expect(main(argv(none.url, newOut(), strict("union,mystery")), io().io)).rejects.toThrow("--require-list-backend must be a comma list");
+    expect(none.log).toEqual([]);
+  });
+
+  test("every page counts, empty ones included: an empty neon first page and an empty last page", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, leadingEmpty: true, trailingEmpty: true, servedBy: (n) => (n === 1 ? "neon" : "union") });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    const r = receipt(out);
+    // Leading empty, two pages of rows, trailing empty: four pages.
+    expect(r.frame.pages).toBe(4);
+    expect(r.frame.sources).toMatchObject({ offendingPages: 1, listServedBy: { neon: { pages: 1, firstPage: 1, lastPage: 1 }, union: { pages: 3, firstPage: 2, lastPage: 4 } } });
+    expect(r.frame.sessions).toBe(3);
+  });
+
+  test("a mixed fallback across a resume: union, neon, a crash, then union is incomplete with the right tallies", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, pageSize: 1, failAfter: 2, servedBy: (n) => (n === 2 ? "neon" : "union") });
+    const out = newOut();
+    await expect(main(argv(api.url, out, strict("union")), io().io)).rejects.toThrow("answered 400");
+    api.opts.failAfter = undefined;
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    const r = receipt(out);
+    expect(r).toMatchObject({ complete: false, incompleteReasons: ["frame_backend_unverified"], runs: 2 });
+    expect(r.frame.sources).toMatchObject({ offendingPages: 1,
+      listServedBy: { neon: { pages: 1, firstPage: 2, lastPage: 2 }, union: { pages: 2, firstPage: 1, lastPage: 3 } } });
+    expect(r.frame.pages).toBe(3);
+    // Pages 1 and 2 were not read again: the only repeat is page 3, whose first attempt was the failure.
+    expect(api.log.filter((x) => x.path === "/v1/sessions").map((x) => x.params.get("cursor"))).toEqual([null, "1", "2", "2"]);
+  });
+
+  test("the setting is bound to the harvest: a record-only start cannot resume as strict, nor a strict one with another set", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: () => "union" });
+    const recordOnly = newOut();
+    expect(await main(argv(api.url, recordOnly, ["--max-requests", "1"]), io().io)).toBe(EXIT_CAPPED);
+    await expect(main(argv(api.url, recordOnly, strict("union")), io().io)).rejects.toThrow("other --read-api");
+    const strictOut = newOut();
+    expect(await main(argv(api.url, strictOut, [...strict("union"), "--max-requests", "1"]), io().io)).toBe(EXIT_CAPPED);
+    await expect(main(argv(api.url, strictOut, strict("union,supabase")), io().io)).rejects.toThrow("other --read-api");
+    await expect(main(argv(api.url, strictOut), io().io)).rejects.toThrow("other --read-api");
+    // The same set in another order is the same setting.
+    expect(await main(argv(api.url, strictOut, strict(" union ")), io().io)).toBe(0);
+  });
+
+  test("no flag: the tallies are recorded but nothing is gated; without the read API's marker the source is unverified and the replay refuses it", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: () => "neon", readBackend: null });
+    const out = newOut();
+    expect(await main(argv(api.url, out), io().io)).toBe(0);
+    const r = receipt(out);
+    expect(r).toMatchObject({ complete: true, incompleteReasons: [], sourceAttribution: "unverified" });
+    expect(r.frame.sources).toMatchObject({ gated: false, required: null, offendingPages: 0, listServedBy: { neon: { pages: 2, firstPage: 1, lastPage: 2 } } });
+    expect(r.notes.join(" ")).toContain("not representative proof");
+    const evalDir = tmp("si-harvest-eval-");
+    const rq = io();
+    await expect(replayMain(["replay", "--snapshot", out, "--out", join(evalDir, "replay")], { out: rq.io.out, err: rq.io.err, now: NOW }))
+      .rejects.toThrow("source attribution is unverified");
   });
 });
