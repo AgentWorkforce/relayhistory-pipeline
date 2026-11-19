@@ -1,0 +1,12 @@
+{
+  "format": "session-intel-snapshot/1",
+  "createdAt": "2026-11-02T00:00:00.000Z",
+  "deleteBy": "2099-01-01T00:00:00.000Z",
+  "window": {
+    "since": "2026-11-01T09:00:00.000Z",
+    "until": "2026-11-01T13:00:00.000Z"
+  },
+  "files": {
+    "sessions.jsonl": "b529c46f69fcf080883aa378aed6dc89d96ae9996dbbe272586e4acdc9a2a369"
+  }
+}
