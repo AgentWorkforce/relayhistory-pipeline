@@ -58,6 +58,14 @@ export interface FactsRecord {
   pages: number;
   /** Why no events could be read: a 501 reason or `not_found`. */
   failure: string | null;
+  /**
+   * True when the session's writes were cut at the per-session bound (IMPORT_BOUNDS.facts): the snapshot holds
+   * fewer writes than the read API has. `censorReason` says how; `droppedWrites` is the count dropped, or null
+   * when it is unknown (the cursor was not exhausted, so later pages were never read).
+   */
+  writesCensored: boolean;
+  censorReason: string | null;
+  droppedWrites: number | null;
 }
 export type OutputCounts = { counts: Record<string, number> } | { unavailable: string };
 
@@ -66,6 +74,10 @@ export interface HarvestState {
   startedAt: string;
   runs: number;
   requests: number;
+  /** The client's cumulative counts as last recorded, restored on resume; null on a fresh harvest. */
+  stats: ClientStats | null;
+  /** Set when a run ended without recording its final counts (a hard crash): the counts are lower bounds. */
+  statsPartial: string | null;
   frame: { pages: number; cursor: string | null; done: boolean; rows: FrameRow[]; duplicates: number; outsideWindow: number };
   facts: Map<string, FactsRecord>;
   output: OutputCounts | null;
@@ -112,14 +124,19 @@ export async function readState(path: string): Promise<HarvestState & { goodByte
   }
   const start = lines[0];
   if (!start || start.t !== "start" || start.format !== STATE_FORMAT) throw new HarvestError(`${STATE_FILE} is not a harvest state log`);
-  const state: HarvestState = {
-    params: start.params as HarvestParams, startedAt: String(start.startedAt), runs: 0, requests: 0,
-    frame: { pages: 0, cursor: null, done: false, rows: [], duplicates: 0, outsideWindow: 0 }, facts: new Map(), output: null,
-  };
+  const state = newState(start.params as HarvestParams, String(start.startedAt));
   const seen = new Set<string>();
+  let open = false;
+  let abrupt = 0;
   for (const l of lines) {
     if (typeof l.requests === "number") state.requests = Math.max(state.requests, l.requests);
-    if (l.t === "run") state.runs++;
+    // Cumulative and written in order, so the last line's counts are the latest.
+    if (isRecord(l.stats)) state.stats = l.stats as unknown as ClientStats;
+    if (l.t === "run") {
+      if (open) abrupt++;
+      open = true;
+      state.runs++;
+    } else if (l.t === "runEnd") open = false;
     else if (l.t === "frame") {
       state.frame.pages++;
       state.frame.cursor = (l.cursor as string | null) ?? null;
@@ -129,14 +146,21 @@ export async function readState(path: string): Promise<HarvestState & { goodByte
       for (const r of l.rows as FrameRow[]) if (!seen.has(rowKey(r))) { seen.add(rowKey(r)); state.frame.rows.push(r); }
     } else if (l.t === "facts") {
       const f = l.record as FactsRecord;
-      state.facts.set(rowKey(f), f);
+      state.facts.set(rowKey(f), { ...f, writesCensored: f.writesCensored === true, censorReason: f.censorReason ?? null, droppedWrites: f.droppedWrites ?? null });
     } else if (l.t === "output") state.output = l.output as OutputCounts;
   }
+  if (open) abrupt++;
+  if (abrupt) state.statsPartial = `${abrupt} run(s) ended without recording final request counts (a hard crash); requests after their last state line are not counted, so every request count is a lower bound`;
+  // Stats from before they were persisted cannot be rebuilt: the total survives, nothing else does.
+  if (!state.stats && state.requests > 0) state.statsPartial ??= "the state log holds no request breakdown; only the total is known";
   return { ...state, goodBytes, torn };
 }
 
+/** What every progress line records: the request total and the client's cumulative counts. */
+export const progress = (client: ReadApiClient) => ({ requests: client.stats.requests, stats: client.stats });
+
 export const newState = (params: HarvestParams, startedAt: string): HarvestState => ({
-  params, startedAt, runs: 0, requests: 0,
+  params, startedAt, runs: 0, requests: 0, stats: null, statsPartial: null,
   frame: { pages: 0, cursor: null, done: false, rows: [], duplicates: 0, outsideWindow: 0 }, facts: new Map(), output: null,
 });
 
@@ -211,7 +235,7 @@ export async function runFrame({ client, state, log }: RunOptions): Promise<void
     state.frame.done = body.nextCursor === null;
     state.frame.duplicates += duplicates;
     state.frame.outsideWindow += outsideWindow;
-    await log.write({ t: "frame", cursor: state.frame.cursor, rows, duplicates, outsideWindow, requests: client.stats.requests });
+    await log.write({ t: "frame", cursor: state.frame.cursor, rows, duplicates, outsideWindow, ...progress(client) });
   }
 }
 
@@ -229,19 +253,22 @@ export async function runOutput({ client, state, log }: RunOptions): Promise<voi
     output = { counts };
   } else output = { unavailable: a.kind === "unsupported" ? a.reason : a.kind === "not_found" ? "not_found" : "outside_contract" };
   state.output = output;
-  await log.write({ t: "output", output, requests: client.stats.requests });
+  await log.write({ t: "output", output, ...progress(client) });
 }
 
 /**
  * One session's write facts from GET /v1/sessions/:sessionId/events (ascending, content truncated to one
  * character and never read). As the production facts backend (src/session-read-api/coordination-backend.ts),
- * every event with a non-empty filesTouched is a write of each path, with the event's kind. Paging stops at
- * the first event at or after `until`.
+ * every event with a non-empty filesTouched is a write of each path, with the event's kind. Pages are read
+ * until the cursor is exhausted; events outside the window are counted and skipped, never taken as a reason
+ * to stop (the order is not relied on to bound the window). The one early stop is the per-session write bound
+ * with the cursor not exhausted: the record is then censored with an unknown drop count, never silently short.
  */
 export async function sessionFacts(client: ReadApiClient, row: FrameRow, p: HarvestParams, heldWrites: { n: number }): Promise<FactsRecord> {
   const rec: FactsRecord = {
     source: row.source, sessionId: row.sessionId, writes: [], eventProjectId: null, events: 0, eventsWithFiles: 0,
     eventsOutsideWindow: 0, droppedPaths: 0, truncatedWrites: 0, pages: 0, failure: null,
+    writesCensored: false, censorReason: null, droppedWrites: null,
   };
   let cursor: string | null = null;
   for (;;) {
@@ -256,7 +283,6 @@ export async function sessionFacts(client: ReadApiClient, row: FrameRow, p: Harv
         (body.sessionId !== undefined && body.sessionId !== row.sessionId))
       throw new HarvestError("/v1/sessions/:sessionId/events: a page is outside the contract");
     if (body.nextCursor !== null && body.nextCursor === cursor) throw new HarvestError("/v1/sessions/:sessionId/events: the cursor did not advance; refused to loop");
-    let pastWindow = false;
     for (const e of body.events) {
       if (!isRecord(e)) throw new HarvestError("/v1/sessions/:sessionId/events: an event is not an object");
       // An event of another session or harness is a server fault, never silently mixed in.
@@ -266,8 +292,7 @@ export async function sessionFacts(client: ReadApiClient, row: FrameRow, p: Harv
       const t = ts(e.ts);
       const eventId = str(e.eventId);
       if (!t || !eventId) throw new HarvestError("/v1/sessions/:sessionId/events: an event is outside the contract (eventId, ts)");
-      if (t >= p.until) { pastWindow = true; rec.eventsOutsideWindow++; continue; }
-      if (t < p.since) { rec.eventsOutsideWindow++; continue; }
+      if (t >= p.until || t < p.since) { rec.eventsOutsideWindow++; continue; }
       const project = str(e.projectId);
       if (project) rec.eventProjectId = project;
       const files = Array.isArray(e.filesTouched) ? e.filesTouched : [];
@@ -287,7 +312,20 @@ export async function sessionFacts(client: ReadApiClient, row: FrameRow, p: Harv
       rec.droppedPaths += Math.max(0, paths.length - IMPORT_BOUNDS.eventFiles);
     }
     cursor = body.nextCursor as string | null;
-    if (!cursor || pastWindow || rec.writes.length >= IMPORT_BOUNDS.facts) return rec;
+    if (!cursor) {
+      // Exhausted: any drop at the bound is known exactly.
+      if (rec.truncatedWrites > 0) Object.assign(rec, { writesCensored: true, censorReason: "writes_bound_exceeded", droppedWrites: rec.truncatedWrites });
+      return rec;
+    }
+    if (rec.writes.length >= IMPORT_BOUNDS.facts) {
+      // At or over the bound with pages left: later pages are never read, so the drop count is unknown.
+      Object.assign(rec, {
+        writesCensored: true,
+        censorReason: rec.truncatedWrites > 0 ? "writes_bound_exceeded_cursor_remaining" : "writes_bound_reached_cursor_remaining",
+        droppedWrites: null,
+      });
+      return rec;
+    }
   }
 }
 
@@ -303,7 +341,7 @@ export async function runFacts({ client, state, log, concurrency }: RunOptions):
       try {
         const record = await sessionFacts(client, row, state.params, held);
         state.facts.set(rowKey(row), record);
-        await log.write({ t: "facts", record, requests: client.stats.requests });
+        await log.write({ t: "facts", record, ...progress(client) });
       } catch (err) {
         stop ??= err;
       }
@@ -355,6 +393,9 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
   const facts = [...state.facts.values()];
   const failures: Record<string, number> = {};
   for (const f of facts) if (f.failure) failures[f.failure] = (failures[f.failure] ?? 0) + 1;
+  const censored = facts.filter((f) => f.writesCensored);
+  const censoredBy: Record<string, number> = {};
+  for (const f of censored) censoredBy[f.censorReason ?? "unknown"] = (censoredBy[f.censorReason ?? "unknown"] ?? 0) + 1;
   const sum = (k: keyof FactsRecord) => facts.reduce((n, f) => n + (typeof f[k] === "number" ? f[k] as number : 0), 0);
   const sortObj = <T>(o: Record<string, T>) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
   return {
@@ -365,7 +406,12 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
     startedAt: state.startedAt,
     finishedAt: r.finishedAt,
     runs: state.runs,
-    requests: { total: stats.requests, byRoute: sortObj(stats.byRoute), retries: stats.retries, retryAfterHonoured: stats.retryAfterHonoured, waitedMs: stats.waitedMs },
+    requests: {
+      total: stats.requests, byRoute: sortObj(stats.byRoute), retries: stats.retries, retryAfterHonoured: stats.retryAfterHonoured, waitedMs: stats.waitedMs,
+      // Restored across runs from the state log; partial (lower bounds) only when a run ended without its counts.
+      partial: state.statsPartial !== null,
+      ...(state.statsPartial ? { partialReason: state.statsPartial } : {}),
+    },
     frame: {
       route: "/v1/sessions",
       params: { limit: FRAME_PAGE_LIMIT, lastTsAfter: state.params.since, firstTsBefore: state.params.until },
@@ -389,6 +435,11 @@ export function buildReceipt(r: ReceiptInput): Record<string, unknown> {
       eventsOutsideWindow: sum("eventsOutsideWindow"),
       writesRead: facts.reduce((n, f) => n + f.writes.length, 0),
       truncatedWrites: sum("truncatedWrites"),
+      // Sessions whose writes were cut at the per-session bound; their drop count is known only when exhausted.
+      sessionsCensored: censored.length,
+      censoredByReason: sortObj(censoredBy),
+      droppedWritesKnown: censored.reduce((n, f) => n + (f.droppedWrites ?? 0), 0),
+      sessionsWithUnknownDrops: censored.filter((f) => f.droppedWrites === null).length,
       droppedPaths: sum("droppedPaths") + r.snapshot.droppedPaths,
     },
     snapshot: { sessions: r.snapshot.sessions, writes: r.snapshot.writes, oversizeSessions: r.snapshot.oversizeSessions },

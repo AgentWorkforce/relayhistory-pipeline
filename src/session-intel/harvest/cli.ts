@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { HarvestError, parseReadApi, ReadApiClient, readToken, redact, RequestCapReached, TOKEN_ENV } from "./client.ts";
 import {
-  buildReceipt, newState, readState, RECEIPT_FILE, rowKey, runFacts, runFrame, runOutput, STATE_FILE, STATE_FORMAT,
+  buildReceipt, newState, progress, readState, RECEIPT_FILE, rowKey, runFacts, runFrame, runOutput, STATE_FILE, STATE_FORMAT,
   StateLog, type HarvestParams, type HarvestState,
 } from "./harvest.ts";
 import { buildRows, readSaltStdin, type SaltInput } from "../import/cli.ts";
@@ -150,13 +150,13 @@ async function harvest(r: Run): Promise<number> {
   const params: HarvestParams = { readApi: r.base.href, workspace: r.workspace, since: r.since, until: r.until, deleteBy: r.deleteBy };
   const { state, log } = await openState(r.out, params, r.clock());
   const client = new ReadApiClient({
-    base: r.base, token: r.token, workspace: r.workspace, maxRequests: r.maxRequests, spent: state.requests,
+    base: r.base, token: r.token, workspace: r.workspace, maxRequests: r.maxRequests, spent: state.requests, initial: state.stats,
     concurrency: r.concurrency, fetch: r.io.fetch, sleep: r.io.sleep, clock: () => r.clock().getTime(),
   });
   let capped = false;
   try {
     state.runs++;
-    await log.write({ t: "run", startedAt: r.clock().toISOString(), requests: state.requests });
+    await log.write({ t: "run", startedAt: r.clock().toISOString(), ...progress(client) });
     const opts = { client, state, log, concurrency: r.concurrency };
     await runFrame(opts);
     await runOutput(opts);
@@ -165,6 +165,9 @@ async function harvest(r: Run): Promise<number> {
     if (!(err instanceof RequestCapReached)) throw err;
     capped = true;
   } finally {
+    // The run's final counts, on success, the cap or an error, so a resume continues them exactly. A run
+    // killed before this line is detected on resume, and its counts are then reported as partial.
+    await log.write({ t: "runEnd", endedAt: r.clock().toISOString(), ...progress(client) }).catch(() => {});
     await log.close();
   }
   if (capped && !r.partial) {
@@ -211,7 +214,11 @@ async function harvest(r: Run): Promise<number> {
   if (capped) notes.push(`request cap reached (--max-requests ${r.maxRequests}): the frame is ${state.frame.done ? "exhausted" : "NOT exhausted"}; ${state.frame.rows.length - factsRead} sessions' events were not read`);
   if (failed) notes.push(`${failed} sessions' events were not served (reasons in facts.sessionsWithoutEvents); they are in the snapshot without writes`);
   if (stats.oversizeSessions) notes.push(`${stats.oversizeSessions} sessions exceeded the snapshot line bound and were dropped`);
-  const complete = !capped && state.frame.done && factsRead === state.frame.rows.length && failed === 0 && stats.oversizeSessions === 0;
+  const censored = [...state.facts.values()].filter((f) => f.writesCensored);
+  if (censored.length) notes.push(`${censored.length} sessions' writes were cut at ${IMPORT_BOUNDS.facts} per session (facts.censoredByReason); `
+    + `${censored.filter((f) => f.droppedWrites === null).length} of them stopped with pages unread, so their drop count is unknown`);
+  if (state.statsPartial) notes.push(`request counts are partial: ${state.statsPartial}`);
+  const complete = !capped && state.frame.done && factsRead === state.frame.rows.length && failed === 0 && stats.oversizeSessions === 0 && censored.length === 0;
   const finishedAt = r.clock().toISOString();
   const receipt = buildReceipt({
     state, stats: client.stats, finishedAt, workspaceHash: hasher.workspace(r.workspace), complete, notes, createdAt,
