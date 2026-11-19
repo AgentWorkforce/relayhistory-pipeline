@@ -15,6 +15,12 @@ export const COORDINATION_ADVISOR_RELAY_TOKEN = "COORDINATION_ADVISOR_RELAY_TOKE
 export const COORDINATION_ADVISOR_RELAY_URL = "COORDINATION_ADVISOR_RELAY_URL";
 export const COORDINATION_ADVISOR_FACTS_BACKEND = "COORDINATION_ADVISOR_FACTS_BACKEND";
 /**
+ * M2-4: the conflict rows (constraint_violation, intent_conflict, overlap from the claim detectors). Exactly
+ * "true" only, default off; the M3-1 `conflicts` control must also be on for the workspace. Off: the scan reads no
+ * claims and runs no conflict code.
+ */
+export const SESSION_INTEL_CONFLICTS_ENABLED = "SESSION_INTEL_CONFLICTS_ENABLED";
+/**
  * The read API's per-workspace canary (requireCanary "coordination"), read by the worker too: "*" or a
  * comma-separated list of workspace ids. Absent or empty: the worker scans, writes and DMs no workspace.
  */
@@ -32,6 +38,8 @@ export interface AdvisorConfig {
   /** The workspaces the worker may scan: the routes' canary allowlist. */
   workspaces: ReadonlySet<string> | "*";
   relayDm: { enabled: false } | { enabled: true; token: string; url: string };
+  /** SESSION_INTEL_CONFLICTS_ENABLED is exactly "true". */
+  conflicts: boolean;
 }
 
 /** Only the exact string "true" turns the worker's scan and writes on. */
@@ -91,5 +99,6 @@ export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {
     factsBackend,
     workspaces: parseDirectoryWorkspaces(typeof env[READ_API_DIRECTORY_WORKSPACES] === "string" ? env[READ_API_DIRECTORY_WORKSPACES] as string : undefined),
     relayDm,
+    conflicts: exactTrueFlag(env[SESSION_INTEL_CONFLICTS_ENABLED]),
   };
 }

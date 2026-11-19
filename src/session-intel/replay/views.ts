@@ -18,7 +18,8 @@ import type { CandidateLane, RecentAdvisory, SessionRef } from "../../coordinati
 import { ARTIFACT_MAX_CHARS, CANDIDATES_PER_WORKSPACE, type AdvisorStore, type AdvisoryRowInput, type UpsertResult } from "../../coordination-advisor/scan.ts";
 import { SESSION_INTEL_FEATURES, type SessionIntelControls, type SessionIntelFeature } from "../../shared/session-intel-controls.ts";
 import type { Snapshot, SnapshotClaim, SnapshotSession } from "./snapshot.ts";
-import { textCompare } from "./util.ts";
+import type { ClaimRow } from "../../coordination-advisor/conflicts.ts";
+import { sha256Hex, textCompare } from "./util.ts";
 
 /** The simulated clock shared by a replay's store, directory, backend and sender. */
 export interface SimClock { now: Date }
@@ -205,6 +206,31 @@ export class ReplayAdvisorStore implements AdvisorStore {
       if (r.status === "expired" || r.createdAt < cutoff) { this.rows.delete(k); deleted++; }
     }
     return { expired, deleted };
+  }
+
+  /**
+   * 062150 relayfacts_claims_v1 as of the clock: the tenant's current claims (visible, not superseded), one row per
+   * session claim, newest first, updated at or after `since`, at most `limit`. A row's id is a hash of the
+   * session and claim id (unique in the workspace, as a relayfacts id is); its evidence names the session.
+   */
+  async claims(orgId: string, workspaceId: string, since: Date, limit: number): Promise<ClaimRow[]> {
+    const nowIso = this.clock.now.toISOString();
+    const sinceIso = since.toISOString();
+    const rows: ClaimRow[] = [];
+    for (const v of this.view.sessionsAsOf(this.clock.now)) {
+      const s = v.session;
+      if (s.orgId !== orgId || s.workspaceId !== workspaceId) continue;
+      for (const c of v.claims) {
+        if (!(c.at < nowIso) || (c.supersededAt !== undefined && c.supersededAt < nowIso) || c.at < sinceIso) continue;
+        const ids = c.evidenceIds.length ? c.evidenceIds : [""];
+        rows.push({
+          id: sha256Hex(`${s.harness}\u0000${s.sessionId}\u0000${c.id}`).slice(0, 32), kind: c.kind, scope: c.kind === "decision" ? null : c.scope,
+          topic: c.topic ?? "general", statement: c.text.slice(0, 200), observedAt: c.kind === "decision" ? null : c.at, createdAt: c.at,
+          evidence: ids.map((id) => ({ id, source: s.harness, sessionId: s.sessionId, createdAt: c.at })),
+        });
+      }
+    }
+    return rows.sort((a, b) => textCompare(b.createdAt, a.createdAt) || textCompare(a.id, b.id)).slice(0, limit);
   }
 
   async recent(orgId: string, workspaceId: string, pairSince: Date): Promise<RecentAdvisory[]> {
