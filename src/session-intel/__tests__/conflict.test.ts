@@ -233,6 +233,20 @@ describe("which actions may make an alert HIGH", () => {
   });
 });
 
+describe("a claim shared by both sessions (replay)", () => {
+  test("the same recordId on both sides is excluded from both as shared; another claim is unaffected", () => {
+    const b = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
+      actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
+    expect([...b.excluded]).toEqual([["claude:s-a#k1", "shared"], ["claude:s-b#k9", "shared"]]);
+    expect(ruleClassify(b.input).verdict).toBe("none");
+    const other = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
+      actor("09:40", { claims: [claim("k9", "09:12", "intent", "Write in supabase/migrations.", { recordId: "rec-2" })] }));
+    expect(ruleClassify(other.input).verdict).toBe("constraint_violation");
+    // A recordId must look like a claim id.
+    expect(() => snap("s1", { claims: [claim("x", "09:10", "intent", "a", { recordId: "a#b" })] })).toThrow("recordId must match");
+  });
+});
+
 describe("the rule judge (conservative lexical baseline)", () => {
   test("constraint parsing: negation, verb, target", () => {
     expect(parseConstraint(CONSTRAINT)).toEqual({ verb: null, writeish: true, paths: ["supabase/migrations"], head: null });

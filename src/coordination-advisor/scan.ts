@@ -231,9 +231,23 @@ function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryR
 
 /** Applies the limits and writes one workspace's advisories; DMs HIGH rows that were newly written. */
 async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Array<Advisory | ConflictAdvisory>, now: number, stats: ScanStats) {
+  // Conflicts on: each advisory is checked against the pair state the tick started with, plus what its OWN source
+  // (the advisor, or the conflict detector) touched this tick. Two sources for one pair in one tick both go through
+  // (a collision and a conflict); within a source the check is exactly today's. Every write touches the pair as
+  // before, so across ticks the cooldown is unchanged. Conflicts off: the live state, as before.
+  const start = deps.conflicts === true ? deps.limits.cooldownSnapshot() : null;
+  const sourceTouched = new Set<string>();
+  const touchedKey = (src: string, urgency: string, pair: string) => `${src}\u0002${urgency}\u0002${pair}`;
+  const inCooldown = (a: Advisory, pair: string) => {
+    if (!start) return deps.limits.inCooldown(pair, a.urgency, now);
+    if (start.inCooldown(pair, a.urgency, now)) return true;
+    if (deps.limits.pairCooldownMs <= 0) return false;
+    const src = "rows" in a ? "conflict" : "advisor";
+    return sourceTouched.has(touchedKey(src, "high", pair)) || (a.urgency === "low" && sourceTouched.has(touchedKey(src, "low", pair)));
+  };
   for (const a of orderAdvisories(advisories)) {
     const pair = pairKey(a.lanes[0], a.lanes[1]);
-    if (deps.limits.inCooldown(pair, a.urgency, now)) { stats.cooldown++; continue; }
+    if (inCooldown(a, pair)) { stats.cooldown++; continue; }
     let attempted = false;
     // A conflict advisory names its own rows (a fleet conflict: the orchestrator only; a repo-policy owner: none).
     const rows: ReadonlyArray<readonly [SessionRef, SessionRef]> = "rows" in a
@@ -274,7 +288,10 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
       stats.dmSent++;
       await deps.store.markDelivered(orgId, workspaceId, a.advisoryId, recipient);
     }
-    if (attempted) deps.limits.touchPair(pair, a.urgency, now);
+    if (attempted) {
+      deps.limits.touchPair(pair, a.urgency, now);
+      sourceTouched.add(touchedKey("rows" in a ? "conflict" : "advisor", a.urgency, pair));
+    }
   }
 }
 

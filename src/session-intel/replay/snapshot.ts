@@ -49,6 +49,11 @@ export interface SnapshotClaim {
   id: string; at: string; kind: ClaimKind; scope: ClaimScope; text: string; confidence: number; evidenceIds: string[]; supersededAt?: string;
   /** The stored claim's topic slug (relayfacts claims carry one); optional. */
   topic?: string;
+  /**
+   * The stored claim record this claim belongs to (a relayfacts claim or decision id). Two sessions holding a claim
+   * with the same recordId share one claim (its evidence spans both): agreement, never a conflict. Optional.
+   */
+  recordId?: string;
 }
 export interface SummaryEntry { at: string; text: string }
 
@@ -242,7 +247,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
     const claims = list(raw.claims, `${where}.claims`, SNAPSHOT_BOUNDS.claims).map((c, i): SnapshotClaim => {
       const f = `${where}.claims[${i}]`;
       if (!isRecord(c)) throw new SnapshotError(`${f} must be an object`);
-      onlyKeys(c, ["id", "at", "kind", "scope", "text", "confidence", "evidenceIds", "supersededAt", "topic"], f);
+      onlyKeys(c, ["id", "at", "kind", "scope", "text", "confidence", "evidenceIds", "supersededAt", "topic", "recordId"], f);
       const at = isoTime(c.at, `${f}.at`);
       if (at < createdAt) throw new SnapshotError(`${f}.at is before createdAt`);
       if (c.kind !== "intent" && c.kind !== "constraint" && c.kind !== "decision") throw new SnapshotError(`${f}.kind must be intent, constraint or decision`);
@@ -253,6 +258,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
       if (claimIds.has(claimId)) throw new SnapshotError(`${f}.id repeats a claim id of this session`);
       claimIds.add(claimId);
       if (c.topic !== undefined && (typeof c.topic !== "string" || !TOPIC_SLUG.test(c.topic))) throw new SnapshotError(`${f}.topic must be a topic slug`);
+      if (c.recordId !== undefined && (typeof c.recordId !== "string" || !CLAIM_ID.test(c.recordId))) throw new SnapshotError(`${f}.recordId must match ${CLAIM_ID.source}`);
       let supersededAt: string | undefined;
       if (c.supersededAt !== undefined) {
         supersededAt = isoTime(c.supersededAt, `${f}.supersededAt`);
@@ -264,6 +270,7 @@ export function parseSession(raw: unknown, where: string): SnapshotSession {
         evidenceIds: list(c.evidenceIds, `${f}.evidenceIds`, SNAPSHOT_BOUNDS.evidenceIds).map((e, j) => id(e, `${f}.evidenceIds[${j}]`)),
         ...(supersededAt === undefined ? {} : { supersededAt }),
         ...(c.topic === undefined ? {} : { topic: c.topic as string }),
+        ...(c.recordId === undefined ? {} : { recordId: c.recordId as string }),
       };
     });
 

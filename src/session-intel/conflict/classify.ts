@@ -70,7 +70,8 @@ export interface PairJudge {
 }
 
 /** Why a live-or-not claim was kept out of the judge's input. */
-export type ExclusionReason = "superseded" | "session_scope" | "off_topic";
+/** `shared`: the same stored claim (one recordId) is held by both sessions: that is agreement, never a conflict. */
+export type ExclusionReason = "superseded" | "session_scope" | "off_topic" | "shared";
 
 export interface BuiltInput { input: JudgeInput; excluded: Map<string, ExclusionReason> }
 
@@ -93,6 +94,11 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
     return m;
   };
   const knownA = known(c.a), knownB = known(c.b);
+  // A stored claim whose evidence spans both sessions appears on both sides with one recordId: it is left out of
+  // both, so it can never be cited (it would be a self-conflict in disguise, or an "overlap" with itself).
+  const records = (v: ConflictCandidate["a"]) => new Set(v.claims.filter((cl) => cl.recordId !== undefined && isLiveClaim(cl, nowIso)).map((cl) => cl.recordId!));
+  const recA = records(c.a), recB = records(c.b);
+  const shared = new Set([...recA].filter((r) => recB.has(r)));
   const side = (name: SideName): JudgeSide => {
     const v = name === "a" ? c.a : c.b;
     const ref = refString(v.session);
@@ -101,6 +107,7 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
     for (const cl of v.claims) {
       const id = claimRef(ref, cl.id);
       if (!isLiveClaim(cl, nowIso)) { if (cl.at < nowIso) excluded.set(id, "superseded"); continue; }
+      if (cl.recordId !== undefined && shared.has(cl.recordId)) { excluded.set(id, "shared"); continue; }
       if (cl.kind === "constraint" && cl.scope === "session") { excluded.set(id, "session_scope"); continue; }
       const mine = topicsOfClaim(cl, otherKnown).filter((t) => topics.has(t)).sort(textCompare);
       if (!mine.length) { excluded.set(id, "off_topic"); continue; }
@@ -139,7 +146,7 @@ export function citable(input: JudgeInput): boolean {
 }
 
 export type VetoReason =
-  | "invalid_reply" | "invalid_verdict" | "bad_ids" | "duplicate_id" | "unknown_id" | "superseded" | "session_scope" | "off_topic"
+  | "invalid_reply" | "invalid_verdict" | "bad_ids" | "duplicate_id" | "unknown_id" | "superseded" | "session_scope" | "off_topic" | "shared"
   | "self_conflict" | "bad_citation" | "action_before_constraint" | "action_before_claim";
 
 export interface Classification {
