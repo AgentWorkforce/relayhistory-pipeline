@@ -303,7 +303,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-4 Dashboard "Session intelligence" view: alerts with adjudication buttons, live status and progress per workspace, and searchable handoffs | sessions-intel-lead (Khaliq, 2026-11-19) | Behind a setting; no transcript text | none |
 | M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | codex-relayhistory-pipeline-session | `e2e/pipeline` step green in the CI full lane | none |
 | M3-7 Delivery state on the pull path: an additive `delivery {dm, deliveredAt}` on each GET item; the hook deduplicates by advisory id across restarts | sessions-intel-lead (route), relay-app's agent (hook) | Route and hook tests; at-least-once is documented until both ship | none |
-| M3-8 DM transport contract: register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
+| M3-8 DM transport contract ([session-intel-dm-transport.md](../session-intel-dm-transport.md)): register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
 ### M4: Enterprise trace import
