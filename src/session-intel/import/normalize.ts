@@ -58,12 +58,17 @@ export interface ImportStats {
   outOfWindowFacts: number;
   /** Sessions kept but clamped to start at that window (their earlier records or facts dropped). */
   clampedSessions: number;
+  /** Modern Codex child records before a NEW_TASK addressed to that child (copied context and setup). */
+  codexPrefixRecordsDropped: number;
+  /** Children with copied-context metadata whose own task boundary could not be verified. */
+  codexChildrenWithoutTaskBoundary: number;
 }
 
 export const emptyStats = (): ImportStats => ({
   files: 0, lines: 0, malformedLines: 0, oversizeLines: 0, untimedRecords: 0, droppedPaths: 0, truncatedFacts: 0,
   oversizeSessions: 0, sessions: 0, writes: 0, commits: 0, outcomes: 0, usage: 0, heldFacts: 0,
   futureTimestamps: 0, outOfWindowSessions: 0, outOfWindowFacts: 0, clampedSessions: 0,
+  codexPrefixRecordsDropped: 0, codexChildrenWithoutTaskBoundary: 0,
 });
 
 /** An error whose message is safe to print: it names flags, bounds and codes, never a path, id, salt or text. */
