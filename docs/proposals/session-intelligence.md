@@ -127,6 +127,14 @@ that is the number that matters.
 - **HIGH → Agent Relay DM** from the pipeline service identity, using the existing sender
   (`relay-sender.ts`) and template rules: ids, kinds, artifacts and scrub-clean claim excerpts only.
   It also stays on the pull path until acked.
+  - **The DM transport is not verified.** `relay-sender.ts` was never tested against a live relay.
+    Sending is Relaycast's: every sender is a Relaycast agent with its own token, and a DM names the
+    recipient agent. Only Cloud can resolve a (harness, session id) to that agent, from Desktop's
+    identity sync. Until the contract is confirmed with Relaycast and Cloud, alerts are delivered
+    through the pull path only, and a session with no attached agent has an explicit "not attached"
+    outcome.
+  - **Delivery is at least once.** A DM and the turn-end pull can show the same advisory. M3-7 adds
+    the delivery state to the GET response, so the hook can tell them apart.
 - **LOW → turn-end advisory** through `GET /v1/coordination/advisories`, which the desktop hook polls
   at the end of each turn, then acks.
 - **Dashboard → "Session intelligence" view**, which extends the dashboard's Overlaps tab. It shows
@@ -289,11 +297,13 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 
 | Ticket | Owner | Acceptance | Gate |
 |---|---|---|---|
-| M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM), with a per-feature workspace allowlist that denies by default; fail-closed for alerting; its slot comes from the lander | sessions-intel-lead | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
+| M3-1 Kill-switch control row and getter (global, workspace, and per-feature: claims, conflicts, DM), with a per-feature workspace allowlist that denies by default; fail-closed for alerting; slot 062160 | codex-relayhistory-pipeline-session | Migration and tests; the e2e proves the flip takes effect within one tick | **Real-DB migration: Khaliq OK** |
 | M3-2 Per-workspace DM cap and model budget, durable | sessions-intel-lead | Tests; metrics emitted | none |
-| M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-app's agent (Khaliq, 2026-11-19); sessions-intel-lead briefs it with the hook contract | Hook treats 501 as none; never blocks a turn | none |
+| M3-3 Desktop turn-end hook consumes `GET /v1/coordination/advisories` and acks | relay-app's agent (Khaliq, 2026-11-19); sessions-intel-lead briefs it with the hook contract | Hook treats 501 as none; never blocks a turn; sends `workspace` on the ack. **External dependency:** the hook exists on relay-app `review/teammate-context-all-advisories` and waits on relay PR #2166 (TurnEndAdvisories) | none |
 | M3-4 Dashboard "Session intelligence" view: alerts with adjudication buttons, live status and progress per workspace, and searchable handoffs | sessions-intel-lead (Khaliq, 2026-11-19) | Behind a setting; no transcript text | none |
-| M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | sessions-intel-lead | `e2e/pipeline` step green in the CI full lane | none |
+| M3-5 Pipeline e2e lane covering claims, then a conflict alert, then pull and ack, and the kill switch | codex-relayhistory-pipeline-session | `e2e/pipeline` step green in the CI full lane | none |
+| M3-7 Delivery state on the pull path: an additive `delivery {dm, deliveredAt}` on each GET item; the hook deduplicates by advisory id across restarts | sessions-intel-lead (route), relay-app's agent (hook) | Route and hook tests; at-least-once is documented until both ship | none |
+| M3-8 DM transport contract: register a Relaycast service identity, resolve a session to its agent through Cloud, and define the "not attached" outcome | sessions-intel-lead, with layered-relaycast; the Cloud owner is Khaliq's call | Contract written and tested against a fake; no real token | **Service identity and token: Khaliq OK** |
 | M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
 
 ### M4: Enterprise trace import
