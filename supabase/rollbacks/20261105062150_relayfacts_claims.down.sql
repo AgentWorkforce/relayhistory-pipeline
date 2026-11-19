@@ -24,7 +24,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062150_relayfacts_claims.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='relayfacts claims: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062150_relayfacts_claims.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'252fc5bec7af162f07022f89581e6c015ec21f360c60e2144edcec1e234bb735'
+ IF NOT FOUND OR v_sha<>'f9c3cbf2fc71f942fd340659cbbba335872bd7859746746a39ccf03f581ed550'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='relayfacts claims: own applied checksum required';END IF;
  LOCK TABLE sessions.relayfacts_claims_v1, sessions.relayfacts_claim_evidence_v1 IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.relayfacts_claims_v1)
