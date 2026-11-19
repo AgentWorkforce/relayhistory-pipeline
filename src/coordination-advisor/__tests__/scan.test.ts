@@ -4,6 +4,7 @@ import type { LaneFacts } from "../../../packages/coordination-detect/src/index.
 import type { CoordinationBackend, CoordinationFacts } from "../../session-read-api/coordination-backend.ts";
 import type { Directory } from "../../session-read-api/directory.ts";
 import type { WorkerOptions } from "../../shared/worker.ts";
+import { SESSION_INTEL_FEATURES, type SessionIntelControls } from "../../shared/session-intel-controls.ts";
 import { advisorMain, type AdvisorIo } from "../main.ts";
 import { InMemoryRelaySender } from "../relay-sender.ts";
 import { AdvisorLimits, type CandidateLane, type RecentAdvisory, type SessionRef } from "../rubric.ts";
@@ -26,6 +27,8 @@ const lane = (sessionId: string, writes: Array<[string, number]>): LaneFacts => 
 
 /** Mirrors 062000's upsert: insert new; upgrade low->high on pending/delivered; skip acked/expired or same. */
 class FakeStore implements AdvisorStore {
+  featureControls: SessionIntelControls = new Map(SESSION_INTEL_FEATURES.map((f) => [f, true]));
+  async controls() { return this.featureControls; }
   rows = new Map<string, AdvisoryRowInput & { status: string }>();
   calls: string[] = [];
   constructor(private lanes: CandidateLane[]) {}
@@ -76,6 +79,24 @@ const limits = (over: Partial<{ pairCooldownMs: number; sessionHourlyCap: number
 const shared = [lane("a", [["src/x/shared.ts", -40]]), lane("b", [["src/x/shared.ts", -20]])];
 
 describe("scanOnce", () => {
+  test("controls skip disabled workspaces and gate DMs independently on each scan", async () => {
+    const store = new FakeStore([cand("a"), cand("b")]);
+    const be = backend(shared);
+    const sender = new InMemoryRelaySender();
+    store.featureControls = new Map();
+    expect(await scanOnce({ workspaces: "*", store, backend: be, limits: limits(), sender }, NOW))
+      .toMatchObject({ workspaces: 0, findings: 0, written: 0, dmSent: 0 });
+    expect(store.rows.size).toBe(0);
+    store.featureControls = new Map([["advisor", true], ["dm", false]]);
+    expect(await scanOnce({ workspaces: "*", store, backend: be, limits: limits(), sender }, NOW))
+      .toMatchObject({ findings: 1, written: 2, dmSent: 0 });
+    expect(sender.sent).toEqual([]);
+    expect([...store.rows.values()].every((r) => r.status === "pending")).toBe(true);
+    // A DM control never creates a sender when the environment flag is off.
+    const noSender = new FakeStore([cand("a"), cand("b")]);
+    expect(await scanOnce({ workspaces: "*", store: noSender, backend: backend(shared), limits: limits() }, NOW))
+      .toMatchObject({ written: 2, dmSent: 0 });
+  });
   test("a HIGH pair writes one row per recipient, DMs both, marks delivered only after the send", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const sender = new InMemoryRelaySender();
