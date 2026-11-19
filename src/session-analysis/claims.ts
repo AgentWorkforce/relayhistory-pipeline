@@ -18,6 +18,7 @@
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { log } from "../shared/log.ts";
+import type { SessionIntelControlsReader } from "../shared/session-intel-controls.ts";
 import type { SessionAnalysisSnapshot } from "./engine/session-analysis-result.ts";
 import type { AnalysisJob, AnalysisJobOutput } from "./processor.ts";
 import {
@@ -183,14 +184,20 @@ export interface CurrentClaim {
 export const CLAIMS_READ_MAX = 500;
 
 export interface ClaimsPort {
+  /** The M3-1 'claims' control for the workspace; false on any doubt (the shared reader fails closed). */
+  enabled(scope: { orgId: string; workspaceId: string }): Promise<boolean>;
   insert(scope: { orgId: string; workspaceId: string }, records: ClaimRecordInput[]): Promise<DecisionRecordsWrite | null>;
   current(scope: { orgId: string; workspaceId: string }, filter: { topic: string; kind: ClaimKind }): Promise<CurrentClaim[]>;
   supersede(scope: { orgId: string; workspaceId: string }, oldId: string, newId: string): Promise<boolean>;
 }
 
-/** The port over the worker's HoopDb connection (service_role or the runtime role). */
-export function postgresClaimsPort(db: SqlExecutor): ClaimsPort {
+/** The port over the worker's HoopDb connection (service_role or the runtime role) and the controls reader. */
+export function postgresClaimsPort(db: SqlExecutor, controls: SessionIntelControlsReader): ClaimsPort {
   return {
+    async enabled(scope) {
+      try { return (await controls.read(scope.orgId, scope.workspaceId)).get("claims") === true; }
+      catch { return false; }
+    },
     async insert(scope, records) {
       if (records.length === 0) return null;
       const { rows } = await db.query<DecisionRecordsWrite>(
@@ -271,10 +278,11 @@ export async function supersedeDroppedClaims(
 /**
  * The claims part of the analysis tick's completion hook with SESSION_INTEL_CLAIMS_ENABLED (the worker runs
  * it after decisionRecordsHook, which is unchanged): writes the job's claims in the job's own workspace,
- * then supersedes dropped claims. A claim whose earliest cited time is out of range is dropped alone
- * (`claim_records_bad_time`, one warning line with the count). Counts `claim_records` (claims sent), `claim_records_fenced` (RH016, an
- * erased session), `claim_records_failed`, `claim_records_superseded` and `claim_supersede_failed`; never
- * throws, never logs.
+ * then supersedes dropped claims. Before any write it reads the M3-1 'claims' control for that workspace,
+ * fail-closed: off, or any doubt, writes nothing and counts `claim_records_control_off`. A claim whose earliest
+ * cited time is out of range is dropped alone (`claim_records_bad_time`, one warning line with the count). Counts
+ * `claim_records` (claims sent), `claim_records_fenced` (RH016, an erased session), `claim_records_failed`,
+ * `claim_records_superseded` and `claim_supersede_failed`; never throws.
  */
 export function claimsHook(
   port: ClaimsPort,
@@ -292,6 +300,12 @@ export function claimsHook(
         log.warn("claim records dropped", { stage: "claims", reason: "observed_at_out_of_range", count: extracted.badTime });
       }
       if (records.length === 0) return;
+      let enabled = false;
+      try { enabled = await port.enabled(scope); } catch { enabled = false; }
+      if (!enabled) {
+        counts.claim_records_control_off = (counts.claim_records_control_off ?? 0) + 1;
+        return;
+      }
       await port.insert(scope, records);
       counts.claim_records = (counts.claim_records ?? 0) + records.length;
     } catch (e) {

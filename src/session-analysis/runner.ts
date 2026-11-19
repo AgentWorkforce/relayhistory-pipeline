@@ -31,6 +31,9 @@
  *   SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS, SESSION_ANALYSIS_CUTOVER_PROOF,
  *   SUMMARY_DECISION_RECORDS_ENABLED  passed through unchanged to the shared code that reads them
  *                                     (the first must stay unset; "true"/"false"/unset only)
+ *   SESSION_INTEL_CLAIMS_SCHEDULER_ENABLED and its tuning (claims-scheduler.ts): the live claims scheduler side
+ *                                     tick, only with every gate exactly "true" and a model configured; off, the
+ *                                     tick is the analysis tick itself
  *
  * Probes: GET /healthz 200 {"ok":true,"enabled":true,"reason":"starting"|"ok"} while a tick ended (or
  * the service started) within tickMs + batch x lease + 60 s and fewer than 5 ticks failed in a row,
@@ -56,6 +59,8 @@ import { supabasePool, transaction } from "../session-pipeline/lambda.ts";
 import { modelKey } from "../session-brief/config.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
+import { sessionIntelControls } from "../shared/session-intel-controls.ts";
+import { claimsSchedulerEnabled, claimsSchedulerSettings, claimsSchedulerTick, withClaimsScheduler } from "./claims-scheduler.ts";
 import type { HoopDb } from "../shared/db.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
@@ -372,7 +377,7 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
     else if (cfg && secrets) {
       const built = runnerAnalysisDeps(env, cfg, secrets, options.ports);
       db = built.db;
-      tick = analysisTick({ ...built.deps, stopping });
+      tick = runnerTick(env, analysisTick({ ...built.deps, stopping }), built.db, secrets.modelKey !== null, now);
     }
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -403,6 +408,21 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
     await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections?.(); });
     await db?.end?.().catch(() => {});
   }
+}
+
+/**
+ * The runner's tick: the analysis tick, with the claims scheduler side tick (claims-scheduler.ts) around it
+ * only when every gate is exactly "true" and a model is configured. Otherwise the analysis tick itself.
+ */
+export function runnerTick(env: NodeJS.ProcessEnv, tick: AnalysisTickFn, db: HoopDb, model: boolean, now: () => number = Date.now): AnalysisTickFn {
+  if (!model || !claimsSchedulerEnabled(env)) return tick;
+  const settings = claimsSchedulerSettings(env);
+  const controls = sessionIntelControls(db);
+  return withClaimsScheduler(tick, {
+    run: () => claimsSchedulerTick({ db, controls, settings }),
+    intervalMs: settings.intervalSeconds * 1000,
+    now,
+  });
 }
 
 /** 2: refused configuration (do not retry unchanged); 1: any other startup failure. */

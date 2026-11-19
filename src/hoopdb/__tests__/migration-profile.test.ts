@@ -2652,6 +2652,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const RFC = "upstream:20261105062150_relayfacts_claims.sql";
     const SIC = "upstream:20261105062160_session_intel_controls.sql";
     const SIW = "upstream:20261105062170_session_intel_workspace.sql";
+    const CSC = "upstream:20261105062180_claims_scheduler.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2662,7 +2663,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR, SOF, RFC]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR, SOF, RFC, SIC, SIW, CSC]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2713,6 +2714,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062180 is newest: 062170's and 062160's downs refuse (55000) while it is applied; its checksum-pinned down restores
+    // 046000's analysis_request_v1 body exactly, drops the scheduler functions, the two helpers and the ledger table and
+    // its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(CSC);
+    expect((await failure(rollback("20261105062170_session_intel_workspace.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105062160_session_intel_controls.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062180_claims_scheduler.down.sql");
+    expect(await names()).not.toContain(CSC);
+    expect((await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.analysis_request_v1(text,text,text,text)'::regprocedure")).rows[0]!.s)
+      .toBe(bodyOf("20261105046000_analysis_jobs.sql", "analysis_request_v1", "$request$"));
+    expect(await relation("sessions.session_analysis_schedule_ledger_v1")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'session\\_analysis\\_schedule\\_%' OR proname IN ('session_analysis_admit_live_v1','session_analysis_admit_job_v1'))")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062180_claims_scheduler.down.sql")))?.code).toBe("55000");
     // 20261105062170 is newest: 062160's down refuses (55000) while it is applied; its checksum-pinned down drops the
     // two workspace-view readers and its ledger row, touches no table, and refuses on a rerun.
     expect(await names()).toContain(SIW);
