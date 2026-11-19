@@ -256,7 +256,9 @@ paths:
         sessions. `session_partial_unbounded` lists and excludes nothing, so
         its pages may hold stale rows of a partial session. Otherwise (the
         default) the first page is 501 `session_partial` /
-        `session_partial_unbounded`.
+        `session_partial_unbounded`. The unbounded condition counts only
+        partial sessions attributed to the requested workspace, not sibling
+        workspaces in the same organization.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}

@@ -70,7 +70,9 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
       if (rows.fail) throw rows.fail;
       if (query.includes("in_workspace")) {
         const inWs = new Set(rows.partialInWorkspace ?? []);
-        return (rows.partial ?? []).map((session_id) => ({ session_id, in_workspace: inWs.has(session_id) ? 1 : 0 })) as T[];
+        const after = String(options?.params?.after ?? "");
+        const page = Number(options?.params?.page ?? PARTIAL_SESSIONS_CAP);
+        return [...(rows.partial ?? [])].sort().filter((session_id) => session_id > after).slice(0, page).map((session_id) => ({ session_id, in_workspace: inWs.has(session_id) ? 1 : 0 })) as T[];
       }
       if (query.includes("search_ingest_session_state")) {
         const session = options?.params?.session;
@@ -254,14 +256,15 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
   });
 
   test("a workspace search starts at relayhistory while a session of its workspace is partial", async () => {
-    // A row in this workspace: decided in ClickHouse, Supabase not asked.
+    // A row in this workspace is attributed in ClickHouse; rowless siblings
+    // are still checked so skip mode can return the complete attributed set.
     const rowHere = stubCh({ partial: ["s-row", "s-elsewhere"], partialInWorkspace: ["s-row"] });
     const noPointers = memoryLiveness();
     let r = await api({ ch: rowHere.ch, liveness: noPointers.liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(501);
     expect((await body(r)).error.reason).toBe("session_partial");
     expect(rowHere.eventQueries()).toHaveLength(0);
-    expect(noPointers.calls.livePointerSessions).toEqual([]);
+    expect(noPointers.calls.livePointerSessions).toEqual([["s-elsewhere"]]);
     // No row anywhere yet (every pass was partial), but a live pointer here: still this workspace's.
     const pointerHere = stubCh({ partial: ["s-1", "s-elsewhere"] });
     const pointers = memoryLiveness({ createdAt: { "codex\u0000s-1": 1 } });
@@ -281,7 +284,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     expect(rowHere.eventQueries()).toHaveLength(1);
     // More partial sessions than one check lists: answered, and said to be unbounded.
     const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-other-${i}`);
-    r = await api({ ch: stubCh({ partial: many }).ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    r = await api({ ch: stubCh({ partial: many, partialInWorkspace: many }).ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(200);
     expect((await body(r)).incomplete).toEqual({ reason: "session_partial_unbounded" });
     // No partial session: the reply is exactly as without the setting.
@@ -302,7 +305,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     test("unset and false keep the 501, with neither the header nor the field", async () => {
       for (const over of [{}, { searchSkipsPartialSessions: false }]) {
         for (const [partial, reason] of [[["s-row"], "session_partial"], [Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-${i}`), "session_partial_unbounded"]] as const) {
-          const stub = stubCh({ partial: [...partial], partialInWorkspace: ["s-row"] });
+          const stub = stubCh({ partial: [...partial], partialInWorkspace: [...partial] });
           const { get, logs } = api({ ch: stub.ch, liveness: memoryLiveness().liveness, ...over });
           const r = await get(SEARCH);
           expect(r.status).toBe(501);
@@ -552,18 +555,29 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     expect((await api({ ch: stubCh().ch }).get("/v1/events?workspace=ws-a&q=needle&limit=20")).status).toBe(200);
   });
 
-  test("more partial sessions than one check lists is not decided: the search falls back whole", async () => {
+  test("more than one page of sibling-workspace partial sessions does not stop this workspace's search", async () => {
     const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-other-${i}`);
-    const { ch, eventQueries } = stubCh({ partial: many });
+    const { ch, queries, params, eventQueries } = stubCh({ partial: many });
+    const { liveness, calls } = memoryLiveness();
+    const r = await api({ ch, liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(200);
+    expect(eventQueries()).toHaveLength(1);
+    const statePages = queries.map((query, i) => ({ query, params: params[i]! })).filter(({ query }) => query.includes("in_workspace"));
+    expect(statePages).toHaveLength(2);
+    expect(statePages.map(({ params }) => params.after)).toEqual(["", [...many].sort()[PARTIAL_SESSIONS_CAP - 1]]);
+    expect(statePages.map(({ params }) => params.page)).toEqual([PARTIAL_SESSIONS_CAP, PARTIAL_SESSIONS_CAP]);
+    expect(calls.livePointerSessions.map((ids) => ids.length)).toEqual([PARTIAL_SESSIONS_CAP, 1]);
+  });
+
+  test("more partial sessions in this workspace than one check lists is not decided", async () => {
+    const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-here-${i}`);
+    const { ch, eventQueries } = stubCh({ partial: many, partialInWorkspace: many });
     const { liveness, calls } = memoryLiveness();
     const r = await api({ ch, liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(501);
     expect((await body(r)).error.reason).toBe("session_partial_unbounded");
     expect(eventQueries()).toHaveLength(0);
     expect(calls.livePointerSessions).toEqual([]);
-    // Exactly the cap is decided.
-    const atCap = stubCh({ partial: many.slice(1) });
-    expect((await api({ ch: atCap.ch, liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20")).status).toBe(200);
   });
 
   test("the partial check is bound to the token's org and checked when pagination starts, not on cursor pages", async () => {
