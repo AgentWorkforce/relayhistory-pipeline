@@ -324,7 +324,8 @@ Every execute additionally needs all of the following:
     When `failed` is not 0, the export receipt's `failed_codes` names the causes (closed codes only, summing to
     `failed`): `store_<code>` for an object-store error, `fence_<cause>` for a user whose S3 fence could not be read,
     `export_proof_mismatch`, `export_lock_lost`, `no_head_parity_unlisted`, `supersede_<cause>`, or `internal`.
-    The export retries every object-store call on `transient` (a throttle, 408/429 or 5xx) up to
+    The export retries every object read, list and write of the run (not the lease's acquire or release, and not a
+    response body that fails mid-stream) on `transient` (a throttle, 408/429 or 5xx) up to
     `EXPORT_TRANSIENT_ATTEMPTS` (5) times with backoff, and a failed lease renewal likewise, so `store_transient` in
     a receipt means S3 stayed unavailable across all of them. Any other code is never retried. A lost lease
     (`export_lock_lost`) stays a hard stop.

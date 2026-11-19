@@ -922,8 +922,46 @@ describe("Path B: no-head parity, per listed org, default off", () => {
       const summary = await run(store, { sleep: async () => {}, ...(attempts === undefined ? {} : { transientAttempts: attempts }) });
       expect(fenceReads).toBe(calls);
       expect(summary.failed).toBe(1);
-      expect(Object.keys(summary.failed_codes)).toEqual([code === "transient" ? expect.stringMatching(/^fence_/) : expect.stringMatching(/^fence_/)]);
+      expect(summary.failed_codes).toEqual({ [code === "transient" ? "fence_ledger_store_transient" : "fence_ledger_store_unauthorized"]: 1 });
       expect(summary.orgs.incomplete).toBe(1);
+      await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;");
+    }
+  });
+
+  test("a sidecar CAS that landed then failed transiently settles by read-back: same verdict counts, another fails", async () => {
+    for (const landed of ["ours", "other"] as const) {
+      const inner = scratch();
+      await backfillFence(inner, A);
+      const s = await seed(A, one);
+      expect((await run(inner)).written).toBe(1);
+      const sidecar = s.key + ACCEPTED_SUFFIX;
+      const current = JSON.parse(await readText(inner, sidecar));
+      // An earlier export's different verdict, so this run replaces it by CAS (ifMatch).
+      await inner.put(objectKey(sidecar), enc.encode(JSON.stringify({ ...current, live: false, kept: [] })), { contentType: "application/json" });
+      let first = true;
+      const store = new Proxy(inner, {
+        get(target, prop) {
+          if (prop === "put") return async (key: unknown, body: Uint8Array, opts: unknown) => {
+            if (first && String(key) === objectKey(sidecar)) {
+              first = false;
+              // The first attempt lands (ours), or another verdict lands in its place (other); then a 503.
+              const bytes = landed === "ours" ? body : enc.encode(JSON.stringify({ ...current, kept: [] }));
+              await target.put(key as never, bytes, { contentType: "application/json" });
+              throw new ObjectStoreError("transient", "fs", "injected 503", { status: 503 });
+            }
+            return (target.put as (...a: unknown[]) => unknown).call(target, key, body, opts);
+          };
+          const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+        },
+      });
+      const summary = await run(store, { sleep: async () => {} });
+      if (landed === "ours") {
+        expect(summary).toMatchObject({ updated: 1, failed: 0, failed_codes: {}, orgs: { already_complete: 1, incomplete: 0 } });
+        expect(JSON.parse(await readText(inner, sidecar))).toEqual(current);
+      } else {
+        expect(summary).toMatchObject({ updated: 0, failed: 1, failed_codes: { store_precondition_failed: 1 }, orgs: { incomplete: 1 } });
+      }
       await db.exec("SET session_replication_role = replica; DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;");
     }
   });

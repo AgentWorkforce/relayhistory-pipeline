@@ -133,10 +133,16 @@ export const EXPORT_TRANSIENT_ATTEMPTS = 5;
 export const exportTransientBackoffMs = (n: number) => Math.min(4000, 250 * 2 ** n);
 
 /**
- * `store` with every call retried on ObjectStoreError `transient`, at most `attempts` times in all, backing off
- * between tries; any other error, and the last transient one, is thrown as is. A put is retried too: a create or CAS
- * whose first attempt landed then answers already_exists / precondition_failed, which the callers settle by reading
- * the object back (the sidecar, proof and superseded writes). Not used for the run lease (its CAS must not be replayed).
+ * `store` with every object read, list and write of the run (getObject, head, list, put) retried on ObjectStoreError
+ * `transient`, at most `attempts` times in all, backing off between tries; any other error, and the last transient
+ * one, is thrown as is. Not the lease's acquire, renew or release (its CAS must not be replayed), and not a response
+ * body that fails mid-stream (only the call is retried). How a retried put whose first attempt landed settles:
+ * - a create (ifNoneMatch) with identical content: the store answers created:false, an idempotent success (a proof
+ *   then counts as proofs_existing; a sidecar create counts as written);
+ * - a create with other content: already_exists. The proof reads back and accepts only a record naming this stage's
+ *   bytes; the superseded record accepts any (it is there either way, and is then not counted in superseded);
+ * - a CAS (ifMatch, the sidecar replacing an earlier verdict): precondition_failed. The sidecar reads back and
+ *   accepts only exactly this verdict; anything else is the conflict it was.
  */
 export function retryTransient(store: ObjectStore, attempts: number, sleep: (ms: number) => Promise<void>): ObjectStore {
   const retried = new Set<PropertyKey>(["getObject", "head", "list", "put"]);
@@ -601,22 +607,24 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   // A renewal that fails transiently is tried again (bounded) before the next tick: one missed renewal is the safety
   // margin alive() keeps, so a single 503 used to end the run (export_lock_lost). A renewal that lost the lock (its CAS
   // found another version, including its own earlier write after an ambiguous 5xx) stays lost: a hard stop.
-  let renewing = false;
+  // At the end of the run `stopped` is set first, so a renewal sleeping in backoff never fires after the release (it
+  // would extend the lock for a full TTL); the release then waits for any renewal in flight.
+  let stopped = false;
+  let inFlight: Promise<void> | undefined;
   const renewBounded = async () => {
-    for (let n = 0; n < attempts; n++) {
+    for (let n = 0; n < attempts && !stopped; n++) {
       try {
         await lease!.renew();
         return;
       } catch (error) {
-        if (!isObjectStoreError(error, "transient")) return;
+        if (!isObjectStoreError(error, "transient") || n + 1 >= attempts) return;
         await sleep(exportTransientBackoffMs(n));
       }
     }
   };
   const renew = lease ? setInterval(() => {
-    if (renewing) return;
-    renewing = true;
-    renewBounded().finally(() => { renewing = false; });
+    if (inFlight || stopped) return;
+    inFlight = renewBounded().finally(() => { inFlight = undefined; });
   }, Math.max(500, Math.floor(ttl / 3))) : undefined;
   const leaseOk = () => opts.dryRun || (lease !== undefined && lease.alive());
 
@@ -847,7 +855,9 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       }
     }
   } finally {
+    stopped = true;
     if (renew) clearInterval(renew);
+    await inFlight;
     await lease?.release();
   }
   return summary;
