@@ -215,6 +215,66 @@ function serves SQS, every schedule and the analysis tick, so analysis ticks can
 a tick runs up to 300 s and the schedule fires every minute. Leases keep that safe. While both the
 runner and the Lambda schedule are on, the claim rate is the sum of both.
 
+## Claims scheduler (Session Intelligence M1-3)
+
+A side tick of this runner (never the Lambda) that enqueues an analysis for live sessions, so their claims
+(`docs/relayfacts.md`, Claims) stay current. Code: `src/session-analysis/claims-scheduler.ts`, wired in
+`runner.ts` `runnerTick`. Store side: migration `20261105062180_claims_scheduler.sql` (PROVISIONAL slot; applying
+it to a real database needs Khaliq's OK).
+
+Gates, all required, each exactly `"true"`: `SESSION_ANALYSIS_ENABLED`, `SUMMARY_DECISION_RECORDS_ENABLED`,
+`SESSION_INTEL_CLAIMS_ENABLED`, `SESSION_INTEL_CLAIMS_SCHEDULER_ENABLED` (default off), a configured model key, and
+per workspace the M3-1 `claims` control (global AND workspace row; read through `src/shared/session-intel-controls.ts`,
+fail-closed, counted as `skipped_control`). With any gate off the runner's tick is the analysis tick itself: no
+query, no log line.
+
+| Env | Default | Bounds | Meaning |
+|---|---|---|---|
+| `SESSION_INTEL_CLAIMS_SCHEDULER_INTERVAL_SECONDS` | 120 | 30..3600 | at most one scheduler pass per interval, after an analysis tick |
+| `SESSION_INTEL_CLAIMS_SCHEDULER_MIN_INTERVAL_SECONDS` | 600 | 60..86400 | per session: at most one scheduled job per interval, and none within it of a completed analysis |
+| `SESSION_INTEL_CLAIMS_WORKSPACE_HOURLY_CAP` | 5 | 1..100 | scheduled jobs per workspace in the last hour |
+| `SESSION_INTEL_CLAIMS_GLOBAL_DAILY_CAP` | 40 | 1..1000 | scheduled jobs across every org per UTC day |
+| `SESSION_INTEL_CLAIMS_DAILY_TOKEN_CEILING` | 5600000 | 1..50000000 | sum of the jobs' token reservations per UTC day |
+
+A value out of range, or not a plain decimal, falls back to its default (as the regen settings do). The database
+clamps the same values again.
+
+- **Selection.** `session_analysis_schedule_candidates_v1`: sessions of workspaces whose `claims` control is on,
+  with directory activity in the last 2 hours (by canonical id), no native job queued or running, activity newer
+  than their last completed analysis, and neither a completed analysis nor a scheduled job within the minimum
+  interval; at most 50 per pass, newest first. Fallback, documented: the analysis jobs carry no turn coverage, so
+  "at least N new user turns since the last analysis" is not derivable from analysis data and is not enforced.
+  Future work: the 3-new-turns rule, once the analysis records its turn coverage.
+- **Enqueue.** `session_analysis_schedule_v1`, per candidate, as `service_role` (or the runtime role): the same
+  locks, evidence check, purge fence and 30-minute reuse as a user request (`analysis_request_v1`'s own blocks, now
+  shared helpers), a job-level in-flight check, then the budgets under the per-org lock plus one global scheduler
+  lock. Answers `enqueued`, `reused`, `in_flight`, `not_found` or `over_budget` with a reason (`session_interval`,
+  `workspace_hourly`, `global_daily`, `daily_tokens`); over budget is skipped and counted, never deferred. It writes
+  no request row, so it never spends the user request limits. Known limit: `analysis_request_v1` finds an
+  in-flight analysis only through a request row (its 046000 check joins requests to jobs), so a user request while
+  a scheduled job is queued or running may start a second job; once the scheduled job completes, a request within
+  30 minutes on the same pointer set reuses it. Scheduled jobs do not count toward the user's per-session daily
+  limit (30 requests), which counts request rows. The scheduler never sets a model: jobs carry the
+  pinned versions of `src/session-analysis/versions.ts`.
+- **Known limits.** Candidates are read by canonical session id; a job a user requested under a physical session
+  id is not seen as covering that session, so the scheduler may enqueue one for it too. At most 50 candidates are
+  read per pass (newest activity first, across every organisation); the database budgets then decide how many are
+  enqueued, and the rest are read again on a later pass.
+- **Budget ledger.** `sessions.session_analysis_schedule_ledger_v1`, one row per enqueued job with its token
+  reservation; durable, so a restart keeps the counts. Rows reference their job `ON DELETE CASCADE`, so every erase
+  of a session's analysis jobs (per-session operator purge, per-user erase, C3 purge, the v2 forget trigger) erases
+  them too; rows older than 8 days are deleted by the admission function.
+- **Token reservation.** Each job reserves its worst case: `ceil(480 KiB / 4)` input tokens (the engine's
+  `MAXIMUM_INPUT_BYTES`) plus 16,384 for the response (the full analysis call has no output cap of its own), that is
+  139,264 tokens. It is a reservation, not actual spend; reconciling it against the job's recorded
+  `input_tokens`/`output_tokens` is a follow-up. The default ceiling, 5,600,000, fits 40 reservations (5,570,560), so
+  the daily cap of 40 is reachable. The hosted value is Khaliq's open decision.
+- **Fail-open.** The pass runs after the analysis tick in its own try/catch; each call is one statement in its own
+  transaction. A failure is counted and logged and never fails the analysis tick, a summary, a brief, a
+  user-requested analysis or the read API.
+- **Log.** One line per pass, `claims scheduler tick`, stage `claims-scheduler`, with `selected`, `enqueued`,
+  `skipped_budget`, `skipped_control`, `skipped` (in flight, reused, not found), `failed` and `duration_ms`; no ids.
+
 ## Activation checklist (blocked)
 
 Each step needs Khaliq's explicit OK in his own words. A request relayed by another agent is not

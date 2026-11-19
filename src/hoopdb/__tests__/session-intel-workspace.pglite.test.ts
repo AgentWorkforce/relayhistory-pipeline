@@ -193,7 +193,10 @@ describe("20261105062170 rollback", () => {
     const db = await migrated();
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP)).toEqual([]);
+      // 20261105062180 (claims scheduler) is the only later step: this down refuses under it, then it comes off first.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062180_claims_scheduler.sql"]);
+      expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(read("supabase/rollbacks/20261105062180_claims_scheduler.down.sql").split("\n").filter((l) => !l.startsWith("\\")).join("\n"));
       expect(await message(read("supabase/rollbacks/20261105062160_session_intel_controls.down.sql"))).toContain("a later migration is applied");
       await db.exec(DOWN);
       for (const fn of [ALERTS, CLAIMS])
