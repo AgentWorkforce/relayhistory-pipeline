@@ -570,7 +570,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     // The GET only; the ack's writer refuses, and the GET-only gate above answers a POST with 405 before it.
     ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
-      ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(tenant.run, workerAckRefused) } }
+      ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(tenant.run, workerAckRefused, { warn: (fields) => log("warn", "coordination advisories pull fell back to v1", fields) }) } }
       : {}),
     ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
     ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),

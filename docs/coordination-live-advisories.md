@@ -92,7 +92,13 @@ GET /v1/coordination/advisories?workspace=<id>&source=<harness>&sessionId=<id>&s
 - **Auth, as the overlaps route does.** The workspace comes from the verified identity: `attestWorkspace` requires `workspace` exactly once and equal to the token's workspace. Then `requireCanary(identity, "coordination")` and `rejectUnsupported(c)`.
 - **Parameters.** `source` and `sessionId` are each required exactly once. `status` defaults to `pending`, and `pending` is the only value served in v1.
 - **Contract:** `coordination-advisories/1`, returned as the response's `contract` field, as overlaps returns `coordination-overlaps/1`.
-- **Response.** At most 10 advisories, oldest first, and `nextCursor` is always `null` in v1:
+- **Response.** At most 10 advisories, and `nextCursor` is always `null` in v1. **Order: priority first** (P1, then
+  P2, then P3; oldest first within a priority), from `sessions.coordination_advisories_pending_for_v2` (migration
+  `062190`), so a new P1 is never hidden behind 10 older unacked LOW rows. The bound, the shape and the contract are
+  unchanged; a client must not rely on the order beyond that. Without `062190` (the function is missing, `42883`), the
+  read API falls back to 062000's `pending_for_v1` (oldest first) in a fresh transaction and logs a counted warning,
+  `coordination_advisories_v1_fallback`. The SQL rank and `advisoryPriority` agree on a shared fixture
+  (`src/hoopdb/__tests__/coordination-advisories-pending-priority.pglite.test.ts`).
 
 ```json
 {

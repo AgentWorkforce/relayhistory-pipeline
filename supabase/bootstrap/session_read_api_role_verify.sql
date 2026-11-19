@@ -126,6 +126,7 @@ BEGIN
          'sessions.buffered_turn_sources_for(text,text,text,text,text,text,boolean,text,text)',
          'sessions.coordination_advisories_ack_v1(text,text,text,text,text)',
          'sessions.coordination_advisories_pending_for_v1(text,text,text,text)',
+         'sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)',
          'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.digest_narrative_read(text,date,text,text)',
