@@ -128,6 +128,12 @@ export interface SessionPipelineInputs {
    */
   desktopCatalog?: boolean;
   /**
+   * Default off. `true` renders SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: a search pass returns before any
+   * object read or ClickHouse query when the session directory proves a complete pass already covered the
+   * scope's live pointer set at its current revisions (search-index.ts alreadyCurrent). Needs `searchIndex: true`.
+   */
+  skipCurrent?: boolean;
+  /**
    * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
    * 20 means up to 80 connections from this function alone. It is also capped in practice by the
@@ -300,7 +306,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -318,6 +324,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   // Same gap for the analysis cache: publications are normalized-prefix S3 writes the role cannot make yet.
   if (v.analysisCache === true) refuse("transcriptStore.sessionPipeline.analysisCache requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
   if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
+  if (v.skipCurrent !== undefined && typeof v.skipCurrent !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrent must be a boolean");
+  if (v.skipCurrent === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrent requires searchIndex: true");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
@@ -668,6 +676,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedErasureDelete?.pageSize !== undefined ? { INGEST_BUFFERED_ERASURE_PAGE: String(i.p.bufferedErasureDelete.pageSize) } : {}),
     ...(i.p.bufferedErasureDelete?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_ERASURE_RATE: String(i.p.bufferedErasureDelete.stagesPerSecond) } : {}),
     ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
+    // Only when armed: a stage without skipCurrent: true renders nothing and never skips.
+    ...(i.p.skipCurrent === true ? { SEARCH_INDEX_SKIP_CURRENT_ENABLED: "true" } : {}),
     // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),

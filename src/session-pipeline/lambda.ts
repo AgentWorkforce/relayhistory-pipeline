@@ -143,6 +143,8 @@ export interface LambdaEnv {
   outputFactsEnabled?: boolean;
   /** MESSAGE_ORIGIN_LABELS_ENABLED=true: index rows label who wrote each event (message-origin.ts). Default off. */
   originLabelsEnabled?: boolean;
+  /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
+  skipCurrentEnabled?: boolean;
   /**
    * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
    * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
@@ -221,6 +223,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   // The facts are built from a whole read; the streamed path never writes them.
   if (searchStreamCh && env.SEARCH_INDEX_OUTPUT_FACTS === "1")
     throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 cannot be combined with SEARCH_INDEX_OUTPUT_FACTS=1");
+  // SEARCH_INDEX_SKIP_CURRENT_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipCurrent = searchIndexSkipCurrentFromEnv(env);
+  if (skipCurrent && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   return {
@@ -241,6 +247,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
+    ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
@@ -508,6 +515,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.outputFactsEnabled ? { outputFacts: true as const } : {}),
       // Default off; on, each scope's next pass rewrites its labelled rows once (new fingerprints).
       ...(env.originLabelsEnabled ? { originLabels: true as const } : {}),
+      // Default off; on, a pass the session directory proves current returns before any read (already_current).
+      ...(env.skipCurrentEnabled ? { skipCurrent: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
@@ -984,3 +993,14 @@ export function createPipelineLambdaHandler(options: { search?: SearchCompositio
 }
 
 export const handler = createPipelineLambdaHandler();
+
+/**
+ * SEARCH_INDEX_SKIP_CURRENT_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else ("1", "TRUE", padded values) fails init naming the variable, never the value.
+ */
+export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_CURRENT_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}

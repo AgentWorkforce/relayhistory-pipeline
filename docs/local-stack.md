@@ -766,6 +766,36 @@ only from `transcriptStore.sessionPipeline.streamReconcile` with `enabled: true`
 `maxReadBytes`, `maxReadEvents` and `deadlineMarginMs` take the same ranges in plain numbers. Streamed output facts
 (D2) and the large-scope worker (D3) are not in this cut.
 
+### Hosted Lambda: skip a search pass already current
+
+`SEARCH_INDEX_SKIP_CURRENT_ENABLED` (hosted session-pipeline Lambda only; stack input
+`transcriptStore.sessionPipeline.skipCurrent`, which needs `searchIndex: true`) is **default off**: unset, `""` and
+`false` are off and change nothing (no query, no log line); `true` is on; any other value fails Lambda init naming
+the variable. The self-host consumer and the large-read job do not read it.
+
+On, a search pass returns before any object read and any ClickHouse query when the session directory proves that a
+complete pass already covered exactly the scope's live pointer set at its current revisions. It answers `skipped`
+with the reason `already_current`, writes nothing, and the consumer logs `search index skipped` (no requeue, no
+failure). Every redelivered or duplicate manifest event of an unchanged session then costs the pointer stage and one
+Postgres check instead of a full re-read of the session and a FINAL scan.
+
+The proof is the canonical session's `sessions.session_directory` row: `event_projection_ready` (set only by the
+directory write of a complete pass, when the live pointers equal that pass's sources), `event_projection_sources`
+equal to the live `manifest_key -> revision` map of the canonical id in `sessions.session_index`, version 1, not
+deleted. Readiness is reset by every incomplete pass and by the `session_index` trigger on any pointer insert,
+update or delete of the scope or its canonical id. With `SEARCH_INDEX_OUTPUT_FACTS=1` the facts state of the canonical
+id must also be complete (one ClickHouse point read).
+
+Never skipped: a scope with no live pointer (erase), a canonical mismatch or a still-live alias, a previous pass that
+was partial or incomplete, a new revision, a sibling manifest added or removed, a canonical change, a busy scope
+(busy is answered before the check and still requeues). Replay pages and large-read delegation are separate stages
+and are not affected.
+
+Not detected: a change that re-fingerprints index rows without any pointer change (`READER_MAX_RULESET`,
+`MESSAGE_ORIGIN_LABELS_ENABLED`, a projection code change). With the flag on, an unchanged session keeps its old rows
+until its source next changes; turn the flag off for as long as such a change should reach sessions through their
+events.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

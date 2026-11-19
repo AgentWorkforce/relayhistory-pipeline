@@ -170,6 +170,14 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           log.info("search index busy, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "scope_busy" });
           continue;
         }
+        if (result.skipped) {
+          // SEARCH_INDEX_SKIP_CURRENT_ENABLED: a complete pass already covers the live source set; done, not retried.
+          log.info("search index skipped", {
+            stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
+            reason: result.reasons.join(","), duration_ms: Date.now() - started,
+          });
+          continue;
+        }
         if (result.deferred) {
           // This invocation already streamed a scope (streamSlot): stream this one in a later invocation.
           if (!deps.requeue) throw new Error("stream deferred and no requeue");
