@@ -40,8 +40,9 @@ describe("replay of the fixture", () => {
     const a = await replaySnapshot(await fixture(), { detectors: [advisorDetector()] });
     const b = await replaySnapshot(await fixture(), { detectors: [advisorDetector()] });
     expect(JSON.stringify(b)).toBe(JSON.stringify(a));
-    expect(detectorHash(advisorDetector())).toBe(a.detectors[0]!.hash);
-    expect(detectorHash(advisorDetector({ sessionHourlyCap: 1 }))).not.toBe(a.detectors[0]!.hash);
+    expect(detectorHash(advisorDetector(), { intervalMs: 120_000 })).toBe(a.detectors[0]!.hash);
+    expect(detectorHash(advisorDetector(), { intervalMs: 600_000 })).not.toBe(a.detectors[0]!.hash);
+    expect(detectorHash(advisorDetector({ sessionHourlyCap: 1 }), { intervalMs: 120_000 })).not.toBe(a.detectors[0]!.hash);
   });
 
   test("a coarser interval delays sentAt to the next tick, never earlier than the evidence", async () => {
@@ -61,7 +62,7 @@ describe("replay of the fixture", () => {
       name: "repeat", version: "1", params: {},
       async run(_v, now) {
         n++;
-        return [{ detector: "repeat", alertId: "x", kind: "k", urgency: "low", orgId: "o", workspaceId: "w", pair: ["a:1", "a:2"], artifact: "f", sentAt: now.toISOString(), alertAt: now.toISOString(), channel: "pull", evidence: [] }];
+        return [{ detector: "repeat", alertId: "x", kind: "nearby_work", urgency: "low", orgId: "o", workspaceId: "w", pair: ["a:1", "a:2"], artifact: "f", sentAt: now.toISOString(), alertAt: now.toISOString(), channel: "pull", evidence: [] }];
       },
     };
     const snap = await fixture();
@@ -83,20 +84,21 @@ describe("cli", () => {
     const alerts = join(out, "replay", "alerts.json");
 
     expect(await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score")], io)).toBe(0);
-    const dev = JSON.parse(readFileSync(join(out, "score", "report.json"), "utf8"));
+    const dev = JSON.parse(readFileSync(join(out, "score", "report.dev.json"), "utf8"));
     // The held-out billing pair is only unlabeled on dev: dev never reads held-out labels.
-    expect(dev.detectors[0].pairMatch.total).toMatchObject({ alerts: 6, truePositives: 4, misclassified: 0, hardNegativeHits: 1, unlabeled: 1, outOfScope: 0, precision: 4 / 6, recall: 1, beforeHarm: 3, medianLeadMs: 58 * 60_000 });
+    expect(dev.detectors[0].pairMatch.total).toMatchObject({ alerts: 6, truePositives: 4, misclassified: 0, hardNegativeHits: 1, unlabeled: 1, outOfScope: 0, alertPrecision: 4 / 6, recall: 1, beforeHarm: 3, medianLeadMs: 58 * 60_000 });
     // class-match: the sess-k/sess-l LOW nearby_work (overlap) on an intent_conflict incident is misclassified,
-    // and so is the sess-g/sess-h HIGH shared file (collision) on an overlap incident.
-    expect(dev.detectors[0].classMatch.total).toMatchObject({ alerts: 6, truePositives: 2, misclassified: 2, falsePositives: 2, precision: 2 / 6, detected: 2, recall: 2 / 3 });
-    expect(dev.detectors[0].confusion.counts.overlap).toMatchObject({ intent_conflict: 1, overlap: 1, none: 1, unlabeled: 0 });
+    // and so is the sess-g/sess-h HIGH shared file (collision) on an overlap incident. The sess-e/sess-f LOW
+    // nearby_work on its benign_overlap hard negative is class-correct (a TP with no incident to credit).
+    expect(dev.detectors[0].classMatch.total).toMatchObject({ alerts: 6, truePositives: 3, misclassified: 2, falsePositives: 1, alertPrecision: 3 / 6, detected: 2, recall: 2 / 3 });
+    expect(dev.detectors[0].confusion.counts.overlap).toMatchObject({ intent_conflict: 1, overlap: 2, none: 0, unlabeled: 0 });
     expect(dev.detectors[0].confusion.counts.collision).toMatchObject({ collision: 1, overlap: 1, unlabeled: 1 });
-    expect(readFileSync(join(out, "score", "report.md"), "utf8")).toContain("### Confusion (alert class by labeled class)");
+    expect(readFileSync(join(out, "score", "report.dev.md"), "utf8")).toContain("### Confusion (alert class by labeled class)");
     expect(existsSync(join(out, "score", "scored-hashes.json"))).toBe(false);
 
     expect(await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout"], io)).toBe(0);
-    const held = JSON.parse(readFileSync(join(out, "score", "report.json"), "utf8"));
-    expect(held.detectors[0].pairMatch.total).toMatchObject({ alerts: 1, truePositives: 1, precision: 1, recall: 1, beforeHarm: 0, afterHarm: 1, medianLeadMs: -16 * 60_000 });
+    const held = JSON.parse(readFileSync(join(out, "score", "report.heldout.json"), "utf8"));
+    expect(held.detectors[0].pairMatch.total).toMatchObject({ alerts: 1, truePositives: 1, alertPrecision: 1, recall: 1, beforeHarm: 0, afterHarm: 1, medianLeadMs: -16 * 60_000 });
     await expect(main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout"], io)).rejects.toThrow("already scored");
     expect(await main(["score", "--alerts", alerts, "--labels", FIXTURE_LABELS, "--out", join(out, "score"), "--split", "heldout", "--force"], io)).toBe(0);
     const ledger = JSON.parse(readFileSync(join(out, "score", "scored-hashes.json"), "utf8"));
