@@ -4,7 +4,7 @@
  * OTEL_SERVICE_NAME, DEPLOYMENT and DEPLOYMENT_ID, and a scan warning prints org and workspace ids to stderr.
  * Outputs carry session ids, so --out must be outside this repository (a synthetic run may pass --allow-repo-out).
  *
- *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N]
+ *   bun run src/session-intel/replay/cli.ts replay   --snapshot <dir> --out <dir> [--interval-ms N] [--detectors coordination-advisor,conflict-rule]
  *   bun run src/session-intel/replay/cli.ts score    --alerts <alerts.json> --labels <labels.json> --out <dir> [--split dev|heldout] [--force] [--reason <text>] [--budget N]
  *   bun run src/session-intel/replay/cli.ts packet   --alerts <alerts.json> [--alerts ...] --seed <s> --out <dir> [--budget N]
  *   bun run src/session-intel/replay/cli.ts verdicts --key <key.json> --verdicts <verdicts.jsonl|json> --out <dir>
@@ -15,7 +15,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { buildPacket, parsePacketKey, parseVerdicts, verdictMarkdown, verdictReport } from "./adjudicate.ts";
-import { advisorDetector } from "./detector.ts";
+import { CONFLICT_MODEL_DETECTOR, CONFLICT_RULE_DETECTOR, ruleConflictDetector } from "../conflict/detector.ts";
+import { ADVISOR_DETECTOR_NAME, advisorDetector, type ReplayDetector } from "./detector.ts";
 import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
 import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay } from "./score.ts";
@@ -78,6 +79,21 @@ function replayMarkdown(r: ReplayResult): string {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * The detectors a replay runs: `coordination-advisor` (the default) and `conflict-rule`. `conflict-model` needs
+ * a model transport, which this offline CLI does not have: it is refused rather than run without one.
+ */
+export function replayDetectors(list: string | undefined): ReplayDetector[] {
+  const names = (list ?? ADVISOR_DETECTOR_NAME).split(",").map((n) => n.trim()).filter(Boolean);
+  if (!names.length || new Set(names).size !== names.length) throw new Error("--detectors must name each detector once");
+  return names.map((n) => {
+    if (n === ADVISOR_DETECTOR_NAME) return advisorDetector();
+    if (n === CONFLICT_RULE_DETECTOR) return ruleConflictDetector();
+    if (n === CONFLICT_MODEL_DETECTOR) throw new Error(`--detectors: ${CONFLICT_MODEL_DETECTOR} needs a model transport, which the offline CLI has none of; run it from code with an injected transport`);
+    throw new Error(`--detectors: unknown detector ${JSON.stringify(n.slice(0, 64))} (known: ${ADVISOR_DETECTOR_NAME}, ${CONFLICT_RULE_DETECTOR})`);
+  });
+}
+
 export async function main(argv: string[], io: CliIo = defaultIo): Promise<number> {
   const [command, ...rest] = argv;
   const { values } = parseArgs({
@@ -86,7 +102,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
       snapshot: { type: "string" }, out: { type: "string" }, "interval-ms": { type: "string" },
       alerts: { type: "string", multiple: true }, labels: { type: "string" }, split: { type: "string" }, force: { type: "boolean" }, reason: { type: "string" },
       budget: { type: "string" }, seed: { type: "string" }, key: { type: "string" }, verdicts: { type: "string" },
-      "allow-repo-out": { type: "boolean" },
+      "allow-repo-out": { type: "boolean" }, detectors: { type: "string" },
     },
   });
   const allowRepo = values["allow-repo-out"] === true;
@@ -98,7 +114,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const out = outDir(values.out, allowRepo);
     const intervalMs = values["interval-ms"] === undefined ? DEFAULT_INTERVAL_MS : Number(values["interval-ms"]);
     const snapshot = await loadSnapshot(resolve(values.snapshot), { now: io.now });
-    const result = await replaySnapshot(snapshot, { detectors: [advisorDetector()], intervalMs });
+    const result = await replaySnapshot(snapshot, { detectors: replayDetectors(values.detectors), intervalMs });
     // A workspace scan that failed or a row the store refused means alerts may be missing; alerts.json says so.
     const incomplete = result.incomplete;
     await writeAtomic(join(out, "alerts.json"), json(result));
