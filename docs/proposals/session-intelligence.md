@@ -144,7 +144,10 @@ simulated clock. Its output is a report: "these N alerts would have fired, this 
 1. **Import (M4).** Adapters for Claude Code JSONL, Codex rollouts, and a generic JSONL / OpenTelemetry
    GenAI-span format. They map into canonical sessions through the existing upload path, into an
    isolated tenant (or the customer's own self-host install, for customers who won't ship data).
-   Scrubbing runs through relayscrubber at ingest, as for every session.
+   Scrubbing runs through relayscrubber at ingest, as for every session. The offline converter
+   (M4-1a) never reaches ingest: it keeps no message text, and it hashes every id and each file-path
+   segment with a per-import salt. Depth, extension, well-known source roots and migration number
+   prefixes stay in clear, so equal paths still match across sessions.
 2. **Analyse.** Summaries, the claims pass, and facts projection run as backfill jobs under a
    per-import budget.
 3. **Replay.** `session-intel replay` steps the clock over the import window, runs every enabled
@@ -292,7 +295,8 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 
 | Ticket | Owner | Acceptance | Gate |
 |---|---|---|---|
-| M4-1 Import adapters (Claude Code JSONL, Codex rollouts, generic JSONL / OTel GenAI) into canonical sessions through the upload path | M4 builder | Synthetic fixtures; scrubbing via relayscrubber; idempotent re-import | none |
+| M4-1a Offline converter: Claude Code JSONL, Codex rollouts and generic JSONL into the replay snapshot format | M4 builder | Synthetic fixtures; no message text; salted HMAC of ids and of each path segment (depth, extension, source roots and migration number prefixes in clear); salt from stdin; replay runs unchanged on the output | none |
+| M4-1b Upload-path import: the same adapters into canonical sessions through the upload path, plus OTel GenAI spans | M4 builder | Scrubbing via relayscrubber; idempotent re-import | none |
 | M4-2 Batch runner: backfill the analysis and claims for an imported tenant under budget, then replay, then report | M4 builder | Runs on a synthetic import end to end | none |
 | M4-3 Customer report template (confirmed conflicts, lead time, cost) | sessions-intel-lead | Rendered from the M0 report JSON | none |
 | M4-4 First real customer run | sessions-intel-lead | | **Customer data: Khaliq OK and customer authorization** |
