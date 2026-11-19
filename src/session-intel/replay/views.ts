@@ -16,6 +16,7 @@ import type { Directory, DirectoryListRow } from "../../session-read-api/directo
 import type { RelayDm, RelaySender } from "../../coordination-advisor/relay-sender.ts";
 import type { CandidateLane, RecentAdvisory, SessionRef } from "../../coordination-advisor/rubric.ts";
 import { ARTIFACT_MAX_CHARS, CANDIDATES_PER_WORKSPACE, type AdvisorStore, type AdvisoryRowInput, type UpsertResult } from "../../coordination-advisor/scan.ts";
+import { SESSION_INTEL_FEATURES, type SessionIntelControls, type SessionIntelFeature } from "../../shared/session-intel-controls.ts";
 import type { Snapshot, SnapshotClaim, SnapshotSession } from "./snapshot.ts";
 import { textCompare } from "./util.ts";
 
@@ -126,10 +127,19 @@ const dbError = (code: string, message: string) => Object.assign(new Error(messa
  * tenant; otherwise skipped), mark_delivered_v1, sweep_v1, and 062070 recent_v1 (derived from the rows by
  * created_at). Every upsert is recorded with its simulated time.
  */
+/** The M3-1 controls a replay assumes, per feature. Required: a replay store never assumes a default. */
+export type ReplayControls = Readonly<Record<SessionIntelFeature, boolean>>;
+
 export class ReplayAdvisorStore implements AdvisorStore {
   readonly rows = new Map<string, StoredRow>();
   readonly writes: RecordedWrite[] = [];
-  constructor(private readonly view: ReplayView, private readonly clock: SimClock) {}
+  /** `controls`: what sessions.session_intel_controls_v1 would return, for every workspace of the replay. */
+  constructor(private readonly view: ReplayView, private readonly clock: SimClock, private readonly replayControls: ReplayControls) {}
+
+  async controls(_orgId: string, _workspaceId: string): Promise<SessionIntelControls> {
+    // Every feature is listed, as the production reader returns it; a missing one is off (fail closed).
+    return new Map(SESSION_INTEL_FEATURES.map((f) => [f, this.replayControls[f] === true]));
+  }
   private key = (advisoryId: string, r: SessionRef) => `${advisoryId}\u0000${r.harness}\u0000${r.sessionId}`;
 
   async candidates(since: Date, limit: number, workspaces: string[] | null): Promise<CandidateLane[]> {
