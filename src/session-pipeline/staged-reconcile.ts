@@ -661,6 +661,6 @@ export async function assertStagedReconcileSchema(db: SqlExecutor): Promise<void
   );
   if (rows.length)
     throw new Error(
-      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires migration 20261105062110_search_reconcile_staging.sql (missing sessions.search_reconcile_* functions)",
+      "pipeline consumer: the staged reconcile is on (the default; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off) and requires migration 20261105062110_search_reconcile_staging.sql (missing sessions.search_reconcile_* functions)",
     );
 }

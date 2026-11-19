@@ -817,6 +817,9 @@ describe("startup with output facts and the staged reconcile", () => {
   test("startup refuses a database without the 062140 writers, naming the migration", async () => {
     const missing = { query: async () => ({ rows: [{ fn: STAGED_OUTPUT_FACTS_FUNCTIONS[0] }] }) } as unknown as SqlExecutor;
     await expect(assertStagedOutputFactsSchema(missing)).rejects.toThrow(/20261105062140_staged_output_facts\.sql/);
+    await expect(assertStagedOutputFactsSchema(missing)).rejects.toThrow(
+      "pipeline consumer: the staged reconcile is on (the default; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off) and with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true requires migration 20261105062140_staged_output_facts.sql (missing sessions.staged_facts_* functions)",
+    );
     const present = { query: async () => ({ rows: [] }) } as unknown as SqlExecutor;
     await assertStagedOutputFactsSchema(present);
   });

@@ -1497,12 +1497,6 @@ export interface SearchIndexStreamNotice {
   fields: Record<string, string | number>;
 }
 
-/**
- * The streaming reconcile as the indexer SERVICE starts it: the budgets (undefined when off)
- * and at most one log line. Off by default because RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true
- * logs that reason (info) instead of failing; budgets no scope can use log a warning.
- * Throws exactly as searchIndexStreamFlag / searchIndexStreamFromEnv do.
- */
 /** The streaming-off line output facts give while the staged reconcile is off (searchIndexStreamStartup). */
 const STREAMING_OFF_FOR_FACTS: SearchIndexStreamNotice = {
   level: "info",
@@ -1510,6 +1504,12 @@ const STREAMING_OFF_FOR_FACTS: SearchIndexStreamNotice = {
   fields: { streaming: "off", reason: "output_facts" },
 };
 
+/**
+ * The streaming reconcile as the indexer SERVICE starts it: the budgets (undefined when off)
+ * and at most one log line. Off by default because RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true
+ * logs that reason (info) instead of failing; budgets no scope can use log a warning.
+ * Throws exactly as searchIndexStreamFlag / searchIndexStreamFromEnv do.
+ */
 export function searchIndexStreamStartup(
   env: Record<string, string | undefined>,
   limits: Partial<SearchIndexLimits>,
@@ -1591,7 +1591,7 @@ export function searchIndexStagedStartup(
   env: Record<string, string | undefined>,
   stream: StreamReadLimits | undefined,
   _outputFacts: boolean,
-): { state: SearchIndexStagedState; staged?: StagedReconcile; notice?: SearchIndexStreamNotice } {
+): { state: SearchIndexStagedState; staged?: StagedReconcile; notice?: SearchIndexStreamNotice; streamingExplicitOn?: true } {
   const state = searchIndexStagedState(env);
   if (state === "explicit_off") return { state };
   if (state === "default_off_streaming")
@@ -1607,6 +1607,8 @@ export function searchIndexStagedStartup(
     throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)");
   return {
     state,
+    // Kept for searchIndexStagedForIndex: an explicit streaming "true" with output facts cannot fall back.
+    ...(env.SEARCH_INDEX_STREAMING_ENABLED === "true" ? { streamingExplicitOn: true as const } : {}),
     staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: new StagedRefusals() },
     notice: {
       level: "info",
@@ -1624,8 +1626,10 @@ export function searchIndexStagedStartup(
  * explicit_on refuses to start (assertStagedSearchIndex); by default the staged reconcile is off with a
  * warn line, never a failure (both shipped backends have them, so the service never gets here). With
  * output facts on, that fallback also turns streaming off again (`streamOff`, with today's streaming-off
- * line): streaming resolved on only because the staged run would carry the facts, so without it the
- * consumer is exactly on the path the staged reconcile off gives.
+ * line): streaming resolved on only because the staged run would carry the facts. The consumer then
+ * reconciles as with the staged reconcile off, plus the startup lines and the schema asserts already
+ * run. An explicit SEARCH_INDEX_STREAMING_ENABLED=true with output facts is never turned off silently:
+ * it fails startup with the error it gives while the staged reconcile is off.
  */
 export function searchIndexStagedForIndex(
   started: ReturnType<typeof searchIndexStagedStartup>,
@@ -1634,6 +1638,8 @@ export function searchIndexStagedForIndex(
 ): { staged?: StagedReconcile; notice?: SearchIndexStreamNotice; streamOff?: SearchIndexStreamNotice } {
   if (!started.staged || typeof index.scanFingerprintsPage === "function") return started.staged ? { staged: started.staged } : {};
   if (started.state === "explicit_on") assertStagedSearchIndex(started.staged, index);
+  if (outputFacts && started.streamingExplicitOn)
+    throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
   return {
     notice: {
       level: "warn",

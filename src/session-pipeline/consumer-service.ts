@@ -1191,10 +1191,6 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   await assertRuntimeIdentity(db);
   await assertServiceSchema(db);
   await assertSearchTenantGate(db);
-  await assertStagedStartupSchema(db, searchStaged, config.outputFacts);
-  // A healthy start clears a stale UNHEALTHY marker from an earlier crash
-  // loop; without this the marker is sticky across restarts.
-  clearUnhealthyFile(config.unhealthyFile);
   const composition = writerComposition(config.backendId, config.floorMs, config.searchBackend, env);
   const writerSql = writerTransactionSql(db);
   const tenantRunner = writerTenantRunner(db);
@@ -1209,17 +1205,21 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     tenantRunner,
   );
 
-  // The staged reconcile walks the index in keyset pages: refuse an index without them now,
-  // not on the first scope.
-  // Explicitly on refuses an index without keyset pages; by default the staged reconcile is then off.
+  // The staged reconcile walks the index in keyset pages: explicitly on refuses an index without
+  // them now (not on the first scope); by default the staged reconcile is then off.
   const stagedIndexed = searchIndexStagedForIndex(stagedStart, binding.index, config.outputFacts);
   if (stagedIndexed.notice) log[stagedIndexed.notice.level](stagedIndexed.notice.message, { service: "session-pipeline-consumer", ...stagedIndexed.notice.fields });
   searchStaged = stagedIndexed.staged;
-  // Without the staged run, output facts hold streaming off again, exactly as with the flag off.
+  // Without the staged run, output facts hold streaming off again, as with the flag off.
   if (stagedIndexed.streamOff) {
     searchStream = undefined;
     log[stagedIndexed.streamOff.level](stagedIndexed.streamOff.message, { service: "session-pipeline-consumer", ...stagedIndexed.streamOff.fields });
   }
+  // After the binding: only the staged deps that will run need their migrations.
+  await assertStagedStartupSchema(db, searchStaged, config.outputFacts);
+  // A healthy start clears a stale UNHEALTHY marker from an earlier crash
+  // loop; without this the marker is sticky across restarts.
+  clearUnhealthyFile(config.unhealthyFile);
   const raw = lockerStore();
   const reader = lockerManifestReader();
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: config.keyPrefix };

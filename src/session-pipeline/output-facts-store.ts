@@ -477,6 +477,6 @@ export async function assertStagedOutputFactsSchema(db: SqlExecutor): Promise<vo
   );
   if (rows.length)
     throw new Error(
-      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true requires migration 20261105062140_staged_output_facts.sql (missing sessions.staged_facts_* functions)",
+      "pipeline consumer: the staged reconcile is on (the default; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off) and with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true requires migration 20261105062140_staged_output_facts.sql (missing sessions.staged_facts_* functions)",
     );
 }

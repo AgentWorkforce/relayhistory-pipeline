@@ -17,7 +17,6 @@
  * Synthetic, secret-free data only. Staging and HoopDb in PGlite.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { createOpenSearchCapableSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { objectKey } from "../../../packages/object-store/src/index.ts";
 import { prefixAllowed, prefixOrgResolver } from "../../shared/vendor.ts";

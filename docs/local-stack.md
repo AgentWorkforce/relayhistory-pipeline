@@ -440,7 +440,10 @@ reconcile). `true` is an explicit on and needs the streaming reconcile above to 
 then stages; see "Staged output facts" below), or startup fails naming the migration. Any other value
 (`1`, `TRUE`, padded values included) fails startup. On, the consumer logs `pipeline consumer staged reconcile on`
 (`... on by default` when unset) once at startup. Explicitly on, it refuses to start on a search index without paged
-scans; by default it is then off with a warn line (the Postgres and OpenSearch adapters both have them). The hosted
+scans; by default it is then off with a warn line (the Postgres and OpenSearch adapters both have them). That
+fallback is the off path plus its startup lines; with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` it also turns
+streaming off again, and an explicit `SEARCH_INDEX_STREAMING_ENABLED=true` then fails startup as it does with the
+staged reconcile off. The hosted
 pipeline Lambda and the large-read worker never read it.
 
 #### Upgrading to the default-on image (Phase 3)
@@ -448,7 +451,9 @@ pipeline Lambda and the large-read worker never read it.
 - **Migrations first.** Run the image's migrator to completion before the new indexer starts: it applies
   `20261105062110` and `20261105062140` with the rest of its steps. The consumer already ticks only once every migration of its image is applied
   (it waits for the schema ledger); with the staged reconcile on, a missing writer of either step also fails its
-  startup at once, naming the migration (`... requires migration 20261105062110_search_reconcile_staging.sql`), so a
+  startup at once, naming the migration and the off switch (`pipeline consumer: the staged reconcile is on (the default;
+  SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off) and requires migration
+  20261105062110_search_reconcile_staging.sql ...`), so a
   consumer started before its migrator finished restarts (instead of waiting, as it did with the staged reconcile
   off) until the steps are applied.
 - **The first ticks.** A scope the whole read takes is indexed exactly as before. A scope past the whole-read bound

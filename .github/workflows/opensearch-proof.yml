@@ -145,6 +145,7 @@ jobs:
       # whole-read bound through this backend's paged scans. OPENSEARCH_PROOF_REQUIRED makes a missing URL fail.
       - name: Staged reconcile through the opensearch binding (${{ matrix.dialect }} dialect, real server, flag unset)
         if: steps.proof.outputs.present == 'true'
+        timeout-minutes: 15
         env:
           SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
           SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}

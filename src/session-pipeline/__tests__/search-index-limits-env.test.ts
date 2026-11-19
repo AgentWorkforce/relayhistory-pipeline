@@ -281,6 +281,26 @@ describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, def
     });
     expect(searchIndexStagedForIndex(factsDefault, withPages, true)).toEqual({ staged: factsDefault.staged });
     expect(searchIndexStagedForIndex(byDefault, without, false).streamOff).toBeUndefined();
+    // An explicit SEARCH_INDEX_STREAMING_ENABLED=true is never turned off silently: with output facts the
+    // fallback fails startup with the error the staged reconcile off gives; without them streaming stays on.
+    const STREAM_WITH_FACTS = "pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true";
+    expect(() => searchIndexStreamFlag({ [VAR]: "false", SEARCH_INDEX_STREAMING_ENABLED: "true" }, true)).toThrow(STREAM_WITH_FACTS);
+    for (const staged of [undefined, ""]) {
+      const env = { [VAR]: staged, SEARCH_INDEX_STREAMING_ENABLED: "true" };
+      expect(searchIndexStreamFlag(env, true)).toBe("explicit_on");
+      const started = searchIndexStagedStartup(env, stream, true);
+      expect(started.streamingExplicitOn).toBe(true);
+      expect(() => searchIndexStagedForIndex(started, without, true)).toThrow(STREAM_WITH_FACTS);
+      expect(searchIndexStagedForIndex(started, withPages, true)).toEqual({ staged: started.staged });
+      expect(searchIndexStagedForIndex(started, without, false)).toEqual({
+        notice: expect.objectContaining({ fields: { state: "off", reason: "no_paged_scan" } }),
+      });
+    }
+    expect(factsDefault.streamingExplicitOn).toBeUndefined();
+    // Explicitly on with explicit streaming still refuses with its own (paged scans) error first.
+    expect(() => searchIndexStagedForIndex(searchIndexStagedStartup({ [VAR]: "true", SEARCH_INDEX_STREAMING_ENABLED: "true" }, stream, true), without, true)).toThrow(
+      "requires a search index with paged scans",
+    );
   });
 
   test("any other value fails startup with a fixed message that never carries the value", () => {

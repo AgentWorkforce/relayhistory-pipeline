@@ -291,6 +291,10 @@ describe("consumer service config", () => {
       expect(fns(withFacts.queries).some((f) => f.startsWith("sessions.staged_facts_"))).toBe(true);
       // A missing writer fails startup, naming the migration (as an explicit "true" always did).
       await expect(assertStagedStartupSchema(recorder(true).db, staged, false)).rejects.toThrow("20261105062110_search_reconcile_staging.sql");
+      // True under the default as under an explicit "true": it names the default and the off switch.
+      await expect(assertStagedStartupSchema(recorder(true).db, staged, false)).rejects.toThrow(
+        "pipeline consumer: the staged reconcile is on (the default; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off) and requires migration 20261105062110_search_reconcile_staging.sql (missing sessions.search_reconcile_* functions)",
+      );
     }
     for (const env of [{ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }, { SEARCH_INDEX_STREAMING_ENABLED: "false" }]) {
       const off = recorder(false);
