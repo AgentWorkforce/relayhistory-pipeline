@@ -64,6 +64,10 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
   // Each pair is in its own project, avoiding accidental cross-scenario LOWs.
   const firstScan = scanLines().length;
   stack.sql(`BEGIN;
+    INSERT INTO sessions.session_intel_controls(scope,feature,enabled,updated_by)
+      VALUES ('global','advisor',true,'fixture');
+    INSERT INTO sessions.session_intel_controls(scope,org_id,workspace_id,feature,enabled,updated_by)
+      VALUES ('workspace',${q(a.org)},${q(a.workspace)},'advisor',true,'fixture');
     ${directory("high-a", "high")}${directory("high-b", "high")}
     ${fact("high-a", ["src/collision/shared.ts"])}${fact("high-b", ["src/collision/shared.ts"])}
     ${directory("low-a", "low")}${directory("low-b", "low")}
@@ -131,10 +135,10 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
 
   // Four peers generate more than the configured three advisories for the hub.
   // Different top-level directories avoid spurious LOW pairs between the peers.
+  before = scanLines().length;
   stack.sql(`BEGIN; ${directory("cap-hub", "cap")}
     ${[1, 2, 3, 4].map((i) => directory(`cap-${i}`, "cap") + fact(`cap-${i}`, [`cap${i}/shared.ts`])).join("\n")}
     ${fact("cap-hub", [1, 2, 3, 4].map((i) => `cap${i}/shared.ts`))} COMMIT;`);
-  before = scanLines().length;
   await scanAfter(before, /capped=[1-9]/u);
   const hubCount = () => rows().filter((r) => r[0] === session("cap-hub")).length;
   check(hubCount() === 3, `hourly cap: hub has ${hubCount()} rows`);
@@ -148,5 +152,22 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
   await scanAfter(before, /capped=[1-9]/u);
   check(hubCount() === 3, "restart reset the hourly cap");
   check(rows().every((r) => r[5] !== "delivered"), "DM-disabled proof delivered a message");
-  return "HIGH collision + LOW overlap; fleet silent; allowlist and tenant isolation; pull citations; idempotent recipient ack; cooldown and cap survive worker restarts; no DMs";
+  stack.compose(["stop", "coordination-advisor"], { quiet: true });
+  stack.sql(`BEGIN;
+    UPDATE sessions.session_intel_controls SET enabled=false,updated_at=now(),updated_by='fixture'
+      WHERE scope='workspace' AND org_id=${q(a.org)} AND workspace_id=${q(a.workspace)} AND feature='advisor';
+    ${directory("switch-a", "switch")}${directory("switch-b", "switch")}
+    ${fact("switch-a", ["src/switch/shared.ts"])}${fact("switch-b", ["src/switch/shared.ts"])} COMMIT;`);
+  before = scanLines().length;
+  stack.compose(["start", "coordination-advisor"], { quiet: true });
+  await scanAfter(before, /workspaces=0/u);
+  const switchRows = () => rows().filter((r) => r[0] === session("switch-a") || r[0] === session("switch-b"));
+  check(switchRows().length === 0, "disabled workspace still wrote advisories");
+  // No restart: the next completed tick must observe the operator's flip.
+  before = scanLines().length;
+  stack.sql(`UPDATE sessions.session_intel_controls SET enabled=true,updated_at=now(),updated_by='fixture'
+    WHERE scope='workspace' AND org_id=${q(a.org)} AND workspace_id=${q(a.workspace)} AND feature='advisor'`);
+  await scanAfter(before, /written=2\s/u);
+  check(switchRows().length === 2, "control flip was not applied by the next scan");
+  return "HIGH collision + LOW overlap; fleet silent; allowlist and tenant isolation; pull citations; idempotent recipient ack; cooldown and cap survive restarts; control flip on the next tick; no DMs";
 }
