@@ -13,6 +13,8 @@ import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/p
 import { inventoryOf, RUNTIME_APPLICATION_FUNCTIONS } from "../migrate-guards.ts";
 import { MIGRATION_SENTINELS } from "../migration-sentinels.ts";
 import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../migrate.ts";
+import { advisoryItem, sqlCoordinationAdvisories } from "../../session-read-api/coordination-advisories.ts";
+import type { TenantRunner } from "../../session-read-api/liveness.ts";
 
 setDefaultTimeout(300_000);
 const root = join(import.meta.dir, "../../..");
@@ -139,6 +141,24 @@ describe("20261105062170 session intelligence workspace readers", () => {
     // An advisory older than the 7-day retention but not yet swept is not open.
     await db.exec(`UPDATE sessions.coordination_advisories SET created_at = now() - interval '8 days' WHERE advisory_id = '${hex(2)}'`);
     expect((await alerts("org-a", "ws-a")).map((r) => r.advisory_id)).toEqual([hex(1)]);
+  });
+
+  test("M3-7 over the real 062000 reader: delivery.dm is false until the DM path marks the row, then true with its time; priority by urgency and kind", async () => {
+    await reset();
+    await upsert("org-a", "ws-a", pair(hex(7), ["claude", "s-a"], ["codex", "s-b"]));
+    const run: TenantRunner = (org, ws, work) => as("bulls96_read_api", (tx) => work({
+      query: async <R,>(text: string, params?: unknown[]) => ({ rows: (await tx.query<R>(text, params)).rows }),
+    }), [org, ws]);
+    const source = sqlCoordinationAdvisories(run, (() => { throw new Error("no write"); }) as never);
+    const recipient = { orgId: "org-a", workspaceId: "ws-a", source: "claude", sessionId: "s-a" };
+    const before = (await source.pending(recipient)).map(advisoryItem);
+    expect(before.map((i) => [i.advisoryId, i.priority, i.delivery])).toEqual([[hex(7), 1, { dm: false, deliveredAt: null }]]);
+    await as("service_role", (tx) => tx.query("SELECT sessions.coordination_advisories_mark_delivered_v1('org-a','ws-a',$1,'claude','s-a')", [hex(7)]));
+    const after = (await source.pending(recipient)).map(advisoryItem);
+    expect(after[0]!.delivery.dm).toBe(true);
+    expect(Date.parse(after[0]!.delivery.deliveredAt!)).toBeGreaterThan(Date.now() - 60_000);
+    // The peer's row was not DMed: still dm false. The workspace view ranks the advisory the same.
+    expect((await source.pending({ ...recipient, source: "codex", sessionId: "s-b" })).map(advisoryItem)[0]!.delivery).toEqual({ dm: false, deliveredAt: null });
   });
 
   test("alerts and claims refuse an org or workspace outside the read scope (42501) and out-of-bound arguments (22023)", async () => {

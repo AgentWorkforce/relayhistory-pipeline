@@ -106,12 +106,31 @@ GET /v1/coordination/advisories?workspace=<id>&source=<harness>&sessionId=<id>&s
       "peer": { "source": "codex", "sessionId": "<peer session id>" },
       "createdAt": "2026-11-12T10:04:00.000Z",
       "message": "<templated, at most 600 characters, no transcript text>",
-      "evidence": [{ "sessionId": "<id>", "eventId": "<id>", "ts": "2026-11-12T09:58:12.000Z", "kind": "tool_result" }]
+      "evidence": [{ "sessionId": "<id>", "eventId": "<id>", "ts": "2026-11-12T09:58:12.000Z", "kind": "tool_result" }],
+      "priority": 3,
+      "delivery": { "dm": false, "deliveredAt": null }
     }
   ],
   "nextCursor": null
 }
 ```
+
+**Priority and delivery (M3-7, additive).** Each item also carries two fields, added under the same contract
+`coordination-advisories/1`: clients must ignore fields they do not know, and the original eight keys keep their
+names, meaning and order.
+
+- `priority` (1, 2 or 3), from the one shared function `src/session-read-api/advisory-priority.ts` (the proposal's
+  "Priority and the human notice"; `GET /v1/session-intel/workspace` uses the same one). P1: HIGH
+  `constraint_violation`, `intent_conflict`, `duplicate_work` or `superseded_work`. P2: HIGH `concurrent_edit`, and
+  any other HIGH kind (an unknown kind is never P1). P3: every LOW, and `planned_fleet`. A row carries no
+  orchestrator marker, so a fleet conflict is ranked by urgency and kind; the advisor writes fleet conflicts LOW to
+  the orchestrator only, so they are P3.
+- `delivery: {dm, deliveredAt}`: `deliveredAt` is the row's `delivered_at` (returned by `pending_for_v1` since
+  062000, so no migration), and `dm` is true when it is set. On a listed row only the HIGH DM path
+  (`coordination_advisories_mark_delivered_v1`) sets it; the ack also sets it, but an acked row is no longer listed.
+  A client that saw `dm: true` already had the DM and can skip a second notice for that advisory.
+- **Dedup.** Desktop dedupes system notifications by `advisoryId` per human per device, recorded across restarts
+  (M3-9); until it ships, the pull path is at-least-once and the same advisory can show again on a later turn.
 
 The GET is read-only, like every read-API route on the read pool. `status=pending` means not yet acked: it returns rows whose status is `pending` or `delivered`, so a row the desktop has not acked stays visible until it expires, and a crashed turn sees it again.
 
