@@ -22,10 +22,12 @@ import {
   runBootstrap,
   stripPsqlMeta,
 } from "../consumer-bootstrap.ts";
+import { STREAM_READ_CEILING, searchIndexStagedStartup } from "../search-index.ts";
 import {
   assertRuntimeIdentity,
   assertSearchTenantGate,
   assertServiceSchema,
+  assertStagedStartupSchema,
   clearUnhealthyFile,
   collectFreshnessSend,
   computeSince,
@@ -185,8 +187,8 @@ describe("consumer service config", () => {
       }
       return lines.filter((l) => String(l.message).includes("streaming reconcile"));
     };
-    // Unset with output facts: off, one info line naming why.
-    expect(await startup({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([
+    // Output facts with the staged reconcile explicitly off: off, one info line naming why (the pre-staged answer).
+    expect(await startup({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true", SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" })).toEqual([
       expect.objectContaining({
         level: "info",
         message: expect.stringContaining("streaming reconcile off"),
@@ -206,8 +208,10 @@ describe("consumer service config", () => {
         largest_streamed_scope_events: 100_000,
       }),
     ]);
-    // On at the default budgets, and explicitly off: no streaming line.
+    // On at the default budgets, and explicitly off: no streaming line. With output facts and the staged
+    // reconcile on by default, streaming is on too (the staged run carries the facts): no line either.
     expect(await startup({})).toEqual([]);
+    expect(await startup({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([]);
     expect(await startup({ SEARCH_INDEX_STREAMING_ENABLED: "false", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([]);
     // A malformed flag fails startup before the log line or any connection.
     await expect(serve(env({ SEARCH_INDEX_STREAMING_ENABLED: "1" }))).rejects.toThrow("SEARCH_INDEX_STREAMING_ENABLED must be true or false");
@@ -233,9 +237,23 @@ describe("consumer service config", () => {
       }
       return lines.filter((l) => String(l.message).includes("staged"));
     };
-    // Off (the default): no line at all.
-    for (const off of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "" }, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }])
-      expect(await startup(off)).toEqual([]);
+    // Explicitly off: no line at all.
+    expect(await startup({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" })).toEqual([]);
+    expect(await startup({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual([]);
+    // Unset or "" (the default since Phase 3 slice 4): on, before any connection opens, one line.
+    for (const byDefault of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "" }, { RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" }])
+      expect(await startup(byDefault)).toEqual([
+        expect.objectContaining({
+          level: "info",
+          message: "pipeline consumer staged reconcile on by default (keyed records cap 500000; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off)",
+          state: "on",
+          service: "session-pipeline-consumer",
+        }),
+      ]);
+    // Unset with streaming explicitly off: off, one info line, no failure.
+    expect(await startup({ SEARCH_INDEX_STREAMING_ENABLED: "false" })).toEqual([
+      expect.objectContaining({ level: "info", message: expect.stringContaining("staged reconcile off: SEARCH_INDEX_STREAMING_ENABLED=false"), state: "off", reason: "streaming_off" }),
+    ]);
     expect(await startup({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true" })).toEqual([
       expect.objectContaining({ level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", state: "on", service: "session-pipeline-consumer" }),
     ]);
@@ -252,6 +270,33 @@ describe("consumer service config", () => {
     await expect(refused({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true", SEARCH_INDEX_STREAMING_ENABLED: "false", RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).rejects.toThrow(
       "SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on",
     );
+  });
+  test("the staged startup schema checks: on (explicitly or by default) queries the 062110 writers, and the 062140 ones with output facts; off queries nothing", async () => {
+    const recorder = (missing: boolean) => {
+      const queries: unknown[][] = [];
+      const db = { query: async (_sql: string, params?: unknown[]) => { queries.push(params ?? []); return { rows: missing ? [{ fn: "x" }] : [] }; } } as never;
+      return { db, queries };
+    };
+    const fns = (q: unknown[][]) => q.flatMap((p) => (p[0] as string[]) ?? []);
+    for (const env of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true" }]) {
+      const staged = searchIndexStagedStartup(env, STREAM_READ_CEILING, true).staged;
+      expect(staged).toBeDefined();
+      const without = recorder(false);
+      await assertStagedStartupSchema(without.db, staged, false);
+      expect(fns(without.queries).every((f) => f.startsWith("sessions.search_reconcile_"))).toBe(true);
+      expect(without.queries).toHaveLength(1);
+      const withFacts = recorder(false);
+      await assertStagedStartupSchema(withFacts.db, staged, true);
+      expect(withFacts.queries).toHaveLength(2);
+      expect(fns(withFacts.queries).some((f) => f.startsWith("sessions.staged_facts_"))).toBe(true);
+      // A missing writer fails startup, naming the migration (as an explicit "true" always did).
+      await expect(assertStagedStartupSchema(recorder(true).db, staged, false)).rejects.toThrow("20261105062110_search_reconcile_staging.sql");
+    }
+    for (const env of [{ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }, { SEARCH_INDEX_STREAMING_ENABLED: "false" }]) {
+      const off = recorder(false);
+      await assertStagedStartupSchema(off.db, searchIndexStagedStartup(env, undefined, true).staged, true);
+      expect(off.queries).toEqual([]);
+    }
   });
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());

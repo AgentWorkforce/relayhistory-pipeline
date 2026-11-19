@@ -4,10 +4,10 @@
  * 20261105062110) instead of in memory, committed in batches under a run lease, so a crash
  * resumes at the committed cursor once the lease expires instead of starting over.
  *
- * Behind SEARCH_INDEX_STAGED_RECONCILE_ENABLED (default off). This module reads no
+ * Behind SEARCH_INDEX_STAGED_RECONCILE_ENABLED (default on since Phase 3 slice 4). This module reads no
  * environment and imports nothing from the consumer: every source read, index read and
  * write is a callback the caller injects (`StagedReconcileOps`), every transaction comes
- * from `deps.transact`. In this slice nothing calls it at runtime.
+ * from `deps.transact`. The consumer's staged run (search-index.ts stagedSearchScope) calls it.
  *
  * Phases (sessions.search_reconcile_runs_v1.phase), each batch its own committed transaction:
  *   want   passes 1-3 (the caller's `readSource`): the in-window index identities, staged in

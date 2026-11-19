@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STAGED_KEYED_RECORDS_CAP, STREAM_READ_CEILING, StagedRefusals, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamChFromEnv, searchIndexStreamFromEnv } from "../search-index.ts";
+import { REPLAY_SEARCH_INDEX_LIMITS, SEARCH_INDEX_DEFAULT_LIMITS, SEARCH_INDEX_STREAM_CH_CEILING, STAGED_KEYED_RECORDS_CAP, STREAM_READ_CEILING, StagedRefusals, searchIndexLimitsFromEnv, searchIndexStagedForIndex, searchIndexStagedOn, searchIndexStagedStartup, searchIndexStagedState, searchIndexStreamChFromEnv, searchIndexStreamFlag, searchIndexStreamFromEnv, searchIndexStreamStartup } from "../search-index.ts";
 
 const MiB = 1024 * 1024;
 const NAMES = ["SEARCH_INDEX_MAX_SCOPE_BYTES", "SEARCH_INDEX_MAX_SCOPE_EVENTS", "SEARCH_INDEX_MAX_ROWS"] as const;
@@ -141,7 +141,7 @@ describe("SEARCH_INDEX_STREAMING_CH (hosted Lambda streaming reconcile)", () => 
   });
 });
 
-describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Phase 3 slice 1)", () => {
+describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, default on since Phase 3 slice 4)", () => {
   const VAR = "SEARCH_INDEX_STAGED_RECONCILE_ENABLED";
   const stream = { ...STREAM_READ_CEILING };
   const refusal = (env: Record<string, string | undefined>, streaming: typeof stream | undefined, outputFacts: boolean) => {
@@ -152,42 +152,135 @@ describe("SEARCH_INDEX_STAGED_RECONCILE_ENABLED (self-host staged reconcile, Pha
     }
     return "accepted";
   };
+  const ON_LINE = "pipeline consumer staged reconcile on (keyed records cap 500000)";
+  const DEFAULT_LINE = "pipeline consumer staged reconcile on by default (keyed records cap 500000; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off)";
+  const OFF_STREAMING_LINE = "pipeline consumer staged reconcile off: SEARCH_INDEX_STREAMING_ENABLED=false (it runs only with streaming)";
+  const STAGED_INVALID = "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false";
+  const STAGED_NEEDS_STREAM = "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)";
+  const STREAM_WITH_FACTS = "pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true";
 
-  test("unset, empty and false are off: undefined, no notice, whatever streaming and output facts say", () => {
-    for (const env of [{}, { [VAR]: "" }, { [VAR]: "false" }])
-      for (const streaming of [stream, undefined])
-        for (const outputFacts of [false, true]) expect(searchIndexStagedStartup(env, streaming, outputFacts)).toBeUndefined();
+  // The full truth table, as serve() resolves it (streaming first, then the staged reconcile), written out by hand:
+  // staged x streaming x output facts -> the streaming flag and the staged state, or the startup error.
+  type Cell = { stream: string; staged: string } | { error: string };
+  const U = undefined;
+  const TABLE: Array<[string | undefined, string | undefined, boolean, Cell]> = [
+    // staged unset
+    [U, U, false, { stream: "default_on", staged: "default_on" }],
+    [U, U, true, { stream: "default_on", staged: "default_on" }],
+    [U, "true", false, { stream: "explicit_on", staged: "default_on" }],
+    [U, "true", true, { stream: "explicit_on", staged: "default_on" }],
+    [U, "false", false, { stream: "explicit_off", staged: "default_off_streaming" }],
+    [U, "false", true, { stream: "explicit_off", staged: "default_off_streaming" }],
+    // staged ""
+    ["", U, false, { stream: "default_on", staged: "default_on" }],
+    ["", U, true, { stream: "default_on", staged: "default_on" }],
+    ["", "true", false, { stream: "explicit_on", staged: "default_on" }],
+    ["", "true", true, { stream: "explicit_on", staged: "default_on" }],
+    ["", "false", false, { stream: "explicit_off", staged: "default_off_streaming" }],
+    ["", "false", true, { stream: "explicit_off", staged: "default_off_streaming" }],
+    // staged "true"
+    ["true", U, false, { stream: "default_on", staged: "explicit_on" }],
+    ["true", U, true, { stream: "default_on", staged: "explicit_on" }],
+    ["true", "true", false, { stream: "explicit_on", staged: "explicit_on" }],
+    ["true", "true", true, { stream: "explicit_on", staged: "explicit_on" }],
+    ["true", "false", false, { error: STAGED_NEEDS_STREAM }],
+    ["true", "false", true, { error: STAGED_NEEDS_STREAM }],
+    // staged "false": exactly the pre-staged answers
+    ["false", U, false, { stream: "default_on", staged: "explicit_off" }],
+    ["false", U, true, { stream: "default_off_output_facts", staged: "explicit_off" }],
+    ["false", "true", false, { stream: "explicit_on", staged: "explicit_off" }],
+    ["false", "true", true, { error: STREAM_WITH_FACTS }],
+    ["false", "false", false, { stream: "explicit_off", staged: "explicit_off" }],
+    ["false", "false", true, { stream: "explicit_off", staged: "explicit_off" }],
+    // staged "1": refused (streaming answers as with the staged reconcile off, and may refuse first)
+    ["1", U, false, { error: STAGED_INVALID }],
+    ["1", U, true, { error: STAGED_INVALID }],
+    ["1", "true", false, { error: STAGED_INVALID }],
+    ["1", "true", true, { error: STREAM_WITH_FACTS }],
+    ["1", "false", false, { error: STAGED_INVALID }],
+    ["1", "false", true, { error: STAGED_INVALID }],
+  ];
+
+  test("the truth table: staged {unset, \"\", true, false, 1} x streaming {unset, true, false} x output facts {off, on}", () => {
+    expect(TABLE).toHaveLength(30);
+    for (const [staged, streaming, facts, want] of TABLE) {
+      const env: Record<string, string | undefined> = {
+        ...(staged === undefined ? {} : { [VAR]: staged }),
+        ...(streaming === undefined ? {} : { SEARCH_INDEX_STREAMING_ENABLED: streaming }),
+      };
+      let got: Cell;
+      try {
+        const flag = searchIndexStreamFlag(env, facts);
+        const resolved = searchIndexStreamFromEnv(env, {}, facts);
+        const start = searchIndexStagedStartup(env, resolved, facts);
+        got = { stream: flag, staged: start.state };
+        // On exactly when the state says so, and then with streaming resolved on.
+        expect(!!start.staged, JSON.stringify(env)).toBe(start.state === "explicit_on" || start.state === "default_on");
+        if (start.staged) expect(resolved).toBeDefined();
+        expect(searchIndexStagedOn(env)).toBe(start.state === "explicit_on" || start.state === "default_on");
+        expect(searchIndexStagedState(env)).toBe(start.state);
+      } catch (error) {
+        got = { error: (error as Error).message };
+      }
+      expect(got, `staged=${String(staged)} streaming=${String(streaming)} facts=${facts}`).toEqual(want);
+    }
   });
 
-  test("true with streaming on is on, with the interim keyed-records cap and one info line", () => {
+  test("one startup line per state but explicit_off; explicit_off logs nothing and stages nothing", () => {
+    expect(searchIndexStagedStartup({ [VAR]: "false" }, stream, false)).toEqual({ state: "explicit_off" });
+    expect(searchIndexStagedStartup({ [VAR]: "false" }, undefined, true)).toEqual({ state: "explicit_off" });
+    expect(searchIndexStagedStartup({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, undefined, false)).toEqual({
+      state: "default_off_streaming",
+      notice: { level: "info", message: OFF_STREAMING_LINE, fields: { state: "off", reason: "streaming_off" } },
+    });
+    for (const env of [{}, { [VAR]: "" }])
+      expect(searchIndexStagedStartup(env, stream, false)).toEqual({
+        state: "default_on",
+        staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) },
+        notice: { level: "info", message: DEFAULT_LINE, fields: { state: "on" } },
+      });
+    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, false)).toEqual({
+      state: "explicit_on",
+      staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) },
+      notice: { level: "info", message: ON_LINE, fields: { state: "on" } },
+    });
+  });
+
+  test("on: the interim keyed-records cap, a fresh StagedRefusals per start; explicitly on needs streaming", () => {
     expect(STAGED_KEYED_RECORDS_CAP).toBe(500_000);
     // The cap never asks for more key memory than the default streaming budgets already stream.
     expect(STAGED_KEYED_RECORDS_CAP).toBeLessThanOrEqual(STREAM_READ_CEILING.maxReadEvents / 4);
-    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, false)).toEqual({
-      staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) },
-      notice: { level: "info", message: "pipeline consumer staged reconcile on (keyed records cap 500000)", fields: { state: "on" } },
-    });
-    // Streaming resolved on by default (SEARCH_INDEX_STREAMING_ENABLED unset) is enough.
-    const defaultOn = searchIndexStreamFromEnv({}, {}, false);
-    expect(searchIndexStagedStartup({ [VAR]: "true" }, defaultOn, false)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) });
-  });
-
-  test("true needs streaming on, naming the variables; with output facts it starts (slice 2c stages them)", () => {
-    expect(refusal({ [VAR]: "true" }, undefined, false)).toBe(
-      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
-    );
-    // Streaming explicitly off resolves to no budgets: refused the same way.
-    expect(refusal({ [VAR]: "true" }, searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, false), false)).toContain("requires the streaming reconcile on");
-    // Output facts on: started with streaming on, refused without it, as without facts.
-    expect(searchIndexStagedStartup({ [VAR]: "true" }, stream, true)?.staged).toEqual({ keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: expect.any(StagedRefusals) });
-    // Each start holds its own (empty) cached size refusals.
-    const a = searchIndexStagedStartup({ [VAR]: "true" }, stream, true)!.staged.refusals;
-    const b = searchIndexStagedStartup({ [VAR]: "true" }, stream, true)!.staged.refusals;
+    const a = searchIndexStagedStartup({}, stream, true).staged!.refusals;
+    const b = searchIndexStagedStartup({ [VAR]: "true" }, stream, true).staged!.refusals;
     expect(a).not.toBe(b);
     expect([a!.size, b!.size]).toEqual([0, 0]);
-    expect(refusal({ [VAR]: "true" }, undefined, true)).toBe(
-      "pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)",
-    );
+    expect(refusal({ [VAR]: "true" }, undefined, false)).toBe(STAGED_NEEDS_STREAM);
+    expect(refusal({ [VAR]: "true" }, undefined, true)).toBe(STAGED_NEEDS_STREAM);
+  });
+
+  test("an index without keyset pages: explicitly on refuses to start, by default the staged reconcile is off with a warn line", () => {
+    const without = {};
+    const withPages = { scanFingerprintsPage: () => undefined };
+    const explicit = searchIndexStagedStartup({ [VAR]: "true" }, stream, false);
+    const byDefault = searchIndexStagedStartup({}, stream, false);
+    expect(() => searchIndexStagedForIndex(explicit, without)).toThrow("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires a search index with paged scans");
+    expect(searchIndexStagedForIndex(byDefault, without)).toEqual({
+      notice: { level: "warn", message: expect.stringContaining("no paged scans"), fields: { state: "off", reason: "no_paged_scan" } },
+    });
+    expect(searchIndexStagedForIndex(explicit, withPages)).toEqual({ staged: explicit.staged });
+    expect(searchIndexStagedForIndex(byDefault, withPages)).toEqual({ staged: byDefault.staged });
+    expect(searchIndexStagedForIndex(searchIndexStagedStartup({ [VAR]: "false" }, stream, false), without)).toEqual({});
+    // With output facts the fallback puts streaming back off, with exactly the line the flag off gives:
+    // the consumer is then on today's path (facts from a whole read, a too-large scope scope_too_large).
+    const factsDefault = searchIndexStagedStartup({}, stream, true);
+    const today = searchIndexStreamStartup({ [VAR]: "false" }, {}, true);
+    expect(today.stream).toBeUndefined();
+    expect(searchIndexStagedForIndex(factsDefault, without, true)).toEqual({
+      notice: expect.objectContaining({ fields: { state: "off", reason: "no_paged_scan" } }),
+      streamOff: today.notice,
+    });
+    expect(searchIndexStagedForIndex(factsDefault, withPages, true)).toEqual({ staged: factsDefault.staged });
+    expect(searchIndexStagedForIndex(byDefault, without, false).streamOff).toBeUndefined();
   });
 
   test("any other value fails startup with a fixed message that never carries the value", () => {

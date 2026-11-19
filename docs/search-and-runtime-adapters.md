@@ -71,7 +71,7 @@ interface SearchIndexAdapter {
 
 `scanFingerprintsPage` is optional, except that the self-host consumer refuses to start with
 `SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true` on an index without it (the Postgres and OpenSearch adapters
-have it). One call returns at most `limit` rows (`limit` is 1..5000, `MAX_SCAN_PAGE`) of the rows
+have it); by default (the flag unset) the staged reconcile is then off instead, with a warn line. One call returns at most `limit` rows (`limit` is 1..5000, `MAX_SCAN_PAGE`) of the rows
 `scanFingerprints` would return, in the same page order, strictly after `after` and strictly increasing.
 `next` is present only when another page may exist, and is then exactly the position of the last row
 returned (pass it back as `after`); an empty page has no `next`. The consumer refuses a page that breaks

@@ -90,16 +90,19 @@
  *                                   searchIndexStreamFromEnv). Unset: 2 GiB / 2000000
  *                                   (scopes up to 512 MiB / 500000 stream); accepted
  *                                   from 4x the limits above up to that
- *   SEARCH_INDEX_STAGED_RECONCILE_ENABLED     enabled only, default off (unset, "" or "false"):
- *                                   exactly "true" turns on the staged reconcile (Phase 3
- *                                   slice 1, search-index.ts searchIndexStagedStartup): the
- *                                   index scan walks keyset pages (no search_index_truncated
- *                                   up to the cap), the streaming budgets above bound each
- *                                   pass instead of their sum, and the records one pass keys
- *                                   are capped at 500000 (stream_keyed_records_cap). "true"
- *                                   fails startup unless streaming resolved on; with
- *                                   RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true" it stages the
- *                                   facts (slice 2c, migration 20261105062140); any other
+ *   SEARCH_INDEX_STAGED_RECONCILE_ENABLED     enabled only, default on since Phase 3 slice 4
+ *                                   (unset or ""; search-index.ts searchIndexStagedState):
+ *                                   the staged reconcile: the index scan walks keyset pages
+ *                                   (no search_index_truncated up to the cap), the streaming
+ *                                   budgets above bound each pass instead of their sum, and
+ *                                   the records one pass keys are capped at 500000
+ *                                   (stream_keyed_records_cap). Unset with
+ *                                   SEARCH_INDEX_STREAMING_ENABLED="false" is off (one info
+ *                                   line, no failure); "false" is off exactly as before the
+ *                                   staged reconcile; "true" fails startup unless streaming
+ *                                   resolved on. On, migration 20261105062110 is required at
+ *                                   startup, and with RELAYHISTORY_SELFHOST_OUTPUT_FACTS="true"
+ *                                   it stages the facts (migration 20261105062140); any other
  *                                   value fails startup. Never read by the hosted Lambda or
  *                                   the large-read worker
  *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |

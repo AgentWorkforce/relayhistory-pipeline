@@ -184,8 +184,8 @@ export interface SearchIndexDeps {
   /** Tests only: how often the streaming reader keeps its transaction busy (default 20 s). */
   streamKeepaliveMs?: number;
   /**
-   * SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true only (the self-host consumer, with `stream`, never
-   * with output facts; searchIndexStagedStartup), Phase 3 slice 1: the index scan of every pass
+   * The staged reconcile (the self-host consumer only, with `stream`; searchIndexStagedStartup, on by
+   * default since Phase 3 slice 4; with output facts their hooks stage them), Phase 3 slice 1: the index scan of every pass
    * walks the adapter's keyset pages (scanFingerprintsPage) instead of one read bounded by
    * SEARCH_INDEX_MAX_ROWS, so there is no `search_index_truncated`; the streaming budgets bound
    * each pass, not their sum, so there is no four-times refusal; and the records one pass keys
@@ -1503,6 +1503,13 @@ export interface SearchIndexStreamNotice {
  * logs that reason (info) instead of failing; budgets no scope can use log a warning.
  * Throws exactly as searchIndexStreamFlag / searchIndexStreamFromEnv do.
  */
+/** The streaming-off line output facts give while the staged reconcile is off (searchIndexStreamStartup). */
+const STREAMING_OFF_FOR_FACTS: SearchIndexStreamNotice = {
+  level: "info",
+  message: "pipeline consumer streaming reconcile off: RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true builds facts from a whole read",
+  fields: { streaming: "off", reason: "output_facts" },
+};
+
 export function searchIndexStreamStartup(
   env: Record<string, string | undefined>,
   limits: Partial<SearchIndexLimits>,
@@ -1510,15 +1517,7 @@ export function searchIndexStreamStartup(
 ): { stream: StreamReadLimits | undefined; notice: SearchIndexStreamNotice | undefined } {
   const flag = searchIndexStreamFlag(env, outputFacts);
   const stream = searchIndexStreamFromEnv(env, limits, outputFacts);
-  if (flag === "default_off_output_facts")
-    return {
-      stream,
-      notice: {
-        level: "info",
-        message: "pipeline consumer streaming reconcile off: RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true builds facts from a whole read",
-        fields: { streaming: "off", reason: "output_facts" },
-      },
-    };
+  if (flag === "default_off_output_facts") return { stream, notice: STREAMING_OFF_FOR_FACTS };
   const budget = searchIndexStreamBudgetWarning(stream, limits);
   return {
     stream,
@@ -1547,48 +1546,101 @@ function stagedScanBounds(staged: StagedReconcile, limits: SearchIndexLimits): {
 }
 
 /**
- * SEARCH_INDEX_STAGED_RECONCILE_ENABLED for the indexer SERVICE (consumer-service.ts serve()
- * only; the hosted Lambda and the large-read worker never read it), Phase 3 slice 1, default
- * off:
+ * How SEARCH_INDEX_STAGED_RECONCILE_ENABLED resolved for the indexer SERVICE (consumer-service.ts
+ * serve() only; the hosted Lambda and the large-read worker never read it). Phase 3 slice 4: default on.
  *
- *   unset or ""  off (returns undefined: the search deps carry no `staged`)
- *   "false"      off
- *   "true"       on (SearchIndexDeps.staged); fails startup unless the streaming reconcile
- *                resolved on (`stream`, SEARCH_INDEX_STREAMING_ENABLED); with
- *                RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true the facts are staged (slice 2c)
- *   anything     else fails startup ("1", "TRUE" and padded values included)
+ *   "true"            explicit_on: on; fails startup unless the streaming reconcile resolved on
+ *   "false"           explicit_off: off, exactly the pre-staged path (no log line, no query)
+ *   unset or ""       default_on: on, as explicit_on, unless SEARCH_INDEX_STREAMING_ENABLED is
+ *                     exactly "false": default_off_streaming (off, one info line, no failure)
+ *   anything else     fails startup ("1", "TRUE" and padded values included)
  *
- * Errors name the variables, never a value. On: `notice` is the one startup log line.
+ * The one place that decides it. It reads only the staged value and whether streaming is exactly
+ * "false", so it never depends on how streaming itself resolved: searchIndexStreamFlag follows it
+ * (with the staged reconcile on, output facts no longer hold streaming off), and
+ * searchIndexStagedStartup returns it. Errors name the variable, never a value.
  */
-/**
- * Whether the staged reconcile is on: SEARCH_INDEX_STAGED_RECONCILE_ENABLED is exactly "true". The one
- * place that decides it (searchIndexStagedStartup validates the value; streaming and the output
- * facts follow this answer).
- */
-export function searchIndexStagedOn(env: Record<string, string | undefined>): boolean {
-  return env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED === "true";
+export type SearchIndexStagedState = "explicit_on" | "explicit_off" | "default_on" | "default_off_streaming";
+
+export function searchIndexStagedState(env: Record<string, string | undefined>): SearchIndexStagedState {
+  const flag = env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED;
+  if (flag === "true") return "explicit_on";
+  if (flag === "false") return "explicit_off";
+  if (flag === undefined || flag === "") return env.SEARCH_INDEX_STREAMING_ENABLED === "false" ? "default_off_streaming" : "default_on";
+  throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
 }
 
+/** Whether the staged reconcile is on (searchIndexStagedState); an invalid value is not on (startup refuses it). */
+export function searchIndexStagedOn(env: Record<string, string | undefined>): boolean {
+  try {
+    const state = searchIndexStagedState(env);
+    return state === "explicit_on" || state === "default_on";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * serve()'s staged deps for the resolved state: `staged` when on, and at most one startup log line
+ * (`notice`) for every state but explicit_off. On (explicit or default) needs the streaming reconcile
+ * resolved on: explicitly "true" without it fails startup; by default it cannot happen (streaming
+ * "false" is default_off_streaming, and output facts no longer hold streaming off). With
+ * RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true the facts are staged (slice 2c, migration 20261105062140).
+ */
 export function searchIndexStagedStartup(
   env: Record<string, string | undefined>,
   stream: StreamReadLimits | undefined,
   _outputFacts: boolean,
-): { staged: StagedReconcile; notice: SearchIndexStreamNotice } | undefined {
-  const flag = env.SEARCH_INDEX_STAGED_RECONCILE_ENABLED;
-  if (flag === undefined || flag === "" || flag === "false") return undefined;
-  if (!searchIndexStagedOn(env)) throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED must be true or false");
-  // RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true is accepted: its Postgres facts are staged by the run's
-  // hooks (stagedOutputFactsHooks, migration 20261105062140).
+): { state: SearchIndexStagedState; staged?: StagedReconcile; notice?: SearchIndexStreamNotice } {
+  const state = searchIndexStagedState(env);
+  if (state === "explicit_off") return { state };
+  if (state === "default_off_streaming")
+    return {
+      state,
+      notice: {
+        level: "info",
+        message: "pipeline consumer staged reconcile off: SEARCH_INDEX_STREAMING_ENABLED=false (it runs only with streaming)",
+        fields: { state: "off", reason: "streaming_off" },
+      },
+    };
   if (!stream)
     throw new Error("pipeline consumer: SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true requires the streaming reconcile on (SEARCH_INDEX_STREAMING_ENABLED)");
   return {
+    state,
     staged: { keyedRecordsCap: STAGED_KEYED_RECORDS_CAP, refusals: new StagedRefusals() },
     notice: {
       level: "info",
       // Allowlisted log fields only (src/shared/log.ts): the cap is a constant, so it rides in the message.
-      message: `pipeline consumer staged reconcile on (keyed records cap ${STAGED_KEYED_RECORDS_CAP})`,
+      message: state === "explicit_on"
+        ? `pipeline consumer staged reconcile on (keyed records cap ${STAGED_KEYED_RECORDS_CAP})`
+        : `pipeline consumer staged reconcile on by default (keyed records cap ${STAGED_KEYED_RECORDS_CAP}; SEARCH_INDEX_STAGED_RECONCILE_ENABLED=false turns it off)`,
       fields: { state: "on" },
     },
+  };
+}
+
+/**
+ * The staged deps for the composed search index. An index without keyset pages (scanFingerprintsPage):
+ * explicit_on refuses to start (assertStagedSearchIndex); by default the staged reconcile is off with a
+ * warn line, never a failure (both shipped backends have them, so the service never gets here). With
+ * output facts on, that fallback also turns streaming off again (`streamOff`, with today's streaming-off
+ * line): streaming resolved on only because the staged run would carry the facts, so without it the
+ * consumer is exactly on the path the staged reconcile off gives.
+ */
+export function searchIndexStagedForIndex(
+  started: ReturnType<typeof searchIndexStagedStartup>,
+  index: { scanFingerprintsPage?: unknown },
+  outputFacts = false,
+): { staged?: StagedReconcile; notice?: SearchIndexStreamNotice; streamOff?: SearchIndexStreamNotice } {
+  if (!started.staged || typeof index.scanFingerprintsPage === "function") return started.staged ? { staged: started.staged } : {};
+  if (started.state === "explicit_on") assertStagedSearchIndex(started.staged, index);
+  return {
+    notice: {
+      level: "warn",
+      message: "pipeline consumer staged reconcile off: the search index has no paged scans (SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true would refuse to start)",
+      fields: { state: "off", reason: "no_paged_scan" },
+    },
+    ...(outputFacts ? { streamOff: STREAMING_OFF_FOR_FACTS } : {}),
   };
 }
 

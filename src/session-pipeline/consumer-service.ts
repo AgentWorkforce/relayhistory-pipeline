@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { assertStagedOutputFactsSchema, postgresOutputFactsStore } from "./output-facts-store.ts";
-import { assertStagedSearchIndex, searchIndexLimitsFromEnv, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
+import { searchIndexLimitsFromEnv, searchIndexStagedForIndex, searchIndexStagedStartup, searchIndexStreamStartup, type SearchIndexDeps } from "./search-index.ts";
 import { assertStagedReconcileSchema } from "./staged-reconcile.ts";
 import {
   ingestLoginIdentity,
@@ -988,6 +988,17 @@ export async function assertSearchTenantGate(db: SqlExecutor): Promise<void> {
   }
 }
 
+/**
+ * The staged reconcile on (explicitly or by default): the 062110 writers must exist, and with output facts
+ * the 062140 writers too, or startup fails naming the migration, checked now rather than on the first
+ * large scope. Off: no query.
+ */
+export async function assertStagedStartupSchema(db: SqlExecutor, staged: unknown, outputFacts: boolean): Promise<void> {
+  if (!staged) return;
+  await assertStagedReconcileSchema(db);
+  if (outputFacts) await assertStagedOutputFactsSchema(db);
+}
+
 export async function assertServiceSchema(db: SqlExecutor): Promise<void> {
   for (const table of ["sessions.search_consumer_pending", "sessions.search_consumer_progress"]) {
     const { rows } = await db.query<{ present: boolean }>(`SELECT to_regclass($1) IS NOT NULL AS present`, [table]);
@@ -1153,14 +1164,17 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // startup, unless the staged reconcile is on, which stages the facts): the streaming reconcile for a scope past the whole-read bound, within
   // SEARCH_INDEX_STREAM_MAX_READ_* (search-index.ts searchIndexStreamStartup). Off returns
   // undefined and the search deps carry no `stream`.
-  const { stream: searchStream, notice: streamNotice } = searchIndexStreamStartup(env, searchLimits, config.outputFacts);
+  const { stream: resolvedStream, notice: streamNotice } = searchIndexStreamStartup(env, searchLimits, config.outputFacts);
+  let searchStream = resolvedStream;
   if (streamNotice) log[streamNotice.level](streamNotice.message, { service: "session-pipeline-consumer", ...streamNotice.fields });
-  // SEARCH_INDEX_STAGED_RECONCILE_ENABLED, default off (Phase 3 slice 1; search-index.ts
-  // searchIndexStagedStartup): "true" needs streaming on; with output facts on, they are staged
-  // by the run's hooks (migration 20261105062140). Off returns
-  // undefined, logs nothing, and the search deps carry no `staged`.
-  const searchStaged = searchIndexStagedStartup(env, searchStream, config.outputFacts);
-  if (searchStaged) log.info(searchStaged.notice.message, { service: "session-pipeline-consumer", ...searchStaged.notice.fields });
+  // SEARCH_INDEX_STAGED_RECONCILE_ENABLED, default on since Phase 3 slice 4 (search-index.ts
+  // searchIndexStagedState / searchIndexStagedStartup): on unless "false", or unset with streaming
+  // "false"; "true" needs streaming on; with output facts on, they are staged by the run's hooks
+  // (migration 20261105062140). Off stages nothing (explicit "false" logs nothing either), and the
+  // search deps carry no `staged`.
+  const stagedStart = searchIndexStagedStartup(env, searchStream, config.outputFacts);
+  if (stagedStart.notice) log[stagedStart.notice.level](stagedStart.notice.message, { service: "session-pipeline-consumer", ...stagedStart.notice.fields });
+  let searchStaged = stagedStart.staged;
   // Dormant never opens a database, so smuggled startup options there are
   // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);
@@ -1177,11 +1191,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   await assertRuntimeIdentity(db);
   await assertServiceSchema(db);
   await assertSearchTenantGate(db);
-  // SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true: the 062110 writers must exist (names the
-  // migration), checked now rather than on the first large scope. Off: no query.
-  if (searchStaged) await assertStagedReconcileSchema(db);
-  // With output facts too: the 062140 writers must exist (names the migration).
-  if (searchStaged && config.outputFacts) await assertStagedOutputFactsSchema(db);
+  await assertStagedStartupSchema(db, searchStaged, config.outputFacts);
   // A healthy start clears a stale UNHEALTHY marker from an earlier crash
   // loop; without this the marker is sticky across restarts.
   clearUnhealthyFile(config.unhealthyFile);
@@ -1201,7 +1211,15 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
 
   // The staged reconcile walks the index in keyset pages: refuse an index without them now,
   // not on the first scope.
-  assertStagedSearchIndex(searchStaged?.staged, binding.index);
+  // Explicitly on refuses an index without keyset pages; by default the staged reconcile is then off.
+  const stagedIndexed = searchIndexStagedForIndex(stagedStart, binding.index, config.outputFacts);
+  if (stagedIndexed.notice) log[stagedIndexed.notice.level](stagedIndexed.notice.message, { service: "session-pipeline-consumer", ...stagedIndexed.notice.fields });
+  searchStaged = stagedIndexed.staged;
+  // Without the staged run, output facts hold streaming off again, exactly as with the flag off.
+  if (stagedIndexed.streamOff) {
+    searchStream = undefined;
+    log[stagedIndexed.streamOff.level](stagedIndexed.streamOff.message, { service: "session-pipeline-consumer", ...stagedIndexed.streamOff.fields });
+  }
   const raw = lockerStore();
   const reader = lockerManifestReader();
   const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: config.keyPrefix };
@@ -1241,7 +1259,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
     ...(Object.keys(searchLimits).length ? { limits: searchLimits } : {}),
     ...(searchStream ? { stream: searchStream } : {}),
-    ...(searchStaged ? { staged: searchStaged.staged } : {}),
+    ...(searchStaged ? { staged: searchStaged } : {}),
     ...outputFactsDeps(config),
     ...(config.originLabels ? { originLabels: true as const } : {}),
   };

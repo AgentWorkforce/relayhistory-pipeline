@@ -698,10 +698,64 @@ describe("the facts pass's record bytes bound (STAGED_FACTS_RECORD_BYTES_CAP, wi
   });
 });
 
+describe("upgrading to the default-on image: the first pass over scopes the pre-flip paths indexed", () => {
+  let x: ExportedScope;
+  beforeAll(async () => {
+    x = await exportStreamScope(generate(31), 1200);
+    cleanup.length = 0;
+  }, 180_000);
+  afterAll(() => x?.dispose());
+  /** serve()'s staged deps with the flag unset (the new default). */
+  const byDefault = (): StagedReconcile => {
+    const started = searchIndexStagedStartup({}, UNLIMITED, false);
+    expect(started.state).toBe("default_on");
+    return started.staged!;
+  };
+  const index = async (r: Awaited<ReturnType<typeof rig>>) =>
+    (await r.hoop.pg.query<{ n: number }>("SELECT count(*)::int n FROM sessions.search_reconcile_runs_v1")).rows[0]!.n;
+
+  test("a scope the whole read indexed: the default-on pass takes the whole read again, re-sends and deletes nothing, starts no staged run", async () => {
+    const r = await rig(x);
+    await r.tick({});
+    const before = await r.pass({});
+    expect(before).toMatchObject({ complete: true });
+    const after = await r.pass({ stream: UNLIMITED, staged: byDefault() });
+    expect(after).toMatchObject({ complete: true, inserted: 0, deleted: 0 });
+    expect(after.stream).toBeUndefined();
+    expect(await index(r)).toBe(0);
+  }, 180_000);
+
+  test("a scope the in-transaction stream indexed: the default-on pass runs it staged, reads the source again, re-sends and deletes nothing", async () => {
+    const r = await rig(x);
+    await r.tick({});
+    // Pre-flip: past the whole-read bound, streamed inside the index transaction.
+    const before = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED });
+    expect(before).toMatchObject({ complete: true });
+    expect(before.stream).toBeDefined();
+    const after = await r.pass({ limits: STAGED_LIMITS, stream: UNLIMITED, staged: byDefault() });
+    expect(after).toMatchObject({ complete: true, inserted: 0, deleted: 0, reasons: [] });
+    expect(after.stream!.passes).toBeGreaterThanOrEqual(3); // the source is read again (passes 1-3)
+    expect(await index(r)).toBe(0); // the run finished and left nothing staged
+  }, 180_000);
+
+  test("with output facts: a too-large scope the pre-flip path left without facts gets them on the first default-on pass", async () => {
+    const r = await rig(x);
+    await r.tick({});
+    // Pre-flip with output facts: streaming was off by default, so the scope stayed scope_too_large.
+    const before = await r.pass({ ...FACTS, limits: STAGED_LIMITS });
+    expect(before).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large"] });
+    expect((await r.facts()).events).toEqual([]);
+    const after = await r.pass({ ...FACTS, limits: STAGED_LIMITS, stream: UNLIMITED, staged: byDefault() });
+    expect(after).toMatchObject({ complete: true });
+    expect(after.outputFacts).toMatchObject({ complete: true, deleted: 0 });
+    expect((await r.facts()).events.length).toBeGreaterThan(10);
+  }, 180_000);
+});
+
 describe("startup with output facts and the staged reconcile", () => {
   const FACTS_ENV = { RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" };
-  test("staged flag off: every streaming answer and notice is today's, byte for byte", () => {
-    for (const staged of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "" }, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }]) {
+  test("staged flag explicitly off: every streaming answer and notice is the pre-staged one, byte for byte", () => {
+    for (const staged of [{ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }]) {
       const env = { ...FACTS_ENV, ...staged };
       expect(searchIndexStagedOn(env)).toBe(false);
       expect(searchIndexStreamStartup(env, {}, true)).toEqual({
@@ -715,7 +769,20 @@ describe("startup with output facts and the staged reconcile", () => {
       expect(() => searchIndexStreamStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "true" }, {}, true)).toThrow(
         new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true"),
       );
-      expect(searchIndexStagedStartup(env, undefined, true)).toBeUndefined();
+      expect(searchIndexStagedStartup(env, undefined, true)).toEqual({ state: "explicit_off" });
+    }
+  });
+  test("staged flag unset or empty (on by default): output facts no longer hold streaming off; the staged run starts", () => {
+    for (const staged of [{}, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "" }]) {
+      const env = { ...FACTS_ENV, ...staged };
+      expect(searchIndexStagedOn(env)).toBe(true);
+      const { stream, notice } = searchIndexStreamStartup(env, {}, true);
+      expect([stream !== undefined, notice]).toEqual([true, undefined]);
+      expect(searchIndexStreamStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "true" }, {}, true).stream).toBeDefined();
+      expect(searchIndexStagedStartup(env, stream, true)).toMatchObject({ state: "default_on", staged: { keyedRecordsCap: 500_000 } });
+      // Unset with streaming explicitly off: off, no failure.
+      const off = searchIndexStreamStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, true);
+      expect(searchIndexStagedStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "false" }, off.stream, true)).toMatchObject({ state: "default_off_streaming" });
     }
   });
   test("staged flag on: output facts no longer hold streaming off; the staged run starts; invalid values still fail", () => {
@@ -725,7 +792,7 @@ describe("startup with output facts and the staged reconcile", () => {
     expect(stream).toBeDefined();
     expect(notice).toBeUndefined();
     expect(searchIndexStreamStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "true" }, {}, true).stream).toBeDefined();
-    expect(searchIndexStagedStartup(env, stream, true)?.staged).toBeDefined();
+    expect(searchIndexStagedStartup(env, stream, true).staged).toBeDefined();
     // Explicit streaming off still refuses the staged flag, facts or not.
     const off = searchIndexStreamStartup({ ...env, SEARCH_INDEX_STREAMING_ENABLED: "false" }, {}, true);
     expect(() => searchIndexStagedStartup(env, off.stream, true)).toThrow(/requires the streaming reconcile on/);
@@ -767,12 +834,13 @@ describe("Azure-shaped self-host consumer with output facts and the staged recon
   afterEach(() => {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   });
-  test("LOCKER_PROVIDER=azure, RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, SEARCH_INDEX_STAGED_RECONCILE_ENABLED=true: serve()'s startup chain to the search deps", () => {
+  for (const staged of [undefined, "true"] as const)
+  test(`LOCKER_PROVIDER=azure, RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, SEARCH_INDEX_STAGED_RECONCILE_ENABLED ${staged === undefined ? "unset (the default)" : "=true"}: serve()'s startup chain to the search deps`, () => {
     const env: Record<string, string> = {
       LOCKER_PROVIDER: "azure", LOCKER_BUCKET: "sessions", LOCKER_AZURE_ACCOUNT: "devstoreaccount1",
       LOCKER_AZURE_ACCOUNT_KEY: Buffer.from("synthetic-azure-account-key").toString("base64"),
       RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER: "true", PIPELINE_ORG_FROM_PREFIX: "true",
-      RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true", SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true",
+      RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true", ...(staged ? { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: staged } : {}),
       RELAYHISTORY_PIPELINE_CONSUMER_SECRET: JSON.stringify({ hoopdb_url: "postgres://consumer@db.invalid:5432/hoop" }),
       SESSION_POSTGRES_TLS_PROFILE: "custom-ca", SEARCH_INDEX_BACKEND: "postgres", SEARCH_INDEX_POSTGRES_BACKEND_ID: "pg-1",
       PIPELINE_KEY_PREFIX: "96bulls", READ_API_COMPLETE_SINCE: "epoch",
@@ -784,9 +852,10 @@ describe("Azure-shaped self-host consumer with output facts and the staged recon
     expect(config).toMatchObject({ enabled: true, outputFacts: true });
     if (!config.enabled) throw new Error("unreachable");
     const { stream } = searchIndexStreamStartup(process.env, {}, config.outputFacts);
-    const staged = searchIndexStagedStartup(process.env, stream, config.outputFacts);
+    const started = searchIndexStagedStartup(process.env, stream, config.outputFacts);
     expect(stream).toBeDefined();
-    expect(staged?.staged).toBeDefined();
+    expect(started.staged).toBeDefined();
+    expect(started.state).toBe(staged === undefined ? "default_on" : "explicit_on");
     expect(outputFactsDeps(config).outputFactsStore).toBe(postgresOutputFactsStore);
     // runWorker past the vendored bindings with the consumer's own Azure Locker store.
     validateAdapterEnv(process.env, workerAdapterEntry(CONSUMER_WORKER));

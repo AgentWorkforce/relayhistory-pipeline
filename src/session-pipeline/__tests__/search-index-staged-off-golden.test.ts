@@ -1,6 +1,8 @@
 /**
- * SEARCH_INDEX_STAGED_RECONCILE_ENABLED unset must leave the search pass byte-identical to
- * the base commit (Phase 3 slice 1). The consumer's event path (processBatch) runs the
+ * SEARCH_INDEX_STAGED_RECONCILE_ENABLED off must leave the search pass byte-identical to the base
+ * commit (Phase 3 slice 1). Since the default flip (slice 4) off is "false", or unset with
+ * SEARCH_INDEX_STREAMING_ENABLED=false; each run's `staged` comes from searchIndexStagedStartup over
+ * that env, as serve() builds it. The consumer's event path (processBatch) runs the
  * search-index-stream / consumer-large fixtures through a recording search transaction
  * (SQL text and parameters), a recording adapter (every index and projection-state call
  * with its arguments) and the consumer's log records, and compares them to a golden
@@ -25,7 +27,7 @@ import { composeSearchService } from "../../shared/search-composition.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout } from "../pointer.ts";
 import type { SearchProjectionState, SearchServiceBinding } from "../search-adapter.ts";
-import type { SearchIndexDeps } from "../search-index.ts";
+import { searchIndexStagedStartup, STREAM_READ_CEILING, type SearchIndexDeps } from "../search-index.ts";
 import { exportStreamScope, generate, prefixFor } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { clonedReplayDatabase, closeReplayTemplate } from "./replay-fixture.ts";
 
@@ -87,7 +89,14 @@ const SCENARIOS: Scenario[] = [
   { name: "streaming off: too large stays partial", seed: 46, runs: [{ limits: TINY }] },
 ];
 
-async function record(s: Scenario): Promise<Entry[]> {
+/** The env each golden run's staged reconcile resolves from: explicitly off, and unset with streaming off. */
+type OffEnv = "false" | "unset_streaming_false";
+const OFF_ENV: Record<OffEnv, Record<string, string>> = {
+  false: { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" },
+  unset_streaming_false: { SEARCH_INDEX_STREAMING_ENABLED: "false" },
+};
+
+async function record(s: Scenario, off: OffEnv = "false"): Promise<Entry[]> {
   const out: Entry[] = [];
   const x = await clonedReplayDatabase();
   cleanup.push(() => x.pg.close());
@@ -141,7 +150,7 @@ async function record(s: Scenario): Promise<Entry[]> {
         allowPrefix: (p: string, o: string) => prefixAllowed(bindings, p, o),
         fanout: droppedFanout,
       } as never,
-      search: { ...base, ...extra },
+      search: { ...base, ...extra, ...stagedFrom(off, extra) },
     };
     const lines: Entry[] = [];
     const stdout = process.stdout.write, stderr = process.stderr.write;
@@ -170,10 +179,22 @@ async function record(s: Scenario): Promise<Entry[]> {
   return out;
 }
 
-test("staged reconcile unset: SQL, parameters, adapter calls and log records equal the base commit's golden", async () => {
+/** serve()'s staged deps for this env: off, so none (asserted), whatever streaming the run has. */
+function stagedFrom(off: OffEnv, extra: Partial<SearchIndexDeps>): Partial<SearchIndexDeps> {
+  const start = searchIndexStagedStartup(OFF_ENV[off], extra.stream ?? (off === "false" ? STREAM_READ_CEILING : undefined), false);
+  expect(start.state).toBe(off === "false" ? "explicit_off" : "default_off_streaming");
+  expect(start.staged).toBeUndefined();
+  return start.staged ? { staged: start.staged } : {};
+}
+
+test("staged reconcile off (\"false\", or unset with streaming \"false\"): SQL, parameters, adapter calls and log records equal the base commit's golden", async () => {
   const got: Record<string, Entry[]> = {};
+  const streamingOff = SCENARIOS.find((s) => s.name === "streaming off: too large stays partial")!;
+  let unsetStreamingFalse: Entry[] = [];
   try {
-    for (const s of SCENARIOS) got[s.name] = await record(s);
+    for (const s of SCENARIOS) got[s.name] = await record(s, "false");
+    // Unset with streaming explicitly off: the scenario without streaming, the same golden.
+    unsetStreamingFalse = await record(streamingOff, "unset_streaming_false");
   } finally {
     await closeReplayTemplate();
   }
@@ -181,6 +202,7 @@ test("staged reconcile unset: SQL, parameters, adapter calls and log records equ
   const golden = JSON.parse(readFileSync(GOLDEN, "utf8")) as Record<string, Entry[]>;
   expect(Object.keys(got)).toEqual(Object.keys(golden));
   for (const s of SCENARIOS) expect(got[s.name]).toEqual(golden[s.name]!);
+  expect(unsetStreamingFalse).toEqual(golden[streamingOff.name]!);
   // The golden exercises what the staged reconcile changes when on: both truncations, a
   // streamed pass and the four-times refusal.
   const reasons = JSON.stringify(golden);

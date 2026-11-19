@@ -17,6 +17,18 @@ on:
       - scripts/opensearch-proof/**
       - src/session-pipeline/search-adapter*
       - src/session-pipeline/pointer.ts
+      # The staged reconcile on this backend (staged-search-opensearch.pglite.test.ts) and what it runs.
+      - src/session-pipeline/__tests__/staged-search-opensearch.pglite.test.ts
+      - src/session-pipeline/search-index.ts
+      - src/session-pipeline/staged-reconcile.ts
+      - src/session-pipeline/output-facts*.ts
+      - src/session-pipeline/consumer.ts
+      - src/session-pipeline/consumer-service.ts
+      - src/session-read-api/canonical-stream-projection.ts
+      - src/shared/opensearch-composition.ts
+      - src/shared/search-composition.ts
+      - supabase/migrations/20261105062110_search_reconcile_staging.sql
+      - supabase/migrations/20261105062140_staged_output_facts.sql
       - src/concourse/seed.ts
       - package.json
       - bun.lock
@@ -34,6 +46,18 @@ on:
       - scripts/opensearch-proof/**
       - src/session-pipeline/search-adapter*
       - src/session-pipeline/pointer.ts
+      # The staged reconcile on this backend (staged-search-opensearch.pglite.test.ts) and what it runs.
+      - src/session-pipeline/__tests__/staged-search-opensearch.pglite.test.ts
+      - src/session-pipeline/search-index.ts
+      - src/session-pipeline/staged-reconcile.ts
+      - src/session-pipeline/output-facts*.ts
+      - src/session-pipeline/consumer.ts
+      - src/session-pipeline/consumer-service.ts
+      - src/session-read-api/canonical-stream-projection.ts
+      - src/shared/opensearch-composition.ts
+      - src/shared/search-composition.ts
+      - supabase/migrations/20261105062110_search_reconcile_staging.sql
+      - supabase/migrations/20261105062140_staged_output_facts.sql
       - src/concourse/seed.ts
       - package.json
       - bun.lock
@@ -117,6 +141,17 @@ jobs:
         run: |
           set -o pipefail
           bun run --filter @96bulls/pipeline test test/search-index-opensearch-real.test.ts 2>&1 | tee conformance-${{ matrix.dialect }}.log
+      # The staged reconcile with SEARCH_INDEX_STAGED_RECONCILE_ENABLED unset (its default): a scope past the
+      # whole-read bound through this backend's paged scans. OPENSEARCH_PROOF_REQUIRED makes a missing URL fail.
+      - name: Staged reconcile through the opensearch binding (${{ matrix.dialect }} dialect, real server, flag unset)
+        if: steps.proof.outputs.present == 'true'
+        env:
+          SEARCH_INDEX_OPENSEARCH_TEST_URL: http://127.0.0.1:9200
+          SEARCH_INDEX_OPENSEARCH_TEST_DIALECT: ${{ matrix.dialect }}
+          OPENSEARCH_PROOF_REQUIRED: "1"
+        run: |
+          set -o pipefail
+          bun test --timeout 300000 ./src/session-pipeline/__tests__/staged-search-opensearch.pglite.test.ts 2>&1 | tee staged-${{ matrix.dialect }}.log
       - name: End-to-end proof (upload, scrub, index, search, erase)
         if: steps.proof.outputs.present == 'true'
         env:
@@ -147,3 +182,4 @@ jobs:
             opensearch-proof-${{ matrix.dialect }}.json
             opensearch-proof-${{ matrix.dialect }}.log
             conformance-${{ matrix.dialect }}.log
+            staged-${{ matrix.dialect }}.log

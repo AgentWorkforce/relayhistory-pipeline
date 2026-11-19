@@ -302,7 +302,7 @@ test("streaming on: a failed keepalive ends the pass with its error, not a read 
   expect(b.recorded).toEqual([]);
 }, 60_000);
 
-test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts, and the read budgets are validated", () => {
+test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts while the staged reconcile is off, and the read budgets are validated", () => {
   const MiB = 1024 * 1024;
   const limits = { maxScopeBytes: 64 * MiB, maxScopeEvents: 100_000 };
   const CEILING = { maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000 };
@@ -311,10 +311,17 @@ test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts, an
   expect(searchIndexStreamFlag({}, false)).toBe("default_on");
   expect(searchIndexStreamFromEnv({}, limits, false)).toEqual(CEILING);
   expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "" }, limits, false)).toEqual(CEILING);
-  // Unset or "" with output facts: off, no failure, and the budgets are not read.
-  for (const env of [{}, { SEARCH_INDEX_STREAMING_ENABLED: "" }]) {
+  // Unset or "" with output facts and the staged reconcile explicitly off: off, no failure, and the budgets are
+  // not read (the pre-staged answer).
+  const stagedOff = { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" };
+  for (const env of [stagedOff, { ...stagedOff, SEARCH_INDEX_STREAMING_ENABLED: "" }]) {
     expect(searchIndexStreamFlag(env, true)).toBe("default_off_output_facts");
     expect(searchIndexStreamFromEnv({ ...env, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "nonsense" }, limits, true)).toBeUndefined();
+  }
+  // With the staged reconcile on (its default, Phase 3 slice 4) the staged run carries the facts: on.
+  for (const env of [{}, { SEARCH_INDEX_STREAMING_ENABLED: "" }, { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "true" }]) {
+    expect(searchIndexStreamFlag(env, true)).toBe("default_on");
+    expect(searchIndexStreamFromEnv(env, limits, true)).toEqual(CEILING);
   }
   // Explicit "false": off, with or without output facts, and the budgets are not read.
   for (const facts of [false, true]) {
@@ -324,10 +331,12 @@ test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts, an
   // Strict grammar: anything but "true" / "false" / "" fails, "1" and "0" included.
   for (const flag of ["1", "0", "TRUE", "False", "yes", " true", "false "])
     expect(() => searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: flag }, limits, false)).toThrow("SEARCH_INDEX_STREAMING_ENABLED must be true or false");
-  // Explicit "true" with output facts still fails startup, exactly as before the default flip.
-  expect(() => searchIndexStreamFromEnv({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, limits, true)).toThrow(
+  // Explicit "true" with output facts still fails startup while the staged reconcile is off, exactly as before
+  // the default flip; with it on (by default) it is an explicit on.
+  expect(() => searchIndexStreamFromEnv({ ...stagedOff, SEARCH_INDEX_STREAMING_ENABLED: "true" }, limits, true)).toThrow(
     "pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true",
   );
+  expect(searchIndexStreamFlag({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, true)).toBe("explicit_on");
   const on = { SEARCH_INDEX_STREAMING_ENABLED: "true" };
   expect(searchIndexStreamFlag(on, false)).toBe("explicit_on");
   expect(searchIndexStreamFromEnv(on, limits, false)).toEqual(CEILING);
@@ -359,17 +368,20 @@ test("SEARCH_INDEX_STREAMING_ENABLED is on by default, off with output facts, an
   }
 });
 
-test("startup: unset with output facts logs why streaming is off; budgets at their floors warn; the defaults do not", () => {
+test("startup: output facts with the staged reconcile off log why streaming is off; budgets at their floors warn; the defaults do not", () => {
   const MiB = 1024 * 1024;
   const limits = { maxScopeBytes: 64 * MiB, maxScopeEvents: 100_000 };
   const start = (env: Record<string, string>, facts = false, l: Partial<typeof limits> = limits) => searchIndexStreamStartup(env, l, facts);
-  expect(start({}, true)).toEqual({
+  const stagedOff = { SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" };
+  expect(start(stagedOff, true)).toEqual({
     stream: undefined,
     notice: { level: "info", message: expect.stringContaining("RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true"), fields: { streaming: "off", reason: "output_facts" } },
   });
+  // The staged reconcile on by default: output facts no longer hold streaming off, no line.
+  expect(start({}, true)).toEqual({ stream: { maxReadBytes: 2048 * MiB, maxReadEvents: 2_000_000 }, notice: undefined });
   expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "false" }, true)).toEqual({ stream: undefined, notice: undefined });
   expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "false" })).toEqual({ stream: undefined, notice: undefined });
-  expect(() => start({ SEARCH_INDEX_STREAMING_ENABLED: "true" }, true)).toThrow("RELAYHISTORY_SELFHOST_OUTPUT_FACTS");
+  expect(() => start({ ...stagedOff, SEARCH_INDEX_STREAMING_ENABLED: "true" }, true)).toThrow("RELAYHISTORY_SELFHOST_OUTPUT_FACTS");
   // The defaults (the ceiling) stream scopes past the bound: no warning, at any accepted whole-read bound.
   expect(start({})).toEqual({ stream: STREAM_READ_CEILING, notice: undefined });
   expect(start({ SEARCH_INDEX_STREAMING_ENABLED: "true" })).toEqual({ stream: STREAM_READ_CEILING, notice: undefined });
@@ -422,8 +434,10 @@ test("streaming at the default budgets: a scope past the whole-read bound is str
   expect(s).toMatchObject({ complete: true, reasons: [], deleted: 0 });
   expect(s.stream).toMatchObject({ passes: 4 });
   expect(s.rows).toBeGreaterThan(10);
-  // Off by default with output facts: the same scope stays partial (scope_too_large).
-  expect(searchIndexStreamFromEnv({}, TINY, true)).toBeUndefined();
+  // Off with output facts while the staged reconcile is explicitly off: the same scope stays partial
+  // (scope_too_large). (With the staged reconcile on, its default, streaming resolves on and the staged run
+  // carries the facts: staged-facts-wiring.pglite.test.ts.)
+  expect(searchIndexStreamFromEnv({ SEARCH_INDEX_STAGED_RECONCILE_ENABLED: "false" }, TINY, true)).toBeUndefined();
   const off = await backend(x, { limits: TINY });
   expect(await indexSearchScope(SCOPE, off.deps)).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large"] });
 }, 60_000);
