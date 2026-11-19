@@ -5,13 +5,13 @@
  * output, and harvest followed by the unchanged replay CLI.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { HARVEST_ROUTES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
 import { EXIT_CAPPED, failureMessage, main, type HarvestIo } from "../harvest/cli.ts";
-import { RECEIPT_FILE, STATE_FILE } from "../harvest/harvest.ts";
-import { Hasher } from "../import/normalize.ts";
+import { RECEIPT_FILE, sessionFacts, STATE_FILE, type FrameRow } from "../harvest/harvest.ts";
+import { Hasher, IMPORT_BOUNDS } from "../import/normalize.ts";
 import { mappingPath } from "../import/writer.ts";
 import { main as replayMain } from "../replay/cli.ts";
 import { loadSnapshot } from "../replay/snapshot.ts";
@@ -64,7 +64,7 @@ const SESSIONS: FxSession[] = [
 interface ServerOptions {
   pageSize?: number; eventPageSize?: number; workspaceHeader?: string; catalogWorkspace?: string;
   retryAfter?: { times: number; value: string; status?: number }; redirect?: boolean; failAfter?: number;
-  errorCode?: string; status?: number; outputUnsupported?: boolean;
+  errorCode?: string; status?: number; outputUnsupported?: boolean; sessions?: FxSession[];
 }
 interface LoggedRequest { path: string; params: URLSearchParams; authorization: string | null }
 
@@ -90,7 +90,7 @@ function fakeReadApi(opts: ServerOptions = {}) {
       if (p === "/v1/sessions") {
         expect(url.searchParams.get("limit")).toBe("200");
         const after = url.searchParams.get("lastTsAfter")!, before = url.searchParams.get("firstTsBefore")!;
-        const rows = SESSIONS.filter((s) => s.lastTs >= after && s.firstTs < before).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));
+        const rows = (opts.sessions ?? SESSIONS).filter((s) => s.lastTs >= after && s.firstTs < before).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));
         const offset = Number(url.searchParams.get("cursor") ?? "0");
         const page = rows.slice(offset, offset + pageSize);
         return json({
@@ -105,7 +105,7 @@ function fakeReadApi(opts: ServerOptions = {}) {
       }
       const m = /^\/v1\/sessions\/([^/]+)\/events$/u.exec(p);
       if (m) {
-        const s = SESSIONS.find((x) => x.sessionId === decodeURIComponent(m[1]!) && x.source === url.searchParams.get("source"));
+        const s = (opts.sessions ?? SESSIONS).find((x) => x.sessionId === decodeURIComponent(m[1]!) && x.source === url.searchParams.get("source"));
         if (!s) return json({ error: { code: "not_found" } }, 404);
         if (s.eventsUnsupported) return json({ error: { code: "unsupported_by_backend", reason: s.eventsUnsupported } }, 501);
         const offset = Number(url.searchParams.get("cursor") ?? "0");
@@ -195,7 +195,7 @@ describe("harvest", () => {
       // Counted on answered (2xx) responses: every request but fx-h-d's 501.
       server: { headers: { "x-sessions-read-backend": { "96bulls": api.log.length - 1 } } },
     });
-    // Two pages of fx-h-a's events, one of fx-h-b's, two of fx-h-c's (stopped at the first event past --until), fx-h-d's 501.
+    // Two pages of fx-h-a's events, one of fx-h-b's, two of fx-h-c's (read to exhaustion; its last event is past --until), fx-h-d's 501.
     expect(r.requests.byRoute).toEqual({ "/v1/sessions": 2, "/v1/sessions/:sessionId/events": 6, "/v1/sessions/output": 1 });
     expect(r.requests.total).toBe(api.log.length);
     expect(q.lines.join("\n")).toContain("\"complete\":false");
@@ -435,5 +435,155 @@ describe("harvest guards", () => {
     await expect(main(argv(api.url, newOut()).filter((a) => a !== "--salt-stdin"), io().io)).rejects.toThrow("--salt-stdin is required");
     await expect(main(argv(api.url, newOut()), io({ stdin: Readable.from(["short"]) }).io)).rejects.toThrow("--salt-stdin must carry");
     expect(api.log).toEqual([]);
+  });
+});
+
+/** A client whose fetch is injected: it records the raw URL of every request and serves `pages` in turn. */
+function recordingClient(base: string, pages: unknown[] = []) {
+  const urls: string[] = [];
+  let i = 0;
+  const f = (async (input: string | URL | Request) => {
+    urls.push(input instanceof URL ? input.href : typeof input === "string" ? input : input.url);
+    const body = pages.length ? pages[Math.min(i++, pages.length - 1)] : { sessions: [], nextCursor: null };
+    return Response.json(body, { headers: { "x-relayhistory-workspace-id": WS } });
+  }) as typeof fetch;
+  return { urls, client: new ReadApiClient({ base: parseReadApi(base), token: TOKEN, workspace: WS, maxRequests: 1_000, concurrency: 1, fetch: f }) };
+}
+
+describe("censoring at the per-session write bound", () => {
+  const BOUND = IMPORT_BOUNDS.facts;
+  const P = { readApi: "x", workspace: WS, since: SINCE, until: UNTIL, deleteBy: DELETE_BY };
+  const row: FrameRow = { source: "claude", sessionId: "fx-big", firstTs: at("01", "09:00"), lastTs: at("01", "10:00"), projectId: null, repo: null, gitBranch: null, parentSessionIds: [], catalog: false, eventCount: null };
+  /** One page of `events` events with `files` paths each, all inside the window. */
+  const page = (events: number, files: number, nextCursor: string | null, from = 0) => ({
+    sessionId: "fx-big", nextCursor,
+    events: Array.from({ length: events }, (_, e) => ({
+      eventId: `ev-${from + e}`, sessionId: "fx-big", source: "claude", kind: "tool_call", ts: at("01", "09:30"),
+      filesTouched: Array.from({ length: files }, (_, j) => `src/f${j}.ts`),
+    })),
+  });
+  const run = async (pages: unknown[]) => {
+    const { urls, client } = recordingClient("https://example.invalid", pages);
+    return { rec: await sessionFacts(client, row, P, { n: 0 }), urls };
+  };
+
+  test("exactly at the bound with a cursor remaining: censored, drop count unknown, the next page never read", async () => {
+    expect(1_000 * 20).toBe(BOUND);
+    const { rec, urls } = await run([page(1_000, 20, "more")]);
+    expect(rec).toMatchObject({ writesCensored: true, censorReason: "writes_bound_reached_cursor_remaining", droppedWrites: null, truncatedWrites: 0, pages: 1 });
+    expect(rec.writes).toHaveLength(BOUND);
+    expect(urls).toHaveLength(1);
+  });
+
+  test("over the bound within a page with a cursor remaining: censored, drop count unknown", async () => {
+    const { rec } = await run([page(1_000, 21, "more")]);
+    expect(rec).toMatchObject({ writesCensored: true, censorReason: "writes_bound_exceeded_cursor_remaining", droppedWrites: null, truncatedWrites: 1_000 });
+    expect(rec.writes).toHaveLength(BOUND);
+  });
+
+  test("over the bound on the last page: censored with the exact drop count", async () => {
+    const { rec } = await run([page(1_000, 21, null)]);
+    expect(rec).toMatchObject({ writesCensored: true, censorReason: "writes_bound_exceeded", droppedWrites: 1_000, truncatedWrites: 1_000 });
+  });
+
+  test("exactly at the bound with the cursor exhausted, or under it across pages: not censored, every page read", async () => {
+    expect((await run([page(1_000, 20, null)])).rec).toMatchObject({ writesCensored: false, censorReason: null, droppedWrites: null });
+    const under = await run([page(500, 19, "p2"), page(500, 19, null, 500)]);
+    expect(under.rec).toMatchObject({ writesCensored: false, pages: 2 });
+    expect(under.rec.writes).toHaveLength(1_000 * 19);
+    expect(under.urls).toHaveLength(2);
+  });
+
+  test("an event past --until no longer stops the paging: the pages after it are read", async () => {
+    const late = { ...page(1, 1, "p2"), events: [{ ...page(1, 1, null).events[0]!, ts: "2026-11-03T01:00:00.000Z" }] };
+    const { rec, urls } = await run([late, page(1, 1, null, 1)]);
+    expect(urls).toHaveLength(2);
+    expect(rec).toMatchObject({ writesCensored: false, eventsOutsideWindow: 1 });
+    expect(rec.writes).toHaveLength(1);
+  });
+
+  test("end to end: a censored session makes the harvest incomplete, and the receipt counts it", async () => {
+    const big: FxSession = {
+      source: "claude", sessionId: "fx-h-big", firstTs: at("01", "09:00"), lastTs: at("01", "12:00"), projectId: "fixture-proj",
+      events: Array.from({ length: 1_001 }, (_, e) => ({ eventId: `ev-big-${e}`, ts: at("01", "09:30"), kind: "tool_call", filesTouched: Array.from({ length: 20 }, (_, j) => `src/f${j}.ts`) })),
+    };
+    const api = fakeReadApi({ sessions: [big], eventPageSize: 1_000 });
+    const out = newOut();
+    expect(await main(argv(api.url, out), io().io)).toBe(0);
+    const r = receipt(out);
+    expect(r.complete).toBe(false);
+    expect(r.facts).toMatchObject({ sessionsCensored: 1, censoredByReason: { writes_bound_reached_cursor_remaining: 1 }, sessionsWithUnknownDrops: 1, droppedWritesKnown: 0 });
+    expect(r.notes.join(" ")).toContain("1 sessions' writes were cut at 20000 per session");
+    // The second events page was never asked for.
+    expect(api.log.filter((x) => x.path.endsWith("/events"))).toHaveLength(1);
+  });
+});
+
+describe("request provenance across runs", () => {
+  /** The receipt's view of a server log: requests per route. */
+  const fromLog = (log: LoggedRequest[]) => {
+    const byRoute: Record<string, number> = {};
+    for (const r of log) {
+      const k = r.path.replace(/^\/v1\/sessions\/[^/]+\/events$/u, "/v1/sessions/:sessionId/events");
+      byRoute[k] = (byRoute[k] ?? 0) + 1;
+    }
+    return byRoute;
+  };
+
+  test("after an error and a resume, every count is restored and matches the server; an uninterrupted run differs only by the failed request", async () => {
+    const api = fakeReadApi({ failAfter: 4, retryAfter: { times: 1, value: "2" } });
+    const out = newOut();
+    // One worker, so exactly one request fails.
+    const one = ["--concurrency", "1"];
+    await expect(main(argv(api.url, out, one), io().io)).rejects.toThrow("answered 400");
+    api.opts.failAfter = undefined;
+    expect(await main(argv(api.url, out, one), io().io)).toBe(0);
+    const r = receipt(out).requests;
+    expect(r).toMatchObject({ partial: false, total: api.log.length, byRoute: fromLog(api.log), retries: 1, retryAfterHonoured: 1, waitedMs: 2_000 });
+    expect(r.partialReason).toBeUndefined();
+    // Headers are counted on 2xx only: everything but the 429, the 400 and fx-h-d's 501.
+    expect(receipt(out).server.headers["x-sessions-read-backend"]).toEqual({ "96bulls": api.log.length - 3 });
+    const fresh = fakeReadApi({ retryAfter: { times: 1, value: "2" } });
+    const freshOut = newOut();
+    expect(await main(argv(fresh.url, freshOut, one), io().io)).toBe(0);
+    const f = receipt(freshOut).requests;
+    expect(r.total).toBe(f.total + 1);
+    expect({ ...r.byRoute, "/v1/sessions/:sessionId/events": r.byRoute["/v1/sessions/:sessionId/events"] - 1 }).toEqual(f.byRoute);
+    expect([r.retries, r.retryAfterHonoured, r.waitedMs]).toEqual([f.retries, f.retryAfterHonoured, f.waitedMs]);
+  });
+
+  test("a run that ended without its final counts (a hard crash) makes the request counts explicitly partial", async () => {
+    const api = fakeReadApi({ failAfter: 4 });
+    const out = newOut();
+    await expect(main(argv(api.url, out), io().io)).rejects.toThrow("answered 400");
+    // Simulate a kill: the run's final line never made it to disk.
+    const path = join(out, STATE_FILE);
+    const lines = readFileSync(path, "utf8").trim().split("\n").filter((l) => !l.includes("\"t\":\"runEnd\""));
+    writeFileSync(path, `${lines.join("\n")}\n`, { mode: 0o600 });
+    api.opts.failAfter = undefined;
+    expect(await main(argv(api.url, out), io().io)).toBe(0);
+    const r = receipt(out);
+    expect(r.requests.partial).toBe(true);
+    expect(r.requests.partialReason).toContain("lower bound");
+    expect(r.requests.total).toBeLessThanOrEqual(api.log.length);
+    expect(r.notes.join(" ")).toContain("request counts are partial");
+  });
+});
+
+describe("request paths", () => {
+  test.each([
+    ["https://example.invalid", ""], ["https://example.invalid/", ""], ["https://example.invalid//", ""],
+    ["https://example.invalid/api", "/api"], ["https://example.invalid/api/", "/api"], ["https://example.invalid//api//", "/api"],
+  ])("base %s joins every route with exactly one slash", async (base, prefix) => {
+    const { urls, client } = recordingClient(base);
+    await client.get("/v1/sessions", [["limit", "200"]]);
+    await client.get("/v1/sessions/output", []);
+    await client.get("/v1/sessions/:sessionId/events", [], "fx-h-a");
+    expect(urls).toEqual([
+      `https://example.invalid${prefix}/v1/sessions?workspace=${WS}&limit=200`,
+      `https://example.invalid${prefix}/v1/sessions/output?workspace=${WS}`,
+      `https://example.invalid${prefix}/v1/sessions/fx-h-a/events?workspace=${WS}`,
+    ]);
+    for (const u of urls) expect(new URL(u).pathname).not.toContain("//");
   });
 });
