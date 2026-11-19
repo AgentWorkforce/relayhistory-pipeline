@@ -172,6 +172,10 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
   let cwd: string | null = null;
   let lastTs: string | null = null;
   let lastTotal: number | null = null;
+  let childPath: string | null = null;
+  let waitingForChildTask = false;
+  let childThreadConfirmed = false;
+  let metadataSeen = false;
   const pending = new Map<string, { sha: string | null; ts: string }>();
   await readJsonl(file, set.stats, (r, line) => {
     if (!isRecord(r)) { set.stats.malformedLines++; return; }
@@ -182,6 +186,20 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     const ts = set.accept(strictTs(r.timestamp) ?? (enveloped ? null : lastTs));
     if (!ts) return;
     lastTs = ts;
+    // Modern child rollouts start with their own metadata, then copied parent
+    // records retimestamped to the child's start. A parent task in that prefix
+    // is addressed to a different agent_path; neither timestamps nor the first
+    // session_meta can distinguish authorship. Do not read the encrypted body.
+    if (waitingForChildTask) {
+      if (type === "event_msg" && p.type === "thread_settings_applied" && p.thread_id === id)
+        childThreadConfirmed = true;
+      const ownTask = childThreadConfirmed && childPath !== null && type === "response_item" && p.type === "agent_message"
+        && p.recipient === childPath && Array.isArray(p.content)
+        && p.content.some((c) => isRecord(c) && c.type === "input_text" && typeof c.text === "string"
+          && /^Message Type: NEW_TASK(?:\r?\n|$)/u.test(c.text));
+      if (!ownTask) { set.stats.codexPrefixRecordsDropped++; return; }
+      waitingForChildTask = false;
+    }
     b.touch(ts, at);
     if (type === "session_meta" || (!enveloped && typeof r.id === "string" && r.type === undefined)) {
       id ??= cleanId(p.id);
@@ -190,9 +208,18 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
       const git = isRecord(p.git) ? p.git : {};
       b.remote ??= cleanId(git.repository_url, IMPORT_BOUNDS.path);
       b.branch = cleanId(git.branch) ?? b.branch;
-      // A spawned subagent thread names its parent thread (field name not confirmed; see the doc).
+      // A spawned subagent thread names its parent (confirmed in the audited format; see the doc).
       const src = isRecord(p.source) && isRecord(p.source.subagent) && isRecord(p.source.subagent.thread_spawn) ? p.source.subagent.thread_spawn : null;
       if (src) b.parent(src.parent_thread_id);
+      if (!metadataSeen && src) {
+        const parent = cleanId(src.parent_thread_id);
+        childPath = cleanId(p.agent_path);
+        const inherited = Number.isSafeInteger(p.subagent_history_start_ordinal) && (p.subagent_history_start_ordinal as number) > 0;
+        // Legacy children have neither field; retain their existing behavior.
+        // An explicit copied prefix without a usable path stays fail-closed.
+        waitingForChildTask = parent !== null && parent !== id && (childPath !== null || inherited);
+      }
+      metadataSeen = true;
       return;
     }
     if (type === "turn_context") { cwd = cleanId(p.cwd, IMPORT_BOUNDS.path) ?? cwd; b.cwd ??= cwd; return; }
@@ -256,6 +283,7 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     }
   });
   if (!b.first) return;
+  if (waitingForChildTask) set.stats.codexChildrenWithoutTaskBoundary++;
   b.sourceId = id ?? /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.exec(stem(file))?.[1] ?? stem(file);
   // The id is known only now: a session naming itself as its parent is not a fleet.
   b.parents.delete(b.sourceId);

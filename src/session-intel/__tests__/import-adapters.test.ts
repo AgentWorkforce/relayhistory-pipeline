@@ -65,6 +65,59 @@ describe("claude code adapter, hostile records", () => {
 });
 
 describe("codex adapter", () => {
+  test("a paginated child imports only its own task, not retimestamped parent context", async () => {
+    const dir = tmp("si-imp-codex-child-");
+    const row = (type: string, payload: unknown) => ({ timestamp: at("09:00"), type, payload });
+    const patch = (path: string) => ({ type: "custom_tool_call", name: "apply_patch", input: `*** Begin Patch\n*** Add File: ${path}\n+example\n*** End Patch` });
+    const task = (recipient: string) => ({ type: "agent_message", recipient, content: [
+      { type: "input_text", text: "Message Type: NEW_TASK\nTask name: fixture" },
+      { type: "encrypted_content", encrypted_content: "fixture-encrypted-body" },
+    ] });
+    writeFileSync(join(dir, "child.jsonl"), [
+      row("session_meta", { id: "fixture-child", cwd: "/work/child", agent_path: "/root/child", source: { subagent: { thread_spawn: { parent_thread_id: "fixture-parent" } } } }),
+      // The inherited session_meta must not replace the child's cwd or identity.
+      row("session_meta", { id: "fixture-parent", cwd: "/work/parent" }),
+      row("response_item", patch("src/parent.ts")),
+      row("response_item", task("/root")),
+      row("response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Message Type: NEW_TASK\nTask name: fixture" }] }),
+      row("response_item", { type: "function_call", name: "shell", call_id: "parent-commit", arguments: JSON.stringify({ command: "git commit -m fixture" }) }),
+      row("event_msg", { type: "token_count", info: { total_token_usage: { total_tokens: 900 } } }),
+      row("event_msg", { type: "thread_settings_applied", thread_id: "fixture-parent" }),
+      row("response_item", task("/root/child")),
+      row("event_msg", { type: "thread_settings_applied", thread_id: "fixture-child" }),
+      row("response_item", task("/root/child")),
+      row("response_item", patch("/work/child/src/own.ts")),
+      row("event_msg", { type: "token_count", info: { total_token_usage: { total_tokens: 100 } } }),
+      // Resuming the same child can repeat its metadata without a new spawn.
+      row("session_meta", { id: "fixture-child", cwd: "/work/child", agent_path: "/root/child", source: { subagent: { thread_spawn: { parent_thread_id: "fixture-parent" } } } }),
+      row("response_item", patch("src/resumed.ts")),
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const set = await read(dir, readCodex);
+    const b = set.byKey.get("codex\u0000fixture-child")!;
+    expect([b.cwd, ...b.parents]).toEqual(["/work/child", "fixture-parent"]);
+    expect(facts(b)).toEqual({ writes: [["src/own.ts", at("09:00")], ["src/resumed.ts", at("09:00")]], commits: [], outcomes: [], usage: [100] });
+    expect(set.stats).toMatchObject({ codexPrefixRecordsDropped: 9, codexChildrenWithoutTaskBoundary: 0 });
+  });
+
+  test("a child with inherited context but no verified own task fails closed", async () => {
+    const dir = tmp("si-imp-codex-child-boundary-");
+    for (const { id, path, recipient, marker } of [
+      { id: "fixture-a", path: "/root/child", recipient: "/root/other", marker: true },
+      { id: "fixture-b", path: undefined, recipient: "/root/child", marker: true },
+      { id: "fixture-c", path: "/root/child", recipient: "/root/child", marker: false },
+    ]) {
+      writeFileSync(join(dir, `${id}.jsonl`), [
+        { timestamp: at("09:00"), type: "session_meta", payload: { id, cwd: "/work/acme", agent_path: path, subagent_history_start_ordinal: 1, source: { subagent: { thread_spawn: { parent_thread_id: "fixture-parent" } } } } },
+        ...(marker ? [{ timestamp: at("09:00"), type: "event_msg", payload: { type: "thread_settings_applied", thread_id: id } }] : []),
+        { timestamp: at("09:00"), type: "response_item", payload: { type: "agent_message", recipient, content: [{ type: "input_text", text: "Message Type: NEW_TASK\nTask name: fixture" }] } },
+        { timestamp: at("09:00"), type: "response_item", payload: { type: "custom_tool_call", name: "apply_patch", input: "*** Begin Patch\n*** Add File: src/inherited.ts\n+example\n*** End Patch" } },
+      ].map((r) => JSON.stringify(r)).join("\n"));
+    }
+    const set = await read(dir, readCodex);
+    expect([...set.byKey.values()].flatMap((b) => b.writes)).toEqual([]);
+    expect(set.stats).toMatchObject({ codexPrefixRecordsDropped: 8, codexChildrenWithoutTaskBoundary: 3 });
+  });
+
   test("code-mode exec imports nested static apply_patch writes like the production projection", async () => {
     const dir = tmp("si-imp-code-mode-");
     const file = join(dir, "code-mode.jsonl");
