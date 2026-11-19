@@ -1,0 +1,1945 @@
+{
+ "put revision 1": {
+  "result": {
+   "batchItemFailures": []
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-11-01T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\xa16d0cbfdd7c1ffcc2cb7ebeb8eaa4aeb72c176f445ad303cc93882699c6edd6\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":1,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index_ext SET fanout_revision = greatest(fanout_revision, $6) WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "session indexed",
+    "stage": "session-indexed",
+    "revision": 1,
+    "session_uuid": "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+    "session_uuid_source": "minted",
+    "chunk_count": 1,
+    "bytes_raw": 168,
+    "trace_id": "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+    "traceparent": "<traceparent>"
+   },
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer indexed",
+    "stage": "session-indexed",
+    "outcome": "indexed",
+    "org_id": "org_1",
+    "workspace_id": "ws_1",
+    "harness": "claude",
+    "session_id": "sess_1",
+    "revision": 1
+   }
+  ],
+  "rows": [
+   {
+    "revision": "1",
+    "deleted_at": null,
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   }
+  ]
+ },
+ "the same put again": {
+  "result": {
+   "batchItemFailures": []
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-11-01T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\xa16d0cbfdd7c1ffcc2cb7ebeb8eaa4aeb72c176f445ad303cc93882699c6edd6\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":1,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer indexed",
+    "stage": "session-indexed",
+    "outcome": "unchanged",
+    "org_id": "org_1",
+    "workspace_id": "ws_1",
+    "harness": "claude",
+    "session_id": "sess_1",
+    "revision": 1
+   }
+  ],
+  "rows": [
+   {
+    "revision": "1",
+    "deleted_at": null,
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   }
+  ]
+ },
+ "put revision 2": {
+  "result": {
+   "batchItemFailures": []
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-11-01T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\x117f4df3686a85ce3a05585ac6823aefa8d8575f58bb0d099b2c729ecc36f451\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":2,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      2
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index_ext SET fanout_revision = greatest(fanout_revision, $6) WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      2
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "session indexed",
+    "stage": "session-indexed",
+    "revision": 2,
+    "session_uuid": "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+    "session_uuid_source": "minted",
+    "chunk_count": 1,
+    "bytes_raw": 168,
+    "trace_id": "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+    "traceparent": "<traceparent>"
+   },
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer indexed",
+    "stage": "session-indexed",
+    "outcome": "indexed",
+    "org_id": "org_1",
+    "workspace_id": "ws_1",
+    "harness": "claude",
+    "session_id": "sess_1",
+    "revision": 2
+   }
+  ],
+  "rows": [
+   {
+    "revision": "2",
+    "deleted_at": null,
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   }
+  ]
+ },
+ "move in progress (both keys live)": {
+  "result": {
+   "batchItemFailures": [
+    {
+     "itemIdentifier": "m1"
+    }
+   ]
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-10-31T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\xa16d0cbfdd7c1ffcc2cb7ebeb8eaa4aeb72c176f445ad303cc93882699c6edd6\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":1,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "error",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer index failed",
+    "stage": "session-indexed",
+    "error_code": "pointer_move_pending",
+    "retryable": true
+   }
+  ],
+  "rows": [
+   {
+    "revision": "2",
+    "deleted_at": null,
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   }
+  ]
+ },
+ "move (old key erased)": {
+  "result": {
+   "batchItemFailures": []
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-10-31T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\xa16d0cbfdd7c1ffcc2cb7ebeb8eaa4aeb72c176f445ad303cc93882699c6edd6\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":1,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT manifest_key, deleted_at IS NOT NULL AS deleted FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT session_uuid::text, user_id, fanout_revision::text FROM sessions.session_index_ext WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "DELETE FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 RETURNING created_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+     "params": [
+      "[{\"org_id\":\"org_1\",\"workspace_id\":\"ws_1\",\"harness\":\"claude\",\"session_id\":\"sess_1\",\"machine_id\":\"srv_bb\",\"user_id\":\"user_1\",\"project_id\":null,\"title\":null,\"state\":null,\"state_classified_at\":null,\"created_at\":\"2026-10-31T10:00:00.000Z\",\"last_activity_at\":\"2026-11-01T10:00:00.000Z\",\"git_repo\":null,\"git_branch\":null,\"git_commit\":null,\"model\":null,\"event_count\":1,\"storage_provider\":\"s3\",\"bucket\":\"bucket\",\"manifest_key\":\"96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json\",\"content_sha256\":\"\\\\xa16d0cbfdd7c1ffcc2cb7ebeb8eaa4aeb72c176f445ad303cc93882699c6edd6\",\"raw_bytes\":168,\"chunk_count\":1,\"raw_format\":\"ndjson\",\"format_version\":1,\"normalized_version\":null,\"scrubbed\":true,\"manifest_etag\":\"<etag>\",\"revision\":1,\"trace_id\":\"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18\",\"deleted_at\":null}]"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "INSERT INTO sessions.session_index_ext (org_id, workspace_id, harness, session_id, machine_id, session_uuid, session_uuid_source, tenant_id, user_id, first_trace_id, last_trace_id, last_revision) VALUES ($1,$2,$3,$4,$5,$6::uuid,$7,$8,$9,$10::uuid,$10::uuid,$11) ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_trace_id = excluded.last_trace_id, last_revision = greatest(sessions.session_index_ext.last_revision, excluded.last_revision), user_id = coalesce(excluded.user_id, sessions.session_index_ext.user_id), updated_at = now()",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "0193a1f3-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      "minted",
+      "org_1",
+      "user_1",
+      "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",
+      1
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET user_id = CASE WHEN $7::text IS NULL THEN user_id ELSE $7 END, canonical_session_id = $8, canonical_machine_id = $9 WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 AND deleted_at IS NULL",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json",
+      "user_1",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_users AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' AND p.user_id = m.user_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_users (org_id, workspace_id, harness, session_id, user_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, p.user_id, t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL AND p.user_id <> 'unknown' ON CONFLICT (org_id, workspace_id, harness, session_id, user_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) DELETE FROM sessions.session_directory_machines AS m USING target AS t WHERE m.org_id = $1 AND m.workspace_id = $2 AND m.harness = $3 AND m.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = m.org_id AND p.workspace_id = m.workspace_id AND p.harness = m.harness AND p.session_id = $4 AND p.deleted_at IS NULL AND coalesce(p.canonical_machine_id, p.machine_id) = m.machine_id)",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH target AS ( SELECT d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NULL AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id)) ORDER BY (d.session_id <> $4) DESC LIMIT 1 ) INSERT INTO sessions.session_directory_machines (org_id, workspace_id, harness, session_id, machine_id, last_activity_at) SELECT DISTINCT p.org_id, p.workspace_id, p.harness, t.session_id, coalesce(p.canonical_machine_id, p.machine_id), t.last_activity_at FROM sessions.session_index AS p CROSS JOIN target AS t WHERE p.org_id = $1 AND p.workspace_id = $2 AND p.harness = $3 AND p.session_id = $4 AND p.deleted_at IS NULL ON CONFLICT (org_id, workspace_id, harness, session_id, machine_id) DO UPDATE SET last_activity_at = excluded.last_activity_at",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer indexed",
+    "stage": "session-indexed",
+    "outcome": "moved",
+    "org_id": "org_1",
+    "workspace_id": "ws_1",
+    "harness": "claude",
+    "session_id": "sess_1",
+    "revision": 1
+   }
+  ],
+  "rows": [
+   {
+    "revision": "1",
+    "deleted_at": null,
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   }
+  ]
+ },
+ "delete (no sibling left)": {
+  "result": {
+   "batchItemFailures": []
+  },
+  "calls": [
+   {
+    "at": "free",
+    "kind": "sql",
+    "detail": {
+     "sql": "SELECT sessions.session_publication_is_managed($1,$2,$3,$4,$5) AS managed",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "BEGIN"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "SET LOCAL lock_timeout = '30s'"
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": [
+     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+     "96bulls:pointer\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+    ]
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/30/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/29/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/02/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/28/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/03/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/27/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/04/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/26/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/05/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/25/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/06/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/24/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/07/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/23/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/08/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/22/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/09/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/21/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/10/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/20/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/11/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/19/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/12/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/18/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/13/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/17/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/14/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/16/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/15/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/15/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/16/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/14/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/17/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/13/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/18/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/12/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/19/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/11/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/20/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/10/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/21/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/09/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/22/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/08/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/23/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/07/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/24/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/06/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/25/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/05/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/26/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/04/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/27/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/03/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/28/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/02/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/29/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/11/30/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/30/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/01/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/29/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/02/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/28/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/03/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/27/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/04/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/26/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/05/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/25/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/06/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/24/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/07/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/23/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/08/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/22/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/09/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/21/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/10/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/20/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/11/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/19/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/12/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/18/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/13/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/17/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/14/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/09/16/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.head",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/12/15/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "s3.read",
+    "detail": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "UPDATE sessions.session_index SET deleted_at = now(), indexed_at = now() WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5 AND manifest_key = $6 RETURNING 1",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "srv_bb",
+      "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH identity_stats AS ( SELECT count(*) AS pointers, count(DISTINCT coalesce(canonical_session_id, session_id)) AS identities, min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 ), identity AS ( SELECT CASE WHEN pointers = 0 THEN $4 ELSE canonical_session_id END AS canonical_session_id FROM identity_stats WHERE pointers = 0 OR identities = 1 ), target AS ( SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ) UPDATE sessions.session_directory AS d SET short_summary = NULL, short_summary_scrub_ruleset = NULL, short_summary_scrub_version = NULL, short_summary_source = NULL, short_summary_generated_at = NULL, search_text = sessions.session_directory_search_text( d.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch, d.model, NULL), deleted_at = CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND p.deleted_at IS NULL) THEN d.deleted_at ELSE coalesce(d.deleted_at, now()) END, projected_at = now() FROM target AS t WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id RETURNING d.deleted_at IS NOT NULL AS tombstoned",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH live AS ( SELECT * FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ), latest AS ( SELECT * FROM live ORDER BY last_activity_at DESC, revision DESC, machine_id DESC LIMIT 1 ), identity AS ( SELECT min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM live HAVING count(DISTINCT coalesce(canonical_session_id, session_id)) = 1 ), target AS ( -- Do not create a duplicate while a legacy physical-id row is still live. A -- controlled re-projection removes that row first; new sessions use the source id. SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ), brief AS ( -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill', -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or -- the brief-document/search publication built from them. Only -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version, -- the column origin is derived from, so this read also works before 043000 is applied. SELECT title FROM sessions.session_briefs WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%' ), agg AS ( SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at, coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id) ORDER BY coalesce(canonical_machine_id, machine_id)), '{}') AS machine_ids, coalesce(array_agg(DISTINCT user_id ORDER BY user_id) FILTER (WHERE user_id <> 'unknown'), '{}') AS user_ids FROM live ) INSERT INTO sessions.session_directory AS d (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, project_id, git_repo, git_branch, model, state, event_count, input_tokens, output_tokens, cost_usd_micros, machine_ids, user_ids, search_text, projected_at) SELECT $1, $2, $3, t.session_id, agg.created_at, agg.last_activity_at, coalesce((SELECT title FROM brief), l.title), l.project_id, l.git_repo, l.git_branch, l.model, l.state, l.event_count, l.input_tokens, l.output_tokens, l.cost_usd_micros, agg.machine_ids, agg.user_ids, sessions.session_directory_search_text( coalesce((SELECT title FROM brief), l.title), NULL, NULL, l.project_id, l.git_repo, l.git_branch, l.model, NULL), now() FROM latest AS l CROSS JOIN agg CROSS JOIN target AS t ON CONFLICT (org_id, workspace_id, harness, session_id) DO UPDATE SET created_at = LEAST(d.created_at, excluded.created_at), deleted_at = NULL, last_activity_at = excluded.last_activity_at, title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), project_id = coalesce(excluded.project_id, d.project_id), git_repo = coalesce(excluded.git_repo, d.git_repo), git_branch = coalesce(excluded.git_branch, d.git_branch), model = excluded.model, state = excluded.state, event_count = CASE WHEN d.event_projection_version > 0 THEN d.event_count ELSE excluded.event_count END, input_tokens = CASE WHEN d.event_projection_version > 0 THEN d.input_tokens ELSE excluded.input_tokens END, output_tokens = CASE WHEN d.event_projection_version > 0 THEN d.output_tokens ELSE excluded.output_tokens END, cost_usd_micros = CASE WHEN d.event_projection_version > 0 THEN d.cost_usd_micros ELSE excluded.cost_usd_micros END, machine_ids = excluded.machine_ids, user_ids = excluded.user_ids, search_text = sessions.session_directory_search_text( coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id), coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch), excluded.model, d.short_summary), projected_at = now() WHERE d.deleted_at IS NULL OR EXISTS ( -- Resurrection only for a genuinely new pointer revision: live, and strictly -- above its machine's fence (or a machine with no fence at all). SELECT 1 FROM sessions.session_index AS later WHERE later.org_id = d.org_id AND later.workspace_id = d.workspace_id AND later.harness = d.harness AND later.session_id = $4 AND later.deleted_at IS NULL AND NOT EXISTS ( SELECT 1 FROM sessions.session_directory_resurrection_fences AS f WHERE f.org_id = later.org_id AND f.workspace_id = later.workspace_id AND f.harness = later.harness AND f.session_id = d.session_id AND f.machine_id = coalesce(later.canonical_machine_id, later.machine_id) AND f.revision >= later.revision)) RETURNING true AS projected",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "WITH identity_stats AS ( SELECT count(*) AS pointers, count(DISTINCT coalesce(canonical_session_id, session_id)) AS identities, min(coalesce(canonical_session_id, session_id)) AS canonical_session_id FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 ), identity AS ( SELECT CASE WHEN pointers = 0 THEN $4 ELSE canonical_session_id END AS canonical_session_id FROM identity_stats WHERE pointers = 0 OR identities = 1 ), target AS ( SELECT CASE WHEN EXISTS ( SELECT 1 FROM sessions.session_directory AS existing WHERE existing.org_id = $1 AND existing.workspace_id = $2 AND existing.harness = $3 AND existing.session_id = i.canonical_session_id) THEN i.canonical_session_id WHEN i.canonical_session_id <> $4 AND EXISTS ( SELECT 1 FROM sessions.session_directory AS legacy WHERE legacy.org_id = $1 AND legacy.workspace_id = $2 AND legacy.harness = $3 AND legacy.session_id = $4) THEN $4 ELSE i.canonical_session_id END AS session_id FROM identity AS i ) UPDATE sessions.session_directory AS d SET deleted_at = coalesce(d.deleted_at, now()), machine_ids = '{}', user_ids = '{}', projected_at = now() FROM target AS t WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = t.session_id AND NOT EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND p.deleted_at IS NULL) RETURNING true AS tombstoned",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "DELETE FROM sessions.session_directory_users AS m USING sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NOT NULL AND m.org_id = d.org_id AND m.workspace_id = d.workspace_id AND m.harness = d.harness AND m.session_id = d.session_id AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "sql",
+    "detail": {
+     "sql": "DELETE FROM sessions.session_directory_machines AS m USING sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.deleted_at IS NOT NULL AND m.org_id = d.org_id AND m.workspace_id = d.workspace_id AND m.harness = d.harness AND m.session_id = d.session_id AND (d.session_id = $4 OR EXISTS ( SELECT 1 FROM sessions.session_index AS p WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id AND p.harness = d.harness AND p.session_id = $4 AND coalesce(p.canonical_session_id, p.session_id) = d.session_id))",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   },
+   {
+    "at": "lock",
+    "kind": "lock.sql",
+    "detail": "COMMIT"
+   }
+  ],
+  "log": [
+   {
+    "level": "info",
+    "service": "96bulls",
+    "deployment": "selfhost",
+    "deployment_id": "local",
+    "message": "pointer indexed",
+    "stage": "session-indexed",
+    "outcome": "deleted",
+    "org_id": "org_1",
+    "workspace_id": "ws_1",
+    "harness": "claude",
+    "session_id": "sess_1"
+   }
+  ],
+  "rows": [
+   {
+    "revision": "1",
+    "deleted_at": "<now>",
+    "manifest_key": "96bulls/org_1/v1/ws=ws_1/m=srv_bb/h=claude/d=2026/10/31/s=sess_1/manifest.json"
+   }
+  ]
+ }
+}
