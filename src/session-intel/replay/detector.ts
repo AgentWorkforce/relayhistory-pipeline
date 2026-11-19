@@ -78,6 +78,8 @@ export const ADVISOR_SOURCES = [
   "./views.ts",
   "./detector.ts",
   "./replay.ts",
+  "./snapshot.ts",
+  "./util.ts",
 ];
 function sourceSha256(): string {
   return sha256Hex(ADVISOR_SOURCES.map((p) => sha256Hex(readFileSync(new URL(p, import.meta.url)))).join("\n"));

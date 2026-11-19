@@ -1,6 +1,6 @@
 /** Small shared helpers for the replay harness (docs/session-intel-replay.md). No I/O beyond the atomic writer. */
 import { createHash } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { link, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export const sha256Hex = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex");
@@ -47,6 +47,21 @@ export async function writeAtomic(path: string, data: string): Promise<void> {
   const tmp = join(dirname(path), `.${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.tmp`);
   await writeFile(tmp, data, { mode: 0o600 });
   await rename(tmp, path);
+}
+
+/** Writes a new file and never replaces one: link(2) of a temp file fails with EEXIST when `path` exists. */
+export async function writeNew(path: string, data: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = join(dirname(path), `.${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.tmp`);
+  await writeFile(tmp, data, { mode: 0o600 });
+  try {
+    await link(tmp, path);
+  } catch (err) {
+    if ((err as { code?: string }).code === "EEXIST") throw new Error(`${path} already exists; it is never overwritten`);
+    throw err;
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
 }
 
 /** A deterministic 32-bit PRNG (mulberry32) seeded from a string through sha256. */

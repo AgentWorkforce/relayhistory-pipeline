@@ -53,13 +53,13 @@ The parts the scan calls:
 
 `ReplayDetector` is `{name, version, params, run(view, now), diagnostics?}`. Each alert carries `{detector, alertId, kind, urgency, pair, artifact, sentAt, alertAt, channel, evidence}`. A detector's **hash** is the sha256 of its name, version, params and the replay's `intervalMs`.
 
-`advisorDetector()` wraps `scanOnce` with the real `AdvisorLimits` at the config defaults: a 6-hour pair cooldown and 3 advisories per recipient per hour. Its params include a sha256 of the source files that decide which alerts exist: the scan, rubric, template, relay sender, facts backend and detector package, and this harness's views, detector adapter and replay driver. A change to any of them is a new detector hash. Like `advisorTick`, it runs the store's retention sweep once an hour of simulated time, so a row older than 7 days expires and the same finding can be written and DMed again. Only the first `sentAt` appears among the alerts; the diagnostics count every write.
+`advisorDetector()` wraps `scanOnce` with the real `AdvisorLimits` at the config defaults: a 6-hour pair cooldown and 3 advisories per recipient per hour. Its params include a sha256 of the source files that decide which alerts exist: the scan, rubric, template, relay sender, facts backend and detector package, and this harness's views, detector adapter, replay driver, snapshot loader and helpers. A change to any of them is a new detector hash. Like `advisorTick`, it runs the store's retention sweep once an hour of simulated time, so a row older than 7 days expires and the same finding can be written and DMed again. Only the first `sentAt` appears among the alerts. So in a window longer than 7 days, the alerts-per-100-sessions rate undercounts DMs. The diagnostics count every write (`written`) and every DM (`dmSent`), and the score report shows both.
 
 - **Alert id.** Its `alertId` is `<advisoryId>/<urgency>`, so a LOW-to-HIGH upgrade counts as its own HIGH alert.
 - **sentAt.** For HIGH it is the tick of the recorded DM; for LOW it is the tick the row became available to the pull path.
 - **Incomplete replays.** Its diagnostics are the summed `ScanStats`. A replay where any workspace scan `failed` or any row was `rejected` is incomplete. `alerts.json` (format `session-intel-replay/2`) records the reasons in `incomplete`, and the CLI exits 1. Dev scoring reports the reasons. Held-out scoring refuses an incomplete replay, before anything is recorded.
 
-The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). It keeps each alert's first `sentAt` and orders alerts deterministically. M2's intent and constraint detectors plug in behind the same interface.
+The driver steps from `window.since` to `window.until` every `--interval-ms`, default 120000 (the `COORDINATION_ADVISOR_INTERVAL_SECONDS` default). Fix the interval for a study: a different `--interval-ms` is a new detector hash, and would buy another held-out score. It keeps each alert's first `sentAt` and orders alerts deterministically. M2's intent and constraint detectors plug in behind the same interface.
 
 ## Classes
 
@@ -111,14 +111,22 @@ It scores in two modes and reports both:
 For each mode, the scorer reports per detector: per (urgency, kind) row, per alert class, and per (alert class, urgency). The (alert class, urgency) rows are the ones the spec's bars apply to. For each row it reports:
 
 - alerts, true and false positives, misclassified, and recall. A class row's class-match recall is over the incidents of that class;
-- precision two ways, both named. **Per alert** counts every alert. **Per pair** counts each (detector, pair) once, so a LOW upgraded to HIGH, or two artifacts on one pair, cannot count as two true positives;
+- precision two ways, both named. **Per alert** counts every alert. **Per pair** counts each (detector, pair) once, so a LOW upgraded to HIGH, or two artifacts on one pair, cannot count as two true positives. The spec's precision bars use **per-pair** precision, so duplicate alerts on one pair cannot inflate the score; per-alert precision is still reported;
 - lead time (`harmAt` minus the first `sentAt` per detected incident): the counts before and after harm, and the median;
 - alerts per 100 sessions (the rate the budget is measured against);
 - the top K at 5 per 100 sessions (`--budget`), ranked HIGH first, then the earliest.
 
-It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, `planned_fleet` or `none`; or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both reports.
+It also reports a confusion table of in-scope alerts: alert class (rows) by labeled class (columns). The columns are the incident's class; for a hard negative, its class (`overlap` for `benign_overlap`, `planned_fleet`, or `none` for `unrelated`); or `unlabeled`. An alert counts once per distinct class labeled on its pair. The table is in both reports.
 
-Scoring uses `dev` unless you pass `--split heldout`. Reports are split-named (`report.dev.{json,md}`, `report.heldout.{json,md}`), so a dev run never overwrites the held-out report. Held-out is scored once per detector hash: `scored-hashes.json` in the output directory records each one. A repeat is refused, whatever the class map, unless `--force`. A forced repeat is recorded as forced, with the optional `--reason` text. A different `--out` or an edited `alerts.json` gets round the ledger: it is a protocol aid, not a control. Keep one evaluation directory per study.
+Scoring uses `dev` unless you pass `--split heldout`. `--force` and `--reason` apply to held-out only, and dev refuses them.
+
+Reports are split-named (`report.dev.{json,md}`, `report.heldout.{json,md}`), so a dev run never overwrites the held-out report. A forced held-out re-score writes `report.heldout.forced-<n>.{json,md}`, and a held-out report is never overwritten.
+
+Held-out is scored once per detector hash. `scored-hashes.json` in the output directory records each one: the detector hash, the class-map hash, the scorer hash (`scorerSha256`, over `score.ts`, `classes.ts` and `labels.ts`), `forced`, and the `--reason` text when given. A repeat is refused, whatever the class map, unless `--force`.
+
+The check, the reports and the entry run under an exclusive lock file, `scored-hashes.json.lock`. A second run, or a stale lock left by a crash, is refused with a message naming the file. The reports are written before the entry, so a report that cannot be written does not spend the hash. A damaged ledger entry is an error naming the file; it is never skipped.
+
+The alerts reader refuses duplicate detector names and duplicate (detector, alertId) pairs. It also derives `incomplete` from the diagnostics as well as from the stored flag. A different `--out` or an edited `alerts.json` gets round the ledger: it is a protocol aid, not a control. Keep one evaluation directory per study.
 
 `packet` pools each detector's top K and merges the same (pair, artifact) across detectors, keeping one member per detector. The same replay given twice is refused: the same file, or the same detector hash on the same snapshot. It strips detector names, kinds, urgencies, alert ids and evidence kinds, then shuffles with a seeded PRNG (`--seed`). It writes `packet.jsonl` for the adjudicators and a private `key.json`. `verdicts` imports `{alertKey, verdict, adjudicator}` records, where a verdict is one of `collision`, `overlap`, `real_overlap`, `intent_conflict`, `constraint_violation`, `planned`, `unrelated` or `unclear`. It reports pairwise agreement and Cohen's kappa (with 0/1 weights from the agreement rule above), and takes the majority verdict for each alert by class (a tie is `unclear`). The report format is `session-intel-verdicts/2`. It reports precision two ways, both excluding `unclear`:
 

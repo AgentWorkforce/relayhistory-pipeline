@@ -117,6 +117,8 @@ export function parsePacketKey(raw: unknown): PacketKey {
       // A member without a class must have a kind that maps to one.
       alertClassOf(m as { kind: string; urgency: "high" | "low"; alertClass?: AlertClass });
     });
+    const hashes = (e.members as Array<{ detectorHash: string }>).map((m) => m.detectorHash);
+    if (new Set(hashes).size !== hashes.length) throw new Error(`${where}.members repeats a detectorHash`);
   });
   return raw as unknown as PacketKey;
 }
