@@ -6,7 +6,7 @@
 import { basename } from "node:path";
 import { commitShaFromOutput, gitOps } from "./git.ts";
 import { readJsonl } from "./io.ts";
-import { cleanId, IMPORT_BOUNDS, SessionBuilder, strictTs, type ImportHarness, type ImportStats, type LineRef } from "./normalize.ts";
+import { cleanId, IMPORT_BOUNDS, ImportError, SessionBuilder, strictTs, type ImportHarness, type ImportStats, type LineRef } from "./normalize.ts";
 import { isRecord } from "../replay/util.ts";
 
 export type ImportFormat = "claude-code" | "codex" | "generic";
@@ -27,7 +27,7 @@ export class SessionSet {
     const k = `${harness}\u0000${id}`;
     let b = this.byKey.get(k);
     if (!b) {
-      if (this.byKey.size >= IMPORT_BOUNDS.sessions) throw new Error(`import: more than ${IMPORT_BOUNDS.sessions} sessions`);
+      if (this.byKey.size >= IMPORT_BOUNDS.sessions) throw new ImportError(`more than ${IMPORT_BOUNDS.sessions} sessions`);
       b = new SessionBuilder(harness, id, this.stats);
       this.byKey.set(k, b);
     }
@@ -38,7 +38,7 @@ export class SessionSet {
     const cur = this.byKey.get(k);
     if (cur) cur.absorb(b);
     else {
-      if (this.byKey.size >= IMPORT_BOUNDS.sessions) throw new Error(`import: more than ${IMPORT_BOUNDS.sessions} sessions`);
+      if (this.byKey.size >= IMPORT_BOUNDS.sessions) throw new ImportError(`more than ${IMPORT_BOUNDS.sessions} sessions`);
       this.byKey.set(k, b);
     }
   }
