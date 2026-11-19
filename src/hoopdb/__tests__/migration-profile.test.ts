@@ -2649,6 +2649,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const OSC = "upstream:20261105062120_analysis_org_s3_cutover.sql";
     const OSR = "upstream:20261105062130_analysis_cutover_source_revision.sql";
     const SOF = "upstream:20261105062140_staged_output_facts.sql";
+    const SIC = "upstream:20261105062160_session_intel_controls.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2710,6 +2711,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    expect(await names()).toContain(SIC);
+    expect((await failure(rollback("20261105062140_staged_output_facts.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062160_session_intel_controls.down.sql");
+    expect(await names()).not.toContain(SIC);
+    expect(await relation("sessions.session_intel_controls")).toBeNull();
+    expect((await failure(rollback("20261105062160_session_intel_controls.down.sql")))?.code).toBe("55000");
     // 20261105062140 is newest: 062130's down refuses (55000) while it is applied; its checksum-pinned down drops its
     // trigger on the 062110 run table, its two tables, its eight functions and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(SOF);

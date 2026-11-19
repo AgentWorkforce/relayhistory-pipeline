@@ -439,6 +439,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
   "sessions.session_index_scrub_sticky()",
+  "sessions.session_intel_controls_v1(text,text)",
   "sessions.session_publication_is_managed(text,text,text,text,text)",
   "sessions.session_publication_lock(jsonb)",
   "sessions.session_publication_probe(jsonb)",
@@ -1668,7 +1669,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "55b72e20671d1eeeea4c2920daef9b2396eed7f2487cf3f3bddfaa070c15d364";
+  "325e9506109605a4c044ec209420244bc3d468887b2c35072c843c82dbf26b1f";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

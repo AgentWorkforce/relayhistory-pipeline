@@ -11,6 +11,7 @@ import type { CoordinationBackend } from "../session-read-api/coordination-backe
 import type { Directory, DirectoryListRow } from "../session-read-api/directory.ts";
 import type { SqlQuery } from "../session-read-api/liveness.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { sessionIntelControls, type SessionIntelControls } from "../shared/session-intel-controls.ts";
 import type { RelaySender } from "./relay-sender.ts";
 import {
   ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS, highAdvisories, lowAdvisories, orderAdvisories,
@@ -100,6 +101,7 @@ export interface AdvisoryRowInput {
 
 /** Everything the scan reads from and writes to Postgres. */
 export interface AdvisorStore {
+  controls(orgId: string, workspaceId: string): Promise<SessionIntelControls>;
   /** `workspaces` null: every workspace ("*"). */
   candidates(since: Date, limit: number, workspaces: string[] | null): Promise<CandidateLane[]>;
   directory(): Directory;
@@ -111,7 +113,9 @@ export interface AdvisorStore {
 }
 
 export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
+  const controls = sessionIntelControls(db);
   return {
+    controls: (orgId, workspaceId) => controls.read(orgId, workspaceId),
     async candidates(since, limit, workspaces) {
       const { rows } = await db.query<Record<string, unknown>>(CANDIDATES_SQL, [since, limit, workspaces, CANDIDATES_PER_WORKSPACE]);
       return rows.map((r) => ({
@@ -284,6 +288,8 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
   stats.candidates = Math.min(rows.length, CANDIDATE_LIMIT);
   for (const lanes of byWorkspace.values()) {
     const { orgId, workspaceId } = lanes[0]!;
+    const controls = await deps.store.controls(orgId, workspaceId);
+    if (controls.get("advisor") !== true) continue;
     // A pair needs two sessions in one project.
     const perProject = new Map<string, number>();
     for (const l of lanes) perProject.set(l.projectId!, (perProject.get(l.projectId!) ?? 0) + 1);
@@ -308,7 +314,7 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
         since.toISOString(), truncated);
       stats.findings += high.length + low.length;
       if (high.length + low.length) await seedLimits(deps, orgId, workspaceId, nowMs);
-      await deliver(deps, orgId, workspaceId, [...high, ...low], nowMs, stats);
+      await deliver({ ...deps, sender: controls.get("dm") === true ? deps.sender : undefined }, orgId, workspaceId, [...high, ...low], nowMs, stats);
     } catch (err) {
       stats.failed++;
       log.warn("coordination advisor workspace scan failed", { org_id: orgId, workspace_id: workspaceId, ...errorFields(err) });
