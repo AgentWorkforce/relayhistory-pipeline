@@ -34,7 +34,7 @@ import {
   type PipelineQueue,
   type StageMessage,
 } from "../shared/vendor.ts";
-import { RETENTION_BUCKET_HARNESS, type ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
+import { RETENTION_BUCKET_HARNESS, normalizeEtag, type ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
 import type { HoopDb,Transact } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { hoopDbSessionIndex } from "../hoopdb/index.ts";
@@ -117,7 +117,7 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
     sessionId: location.sessionId,
   };
 
-  if (deps.preRead) return indexPreRead(landed, orgId, scope, deps);
+  if (deps.preRead) return indexPreRead(landed, orgId, scope, location.machineId, deps);
   return deps.lock(scope, () => indexLocked(landed, orgId, scope, deps));
 }
 
@@ -208,10 +208,20 @@ const SCOPE_CHANGED = Symbol("scope_changed");
  * before against the pre-read (the revision fence still answers a non-newer revision); changed means the
  * reads may be stale (the put whose read raced an erasure), so they are made again, once. A second change
  * throws the retryable pointer_scope_changed (the event is retried, as pointer_move_pending is).
+ * An event whose eTag the live row of its key already indexed answers `unchanged` from the stamp alone.
  */
-async function indexPreRead(landed: ObjectLanded, orgId: string, scope: SessionScope, deps: PointerDeps): Promise<PointerOutcome> {
+async function indexPreRead(landed: ObjectLanded, orgId: string, scope: SessionScope, machineId: string, deps: PointerDeps): Promise<PointerOutcome> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const stamp = await scopeStamp(deps.db, scope);
+    // An unchanged manifest: the event's eTag (normalized as every read's) is the one the live row of this
+    // key already indexed, so the row reflects this write. No read, no lock; a later write or delete of the key
+    // has its own event.
+    const landedEtag = normalizeEtag(landed.etag);
+    if (attempt === 0 && landedEtag && !landed.deleted) {
+      const rows = JSON.parse(stamp) as Array<[string, string, string, string | null, string | null, string]>;
+      const same = rows.find(([machine, key, , etag, deleted]) => machine === machineId && key === landed.key && etag === landedEtag && deleted === null);
+      if (same) return { status: "unchanged", scope, manifestKey: landed.key, revision: Number(same[2]) };
+    }
     const cache = await preReadEvent(landed, orgId, scope, deps);
     const out = await deps.lock(scope, async () => {
       if ((await scopeStamp(deps.db, scope)) !== stamp) return SCOPE_CHANGED;
