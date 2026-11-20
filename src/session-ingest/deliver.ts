@@ -42,6 +42,14 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * stay 503) is the same 429 `ClaimLockBusy`. It is the same rolled back single statement.
  * Hypothesis, pending operator pg_stat_activity/lock/plan evidence: several sub-2 s lock
  * waits on the per-user fence row add up to the 5 s statement_timeout.
+ * Buffered acceptance, two more exceptions, each default off and independent:
+ * INGEST_BUFFER_LOCK_RETRY=on (`DeliverDeps.bufferLockRetry`) re-issues a `buffer_intent` /
+ * `buffer_receipt` ledger call that failed with `ledger_lock_timeout` (55P03/40P01) once, after a
+ * 50-250 ms jittered pause; INGEST_BUFFER_LOCK_BUSY=on (`DeliverDeps.bufferLockBusy`) answers that
+ * failure (after the retry, if any) as the 429 `BufferLockBusy` (a `ClaimLockBusy`, Retry-After 5-10 s)
+ * instead of a 503. Both calls are one autocommit statement whose error rolled it back whole
+ * (ingest_prepare_buffer_stage is idempotent per claim and stage key; ingest_commit_buffered_batch
+ * answers a repeat with the same receipt). Every other stage and cause stays as it was.
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -127,8 +135,24 @@ export interface DeliverDeps {
    * `db_error_code: 57014`, so the two causes stay separable. Unset (the default): the 503, unchanged.
    */
   claimTimeoutBusy?: true;
-  /** Test seam for the ClaimLockBusy jitter: a value in [0, 1). Default Math.random. */
+  /**
+   * INGEST_BUFFER_LOCK_BUSY=on (buffered acceptance): a `buffer_intent` / `buffer_receipt` ledger failure with
+   * cause `ledger_lock_timeout` (SQLSTATE 55P03/40P01) is refused as a 429 `BufferLockBusy` (a `ClaimLockBusy`
+   * that keeps the real stage) with `Retry-After` in CLAIM_LOCK_RETRY_AFTER instead of a 503. Every other
+   * cause and stage is unchanged. Unset (the default): the 503 `IngestUnavailable`, unchanged.
+   */
+  bufferLockBusy?: true;
+  /**
+   * INGEST_BUFFER_LOCK_RETRY=on (buffered acceptance): on that same failure, the same ledger call with the
+   * same input is issued exactly once more after a pause in BUFFER_LOCK_RETRY_PAUSE_MS (jitter from
+   * `random`). A second failure propagates as before (with `bufferLockBusy`, the 429; otherwise the 503).
+   * Every other cause and stage is never retried. Unset (the default): one call, unchanged.
+   */
+  bufferLockRetry?: true;
+  /** Test seam for the ClaimLockBusy / BufferLockBusy jitter and the buffer retry pause: a value in [0, 1). Default Math.random. */
   random?: () => number;
+  /** Test seam for the INGEST_BUFFER_LOCK_RETRY pause. Default: a setTimeout promise. */
+  sleep?: (ms: number) => Promise<void>;
   /**
    * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
    * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
@@ -234,10 +258,33 @@ export const CLAIM_LOCK_RETRY_AFTER = Object.freeze({ min: 5, max: DELIVERY_BUSY
  * and database diagnosis of the 503 it replaces, for the route line and the lock alert.
  */
 export class ClaimLockBusy extends DeliveryBusyError {
-  readonly stage = "claim";
-  constructor(readonly cause_code: string, readonly db: DbErrorDiagnosis | undefined, retryAfterSeconds: number) {
-    super("ledger_claim", retryAfterSeconds);
+  readonly stage: string = "claim";
+  constructor(readonly cause_code: string, readonly db: DbErrorDiagnosis | undefined, retryAfterSeconds: number, lock: "ledger_claim" | "ledger_buffer" = "ledger_claim") {
+    super(lock, retryAfterSeconds);
   }
+}
+
+export type BufferLockStage = "buffer_intent" | "buffer_receipt";
+
+/**
+ * A buffered stage-intent / receipt ledger call refused because its single autocommit statement lost a
+ * lock wait (INGEST_BUFFER_LOCK_BUSY=on). The same 429 `delivery_busy` answer as `ClaimLockBusy` (it is
+ * one, so the route line, the lock alert and the admission consumer treat it alike) with lock
+ * `ledger_buffer` and the real stage. The statement rolled back; nothing was written.
+ */
+export class BufferLockBusy extends ClaimLockBusy {
+  constructor(override readonly stage: BufferLockStage, cause_code: string, db: DbErrorDiagnosis | undefined, retryAfterSeconds: number) {
+    super(cause_code, db, retryAfterSeconds, "ledger_buffer");
+  }
+}
+
+/** INGEST_BUFFER_LOCK_RETRY pause before the one re-issue, in ms (inclusive). */
+export const BUFFER_LOCK_RETRY_PAUSE_MS = Object.freeze({ min: 50, max: 250 });
+
+function bufferLockRetryPauseMs(random: () => number): number {
+  const { min, max } = BUFFER_LOCK_RETRY_PAUSE_MS;
+  const r = random();
+  return min + Math.floor((Number.isFinite(r) && r >= 0 && r < 1 ? r : 0) * (max - min + 1));
 }
 
 function claimLockRetryAfter(random: () => number): number {
@@ -345,6 +392,41 @@ async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLock
       throw new ClaimLockBusy(error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
     throw error;
   }
+}
+
+const isBufferLockWait = (error: unknown, stage: BufferLockStage): error is IngestUnavailable =>
+  error instanceof IngestUnavailable && error.stage === stage && error.cause_code === "ledger_lock_timeout";
+
+/**
+ * A buffered ledger stage (`buffer_intent` / `buffer_receipt`). Neither flag (the default): exactly the plain
+ * stage. With `bufferLockRetry`, a lock-wait failure (`ledger_lock_timeout`) re-runs the SAME `work` once
+ * after a jittered pause (each attempt is its own stage-latency line); with `bufferLockBusy`, a lock-wait
+ * failure still standing is a 429 BufferLockBusy. Every other error propagates unchanged.
+ */
+async function bufferLedgerStage<T>(
+  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep">,
+  name: BufferLockStage,
+  work: () => Promise<T>,
+): Promise<T> {
+  if (!deps.bufferLockBusy && !deps.bufferLockRetry) return runStage(name, work, deps.stageLatency);
+  const random = deps.random ?? Math.random;
+  let error: unknown;
+  try {
+    return await runStage(name, work, deps.stageLatency);
+  } catch (first) {
+    error = first;
+  }
+  if (deps.bufferLockRetry && isBufferLockWait(error, name)) {
+    await (deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(bufferLockRetryPauseMs(random));
+    try {
+      return await runStage(name, work, deps.stageLatency);
+    } catch (second) {
+      error = second;
+    }
+  }
+  if (deps.bufferLockBusy && isBufferLockWait(error, name))
+    throw new BufferLockBusy(name, error.cause_code, error.db, claimLockRetryAfter(random));
+  throw error;
 }
 
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
@@ -499,12 +581,12 @@ async function writeAndCommit(
     const preparedStage = await stage("buffer_prepare", async () => prepareBufferedStage(deps.target.keyRoot,
       {claim_token:claimToken,batch_digest:prepared.batchDigest,received_at:receivedAt.toISOString(),org_id:tenant.orgId,workspace_id:tenant.workspaceId,origin_id:prepared.originId,user_id:tenant.userId},
       grouped.groups, grouped.index.map(indexes => indexes.map(i => keep[i]!))));
-    const intent = await stage("buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
+    const intent = await bufferLedgerStage(deps, "buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
     mark("buffer_intent");
     await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
     mark("buffer_put");
     if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
-    const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    const ack=await bufferLedgerStage(deps, "buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
     let custodyAck:CurrentCustodyAck|undefined;
     if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
     mark("buffer_receipt");
