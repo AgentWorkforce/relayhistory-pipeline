@@ -52,6 +52,6 @@ a `*.test.ts`, and nothing is imported by `src/`.
 ## What these results do not establish
 
 - Production hold times, network round-trips or fsync.
-- Which stage each `55P03` hit (`log_lock_waits` was off).
+- Which stage each `55P03` hit in runs 1-4 (`log_lock_waits` was off; run 5 has it).
 - Stable absolute numbers on this host.
 - An absence of `40P01` beyond the schedules that were run.
