@@ -387,8 +387,10 @@ failing. Clients keep their batches and retry, so nothing is lost while it lasts
    - The separate `session ingest db error` line comes from the pg client's `error` event, not the route,
      and is not counted. It carries `db_error_detail` (closed message shape), `error_frame` (the first
      stack frame's function name only) and `db_client_phase`. `socket_closed` with
-     `CloudflareSocket._listen` and `ending` is the client's own `end()` closing the socket after the
-     response, which leaves the response unchanged. `active` means the socket failed during the request.
+     `CloudflareSocket._listen` and `ending` is expected to be the client's own `end()` closing the
+     socket after the response (inferred from the code path, not yet confirmed on a deployed Worker); in
+     that case the response is unchanged. `active` means the socket failed during the request. The queue
+     consumers' db error lines carry no `db_client_phase`.
 2. Generation fence after a schema apply: readiness already moved to `(H, pass)` while the Worker offers
    only G. Follow `docs/design/zero-503-schema-windows.md` section 3.2, "Post-apply recovery": deploy the
    Worker at G+H with `OVERLAP <H>`, then dispatch the overlap workflow `rebind-dry-run` and `rebind`.

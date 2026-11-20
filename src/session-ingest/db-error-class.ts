@@ -118,8 +118,12 @@ function readString(target: unknown, key: "code" | "message" | "name" | "stack")
 
 function snapshot(error: unknown): Snapshot {
   const message = readString(error, "message");
-  // In RAM only; bounded, lower-cased, matched and discarded.
-  return { code: readString(error, "code"), message: message === undefined ? undefined : message.slice(0, 2048).toLowerCase(), name: readString(error, "name") };
+  return snapshotOf(message, readString(error, "code"), readString(error, "name"));
+}
+
+/** The snapshot from already-read raw values. In RAM only; bounded, lower-cased, matched and discarded. */
+function snapshotOf(message: string | undefined, code: string | undefined, name: string | undefined): Snapshot {
+  return { code, message: message === undefined ? undefined : message.slice(0, 2048).toLowerCase(), name };
 }
 
 function closedClass(value: DbErrorClass | undefined): DbErrorClass | undefined {
@@ -219,15 +223,24 @@ function detailOf(message: string | undefined): DbErrorDetail {
 /** The first frame's function name, or a fixed sentinel. Never throws, never returns text
  * that fails FRAME_NAME. The stack's header is removed by equality with the error's own
  * name and message (read once each), so a message carrying "\n    at x (" cannot forge a frame.
- * Residual: a message rewritten after the stack was captured to a prefix of itself that ends just
- * before such a line could still expose one identifier-shaped token. Neither pg, pg-protocol,
- * pg-cloudflare nor this package rewrites an Error's message that way. */
+ * dbClientErrorFields reads name and message once and passes that same snapshot here, so the
+ * detail and the header comparison see one text.
+ * Residual: the stack is text captured earlier. If that single message read returns a prefix of
+ * the text the stack was captured with, ending just before such a line, one identifier-shaped
+ * token could still be exposed. Neither pg, pg-protocol, pg-cloudflare nor this package rewrites
+ * an Error's message that way. */
 export function errorFrame(error: unknown): string {
+  return frameOf(error, () => [readString(error, "name"), readString(error, "message")]);
+}
+
+/** errorFrame with the name and message supplied by the caller (read only when a stack exists). */
+function frameOf(error: unknown, nameAndMessage: () => readonly [string | undefined, string | undefined]): string {
   try {
     const stack = readString(error, "stack");
     if (stack === undefined || stack === "") return "none";
-    const name = readString(error, "name") ?? "Error";
-    const message = readString(error, "message") ?? "";
+    const [rawName, rawMessage] = nameAndMessage();
+    const name = rawName ?? "Error";
+    const message = rawMessage ?? "";
     const header = message === "" ? name : `${name}: ${message}`;
     if (!stack.startsWith(header)) return "other";
     const rest = stack.slice(header.length, header.length + STACK_SCAN_MAX);
@@ -264,12 +277,16 @@ export type DbClientErrorFields = {
 export function dbClientErrorFields(error: unknown, phase?: DbClientPhase): DbClientErrorFields {
   const withPhase = (f: DbClientErrorFields): DbClientErrorFields => (phase === "active" || phase === "ending" ? { ...f, db_client_phase: phase } : f);
   try {
-    const s = snapshot(error);
+    // One read each of message and name, shared by the detail and the frame's header check.
+    const message = readString(error, "message");
+    const code = readString(error, "code");
+    const name = readString(error, "name");
+    const s = snapshotOf(message, code, name);
     const d = diagnose(s);
     return withPhase({
       error_code: d.db_error_code, db_error_class: d.db_error_class, db_error_basis: d.db_error_basis,
       error_name: s.name !== undefined && NAME_SET.has(s.name) ? s.name : "other",
-      db_error_detail: detailOf(s.message), error_frame: errorFrame(error),
+      db_error_detail: detailOf(s.message), error_frame: frameOf(error, () => [name, message]),
     });
   } catch {
     return withPhase({ error_code: DB_ERROR_CODE_FALLBACK, db_error_class: "unknown", db_error_basis: "none", error_name: "other", db_error_detail: "none", error_frame: "other" });
