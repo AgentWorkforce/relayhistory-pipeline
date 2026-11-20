@@ -833,6 +833,11 @@ reads again and indexes it; a move follows today's rule (both keys live: `pointe
 write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read converges
 through its own event exactly as before.
 
+In the no-op-delete race, the pointer inserted from the stale pre-read can remain live for the requeue delay
+(60 seconds in the hosted Lambda) plus queue lag before that reconcile tombstones it. The same batch's search pass
+does not make that stale pointer ready: the missing manifest makes the pass incomplete (`manifest_missing`), it
+writes no search rows or deletes, invalidates directory-event readiness, and records the index state incomplete.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

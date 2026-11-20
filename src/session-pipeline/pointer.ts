@@ -76,9 +76,9 @@ export interface PointerDeps {
   publication?:{schemaGeneration:string;transact:Transact};
   now?: () => Date;
   /**
-   * SESSION_POINTER_PREREAD_ENABLED=true only (the hosted Lambda): every object-store call of the stage runs
-   * BEFORE the scope lock, and the lock transaction holds SQL only (indexPreRead). Absent: as before, the
-   * manifest is re-read under the lock.
+   * SESSION_POINTER_PREREAD_ENABLED=true only (the hosted Lambda): the normal path runs every object-store
+   * call BEFORE the scope lock, so its lock holds SQL only (indexPreRead). After two stamp changes the safety
+   * fallback uses the original locked-read path. Absent: as before, the manifest is re-read under the lock.
    */
   preRead?: boolean;
 }
