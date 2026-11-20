@@ -4,9 +4,9 @@ Status: seam only. The default engine is the TypeScript scrubber
 (`packages/pipeline/src/lib/scrub.ts`, ruleset `relayhistory-scrub` version 8, plus
 `scrubRecords`/`scrubLong`/`sealRawChunk` in `packages/pipeline/src/lib/pipeline/raw-chunks.ts`).
 The raw-ABI pin (`scrub-wasm-pin.json`) is still a placeholder that refuses to load. The
-wasm-bindgen pin is the exact relayscrubber `0.5.0-alpha.9` package, vendored byte-for-byte under
+wasm-bindgen pin is the exact relayscrubber `0.5.0-alpha.10` package, vendored byte-for-byte under
 `packages/pipeline/scrub-bindgen/`, and is used only under the opt-in env triple described in
-"Cutover: pinned relayscrubber 0.5.0-alpha.9". With `SCRUB_ENGINE` unset, `""` or `ts` nothing changes.
+"Cutover: pinned relayscrubber 0.5.0-alpha.10". With `SCRUB_ENGINE` unset, `""` or `ts` nothing changes.
 
 Code: `packages/pipeline/src/lib/scrub-engine/`
 
@@ -19,7 +19,7 @@ Code: `packages/pipeline/src/lib/scrub-engine/`
 | `predicate-hook.ts` | Late-bound `scrubText` for `trace.ts` `isSafeIdentifier` (import-cycle break, see below) |
 | `packages/pipeline/scrub-wasm-pin.json` | The pin |
 | `bindgen-engine.ts` | `SCRUB_ENGINE=wasm-bindgen`: pin parsing, verified glue import, manifest check, `createCompiledBindgenEngine` (see "wasm-bindgen path") |
-| `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (relayscrubber `0.5.0-alpha.9`) |
+| `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (relayscrubber `0.5.0-alpha.10`) |
 | `packages/pipeline/scrub-bindgen/` | The vendored package bytes the pin names (data; `.gitattributes` `-text`) |
 | `packages/pipeline/technical-foul-cutover.json` | The cutover provenance entry (separate from `technical-foul.json`) |
 
@@ -195,7 +195,7 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
    scrubs internally and its bytes are pinned. The follow-up re-pins `raw-chunks.ts` so that
    `sealRawChunk` takes the engine as a parameter. It needs a technical-foul re-pin with review.
    (Done differently for the alpha.4 cutover: `raw-chunks.ts` stays sealed and unchanged, and the
-   bound sealer in `engine-raw-chunks.ts` is injected per call site; see "Cutover: pinned relayscrubber 0.5.0-alpha.9".)
+   bound sealer in `engine-raw-chunks.ts` is injected per call site; see "Cutover: pinned relayscrubber 0.5.0-alpha.10".)
 
 ## Worker bundling (findings, nothing shipped)
 
@@ -239,8 +239,8 @@ are mutually exclusive in one process (a conflicting selection throws), and a bi
 init never consults the raw-ABI loader. Raw ABI v1 stays in the tree, but the first
 cutover is not planned to use it.
 
-`packages/pipeline/scrub-bindgen-pin.json` pins relayscrubber `0.5.0-alpha.9` (see "Cutover:
-pinned relayscrubber 0.5.0-alpha.9" for the values, the env triple and what refuses when).
+`packages/pipeline/scrub-bindgen-pin.json` pins relayscrubber `0.5.0-alpha.10` (see "Cutover:
+pinned relayscrubber 0.5.0-alpha.10" for the values, the env triple and what refuses when).
 Selecting `wasm-bindgen` without `READER_MAX_RULESET=10` makes `initScrubEngine` throw
 `ScrubEngineUnavailable(bindgen_ruleset_above_reader_ceiling)`, and every call site then
 refuses as described in "Fail-closed rules".
@@ -317,15 +317,15 @@ entrypoint calls it. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 
 ### Blockers before a real pin (relayscrubber-lead 245870894909468672)
 
-(Historical record from the scaffold PR; the status of each item for the alpha.9 cutover is in "Cutover: pinned relayscrubber 0.5.0-alpha.9".) Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
+(Historical record from the scaffold PR; the status of each item for the alpha.10 cutover is in "Cutover: pinned relayscrubber 0.5.0-alpha.10".) Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
-1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy implemented in #489. The alpha.9 pin is version 10 and refuses without `READER_MAX_RULESET=10`; see "Cutover" and "Reader-first rollout". Fleet rollout of the ceiling is an operational step, not a source change.)
-2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Schema-3 crate-owned profile comparison implemented in #489; the alpha.9 pin compares `relayhistory-secrets-v10` verbatim, see "Cutover".)
-3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Refusal-tag recognition and sticky unknown-error poisoning implemented in #489; the fault matrix runs against the real alpha.9 module in `packages/pipeline/test/scrub-bindgen-faults.test.ts`.)
-4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489. Release provenance is implemented for alpha.9: the pin's `release` block records the GitHub release tarball sha256, every receipt emits it, and the `--tarball` check proves the vendored bytes equal the tarball's; see "Cutover" / "Provenance checks".)
+1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy implemented in #489. The alpha.10 pin is version 10 and refuses without `READER_MAX_RULESET=10`; see "Cutover" and "Reader-first rollout". Fleet rollout of the ceiling is an operational step, not a source change.)
+2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Schema-3 crate-owned profile comparison implemented in #489; the alpha.10 pin compares `relayhistory-secrets-v10` verbatim, see "Cutover".)
+3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Refusal-tag recognition and sticky unknown-error poisoning implemented in #489; the fault matrix runs against the real alpha.10 module in `packages/pipeline/test/scrub-bindgen-faults.test.ts`.)
+4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489. Release provenance is implemented for alpha.10: the pin's `release` block records the GitHub release tarball sha256, every receipt emits it, and the `--tarball` check proves the vendored bytes equal the tarball's; see "Cutover" / "Provenance checks".)
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
-Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489. The Rust recheck and limit-1 / limit / limit+1 boundary tests run against the real alpha.9 module in `packages/pipeline/test/scrub-bindgen-limits.test.ts`. Seal-path routing is implemented, see "Cutover" / "Routing"; unwired call sites refuse with `seal_path_not_routed`. Workers remain excluded.)
+Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489. The Rust recheck and limit-1 / limit / limit+1 boundary tests run against the real alpha.10 module in `packages/pipeline/test/scrub-bindgen-limits.test.ts`. Seal-path routing is implemented, see "Cutover" / "Routing"; unwired call sites refuse with `seal_path_not_routed`. Workers remain excluded.)
 
 Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 
@@ -337,7 +337,7 @@ Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 - NDJSON is limited to 16 MiB per physical LF-delimited record and 64 MiB per stream. LF is excluded from the record size but included in the stream size; CR and whitespace count toward the record size. This is the intended Rust physical-byte contract before blank-line handling; adapter tests alone do not prove package conformance.
 - Shared record buffers are refused, including foreign-realm SharedArrayBuffers. Ordinary record buffers are copied into a private Uint8Array, so Buffer views cannot retain a mutable alias. UTF-8 is validated in bounded chunks; the original bytes are passed to Rust without decoding/re-encoding or JSON parsing.
 
-Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. This admission layer changes neither recognition rules nor any reader ceiling or scrub marker. The limits are exercised against the real alpha.9 module at limit-1 / limit / limit+1 with multibyte boundaries in `packages/pipeline/test/scrub-bindgen-limits.test.ts`.
+Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. This admission layer changes neither recognition rules nor any reader ceiling or scrub marker. The limits are exercised against the real alpha.10 module at limit-1 / limit / limit+1 with multibyte boundaries in `packages/pipeline/test/scrub-bindgen-limits.test.ts`.
 
 The adapter requires the ABI-2 `scrubTextChecked` export for both text and long
 text after JS admission. That Rust entrypoint rechecks the byte limit before
@@ -371,11 +371,11 @@ from glue failures and do not poison an untouched instance; local admission
 allocation failures retain their retryable classification.
 
 These guards use inert glue tests on both loader paths, and the fault matrix is
-repeated against the real alpha.9 module through an injecting wrapper (never by
+repeated against the real alpha.10 module through an injecting wrapper (never by
 editing vendored bytes) in `packages/pipeline/test/scrub-bindgen-faults.test.ts`.
 Worker bundle qualification remains open (Workers are excluded from the cutover).
 
-## Cutover: pinned relayscrubber 0.5.0-alpha.9
+## Cutover: pinned relayscrubber 0.5.0-alpha.10
 
 Opt-in only. With `SCRUB_ENGINE` unset, `""` or `ts` every path is byte-identical to before:
 the TS engine, the TS `sealRawChunk`, ruleset `relayhistory-scrub` version 8, and
@@ -385,14 +385,14 @@ the TS engine, the TS `sealRawChunk`, ruleset `relayhistory-scrub` version 8, an
 
 | Field | Value |
 |---|---|
-| `package` / `package_version` | `@agentworkforce/relayscrubber` / `0.5.0-alpha.9` |
-| `wasm_sha256` (`generated/relayscrubber_bg.wasm`) | `4228d2cd50334a6b714dcbd8cfc89220fdf36b1c903d170f873ad9b738fee090` |
+| `package` / `package_version` | `@agentworkforce/relayscrubber` / `0.5.0-alpha.10` |
+| `wasm_sha256` (`generated/relayscrubber_bg.wasm`) | `491fc18e691ea4549ba84739e1c1a3e56b76709bb85193a2606996b8f8c4528b` |
 | `glue_sha256` (`generated/relayscrubber.js`) | `55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b` |
 | `loader_sha256` (`index.js`, hashed, never evaluated) | `ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490` |
 | `scrub_profile` | `relayhistory-secrets-v10` |
-| `manifest` | schema 3, `relayhistory-scrub`, rulesetVersion 10, rulesetSourceSha256 `7837062214ff56145c72999880179598244cff5f80554a4b697548920561c143`, crateVersion `0.5.0-alpha.9`, abiVersion 2, policy `secrets`, redactionToken `[REDACTED]`, scrubProfile `relayhistory-secrets-v10` |
+| `manifest` | schema 3, `relayhistory-scrub`, rulesetVersion 10, rulesetSourceSha256 `658c54d896815a919b36cf94fb364a08b4d16e524e34a56c5e405331246933e4`, crateVersion `0.5.0-alpha.10`, abiVersion 2, policy `secrets`, redactionToken `[REDACTED]`, scrubProfile `relayhistory-secrets-v10` |
 
-The release's `generated/artifact.json` (sha256 `3134f3b65f93fba7b050d47e243af2639f3c9d4b7ebfd863a7ad1f9d1e3fdec5`,
+The release's `generated/artifact.json` (sha256 `fb6635eef4c888b60ca0a5d9304001144b366bd1baf5b1543be25b94a7214133`,
 toolchain Rust 1.88.0, wasm-bindgen 0.2.104) and the `.d.ts` files are vendored for provenance.
 `packages/pipeline/scrub-bindgen/.gitattributes` (`* -text`) keeps git from normalising the bytes.
 The vendored directory reaches the services image through `COPY packages packages`.
@@ -418,26 +418,34 @@ pinned here) preserved bare credential reassignments such as `password = API_TOK
 `588d8ec32ced45f40da1ae88a95c7e3b7674841d33f29e29734eeedc80e56bb0`, release tarball
 `7f08abcda6ee1e463a2414878131433631de869125c8f9153ed8c9ded555f099`, crates.io checksum
 `7f79b62f5fc4b52a738cb86e428c1a69b7f55ccb7258ffa16ebced7eb7beebc6`) fixes that recall regression.
-`0.5.0-alpha.9` (tag `v0.5.0-alpha.9` -> relayscrubber `934e7b67`, crates.io checksum
+`0.5.0-alpha.9` (tag `v0.5.0-alpha.9` -> relayscrubber `934e7b67`, wasm
+`4228d2cd50334a6b714dcbd8cfc89220fdf36b1c903d170f873ad9b738fee090`, rulesetSourceSha256
+`7837062214ff56145c72999880179598244cff5f80554a4b697548920561c143`, `artifact.json`
+`3134f3b65f93fba7b050d47e243af2639f3c9d4b7ebfd863a7ad1f9d1e3fdec5`, release tarball
+`c3103a59edd24075c35d974c955aee1faf3fd6fb6eeabcd92aea338ac2448832`, crates.io checksum
 `6a97cd235bb6ded9f15f9f100e37627ee3aeef2f73e3c32c13f4a0e913d8f1e6`) keeps an exact `project_key`
 whose value is a normalized repository identity (`github.com/owner/repo`), which alpha.8 redacted
 as a generic `*_key`; capture's project tag then reaches the session directory. It was released on
-Khaliq's authorization without a relayscrubber-lead exact-head PASS. Each step changes only the wasm,
+Khaliq's authorization without a relayscrubber-lead exact-head PASS. `0.5.0-alpha.10` (tag
+`v0.5.0-alpha.10` -> relayscrubber `18de56c2`, crates.io checksum
+`9850b39b2fe427a096974d36ea0180535d97b2a0fa3e990fc5ebb8cc16acea2f`) is the current pin; its
+credential-keyword sentence seam regressions are in
+`packages/pipeline/test/scrub-bindgen-credential-keyword-sentence.test.ts`. Each step changes only the wasm,
 the ruleset source digest, the crate version and therefore `artifact.json`; rulesetVersion 10, the
 `relayhistory-secrets-v10` profile, abiVersion 2, the glue, the loader and the `.d.ts` files are
 byte-identical.
 
 The pin (schema 2) also carries a `release` block: `source` `github-release`, `repository`
-`AgentWorkforce/relayscrubber`, `tag` `v0.5.0-alpha.9`, `tarball`
-`agentworkforce-relayscrubber-0.5.0-alpha.9.tgz`, `tarball_sha256`
-`c3103a59edd24075c35d974c955aee1faf3fd6fb6eeabcd92aea338ac2448832`, and `sha256sums`
+`AgentWorkforce/relayscrubber`, `tag` `v0.5.0-alpha.10`, `tarball`
+`agentworkforce-relayscrubber-0.5.0-alpha.10.tgz`, `tarball_sha256`
+`a6a30eb589f446b7e5153bb03d093a8758da048a422cb644683236b5e8cd2084`, and `sha256sums`
 (`artifact.json` = the vendored digest above). `parseScrubBindgenPin` refuses a pin without a
 well-formed block (`bindgen_unpinned_release`). The pin is read from disk on first use by
 `loadScrubBindgenPin()` (failure `bindgen_pin_unreadable`), never imported as JSON, so its
 digests and version-10 profile stay out of any bundle that imports the seam.
 
 Provenance checks:
-- `packages/pipeline/test/scrub-bindgen-pin-alpha9.test.ts` recomputes every vendored digest against
+- `packages/pipeline/test/scrub-bindgen-pin-alpha10.test.ts` recomputes every vendored digest against
   the pin and `artifact.json`; mutated bytes and swapped modules fail closed.
 - `packages/pipeline/test/scrub-bindgen-reassignment-alpha8.test.ts` drives the real vendored wasm
   through the pipeline's own binding (seam `scrubText` / `scrubLong` / `scrubJson` and the routed

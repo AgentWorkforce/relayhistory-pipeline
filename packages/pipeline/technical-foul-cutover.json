@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "entry": "cutover-relayscrubber-0.5.0-alpha.9",
+  "entry": "cutover-relayscrubber-0.5.0-alpha.10",
   "engine": "wasm-bindgen",
   "envTriple": {
     "SCRUB_ENGINE": "wasm-bindgen",
@@ -8,21 +8,21 @@
     "READER_MAX_RULESET": "10"
   },
   "package": "@agentworkforce/relayscrubber",
-  "packageVersion": "0.5.0-alpha.9",
+  "packageVersion": "0.5.0-alpha.10",
   "pinPath": "packages/pipeline/scrub-bindgen-pin.json",
-  "pinFileSha256": "11541b7da9236c21187183b1449301bae4b45b6a90d1688de91c540bd42cab3c",
+  "pinFileSha256": "c547ec14159378d4590c4bd37178752660227e3de0b56b7f35dee8d09118c3a0",
   "release": {
     "source": "github-release",
     "repository": "AgentWorkforce/relayscrubber",
-    "tag": "v0.5.0-alpha.9",
-    "tarball": "agentworkforce-relayscrubber-0.5.0-alpha.9.tgz",
-    "tarball_sha256": "c3103a59edd24075c35d974c955aee1faf3fd6fb6eeabcd92aea338ac2448832",
+    "tag": "v0.5.0-alpha.10",
+    "tarball": "agentworkforce-relayscrubber-0.5.0-alpha.10.tgz",
+    "tarball_sha256": "a6a30eb589f446b7e5153bb03d093a8758da048a422cb644683236b5e8cd2084",
     "sha256sums": {
-      "artifact.json": "3134f3b65f93fba7b050d47e243af2639f3c9d4b7ebfd863a7ad1f9d1e3fdec5"
+      "artifact.json": "fb6635eef4c888b60ca0a5d9304001144b366bd1baf5b1543be25b94a7214133"
     }
   },
   "pinDigests": {
-    "wasm": "4228d2cd50334a6b714dcbd8cfc89220fdf36b1c903d170f873ad9b738fee090",
+    "wasm": "491fc18e691ea4549ba84739e1c1a3e56b76709bb85193a2606996b8f8c4528b",
     "glue": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
     "loader": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490"
   },
@@ -31,8 +31,8 @@
     "schema": 3,
     "ruleset": "relayhistory-scrub",
     "rulesetVersion": 10,
-    "rulesetSourceSha256": "7837062214ff56145c72999880179598244cff5f80554a4b697548920561c143",
-    "crateVersion": "0.5.0-alpha.9",
+    "rulesetSourceSha256": "658c54d896815a919b36cf94fb364a08b4d16e524e34a56c5e405331246933e4",
+    "crateVersion": "0.5.0-alpha.10",
     "abiVersion": 2,
     "policy": "secrets",
     "redactionToken": "[REDACTED]",
@@ -42,21 +42,21 @@
     "rust": "1.88.0",
     "wasmBindgen": "0.2.104"
   },
-  "artifactJsonSha256": "3134f3b65f93fba7b050d47e243af2639f3c9d4b7ebfd863a7ad1f9d1e3fdec5",
+  "artifactJsonSha256": "fb6635eef4c888b60ca0a5d9304001144b366bd1baf5b1543be25b94a7214133",
   "vendoredFiles": {
     "index.js": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
     "index.d.ts": "c94dd2a4f8596f4f7f8c27a51d0b9bfa7b8594615cf2576a22beb5a697db1980",
     "generated/relayscrubber.js": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
     "generated/relayscrubber.d.ts": "2c20949933851d1c100f690b0fd35338040616951404a0a1ed8d98c664304441",
-    "generated/relayscrubber_bg.wasm": "4228d2cd50334a6b714dcbd8cfc89220fdf36b1c903d170f873ad9b738fee090",
+    "generated/relayscrubber_bg.wasm": "491fc18e691ea4549ba84739e1c1a3e56b76709bb85193a2606996b8f8c4528b",
     "generated/relayscrubber_bg.wasm.d.ts": "27183d892b07da18aebd7cf06362ccb64b10019f84ecec926f070687903e84b1",
-    "generated/artifact.json": "3134f3b65f93fba7b050d47e243af2639f3c9d4b7ebfd863a7ad1f9d1e3fdec5"
+    "generated/artifact.json": "fb6635eef4c888b60ca0a5d9304001144b366bd1baf5b1543be25b94a7214133"
   },
   "sealerSources": {
-    "packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts": "6b395e9a69c372d738e03fe7c988dc369f0ded83e81586b711e37986eca25f5d",
+    "packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts": "5807a1ac67156e54f945531ee2b945eee67007d1e03ef74d788fccf0826f10ac",
     "packages/pipeline/src/lib/scrub-engine/bindgen-engine.ts": "6a4d19ac3558c266158e5b033f4ae4c50cbd313e3513ce088f51391ca53a43de",
     "packages/pipeline/src/lib/scrub-engine/bindgen-admission.ts": "ecf1fa15513369f37bcd8ee899cfd9bc487d98a7bb1b33ee5bb5717c379a3422",
-    "packages/pipeline/src/lib/scrub-engine/index.ts": "4d93ef0a207a878da81521049f5a861426f57c1b4226a72993457750ffc26b98"
+    "packages/pipeline/src/lib/scrub-engine/index.ts": "e8cdea31fd9f42cc88caeb83ec6806ac828a80ffe9c88e7b81810dd43565792a"
   },
   "tsReference": {
     "manifestPath": "packages/pipeline/technical-foul.json",

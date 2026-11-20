@@ -1,6 +1,6 @@
 /**
  * Pipeline-side check for relayscrubber alpha.9's project_key change
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.9").
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.10").
  *
  * alpha.8 redacted capture's `project_key` as a generic `*_key`, so the session directory never
  * learned which repository a session worked in. alpha.9 keeps an exact `project_key` whose value
@@ -50,8 +50,8 @@ afterEach(async () => {
 async function realEngine() {
   const engine = await initScrubEngine({ env: TRIPLE });
   expect(engine.kind).toBe("wasm-bindgen");
-  expect(PIN.package_version).toBe("0.5.0-alpha.9");
-  expect((engine as unknown as { manifest: { crateVersion: string } }).manifest.crateVersion).toBe("0.5.0-alpha.9");
+  expect(PIN.package_version).toBe("0.5.0-alpha.10");
+  expect((engine as unknown as { manifest: { crateVersion: string } }).manifest.crateVersion).toBe("0.5.0-alpha.10");
   return engine;
 }
 
