@@ -700,6 +700,22 @@ describe("frame source attribution (X-Relayhistory-List-Served-By)", () => {
     expect(existsSync(join(evalDir, "score", "scored-hashes.json"))).toBe(false);
   });
 
+  test("--detectors and --allow-incomplete-coverage together: both detectors run, and the replay is still incomplete", async () => {
+    const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 2 ? "neon" : "union") });
+    const out = newOut();
+    expect(await main(argv(api.url, out, strict("union")), io().io)).toBe(4);
+    const evalDir = tmp("si-harvest-eval-");
+    const rq = io();
+    const rio = { out: rq.io.out, err: rq.io.err, now: NOW };
+    const args = ["replay", "--snapshot", out, "--out", join(evalDir, "replay"), "--detectors", "coordination-advisor,conflict-rule", "--allow-incomplete-coverage"];
+    expect(await replayMain(args, rio)).toBe(1);
+    const alerts = JSON.parse(readFileSync(join(evalDir, "replay", "alerts.json"), "utf8"));
+    expect(alerts.detectors.map((d: { name: string }) => d.name)).toEqual(["coordination-advisor", "conflict-rule"]);
+    expect(alerts.incomplete).toContain("coverage: the harvest's coverage receipt says complete:false (frame_backend_unverified)");
+    // Without the flag the same detectors are still refused before any replay.
+    await expect(replayMain(args.slice(0, -1), rio)).rejects.toThrow("refused");
+  });
+
   test("strict, a page with no header: incomplete, counted as missing", async () => {
     const api = fakeReadApi({ sessions: COMPLETE, servedBy: (n) => (n === 1 ? "union" : null) });
     const out = newOut();

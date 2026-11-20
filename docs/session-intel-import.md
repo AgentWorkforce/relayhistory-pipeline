@@ -75,7 +75,12 @@ It prints no session ids, source paths, salt or text.
    - in a migration directory, an all-digit file name of at most 14 digits (`0042.sql`), or a number prefix of 3 to 14 digits with its `_` or `-` (`0042_`, `20261105062150_`, a `YYYYMMDDHHMMSS` stamp). The rest of the name is hashed. So is a longer digit run, and so is a "prefix" with a non-digit in it.
 
    Depth is kept. A sentence used as a file name, a key-shaped name, a name with whitespace or `@`, and a patch header holding a sentence all come out hashed. For example, `supabase/migrations/0042_add_index.sql` becomes `supabase/migrations/0042_<12 hex>.sql`, so the duplicate-migration detector still keys on `0042`. The private mapping file maps each hashed path back.
-4. **Projects.** The project key is the repository name: the last segment of the remote URL with `.git` dropped, or else the cwd's basename, lowercased. A home directory itself is never a key. `projectId` and `repo` are hashes of that key, so a Claude Code session in a checkout named `acme-api` and a Codex session whose remote ends in `acme-api` line up. In the generic format an explicit `projectId` becomes the project key, and `repo` the repository key.
+4. **Projects.** The project key is the repository name from the remote (`repoNameFromRemote`, shared with the harvester), or else the cwd's basename, lowercased. A home directory itself is never a key. The remote rule never keeps credentials:
+   - a `scheme://` URL keeps only its path (the host and any `user[:password]@` are dropped); `[user@]host:path` needs a `/` in its path; anything else is a local path;
+   - the query, fragment and `;params` are cut; the last segment, with `.git` dropped, is the name;
+   - a remote with whitespace, a control character or a `%` escape, an `@` left in its path, or a name outside `[a-z0-9._-]` gives no name, and the cwd decides.
+
+   So some legitimate remotes now fall back to the cwd, and their key can change from earlier imports: an scp-form remote with no `/` in its path (`myserver:project.git`), a repository name with a space, `+` or a percent escape (Azure DevOps `_git/My%20Repo`), a credentialed URL whose password contains `%`, and a remote ending `/.git`. `projectId` and `repo` are hashes of that key, so a Claude Code session in a checkout named `acme-api` and a Codex session whose remote ends in `acme-api` line up. In the generic format an explicit `projectId` becomes the project key, and `repo` the repository key.
 5. **Bounds.** These are the M0 loader's limits:
    - 100,000 sessions;
    - 20,000 facts per list per session (more are truncated and counted);
