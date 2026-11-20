@@ -42,6 +42,15 @@
  *                              instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY; every other
  *                              stage and cause stays 503 (HTTP only, as above). The Cloudflare stack
  *                              renders it only from sessionIngest.claimTimeoutBusy: "on"
+ *   INGEST_BUFFER_LOCK_BUSY    unset/off (default) | on (any case; buffered acceptance only): a buffer_intent /
+ *                              buffer_receipt ledger call that loses its lock wait (ledger_lock_timeout,
+ *                              55P03/40P01) is the same 429 delivery_busy with Retry-After 5-10 s instead of
+ *                              a 503 (deliver.ts BufferLockBusy; the route line keeps the real stage); every
+ *                              other stage and cause is unchanged. Rendered only from sessionIngest.bufferLockBusy: "on"
+ *   INGEST_BUFFER_LOCK_RETRY   unset/off (default) | on (any case; buffered acceptance only): that same failure
+ *                              re-issues the same ledger call once after a 50-250 ms jittered pause; a second
+ *                              failure propagates as before (429 with INGEST_BUFFER_LOCK_BUSY, else 503).
+ *                              Rendered only from sessionIngest.bufferLockRetry: "on"
  *   INGEST_CLAIM_LOCK_WAIT_MS  unset (default) | 25..2000: each claim runs in its own short transaction with
  *                              SET LOCAL lock_timeout of this many ms (ledger-sql.ts inClaimLockWait), so a
  *                              claim behind the same user's in-flight claim gives up quickly (55P03, and
@@ -178,6 +187,8 @@ export interface IngestWorkerEnv {
   INGEST_STAGE_LATENCY_LOG?: string;
   INGEST_CLAIM_LOCK_BUSY?: string;
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
+  INGEST_BUFFER_LOCK_BUSY?: string;
+  INGEST_BUFFER_LOCK_RETRY?: string;
   /** 25..2000 ms: a claim's own lock wait (ledger-sql.ts inClaimLockWait). Unset (default): the role's lock_timeout. */
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
@@ -266,6 +277,10 @@ export interface IngestSettings {
   claimLockBusy?: true;
   /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
   claimTimeoutBusy?: true;
+  /** INGEST_BUFFER_LOCK_BUSY=on: a buffer_intent / buffer_receipt lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
+  bufferLockBusy?: true;
+  /** INGEST_BUFFER_LOCK_RETRY=on: that failure re-issues the same ledger call once after 50-250 ms. Absent (the default): one call. */
+  bufferLockRetry?: true;
   /** INGEST_CLAIM_LOCK_WAIT_MS (25..2000): each claim waits at most this long for a lock (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
   claimLockWaitMs?: number;
   /** INGEST_ORIGIN_CLAIM_FENCE=on (buffered only): per-origin claim serialization (ledger-sql.ts). Absent (the default): per-user. */
@@ -387,6 +402,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
+    ...(routingFlag(env.INGEST_BUFFER_LOCK_BUSY) ? { bufferLockBusy: true as const } : {}),
+    ...(routingFlag(env.INGEST_BUFFER_LOCK_RETRY) ? { bufferLockRetry: true as const } : {}),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
     ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
@@ -467,6 +484,8 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     ...(settings.stageLatencyLog ? { stageLatency: (fields: StageLatencyFields) => log.info("session ingest", { ...fields }) } : {}),
     ...(settings.claimLockBusy ? { claimLockBusy: true as const } : {}),
     ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
+    ...(settings.bufferLockBusy ? { bufferLockBusy: true as const } : {}),
+    ...(settings.bufferLockRetry ? { bufferLockRetry: true as const } : {}),
   };
 }
 

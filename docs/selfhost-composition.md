@@ -359,6 +359,16 @@ The chart turns it on with the managed value `ingestEdge.claimLockBusy: true`
 `INGEST_CLAIM_LOCK_BUSY="on"` and omits the variable when false; the chart
 rejects `ingestEdge.extraEnv`.
 
+`INGEST_BUFFER_LOCK_BUSY` and `INGEST_BUFFER_LOCK_RETRY` (hosted Worker only,
+both default off) are not read by the self-host server. They act on the
+buffered `buffer_intent` / `buffer_receipt` stages, which self-host never runs
+(it always uses canonical acceptance), so setting them here changes nothing.
+On the Worker, `INGEST_BUFFER_LOCK_BUSY=on` makes a lock wait (55P03/40P01) at
+those stages the same 429 `delivery_busy` as the claim flag, and
+`INGEST_BUFFER_LOCK_RETRY=on` re-issues that ledger call once after 50-250 ms.
+Both change only the error shape and the client's backoff; neither removes the
+underlying lock contention.
+
 `SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
 upload request path: one create-only inbox PUT, then the hosted queued receipt,
 with an in-process consumer that admits the inbox. It also serves

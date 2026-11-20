@@ -175,6 +175,20 @@ export interface SessionIngestInputs {
    */
   claimTimeoutBusy?: "on";
   /**
+   * INGEST_BUFFER_LOCK_BUSY: a buffered buffer_intent / buffer_receipt ledger call that loses its lock wait
+   * (ledger_lock_timeout, SQLSTATE 55P03/40P01) answers the same 429 delivery_busy with Retry-After 5-10 s
+   * instead of 503; the route line keeps the real stage. Every other stage and cause is unchanged. It changes
+   * the error shape and the client's backoff only; the contention stays. Buffered mode only. Present: the var
+   * only (no queue, no binding). Omit for off (the Worker default; no var rendered, vars byte-identical to before).
+   */
+  bufferLockBusy?: "on";
+  /**
+   * INGEST_BUFFER_LOCK_RETRY: that same failure re-issues the same ledger call once after a 50-250 ms jittered
+   * pause; a second failure answers as before (429 with bufferLockBusy, otherwise 503). Never any other stage or
+   * cause. Buffered mode only. Present: the var only. Omit for off (no var rendered, vars byte-identical to before).
+   */
+  bufferLockRetry?: "on";
+  /**
    * INGEST_CLAIM_LOCK_WAIT_MS: each claim runs in its own short transaction with SET LOCAL lock_timeout of this
    * many ms (25..2000), so a claim queued behind the same user's in-flight claim gives up quickly with 55P03
    * (and, with claimLockBusy, the 429 delivery_busy) instead of waiting the role's 2 s lock_timeout and
@@ -255,7 +269,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -369,6 +383,10 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.claimLockBusy must be "on" (omit for off)');
   if (v.claimTimeoutBusy !== undefined && v.claimTimeoutBusy !== "on")
     refuse('sessionIngest.claimTimeoutBusy must be "on" (omit for off)');
+  if (v.bufferLockBusy !== undefined && (v.bufferLockBusy !== "on" || v.acceptanceMode !== "buffered"))
+    refuse('sessionIngest.bufferLockBusy must be "on", in buffered mode only (omit for off)');
+  if (v.bufferLockRetry !== undefined && (v.bufferLockRetry !== "on" || v.acceptanceMode !== "buffered"))
+    refuse('sessionIngest.bufferLockRetry must be "on", in buffered mode only (omit for off)');
   if (v.claimLockWaitMs !== undefined && (typeof v.claimLockWaitMs !== "number" || !Number.isSafeInteger(v.claimLockWaitMs) || v.claimLockWaitMs < 25 || v.claimLockWaitMs > 2000))
     refuse("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
   if (v.originClaimFence !== undefined && (v.originClaimFence !== "on" || v.acceptanceMode !== "buffered"))
@@ -419,6 +437,8 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
     ...(p.claimLockBusy === "on" ? { INGEST_CLAIM_LOCK_BUSY: "on" } : {}),
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
+    ...(p.bufferLockBusy === "on" ? { INGEST_BUFFER_LOCK_BUSY: "on" } : {}),
+    ...(p.bufferLockRetry === "on" ? { INGEST_BUFFER_LOCK_RETRY: "on" } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
     ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
     ...(p.turnFenceRegister === "on" ? { INGEST_TURN_FENCE_REGISTER: "on" } : {}),

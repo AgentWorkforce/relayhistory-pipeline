@@ -631,6 +631,59 @@ describe("session ingest: INGEST_CLAIM_TIMEOUT_BUSY (default off)", () => {
   });
 });
 
+describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (default off, buffered only)", () => {
+  // Same shape as the claim flag blocks above; the two inputs are independent of each other and of the claim flags.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+  const FLAGS = [["bufferLockBusy", "INGEST_BUFFER_LOCK_BUSY"], ["bufferLockRetry", "INGEST_BUFFER_LOCK_RETRY"]] as const;
+
+  it("omitted: neither var at all, vars and props byte-identical to a stack without the inputs", () => {
+    for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }, { ...buffered, claimLockBusy: "on" as const, claimTimeoutBusy: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      const env = (sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env;
+      for (const [, envVar] of FLAGS) {
+        expect(Object.hasOwn(sessionIngestVars(p), envVar)).toBe(false);
+        expect(Object.hasOwn(env, envVar)).toBe(false);
+      }
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, bufferLockBusy: undefined, bufferLockRetry: undefined }, b)));
+    }
+  });
+
+  it('"on" in buffered acceptance: exactly one more var each, no new binding or resource', () => {
+    for (const [key, envVar] of FLAGS) {
+      const on = { ...buffered, [key]: "on" as const };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(buffered), [envVar]: "on" });
+      const p = props(on);
+      expect(p.env[envVar]).toBe("on");
+      expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(buffered).env), envVar].sort());
+      expect(p.env.INGEST_ADMISSION).toBeUndefined();
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+      expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+    }
+    const both = { ...buffered, bufferLockBusy: "on" as const, bufferLockRetry: "on" as const, claimLockBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(both, refuse)).not.toThrow();
+    expect(sessionIngestVars(both)).toEqual({ ...sessionIngestVars(buffered), INGEST_CLAIM_LOCK_BUSY: "on", INGEST_BUFFER_LOCK_BUSY: "on", INGEST_BUFFER_LOCK_RETRY: "on" });
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it('is refused for any value but "on", and outside buffered acceptance', () => {
+    for (const [key] of FLAGS) {
+      const why = `sessionIngest.${key} must be "on", in buffered mode only (omit for off)`;
+      for (const value of ["off", "ON", "On", true, 1, "", null, "yes"])
+        expect(() => assertSessionIngestInputs({ ...buffered, [key]: value }, refuse)).toThrow(why);
+      for (const base of [inputs, canonical])
+        expect(() => assertSessionIngestInputs({ ...base, [key]: "on" }, refuse)).toThrow(why);
+    }
+  });
+
+  it("an unknown key next to them is still refused", () => {
+    expect(() => assertSessionIngestInputs({ ...buffered, bufferLockBusy: "on", bufferLockRetryCount: 2 }, refuse)).toThrow("sessionIngest.bufferLockRetryCount is not a known setting");
+    expect(() => assertSessionIngestInputs({ ...buffered, INGEST_BUFFER_LOCK_RETRY: "on" }, refuse)).toThrow("sessionIngest.INGEST_BUFFER_LOCK_RETRY is not a known setting");
+  });
+});
+
 describe("session ingest: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
   // The only shape the Neon-exit Worker serves (worker.ts ingestSettings): buffered, frozen-supabase, replica off.
   const exit: SessionIngestInputs = {
