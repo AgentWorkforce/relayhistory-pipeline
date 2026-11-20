@@ -405,6 +405,11 @@ failing. Clients keep their batches and retry, so nothing is lost while it lasts
      database generation and the Worker's accepted generations disagree. `other` on every request is
      probably a reworded or new fence message: treat it as the fence. Any other `db_refusal` class is a
      per-org or per-user state, not the fence (not counted).
+   - The separate `session ingest db error` line comes from the pg client's `error` event, not the route,
+     and is not counted. It carries `db_error_detail` (closed message shape), `error_frame` (the first
+     stack frame's function name only) and `db_client_phase`. `socket_closed` with
+     `CloudflareSocket._listen` and `ending` is the client's own `end()` closing the socket after the
+     response, which leaves the response unchanged. `active` means the socket failed during the request.
 2. Generation fence after a schema apply: readiness already moved to `(H, pass)` while the Worker offers
    only G. Follow `docs/design/zero-503-schema-windows.md` section 3.2, "Post-apply recovery": deploy the
    Worker at G+H with `OVERLAP <H>`, then dispatch the overlap workflow `rebind-dry-run` and `rebind`.

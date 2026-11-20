@@ -669,7 +669,9 @@ export default {
     // One Hyperdrive connection per request; Hyperdrive pools the real ones.
     const client = new pg.Client({ connectionString: env.HYPERDRIVE!.connectionString });
     // A dropped socket surfaces on the next query as a coded 503, never as an uncaught error.
-    client.on("error", (err: Error) => log.error("session ingest db error", dbClientErrorFields(err)));
+    // db_client_phase says whether end() had already run (log only; see db-error-class.ts).
+    let ending = false;
+    client.on("error", (err: Error) => log.error("session ingest db error", dbClientErrorFields(err, ending ? "ending" : "active")));
     let connected: Promise<void> | undefined;
     const run = async (text: string, params: unknown[]) => {
       connected ??= client.connect();
@@ -680,7 +682,7 @@ export default {
     try {
       return await app.fetch(request);
     } finally {
-      if (connected) ctx.waitUntil(client.end().catch(() => {}));
+      if (connected) { ending = true; ctx.waitUntil(client.end().catch(() => {})); }
       // Bounded and never rejecting; the response is already final.
       if (analyticsSelection.sink !== "noop") ctx.waitUntil(analytics.shutdown());
     }
