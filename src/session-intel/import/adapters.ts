@@ -230,7 +230,7 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
           const event = relayhistoryActivityEvent({
             kind: "tool_call", origin_id: "import", record_id: callId,
             revision: "1", operation: "upsert", received_at: ts,
-            payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: p.is_error },
+            payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: typeof p.is_error === "boolean" ? p.is_error : null },
           }, { workspaceId: "import", source: "codex", sessionId: "import", machineId: "import", userId: "import" });
           if (Array.isArray(event?.files_touched))
             write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd);
