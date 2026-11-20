@@ -52,6 +52,8 @@ for (const [name, input] of [
   ["object shorthand assignment default", "let a; ({a = tools.exec_command({cmd:'git commit -m x'})} = {a:1})"],
   ["object property assignment default", "let a; ({b: a = tools.exec_command({cmd:'git commit -m x'})} = {b:1})"],
   ["nested assignment default", "let a; ({b: [a = tools.exec_command({cmd:'git commit -m x'})]} = {b:[1]})"],
+  ["rest array assignment default", "let a; [...[a = tools.exec_command({cmd:'git commit -m x'})]] = [1]"],
+  ["rest object assignment default", "let a; [...{b: a = tools.exec_command({cmd:'git commit -m x'})}] = [1]"],
   ["with binding", "with(o){tools.exec_command({cmd:'git commit -m x'})}"],
   ["malformed code", "tools.exec_command({cmd:'git commit'"],
 ] as const) test(`unsupported ${name} is counted as incomplete rather than guessed`, () => {
@@ -107,6 +109,7 @@ test("ordinary array/object expressions and scalar assignments are not destructu
     "let a; [a = tools.exec_command({cmd:'git commit'})]",
     "let a; ({b: a = tools.exec_command({cmd:'git commit'})})",
     "let a; a = tools.exec_command({cmd:'git commit'})",
+    "let a,b; a = [...[b = tools.exec_command({cmd:'git commit'})]]",
     "let a,b; [a = tools.exec_command({cmd:'git commit'}), b = tools.exec_command({cmd:'git status'})]",
   ]) expect(codeModeShells(source)).toEqual({ commands: source.includes("git status") ? ["git commit", "git status"] : ["git commit"], incomplete: false });
 });
