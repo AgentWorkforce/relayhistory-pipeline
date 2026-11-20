@@ -26,7 +26,7 @@ function assignmentDefault(n: ts.Node, cache: WeakMap<ts.Node, boolean>): boolea
     if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && parent.left === at) {
       result = true; break;
     }
-    if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent) || ts.isParenthesizedExpression(parent)
+    if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent) || ts.isParenthesizedExpression(parent) || ts.isSpreadElement(parent)
       || (ts.isPropertyAssignment(parent) && parent.initializer === at)) at = parent;
     else break;
   }
