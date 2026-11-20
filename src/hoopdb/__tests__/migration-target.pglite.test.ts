@@ -999,14 +999,14 @@ test("real tree: after the full tree including 062156, the history-exact helpers
   expect(await ledger(s.db)).toContain(LAH);
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
   const helpers = ["sessions.lazy_ack_history_intents(text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,text,bigint)",
-    "sessions.lazy_ack_history_scope_lock(jsonb)", "sessions.lazy_ack_history_replay(text[],integer[],bigint[])"];
+    "sessions.lazy_ack_history_replay(text[],integer[],bigint[])"];
   // Owner-only helpers: no runtime or consumer role holds them; the gate is off in proconfig.
   for (const fn of helpers) { expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn); expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(fn); }
   expect((await s.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.c)
     .toContain("bulls96.lazy_ack_h_exact=off");
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
-  for (const [fn, role] of [[helpers[0]!, "bulls96_session_ingest"], [helpers[1]!, "service_role"], [helpers[2]!, "bulls96_session_ingest"]] as const) {
+  for (const [fn, role] of [[helpers[0]!, "bulls96_session_ingest"], [helpers[1]!, "service_role"]] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
     await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);

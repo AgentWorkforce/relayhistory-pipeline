@@ -185,7 +185,7 @@ describe("062156 installs the gate off; only the owner's proconfig switches it",
     expect(p.prosrc.indexOf("WHERE singleton FOR NO KEY UPDATE;")).toBeGreaterThan(-1);
     const t = (await f.db.query<any>("SELECT prosecdef,proconfig FROM pg_proc WHERE oid='sessions.ingest_history_native_changed()'::regprocedure")).rows[0];
     expect(t).toEqual({ prosecdef: true, proconfig: ["search_path=pg_catalog, pg_temp"] });
-    for (const fn of ["lazy_ack_history_intents", "lazy_ack_history_scope_lock", "lazy_ack_history_replay"])
+    for (const fn of ["lazy_ack_history_intents", "lazy_ack_history_replay"])
       expect((await f.db.query<any>("SELECT has_function_privilege('bulls96_session_ingest',p.oid,'EXECUTE') x FROM pg_proc p WHERE proname=$1", [fn])).rows[0].x).toBe(false);
     expect((await f.db.query<any>("SELECT has_table_privilege('bulls96_session_ingest','sessions.lazy_ack_history_marks','INSERT') x")).rows[0].x).toBe(false);
     await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
@@ -208,14 +208,14 @@ describe("062156 installs the gate off; only the owner's proconfig switches it",
 });
 
 describe("062156 serial parity: main vs history-exact, history live with managed scopes", () => {
-  test("one scope, four slots, one accept each (the common shape): 4 trigger invalidations become 1 call-free replay", async () => {
+  test("one scope, four slots, one accept each (the common shape): main's 4 invalidate_scope calls become 1 plus coalesced draws", async () => {
     directoryErrors.length = 0;
     const f = await fixture();
     const c = await capture(f, ["a1", "a2", "a3", "a4"].map((id) => S(id, "s-1", 2)));
     const { off, on } = await both(f, [commit(c.payload)], (g) => history(g, { sessions: ["s-1"], keys: [["a1", "s-1"]], build: "a2" }));
     committed(on);
     expect(invalidations(off)).toBeGreaterThan(0);
-    expect(invalidations(on)).toBe(0);
+    expect(invalidations(on)).toBe(1); // the scope's first intent runs main's invalidate_scope; later ones are coalesced
     expect(rows(on, "sessions.ingest_history_scope_builds").every((b) => b.state === "abandoned")).toBe(true);
     expect(rows(on, "sessions.ingest_history_reconcile_outbox").length).toBeGreaterThan(0);
     // the session_directory fixture row exists and was reset by the invalidation in both bodies
@@ -327,20 +327,20 @@ describe("062156 serial parity on aborts: same first error and the same sequence
 });
 
 describe("062156 draws happen at main's logical point; the replay draws nothing", () => {
-  test("lazy_ack_history_replay draws zero sequence values (new and existing publications rows)", async () => {
+  test("lazy_ack_history_replay applies only the remainder (k-1, last) on existing rows and draws zero sequence values", async () => {
     const f = await fixture();
     await f.db.exec("BEGIN");
     try {
-      await history(f, { sessions: ["s-z1", "s-z2"], existing: ["s-z2"] });
+      await history(f, { sessions: ["s-z1", "s-z2", "s-z3"], existing: ["s-z1", "s-z2", "s-z3"] });
       const pos = async () => (await f.db.query<{ v: string }>("SELECT last_value::text v FROM pg_sequences WHERE schemaname='sessions' AND sequencename='session_replay_epoch_seq'")).rows[0]!.v;
-      const before = await pos();
+      const epochOf = async (s: string) => Number((await f.db.query<any>("SELECT epoch FROM sessions.session_replay_publications WHERE session_id=$1", [s])).rows[0].epoch);
+      const before = await pos(), e3 = await epochOf("s-z3");
       const scope = (s: string) => JSON.stringify([TENANT.orgId, TENANT.workspaceId, "claude", s]);
-      await f.db.query("SELECT sessions.lazy_ack_history_replay($1::text[],$2::integer[],$3::bigint[])", [[scope("s-z1"), scope("s-z2")], [3, 2], [101, 102]]);
+      await f.db.query("SELECT sessions.lazy_ack_history_replay($1::text[],$2::integer[],$3::bigint[])", [[scope("s-z1"), scope("s-z2"), scope("s-z3")], [3, 2, 1], [101, 102, null]]);
       expect(await pos()).toBe(before);
-      const pubs = (await f.db.query<any>("SELECT session_id,epoch::int e FROM sessions.session_replay_publications WHERE session_id IN('s-z1','s-z2') ORDER BY 1")).rows;
-      expect(pubs).toEqual([{ session_id: "s-z1", e: 101 }, { session_id: "s-z2", e: 102 }]);
-      const req = (await f.db.query<any>("SELECT session_id,request_version::int v FROM sessions.ingest_history_required_scopes WHERE session_id IN('s-z1','s-z2') ORDER BY 1")).rows;
-      expect(req).toEqual([{ session_id: "s-z1", v: 3 }, { session_id: "s-z2", v: 9 }]);
+      expect([await epochOf("s-z1"), await epochOf("s-z2"), await epochOf("s-z3")]).toEqual([101, 102, e3]); // k=1: untouched
+      const req = (await f.db.query<any>("SELECT session_id,request_version::int v FROM sessions.ingest_history_required_scopes WHERE session_id IN('s-z1','s-z2','s-z3') ORDER BY 1")).rows;
+      expect(req).toEqual([{ session_id: "s-z1", v: 9 }, { session_id: "s-z2", v: 8 }, { session_id: "s-z3", v: 7 }]);
     } finally { await f.db.exec("ROLLBACK"); }
   });
   for (const [label, mutate] of [

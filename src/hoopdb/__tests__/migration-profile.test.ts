@@ -2712,7 +2712,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       return src.slice(open, src.indexOf(tag, open));
     };
     // 20261105062156 is newest: 062150's down refuses (55000) while it is applied; its checksum-pinned down restores
-    // 043800's exact ACK (proconfig back to search_path only) and 026000's exact trigger function, drops the three
+    // 043800's exact ACK (proconfig back to search_path only) and 026000's exact trigger function, drops the two
     // helpers and the mark table and its ledger row, and refuses on a rerun.
     const LAH = "upstream:20261105062156_lazy_ack_history_exact.sql";
     expect(await names()).toContain(LAH);

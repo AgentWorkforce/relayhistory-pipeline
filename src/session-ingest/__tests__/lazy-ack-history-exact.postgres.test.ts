@@ -8,8 +8,13 @@
  *       epoch strictly increased (the stale-build CAS compares with IS DISTINCT FROM).
  *   A1  a forced 55P03 at a scope-lock wait (another session holds the scope's directory-events lock): main and the
  *       candidate fail the same way after the SAME number of draws.
- *   A2  a forced 55P03 inside the deferred row work (another session holds the required_scopes row): the known
- *       residue. Reports the nextval delta and the next successful epoch for both bodies, and checks the bound.
+ *   A2  another session holding a scope's required_scopes row: both bodies block at main's point (the scope's first
+ *       invalidation runs main's invalidate_scope) after the same draws; equal next successful epoch.
+ *   P1  a session_directory publications writer (020000 trigger) racing a gated ACK that is paused mid-loop between two
+ *       scopes: it waits on the publications row this ACK holds from the scope's first invalidation, so the scope's
+ *       epoch never goes backwards; equal to main.
+ *   P2  an absent publications row inserted concurrently (uncommitted) by another session: the ACK's first
+ *       invalidation waits on it and then takes the ON CONFLICT path; equal draws to main.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import pg from "pg";
@@ -192,7 +197,7 @@ describe.skipIf(!url)("062156 history-exact staged ACK (owned PostgreSQL)", () =
     expect(deltas).toEqual({ main: 4n, candidate: 4n });
   }, 120000);
 
-  test("A2: a forced 55P03 inside the deferred row work: the bounded residue, in nextval calls", async () => {
+  test("A2: another session holding a scope's required_scopes row: both bodies block at main's point after the same draws", async () => {
     await managed(["a2-S", "a2-U"], [["a2-1", "a2-S"], ["a2-2", "a2-U"], ["a2-3", "a2-S"], ["a2-4", "a2-U"]], ["a2-S", "a2-U"]);
     const p = await prepared([["a2-1", "a2-own"], ["a2-2", "a2-own"], ["a2-3", "a2-own"], ["a2-4", "a2-own"]]);
     const holder = new pg.Client({ connectionString: target }); await holder.connect();
@@ -213,13 +218,79 @@ describe.skipIf(!url)("062156 history-exact staged ACK (owned PostgreSQL)", () =
         out[on ? "candidate" : "main"] = { delta: s1 - s0, nextEpochOffset: BigInt((ok as any).read[0].e) - s0 };
       }
     } finally { await holder.query("ROLLBACK").catch(() => {}); await holder.end(); await gate(false); }
-    console.log("A2 " + JSON.stringify(out, (_, v) => (typeof v === "bigint" ? v.toString() : v)));
-    // main: record 1 invalidates a2-S (2 draws), record 2 blocks on a2-U's required_scopes row BEFORE its draws: 2.
-    // candidate: all 4 intents draw during the loop (8), then the replay blocks on a2-U's row.
-    // Bound: extra draws <= 2 x (intents from the first blocked one to the end), here 2 x 3 = 6.
+    // Both: record 1 invalidates a2-S (row exists: 2 draws); record 2's first a2-U invalidation runs main's
+    // invalidate_scope, which blocks on the held required_scopes row before its draws. Equal position, equal next epoch.
     expect(out.main!.delta).toBe(2n);
-    expect(out.candidate!.delta).toBe(8n);
-    expect(out.candidate!.delta - out.main!.delta).toBeLessThanOrEqual(6n);
-    expect(out.candidate!.nextEpochOffset - out.main!.nextEpochOffset).toBe(out.candidate!.delta - out.main!.delta);
+    expect(out.candidate!.delta).toBe(2n);
+    expect(out.candidate!.nextEpochOffset).toBe(out.main!.nextEpochOffset);
   }, 120000);
+
+  /** Session H holds scope `hold`'s directory-events lock; the commit on A pauses there mid-loop; returns helpers. */
+  async function pausedAck(payload: string, hold: string) {
+    const H = new pg.Client({ connectionString: target }); await H.connect();
+    await H.query("BEGIN"); await H.query(`SELECT pg_advisory_xact_lock(${scopeKey(hold)})`);
+    const A = new pg.Client({ connectionString: target }); await A.connect();
+    const aPid = (await A.query("SELECT pg_backend_pid() p")).rows[0].p as number;
+    await A.query("BEGIN;SET LOCAL lock_timeout='20s';SET LOCAL statement_timeout='30s';SET LOCAL ROLE bulls96_session_ingest");
+    const ack = A.query(COMMIT, [payload]).then(async () => { await A.query("RESET ROLE"); await A.query("COMMIT"); return "committed"; },
+      async (e: any) => { await A.query("ROLLBACK").catch(() => {}); return "error " + e.code; });
+    const waiting = async (pid: number) => { const end = Date.now() + 10000;
+      while (Date.now() < end) { if ((await pool.query("SELECT wait_event_type='Lock' w FROM pg_stat_activity WHERE pid=$1", [pid])).rows[0]?.w) return; await new Promise((r) => setTimeout(r, 20)); }
+      throw Error("expected_wait_missing"); };
+    await waiting(aPid);
+    return { H, A, ack, waiting, release: async () => { await H.query("COMMIT"); await H.end(); } };
+  }
+
+  test("P1: a session_directory publications writer racing a paused gated ACK waits for it; the epoch never goes backwards (equal to main)", async () => {
+    const out: Record<string, { bWaited: boolean; xAboveY: boolean; ack: string; b: string }> = {};
+    for (const on of [false, true]) {
+      const tag = on ? "p1on" : "p1off";
+      const X = `${tag}-X`, Y = `${tag}-Y`;
+      await managed([X, Y], [[`${tag}-1`, X], [`${tag}-2`, Y]], [X, Y]);
+      const c = await pool.connect();
+      try { await c.query("BEGIN;SET LOCAL session_replication_role=replica"); await c.query("INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at) VALUES($1,$2,'claude',$3,now(),now())", [TENANT.orgId, TENANT.workspaceId, X]); await c.query("COMMIT"); } finally { c.release(); }
+      const p = await prepared([[`${tag}-1`, `${tag}-own`], [`${tag}-2`, `${tag}-own`]]);
+      await gate(on);
+      try {
+        const run = await pausedAck(p, Y); // record 1 invalidates X; record 2 waits on Y's lock
+        const B = new pg.Client({ connectionString: target }); await B.connect();
+        const bPid = (await B.query("SELECT pg_backend_pid() p")).rows[0].p as number;
+        await B.query("BEGIN;SET LOCAL lock_timeout='20s'");
+        const b = B.query("UPDATE sessions.session_directory SET event_projection_epoch=coalesce(event_projection_epoch,0)+1 WHERE session_id=$1", [X])
+          .then(async () => { await B.query("COMMIT"); return "committed"; }, async (e: any) => { await B.query("ROLLBACK").catch(() => {}); return "error " + e.code; });
+        let bWaited = true;
+        try { await run.waiting(bPid); } catch { bWaited = false; }
+        await run.release();
+        const [ack, bres] = [await run.ack, await b]; await run.A.end(); await B.end();
+        const ep = Object.fromEntries((await pool.query("SELECT session_id,epoch::text e FROM sessions.session_replay_publications WHERE session_id = ANY($1)", [[X, Y]])).rows.map((r) => [r.session_id, BigInt(r.e)]));
+        out[on ? "candidate" : "main"] = { bWaited, xAboveY: ep[X]! > ep[Y]!, ack, b: bres };
+      } finally { await gate(false); }
+    }
+    expect(out.main).toEqual({ bWaited: true, xAboveY: true, ack: "committed", b: "committed" });
+    expect(out.candidate).toEqual(out.main);
+  }, 180000);
+
+  test("P2: an absent publications row inserted concurrently (uncommitted) by another session: equal draws to main", async () => {
+    const deltas: Record<string, bigint> = {};
+    for (const on of [false, true]) {
+      const tag = on ? "p2on" : "p2off", X = `${tag}-X`;
+      // Claim first (the scope is not managed yet, so the claim's slot INSERT trigger creates no publications row).
+      const p = await prepared([[`${tag}-1`, `${tag}-own`], [`${tag}-2`, `${tag}-own`]]);
+      await managed([X], [[`${tag}-1`, X], [`${tag}-2`, X]]);
+      expect((await pool.query("SELECT count(*)::int n FROM sessions.session_replay_publications WHERE session_id=$1", [X])).rows[0].n).toBe(0);
+      await gate(on);
+      try {
+        const I = new pg.Client({ connectionString: target }); await I.connect();
+        await I.query("BEGIN"); await I.query("INSERT INTO sessions.session_replay_publications(org_id,workspace_id,harness,session_id) VALUES($1,$2,'claude',$3)", [TENANT.orgId, TENANT.workspaceId, X]);
+        const s0 = await seqPos();
+        const r = run(p, { commit: true });
+        await new Promise((res) => setTimeout(res, 300));
+        await I.query("COMMIT"); await I.end();
+        expect(await r).toMatchObject({ ok: true, kind: "committed" });
+        deltas[on ? "candidate" : "main"] = (await seqPos()) - s0;
+      } finally { await gate(false); }
+    }
+    // Both: the first X invalidation conflicts with the (then committed) row: 2 draws; the second: 2 draws.
+    expect(deltas).toEqual({ main: 4n, candidate: 4n });
+  }, 180000);
 });

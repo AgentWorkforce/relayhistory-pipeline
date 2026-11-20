@@ -30,40 +30,39 @@
 --    then the old scope when the tracked tuple changed. One native key updated twice in a batch (A->B->A) contributes
 --    per accept, as the trigger does. ingest_history_scope_managed implies ingest_history_active(), so no extra
 --    active() read is needed: with no managed scope neither body invalidates anything.
---  * Right after each accepted slot UPDATE, for that accept's intents in the trigger's order, the ACK takes the scope's
---    directory-events advisory lock (main's key, main's order) and draws the sequence values main's invalidate_scope
---    call draws at that point (inline, in the ACK): its session_replay_publications INSERT ... ON CONFLICT DO UPDATE
---    SET epoch=nextval draws the column default for the proposed row AND, on conflict, the update's value, i.e. 1 draw
---    while the scope has no publications row (its first invalidation, absence read under the lock), else 2; the last
---    draw is the value main stores. Only the per-scope count k and that last value are kept (plpgsql variables).
---  * After the loop (mark removed), lazy_ack_history_replay does the deferred row work once per scope, in
---    first-invalidation order: required_scopes request_version = k (new row: default 1 then +1 per later call) or +k,
---    scope_current.ready=false, the session_directory reset, the publications row = the scope's last drawn value
---    (written explicitly: the replay draws nothing), and the derived-object retire.
+--  * Right after each accepted slot UPDATE, for that accept's intents in the trigger's order:
+--      - the FIRST intent of a scope in this ACK calls main's ingest_history_invalidate_scope (026000) itself,
+--        unchanged: main's point, main's lock order (directory-events lock, required_scopes, scope_current,
+--        session_directory, session_replay_publications, derived objects) and main's sequence draws (its own
+--        publications upsert: 1 draw when the row is absent, 2 when it exists, decided by PostgreSQL as in main,
+--        including a concurrent insert of an absent row). From here to commit this transaction holds those rows.
+--      - every LATER intent of that scope is coalesced. main's later call would re-take the (re-entrant) lock, add 1 to
+--        request_version, re-set state that is already set, and run its publications upsert on the row it already holds:
+--        2 draws (the column default for the proposed row and the ON CONFLICT update), storing the second. Those two
+--        draws happen here, at main's point; the count k and the last value are kept in plpgsql variables.
+--  * After the loop (mark removed), lazy_ack_history_replay applies the remainder for every scope with k > 1:
+--    request_version += k-1 and epoch = the last value drawn, on rows this transaction already holds (no new lock,
+--    no draw).
 -- Serial parity (same input, same state; the differential PGlite suite): every stored row equal, including per-scope
--- request_version and epoch, and the sequence position, after success AND after an abort at any accept boundary or at
--- a scope-lock wait (55P03), because draws and scope locks happen where main makes them.
+-- request_version and epoch, and the sequence position, after success and after an abort anywhere: every draw and every
+-- lock acquisition happens at main's point, and the deferred remainder takes no lock and draws nothing.
+-- Concurrent invariant: the publications row is locked from the scope's first invalidation to commit, exactly as in
+-- main, so a session_index / session_directory publications writer (020000 triggers) waits for this ACK and its later
+-- nextval lands after ours: a scope's epoch never goes backwards (the 1da78ec4 head did not have this: its epoch was
+-- written from an earlier draw without the row lock).
 -- Managed-ness is stable inside the ACK: invalidate_scope only sets ready=false, never inserts or deletes a scope_current
 -- row, and nothing in the ACK transaction writes scope_keys or scope_current rows.
--- Remaining differences:
---   - requested_at / updated_at timestamps;
---   - a failure INSIDE the deferred row work (a row-lock or statement timeout on required_scopes, scope_current, the
---     directory or the publications row during the replay): main would have failed at an earlier accept with fewer
---     draws, so the sequence position after such an abort is ahead of main's by the draws of the intents after the
---     failing one (bounded by this ACK's intents). Stated to the history owner; nothing else differs;
---   - a statement error inside the slot UPDATE or the trigger body raised between an accept's UPDATE and its draws:
---     main would have drawn nothing for that accept either (its trigger raised before its invalidations), so equal;
---   - build capture (026000 scope_capture) inserts a publications row ON CONFLICT DO NOTHING, drawing the default,
---     after try-locking the same scope key: while this ACK holds that key (from its first draw to commit) the capture
---     cannot take it, exactly as against main (which holds it from its first invalidate_scope call); race-only before
---     the ACK's first draw for the scope, identical for both bodies;
+-- Remaining differences (store nothing):
+--   - requested_at timestamps (main writes clock_timestamp() at each later call; here once, after the loop);
+--   - main re-runs the scope_current ready=false UPDATE at each later call (a new row version with the same values);
+--     here it runs once;
 --   - race-only: a scope install or erase committing in the middle of a READ COMMITTED ACK is observed per statement by
 --     main and per accept here (the same number of reads, at slightly different instants).
 -- Mark-table churn: one INSERT and one DELETE per gated ACK; rows exist only inside a call; autovacuum keeps the table
 -- tiny (as 062010's marks).
--- Lock order: fence -> clock (NO KEY UPDATE) -> origin -> stage row -> slot rows, with each accept's scope advisory locks
--- taken right after its slot UPDATE, as main's trigger takes them: main's order exactly.
--- No grant changes: the new table and helpers are owner-only; the ACK stays SECURITY INVOKER, the trigger SECURITY DEFINER.
+-- Lock order: fence -> clock (NO KEY UPDATE) -> origin -> stage row -> slot rows, with each scope's invalidation locks
+-- taken at its first intent, right after that accept's slot UPDATE, by main's own invalidate_scope: main's order exactly.
+-- No grant changes: the new table and the two helpers are owner-only; the ACK stays SECURITY INVOKER, the trigger SECURITY DEFINER.
 -- Rollback (generated by scripts/sessions-function-boundary/lanes/lazy-ack-history-exact.ts):
 -- supabase/rollbacks/20261105062156_lazy_ack_history_exact.down.sql restores both bodies, drops the helpers and the table.
 DO $lazy_ack_history_exact_creator$
@@ -103,39 +102,27 @@ BEGIN
  RETURN v_out;
 END $ack_intents$;
 
--- The scope's directory-events advisory xact lock, exactly the key ingest_history_invalidate_scope takes (026000).
-CREATE FUNCTION sessions.lazy_ack_history_scope_lock(p_scope jsonb)RETURNS void
-LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $ack_scope_lock$
-BEGIN
- PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',p_scope->>0,p_scope->>1,p_scope->>2,p_scope->>3),0));
-END $ack_scope_lock$;
-
--- The deferred row work of main's ingest_history_invalidate_scope calls, once per scope in first-invalidation order:
--- required_scopes ends at k (new row: default 1, then +1 per later call) or at +k; ready=false, the directory reset and
--- the derived-object retire are idempotent after the first call; the publications row gets the scope's last drawn value,
--- written explicitly (the INSERT names the column and the DO UPDATE uses EXCLUDED.epoch): this function draws nothing.
+-- The remainder of main's LATER ingest_history_invalidate_scope calls for each scope (k > 1). The first call of every
+-- scope ran itself, unchanged, at main's point (it holds the scope lock and the required_scopes, scope_current,
+-- directory and publications rows from then to commit). Each later call of main would add 1 to request_version,
+-- re-set ready=false and the directory/derived state (no-ops after the first call: same values, the directory and
+-- derived WHERE clauses match nothing) and store its own last draw as the epoch. So only request_version += k-1 and
+-- epoch = the last value drawn remain. Both rows are already this transaction's: no new lock, no draw here.
 CREATE FUNCTION sessions.lazy_ack_history_replay(p_scopes text[],p_k integer[],p_last bigint[])RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $ack_replay$
 DECLARE j jsonb;x integer;
 BEGIN
  FOR x IN 1..coalesce(cardinality(p_scopes),0) LOOP
+  CONTINUE WHEN p_k[x]<2;
   j:=p_scopes[x]::jsonb;
-  INSERT INTO sessions.ingest_history_required_scopes AS r(org_id,workspace_id,harness,session_id,request_version)
-   VALUES(j->>0,j->>1,j->>2,j->>3,p_k[x])
-   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET request_version=r.request_version+p_k[x],requested_at=clock_timestamp();
-  UPDATE sessions.ingest_history_scope_current SET ready=false WHERE org_id=j->>0 AND workspace_id=j->>1 AND harness=j->>2 AND session_id=j->>3;
-  UPDATE sessions.session_directory SET state='unknown',short_summary=NULL,short_summary_scrub_ruleset=NULL,short_summary_scrub_version=NULL,
-   short_summary_source=NULL,short_summary_generated_at=NULL,event_projection_ready=false,work_status=NULL,work_status_at=NULL
-   WHERE org_id=j->>0 AND workspace_id=j->>1 AND harness=j->>2 AND session_id=j->>3
-    AND(state<>'unknown'OR short_summary IS NOT NULL OR event_projection_ready OR work_status IS NOT NULL);
-  INSERT INTO sessions.session_replay_publications AS a(org_id,workspace_id,harness,session_id,epoch)VALUES(j->>0,j->>1,j->>2,j->>3,p_last[x])
-   ON CONFLICT(org_id,workspace_id,harness,session_id)DO UPDATE SET epoch=EXCLUDED.epoch;
-  UPDATE sessions.ingest_history_derived_objects o SET cleanup_state='retired',row_version=row_version+1 FROM sessions.ingest_history_scope_versions v
-   WHERE o.authority_id=v.authority_id AND v.org_id=j->>0 AND v.workspace_id=j->>1 AND v.harness=j->>2 AND v.session_id=j->>3 AND o.cleanup_state='live';
+  UPDATE sessions.ingest_history_required_scopes SET request_version=request_version+(p_k[x]-1),requested_at=clock_timestamp()
+   WHERE org_id=j->>0 AND workspace_id=j->>1 AND harness=j->>2 AND session_id=j->>3;
+  UPDATE sessions.session_replay_publications SET epoch=p_last[x]
+   WHERE org_id=j->>0 AND workspace_id=j->>1 AND harness=j->>2 AND session_id=j->>3;
  END LOOP;
 END $ack_replay$;
 REVOKE ALL ON FUNCTION sessions.lazy_ack_history_intents(text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,text,bigint),
- sessions.lazy_ack_history_scope_lock(jsonb),sessions.lazy_ack_history_replay(text[],integer[],bigint[])
+ sessions.lazy_ack_history_replay(text[],integer[],bigint[])
  FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 CREATE OR REPLACE FUNCTION sessions.ingest_history_native_changed()RETURNS trigger
@@ -289,27 +276,26 @@ BEGIN
     current_seat_key=s.key_sha256,current_legacy_key=NULL WHERE key_sha256=v_key;
    -- 062156: the invalidations main's trigger makes for THIS accept, from the slot as it was before this UPDATE
    -- (slot) and as written by it, in the trigger's own order: new-scope set sorted, then the changed old scope.
-   -- Its scope locks and sequence draws happen here, at main's point and in main's order; the row work is deferred.
-   -- Per intent: the scope's directory-events advisory lock (re-entrant; main's key and order), then the draws main's
-   -- ingest_history_invalidate_scope makes there. Its publications INSERT ... ON CONFLICT DO UPDATE SET epoch=nextval
-   -- draws the column default for the proposed row AND, on conflict, the update's value: 1 draw while the scope has no
-   -- publications row (its first invalidation; absence read under the lock), else 2. The last draw is what main stores.
+   -- The FIRST intent of a scope runs main's ingest_history_invalidate_scope itself, unchanged, right here: main's
+   -- point, main's lock order (scope lock, required_scopes, scope_current, directory, publications, derived) and main's
+   -- draws (PostgreSQL decides 1 or 2 in its publications upsert, as in main). Every LATER intent of that scope is
+   -- coalesced: main's later call would draw the column default and the ON CONFLICT update (2 draws, the row exists
+   -- and is already this transaction's) and store the second; those draws happen here, at main's point. The rest
+   -- (request_version += k-1, epoch = last) is applied after the loop, on rows this transaction already holds.
    IF v_hx THEN
     FOREACH v_iv IN ARRAY sessions.lazy_ack_history_intents(slot.org_id,slot.workspace_id,slot.record_id,
      slot.current_owner,slot.current_source,slot.current_session,slot.current_revision,slot.current_digest,slot.lineage,
      a.user_id,r.key_material->>10,r.key_material->>11,(r.key_material->>8)::bigint,r.candidate_digest,v_new_lineage) LOOP
      v_ij:=v_iv::jsonb;
-     PERFORM sessions.lazy_ack_history_scope_lock(v_ij);
      v_ix:=array_position(v_scopes,v_iv);
      IF v_ix IS NULL THEN
-      v_scopes:=v_scopes||v_iv;v_k:=v_k||0;v_lastv:=v_lastv||NULL::bigint;v_ix:=cardinality(v_scopes);
-      IF EXISTS(SELECT 1 FROM sessions.session_replay_publications pp WHERE pp.org_id=v_ij->>0 AND pp.workspace_id=v_ij->>1
-       AND pp.harness=v_ij->>2 AND pp.session_id=v_ij->>3) THEN v_iseq:=nextval('sessions.session_replay_epoch_seq');END IF;
+      PERFORM sessions.ingest_history_invalidate_scope(v_ij->>0,v_ij->>1,v_ij->>2,v_ij->>3);
+      v_scopes:=v_scopes||v_iv;v_k:=v_k||1;v_lastv:=v_lastv||NULL::bigint;
      ELSE
       v_iseq:=nextval('sessions.session_replay_epoch_seq');
+      v_iseq:=nextval('sessions.session_replay_epoch_seq');
+      v_k[v_ix]:=v_k[v_ix]+1;v_lastv[v_ix]:=v_iseq;
      END IF;
-     v_iseq:=nextval('sessions.session_replay_epoch_seq');
-     v_k[v_ix]:=v_k[v_ix]+1;v_lastv[v_ix]:=v_iseq;
     END LOOP;
    END IF;
   END IF;
