@@ -247,6 +247,13 @@ describe("the rule judge (conservative lexical baseline)", () => {
     expect(pathMatches("*/migrations/*", "db/migrations/1.sql")).toBe(true);
     expect(pathMatches("*/migrations/*", "a/b/migrations/1.sql")).toBe(true);
     expect(pathMatches("*/migrations/*", "src/migrations-tool/1.ts")).toBe(false);
+    // A lone leading `*` also matches at the repo root (the implied leading `**`).
+    expect(pathMatches("*/migrations/*", "migrations/1.sql")).toBe(true);
+    expect(pathMatches("*/migrations/*", "migrations-old/1.sql")).toBe(false);
+    expect(pathMatches("*/package.json", "package.json")).toBe(true);
+    expect(pathMatches("*/**/x.ts", "x.ts")).toBe(true);
+    expect(pathMatches("*.sql", "1.sql")).toBe(true);
+    expect(pathMatches("*.sql", "db/1.sql")).toBe(true);
     expect(pathMatches("src/**/*.sql", "src/a/b/c.sql")).toBe(true);
     expect(pathMatches("src/**/*.sql", "src/a/b/c.ts")).toBe(false);
   });
