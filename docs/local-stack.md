@@ -823,10 +823,17 @@ unchanged, it runs exactly as before against what it read (the revision fence st
 with no object-store call while the lock is held; changed (another pointer stage wrote the session after the reads
 began), it reads again, once; a second change falls back to today's locked-read path instead of creating a new
 retry/DLQ route. Except for that contention fallback, the lock transaction holds SQL only: the stamp, the upsert,
-the stored-row check, a rekey on a move. Connections are unchanged.
+the stored-row check, a rekey on a move. This uses two connections, SQL only, per scope: the transaction connection
+holds the advisory lock while `indexLocked` writes through `deps.db` on a separate pool connection. With the flag on,
+an indexed or moved event also pays for one extra HEAD after the lock and two stamp queries (before and under the
+lock). A repeated attempt after a changed stamp repeats those reads.
+
+Before this flag is enabled anywhere, measure the runtime role's idle-in-transaction connection count in
+`pg_stat_activity` before and after the change at the same concurrency. This change fixes only the pointer stage:
+the search pass still holds its scope-lock transaction across its S3 reads and ClickHouse work.
 
 Races, with the flag on: a put that read the manifest before an erasure cannot bring the pointer back (the
-tombstone normally moves the stamp, so the put reads again and sees the delete. A delete can also be a no-op (there
+tombstone normally moves the stamp, so the put reads again and sees the delete). A delete can also be a no-op (there
 is no row yet, or the row names another key); after every insert or rekey the stage therefore checks the key once,
 outside the lock, and requeues it when it disappeared. A delete that read "gone" before a newer put was indexed
 reads again and indexes it; a move follows today's rule (both keys live: `pointer_move_pending`). An object-store
