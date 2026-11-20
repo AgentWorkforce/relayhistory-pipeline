@@ -139,7 +139,8 @@ export interface SessionPipelineInputs {
   skipCurrent?: boolean;
   /**
    * Default off. `true` renders SEARCH_INDEX_PREREAD_ENABLED=true: the legacy ClickHouse whole-read
-   * path reads its source and index before the search lock. Requires searchIndex.
+   * path reads its source and index before the search lock. A buffered row landing after that scan is
+   * healed by the next delivered or scheduled reconcile pass. Requires searchIndex.
    */
   searchPreRead?: boolean;
   /**

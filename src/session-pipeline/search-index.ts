@@ -532,6 +532,15 @@ interface SearchPreRead {
   scan?: Awaited<ReturnType<SearchProjectionIo["scan"]>>;
 }
 
+interface SearchPreReadCapture {
+  stamp: SourceStamp;
+  siblingKeys: string[];
+  snapshot: { keys: string[]; epoch: string; canonicalId: string };
+}
+
+const isSearchPreRead = (value: SearchPreRead | SearchIndexResult): value is SearchPreRead => "stamp" in value;
+const isSearchPreReadCapture = (value: SearchPreReadCapture | SearchIndexResult): value is SearchPreReadCapture => "stamp" in value;
+
 const sourceStampEqual = (a: SourceStamp, b: SourceStamp): boolean =>
   a.canonicalId === b.canonicalId && a.epoch === b.epoch && a.manifestFingerprint === b.manifestFingerprint;
 
@@ -539,11 +548,17 @@ async function currentSourceStamp(tx: SqlExecutor, scope: SessionScope, snapshot
   return { canonicalId: snapshot.canonicalId, epoch: snapshot.epoch, manifestFingerprint: await sourceFingerprint(tx, scope, snapshot.canonicalId) };
 }
 
-/** Flag-on capture: SQL snapshot only; every object/index read happens after this transaction commits. */
-async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits): Promise<SearchPreRead | undefined> {
-  const captured = await deps.transact(async (tx) => {
+/** Flag-on capture: lock and snapshot with SQL only; every object/index read happens after commit. */
+async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits): Promise<SearchPreRead | SearchIndexResult | undefined> {
+  const captured = await deps.transact<SearchPreReadCapture | SearchIndexResult | undefined>(async (tx) => {
+    const { rows: got } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+    if (!got[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] };
     const snapshot = await livePointerSnapshot(tx, scope);
+    const { rows: canonicalLock } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events", scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId].join("\u001f")]);
+    if (!canonicalLock[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["canonical_scope_busy"] };
     if (!snapshot.keys.length || layoutComponent(snapshot.canonicalId) !== scope.sessionId) return undefined;
+    if (deps.skipCurrent && (await alreadyCurrent(tx, scope, snapshot, snapshot.keys.length)))
+      return { manifests: snapshot.keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
     const { rows: siblings } = await tx.query<{ manifest_key: string }>(`SELECT manifest_key FROM sessions.session_index
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,
       [scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId]);
@@ -552,6 +567,7 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
     return { snapshot, siblingKeys, stamp: await currentSourceStamp(tx, scope, snapshot) };
   });
   if (!captured) return undefined;
+  if (!isSearchPreReadCapture(captured)) return captured;
   const at = (deps.now ?? (() => new Date()))();
   const version = at.getTime();
   const io = observedProjectionIo(legacyProjectionIo(deps.ch!), deps.metrics);
@@ -563,34 +579,19 @@ async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, 
   return { stamp: captured.stamp, siblingKeys: captured.siblingKeys, at, version, fromMs, s3, ...(scan ? { scan } : {}) };
 }
 
-/** The optional skip-current gate stays ahead of every flag-on source or index read. */
-async function preReadSkipCurrent(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult | undefined> {
-  if (!deps.skipCurrent) return undefined;
-  return deps.transact(async (tx) => {
-    const { rows: got } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
-    if (!got[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] };
-    const snapshot = await livePointerSnapshot(tx, scope);
-    const { rows: canonicalLock } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events", scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId].join("\u001f")]);
-    if (!canonicalLock[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["canonical_scope_busy"] };
-    if (!snapshot.keys.length || layoutComponent(snapshot.canonicalId) !== scope.sessionId) return undefined;
-    return (await alreadyCurrent(tx, scope, snapshot, snapshot.keys.length))
-      ? { manifests: snapshot.keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] }
-      : undefined;
-  });
-}
-
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
   // accepted but deliberately leaves them on the byte-identical base path.
-  if (!deps.preRead || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
+  if (!deps.preRead || !deps.ch || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
     return indexSearchScopeBase(scope, deps);
-  const skipped = await preReadSkipCurrent(scope, deps);
-  if (skipped) return skipped;
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   for (let attempt = 0; attempt < 2; attempt++) {
-    const prepared = await captureSearchPreRead(scope, deps, limits);
+    const captured = await captureSearchPreRead(scope, deps, limits);
     // Empty, erased, malformed-canonical and alias-only scopes keep the unmodified locked path.
-    if (!prepared) return indexSearchScopeBase(scope, deps);
+    if (!captured) return indexSearchScopeBase(scope, deps);
+    // Busy and already-current are complete results from the SQL-only capture transaction.
+    if (!isSearchPreRead(captured)) return captured;
+    const prepared = captured;
     const applied = await indexSearchScopeBase(scope, deps, prepared);
     if (applied !== SEARCH_SCOPE_CHANGED) return applied;
   }
