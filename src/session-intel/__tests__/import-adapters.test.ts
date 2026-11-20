@@ -143,15 +143,25 @@ describe("codex adapter", () => {
     expect((globalThis as Record<string, unknown>)[key]).toBeUndefined();
   });
 
-  test("code-mode is_error accepts only booleans and malformed values never abort the import", async () => {
+  test("code-mode is_error keeps production primitive semantics and malformed values never abort the import", async () => {
     const dir = tmp("si-imp-code-mode-error-flag-");
     // Build the deeply nested JSON directly to exercise an invalid error flag
     // without serializing it in this fixture or forwarding it to the projection.
-    const flags = ["true", "false", "null", '"true"', '"false"', "1", "0", "[]", '{"failed":true}', "[".repeat(10_000) + "0" + "]".repeat(10_000)];
-    const calls = flags.map((flag, i) => {
+    const flags = [
+      { json: "true", failed: true }, { json: "false", failed: false }, { json: "null", failed: false },
+      { json: '"true"', failed: true }, { json: '"false"', failed: false },
+      { json: '"1"', failed: true }, { json: '"0"', failed: false },
+      { json: "1", failed: true }, { json: "0", failed: false }, { json: "1.5", failed: false },
+      { json: "1e309", failed: false },
+      { json: '"TRUE"', failed: false }, { json: '" true "', failed: false },
+      { json: JSON.stringify("true".repeat(25_000)), failed: false },
+      { json: "[]", failed: false }, { json: '{"failed":true}', failed: false },
+      { json: "[".repeat(100_000) + "0" + "]".repeat(100_000), failed: false },
+    ];
+    const calls = flags.map(({ json }, i) => {
       const patch = `*** Begin Patch\n*** Add File: src/flag-${i}.ts\n+example\n*** End Patch`;
       const row = JSON.stringify({ timestamp: at("09:01"), type: "response_item", payload: { type: i % 2 ? "function_call" : "custom_tool_call", name: "exec", call_id: `flag-${i}`, input: `tools.apply_patch(${JSON.stringify(patch)})`, arguments: JSON.stringify({ input: `tools.apply_patch(${JSON.stringify(patch)})` }) } });
-      return row.slice(0, -2) + `,"is_error":${flag}}}`;
+      return row.slice(0, -2) + `,"is_error":${json}}}`;
     });
     writeFileSync(join(dir, "exec.jsonl"), [
       JSON.stringify({ timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } }),
@@ -159,7 +169,7 @@ describe("codex adapter", () => {
     ].join("\n"));
     const set = await read(dir, readCodex);
     expect(set.byKey.size).toBe(1);
-    expect(facts([...set.byKey.values()][0]!).writes).toEqual(flags.slice(1).map((_, i) => [`src/flag-${i + 1}.ts`, at("09:01")]));
+    expect(facts([...set.byKey.values()][0]!).writes).toEqual(flags.flatMap(({ failed }, i) => failed ? [] : [[`src/flag-${i}.ts`, at("09:01")]]));
     expect(set.stats.malformedLines).toBe(0);
   });
 

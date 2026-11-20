@@ -254,10 +254,16 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
         // the production projection's bounded static-patch parser unchanged.
         const input = kind === "custom_tool_call" ? str(p.input) : str(parseArgs(p.arguments).input);
         if (input) {
+          const flag = p.is_error;
+          // Preserve the projection's primitive spellings (the longest is
+          // "false") without asking it to serialize arbitrary input objects.
+          const isError = typeof flag === "boolean"
+            || (typeof flag === "number" && Number.isFinite(flag))
+            || (typeof flag === "string" && flag.length <= 5) ? flag : null;
           const event = relayhistoryActivityEvent({
             kind: "tool_call", origin_id: "import", record_id: callId,
             revision: "1", operation: "upsert", received_at: ts,
-            payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: typeof p.is_error === "boolean" ? p.is_error : null },
+            payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: isError },
           }, { workspaceId: "import", source: "codex", sessionId: "import", machineId: "import", userId: "import" });
           if (Array.isArray(event?.files_touched))
             write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd);
