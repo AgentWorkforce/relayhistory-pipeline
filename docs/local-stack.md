@@ -831,6 +831,10 @@ put was indexed reads again and indexes it; a move follows today's rule (both ke
 An object-store write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read
 converges through its own event exactly as before.
 
+Also with the flag on, a put event whose eTag (normalized as every read's) is the one the live row of that key
+already indexed is answered `unchanged` from the stamp alone: no manifest read, no lock. A rewrite of the key carries
+another eTag and takes the full path; a tombstoned row never matches. An event without an eTag takes the full path.
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

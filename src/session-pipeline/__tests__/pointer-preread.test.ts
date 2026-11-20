@@ -161,6 +161,60 @@ describe("pre-read on: races", () => {
   }, 300_000);
 });
 
+describe("pre-read on: an unchanged manifest", () => {
+  test("an event whose eTag the live row already indexed: unchanged with no object-store call and no lock", async () => {
+    const r = await pointerRig();
+    cleanup.push(r.close);
+    const key = await r.writeManifest(1);
+    await r.run("a", r.body(key, "ObjectCreated:Put", "01"), ON);
+    const etag = (await r.pg.query<{ e: string }>("SELECT manifest_etag e FROM sessions.session_index")).rows[0]!.e;
+    expect(etag).toBeTruthy();
+    r.calls.length = 0;
+    const lines: string[] = [];
+    const stdout = process.stdout.write;
+    process.stdout.write = ((c: unknown, ...rest: unknown[]) => { lines.push(String(c)); return (stdout as (...a: unknown[]) => boolean).call(process.stdout, c, ...rest); }) as typeof process.stdout.write;
+    let out;
+    try {
+      // The scheduled reconcile body does not pass through the S3 record normalizer: quoted and
+      // unquoted forms still name the same object version.
+      out = await r.run("a2", JSON.stringify({ reconcile: { key, etag: `"${etag}"` } }), ON);
+    } finally {
+      process.stdout.write = stdout;
+    }
+    expect(out.batchItemFailures).toEqual([]);
+    expect(r.calls.filter((c) => c.kind.startsWith("s3.")).length).toBe(0);
+    expect(r.calls.filter((c) => c.kind === "lock.sql").length).toBe(0);
+    expect(lines.join("")).toContain('"outcome":"unchanged"');
+    // The same machine and eTag under another manifest key is a move, not an unchanged event.
+    const otherKey = await r.writeManifest(1, { ...loc, startDate: "2026-11-03" });
+    r.calls.length = 0;
+    expect((await r.run("other", r.body(otherKey, "ObjectCreated:Put", "025", etag), ON)).batchItemFailures)
+      .toEqual([{ itemIdentifier: "other" }]);
+    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
+    // Another eTag (a rewrite of the key) takes the full path: read before the lock, nothing under it.
+    r.calls.length = 0;
+    await r.writeManifest(2);
+    expect((await r.run("b", r.body(key, "ObjectCreated:Put", "03", "another"), ON)).batchItemFailures).toEqual([]);
+    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
+    expect(inLock(r.calls, s3)).toBe(0);
+    expect((await r.row()).map((x) => x.revision)).toEqual(["2"]);
+  }, 300_000);
+
+  test("the indexed eTag on a tombstoned row is not 'unchanged': the full path runs", async () => {
+    const r = await pointerRig();
+    cleanup.push(r.close);
+    const key = await r.writeManifest(1);
+    await r.run("a", r.body(key, "ObjectCreated:Put", "01"), ON);
+    const etag = (await r.pg.query<{ e: string }>("SELECT manifest_etag e FROM sessions.session_index")).rows[0]!.e;
+    await r.store.delete(objectKey(key));
+    await r.run("d", r.body(key, "ObjectRemoved:DeleteMarkerCreated", "02"), ON);
+    r.calls.length = 0;
+    await r.run("a2", r.body(key, "ObjectCreated:Put", "03", etag), ON);
+    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
+    expect((await r.row())[0]!.deleted_at).not.toBeNull();
+  }, 300_000);
+});
+
 describe("SESSION_POINTER_PREREAD_ENABLED in the Lambda", () => {
   const base = {
     AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "b", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
