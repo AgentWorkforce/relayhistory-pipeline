@@ -50,7 +50,14 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * instead of a 503. Both calls are one autocommit statement whose error rolled it back whole
  * (ingest_prepare_buffer_stage is idempotent per claim and stage key; ingest_commit_buffered_batch
  * answers a repeat with the same receipt). Every other stage and cause stays as it was.
+ * Each retry writes one warn line, `route` `ingest.buffer_lock_retry` (BufferLockRetryFields).
+ * Time bound (role lock_timeout 2 s, statement_timeout 5 s, supabase/bootstrap/session_ingest_role.sql):
+ * lock_timeout applies to each lock acquisition, so one attempt that ends in 55P03/40P01 can take up to
+ * the 5 s statement_timeout (past that it is a 57014, never retried). The retry adds at most 250 ms + 5 s
+ * = 5.25 s per stage (a stage worst case of about 10.25 s); a request where both buffer stages retry adds
+ * at most about 10.5 s, and holds its Hyperdrive connection for that long.
  */
+import { log } from "../shared/log.ts";
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import { STORE_TRANSPORT_CAUSES } from "../shared/vendor.ts";
@@ -153,6 +160,8 @@ export interface DeliverDeps {
   random?: () => number;
   /** Test seam for the INGEST_BUFFER_LOCK_RETRY pause. Default: a setTimeout promise. */
   sleep?: (ms: number) => Promise<void>;
+  /** Test seam for the one INGEST_BUFFER_LOCK_RETRY line per retry. Default: `log.warn` (src/shared/log.ts allowlist). */
+  bufferLockRetryLog?: (fields: BufferLockRetryFields) => void;
   /**
    * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
    * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
@@ -254,7 +263,8 @@ export const CLAIM_LOCK_RETRY_AFTER = Object.freeze({ min: 5, max: DELIVERY_BUSY
 /**
  * A claim refused because its statement lost the lock wait to a concurrent claim for the
  * same tenant (INGEST_CLAIM_LOCK_BUSY=on). A 429 `delivery_busy` (lock `ledger_claim`):
- * the single autocommit statement rolled back, nothing was written. Keeps the stage, cause
+ * the single autocommit claim statement rolled back, so the claim wrote nothing (for the buffer stages
+ * see BufferLockBusy: earlier stages' writes remain). Keeps the stage, cause
  * and database diagnosis of the 503 it replaces, for the route line and the lock alert.
  */
 export class ClaimLockBusy extends DeliveryBusyError {
@@ -270,7 +280,10 @@ export type BufferLockStage = "buffer_intent" | "buffer_receipt";
  * A buffered stage-intent / receipt ledger call refused because its single autocommit statement lost a
  * lock wait (INGEST_BUFFER_LOCK_BUSY=on). The same 429 `delivery_busy` answer as `ClaimLockBusy` (it is
  * one, so the route line, the lock alert and the admission consumer treat it alike) with lock
- * `ledger_buffer` and the real stage. The statement rolled back; nothing was written.
+ * `ledger_buffer` and the real stage. This statement rolled back, but earlier stages' writes remain: at
+ * `buffer_intent` the committed (pending) claim, and at `buffer_receipt` also the staged object (`buffer_put`)
+ * and the stage-intent row. A client retry resumes the same claim and stage key; without one, the stage object
+ * and intent stay orphaned until the intent expires (120 s) or buffered garbage collection reclaims them.
  */
 export class BufferLockBusy extends ClaimLockBusy {
   constructor(override readonly stage: BufferLockStage, cause_code: string, db: DbErrorDiagnosis | undefined, retryAfterSeconds: number) {
@@ -278,8 +291,24 @@ export class BufferLockBusy extends ClaimLockBusy {
   }
 }
 
-/** INGEST_BUFFER_LOCK_RETRY pause before the one re-issue, in ms (inclusive). */
+/** INGEST_BUFFER_LOCK_RETRY pause before the one re-issue, in ms (inclusive). The whole retry adds at most
+ * this pause plus one more attempt, which the role statement_timeout caps at 5 s: about 5.25 s per stage. */
 export const BUFFER_LOCK_RETRY_PAUSE_MS = Object.freeze({ min: 50, max: 250 });
+
+/**
+ * The one warn line per INGEST_BUFFER_LOCK_RETRY retry (written on the retry path only, never without the flag):
+ * the stage, the SQLSTATE that caused the retry (`db_error_code`, 55P03 / 40P01), and how the retry ended.
+ * `outcome` `failed` adds the second failure's cause (`error_code`) and, for a database failure, its SQLSTATE
+ * (`sqlstate`). Closed values only: no tenant data, no ids, no messages. Diagnostic only.
+ */
+export interface BufferLockRetryFields {
+  route: "ingest.buffer_lock_retry";
+  stage: BufferLockStage;
+  db_error_code?: string;
+  outcome: "ok" | "failed";
+  error_code?: string;
+  sqlstate?: string;
+}
 
 function bufferLockRetryPauseMs(random: () => number): number {
   const { min, max } = BUFFER_LOCK_RETRY_PAUSE_MS;
@@ -394,17 +423,28 @@ async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLock
   }
 }
 
+const sqlstateOf = (error: unknown): string | undefined => {
+  const db = error instanceof IngestUnavailable ? error.db : undefined;
+  return db && SQLSTATE_SHAPE.test(db.db_error_code) ? db.db_error_code : undefined;
+};
+
+/** The retry line never changes the delivery: a throwing logger is ignored. */
+function bufferLockRetryLine(deps: Pick<DeliverDeps, "bufferLockRetryLog">, fields: BufferLockRetryFields): void {
+  try { (deps.bufferLockRetryLog ?? ((f: BufferLockRetryFields) => log.warn("session ingest buffer lock retry", { ...f })))(fields); } catch { /* diagnostic only */ }
+}
+
 const isBufferLockWait = (error: unknown, stage: BufferLockStage): error is IngestUnavailable =>
   error instanceof IngestUnavailable && error.stage === stage && error.cause_code === "ledger_lock_timeout";
 
 /**
  * A buffered ledger stage (`buffer_intent` / `buffer_receipt`). Neither flag (the default): exactly the plain
  * stage. With `bufferLockRetry`, a lock-wait failure (`ledger_lock_timeout`) re-runs the SAME `work` once
- * after a jittered pause (each attempt is its own stage-latency line); with `bufferLockBusy`, a lock-wait
+ * after a jittered pause and writes one `ingest.buffer_lock_retry` warn line with the retry's outcome (each
+ * attempt is also its own stage-latency line when INGEST_STAGE_LATENCY_LOG is on); with `bufferLockBusy`, a lock-wait
  * failure still standing is a 429 BufferLockBusy. Every other error propagates unchanged.
  */
 async function bufferLedgerStage<T>(
-  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep">,
+  deps: Pick<DeliverDeps, "stageLatency" | "bufferLockBusy" | "bufferLockRetry" | "random" | "sleep" | "bufferLockRetryLog">,
   name: BufferLockStage,
   work: () => Promise<T>,
 ): Promise<T> {
@@ -417,11 +457,18 @@ async function bufferLedgerStage<T>(
     error = first;
   }
   if (deps.bufferLockRetry && isBufferLockWait(error, name)) {
+    const first = sqlstateOf(error);
     await (deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(bufferLockRetryPauseMs(random));
     try {
-      return await runStage(name, work, deps.stageLatency);
+      const value = await runStage(name, work, deps.stageLatency);
+      bufferLockRetryLine(deps, { route: "ingest.buffer_lock_retry", stage: name, ...(first ? { db_error_code: first } : {}), outcome: "ok" });
+      return value;
     } catch (second) {
       error = second;
+      const code = error instanceof IngestUnavailable ? error.cause_code : error instanceof DeliveryError ? error.code : undefined;
+      const sqlstate = sqlstateOf(error);
+      bufferLockRetryLine(deps, { route: "ingest.buffer_lock_retry", stage: name, ...(first ? { db_error_code: first } : {}), outcome: "failed",
+        ...(code ? { error_code: code } : {}), ...(sqlstate ? { sqlstate } : {}) });
     }
   }
   if (deps.bufferLockBusy && isBufferLockWait(error, name))
