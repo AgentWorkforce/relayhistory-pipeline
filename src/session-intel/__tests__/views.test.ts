@@ -87,6 +87,16 @@ const row = (over: Partial<AdvisoryRowInput> = {}): AdvisoryRowInput => ({
 });
 
 describe("ReplayAdvisorStore", () => {
+  test("controls apply only to a tenant already visible at the replay clock", async () => {
+    const clock: SimClock = { now: new Date(at("09:00")) };
+    const store = new ReplayAdvisorStore(await view([leakSession]), clock, ALL_ON);
+    expect((await store.controls("org_fixture", "ws_fixture")).get("advisor")).toBe(false);
+    clock.now = new Date(at("10:01"));
+    expect((await store.controls("org_fixture", "ws_fixture")).get("advisor")).toBe(true);
+    expect((await store.controls("other", "ws_fixture")).get("advisor")).toBe(false);
+    expect((await store.controls("org_fixture", "other")).get("advisor")).toBe(false);
+  });
+
   test("upsert: insert, same key again is existing, LOW to HIGH upgrades, acked and other tenants are skipped", async () => {
     const clock: SimClock = { now: new Date(at("10:00")) };
     const store = new ReplayAdvisorStore(await view([leakSession]), clock, ALL_ON);

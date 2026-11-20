@@ -28,7 +28,7 @@ const lane = (sessionId: string, writes: Array<[string, number]>): LaneFacts => 
 /** Mirrors 062000's upsert: insert new; upgrade low->high on pending/delivered; skip acked/expired or same. */
 class FakeStore implements AdvisorStore {
   featureControls: SessionIntelControls = new Map(SESSION_INTEL_FEATURES.map((f) => [f, true]));
-  async controls() { return this.featureControls; }
+  async controls(_org: string, _workspace: string) { return this.featureControls; }
   rows = new Map<string, AdvisoryRowInput & { status: string }>();
   calls: string[] = [];
   constructor(private lanes: CandidateLane[]) {}
@@ -97,6 +97,23 @@ describe("scanOnce", () => {
     expect(await scanOnce({ workspaces: "*", store: noSender, backend: backend(shared), limits: limits() }, NOW))
       .toMatchObject({ written: 2, dmSent: 0 });
   });
+  test("one scan isolates enabled, disabled, throwing and non-pair workspaces", async () => {
+    const pair = (workspaceId: string) => [cand("a", { workspaceId }), cand("b", { workspaceId })];
+    const store = new FakeStore([...pair("bad"), ...pair("off"), ...pair("on"), cand("alone", { workspaceId: "lone" })]);
+    const scopes: string[] = [], reads: string[] = [];
+    const upsert = store.upsert.bind(store);
+    store.upsert = async (org, workspace, row) => { scopes.push(workspace); return upsert(org, workspace, row); };
+    store.controls = async (_org, ws) => {
+      reads.push(ws);
+      if (ws === "bad" || ws === "lone") throw new Error("fixture getter unavailable");
+      return new Map([["advisor", ws === "on"], ["dm", false]]);
+    };
+    const stats = await scanOnce({ workspaces: "*", store, backend: backend(shared), limits: limits() }, NOW);
+    expect(reads.sort()).toEqual(["bad", "off", "on"]);
+    expect(stats).toMatchObject({ workspaces: 1, failed: 1, written: 2 });
+    expect(scopes).toEqual(["on", "on"]);
+  });
+
   test("a HIGH pair writes one row per recipient, DMs both, marks delivered only after the send", async () => {
     const store = new FakeStore([cand("a"), cand("b")]);
     const sender = new InMemoryRelaySender();

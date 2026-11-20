@@ -136,9 +136,10 @@ export class ReplayAdvisorStore implements AdvisorStore {
   /** `controls`: what sessions.session_intel_controls_v1 would return, for every workspace of the replay. */
   constructor(private readonly view: ReplayView, private readonly clock: SimClock, private readonly replayControls: ReplayControls) {}
 
-  async controls(_orgId: string, _workspaceId: string): Promise<SessionIntelControls> {
+  async controls(orgId: string, workspaceId: string): Promise<SessionIntelControls> {
+    const present = this.view.sessionsAsOf(this.clock.now).some((s) => s.session.orgId === orgId && s.session.workspaceId === workspaceId);
     // Every feature is listed, as the production reader returns it; a missing one is off (fail closed).
-    return new Map(SESSION_INTEL_FEATURES.map((f) => [f, this.replayControls[f] === true]));
+    return new Map(SESSION_INTEL_FEATURES.map((f) => [f, present && this.replayControls[f] === true]));
   }
   private key = (advisoryId: string, r: SessionRef) => `${advisoryId}\u0000${r.harness}\u0000${r.sessionId}`;
 

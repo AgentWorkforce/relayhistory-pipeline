@@ -288,14 +288,14 @@ export async function scanOnce(deps: ScanDeps, now: Date): Promise<ScanStats> {
   stats.candidates = Math.min(rows.length, CANDIDATE_LIMIT);
   for (const lanes of byWorkspace.values()) {
     const { orgId, workspaceId } = lanes[0]!;
-    const controls = await deps.store.controls(orgId, workspaceId);
-    if (controls.get("advisor") !== true) continue;
     // A pair needs two sessions in one project.
     const perProject = new Map<string, number>();
     for (const l of lanes) perProject.set(l.projectId!, (perProject.get(l.projectId!) ?? 0) + 1);
     if (![...perProject.values()].some((n) => n >= 2)) continue;
-    stats.workspaces++;
     try {
+      const controls = await deps.store.controls(orgId, workspaceId);
+      if (controls.get("advisor") !== true) continue;
+      stats.workspaces++;
       const candidates = new Map(lanes.map((l) => [refKey(l), l]));
       const facts = await deps.backend.readFacts(deps.store.directory(),
         { orgId, workspaceId, since, until: now }, { timeoutMs: FACTS_TIMEOUT_MS });

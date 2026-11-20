@@ -10,7 +10,7 @@ describe("session intelligence controls schema", () => {
   let db: PGlite;
   beforeAll(async () => {
     db = new PGlite();
-    await db.exec("CREATE SCHEMA sessions; CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role; CREATE ROLE bulls96_read_api; GRANT USAGE ON SCHEMA sessions TO service_role,anon,authenticated,bulls96_read_api;");
+    await db.exec("CREATE SCHEMA sessions; CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role; CREATE ROLE bulls96_read_api; CREATE ROLE search_consumer_runtime; CREATE ROLE bulls96_session_ingest; CREATE ROLE bulls96_session_ingest_seeder; GRANT USAGE ON SCHEMA sessions TO service_role,anon,authenticated,bulls96_read_api,search_consumer_runtime,bulls96_session_ingest,bulls96_session_ingest_seeder; ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT ALL ON TABLES TO search_consumer_runtime,bulls96_session_ingest,bulls96_session_ingest_seeder; ALTER DEFAULT PRIVILEGES IN SCHEMA sessions GRANT EXECUTE ON FUNCTIONS TO search_consumer_runtime,bulls96_session_ingest,bulls96_session_ingest_seeder;");
     await db.exec(migration);
   });
   afterAll(async () => { await db?.close(); });
@@ -52,7 +52,7 @@ describe("session intelligence controls schema", () => {
         EXISTS(SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee=0) public_exec
         FROM pg_class c,pg_proc p WHERE c.oid='sessions.session_intel_controls'::regclass AND p.oid=$1::regprocedure`, [fn])).rows[0]!;
     expect(metadata).toEqual({ rls: true, definer: true, config: ["search_path=pg_catalog, sessions, pg_temp"], public_exec: false });
-    for (const role of ["service_role", "bulls96_read_api", "anon", "authenticated"]) {
+    for (const role of ["service_role", "bulls96_read_api", "anon", "authenticated", "search_consumer_runtime", "bulls96_session_ingest", "bulls96_session_ingest_seeder"]) {
       const permissions = (await db.query<{ select: boolean; insert: boolean; execute: boolean }>(
         "SELECT has_table_privilege($1,'sessions.session_intel_controls','SELECT') AS select, has_table_privilege($1,'sessions.session_intel_controls','INSERT') AS insert, has_function_privilege($1,$2,'EXECUTE') AS execute", [role, fn])).rows[0]!;
       expect(permissions).toEqual({ select: false, insert: false, execute: role === "service_role" });
