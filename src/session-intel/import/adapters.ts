@@ -6,6 +6,7 @@
 import { basename } from "node:path";
 import { relayhistoryActivityEvent } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { commitShaFromOutput, gitOps } from "./git.ts";
+import { codeModeShells, codexCommitSha } from "./code-mode.ts";
 import { readJsonl } from "./io.ts";
 import { cleanId, IMPORT_BOUNDS, ImportError, SessionBuilder, strictTs, type ImportHarness, type ImportStats, type LineRef } from "./normalize.ts";
 import { isRecord } from "../replay/util.ts";
@@ -176,7 +177,7 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
   let waitingForChildTask = false;
   let childThreadConfirmed = false;
   let metadataSeen = false;
-  const pending = new Map<string, { sha: string | null; ts: string }>();
+  const pending = new Map<string, { sha: string | null; ts: string; at: LineRef }>();
   await readJsonl(file, set.stats, (r, line) => {
     if (!isRecord(r)) { set.stats.malformedLines++; return; }
     const at: LineRef = { file: fileIndex, line };
@@ -267,6 +268,17 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
           }, { workspaceId: "import", source: "codex", sessionId: "import", machineId: "import", userId: "import" });
           if (Array.isArray(event?.files_touched))
             write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd);
+          const failed = Array.isArray(event?.tool_calls) && event.tool_calls.some((call) => isRecord(call) && call.isError === true);
+          if (!failed) {
+            const nested = codeModeShells(input);
+            if (nested.incomplete) set.stats.codexCodeModeShellUnparsed++;
+            const commits = nested.commands.filter((command) => gitOps(shellScript(command).script).commit);
+            for (const _ of commits) {
+              const c = b.commit(null, ts, at);
+              // One outer output cannot safely name several nested commit attempts.
+              if (commits.length === 1 && !nested.incomplete) pending.set(callId, c);
+            }
+          }
         }
       } else if (name === "apply_patch") {
         const input = kind === "custom_tool_call" ? str(p.input) : (str(parseArgs(p.arguments).input) ?? str(p.arguments));
@@ -283,9 +295,9 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
       const c = pending.get(callId);
       if (!c) return;
       pending.delete(callId);
-      const raw = isRecord(p.output) ? str(p.output.content) ?? "" : str(p.output) ?? "";
-      const inner = parseArgs(raw);
-      c.sha = commitShaFromOutput(str(inner.output) ?? raw);
+      c.sha = codexCommitSha(p.output);
+      // The SHA is not available at call time: do not leak later output into an earlier replay view.
+      if (c.sha) { if (ts > c.ts) c.ts = ts; c.at = at; }
     }
   });
   if (!b.first) return;

@@ -65,6 +65,37 @@ describe("claude code adapter, hostile records", () => {
 });
 
 describe("codex adapter", () => {
+  test("code-mode static git commit attempts pair with their matching text-block outputs", async () => {
+    const dir = tmp("si-imp-code-mode-commit-");
+    const code = "const cmd = 'git add src/new.ts && git commit -m fixture'; text(await tools.exec_command({cmd}));";
+    for (const kind of ["custom_tool_call", "function_call"]) writeFileSync(join(dir, `${kind}.jsonl`), [
+      { timestamp: at("09:00"), type: "session_meta", payload: { id: kind, cwd: "/work/acme-api" } },
+      { timestamp: at("09:01"), type: "response_item", payload: { type: kind, name: "exec", call_id: "commit-call", input: code, arguments: JSON.stringify({ input: code }) } },
+      { timestamp: at("09:02"), type: "response_item", payload: { type: "function_call_output", call_id: "another-call", output: "[fixture 12345678] unrelated" } },
+      { timestamp: at("09:03"), type: "response_item", payload: { type: "function_call_output", call_id: "commit-call", output: [{ type: "input_text", text: JSON.stringify({ output: "[fixture abcdef12] synthetic commit\n 1 file changed", exit_code: 0 }) }] } },
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const set = await read(dir, readCodex);
+    expect([...set.byKey.values()].map((b) => facts(b).commits)).toEqual([[["abcdef12", at("09:03")]], [["abcdef12", at("09:03")]]]);
+    expect([...set.byKey.values()].map((b) => b.commits[0]!.at.line)).toEqual([4, 4]);
+    expect([...set.byKey.values()].flatMap((b) => b.outcomes)).toEqual([]);
+    expect(set.stats.codexCodeModeShellUnparsed).toBe(0);
+  });
+
+  test("missing or ambiguous code-mode output remains an unknown attempt and incomplete syntax is counted", async () => {
+    const dir = tmp("si-imp-code-mode-commit-unknown-");
+    const call = (id: string, input: string, is_error: unknown = false) => ({ timestamp: at("09:01"), type: "response_item", payload: { type: "custom_tool_call", name: "exec", call_id: id, input, is_error } });
+    writeFileSync(join(dir, "exec.jsonl"), [
+      { timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } },
+      call("missing", "tools.exec_command({cmd:'git commit -m fixture'})"),
+      call("two", "tools.exec_command({cmd:'git commit -m one'});tools.exec_command({cmd:'git commit -m two'})"),
+      { timestamp: at("09:02"), type: "response_item", payload: { type: "custom_tool_call_output", call_id: "two", output: "[fixture abcdef12] one\n[fixture 12345678] two" } },
+      call("dynamic", "tools.exec_command({cmd: commandFromElsewhere})"),
+      ...[true, 1, "true", "1"].map((flag) => call(`failed-${flag}`, "tools.exec_command({cmd:'git commit -m failed'})", flag)),
+    ].map((r) => JSON.stringify(r)).join("\n"));
+    const set = await read(dir, readCodex);
+    expect(facts([...set.byKey.values()][0]!).commits).toEqual([[null, at("09:01")], [null, at("09:01")], [null, at("09:01")]]);
+    expect(set.stats.codexCodeModeShellUnparsed).toBe(1);
+  });
   test("a paginated child imports only its own task, not retimestamped parent context", async () => {
     const dir = tmp("si-imp-codex-child-");
     const row = (type: string, payload: unknown) => ({ timestamp: at("09:00"), type, payload });
