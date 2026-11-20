@@ -41,6 +41,16 @@ import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
+  /**
+   * Default off. `true` renders SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: a search pass returns before any
+   * object read or ClickHouse query when the session directory proves a complete pass already covered the
+   * scope's live pointer set at its current revisions (search-index.ts alreadyCurrent). Needs `searchIndex: true`.
+   * Not detected while on (docs/local-stack.md): rows re-fingerprinted without a pointer change, index rows lost
+   * on the ClickHouse side while Postgres says ready (duplicate events, DLQ redrives and the scheduled reconcile
+   * no longer repair them), a wider index window. The way back is `false`; any re-projection or backfill of old
+   * sessions needs it off.
+   */
+  skipCurrent?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
@@ -126,8 +136,10 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "skipCurrent") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
+  if (v.skipCurrent !== undefined && typeof v.skipCurrent !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrent must be a boolean");
+  if (v.skipCurrent === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrent requires searchIndex: true");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
@@ -278,6 +290,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
     ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),
     ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
+    // Only when armed: a stage without skipCurrent: true renders nothing and never skips.
+    ...(i.p.skipCurrent === true ? { SEARCH_INDEX_SKIP_CURRENT_ENABLED: "true" } : {}),
   };
 }
 

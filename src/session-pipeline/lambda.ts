@@ -65,6 +65,8 @@ export interface LambdaEnv {
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
+  /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
+  skipCurrentEnabled?: boolean;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -76,6 +78,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   const fanout = env.PIPELINE_FANOUT ?? "off";
   if (fanout !== "off" && fanout !== "postgres") throw new Error("session pipeline: PIPELINE_FANOUT must be off or postgres");
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
+  // SEARCH_INDEX_SKIP_CURRENT_ENABLED: strict grammar, default off; on needs the search stage.
+  const skipCurrent = searchIndexSkipCurrentFromEnv(env);
+  if (skipCurrent && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -86,7 +92,25 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
+    ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
   };
+}
+
+/**
+ * SEARCH_INDEX_SKIP_CURRENT_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else ("1", "TRUE", padded values) fails init naming the variable, never the value.
+ */
+export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_SKIP_CURRENT_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/** The search deps' skip-current field for `env`: absent unless the flag is on (init spreads it in). */
+export function searchSkipCurrentDeps(env: Pick<LambdaEnv, "skipCurrentEnabled">): { skipCurrent?: true } {
+  // Default off; on, a pass the session directory proves current returns before any read (already_current).
+  return env.skipCurrentEnabled ? { skipCurrent: true } : {};
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -221,6 +245,7 @@ async function init(): Promise<Runtime> {
       store,
       ch: createClickHouseClient(secret.clickhouse),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      ...searchSkipCurrentDeps(env),
     };
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.

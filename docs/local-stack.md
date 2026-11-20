@@ -87,6 +87,41 @@ tokens require `COURIER_ALLOW_FIXED_TOKEN=1`. `JWT_PRIVATE_KEY_PEM` is local
 fixture auth only and is refused in `new` mode unless
 `COURIER_ALLOW_LOCAL_SIGNING_KEY=1` is explicitly set.
 
+### Hosted Lambda: skip a search pass already current
+
+`SEARCH_INDEX_SKIP_CURRENT_ENABLED` (hosted session-pipeline Lambda only; stack input
+`transcriptStore.sessionPipeline.skipCurrent`, which needs `searchIndex: true`) is **default off**: unset, `""` and
+`false` are off and change nothing (no query, no log line); `true` is on; any other value fails Lambda init naming
+the variable, and `true` without `SEARCH_INDEX_ENABLED=1` fails init too.
+
+On, a search pass returns before any object read and any ClickHouse query when the session directory proves that a
+complete pass already covered exactly the scope's live pointer set at its current revisions. It answers `skipped`
+with the reason `already_current`, writes nothing, and the consumer logs `search index skipped` (no requeue, no
+failure). Every redelivered or duplicate manifest event of an unchanged session then costs the pointer stage and one
+Postgres check instead of a full re-read of the session and a FINAL scan.
+
+The proof is the canonical session's `sessions.session_directory` row: `event_projection_ready` (set only by the
+directory write of a complete pass, when the live pointers equal that pass's sources), `event_projection_sources`
+equal to the live `manifest_key -> revision` map of the canonical id in `sessions.session_index`, version 1, not
+deleted. Readiness is reset by every incomplete pass and by the `session_index` trigger on any pointer insert,
+update or delete of the scope or its canonical id.
+
+Never skipped: a scope with no live pointer (erase), a canonical mismatch or a still-live alias, a previous pass that
+was partial or incomplete, a new revision, a sibling manifest added or removed, a canonical change, a busy scope
+(busy is answered before the check and still requeues).
+
+Not detected, because the proof reads only Postgres and the pointer set:
+
+- a change that re-fingerprints index rows without any pointer change (a projection or reader code change);
+- index rows lost on the ClickHouse side while Postgres still says ready: with the flag on, neither duplicate
+  events, DLQ redrives nor the scheduled reconcile repair them, since each of those reaches the same check;
+- a wider index window (the `window_start` state): rows that now fall inside it are never added.
+
+With the flag on, an unchanged session keeps whatever its index holds until its source next changes. The way back is
+the flag off (`false`): every event then re-reads its session as before. Any re-projection or backfill of old
+sessions needs the flag off for its whole run; there is no version to bump instead
+(`event_projection_version` is fixed at 1).
+
 ## Known limits
 
 - Alchemy's Docker provider has no health gating; the CLI waits.

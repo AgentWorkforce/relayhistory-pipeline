@@ -66,6 +66,13 @@ export interface SearchIndexDeps {
   /** Test seam; production writes the catalog in the same Supabase transaction. */
   writeCatalog?: typeof writeDirectoryCatalog;
   writeEvents?: typeof writeDirectoryEvents;
+  /**
+   * SEARCH_INDEX_SKIP_CURRENT_ENABLED=true only (the hosted Lambda, lambda.ts): a pass returns at once,
+   * before any object read or index query, when the session directory proves that a COMPLETE pass already
+   * covered exactly the scope's live pointer set at its current revisions (alreadyCurrent): result
+   * `skipped`, reason `already_current`, nothing written. Absent: every pass exactly as before.
+   */
+  skipCurrent?: boolean;
 }
 
 export interface SearchIndexLimits {
@@ -99,6 +106,8 @@ export interface SearchIndexResult {
   reasons: string[];
   /** Another pass holds this session: nothing was done, re-enqueue the event. */
   busy?: boolean;
+  /** `skipCurrent` only: a complete pass already covers the live source set; nothing was read or written. */
+  skipped?: boolean;
   /** Too large to index whole: no rows written, its index state marked partial. */
   partial?: boolean;
 }
@@ -263,6 +272,10 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
+    // SEARCH_INDEX_SKIP_CURRENT_ENABLED: under both locks, after every branch that must run (canonical
+    // mismatch, alias still live, erase), before any object read or index query.
+    if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length)))
+      return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
     const fromMs = Date.parse(await windowStart(deps.ch, at));
     const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
@@ -322,4 +335,48 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       reasons: truncated ? [...s3.reasons, "clickhouse_truncated"] : s3.reasons,
     };
   });
+}
+
+export const ALREADY_CURRENT = "already_current";
+
+/**
+ * Does a complete pass already cover this scope's live source set? Proven by the session directory row
+ * of the canonical id (the row writeDirectoryEvents writes, picked as livePointerSnapshot picks it):
+ *   - event_projection_ready: set only by writeDirectoryEvents of a COMPLETE pass, in the pass's own
+ *     transaction, and only when the live pointer set equals the pass's sources; reset by every
+ *     incomplete pass (invalidateDirectoryEvents) and by the session_index trigger on ANY pointer insert,
+ *     update or delete of the scope or its canonical id (a new revision, a sibling added or removed, a
+ *     canonical change, a tombstone), which also bumps the epoch;
+ *   - event_projection_sources equal to the live manifest_key -> revision map of the canonical id, the
+ *     same expression writeDirectoryEvents compares;
+ *   - event_projection_version 1 and the row not deleted; the scope has live pointers.
+ * (The directory epoch is not compared: this pass's snapshot reads it from the same row, and the trigger
+ * that moves it on a pointer change resets readiness in the same statement.)
+ * Not detected: a change of reader ruleset, origin labels or projection code that re-fingerprints rows
+ * without a pointer change.
+ */
+async function alreadyCurrent(
+  tx: SqlExecutor,
+  scope: SessionScope,
+  snapshot: { canonicalId: string },
+  liveKeys: number,
+): Promise<boolean> {
+  if (liveKeys === 0) return false;
+  const { rows } = await tx.query<{ current: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM (
+         SELECT d.deleted_at, d.event_projection_ready, d.event_projection_version, d.event_projection_epoch, d.event_projection_sources
+           FROM sessions.session_directory d
+          WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN ($4,$5)
+          ORDER BY (d.session_id=$4) DESC LIMIT 1
+       ) d
+       WHERE d.deleted_at IS NULL AND d.event_projection_ready AND d.event_projection_version=1
+         AND d.event_projection_sources=(
+           SELECT jsonb_object_agg(p.manifest_key,p.revision::text) FROM sessions.session_index p
+            WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3
+              AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL)
+     ) AS current`,
+    [scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId, scope.sessionId],
+  );
+  return rows[0]?.current === true;
 }
