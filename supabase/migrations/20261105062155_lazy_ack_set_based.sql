@@ -52,8 +52,10 @@ LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp SET bulls96.lazy_ac
 DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;
  t sessions.ingest_stage_intents%ROWTYPE;slot sessions.ingest_lazy_native_slots%ROWTYPE;s sessions.ingest_receipt_seats%ROWTYPE;
  d sessions.ingest_lazy_ack_decisions%ROWTYPE;r record;v_last bigint;v_key text;v_material jsonb;v_accept boolean;v_first text;v_new_lineage bigint;
- v_recs jsonb;v_plan jsonb;v_epos integer;v_ephase integer;v_lim integer;v_rounds integer;v_allocs integer;e record;
+ v_recs jsonb;v_plan jsonb;v_epos integer;v_ephase integer;v_lim integer;v_rounds integer;v_allocs integer;e record;v_set_based boolean;
 BEGIN
+ -- 062155 gate, read once: exactly 'on' selects the set-based block; anything else (or absent) the 043800 loop.
+ v_set_based:=current_setting('bulls96.lazy_ack_set_based',true) IS NOT DISTINCT FROM 'on';
  PERFORM sessions.ingest_lazy_guard(p->>'org_id');
  PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');
  PERFORM 1 FROM sessions.ingest_lazy_user_seals u JOIN sessions.ingest_seed_fence_baselines b USING(org_id,workspace_id,user_id)
@@ -94,10 +96,10 @@ BEGIN
   OR jsonb_array_length(a.source_processing_ranks)<>jsonb_array_length(a.records) THEN
   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: original candidate order changed';END IF;
  -- 062155 gate (function-local; only the owner can ALTER FUNCTION ... SET it, and proconfig overrides any session or
- -- role value). Off (the default this file installs): the 043800 per-record loop above, unchanged. On: the
- -- set-based block below. Both run AFTER the same clock NO KEY UPDATE, origin lock and stage/attempt checks, and both
+ -- role value). Off (the default this file installs): the 043800 per-record loop below, unchanged. On: the
+ -- set-based block after it. Both run AFTER the same clock NO KEY UPDATE, origin lock and stage/attempt checks, and both
  -- leave identical rows and raise the loop's first error (SQLSTATE and text) in the loop's order.
- IF current_setting('bulls96.lazy_ack_set_based',true) IS DISTINCT FROM 'on' THEN
+ IF NOT v_set_based THEN
  FOR r IN SELECT q.* FROM sessions.ingest_receipt_seat_records(t.claim_token,t.group_ordinals) q
   ORDER BY (a.source_processing_ranks->>q.ord)::integer LOOP
   IF a.source_processing_ranks->>r.ord IS NULL THEN
@@ -211,10 +213,12 @@ BEGIN
    FROM jsonb_to_recordset(v_plan) q(pos integer,alloc boolean,new_seat_key text,km jsonb,seatnum numeric,first_digest text,fe bigint)
    WHERE q.alloc AND q.pos<v_lim ORDER BY q.pos;
   -- ingest_history_native_changed is a STATEMENT trigger whose invalidations count calls (required_scopes.request_version,
-  -- session_replay_epoch_seq). While history is active, one single-row UPDATE per accept in pos order, exactly the
-  -- loop's sequence of trigger calls. Otherwise (the trigger returns at its first line) one UPDATE per round, round k
-  -- holding the k-th accept of each slot: no slot is updated twice in one statement, and per-slot order is kept.
-  IF sessions.ingest_history_active() THEN
+  -- session_replay_epoch_seq). While the history switch is live, one single-row UPDATE per accept in pos order: exactly
+  -- the loop's sequence of trigger calls, whatever ingest_history_active() (VOLATILE: build leases, installed scopes)
+  -- answers at each of them. The switch is written only by ingest_history_set_live, which takes the clock FOR UPDATE,
+  -- so it cannot change while this ACK holds the clock NO KEY UPDATE. Switch off: the trigger returns at its first line,
+  -- so one UPDATE per round (round k = the k-th accept of each slot; no slot twice in one statement, per-slot order kept).
+  IF sessions.ingest_history_live() THEN
    FOR e IN SELECT q.* FROM jsonb_to_recordset(v_plan) q(pos integer,accept boolean,nk text,km jsonb,cd text,re bigint,fe bigint,lineage_n numeric,seat_key text)
     WHERE q.accept AND q.pos<v_lim ORDER BY q.pos LOOP
     UPDATE sessions.ingest_lazy_native_slots SET lineage=e.lineage_n::bigint,current_owner=a.user_id,

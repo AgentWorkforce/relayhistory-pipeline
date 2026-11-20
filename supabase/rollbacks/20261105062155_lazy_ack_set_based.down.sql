@@ -10,7 +10,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062155_lazy_ack_set_based.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack set-based: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062155_lazy_ack_set_based.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'03d00cb7e815d187c22eb4ce5633e87210816aa66ad71c8763ff1995af4aeb8b'
+ IF NOT FOUND OR v_sha<>'bd377aed627b7ac059ca561f5d0c8cb809c8a9f16c31e3700fb85ed4466a27e5'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack set-based: own applied checksum required';END IF;
  UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack set-based: validation marker required';END IF;
@@ -109,5 +109,5 @@ BEGIN
  IF t.expires_at<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='session ingest: stage expired while assigning seats';END IF;
  PERFORM sessions.ingest_lazy_attempt(t.claim_token);
 END $lazy_ack_batch$;
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062155_lazy_ack_set_based.sql' AND sha256='03d00cb7e815d187c22eb4ce5633e87210816aa66ad71c8763ff1995af4aeb8b';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062155_lazy_ack_set_based.sql' AND sha256='bd377aed627b7ac059ca561f5d0c8cb809c8a9f16c31e3700fb85ed4466a27e5';
 COMMIT;
