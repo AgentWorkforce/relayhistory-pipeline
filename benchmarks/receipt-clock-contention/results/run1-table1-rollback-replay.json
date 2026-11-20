@@ -1,0 +1,295 @@
+{
+ "transactionEnd": "ROLLBACK",
+ "batches": "replay",
+ "status": "WITHDRAWN (rates): run window started before warm-up calls, so ACK counts/rates are understated at higher C. Latency, clock-wait and error columns stand.",
+ "cells": [
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 1,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 125,
+   "ok": 125,
+   "runSeconds": 15.1,
+   "ackedRecordsPerSec": 4167,
+   "acksPerSec": 8.3,
+   "latency": {
+    "p50": 94.6,
+    "p95": 251.5,
+    "max": 283.4
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 135,
+   "ok": 135,
+   "runSeconds": 15.4,
+   "ackedRecordsPerSec": 4500,
+   "acksPerSec": 9,
+   "latency": {
+    "p50": 404.8,
+    "p95": 471.1,
+    "max": 1211.4
+   },
+   "clockWait": {
+    "p50": 301.2,
+    "p95": 351.2,
+    "max": 1106.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 136,
+   "ok": 136,
+   "runSeconds": 15.8,
+   "ackedRecordsPerSec": 4533,
+   "acksPerSec": 9.1,
+   "latency": {
+    "p50": 797.4,
+    "p95": 1403.7,
+    "max": 1408.4
+   },
+   "clockWait": {
+    "p50": 695.4,
+    "p95": 758.8,
+    "max": 1308.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 1,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 150,
+   "ok": 150,
+   "runSeconds": 15,
+   "ackedRecordsPerSec": 5000,
+   "acksPerSec": 10,
+   "latency": {
+    "p50": 93.5,
+    "p95": 99.8,
+    "max": 511.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 140,
+   "ok": 140,
+   "runSeconds": 15.3,
+   "ackedRecordsPerSec": 4667,
+   "acksPerSec": 9.3,
+   "latency": {
+    "p50": 375.7,
+    "p95": 574.9,
+    "max": 1131.4
+   },
+   "clockWait": {
+    "p50": 278.7,
+    "p95": 421.5,
+    "max": 1029.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 145,
+   "ok": 145,
+   "runSeconds": 15.7,
+   "ackedRecordsPerSec": 4833,
+   "acksPerSec": 9.7,
+   "latency": {
+    "p50": 724.7,
+    "p95": 797,
+    "max": 824.5
+   },
+   "clockWait": {
+    "p50": 631.8,
+    "p95": 704.5,
+    "max": 732.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 1,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 57,
+   "ok": 57,
+   "runSeconds": 15.1,
+   "ackedRecordsPerSec": 1900,
+   "acksPerSec": 3.8,
+   "latency": {
+    "p50": 231.3,
+    "p95": 354.1,
+    "max": 720.3
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 57,
+   "ok": 57,
+   "runSeconds": 15.8,
+   "ackedRecordsPerSec": 1900,
+   "acksPerSec": 3.8,
+   "latency": {
+    "p50": 887.4,
+    "p95": 1538,
+    "max": 1556.3
+   },
+   "clockWait": {
+    "p50": 665.3,
+    "p95": 760.9,
+    "max": 1319.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 52,
+   "ok": 52,
+   "runSeconds": 16.8,
+   "ackedRecordsPerSec": 1733,
+   "acksPerSec": 3.5,
+   "latency": {
+    "p50": 1878.2,
+    "p95": 2440.7,
+    "max": 2446.3
+   },
+   "clockWait": {
+    "p50": 1640.8,
+    "p95": 2200.7,
+    "max": 2206.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 1,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 67,
+   "ok": 67,
+   "runSeconds": 15.2,
+   "ackedRecordsPerSec": 2233,
+   "acksPerSec": 4.5,
+   "latency": {
+    "p50": 212.9,
+    "p95": 228.1,
+    "max": 413.9
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 56,
+   "ok": 56,
+   "runSeconds": 15.8,
+   "ackedRecordsPerSec": 1867,
+   "acksPerSec": 3.7,
+   "latency": {
+    "p50": 944.6,
+    "p95": 1158.2,
+    "max": 1372.2
+   },
+   "clockWait": {
+    "p50": 702.7,
+    "p95": 908.1,
+    "max": 1133.9
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "seconds": 15,
+   "derived": 1,
+   "samples": 47,
+   "ok": 47,
+   "runSeconds": 16.8,
+   "ackedRecordsPerSec": 1567,
+   "acksPerSec": 3.1,
+   "latency": {
+    "p50": 2003.7,
+    "p95": 2633.1,
+    "max": 2641.4
+   },
+   "clockWait": {
+    "p50": 1750.2,
+    "p95": 2373,
+    "max": 2384.6
+   },
+   "errors": {}
+  }
+ ]
+}

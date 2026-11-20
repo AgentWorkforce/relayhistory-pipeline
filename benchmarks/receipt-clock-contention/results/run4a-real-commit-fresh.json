@@ -1,0 +1,307 @@
+{
+ "transactionEnd": "COMMIT",
+ "batches": "fresh",
+ "status": "Primary evidence (C=4/8, 8 batches/worker). Large run-to-run variance vs run 4b on this host.",
+ "cells": [
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 7.83,
+   "durableRecordsPerSec": 2045,
+   "latencyThroughCommit": {
+    "p50": 856.4,
+    "p95": 1261.3,
+    "max": 1415.8
+   },
+   "clockWait": {
+    "p50": 616.4,
+    "p95": 1146.4,
+    "max": 1292.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 7.16,
+   "durableRecordsPerSec": 4469,
+   "latencyThroughCommit": {
+    "p50": 792,
+    "p95": 801.7,
+    "max": 804.4
+   },
+   "clockWait": {
+    "p50": 691.7,
+    "p95": 699.7,
+    "max": 703.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 3.28,
+   "durableRecordsPerSec": 4875,
+   "latencyThroughCommit": {
+    "p50": 361.3,
+    "p95": 365.9,
+    "max": 367.3
+   },
+   "clockWait": {
+    "p50": 269.3,
+    "p95": 274,
+    "max": 274.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 6.63,
+   "durableRecordsPerSec": 4827,
+   "latencyThroughCommit": {
+    "p50": 731,
+    "p95": 749.4,
+    "max": 840.1
+   },
+   "clockWait": {
+    "p50": 637.2,
+    "p95": 655.8,
+    "max": 737.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 3.16,
+   "durableRecordsPerSec": 5063,
+   "latencyThroughCommit": {
+    "p50": 310.2,
+    "p95": 323.3,
+    "max": 332.1
+   },
+   "clockWait": {
+    "p50": 229.5,
+    "p95": 244.3,
+    "max": 245.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 6.33,
+   "durableRecordsPerSec": 5059,
+   "latencyThroughCommit": {
+    "p50": 614.1,
+    "p95": 625.6,
+    "max": 626.9
+   },
+   "clockWait": {
+    "p50": 534,
+    "p95": 546.3,
+    "max": 549.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 9.04,
+   "durableRecordsPerSec": 1770,
+   "latencyThroughCommit": {
+    "p50": 1037.6,
+    "p95": 1124.5,
+    "max": 1127.9
+   },
+   "clockWait": {
+    "p50": 779.8,
+    "p95": 857,
+    "max": 882
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 19.25,
+   "durableRecordsPerSec": 1663,
+   "latencyThroughCommit": {
+    "p50": 2179,
+    "p95": 2538.5,
+    "max": 2559.2
+   },
+   "clockWait": {
+    "p50": 1877.7,
+    "p95": 2223.5,
+    "max": 2240.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 8.11,
+   "durableRecordsPerSec": 1973,
+   "latencyThroughCommit": {
+    "p50": 864.1,
+    "p95": 1286.2,
+    "max": 1292.8
+   },
+   "clockWait": {
+    "p50": 645.2,
+    "p95": 866.4,
+    "max": 1075
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 18.55,
+   "durableRecordsPerSec": 1725,
+   "latencyThroughCommit": {
+    "p50": 2172.8,
+    "p95": 2414.5,
+    "max": 2454.3
+   },
+   "clockWait": {
+    "p50": 1899,
+    "p95": 2123.4,
+    "max": 2161.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "k": 8,
+   "attempts": 32,
+   "okClient": 32,
+   "durableBatches": 32,
+   "durableDecisionRows": 16000,
+   "newSeats": 16000,
+   "wallSecondsInclDrain": 11.94,
+   "durableRecordsPerSec": 1340,
+   "latencyThroughCommit": {
+    "p50": 1289.8,
+    "p95": 1358.5,
+    "max": 1366.9
+   },
+   "clockWait": {
+    "p50": 966.2,
+    "p95": 1007.2,
+    "max": 1036.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "k": 8,
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 9.86,
+   "durableRecordsPerSec": 3246,
+   "latencyThroughCommit": {
+    "p50": 995.4,
+    "p95": 1057.4,
+    "max": 1273.9
+   },
+   "clockWait": {
+    "p50": 867.8,
+    "p95": 931.8,
+    "max": 1125.6
+   },
+   "errors": {}
+  }
+ ]
+}

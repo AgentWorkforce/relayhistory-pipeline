@@ -1,0 +1,2262 @@
+{
+ "transactionEnd": "ROLLBACK",
+ "batches": "replay",
+ "status": "WITHDRAWN (rates): same window bug as run 1; loop/shared/C16 has 0 samples. Latency, clock-wait and error columns stand.",
+ "cells": [
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 187,
+   "ok": 187,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 2338,
+   "acksPerSec": 23.4,
+   "latency": {
+    "p50": 39.8,
+    "p95": 71.8,
+    "max": 79.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 641,
+   "ok": 641,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 5342,
+   "acksPerSec": 53.4,
+   "latency": {
+    "p50": 36.7,
+    "p95": 39.1,
+    "max": 56.8
+   },
+   "clockWait": {
+    "p50": 17.5,
+    "p95": 18.9,
+    "max": 33.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 615,
+   "ok": 615,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 5125,
+   "acksPerSec": 51.3,
+   "latency": {
+    "p50": 75.1,
+    "p95": 78.8,
+    "max": 330.7
+   },
+   "clockWait": {
+    "p50": 55.5,
+    "p95": 58.1,
+    "max": 309.9
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 570,
+   "ok": 570,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4750,
+   "acksPerSec": 47.5,
+   "latency": {
+    "p50": 154.6,
+    "p95": 172.6,
+    "max": 825.5
+   },
+   "clockWait": {
+    "p50": 134.3,
+    "p95": 149.9,
+    "max": 804.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 547,
+   "ok": 547,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 4558,
+   "acksPerSec": 45.6,
+   "latency": {
+    "p50": 317.3,
+    "p95": 337.1,
+    "max": 988.4
+   },
+   "clockWait": {
+    "p50": 296.6,
+    "p95": 316,
+    "max": 967.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 72,
+   "ok": 72,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 4500,
+   "acksPerSec": 9,
+   "latency": {
+    "p50": 102.6,
+    "p95": 111.2,
+    "max": 398.9
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 105,
+   "ok": 105,
+   "runSeconds": 12.2,
+   "ackedRecordsPerSec": 4375,
+   "acksPerSec": 8.8,
+   "latency": {
+    "p50": 205.6,
+    "p95": 272.3,
+    "max": 852.7
+   },
+   "clockWait": {
+    "p50": 99.7,
+    "p95": 108.8,
+    "max": 741.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 110,
+   "ok": 110,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 4583,
+   "acksPerSec": 9.2,
+   "latency": {
+    "p50": 406.4,
+    "p95": 460,
+    "max": 551.2
+   },
+   "clockWait": {
+    "p50": 304.2,
+    "p95": 354.6,
+    "max": 433.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 92,
+   "ok": 92,
+   "runSeconds": 12.8,
+   "ackedRecordsPerSec": 3833,
+   "acksPerSec": 7.7,
+   "latency": {
+    "p50": 877.5,
+    "p95": 1505,
+    "max": 1510
+   },
+   "clockWait": {
+    "p50": 764.3,
+    "p95": 1393.8,
+    "max": 1404.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 75,
+   "ok": 69,
+   "runSeconds": 13.8,
+   "ackedRecordsPerSec": 2875,
+   "acksPerSec": 5.8,
+   "latency": {
+    "p50": 1661.3,
+    "p95": 2079.6,
+    "max": 2290.8
+   },
+   "clockWait": {
+    "p50": 1549.8,
+    "p95": 1738.3,
+    "max": 2181.6
+   },
+   "errors": {
+    "55P03": 6
+   }
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 182,
+   "ok": 182,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 2275,
+   "acksPerSec": 22.8,
+   "latency": {
+    "p50": 40,
+    "p95": 47.2,
+    "max": 222
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 297,
+   "ok": 297,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2475,
+   "acksPerSec": 24.8,
+   "latency": {
+    "p50": 79.5,
+    "p95": 83.3,
+    "max": 86.4
+   },
+   "clockWait": {
+    "p50": 38.7,
+    "p95": 41.8,
+    "max": 46.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 262,
+   "ok": 262,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2183,
+   "acksPerSec": 21.8,
+   "latency": {
+    "p50": 176,
+    "p95": 191.3,
+    "max": 251.1
+   },
+   "clockWait": {
+    "p50": 131,
+    "p95": 144.2,
+    "max": 207.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 164,
+   "ok": 161,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 1342,
+   "acksPerSec": 13.4,
+   "latency": {
+    "p50": 378.8,
+    "p95": 1529.7,
+    "max": 3251.2
+   },
+   "clockWait": {
+    "p50": 331,
+    "p95": 1395,
+    "max": 2702.6
+   },
+   "errors": {
+    "55P03": 3
+   }
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 198,
+   "ok": 198,
+   "runSeconds": 12.8,
+   "ackedRecordsPerSec": 1650,
+   "acksPerSec": 16.5,
+   "latency": {
+    "p50": 813.2,
+    "p95": 1453.2,
+    "max": 1463.8
+   },
+   "clockWait": {
+    "p50": 761.4,
+    "p95": 1361.7,
+    "max": 1413.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 26,
+   "ok": 26,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 1625,
+   "acksPerSec": 3.3,
+   "latency": {
+    "p50": 260.2,
+    "p95": 529.9,
+    "max": 534.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 39,
+   "ok": 39,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 1625,
+   "acksPerSec": 3.3,
+   "latency": {
+    "p50": 549.7,
+    "p95": 645.8,
+    "max": 659.6
+   },
+   "clockWait": {
+    "p50": 278.9,
+    "p95": 327,
+    "max": 354.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 33,
+   "ok": 33,
+   "runSeconds": 12.9,
+   "ackedRecordsPerSec": 1375,
+   "acksPerSec": 2.8,
+   "latency": {
+    "p50": 1146.9,
+    "p95": 1243.4,
+    "max": 1249.9
+   },
+   "clockWait": {
+    "p50": 856,
+    "p95": 947.3,
+    "max": 959.9
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 21,
+   "ok": 20,
+   "runSeconds": 14.3,
+   "ackedRecordsPerSec": 833,
+   "acksPerSec": 1.7,
+   "latency": {
+    "p50": 2437.5,
+    "p95": 2783.6,
+    "max": 2845.6
+   },
+   "clockWait": {
+    "p50": 2122.5,
+    "p95": 2254.6,
+    "max": 2480.3
+   },
+   "errors": {
+    "55P03": 1
+   }
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 0,
+   "ok": 0,
+   "runSeconds": 13.6,
+   "ackedRecordsPerSec": 0,
+   "acksPerSec": 0,
+   "latency": {
+    "p50": null,
+    "p95": null,
+    "max": null
+   },
+   "clockWait": {
+    "p50": null,
+    "p95": null,
+    "max": null
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 202,
+   "ok": 202,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 2525,
+   "acksPerSec": 25.3,
+   "latency": {
+    "p50": 35.9,
+    "p95": 41.2,
+    "max": 287.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 328,
+   "ok": 328,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2733,
+   "acksPerSec": 27.3,
+   "latency": {
+    "p50": 71.5,
+    "p95": 75.9,
+    "max": 91.3
+   },
+   "clockWait": {
+    "p50": 34.8,
+    "p95": 37,
+    "max": 46.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 294,
+   "ok": 294,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2450,
+   "acksPerSec": 24.5,
+   "latency": {
+    "p50": 145.5,
+    "p95": 167.8,
+    "max": 774.1
+   },
+   "clockWait": {
+    "p50": 108.3,
+    "p95": 123.3,
+    "max": 728.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 285,
+   "ok": 285,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 2375,
+   "acksPerSec": 23.8,
+   "latency": {
+    "p50": 299.3,
+    "p95": 311.5,
+    "max": 889.2
+   },
+   "clockWait": {
+    "p50": 260.8,
+    "p95": 271.4,
+    "max": 851.2
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 263,
+   "ok": 263,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 2192,
+   "acksPerSec": 21.9,
+   "latency": {
+    "p50": 609.9,
+    "p95": 1195.2,
+    "max": 1267.3
+   },
+   "clockWait": {
+    "p50": 570.6,
+    "p95": 1133.6,
+    "max": 1229.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 38,
+   "ok": 38,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 2375,
+   "acksPerSec": 4.8,
+   "latency": {
+    "p50": 190.3,
+    "p95": 198.7,
+    "max": 202.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 57,
+   "ok": 57,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 2375,
+   "acksPerSec": 4.8,
+   "latency": {
+    "p50": 378.1,
+    "p95": 427,
+    "max": 941.9
+   },
+   "clockWait": {
+    "p50": 187.2,
+    "p95": 203.8,
+    "max": 462.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 49,
+   "ok": 49,
+   "runSeconds": 12.8,
+   "ackedRecordsPerSec": 2042,
+   "acksPerSec": 4.1,
+   "latency": {
+    "p50": 772.8,
+    "p95": 1710.9,
+    "max": 1714.3
+   },
+   "clockWait": {
+    "p50": 573.1,
+    "p95": 1512.4,
+    "max": 1518.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 40,
+   "ok": 40,
+   "runSeconds": 13.5,
+   "ackedRecordsPerSec": 1667,
+   "acksPerSec": 3.3,
+   "latency": {
+    "p50": 1772.1,
+    "p95": 2449.4,
+    "max": 2484.6
+   },
+   "clockWait": {
+    "p50": 1536.3,
+    "p95": 2226.4,
+    "max": 2227.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 49,
+   "ok": 34,
+   "runSeconds": 14.4,
+   "ackedRecordsPerSec": 1417,
+   "acksPerSec": 2.8,
+   "latency": {
+    "p50": 2330.8,
+    "p95": 2586.2,
+    "max": 2650.2
+   },
+   "clockWait": {
+    "p50": 2145.4,
+    "p95": 2371.4,
+    "max": 2391.4
+   },
+   "errors": {
+    "55P03": 15
+   }
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 384,
+   "ok": 384,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 4800,
+   "acksPerSec": 48,
+   "latency": {
+    "p50": 18.8,
+    "p95": 22,
+    "max": 124.4
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 601,
+   "ok": 601,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 5008,
+   "acksPerSec": 50.1,
+   "latency": {
+    "p50": 38.1,
+    "p95": 43,
+    "max": 160.4
+   },
+   "clockWait": {
+    "p50": 18.1,
+    "p95": 21.1,
+    "max": 115.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 532,
+   "ok": 532,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4433,
+   "acksPerSec": 44.3,
+   "latency": {
+    "p50": 79.8,
+    "p95": 92.1,
+    "max": 191.5
+   },
+   "clockWait": {
+    "p50": 59.1,
+    "p95": 67.7,
+    "max": 168.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 524,
+   "ok": 524,
+   "runSeconds": 12.2,
+   "ackedRecordsPerSec": 4367,
+   "acksPerSec": 43.7,
+   "latency": {
+    "p50": 157.7,
+    "p95": 216.1,
+    "max": 868.9
+   },
+   "clockWait": {
+    "p50": 137.3,
+    "p95": 192.5,
+    "max": 847.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 503,
+   "ok": 503,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 4192,
+   "acksPerSec": 41.9,
+   "latency": {
+    "p50": 331.9,
+    "p95": 400.6,
+    "max": 908
+   },
+   "clockWait": {
+    "p50": 310.3,
+    "p95": 367.1,
+    "max": 886.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 59,
+   "ok": 59,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 3688,
+   "acksPerSec": 7.4,
+   "latency": {
+    "p50": 117.3,
+    "p95": 202.7,
+    "max": 236.6
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 100,
+   "ok": 100,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4167,
+   "acksPerSec": 8.3,
+   "latency": {
+    "p50": 204.9,
+    "p95": 262.1,
+    "max": 397
+   },
+   "clockWait": {
+    "p50": 100.6,
+    "p95": 120.7,
+    "max": 225.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 104,
+   "ok": 104,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 4333,
+   "acksPerSec": 8.7,
+   "latency": {
+    "p50": 391.1,
+    "p95": 500.6,
+    "max": 1015.4
+   },
+   "clockWait": {
+    "p50": 290.4,
+    "p95": 393.7,
+    "max": 915
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 91,
+   "ok": 91,
+   "runSeconds": 13,
+   "ackedRecordsPerSec": 3792,
+   "acksPerSec": 7.6,
+   "latency": {
+    "p50": 844.7,
+    "p95": 1808.3,
+    "max": 1915.6
+   },
+   "clockWait": {
+    "p50": 733.9,
+    "p95": 1674,
+    "max": 1800.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "inactive",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 86,
+   "ok": 83,
+   "runSeconds": 13.6,
+   "ackedRecordsPerSec": 3458,
+   "acksPerSec": 6.9,
+   "latency": {
+    "p50": 1662.4,
+    "p95": 2321.5,
+    "max": 2689.3
+   },
+   "clockWait": {
+    "p50": 1563.2,
+    "p95": 2192.5,
+    "max": 2559.9
+   },
+   "errors": {
+    "55P03": 3
+   }
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 173,
+   "ok": 173,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 2163,
+   "acksPerSec": 21.6,
+   "latency": {
+    "p50": 38.8,
+    "p95": 50.4,
+    "max": 154
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 308,
+   "ok": 308,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2567,
+   "acksPerSec": 25.7,
+   "latency": {
+    "p50": 74.3,
+    "p95": 83.2,
+    "max": 176.8
+   },
+   "clockWait": {
+    "p50": 36.1,
+    "p95": 41.6,
+    "max": 116.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 298,
+   "ok": 298,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2483,
+   "acksPerSec": 24.8,
+   "latency": {
+    "p50": 152.2,
+    "p95": 165.1,
+    "max": 235.3
+   },
+   "clockWait": {
+    "p50": 112.9,
+    "p95": 125.5,
+    "max": 196.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 266,
+   "ok": 266,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 2217,
+   "acksPerSec": 22.2,
+   "latency": {
+    "p50": 314.3,
+    "p95": 344.3,
+    "max": 969.3
+   },
+   "clockWait": {
+    "p50": 273.9,
+    "p95": 298.8,
+    "max": 928
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 266,
+   "ok": 266,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 2217,
+   "acksPerSec": 22.2,
+   "latency": {
+    "p50": 618.4,
+    "p95": 925.2,
+    "max": 1009.7
+   },
+   "clockWait": {
+    "p50": 578.7,
+    "p95": 878,
+    "max": 971.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 38,
+   "ok": 38,
+   "runSeconds": 8.2,
+   "ackedRecordsPerSec": 2375,
+   "acksPerSec": 4.8,
+   "latency": {
+    "p50": 192.5,
+    "p95": 206.9,
+    "max": 236.9
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 50,
+   "ok": 50,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 2083,
+   "acksPerSec": 4.2,
+   "latency": {
+    "p50": 403.9,
+    "p95": 560.2,
+    "max": 1087.7
+   },
+   "clockWait": {
+    "p50": 199.5,
+    "p95": 279.8,
+    "max": 862
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 38,
+   "ok": 38,
+   "runSeconds": 12.7,
+   "ackedRecordsPerSec": 1583,
+   "acksPerSec": 3.2,
+   "latency": {
+    "p50": 763.9,
+    "p95": 821.1,
+    "max": 842.4
+   },
+   "clockWait": {
+    "p50": 571.1,
+    "p95": 615.2,
+    "max": 633.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 40,
+   "ok": 40,
+   "runSeconds": 13.5,
+   "ackedRecordsPerSec": 1667,
+   "acksPerSec": 3.3,
+   "latency": {
+    "p50": 1749.3,
+    "p95": 2554.1,
+    "max": 2562.3
+   },
+   "clockWait": {
+    "p50": 1523.1,
+    "p95": 2323.6,
+    "max": 2349
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "shared",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 47,
+   "ok": 33,
+   "runSeconds": 14.4,
+   "ackedRecordsPerSec": 1375,
+   "acksPerSec": 2.8,
+   "latency": {
+    "p50": 2511.4,
+    "p95": 2553.8,
+    "max": 3294.9
+   },
+   "clockWait": {
+    "p50": 2313.2,
+    "p95": 2342.4,
+    "max": 2958.6
+   },
+   "errors": {
+    "55P03": 14
+   }
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 229,
+   "ok": 229,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 2863,
+   "acksPerSec": 28.6,
+   "latency": {
+    "p50": 33.9,
+    "p95": 36.1,
+    "max": 45.9
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 340,
+   "ok": 340,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 2833,
+   "acksPerSec": 28.3,
+   "latency": {
+    "p50": 68.3,
+    "p95": 74.7,
+    "max": 145.6
+   },
+   "clockWait": {
+    "p50": 33.2,
+    "p95": 36.2,
+    "max": 98.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 304,
+   "ok": 304,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 2533,
+   "acksPerSec": 25.3,
+   "latency": {
+    "p50": 142.1,
+    "p95": 163.8,
+    "max": 752
+   },
+   "clockWait": {
+    "p50": 105.5,
+    "p95": 121.9,
+    "max": 709.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 308,
+   "ok": 308,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 2567,
+   "acksPerSec": 25.7,
+   "latency": {
+    "p50": 280.8,
+    "p95": 399.6,
+    "max": 478.8
+   },
+   "clockWait": {
+    "p50": 244.9,
+    "p95": 342.8,
+    "max": 442.2
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 280,
+   "ok": 280,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 2333,
+   "acksPerSec": 23.3,
+   "latency": {
+    "p50": 582.6,
+    "p95": 1143.4,
+    "max": 1207.2
+   },
+   "clockWait": {
+    "p50": 545.7,
+    "p95": 911.5,
+    "max": 1171.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 43,
+   "ok": 43,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 2688,
+   "acksPerSec": 5.4,
+   "latency": {
+    "p50": 173.4,
+    "p95": 177.9,
+    "max": 180.8
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 64,
+   "ok": 64,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 2667,
+   "acksPerSec": 5.3,
+   "latency": {
+    "p50": 350.7,
+    "p95": 409.7,
+    "max": 442.9
+   },
+   "clockWait": {
+    "p50": 173.9,
+    "p95": 213.2,
+    "max": 259.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 57,
+   "ok": 57,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 2375,
+   "acksPerSec": 4.8,
+   "latency": {
+    "p50": 706.2,
+    "p95": 1384.9,
+    "max": 1406.7
+   },
+   "clockWait": {
+    "p50": 528.7,
+    "p95": 604.8,
+    "max": 1216.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 49,
+   "ok": 48,
+   "runSeconds": 13.5,
+   "ackedRecordsPerSec": 2000,
+   "acksPerSec": 4,
+   "latency": {
+    "p50": 1557.9,
+    "p95": 2481.9,
+    "max": 2760.6
+   },
+   "clockWait": {
+    "p50": 1357.5,
+    "p95": 2223.4,
+    "max": 2547.2
+   },
+   "errors": {
+    "55P03": 1
+   }
+  },
+  {
+   "variant": "set",
+   "state": "distinct",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 50,
+   "ok": 34,
+   "runSeconds": 14.2,
+   "ackedRecordsPerSec": 1417,
+   "acksPerSec": 2.8,
+   "latency": {
+    "p50": 2296.9,
+    "p95": 2545.4,
+    "max": 3233.5
+   },
+   "clockWait": {
+    "p50": 2117.8,
+    "p95": 2303.8,
+    "max": 2971.5
+   },
+   "errors": {
+    "55P03": 16
+   }
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 447,
+   "ok": 447,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 5588,
+   "acksPerSec": 55.9,
+   "latency": {
+    "p50": 16,
+    "p95": 25.7,
+    "max": 74.4
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 773,
+   "ok": 773,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 6442,
+   "acksPerSec": 64.4,
+   "latency": {
+    "p50": 30.2,
+    "p95": 32.9,
+    "max": 85.9
+   },
+   "clockWait": {
+    "p50": 14.3,
+    "p95": 15.8,
+    "max": 68.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 711,
+   "ok": 711,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 5925,
+   "acksPerSec": 59.3,
+   "latency": {
+    "p50": 63.4,
+    "p95": 75.6,
+    "max": 218.7
+   },
+   "clockWait": {
+    "p50": 46.6,
+    "p95": 54.9,
+    "max": 175.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 648,
+   "ok": 648,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 5400,
+   "acksPerSec": 54,
+   "latency": {
+    "p50": 130.4,
+    "p95": 151.3,
+    "max": 805.4
+   },
+   "clockWait": {
+    "p50": 113.1,
+    "p95": 129.9,
+    "max": 786
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 603,
+   "ok": 603,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 5025,
+   "acksPerSec": 50.3,
+   "latency": {
+    "p50": 267.8,
+    "p95": 609.1,
+    "max": 1029.5
+   },
+   "clockWait": {
+    "p50": 250,
+    "p95": 567.8,
+    "max": 1010.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 36,
+   "ok": 36,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 2250,
+   "acksPerSec": 4.5,
+   "latency": {
+    "p50": 108.3,
+    "p95": 190.5,
+    "max": 203.5
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 96,
+   "ok": 96,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4000,
+   "acksPerSec": 8,
+   "latency": {
+    "p50": 221.8,
+    "p95": 330,
+    "max": 794.6
+   },
+   "clockWait": {
+    "p50": 105.2,
+    "p95": 177.9,
+    "max": 453.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 124,
+   "ok": 124,
+   "runSeconds": 12.3,
+   "ackedRecordsPerSec": 5167,
+   "acksPerSec": 10.3,
+   "latency": {
+    "p50": 316.5,
+    "p95": 464.7,
+    "max": 627
+   },
+   "clockWait": {
+    "p50": 236,
+    "p95": 295.7,
+    "max": 547.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 105,
+   "ok": 105,
+   "runSeconds": 12.6,
+   "ackedRecordsPerSec": 4375,
+   "acksPerSec": 8.8,
+   "latency": {
+    "p50": 721.2,
+    "p95": 1722.5,
+    "max": 1823.2
+   },
+   "clockWait": {
+    "p50": 629.1,
+    "p95": 1588.3,
+    "max": 1710.3
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "inactive",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 106,
+   "ok": 104,
+   "runSeconds": 13.3,
+   "ackedRecordsPerSec": 4333,
+   "acksPerSec": 8.7,
+   "latency": {
+    "p50": 1358.6,
+    "p95": 2159.6,
+    "max": 2458.1
+   },
+   "clockWait": {
+    "p50": 1269.4,
+    "p95": 2037.1,
+    "max": 2358.7
+   },
+   "errors": {
+    "55P03": 2
+   }
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 339,
+   "ok": 339,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 4238,
+   "acksPerSec": 42.4,
+   "latency": {
+    "p50": 22.9,
+    "p95": 24.7,
+    "max": 33.5
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 482,
+   "ok": 482,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 4017,
+   "acksPerSec": 40.2,
+   "latency": {
+    "p50": 46.8,
+    "p95": 58.2,
+    "max": 152.8
+   },
+   "clockWait": {
+    "p50": 22.3,
+    "p95": 26.7,
+    "max": 106.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 454,
+   "ok": 454,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 3783,
+   "acksPerSec": 37.8,
+   "latency": {
+    "p50": 96,
+    "p95": 109.2,
+    "max": 638.2
+   },
+   "clockWait": {
+    "p50": 71.1,
+    "p95": 82.5,
+    "max": 608.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 451,
+   "ok": 451,
+   "runSeconds": 12.2,
+   "ackedRecordsPerSec": 3758,
+   "acksPerSec": 37.6,
+   "latency": {
+    "p50": 187.7,
+    "p95": 229.9,
+    "max": 692.2
+   },
+   "clockWait": {
+    "p50": 163,
+    "p95": 200.3,
+    "max": 632.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 410,
+   "ok": 410,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 3417,
+   "acksPerSec": 34.2,
+   "latency": {
+    "p50": 395.2,
+    "p95": 455.9,
+    "max": 1087.7
+   },
+   "clockWait": {
+    "p50": 369.1,
+    "p95": 424.1,
+    "max": 1060.7
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 32,
+   "ok": 32,
+   "runSeconds": 8.2,
+   "ackedRecordsPerSec": 2000,
+   "acksPerSec": 4,
+   "latency": {
+    "p50": 229.4,
+    "p95": 260.7,
+    "max": 269.7
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 50,
+   "ok": 50,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 2083,
+   "acksPerSec": 4.2,
+   "latency": {
+    "p50": 452.4,
+    "p95": 466.1,
+    "max": 470.3
+   },
+   "clockWait": {
+    "p50": 224.9,
+    "p95": 233.4,
+    "max": 241.5
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 42,
+   "ok": 42,
+   "runSeconds": 12.7,
+   "ackedRecordsPerSec": 1750,
+   "acksPerSec": 3.5,
+   "latency": {
+    "p50": 965.9,
+    "p95": 1499.1,
+    "max": 1523.9
+   },
+   "clockWait": {
+    "p50": 722.4,
+    "p95": 1240.3,
+    "max": 1267.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 38,
+   "ok": 38,
+   "runSeconds": 14.1,
+   "ackedRecordsPerSec": 1583,
+   "acksPerSec": 3.2,
+   "latency": {
+    "p50": 2031.7,
+    "p95": 2323.8,
+    "max": 2355.5
+   },
+   "clockWait": {
+    "p50": 1774.8,
+    "p95": 2072.9,
+    "max": 2110.8
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "shared",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 34,
+   "ok": 19,
+   "runSeconds": 14.3,
+   "ackedRecordsPerSec": 792,
+   "acksPerSec": 1.6,
+   "latency": {
+    "p50": 2053.4,
+    "p95": 2655,
+    "max": 2663.4
+   },
+   "clockWait": {
+    "p50": 1751.3,
+    "p95": 2391.4,
+    "max": 2407.7
+   },
+   "errors": {
+    "55P03": 15
+   }
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 1,
+   "n": 100,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 394,
+   "ok": 394,
+   "runSeconds": 8,
+   "ackedRecordsPerSec": 4925,
+   "acksPerSec": 49.3,
+   "latency": {
+    "p50": 19.6,
+    "p95": 21.7,
+    "max": 50
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 2,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 573,
+   "ok": 573,
+   "runSeconds": 12,
+   "ackedRecordsPerSec": 4775,
+   "acksPerSec": 47.8,
+   "latency": {
+    "p50": 38.5,
+    "p95": 45.2,
+    "max": 308.9
+   },
+   "clockWait": {
+    "p50": 18.4,
+    "p95": 20.4,
+    "max": 167.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 4,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 544,
+   "ok": 544,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4533,
+   "acksPerSec": 45.3,
+   "latency": {
+    "p50": 80.7,
+    "p95": 102,
+    "max": 328.8
+   },
+   "clockWait": {
+    "p50": 59.7,
+    "p95": 75.3,
+    "max": 259.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 8,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 496,
+   "ok": 496,
+   "runSeconds": 12.2,
+   "ackedRecordsPerSec": 4133,
+   "acksPerSec": 41.3,
+   "latency": {
+    "p50": 168.5,
+    "p95": 227,
+    "max": 814.4
+   },
+   "clockWait": {
+    "p50": 146.4,
+    "p95": 204.4,
+    "max": 789.2
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 16,
+   "n": 100,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 512,
+   "ok": 512,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 4267,
+   "acksPerSec": 42.7,
+   "latency": {
+    "p50": 325.2,
+    "p95": 378.9,
+    "max": 983.1
+   },
+   "clockWait": {
+    "p50": 303.7,
+    "p95": 355.2,
+    "max": 962.1
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 1,
+   "n": 500,
+   "seconds": 8,
+   "derived": 1,
+   "samples": 70,
+   "ok": 70,
+   "runSeconds": 8.1,
+   "ackedRecordsPerSec": 4375,
+   "acksPerSec": 8.8,
+   "latency": {
+    "p50": 102.8,
+    "p95": 143.3,
+    "max": 242.1
+   },
+   "clockWait": {
+    "p50": 0,
+    "p95": 0,
+    "max": 0
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 2,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 101,
+   "ok": 101,
+   "runSeconds": 12.1,
+   "ackedRecordsPerSec": 4208,
+   "acksPerSec": 8.4,
+   "latency": {
+    "p50": 206.5,
+    "p95": 252.9,
+    "max": 703.7
+   },
+   "clockWait": {
+    "p50": 100.4,
+    "p95": 121.9,
+    "max": 426.2
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 4,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 94,
+   "ok": 94,
+   "runSeconds": 12.4,
+   "ackedRecordsPerSec": 3917,
+   "acksPerSec": 7.8,
+   "latency": {
+    "p50": 431.3,
+    "p95": 649.8,
+    "max": 950.6
+   },
+   "clockWait": {
+    "p50": 321.3,
+    "p95": 494.4,
+    "max": 844.6
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 83,
+   "ok": 83,
+   "runSeconds": 12.9,
+   "ackedRecordsPerSec": 3458,
+   "acksPerSec": 6.9,
+   "latency": {
+    "p50": 927.8,
+    "p95": 1861.9,
+    "max": 1873
+   },
+   "clockWait": {
+    "p50": 800.9,
+    "p95": 1730.9,
+    "max": 1755.2
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 16,
+   "n": 500,
+   "seconds": 12,
+   "derived": 1,
+   "samples": 63,
+   "ok": 58,
+   "runSeconds": 13.9,
+   "ackedRecordsPerSec": 2417,
+   "acksPerSec": 4.8,
+   "latency": {
+    "p50": 1851.3,
+    "p95": 2425.8,
+    "max": 2969.4
+   },
+   "clockWait": {
+    "p50": 1730.5,
+    "p95": 2221.8,
+    "max": 2815.6
+   },
+   "errors": {
+    "55P03": 5
+   }
+  },
+  {
+   "variant": "loop",
+   "state": "distinct",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 100,
+   "samples": 44,
+   "ok": 44,
+   "runSeconds": 13.8,
+   "ackedRecordsPerSec": 1833,
+   "acksPerSec": 3.7,
+   "latency": {
+    "p50": 1669.3,
+    "p95": 2100.8,
+    "max": 2108.3
+   },
+   "clockWait": {
+    "p50": 1457.5,
+    "p95": 1896.9,
+    "max": 1900.4
+   },
+   "errors": {}
+  },
+  {
+   "variant": "H",
+   "state": "distinct",
+   "c": 8,
+   "n": 500,
+   "seconds": 12,
+   "derived": 100,
+   "samples": 69,
+   "ok": 69,
+   "runSeconds": 13,
+   "ackedRecordsPerSec": 2875,
+   "acksPerSec": 5.8,
+   "latency": {
+    "p50": 1126.3,
+    "p95": 1954.8,
+    "max": 2009.9
+   },
+   "clockWait": {
+    "p50": 988.2,
+    "p95": 1811.5,
+    "max": 1861.9
+   },
+   "errors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 4,
+   "n": 500,
+   "seconds": 20,
+   "commit": true,
+   "derived": 1,
+   "samples": 4,
+   "ok": 4,
+   "runSeconds": 2.1,
+   "ackedRecordsPerSec": 100,
+   "acksPerSec": 0.2,
+   "latency": {
+    "p50": 363.3,
+    "p95": 483.2,
+    "max": 483.2
+   },
+   "clockWait": {
+    "p50": 236.5,
+    "p95": 361.1,
+    "max": 361.1
+   },
+   "errors": {}
+  }
+ ]
+}

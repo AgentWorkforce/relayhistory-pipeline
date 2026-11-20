@@ -1,0 +1,1642 @@
+{
+ "note": "H-rounds vs loop differential matrix (PGlite); authority_id diffs are fixture UUIDs",
+ "cases": [
+  {
+   "name": "1 one managed scope, 4 slots, one accept each",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 4,
+    "H": 1
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-1",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "96bbe870-9f23-4de5-acd5-b05e84b7329d",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-1",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "8395483f-27e5-46f0-b5ba-957e2c5d9505",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_required_scopes": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "request_version"
+     ],
+     "sampleLoop": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-1",
+       "workspace_id": "ws-a",
+       "request_version": 4
+      }
+     ],
+     "sampleH": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-1",
+       "workspace_id": "ws-a",
+       "request_version": 1
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-1",
+       "authority_id": "96bbe870-9f23-4de5-acd5-b05e84b7329d",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-1",
+       "authority_id": "8395483f-27e5-46f0-b5ba-957e2c5d9505",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-1",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "96bbe870-9f23-4de5-acd5-b05e84b7329d",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-1",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "8395483f-27e5-46f0-b5ba-957e2c5d9505",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    },
+    "sessions.session_replay_publications": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "epoch"
+     ],
+     "sampleLoop": [
+      {
+       "epoch": 7,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-1",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ],
+     "sampleH": [
+      {
+       "epoch": 1,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-1",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ]
+    },
+    "<sequences>": {
+     "rowsLoop": 16,
+     "rowsH": 16,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "last_value"
+     ],
+     "sampleLoop": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "7"
+      }
+     ],
+     "sampleH": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "1"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "2 same slot x3 rising + another slot, one scope",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 4,
+    "H": 3
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-2",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "74d7a1cf-a033-4790-abbd-3b85cdd794f7",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-2",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "6c27fd94-ffc5-41eb-8702-f7dc7b2aeb41",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_required_scopes": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "request_version"
+     ],
+     "sampleLoop": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-2",
+       "workspace_id": "ws-a",
+       "request_version": 6
+      }
+     ],
+     "sampleH": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-2",
+       "workspace_id": "ws-a",
+       "request_version": 5
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-2",
+       "authority_id": "74d7a1cf-a033-4790-abbd-3b85cdd794f7",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-2",
+       "authority_id": "6c27fd94-ffc5-41eb-8702-f7dc7b2aeb41",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-2",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "74d7a1cf-a033-4790-abbd-3b85cdd794f7",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-2",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "6c27fd94-ffc5-41eb-8702-f7dc7b2aeb41",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    },
+    "sessions.session_replay_publications": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "epoch"
+     ],
+     "sampleLoop": [
+      {
+       "epoch": 12,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-2",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ],
+     "sampleH": [
+      {
+       "epoch": 10,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-2",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ]
+    },
+    "<sequences>": {
+     "rowsLoop": 16,
+     "rowsH": 16,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "last_value"
+     ],
+     "sampleLoop": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "12"
+      }
+     ],
+     "sampleH": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "10"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "3 three managed scopes interleaved",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 5,
+    "H": 1
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 3,
+     "rowsH": 3,
+     "onlyLoop": 3,
+     "onlyH": 3,
+     "differingColumns": [
+      "object_key",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-3a",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "faee69cd-613a-4dd4-a649-a4fb324121bf",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      },
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-3b",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "4b1bd1c4-d427-456e-a66d-73bd288e4717",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-3a",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "097f835c-8f5f-4f5c-862f-e3ad3c49680a",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      },
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-3b",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "d2e286c6-2ecb-45b2-88d4-5b537576517d",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_required_scopes": {
+     "rowsLoop": 3,
+     "rowsH": 3,
+     "onlyLoop": 2,
+     "onlyH": 2,
+     "differingColumns": [
+      "session_id",
+      "request_version"
+     ],
+     "sampleLoop": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3a",
+       "workspace_id": "ws-a",
+       "request_version": 2
+      },
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3b",
+       "workspace_id": "ws-a",
+       "request_version": 2
+      }
+     ],
+     "sampleH": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3a",
+       "workspace_id": "ws-a",
+       "request_version": 1
+      },
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3b",
+       "workspace_id": "ws-a",
+       "request_version": 1
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 3,
+     "rowsH": 3,
+     "onlyLoop": 3,
+     "onlyH": 3,
+     "differingColumns": [
+      "session_id",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3a",
+       "authority_id": "faee69cd-613a-4dd4-a649-a4fb324121bf",
+       "workspace_id": "ws-a"
+      },
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3b",
+       "authority_id": "4b1bd1c4-d427-456e-a66d-73bd288e4717",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3a",
+       "authority_id": "097f835c-8f5f-4f5c-862f-e3ad3c49680a",
+       "workspace_id": "ws-a"
+      },
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-3b",
+       "authority_id": "d2e286c6-2ecb-45b2-88d4-5b537576517d",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 3,
+     "rowsH": 3,
+     "onlyLoop": 3,
+     "onlyH": 3,
+     "differingColumns": [
+      "session_id",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-3a",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "faee69cd-613a-4dd4-a649-a4fb324121bf",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-3b",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "4b1bd1c4-d427-456e-a66d-73bd288e4717",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-3a",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "097f835c-8f5f-4f5c-862f-e3ad3c49680a",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-3b",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "d2e286c6-2ecb-45b2-88d4-5b537576517d",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    },
+    "sessions.session_replay_publications": {
+     "rowsLoop": 3,
+     "rowsH": 3,
+     "onlyLoop": 2,
+     "onlyH": 2,
+     "differingColumns": [
+      "epoch",
+      "session_id"
+     ],
+     "sampleLoop": [
+      {
+       "epoch": 15,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-3a",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      },
+      {
+       "epoch": 17,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-3b",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ],
+     "sampleH": [
+      {
+       "epoch": 11,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-3a",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      },
+      {
+       "epoch": 12,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-3b",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ]
+    },
+    "<sequences>": {
+     "rowsLoop": 16,
+     "rowsH": 16,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "last_value"
+     ],
+     "sampleLoop": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "17"
+      }
+     ],
+     "sampleH": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "13"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "4 one slot moves s-4a -> s-4b inside the batch (both managed)",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 2,
+    "H": 2
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 2,
+     "rowsH": 2,
+     "onlyLoop": 2,
+     "onlyH": 2,
+     "differingColumns": [
+      "object_key",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-4a",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "fd009bf8-d3e8-449a-9b6d-27d929412ee2",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      },
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-4b",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "f39978ea-d7ef-4854-8a68-f51bb96baaa9",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-4a",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "01d70b24-d9db-469c-b8e2-e5ccf62228fd",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      },
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-4b",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "01ba563c-a6b2-48b0-a4e6-5096c91a7d92",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 2,
+     "rowsH": 2,
+     "onlyLoop": 2,
+     "onlyH": 2,
+     "differingColumns": [
+      "session_id",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-4a",
+       "authority_id": "fd009bf8-d3e8-449a-9b6d-27d929412ee2",
+       "workspace_id": "ws-a"
+      },
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-4b",
+       "authority_id": "f39978ea-d7ef-4854-8a68-f51bb96baaa9",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-4a",
+       "authority_id": "01d70b24-d9db-469c-b8e2-e5ccf62228fd",
+       "workspace_id": "ws-a"
+      },
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-4b",
+       "authority_id": "01ba563c-a6b2-48b0-a4e6-5096c91a7d92",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 2,
+     "rowsH": 2,
+     "onlyLoop": 2,
+     "onlyH": 2,
+     "differingColumns": [
+      "session_id",
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-4a",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "fd009bf8-d3e8-449a-9b6d-27d929412ee2",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-4b",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "f39978ea-d7ef-4854-8a68-f51bb96baaa9",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-4a",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "01d70b24-d9db-469c-b8e2-e5ccf62228fd",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-4b",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "01ba563c-a6b2-48b0-a4e6-5096c91a7d92",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "5 revision reuse: refused + accepted + fresh, one scope",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 2,
+    "H": 1
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-5",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "eaccb5db-4131-417e-b5d6-95e1979dedc1",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-5",
+       "lease_token": null,
+       "row_version": 2,
+       "authority_id": "c031dad7-99a6-4a47-8f5d-f788eaf63214",
+       "cleanup_state": "retired",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_required_scopes": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "request_version"
+     ],
+     "sampleLoop": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-5",
+       "workspace_id": "ws-a",
+       "request_version": 3
+      }
+     ],
+     "sampleH": [
+      {
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-5",
+       "workspace_id": "ws-a",
+       "request_version": 2
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-5",
+       "authority_id": "eaccb5db-4131-417e-b5d6-95e1979dedc1",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": false,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-5",
+       "authority_id": "c031dad7-99a6-4a47-8f5d-f788eaf63214",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-5",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "eaccb5db-4131-417e-b5d6-95e1979dedc1",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-5",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "c031dad7-99a6-4a47-8f5d-f788eaf63214",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    },
+    "sessions.session_replay_publications": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "epoch"
+     ],
+     "sampleLoop": [
+      {
+       "epoch": 22,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-5",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ],
+     "sampleH": [
+      {
+       "epoch": 20,
+       "org_id": "org-a",
+       "harness": "claude",
+       "index_key": null,
+       "generation": null,
+       "session_id": "s-5",
+       "index_bytes": null,
+       "index_sha256": null,
+       "workspace_id": "ws-a",
+       "artifact_prefix": null,
+       "published_epoch": null,
+       "source_snapshot": null,
+       "source_generation": null,
+       "source_fingerprint": null
+      }
+     ]
+    },
+    "<sequences>": {
+     "rowsLoop": 16,
+     "rowsH": 16,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "last_value"
+     ],
+     "sampleLoop": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "22"
+      }
+     ],
+     "sampleH": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "20"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "6 abort mid-batch (P0W01 at record 3)",
+   "firstErrorEqual": true,
+   "loopOut": {
+    "ok": false,
+    "code": "P0W01",
+    "message": "session ingest: native key currently belongs to another user"
+   },
+   "HOut": {
+    "ok": false,
+    "code": "P0W01",
+    "message": "session ingest: native key currently belongs to another user"
+   },
+   "triggerCalls": {
+    "loop": 2,
+    "H": 1
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-6",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "b9d75771-8740-4e99-aa4f-b2246b364933",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-6",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "1c4fabf8-9011-4107-9bf2-a526316a8c7c",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-6",
+       "authority_id": "b9d75771-8740-4e99-aa4f-b2246b364933",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-6",
+       "authority_id": "1c4fabf8-9011-4107-9bf2-a526316a8c7c",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-6",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "b9d75771-8740-4e99-aa4f-b2246b364933",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-6",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "1c4fabf8-9011-4107-9bf2-a526316a8c7c",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    },
+    "<sequences>": {
+     "rowsLoop": 16,
+     "rowsH": 16,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "last_value"
+     ],
+     "sampleLoop": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "23"
+      }
+     ],
+     "sampleH": [
+      {
+       "sequencename": "session_replay_epoch_seq",
+       "last_value": "21"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "7 suppressed ACK",
+   "firstErrorEqual": true,
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-7",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "83e45d38-0900-4984-8882-787f540efcb9",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-7",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "2fdd1148-8e41-4d56-919a-62780518fb31",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-7",
+       "authority_id": "83e45d38-0900-4984-8882-787f540efcb9",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-7",
+       "authority_id": "2fdd1148-8e41-4d56-919a-62780518fb31",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-7",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "83e45d38-0900-4984-8882-787f540efcb9",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-7",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "2fdd1148-8e41-4d56-919a-62780518fb31",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "8 lost-response replay",
+   "firstErrorEqual": true,
+   "loopOut": "ok",
+   "HOut": "ok",
+   "triggerCalls": {
+    "loop": 0,
+    "H": 0
+   },
+   "diffs": {
+    "sessions.ingest_history_derived_objects": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-8",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "39d3ea4f-73a4-481f-b692-2b3f7689fb8a",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ],
+     "sampleH": [
+      {
+       "bytes": 1,
+       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "object_key": "obj-s-8",
+       "lease_token": null,
+       "row_version": 1,
+       "authority_id": "ac371959-1b88-4301-a56d-d580b73fd2e8",
+       "cleanup_state": "live",
+       "barrier_version_id": null
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_current": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-8",
+       "authority_id": "39d3ea4f-73a4-481f-b692-2b3f7689fb8a",
+       "workspace_id": "ws-a"
+      }
+     ],
+     "sampleH": [
+      {
+       "ready": true,
+       "org_id": "org-a",
+       "harness": "claude",
+       "session_id": "s-8",
+       "authority_id": "ac371959-1b88-4301-a56d-d580b73fd2e8",
+       "workspace_id": "ws-a"
+      }
+     ]
+    },
+    "sessions.ingest_history_scope_versions": {
+     "rowsLoop": 1,
+     "rowsH": 1,
+     "onlyLoop": 1,
+     "onlyH": 1,
+     "differingColumns": [
+      "authority_id"
+     ],
+     "sampleLoop": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-8",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "39d3ea4f-73a4-481f-b692-2b3f7689fb8a",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ],
+     "sampleH": [
+      {
+       "state": "ready",
+       "bucket": "bucket",
+       "org_id": "org-a",
+       "region": "region",
+       "harness": "claude",
+       "key_root": "root",
+       "session_id": "s-8",
+       "mask_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "authority_id": "ac371959-1b88-4301-a56d-d580b73fd2e8",
+       "record_count": 0,
+       "source_epoch": 1,
+       "workspace_id": "ws-a",
+       "pointer_count": 0,
+       "feature_revision": null,
+       "pointer_snapshot": [],
+       "derived_anchor_key": "anchor",
+       "source_fingerprint": null,
+       "content_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "pointer_snapshot_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      }
+     ]
+    }
+   }
+  }
+ ]
+}
