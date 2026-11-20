@@ -1,0 +1,1058 @@
+{
+ "whole read, one manifest: complete, then the same event again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 6,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "sess_1",
+      "{\"96bulls/org_1/v1/ws=ws_1/m=srv_a31/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\"}",
+      "3",
+      "2026-11-01T10:00:31.000000Z",
+      "2026-11-01T10:00:31.002000Z",
+      [
+       "session_event"
+      ],
+      "[]",
+      null,
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:31.002000Z",
+      1,
+      "0",
+      [
+       "2026-11-01T10:00:31.000000Z",
+       "2026-11-01T10:00:31.001000Z",
+       "2026-11-01T10:00:31.002000Z"
+      ],
+      [
+       "user_1"
+      ],
+      [
+       "delivery:1f8ec7c42b0d8ab3f77de967a4640297"
+      ],
+      [],
+      null,
+      "{\"session_id\":\"sess_1\",\"event_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297:r31-1\",\"machine_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:31.001000Z\",\"fingerprint\":\"s3797a6d203163ea\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      []
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_1",
+      "session": "sess_1",
+      "canonical": "sess_1",
+      "workspace": "ws_1",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "transcript_events",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:31.000",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r31-0",
+       "type": "assistant",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r31-0",
+       "content": "synthetic event 31.0",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3e2f8108729b20d",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:31.001",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r31-1",
+       "type": "user",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r31-1",
+       "content": "synthetic event 31.1",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3797a6d203163ea",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:31.002",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r31-2",
+       "type": "assistant",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r31-2",
+       "content": "synthetic event 31.2",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s31dcf2a5eb7d797",
+       "version": 1793534400000
+      }
+     ]
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 3,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 1,
+     "count": 3,
+     "inserted": 3,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 6,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "sess_1",
+      "{\"96bulls/org_1/v1/ws=ws_1/m=srv_a31/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\"}",
+      "3",
+      "2026-11-01T10:00:31.000000Z",
+      "2026-11-01T10:00:31.002000Z",
+      [
+       "session_event"
+      ],
+      "[]",
+      null,
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:31.002000Z",
+      1,
+      "0",
+      [
+       "2026-11-01T10:00:31.000000Z",
+       "2026-11-01T10:00:31.001000Z",
+       "2026-11-01T10:00:31.002000Z"
+      ],
+      [
+       "user_1"
+      ],
+      [
+       "delivery:1f8ec7c42b0d8ab3f77de967a4640297"
+      ],
+      [],
+      null,
+      "{\"session_id\":\"sess_1\",\"event_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297:r31-1\",\"machine_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:31.001000Z\",\"fingerprint\":\"s3797a6d203163ea\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      []
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_1",
+      "session": "sess_1",
+      "canonical": "sess_1",
+      "workspace": "ws_1",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 3,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 1,
+     "count": 3,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  }
+ ],
+ "whole read, two sibling manifests: complete, then the same event again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 12,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "sess_1",
+      "{\"96bulls/org_1/v1/ws=ws_1/m=srv_a32/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\",\"96bulls/org_1/v1/ws=ws_1/m=srv_b32/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\"}",
+      "3",
+      "2026-11-01T10:00:32.000000Z",
+      "2026-11-01T10:00:32.002000Z",
+      [
+       "session_event"
+      ],
+      "[]",
+      null,
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:32.002000Z",
+      2,
+      "2",
+      [
+       "2026-11-01T10:00:32.000000Z",
+       "2026-11-01T10:00:32.001000Z",
+       "2026-11-01T10:00:32.002000Z"
+      ],
+      [
+       "user_1"
+      ],
+      [
+       "delivery:1f8ec7c42b0d8ab3f77de967a4640297"
+      ],
+      [],
+      null,
+      "{\"session_id\":\"sess_1\",\"event_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297:r32-1\",\"machine_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:32.001000Z\",\"fingerprint\":\"s3baa256c7bdf2d6\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      []
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_1",
+      "session": "sess_1",
+      "canonical": "sess_1",
+      "workspace": "ws_1",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "transcript_events",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:32.000",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r32-0",
+       "type": "assistant",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r32-0",
+       "content": "synthetic event 32.0",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3afd5a9be6635b6",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:32.001",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r32-1",
+       "type": "user",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "user",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r32-1",
+       "content": "synthetic event 32.1",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s3baa256c7bdf2d6",
+       "version": 1793534400000
+      },
+      {
+       "org_id": "org_1",
+       "workspace_id": "ws_1",
+       "ts": "2026-11-01 10:00:32.002",
+       "session_id": "sess_1",
+       "source": "claude",
+       "machine_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297",
+       "kind": "session_event",
+       "event_id": "delivery:1f8ec7c42b0d8ab3f77de967a4640297:r32-2",
+       "type": "assistant",
+       "user_id": "user_1",
+       "actor_name": "",
+       "actor_role": "assistant",
+       "subagent_id": "",
+       "project_id": "",
+       "task_title": "",
+       "task_ref": "{}",
+       "task_ref_id": "",
+       "tags": [],
+       "files_touched": [],
+       "tool_name": "",
+       "tool_status": "",
+       "delivery_record_id": "r32-2",
+       "content": "synthetic event 32.2",
+       "content_bytes": 20,
+       "ingested_at": "2026-11-01 10:00:00.000",
+       "fingerprint": "s38b5b076afdf5ad",
+       "version": 1793534400000
+      }
+     ]
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 3,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "count": 3,
+     "inserted": 3,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 12,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "WITH captured AS MATERIALIZED ( SELECT m.source_session_id,m.epoch FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND m.source_session_id IN ( SELECT p.session_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ) ), marker AS MATERIALIZED ( SELECT m.* FROM sessions.session_directory_event_pending m WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ORDER BY source_session_id FOR UPDATE ), live AS MATERIALIZED ( SELECT d.org_id,d.workspace_id,d.harness,d.session_id FROM sessions.session_directory d,marker m WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND d.session_id IN($4,$5) AND d.deleted_at IS NULL AND (SELECT count(*) FROM marker)=(SELECT count(*) FROM captured) ORDER BY (d.session_id=$4) DESC LIMIT 1 FOR UPDATE OF d ), sources AS ( SELECT jsonb_object_agg(p.manifest_key,p.revision::text) AS revisions,count(*) AS n, count(DISTINCT coalesce(p.canonical_session_id,p.session_id)) AS identities, min(coalesce(p.canonical_session_id,p.session_id)) AS canonical_id FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND coalesce(p.canonical_session_id,p.session_id)=$4 AND p.deleted_at IS NULL ), updated AS ( UPDATE sessions.session_directory d SET event_count=$7::bigint,event_first_ts=$8::timestamptz,event_last_ts=$9::timestamptz, kinds=$10::text[],task_refs=$11::jsonb,task_title=$12, event_user_ids=$26::text[],event_machine_ids=$27::text[],event_models=$28::text[],event_project_id=$29,opening_event=$30::jsonb,event_project_event=$31::jsonb,project_requires_hydration=$32::boolean, input_tokens=$13::bigint,output_tokens=$14::bigint,reasoning_tokens=$15::bigint, cache_read_tokens=$16::bigint,cache_create_tokens=$17::bigint,cache_create_5m_tokens=$18::bigint,cache_create_1h_tokens=$19::bigint,cost_usd_micros=$20::bigint, work_status=$21,work_status_at=$22::timestamptz,event_projection_version=1,event_projection_ready=true,event_projected_at=now(),event_projection_sources=$6::jsonb, search_text=sessions.session_directory_search_text(d.title,$12,d.agent_name,d.project_id,d.git_repo,d.git_branch,d.model,d.short_summary) FROM live l,sources s WHERE d.org_id=l.org_id AND d.workspace_id=l.workspace_id AND d.harness=l.harness AND d.session_id=l.session_id AND s.revisions=$6::jsonb AND s.n=$23::integer AND s.identities=1 AND s.canonical_id=$4 AND d.event_projection_epoch=$24::bigint RETURNING d.org_id,d.workspace_id,d.harness,d.session_id ), clean_marker AS ( UPDATE sessions.session_directory_event_pending m SET dirty=false FROM updated u WHERE m.org_id=$1 AND m.workspace_id=$2 AND m.harness=$3 AND (m.source_session_id,m.epoch) IN(SELECT source_session_id,epoch FROM captured) ), drop_times AS ( DELETE FROM sessions.session_directory_event_times t USING updated u WHERE t.org_id=u.org_id AND t.workspace_id=u.workspace_id AND t.harness=u.harness AND t.session_id=u.session_id AND NOT(t.event_ts=ANY($25::timestamptz[])) ), put_times AS ( INSERT INTO sessions.session_directory_event_times(org_id,workspace_id,harness,session_id,event_ts) SELECT u.org_id,u.workspace_id,u.harness,u.session_id,x.ts FROM updated u,unnest($25::timestamptz[]) x(ts) ON CONFLICT DO NOTHING ) SELECT EXISTS(SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      "sess_1",
+      "{\"96bulls/org_1/v1/ws=ws_1/m=srv_a32/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\",\"96bulls/org_1/v1/ws=ws_1/m=srv_b32/h=claude/d=2026/11/01/s=sess_1/manifest.json\":\"1\"}",
+      "3",
+      "2026-11-01T10:00:32.000000Z",
+      "2026-11-01T10:00:32.002000Z",
+      [
+       "session_event"
+      ],
+      "[]",
+      null,
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      "0",
+      null,
+      "active",
+      "2026-11-01T10:00:32.002000Z",
+      2,
+      "2",
+      [
+       "2026-11-01T10:00:32.000000Z",
+       "2026-11-01T10:00:32.001000Z",
+       "2026-11-01T10:00:32.002000Z"
+      ],
+      [
+       "user_1"
+      ],
+      [
+       "delivery:1f8ec7c42b0d8ab3f77de967a4640297"
+      ],
+      [],
+      null,
+      "{\"session_id\":\"sess_1\",\"event_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297:r32-1\",\"machine_id\":\"delivery:1f8ec7c42b0d8ab3f77de967a4640297\",\"kind\":\"session_event\",\"source\":\"claude\",\"ts\":\"2026-11-01T10:00:32.001000Z\",\"fingerprint\":\"s3baa256c7bdf2d6\"}",
+      null,
+      false
+     ]
+    },
+    {
+     "sql": "WITH live AS MATERIALIZED ( SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at FROM sessions.session_directory AS d WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4 AND d.deleted_at IS NULL FOR UPDATE ), updated AS ( UPDATE sessions.session_directory AS d SET agent_names = $5::text[], catalog_models = $6::text[], project_key = $7, project_key_method = $8, initial_commit = $9, originator = $10, agent_version = $11, project_id = coalesce($12, d.project_id), git_repo = coalesce($13, d.git_repo), git_branch = coalesce($14, d.git_branch), -- The scalar agent the search RPC filters on: keep one already projected, -- else the first catalog agent, and rebuild the search document with it. agent_name = coalesce(d.agent_name, ($5::text[])[1]), agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))), search_text = sessions.session_directory_search_text( d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]), coalesce($12, d.project_id), coalesce($13, d.git_repo), coalesce($14, d.git_branch), d.model, d.short_summary), catalog_projected_at = now() FROM live AS l WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id AND d.harness = l.harness AND d.session_id = l.session_id RETURNING d.org_id ), drop_agents AS ( DELETE FROM sessions.session_directory_agents AS a USING live AS l WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id AND a.harness = l.harness AND a.session_id = l.session_id AND NOT (a.agent_name_normalized = ANY ($15::text[])) ), put_agents AS ( INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at) SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at FROM live AS l, unnest($5::text[]) AS x(name) ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized) DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at ), edges AS ( SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child FROM live AS l, unnest($16::text[], $17::text[]) AS e(uid, child) WHERE e.child IS NULL OR NOT EXISTS ( SELECT 1 FROM sessions.session_directory AS c WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness AND c.session_id = e.child AND c.deleted_at IS NOT NULL) ), drop_edges AS ( DELETE FROM sessions.session_directory_relationships AS r USING live AS l WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id AND r.harness = l.harness AND r.parent_session_id = l.session_id AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e)) ), put_edges AS ( INSERT INTO sessions.session_directory_relationships (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id) SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child FROM edges AS e ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid) DO UPDATE SET child_session_id = excluded.child_session_id ) SELECT EXISTS (SELECT 1 FROM updated) AS written",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1",
+      [],
+      [],
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [],
+      [],
+      []
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "select",
+     "query": "SELECT workspace_id, session_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL WHERE org_id = {org:String} AND (session_id = {session:String} OR session_id = {canonical:String}) AND workspace_id = {workspace:String} AND source = {source:String} AND toUnixTimestamp64Milli(ts) >= {from:Int64} LIMIT {limit:UInt32}",
+     "params": {
+      "org": "org_1",
+      "session": "sess_1",
+      "canonical": "sess_1",
+      "workspace": "ws_1",
+      "source": "claude",
+      "from": 1792324800000,
+      "limit": 500001
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "2026-11-01 12:00:00.000",
+       "scanned_rows": 3,
+       "needs_full": 0
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "count": 3,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": true
+    }
+   ]
+  }
+ ],
+ "too large: stays partial, then again": [
+  {
+   "run": 0,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 10,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "reason": "scope_too_large"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large"
+    }
+   ]
+  },
+  {
+   "run": 1,
+   "result": {
+    "batchItemFailures": []
+   },
+   "reads": 10,
+   "sql": [
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok",
+     "params": [
+      "96bulls:search\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT p.manifest_key, coalesce(p.canonical_session_id,p.session_id) AS canonical_id, coalesce(d.event_projection_epoch, 0)::text AS event_epoch FROM sessions.session_index p LEFT JOIN LATERAL ( SELECT d.event_projection_epoch FROM sessions.session_directory d WHERE d.org_id=p.org_id AND d.workspace_id=p.workspace_id AND d.harness=p.harness AND d.session_id IN(coalesce(p.canonical_session_id,p.session_id),p.session_id) ORDER BY (d.session_id=coalesce(p.canonical_session_id,p.session_id)) DESC LIMIT 1 ) d ON true WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4 AND p.deleted_at IS NULL ORDER BY p.machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok",
+     "params": [
+      "96bulls:directory-events\u001forg_1\u001fws_1\u001fclaude\u001fsess_1"
+     ]
+    },
+    {
+     "sql": "SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    },
+    {
+     "sql": "UPDATE sessions.session_directory d SET event_projection_ready=false WHERE d.org_id=$1 AND d.workspace_id=$2 AND d.harness=$3 AND (d.session_id=$4 OR d.session_id IN ( SELECT coalesce(p.canonical_session_id,p.session_id) FROM sessions.session_index p WHERE p.org_id=$1 AND p.workspace_id=$2 AND p.harness=$3 AND p.session_id=$4))",
+     "params": [
+      "org_1",
+      "ws_1",
+      "claude",
+      "sess_1"
+     ]
+    }
+   ],
+   "clickhouse": [
+    {
+     "ch": "select",
+     "query": "SELECT argMax(value, updated_at) AS value, count() AS n FROM search_ingest_state WHERE name = {name:String} HAVING n > 0",
+     "params": {
+      "name": "window_start"
+     }
+    },
+    {
+     "ch": "insert",
+     "table": "search_ingest_session_state",
+     "rows": [
+      {
+       "org_id": "org_1",
+       "session_id": "sess_1",
+       "revision": 1,
+       "synced_at": "2026-11-01 12:00:00.000",
+       "full_synced_at": "1970-01-01 00:00:00.000",
+       "scanned_rows": 0,
+       "needs_full": 1
+      }
+     ]
+    }
+   ],
+   "log": [
+    {
+     "level": "warn",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index partial",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "reason": "scope_too_large"
+    },
+    {
+     "level": "info",
+     "service": "96bulls",
+     "deployment": "selfhost",
+     "deployment_id": "local",
+     "message": "search index reconciled",
+     "stage": "search-index",
+     "org_id": "org_1",
+     "workspace_id": "ws_1",
+     "harness": "claude",
+     "session_id": "sess_1",
+     "manifests": 2,
+     "count": 0,
+     "inserted": 0,
+     "deleted": 0,
+     "ok": false,
+     "reason": "scope_too_large"
+    }
+   ]
+  }
+ ]
+}
