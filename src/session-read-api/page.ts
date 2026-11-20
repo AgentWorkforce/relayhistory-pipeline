@@ -347,7 +347,8 @@ export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, 
       }
     });
   } catch (error) {
-    if (mode === "refuse" && error instanceof SearchIndexError && error.detail === "timeout") return { sessions: [], overflow: true };
+    if (mode === "refuse" && error instanceof SearchIndexError && (error.detail === "timeout" || error.detail === "partial_page_order"))
+      return { sessions: [], overflow: true };
     throw error;
   }
 }

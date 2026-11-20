@@ -81,6 +81,7 @@ import { Hono, type Context } from "hono";
 import { captureSafely, type AnalyticsPort } from "../shared/analytics.ts";
 import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { SearchIndexError } from "@rhc/search-index/contracts.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
@@ -752,7 +753,10 @@ export function createReadApi(deps: ReadApiDeps) {
       log({ route: c.req.routePath, reason: timeout ? "clickhouse_timeout" : "clickhouse_error", error_code: error.code ?? String(error.status), status: 503, correlation_id: correlationId });
       return c.json({ error: { code: timeout ? "search_timeout" : "backend_unavailable", message: timeout ? "search took too long" : "read backend unavailable" }, correlationId }, 503);
     }
-    log({ route: c.req.routePath, reason: "unavailable", error_code: (error as { name?: string })?.name ?? "error", status: 503, correlation_id: correlationId });
+    const detail = error instanceof SearchIndexError && (error.detail === "timeout" || error.detail === "partial_page_cap" || error.detail === "partial_page_order")
+      ? error.detail
+      : undefined;
+    log({ route: c.req.routePath, reason: "unavailable", error_code: (error as { name?: string })?.name ?? "error", ...(detail ? { detail } : {}), status: 503, correlation_id: correlationId });
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
