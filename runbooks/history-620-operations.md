@@ -193,6 +193,13 @@ DB-error rate alert counts only 503s, so for a converted wait the `ingest.lock_a
 `staged_ack` line fires for 40P01 as well as 55P03 (a 40P01 that stays 503 is unchanged). Time bound: one
 attempt that ends in 55P03 / 40P01 can take up to the 5 s `statement_timeout` (the 2 s `lock_timeout` is per
 lock acquisition), so a retry adds at most about 5.25 s per stage and about 10.5 s when both stages retry.
+On the private-ingest release both are cutover controls exactly like `claimTimeoutBusy` (never tracked
+in the public profile): the `private-ingest-production` environment variables
+`PRIVATE_INGEST_BUFFER_LOCK_BUSY` / `PRIVATE_INGEST_BUFFER_LOCK_RETRY` accept only `on`; unset or empty is
+off and renders no var; any other value refuses (`private_ingest_profile_buffer_lock_busy` /
+`private_ingest_profile_buffer_lock_retry`). Setting one and then planning and deploying the private-ingest
+Worker is a production flag change that needs its own approval. A deploy may add or remove them at the live
+phase; rollback is unset (or empty), then plan and deploy, no code change.
 
 Claim lock wait (off unless set; production sets it): with `INGEST_CLAIM_LOCK_WAIT_MS` (25..2000; stack input
 `sessionIngest.claimLockWaitMs`) each claim attempt runs in its own short transaction, `BEGIN;

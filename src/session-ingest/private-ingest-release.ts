@@ -199,6 +199,11 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             INGEST_HTTP_ADMISSION_STOPPED_ORGS, the marker's workerHttpAdmission "off" precondition.
  *   claimTimeoutBusy          "on" only (omit for off): INGEST_CLAIM_TIMEOUT_BUSY, a 57014 claim timeout answers the
  *                             429 ClaimLockBusy (deliver.ts).
+ *   bufferLockBusy            "on" only (omit for off): INGEST_BUFFER_LOCK_BUSY, a buffer_intent / buffer_receipt lock
+ *                             wait (55P03/40P01) answers the 429 BufferLockBusy (deliver.ts). Buffered only; the
+ *                             release profile is always buffered (COMMON_PROFILE).
+ *   bufferLockRetry           "on" only (omit for off): INGEST_BUFFER_LOCK_RETRY, one jittered retry of that buffer
+ *                             stage before it answers (deliver.ts bufferLedgerStage). Independent of bufferLockBusy.
  *   claimLockWaitMs           an integer 25..2000 (omit for the role default): INGEST_CLAIM_LOCK_WAIT_MS, the claim's
  *                             transaction-local lock wait (ledger-sql.ts inClaimLockWait). 2026-11-16 customer
  *                             incident: a deploy may add, change or remove both, like the other cutover controls, so
@@ -211,9 +216,10 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "claimLockWaitMs", "originClaimFence", "turnFenceRegister"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister"] as const;
 export type PrivateIngestCutover = {
-  s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on";
+  s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; bufferLockBusy?: "on"; bufferLockRetry?: "on";
+  claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on";
 };
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
 const claimLockWaitOk = (ms: unknown): ms is number =>
@@ -224,10 +230,15 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
   const mirror = profile.s3FenceMirror, orgs = profile.httpAdmissionStoppedOrgs;
   const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs, originFence = profile.originClaimFence;
   const turnFenceRegister = profile.turnFenceRegister;
+  const bufferBusy = profile.bufferLockBusy, bufferRetry = profile.bufferLockRetry;
   if (mirror !== undefined && mirror !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_fence_mirror");
   if (timeoutBusy !== undefined && timeoutBusy !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_timeout_busy");
+  if (bufferBusy !== undefined && bufferBusy !== "on")
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_buffer_lock_busy");
+  if (bufferRetry !== undefined && bufferRetry !== "on")
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_buffer_lock_retry");
   if (lockWait !== undefined && !claimLockWaitOk(lockWait))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_claim_lock_wait");
   if (originFence !== undefined && originFence !== "on")
@@ -241,6 +252,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(mirror === "on" ? { s3FenceMirror: "on" as const } : {}),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: [...(orgs as string[])] }),
     ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" as const } : {}),
+    ...(bufferBusy === "on" ? { bufferLockBusy: "on" as const } : {}),
+    ...(bufferRetry === "on" ? { bufferLockRetry: "on" as const } : {}),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
     ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" as const } : {}),
@@ -253,6 +266,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS comma-separated org UUIDs or unset/empty; whitespace around an
  *                                              entry is not accepted, so a typo never silently drops an org.
  *   PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY          "on" or unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_BUFFER_LOCK_BUSY            "on" or unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_BUFFER_LOCK_RETRY           "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS          decimal digits, 25..2000, or unset/empty; signs, spaces, exponents,
  *                                              hex and fractions refuse.
  *   PRIVATE_INGEST_ORIGIN_CLAIM_FENCE          "on" or unset/empty; anything else refuses.
@@ -263,6 +278,9 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   const timeoutBusy = env.PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY ?? "", lockWait = env.PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS ?? "";
   if (mirror !== "" && mirror !== "on") privateIngestRefuse("private_ingest_profile_fence_mirror");
   if (timeoutBusy !== "" && timeoutBusy !== "on") privateIngestRefuse("private_ingest_profile_claim_timeout_busy");
+  const bufferBusy = env.PRIVATE_INGEST_BUFFER_LOCK_BUSY ?? "", bufferRetry = env.PRIVATE_INGEST_BUFFER_LOCK_RETRY ?? "";
+  if (bufferBusy !== "" && bufferBusy !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_busy");
+  if (bufferRetry !== "" && bufferRetry !== "on") privateIngestRefuse("private_ingest_profile_buffer_lock_retry");
   if (lockWait !== "" && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_profile_claim_lock_wait");
   const originFence = env.PRIVATE_INGEST_ORIGIN_CLAIM_FENCE ?? "";
   const turnFenceRegister = env.PRIVATE_INGEST_TURN_FENCE_REGISTER ?? "";
@@ -272,6 +290,8 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
     ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
     ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
     ...(timeoutBusy === "on" ? { claimTimeoutBusy: "on" } : {}),
+    ...(bufferBusy === "on" ? { bufferLockBusy: "on" } : {}),
+    ...(bufferRetry === "on" ? { bufferLockRetry: "on" } : {}),
     ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
     ...(originFence === "on" ? { originClaimFence: "on" } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" } : {}),
@@ -290,6 +310,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   };
   const mirror = text("INGEST_S3_FENCE_MIRROR"), orgs = text("INGEST_HTTP_ADMISSION_STOPPED_ORGS");
   const timeoutBusy = text("INGEST_CLAIM_TIMEOUT_BUSY"), lockWait = text("INGEST_CLAIM_LOCK_WAIT_MS");
+  const bufferBusy = text("INGEST_BUFFER_LOCK_BUSY"), bufferRetry = text("INGEST_BUFFER_LOCK_RETRY");
   const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
   const turnFenceRegister = text("INGEST_TURN_FENCE_REGISTER");
   if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
@@ -297,6 +318,8 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
     ...(timeoutBusy === undefined ? {} : { claimTimeoutBusy: timeoutBusy }),
+    ...(bufferBusy === undefined ? {} : { bufferLockBusy: bufferBusy }),
+    ...(bufferRetry === undefined ? {} : { bufferLockRetry: bufferRetry }),
     ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
     ...(originFence === undefined ? {} : { originClaimFence: originFence }),
     ...(turnFenceRegister === undefined ? {} : { turnFenceRegister }),
