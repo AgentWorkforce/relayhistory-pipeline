@@ -1249,6 +1249,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
           return work(tx);
         }),
     },
+    // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
+    ...(config.pointerSkipOriginBucket ? { skipOriginBucket: true as const } : {}),
   };
   const search: ConsumerDeps["search"] = {
     transact: (work) => transaction(db, (tx) => writerSql.run(tx, () => work(tx))),

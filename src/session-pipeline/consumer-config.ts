@@ -58,6 +58,11 @@
  *                                   exactly "true" requests the search pre-read. The portable
  *                                   adapter/staged/output-facts paths stay on the base path.
  *                                   Anything else fails startup.
+ *   SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED enabled only: unset | "" | "false" is off;
+ *                                   exactly "true" makes the pointer stage ignore put and
+ *                                   delete events for the sessionless per-origin bucket
+ *                                   (h=_none/s=_origin) before any lookup; existing rows are
+ *                                   not touched. Anything else fails startup.
  *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
  *                                   case-sensitive) also writes output facts
  *                                   (sessions.session_event_facts /
@@ -132,6 +137,7 @@ export const CONSUMER_KEY_PREFIX_VAR = "PIPELINE_KEY_PREFIX";
 export const CONSUMER_TLS_PROFILE_VAR = "SESSION_POSTGRES_TLS_PROFILE";
 export const CONSUMER_OUTPUT_FACTS_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS";
 export const CONSUMER_SEARCH_PREREAD_VAR = "SEARCH_INDEX_PREREAD_ENABLED";
+export const CONSUMER_SKIP_ORIGIN_BUCKET_VAR = "SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED";
 
 export interface ConsumerSecret {
   hoopdb_url: string;
@@ -160,6 +166,8 @@ export type ConsumerServiceConfig =
       originLabels: boolean;
       /** SEARCH_INDEX_PREREAD_ENABLED is exactly "true" (default off). */
       searchPreRead: boolean;
+      /** SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED is exactly "true" (default off). */
+      pointerSkipOriginBucket: boolean;
       /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
       analytics?: AnalyticsConfig;
     };
@@ -187,6 +195,14 @@ export function consumerSearchPreReadFromEnv(env: NodeJS.ProcessEnv): boolean {
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`pipeline consumer: ${CONSUMER_SEARCH_PREREAD_VAR} must be true or false`);
+}
+
+/** Same strict default-off grammar as the hosted SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED. */
+export function consumerSkipOriginBucketFromEnv(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[CONSUMER_SKIP_ORIGIN_BUCKET_VAR];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`pipeline consumer: ${CONSUMER_SKIP_ORIGIN_BUCKET_VAR} must be true or false`);
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -242,6 +258,7 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
     outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
     originLabels: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     searchPreRead: consumerSearchPreReadFromEnv(env),
+    pointerSkipOriginBucket: consumerSkipOriginBucketFromEnv(env),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
   };
 }

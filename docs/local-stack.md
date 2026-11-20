@@ -152,6 +152,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 2 GB on top of its usual limit, about 3 KB per record, measured); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
 | `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on since Phase 3 slice 4 (unset or `""`; off with `false`, or unset with `SEARCH_INDEX_STREAMING_ENABLED=false`, one info line; see "Upgrading to the default-on image (Phase 3)" below). On, the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on; with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` it starts and stages the facts of a too-large scope ("Staged output facts" below; migration `20261105062140` required); any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
 | `SEARCH_INDEX_PREREAD_ENABLED` | hosted session-pipeline Lambda and enabled self-host consumer | Default off: unset, `""` or `false` changes nothing; exactly `true` requests the search pre-read; any other value fails startup. In this slice only the hosted legacy ClickHouse whole-read path, without streaming or output facts, uses it. Portable adapters (including self-host), staged reconcile, streaming and output-facts paths remain on their base locked path; see "Hosted Lambda: search reads before its lock" below. The stack renders it only from `transcriptStore.sessionPipeline.searchPreRead: true`, which requires `searchIndex: true`. |
+| `SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED` | hosted session-pipeline Lambda and enabled self-host consumer | Default off: unset, `""` or `false` changes nothing; exactly `true` makes the pointer stage ignore put and delete events for the sessionless per-origin bucket (`h=_none/s=_origin`, reason `no_session_origin`) before any lookup; any other value fails startup. Existing rows and dead-letter messages are not touched; keep it off while the seed proof or the history lineage still read such rows. The stack renders it only from `transcriptStore.sessionPipeline.pointerSkipOriginBucket: true`. See "Pointer stage: skip the sessionless per-origin bucket" below. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -877,6 +878,27 @@ outside the lock, and requeues it when it disappeared. A delete that read "gone"
 reads again and indexes it; a move follows today's rule (both keys live: `pointer_move_pending`). An object-store
 write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read converges
 through its own event exactly as before.
+
+### Pointer stage: skip the sessionless per-origin bucket
+
+`SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED` (hosted session-pipeline Lambda, stack input
+`transcriptStore.sessionPipeline.pointerSkipOriginBucket`, and the enabled self-host consumer) is **default off**:
+unset, `""` and `false` change nothing; exactly `true` is on; any other value fails Lambda init or consumer startup
+naming the variable.
+
+Records without a session id are written to the sessionless per-origin bucket (`h=_none/s=_origin`, one per
+machine). Off, its manifest is indexed like a session: a pointer row, a public directory row, and a search pass over
+one logical scope that merges every origin in the workspace and has no useful bound, so such events can end partial
+or in the dead-letter queue. On, the pointer stage ignores put and delete events for exactly that harness and
+session (log `object event ignored`, reason `no_session_origin`) before any object-store or database call, like the
+`_babysitter` retention buckets; the message is acknowledged and no large-read, search or replay work runs for it.
+
+It does not touch anything that already exists: `_none/_origin` pointer, directory and search rows written before
+the flag stay as they are (their delete events are ignored too), and messages already in the dead-letter queue stay
+there. Removing or redriving them is a separate step. The legacy seed proof (`ingest_seed_scope_page` /
+`ingest_seed_scope_capture`) and the history lineage (`ingest_history_pointer_refs`) read `_none/_origin` pointer
+rows, so keep the flag off on any install that still runs either. Turning it on is an operator decision; no stack or
+install sets it by default.
 
 In the no-op-delete race, the pointer inserted from the stale pre-read can remain live for the requeue delay
 (60 seconds in the hosted Lambda) plus queue lag before that reconcile tombstones it. The same batch's search pass

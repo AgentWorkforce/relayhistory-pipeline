@@ -150,6 +150,12 @@ export interface SessionPipelineInputs {
    */
   pointerPreRead?: boolean;
   /**
+   * Default off. `true` renders SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true: the pointer stage ignores put and
+   * delete events for the sessionless per-origin bucket (h=_none/s=_origin) before any lookup. Existing rows are
+   * not touched. Keep it off while the seed proof or the history lineage still read such rows.
+   */
+  pointerSkipOriginBucket?: boolean;
+  /**
    * Lambda concurrency cap from the queue (2-20). Default 4. The upper bound exists because each
    * concurrent invocation can hold up to HOOPDB_POOL_MAX (4, set below) database connections, so
    * 20 means up to 80 connections from this function alone. It is also capped in practice by the
@@ -322,7 +328,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead" && k !== "pointerSkipOriginBucket") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -345,6 +351,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.searchPreRead !== undefined && typeof v.searchPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.searchPreRead must be a boolean");
   if (v.searchPreRead === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchPreRead requires searchIndex: true");
   if (v.pointerPreRead !== undefined && typeof v.pointerPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.pointerPreRead must be a boolean");
+  if (v.pointerSkipOriginBucket !== undefined && typeof v.pointerSkipOriginBucket !== "boolean") refuse("transcriptStore.sessionPipeline.pointerSkipOriginBucket must be a boolean");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
@@ -701,6 +708,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.searchPreRead === true ? { SEARCH_INDEX_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without pointerPreRead: true renders nothing and reads under the lock as before.
     ...(i.p.pointerPreRead === true ? { SESSION_POINTER_PREREAD_ENABLED: "true" } : {}),
+    // Only when armed: a stage without pointerSkipOriginBucket: true renders nothing and indexes h=_none/s=_origin as before.
+    ...(i.p.pointerSkipOriginBucket === true ? { SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: "true" } : {}),
     // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     ...(i.p.streamReconcile?.enabled === true && i.p.streamReconcile.maxReadBytes !== undefined ? { SEARCH_INDEX_STREAM_CH_MAX_READ_BYTES: String(i.p.streamReconcile.maxReadBytes) } : {}),

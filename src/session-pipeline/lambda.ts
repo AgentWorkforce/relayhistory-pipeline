@@ -149,6 +149,8 @@ export interface LambdaEnv {
   searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
   pointerPreReadEnabled?: boolean;
+  /** SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true: the pointer stage ignores h=_none/s=_origin keys (pointer.ts). Default off. */
+  pointerSkipOriginBucketEnabled?: boolean;
   /**
    * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled by the
    * streaming reader on the ClickHouse binding within these budgets, stopping at the invocation's
@@ -237,6 +239,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     throw new Error("session pipeline: SEARCH_INDEX_PREREAD_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
+  // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off.
+  const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
   const maximum = readerMaxRuleset(env);
   return {
@@ -260,6 +264,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
     ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
+    ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
@@ -494,6 +499,8 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       })},
       // Default off; on, the object-store reads run before the scope lock and the lock holds SQL only.
       ...(env.pointerPreReadEnabled ? { preRead: true as const } : {}),
+      // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
+      ...(env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {}),
     },
     requeue: async (manifestKey) => {
       await awsJsonCall({
@@ -1040,4 +1047,15 @@ export function pointerPreReadFromEnv(env: Record<string, string | undefined>): 
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SESSION_POINTER_PREREAD_ENABLED must be true or false");
+}
+
+/**
+ * SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value.
+ */
+export function pointerSkipOriginBucketFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED must be true or false");
 }

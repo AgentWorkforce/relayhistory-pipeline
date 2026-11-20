@@ -13,6 +13,7 @@ import {
   consumerServiceConfig,
   consumerServiceEnabled,
   consumerSearchPreReadFromEnv,
+  consumerSkipOriginBucketFromEnv,
   parseConsumerSecret,
   strictMinutes,
 } from "../consumer-config.ts";
@@ -174,6 +175,15 @@ describe("consumer service config", () => {
     for (const raw of ["1", "TRUE", " true", "on"])
       expect(() => consumerServiceConfig(env({ SEARCH_INDEX_PREREAD_ENABLED: raw }))).toThrow("SEARCH_INDEX_PREREAD_ENABLED must be true or false");
     expect(consumerServiceConfig({ SEARCH_INDEX_PREREAD_ENABLED: "nope" })).toEqual({ enabled: false });
+  });
+  test("SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: exact true is on, false/unset is off, malformed refuses; dormant reads nothing", () => {
+    expect(consumerServiceConfig(env())).toMatchObject({ enabled: true, pointerSkipOriginBucket: false });
+    expect(consumerServiceConfig(env({ SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: "false" }))).toMatchObject({ enabled: true, pointerSkipOriginBucket: false });
+    expect(consumerServiceConfig(env({ SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: "true" }))).toMatchObject({ enabled: true, pointerSkipOriginBucket: true });
+    for (const raw of [undefined, "", "false"]) expect(consumerSkipOriginBucketFromEnv({ SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: raw })).toBe(false);
+    for (const raw of ["1", "TRUE", " true", "on"])
+      expect(() => consumerServiceConfig(env({ SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: raw }))).toThrow("SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED must be true or false");
+    expect(consumerServiceConfig({ SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: "nope" })).toEqual({ enabled: false });
   });
   test("serve() logs the streaming reconcile startup line before any connection opens", async () => {
     // serve() resolves SEARCH_INDEX_STREAMING_ENABLED and logs it before refusing a mismatched

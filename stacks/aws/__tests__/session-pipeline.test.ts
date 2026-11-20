@@ -39,7 +39,7 @@ import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcr
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 import { searchIndexLimits, searchIndexStreamChFromEnv, searchIndexStreamFloor, SEARCH_INDEX_STREAM_CH_CEILING } from "../../../src/session-pipeline/search-index.ts";
-import { lambdaEnv, pointerPreReadFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
+import { lambdaEnv, pointerPreReadFromEnv, pointerSkipOriginBucketFromEnv, searchIndexPreReadFromEnv, searchIndexSkipCurrentFromEnv } from "../../../src/session-pipeline/lambda.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
 const STAGE = "aws-sessions-prod";
@@ -1022,6 +1022,29 @@ describe("session pipeline: pointer pre-read (SESSION_POINTER_PREREAD_ENABLED)",
   });
   it("a non-boolean is refused", () => {
     for (const bad of ["true", 1, null, {}]) expect(refusedBy({ pointerPreRead: bad })).toMatch(/pointerPreRead must be a boolean/);
+  });
+});
+
+describe("session pipeline: pointer skips the sessionless per-origin bucket (SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED)", () => {
+  const envOf = (cfg: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: cfg });
+  const refusedBy = (v: unknown) => { let why = ""; try { assertSessionPipelineInputs(v, (w: string) => { throw new Error(w); }); } catch (e) { why = (e as Error).message; } return why; };
+  it("unset or false renders nothing; true renders exactly the flag; the Lambda parses both", () => {
+    const base = Object.keys(envOf({})).sort();
+    expect(base).not.toContain("SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED");
+    for (const cfg of [{}, { pointerSkipOriginBucket: false }, { searchIndex: true, pointerSkipOriginBucket: false }] as SessionPipelineInputs[]) {
+      expect(refusedBy(cfg)).toBe("");
+      expect(envOf(cfg)).toEqual(envOf({ ...cfg, pointerSkipOriginBucket: undefined } as SessionPipelineInputs));
+      expect(pointerSkipOriginBucketFromEnv(envOf(cfg))).toBe(false);
+    }
+    const env = envOf({ pointerSkipOriginBucket: true });
+    expect(Object.keys(env).sort()).toEqual([...base, "SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED"].sort());
+    expect(env.SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED).toBe("true");
+    expect(pointerSkipOriginBucketFromEnv(env)).toBe(true);
+    // Independent of the pointer pre-read: each renders only its own key.
+    expect(Object.keys(envOf({ pointerPreRead: true, pointerSkipOriginBucket: true })).sort()).toEqual([...base, "SESSION_POINTER_PREREAD_ENABLED", "SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED"].sort());
+  });
+  it("a non-boolean is refused", () => {
+    for (const bad of ["true", 1, null, {}]) expect(refusedBy({ pointerSkipOriginBucket: bad })).toMatch(/pointerSkipOriginBucket must be a boolean/);
   });
 });
 
