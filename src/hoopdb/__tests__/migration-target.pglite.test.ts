@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_|lazy_ack_history_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -980,6 +980,33 @@ test("real tree: after the full tree including 062150, the relayfacts claims wri
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   await s.db.exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN CREATE ROLE bulls96_read_api; END IF; END $$`);
   for (const [fn, role] of [[reader, "bulls96_read_api"], [writer, "bulls96_read_api"], [supersede, "bulls96_session_ingest"], [trigger, "service_role"]] as const) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
+});
+
+test("real tree: after the full tree including 062156, the history-exact helpers are owner-only, the replaced ACK and trigger keep their ACLs, and an extra grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const LAH = "upstream:20261105062156_lazy_ack_history_exact.sql";
+  expect(s.split.held).toContain(LAH);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(LAH);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  const helpers = ["sessions.lazy_ack_history_intents(text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,text,bigint)",
+    "sessions.lazy_ack_history_scope_lock(jsonb)", "sessions.lazy_ack_history_replay(text[],integer[],bigint[])"];
+  // Owner-only helpers: no runtime or consumer role holds them; the gate is off in proconfig.
+  for (const fn of helpers) { expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn); expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(fn); }
+  expect((await s.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.c)
+    .toContain("bulls96.lazy_ack_h_exact=off");
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  for (const [fn, role] of [[helpers[0]!, "bulls96_session_ingest"], [helpers[1]!, "service_role"], [helpers[2]!, "bulls96_session_ingest"]] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
     await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
