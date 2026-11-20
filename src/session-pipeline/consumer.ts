@@ -108,6 +108,16 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         log.info("object event ignored", { stage: "object-landed", reason: outcome.reason });
         continue;
       }
+      // With pre-read enabled a delete can complete without changing a pointer row (no row, or the row
+      // names another key), so the stamp alone cannot prove that a previously read put stayed live. Check
+      // successful inserts/rekeys after their lock is released. A missing key is reconciled through the
+      // normal queue path; without a requeue binding, fail this message so its source queue retries it.
+      if (deps.pointer.preRead && (outcome.status === "indexed" || outcome.status === "moved") && !(await deps.pointer.exists(outcome.manifestKey))) {
+        if (!deps.requeue) throw new Error("pointer changed after pre-read and no requeue");
+        await deps.requeue(outcome.manifestKey);
+        log.info("pointer liveness changed, requeued", { stage: "session-indexed", outcome: outcome.status, org_id: outcome.scope.orgId,
+          workspace_id: outcome.scope.workspaceId, harness: outcome.scope.harness, session_id: outcome.scope.sessionId });
+      }
       log.info("pointer indexed", {
         stage: "session-indexed",
         outcome: outcome.status,

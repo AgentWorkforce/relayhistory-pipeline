@@ -43,6 +43,7 @@ export async function pointerRig() {
   for (const f of readdirSync(join(repo, "src/hoopdb/migrations")).filter((x) => x.endsWith(".sql")).sort()) await pg.exec(readF(`src/hoopdb/migrations/${f}`));
 
   const calls: Call[] = [];
+  const requeued: string[] = [];
   let depth = 0;
   const at = () => (depth > 0 ? "lock" : "free") as Call["at"];
   const plain = (v: unknown): unknown => JSON.parse(JSON.stringify(v ?? null));
@@ -108,7 +109,10 @@ export async function pointerRig() {
   const pointer = (extra: Partial<PointerDeps> = {}): PointerDeps => ({
     db, lock, reader, exists, orgs: prefixOrgResolver, allowPrefix: (p, o) => prefixAllowed(b, p, o), fanout: droppedFanout, now: () => NOW, ...extra,
   });
-  const deps = (extra: Partial<PointerDeps> = {}): ConsumerDeps => ({ pointer: pointer(extra) });
+  const deps = (extra: Partial<PointerDeps> = {}): ConsumerDeps => ({
+    pointer: pointer(extra),
+    requeue: async (key) => { requeued.push(key); },
+  });
 
   async function writeManifest(revision: number, l: Loc = loc) {
     const source = new TextEncoder().encode(JSON.stringify({ kind: "session_event", origin_id: "o", record_id: `r${revision}`, revision: "1", operation: "upsert", received_at: AT, payload: { ts_ms: 1, text: "x" } }) + "\n");
@@ -135,5 +139,5 @@ export async function pointerRig() {
     await pg.close();
     await rm(root, { recursive: true, force: true });
   };
-  return { pg, store, calls, hooks, pointer, deps, run, writeManifest, body, row, close };
+  return { pg, store, calls, requeued, hooks, pointer, deps, run, writeManifest, body, row, close };
 }

@@ -821,19 +821,17 @@ On, the stage stamps the session's pointer rows (key, revision, etag, tombstone,
 every one of those object-store calls BEFORE taking the lock, then takes the same lock and re-reads the stamp:
 unchanged, it runs exactly as before against what it read (the revision fence still answers a non-newer revision),
 with no object-store call while the lock is held; changed (another pointer stage wrote the session after the reads
-began), it reads again, once; a second change fails the event with the retryable `pointer_scope_changed` (SQS
-retries it). The lock transaction holds SQL only: the stamp, the upsert, the stored-row check, a rekey on a move.
-Connections are unchanged.
+began), it reads again, once; a second change falls back to today's locked-read path instead of creating a new
+retry/DLQ route. Except for that contention fallback, the lock transaction holds SQL only: the stamp, the upsert,
+the stored-row check, a rekey on a move. Connections are unchanged.
 
 Races, with the flag on: a put that read the manifest before an erasure cannot bring the pointer back (the
-tombstone moves the stamp, so the put reads again and sees the delete); a delete that read "gone" before a newer
-put was indexed reads again and indexes it; a move follows today's rule (both keys live: `pointer_move_pending`).
-An object-store write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read
-converges through its own event exactly as before.
-
-Also with the flag on, a put event whose eTag (normalized as every read's) is the one the live row of that key
-already indexed is answered `unchanged` from the stamp alone: no manifest read, no lock. A rewrite of the key carries
-another eTag and takes the full path; a tombstoned row never matches. An event without an eTag takes the full path.
+tombstone normally moves the stamp, so the put reads again and sees the delete. A delete can also be a no-op (there
+is no row yet, or the row names another key); after every insert or rekey the stage therefore checks the key once,
+outside the lock, and requeues it when it disappeared. A delete that read "gone" before a newer put was indexed
+reads again and indexes it; a move follows today's rule (both keys live: `pointer_move_pending`). An object-store
+write is not serialized by this lock in either mode, so a re-upload that lands after a delete's read converges
+through its own event exactly as before.
 
 ## Known limits
 

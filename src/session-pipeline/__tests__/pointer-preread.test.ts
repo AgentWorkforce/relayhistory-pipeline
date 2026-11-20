@@ -1,8 +1,9 @@
 /**
- * SESSION_POINTER_PREREAD_ENABLED=true (pointer.ts indexPreRead): no object-store call while the scope lock is
- * held, a short lock (SQL only), the same outcomes and rows as the flag-off pass, and the races the lock exists
- * for: a manifest replaced between the pre-read and the lock, a delete against a write in both orders, a move,
- * and a scope that keeps changing. Synthetic, secret-free data only (pointer-lock-harness.ts).
+ * SESSION_POINTER_PREREAD_ENABLED=true (pointer.ts indexPreRead): normally no object-store call while the scope
+ * lock is held, a short lock (SQL only), the same outcomes and rows as the flag-off pass, and the races the lock
+ * exists for: a manifest replaced between the pre-read and the lock, a delete against a write in both orders, a
+ * move, and a scope that keeps changing. Sustained churn falls back to the base locked read. Synthetic,
+ * secret-free data only (pointer-lock-harness.ts).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { objectKey } from "../../shared/vendor.ts";
@@ -113,6 +114,56 @@ describe("pre-read on: races", () => {
     expect(directory.every((d) => d.deleted_at !== null)).toBe(true);
   }, 300_000);
 
+  test("a no-op delete between a brand-new put's pre-read and lock is caught after the write and requeued", async () => {
+    const off = await pointerRig();
+    cleanup.push(off.close);
+    const offKey = await off.writeManifest(1);
+    off.hooks.beforeLock = async () => {
+      await off.store.delete(objectKey(offKey));
+      expect((await off.run("d", off.body(offKey, "ObjectRemoved:DeleteMarkerCreated", "02"))).batchItemFailures).toEqual([]);
+    };
+    expect((await off.run("p", off.body(offKey, "ObjectCreated:Put", "01"))).batchItemFailures).toEqual([]);
+    expect(await off.row()).toEqual([]); // The base path reads after the no-op delete while holding its lock.
+    expect(off.requeued).toEqual([]);
+
+    const r = await pointerRig();
+    cleanup.push(r.close);
+    const key = await r.writeManifest(1);
+    r.hooks.beforeLock = async () => {
+      // There is no pointer row yet, so this delete writes nothing and cannot move the [] stamp.
+      await r.store.delete(objectKey(key));
+      expect((await r.run("d", r.body(key, "ObjectRemoved:DeleteMarkerCreated", "02"), ON)).batchItemFailures).toEqual([]);
+      expect(await r.row()).toEqual([]);
+    };
+    expect((await r.run("p", r.body(key, "ObjectCreated:Put", "01"), ON)).batchItemFailures).toEqual([]);
+    expect((await r.row()).map((x) => x.deleted_at === null)).toEqual([true]);
+    expect(r.requeued).toEqual([key]);
+    // The delayed reconcile follows the ordinary queue path and removes the stale live pointer.
+    expect((await r.run("q", JSON.stringify({ reconcile: { key } }), ON)).batchItemFailures).toEqual([]);
+    expect((await r.row())[0]!.deleted_at).not.toBeNull();
+  }, 300_000);
+
+  test("a no-op delete of a new key cannot strand a rekey to that dead key", async () => {
+    const r = await pointerRig();
+    cleanup.push(r.close);
+    const oldKey = await r.writeManifest(2);
+    await r.run("old", r.body(oldKey, "ObjectCreated:Put", "01"), ON);
+    // The old row still names oldKey, but the old object is already gone. The new key is the move candidate.
+    await r.store.delete(objectKey(oldKey));
+    const newKey = await r.writeManifest(1, { ...loc, startDate: "2026-11-03" });
+    r.hooks.beforeLock = async () => {
+      await r.store.delete(objectKey(newKey));
+      // This tombstone is a no-op because the row still names oldKey; the pointer stamp does not move.
+      expect((await r.run("d", r.body(newKey, "ObjectRemoved:DeleteMarkerCreated", "03"), ON)).batchItemFailures).toEqual([]);
+      expect((await r.row())[0]!.manifest_key).toBe(oldKey);
+    };
+    expect((await r.run("move", r.body(newKey, "ObjectCreated:Put", "02"), ON)).batchItemFailures).toEqual([]);
+    expect((await r.row())[0]!.manifest_key).toBe(newKey);
+    expect(r.requeued).toEqual([newKey]);
+    expect((await r.run("q", JSON.stringify({ reconcile: { key: newKey } }), ON)).batchItemFailures).toEqual([]);
+    expect((await r.row())[0]!.deleted_at).not.toBeNull();
+  }, 300_000);
+
   test("a delete that read 'gone' before a newer put was indexed does not tombstone it", async () => {
     const r = await pointerRig();
     cleanup.push(r.close);
@@ -128,13 +179,12 @@ describe("pre-read on: races", () => {
     expect((await r.row()).map((x) => [x.revision, x.deleted_at])).toEqual([["2", null]]);
   }, 300_000);
 
-  test("a scope that changes during both attempts is retried by the queue (pointer_scope_changed), nothing written", async () => {
+  test("a scope that changes during both attempts falls back to the base locked read", async () => {
     const r = await pointerRig();
     cleanup.push(r.close);
     const key = await r.writeManifest(1);
     await r.run("a", r.body(key, "ObjectCreated:Put", "01"), ON);
     await r.writeManifest(2);
-    const before = await r.row();
     let n = 0;
     const touch = async () => {
       n += 1;
@@ -142,76 +192,13 @@ describe("pre-read on: races", () => {
       if (n < 2) r.hooks.beforeLock = touch;
     };
     r.hooks.beforeLock = touch;
-    const lines: string[] = [];
-    const stderr = process.stderr.write, stdout = process.stdout.write;
-    const tap = (w: typeof process.stdout.write, s: NodeJS.WriteStream) => ((c: unknown, ...rest: unknown[]) => { lines.push(String(c)); return (w as (...a: unknown[]) => boolean).call(s, c, ...rest); }) as typeof process.stdout.write;
-    process.stderr.write = tap(stderr, process.stderr);
-    process.stdout.write = tap(stdout, process.stdout);
-    let out;
-    try {
-      out = await r.run("b", r.body(key, "ObjectCreated:Put", "02"), ON);
-    } finally {
-      process.stderr.write = stderr;
-      process.stdout.write = stdout;
-    }
+    r.calls.length = 0;
+    const out = await r.run("b", r.body(key, "ObjectCreated:Put", "02"), ON);
     expect(n).toBe(2);
-    expect(out.batchItemFailures).toEqual([{ itemIdentifier: "b" }]);
-    expect(lines.join("")).toContain('"error_code":"pointer_scope_changed"');
-    expect((await r.row()).map((x) => x.revision)).toEqual(before.map((x) => x.revision));
-  }, 300_000);
-});
-
-describe("pre-read on: an unchanged manifest", () => {
-  test("an event whose eTag the live row already indexed: unchanged with no object-store call and no lock", async () => {
-    const r = await pointerRig();
-    cleanup.push(r.close);
-    const key = await r.writeManifest(1);
-    await r.run("a", r.body(key, "ObjectCreated:Put", "01"), ON);
-    const etag = (await r.pg.query<{ e: string }>("SELECT manifest_etag e FROM sessions.session_index")).rows[0]!.e;
-    expect(etag).toBeTruthy();
-    r.calls.length = 0;
-    const lines: string[] = [];
-    const stdout = process.stdout.write;
-    process.stdout.write = ((c: unknown, ...rest: unknown[]) => { lines.push(String(c)); return (stdout as (...a: unknown[]) => boolean).call(process.stdout, c, ...rest); }) as typeof process.stdout.write;
-    let out;
-    try {
-      // The scheduled reconcile body does not pass through the S3 record normalizer: quoted and
-      // unquoted forms still name the same object version.
-      out = await r.run("a2", JSON.stringify({ reconcile: { key, etag: `"${etag}"` } }), ON);
-    } finally {
-      process.stdout.write = stdout;
-    }
     expect(out.batchItemFailures).toEqual([]);
-    expect(r.calls.filter((c) => c.kind.startsWith("s3.")).length).toBe(0);
-    expect(r.calls.filter((c) => c.kind === "lock.sql").length).toBe(0);
-    expect(lines.join("")).toContain('"outcome":"unchanged"');
-    // The same machine and eTag under another manifest key is a move, not an unchanged event.
-    const otherKey = await r.writeManifest(1, { ...loc, startDate: "2026-11-03" });
-    r.calls.length = 0;
-    expect((await r.run("other", r.body(otherKey, "ObjectCreated:Put", "025", etag), ON)).batchItemFailures)
-      .toEqual([{ itemIdentifier: "other" }]);
-    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
-    // Another eTag (a rewrite of the key) takes the full path: read before the lock, nothing under it.
-    r.calls.length = 0;
-    await r.writeManifest(2);
-    expect((await r.run("b", r.body(key, "ObjectCreated:Put", "03", "another"), ON)).batchItemFailures).toEqual([]);
-    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
-    expect(inLock(r.calls, s3)).toBe(0);
     expect((await r.row()).map((x) => x.revision)).toEqual(["2"]);
-  }, 300_000);
-
-  test("the indexed eTag on a tombstoned row is not 'unchanged': the full path runs", async () => {
-    const r = await pointerRig();
-    cleanup.push(r.close);
-    const key = await r.writeManifest(1);
-    await r.run("a", r.body(key, "ObjectCreated:Put", "01"), ON);
-    const etag = (await r.pg.query<{ e: string }>("SELECT manifest_etag e FROM sessions.session_index")).rows[0]!.e;
-    await r.store.delete(objectKey(key));
-    await r.run("d", r.body(key, "ObjectRemoved:DeleteMarkerCreated", "02"), ON);
-    r.calls.length = 0;
-    await r.run("a2", r.body(key, "ObjectCreated:Put", "03", etag), ON);
-    expect(r.calls.filter((c) => c.kind === "s3.read").length).toBeGreaterThan(0);
-    expect((await r.row())[0]!.deleted_at).not.toBeNull();
+    // Only the safety fallback uses the base path's read under the lock.
+    expect(inLock(r.calls, s3)).toBeGreaterThan(0);
   }, 300_000);
 });
 
