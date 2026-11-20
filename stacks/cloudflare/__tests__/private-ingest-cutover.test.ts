@@ -160,6 +160,67 @@ test("claim lock controls: env shapes, and add / change / remove at a held phase
   }
 });
 
+// Buffer-stage lock controls (deliver.ts BufferLockBusy / bufferLedgerStage): cutover controls exactly like
+// claimTimeoutBusy. Absent renders nothing; "on" is accepted and rendered; anything else refuses.
+test("buffer lock controls: absent renders nothing, on renders, anything else refuses, add / remove at a held phase", () => {
+  const keys = { bufferLockBusy: "INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "INGEST_BUFFER_LOCK_RETRY" } as const;
+  const envName = { bufferLockBusy: "PRIVATE_INGEST_BUFFER_LOCK_BUSY", bufferLockRetry: "PRIVATE_INGEST_BUFFER_LOCK_RETRY" } as const;
+  const refusal = { bufferLockBusy: "private_ingest_profile_buffer_lock_busy", bufferLockRetry: "private_ingest_profile_buffer_lock_retry" } as const;
+  for (const key of ["bufferLockBusy", "bufferLockRetry"] as const) expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain(key);
+
+  // Absent: no var rendered and the profile check passes, at every phase.
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "" })).toEqual({});
+  for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
+    const absent = at(phase);
+    expect(privateIngestReleasePhase(absent)).toBe(phase);
+    for (const name of Object.values(keys)) expect(Object.hasOwn(sessionIngestVars(absent.sessionIngest), name)).toBe(false);
+  }
+
+  for (const key of ["bufferLockBusy", "bufferLockRetry"] as const) {
+    // "on": accepted and rendered.
+    expect(privateIngestCutoverFromEnv({ [envName[key]]: "on" })).toEqual({ [key]: "on" });
+    for (const phase of ["baseline-drain", "step-4-async-on"] as const) {
+      const on = at(phase, { [key]: "on" });
+      expect(privateIngestReleasePhase(on)).toBe(phase);
+      expect(sessionIngestVars(on.sessionIngest)).toEqual({ ...sessionIngestVars(at(phase).sessionIngest), [keys[key]]: "on" });
+    }
+    // Any other value refuses, from the environment, the profile and the live version.
+    for (const v of ["off", "ON", "true", "1", " on"])
+      expect(code(() => privateIngestCutoverFromEnv({ [envName[key]]: v }))).toBe(refusal[key]);
+    for (const v of ["off", "ON", true, 1, ""])
+      expect(code(() => privateIngestReleasePhase(at("baseline-drain", { [key]: v })))).toBe(refusal[key]);
+    const plain = at("baseline-drain"), on = at("baseline-drain", { [key]: "on" });
+    const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+    const fromPlain = live(plain), fromOn = live(on);
+    expect(privateIngestTransitionReadback(on, fromPlain.active, fromPlain.version)).toMatchObject(pass);  // add
+    expect(privateIngestTransitionReadback(plain, fromOn.active, fromOn.version)).toMatchObject(pass);     // remove (rollback)
+    expect(privateIngestVersionReadback(on, fromOn.active, fromOn.version)).toMatchObject({ phase: "baseline-drain" });
+    expect(code(() => privateIngestVersionReadback(plain, fromOn.active, fromOn.version))).not.toBeNull();
+    for (const bad of [[{ name: keys[key], type: "plain_text", text: "off" }], [{ name: keys[key], type: "secret_text" }]]) {
+      const fixture = live(plain, bad);
+      expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+    }
+  }
+  // The tracked production profile with the variables unset renders neither var, and the workflow supplies them only
+  // as protected-environment variables (like PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY), never as a dispatch input.
+  const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+  const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
+  expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
+  for (const name of Object.values(keys)) expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
+  const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
+  for (const name of Object.values(envName)) {
+    expect(workflow).toContain(`${name}: \${{ vars.${name} }}`);
+    expect(workflow.split("\npermissions:")[0]).not.toContain(name);
+  }
+  // Independent: both together, alongside the claim controls.
+  const both = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, bufferLockBusy: "on", bufferLockRetry: "on" });
+  expect(privateIngestReleasePhase(both)).toBe("baseline-drain");
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_BUFFER_LOCK_BUSY: "on", PRIVATE_INGEST_BUFFER_LOCK_RETRY: "on" }))
+    .toEqual({ bufferLockBusy: "on", bufferLockRetry: "on" });
+  const fromBoth = live(both);
+  expect(privateIngestVersionReadback(both, fromBoth.active, fromBoth.version)).toMatchObject({ phase: "baseline-drain" });
+});
+
 // Per-origin claim fence (migration 20261105062010): a cutover control like the claim lock controls.
 test("origin claim fence control: env shape, and add / remove at a held phase", () => {
   expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: "on" })).toEqual({ originClaimFence: "on" });
