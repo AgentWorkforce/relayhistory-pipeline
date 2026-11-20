@@ -8,7 +8,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
-import { HARVEST_ROUTES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
+import { carriesTokenFragment, HARVEST_ROUTES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
 import { EXIT_CAPPED, failureMessage, main, type HarvestIo } from "../harvest/cli.ts";
 import { RECEIPT_FILE, repoKey, sessionFacts, STATE_FILE, type FrameRow } from "../harvest/harvest.ts";
 import { Hasher, IMPORT_BOUNDS } from "../import/normalize.ts";
@@ -302,6 +302,9 @@ describe("harvest", () => {
     expect(redact(`a ${TOKEN} b ${TOKEN.slice(0, 40)}`, TOKEN)).not.toContain(TOKEN.slice(0, 16));
     // A message cut at the start carries the token's tail; that is redacted too.
     expect(redact(`x ${TOKEN.slice(-40)} y`, TOKEN)).not.toContain(TOKEN.slice(-16));
+    // A short server code carrying any 8 characters of the token, its tail included, is never kept.
+    expect(carriesTokenFragment(`E_${TOKEN.slice(-9)}`, TOKEN)).toBe(true);
+    expect(carriesTokenFragment("E_RATE_LIMITED", TOKEN)).toBe(false);
   });
 
   test("a catalog repo URL yields the repository name, never its credentials", () => {
@@ -316,6 +319,13 @@ describe("harvest", () => {
     expect(repoKey("https://example.invalid/fixture-org/acme-api#FIXTURE_CRED_tok")).toBe("acme-api");
     // An `@` left after stripping userinfo is refused rather than guessed.
     expect(repoKey("https://example.invalid/a@FIXTURE_CRED_tok")).toBeNull();
+    // `;params`, percent escapes, text after a line break and a bare host:SECRET never become the name.
+    expect(repoKey("https://example.invalid/fixture-org/acme-api.git;token=FIXTURE_CRED_tok")).toBe("acme-api");
+    expect(repoKey("https://example.invalid/fixture-org/acme-api%3Btoken=FIXTURE_CRED_tok")).toBeNull();
+    expect(repoKey("https://example.invalid/fixture-org/acme-api\nFIXTURE_CRED_tok")).toBeNull();
+    expect(repoKey("example.invalid:FIXTURE_CRED_tok")).toBeNull();
+    expect(repoKey("https://u:pa/ss@example.invalid/fixture-org/acme-api")).toBeNull();
+    expect(repoKey("/srv/git/acme-api.git")).toBe("acme-api");
   });
 
   test("a response for another workspace is refused, by header or by a row's catalog", async () => {
