@@ -52,18 +52,28 @@ export function readToken(env: Record<string, string | undefined>): string {
   return token;
 }
 
-/** Replaces every occurrence of the token (and of its first half, in case a message cut it) with a marker. */
+/**
+ * Replaces every occurrence of the token, and of its first and its last half (a message may have cut either
+ * end), with a marker.
+ */
 export function redact(text: string, token: string | undefined): string {
   if (!token) return text;
   let out = text.split(token).join("[redacted]");
-  const half = token.slice(0, Math.ceil(token.length / 2));
-  if (half.length >= 8) out = out.split(half).join("[redacted]");
+  const n = Math.ceil(token.length / 2);
+  for (const half of [token.slice(0, n), token.slice(-n)]) if (half.length >= 8) out = out.split(half).join("[redacted]");
   return out;
 }
 
+/** Whether a short value shares any run of 8 characters with the token: it may carry a fragment of it. */
+const carriesTokenFragment = (v: string, token: string): boolean => {
+  for (let i = 0; i + 8 <= v.length; i++) if (token.includes(v.slice(i, i + 8))) return true;
+  return false;
+};
+
 const SAFE_CODE = /^[A-Za-z0-9_.:-]{1,96}$/u;
 /** A server-supplied code or header value, kept only when it is a short code, and redacted. */
-const safeCode = (v: unknown, token: string): string => typeof v === "string" && SAFE_CODE.test(v) ? redact(v, token) : "other";
+const safeCode = (v: unknown, token: string): string =>
+  typeof v === "string" && SAFE_CODE.test(v) && !carriesTokenFragment(v, token) ? v : "other";
 
 /** Seconds or an HTTP date, as milliseconds from now; null when absent or unreadable. */
 export function retryAfterMs(value: string | null, now: number): number | null {
