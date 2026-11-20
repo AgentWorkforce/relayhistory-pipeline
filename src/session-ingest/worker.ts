@@ -51,6 +51,11 @@
  *                              re-issues the same ledger call once after a 50-250 ms jittered pause; a second
  *                              failure propagates as before (429 with INGEST_BUFFER_LOCK_BUSY, else 503).
  *                              Rendered only from sessionIngest.bufferLockRetry: "on"
+ *   INGEST_ADVERTISED_MAX_RECORDS unset (default: 500) | 1..500 strict integer: the maxRecords published on
+ *                              GET /v1/delivery/limits and in receipts (advertised-limits.ts). Advertising only:
+ *                              acceptance stays MAX_DELIVERY_RECORDS (500). Anything else is ignored (500 published)
+ *                              and warned once at app start, never a refusal. Rendered only from
+ *                              sessionIngest.advertisedMaxRecords
  *   INGEST_CLAIM_LOCK_WAIT_MS  unset (default) | 25..2000: each claim runs in its own short transaction with
  *                              SET LOCAL lock_timeout of this many ms (ledger-sql.ts inClaimLockWait), so a
  *                              claim behind the same user's in-flight claim gives up quickly (55P03, and
@@ -114,6 +119,7 @@ import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
+import { parseAdvertisedMaxRecords } from "./advertised-limits.ts";
 import { UPLOAD_DIRECT_ALLOWLIST_VAR, UPLOAD_DIRECT_FLAG, UPLOAD_DIRECT_OFF, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
@@ -189,6 +195,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
   INGEST_BUFFER_LOCK_BUSY?: string;
   INGEST_BUFFER_LOCK_RETRY?: string;
+  /** 1..500 (strict integer): the maxRecords this Worker ADVERTISES (advertised-limits.ts). Unset or invalid: 500. */
+  INGEST_ADVERTISED_MAX_RECORDS?: string;
   /** 25..2000 ms: a claim's own lock wait (ledger-sql.ts inClaimLockWait). Unset (default): the role's lock_timeout. */
   INGEST_CLAIM_LOCK_WAIT_MS?: string;
   /** "on" (any case): buffered claim/stage/commit through the 062010 origin-scoped entry points. Default off. */
@@ -281,6 +289,10 @@ export interface IngestSettings {
   bufferLockBusy?: true;
   /** INGEST_BUFFER_LOCK_RETRY=on: that failure re-issues the same ledger call once after 50-250 ms. Absent (the default): one call. */
   bufferLockRetry?: true;
+  /** INGEST_ADVERTISED_MAX_RECORDS (1..500): the advertised maxRecords; acceptance stays 500. Absent (the default): 500 published. */
+  advertisedMaxRecords?: number;
+  /** INGEST_ADVERTISED_MAX_RECORDS was set but not a strict integer in 1..500: ignored (500 published), warned once at app start. */
+  advertisedMaxRecordsInvalid?: true;
   /** INGEST_CLAIM_LOCK_WAIT_MS (25..2000): each claim waits at most this long for a lock (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
   claimLockWaitMs?: number;
   /** INGEST_ORIGIN_CLAIM_FENCE=on (buffered only): per-origin claim serialization (ledger-sql.ts). Absent (the default): per-user. */
@@ -404,6 +416,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_BUSY) ? { bufferLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_RETRY) ? { bufferLockRetry: true as const } : {}),
+    ...advertisedSetting(env.INGEST_ADVERTISED_MAX_RECORDS),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
     ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
@@ -486,7 +499,15 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
     ...(settings.bufferLockBusy ? { bufferLockBusy: true as const } : {}),
     ...(settings.bufferLockRetry ? { bufferLockRetry: true as const } : {}),
+    ...(settings.advertisedMaxRecords !== undefined ? { advertisedMaxRecords: settings.advertisedMaxRecords } : {}),
   };
+}
+
+/** INGEST_ADVERTISED_MAX_RECORDS: a valid value, a flag that it was ignored, or nothing (unset). Never a refusal. */
+function advertisedSetting(raw: string | undefined): Pick<IngestSettings, "advertisedMaxRecords" | "advertisedMaxRecordsInvalid"> {
+  const parsed = parseAdvertisedMaxRecords(raw);
+  if (parsed.value !== undefined) return { advertisedMaxRecords: parsed.value };
+  return parsed.invalid ? { advertisedMaxRecordsInvalid: true } : {};
 }
 
 /**
@@ -527,6 +548,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     : undefined;
   const { custodySource, privacyAuthority } = custodyConfig(env);
   // Babysitter retention (additive): on but inactive with a Neon replica; loud, never a 503.
+  if (settings.advertisedMaxRecordsInvalid) log.warn("session ingest advertised limit ignored", { error_code: "advertised_max_records_invalid" });
   if (settings.babysitterRetention && replica) log.warn("babysitter retention routing inactive", { error_code: "replica_on" });
   if (settings.babysitterRetention && settings.subrequestCap === undefined) log.warn("babysitter retention routing inactive", { error_code: "subrequest_cap_unset" });
   if (settings.babysitterRetention && settings.retentionGeneration === undefined) log.warn("babysitter retention routing inactive", { error_code: "generation_unset" });

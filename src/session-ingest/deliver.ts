@@ -64,9 +64,9 @@ import { STORE_TRANSPORT_CAUSES } from "../shared/vendor.ts";
 
 const STORE_CAUSE_SET: ReadonlySet<string> = new Set(STORE_TRANSPORT_CAUSES);
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
+import { advertisedDeliveryLimits } from "./advertised-limits.ts";
 import {
   DELIVERY_BUSY_RETRY_AFTER,
-  DELIVERY_LIMITS,
   DeliveryBusyError,
   DeliveryError,
   MAX_DELIVERY_CONFLICTS,
@@ -156,6 +156,11 @@ export interface DeliverDeps {
    * Every other cause and stage is never retried. Unset (the default): one call, unchanged.
    */
   bufferLockRetry?: true;
+  /**
+   * INGEST_ADVERTISED_MAX_RECORDS (advertised-limits.ts): the maxRecords this Worker publishes in receipts and on
+   * GET /v1/delivery/limits. Advertising only: acceptance stays MAX_DELIVERY_RECORDS. Unset (the default): 500.
+   */
+  advertisedMaxRecords?: number;
   /** Test seam for the ClaimLockBusy / BufferLockBusy jitter and the buffer retry pause: a value in [0, 1). Default Math.random. */
   random?: () => number;
   /** Test seam for the INGEST_BUFFER_LOCK_RETRY pause. Default: a setTimeout promise. */
@@ -332,8 +337,8 @@ function causeCode(error: unknown): string {
 
 const pair = (source: string, sessionId: string | null) => JSON.stringify([source, sessionId ?? ""]);
 
-function withLimits(prepared: PreparedDelivery): DeliveryReceipt {
-  return { ...prepared.receipt, limits: { ...DELIVERY_LIMITS } };
+function withLimits(prepared: PreparedDelivery, deps: Pick<DeliverDeps, "advertisedMaxRecords">): DeliveryReceipt {
+  return { ...prepared.receipt, limits: { ...advertisedDeliveryLimits(deps.advertisedMaxRecords) } };
 }
 
 export function revisionConflict(originId: string, conflicts: RevisionConflict[], count: number): DeliveryError {
@@ -528,12 +533,12 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   if (claim.kind === "replay") {
     // Content-addressed: the same digest recomputes the same receipt. A mismatch is corruption, never a 200.
     if (claim.receiptId !== prepared.receipt.receiptId) throw new IngestUnavailable("replay", "receipt_mismatch");
-    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared, deps), outcome: "replay", stats: { ...base, timing_ms: timing } };
   }
   if (claim.kind === "batch_conflict") throw batchIdConflict(prepared, claim.currentDigest);
   if (claim.kind === "revision_conflict") throw revisionConflict(prepared.originId, claim.conflicts, claim.count);
   if (claim.kind === "replay_fast")
-    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared, deps), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
   if (deps.admissionGate) { await stage("admission_gate", deps.admissionGate); mark("admission_gate"); }
   const dropped: ReadonlySet<string> = new Set(claim.deleted.map(([s, id]) => sessionKey(s, id)));
@@ -637,7 +642,7 @@ async function writeAndCommit(
     let custodyAck:CurrentCustodyAck|undefined;
     if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
     mark("buffer_receipt");
-    return {custodyAck,receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
+    return {custodyAck,receipt:withLimits(prepared, deps),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
   }
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
     // Too wide for this invocation: one staged object now, the sessions from the queue.
@@ -692,7 +697,7 @@ async function writeAndCommit(
   );
   mark("commit");
   return {
-    receipt: withLimits(prepared),
+    receipt: withLimits(prepared, deps),
     outcome: staged ? "accepted_staged" : written ? "accepted" : "accepted_all_deleted",
     stats: {
       ...base,

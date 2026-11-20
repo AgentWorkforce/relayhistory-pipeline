@@ -213,14 +213,19 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             the 20261105062010 origin-scoped entry points (docs/design/per-origin-claim-fence.md).
  *   turnFenceRegister         "on" only (omit for off): INGEST_TURN_FENCE_REGISTER, exact-session privacy
  *                             registration and the registered-v1 capability/receipt contract.
+ *   advertisedMaxRecords      an integer 1..500 (omit for the default 500): INGEST_ADVERTISED_MAX_RECORDS, the
+ *                             maxRecords the Worker publishes (advertised-limits.ts). Advertising only; acceptance
+ *                             stays 500, so no persisted batch is refused when it is lowered.
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords"] as const;
 export type PrivateIngestCutover = {
   s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; bufferLockBusy?: "on"; bufferLockRetry?: "on";
-  claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on";
+  claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
 };
+const ADVERTISED_DIGITS = /^[1-9][0-9]{0,2}$/u;
+const advertisedOk = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 1 && n <= 500;
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
 const claimLockWaitOk = (ms: unknown): ms is number =>
   typeof ms === "number" && Number.isSafeInteger(ms) && ms >= 25 && ms <= 2000;
@@ -231,6 +236,9 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
   const timeoutBusy = profile.claimTimeoutBusy, lockWait = profile.claimLockWaitMs, originFence = profile.originClaimFence;
   const turnFenceRegister = profile.turnFenceRegister;
   const bufferBusy = profile.bufferLockBusy, bufferRetry = profile.bufferLockRetry;
+  const advertised = profile.advertisedMaxRecords;
+  if (advertised !== undefined && !advertisedOk(advertised))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_advertised_max_records");
   if (mirror !== undefined && mirror !== "on")
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_fence_mirror");
   if (timeoutBusy !== undefined && timeoutBusy !== "on")
@@ -257,6 +265,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(lockWait === undefined ? {} : { claimLockWaitMs: lockWait as number }),
     ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" as const } : {}),
+    ...(advertised === undefined ? {} : { advertisedMaxRecords: advertised as number }),
   };
 }
 
@@ -272,6 +281,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *                                              hex and fractions refuse.
  *   PRIVATE_INGEST_ORIGIN_CLAIM_FENCE          "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_TURN_FENCE_REGISTER         "on" or unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_ADVERTISED_MAX_RECORDS      decimal digits 1..500 (no sign, leading zero, space or fraction), or
+ *                                              unset/empty; anything else refuses.
  */
 export function privateIngestCutoverFromEnv(env: Record<string, string | undefined>): PrivateIngestCutover {
   const mirror = env.PRIVATE_INGEST_S3_FENCE_MIRROR ?? "", orgs = env.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS ?? "";
@@ -286,6 +297,8 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   const turnFenceRegister = env.PRIVATE_INGEST_TURN_FENCE_REGISTER ?? "";
   if (originFence !== "" && originFence !== "on") privateIngestRefuse("private_ingest_profile_origin_claim_fence");
   if (turnFenceRegister !== "" && turnFenceRegister !== "on") privateIngestRefuse("private_ingest_profile_turn_fence_register");
+  const advertised = env.PRIVATE_INGEST_ADVERTISED_MAX_RECORDS ?? "";
+  if (advertised !== "" && !ADVERTISED_DIGITS.test(advertised)) privateIngestRefuse("private_ingest_profile_advertised_max_records");
   return checkedCutover({
     ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
     ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
@@ -295,6 +308,7 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
     ...(lockWait === "" ? {} : { claimLockWaitMs: Number(lockWait) }),
     ...(originFence === "on" ? { originClaimFence: "on" } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" } : {}),
+    ...(advertised === "" ? {} : { advertisedMaxRecords: Number(advertised) }),
   });
 }
 
@@ -313,7 +327,9 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   const bufferBusy = text("INGEST_BUFFER_LOCK_BUSY"), bufferRetry = text("INGEST_BUFFER_LOCK_RETRY");
   const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
   const turnFenceRegister = text("INGEST_TURN_FENCE_REGISTER");
+  const advertised = text("INGEST_ADVERTISED_MAX_RECORDS");
   if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
+  if (advertised !== undefined && !ADVERTISED_DIGITS.test(advertised)) privateIngestRefuse("private_ingest_live_cutover");
   return checkedCutover({
     ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
     ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
@@ -323,6 +339,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     ...(lockWait === undefined ? {} : { claimLockWaitMs: Number(lockWait) }),
     ...(originFence === undefined ? {} : { originClaimFence: originFence }),
     ...(turnFenceRegister === undefined ? {} : { turnFenceRegister }),
+    ...(advertised === undefined ? {} : { advertisedMaxRecords: Number(advertised) }),
   }, true);
 }
 

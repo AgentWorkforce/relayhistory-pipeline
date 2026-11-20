@@ -908,6 +908,26 @@ describe("session ingest: INGEST_CLAIM_LOCK_WAIT_MS (claimLockWaitMs, default ab
   });
 });
 
+describe("session ingest: INGEST_ADVERTISED_MAX_RECORDS (advertisedMaxRecords, default absent)", () => {
+  it("omitted: no INGEST_ADVERTISED_MAX_RECORDS var, props byte-identical to a stack without the input", () => {
+    expect(Object.hasOwn(sessionIngestVars(inputs), "INGEST_ADVERTISED_MAX_RECORDS")).toBe(false);
+    expect(JSON.stringify(props(inputs))).toBe(JSON.stringify(props({ ...inputs, advertisedMaxRecords: undefined })));
+  });
+
+  it("set: exactly one more var (the number as text), no new binding", () => {
+    const on: SessionIngestInputs = { ...inputs, advertisedMaxRecords: 100 };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(inputs), INGEST_ADVERTISED_MAX_RECORDS: "100" });
+    expect(Object.keys(props(on).env).sort()).toEqual([...Object.keys(props(inputs).env), "INGEST_ADVERTISED_MAX_RECORDS"].sort());
+  });
+
+  it("is refused outside 1..500 or when not an integer", () => {
+    for (const value of [0, 501, -1, 1000, 12.5, "100", null, true])
+      expect(() => assertSessionIngestInputs({ ...inputs, advertisedMaxRecords: value } as never, refuse)).toThrow("sessionIngest.advertisedMaxRecords must be an integer from 1 to 500 (omit for the default 500)");
+    for (const value of [1, 50, 100, 500]) expect(() => assertSessionIngestInputs({ ...inputs, advertisedMaxRecords: value }, refuse)).not.toThrow();
+  });
+});
+
 describe("session ingest: INGEST_ORIGIN_CLAIM_FENCE (originClaimFence, default absent)", () => {
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
   it("omitted: no var, props byte-identical to a stack without the input", () => {

@@ -369,6 +369,10 @@ those stages the same 429 `delivery_busy` as the claim flag, and
 Both change only the error shape and the client's backoff; neither removes the
 underlying lock contention.
 
+`INGEST_ADVERTISED_MAX_RECORDS` (hosted Worker only, default off) is not read by
+the self-host server, which keeps publishing `maxRecords` 500. On the Worker it
+lowers only the advertised records-per-batch limit; the accepted limit stays 500.
+
 `SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
 upload request path: one create-only inbox PUT, then the hosted queued receipt,
 with an in-process consumer that admits the inbox. It also serves

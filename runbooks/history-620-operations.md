@@ -201,6 +201,23 @@ off and renders no var; any other value refuses (`private_ingest_profile_buffer_
 Worker is a production flag change that needs its own approval. A deploy may add or remove them at the live
 phase; rollback is unset (or empty), then plan and deploy, no code change.
 
+Advertised records per batch (default off; stack input `sessionIngest.advertisedMaxRecords`, an integer
+1..500, omit for off): `INGEST_ADVERTISED_MAX_RECORDS` changes only the `maxRecords` the Worker publishes on
+`GET /v1/delivery/limits` and in every receipt (`advertised-limits.ts`). Acceptance stays
+`MAX_DELIVERY_RECORDS` (500) at every gate, so lowering it refuses nothing and strands no batch an uploader
+already persisted: such a batch is retried with the same body and accepted. Uploaders that follow the
+published limit (desktop-core from v2026.11.4-beta.1; relayhistory sdk-ts) prepare their NEXT batches at the
+lower size after their next receipt or limits request; older uploaders keep sending up to 500, still accepted.
+Why: each staged commit holds the global receipt seat clock for a time roughly linear in its records, and a
+waiting commit fails 55P03 once the queue ahead of it outlasts the 2 s `lock_timeout` in one lock stage;
+smaller batches shorten each hold (more commits, about the same clock time per record). A value that is not a
+strict integer in 1..500 is ignored (500 published) with one warn line at app start, `error_code`
+`advertised_max_records_invalid`; it never refuses startup. On the private-ingest release it is a cutover
+control like the buffer-lock flags: `PRIVATE_INGEST_ADVERTISED_MAX_RECORDS` accepts decimal 1..500, unset or
+empty is off and renders no var, anything else refuses (`private_ingest_profile_advertised_max_records`).
+Setting it, planning and deploying is a production change that needs its own approval; rollback is unset
+(or empty), then plan and deploy, no code change.
+
 Claim lock wait (off unless set; production sets it): with `INGEST_CLAIM_LOCK_WAIT_MS` (25..2000; stack input
 `sessionIngest.claimLockWaitMs`) each claim attempt runs in its own short transaction, `BEGIN;
 SELECT set_config('lock_timeout', '<ms>ms', true), set_config('idle_in_transaction_session_timeout',

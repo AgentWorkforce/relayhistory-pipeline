@@ -14,7 +14,7 @@ import { assertUserDeleteAllowed, CAPTURE_POLICY_REVISION_HEADER, uploadPolicyEr
  * from AWS with S3 as the record and Supabase as the ledger. No Neon.
  *
  *   POST /v1/delivery/batches   rth:sync   one batch -> receipt (same shapes, same codes)
- *   GET  /v1/delivery/limits    rth:sync   DELIVERY_LIMITS + contentEncodings
+ *   GET  /v1/delivery/limits    rth:sync   the advertised limits (INGEST_ADVERTISED_MAX_RECORDS; default DELIVERY_LIMITS) + contentEncodings
  *   GET  /v1/turns/capabilities rth:sync   migration-backed turn-fence preflight
  *   POST /v1/turns/batches      rth:sync   relay session turns as records (turns.ts), same receipt
  *   GET  /healthz                          liveness only
@@ -52,7 +52,8 @@ import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } fro
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
-import { DELIVERY_LIMITS, DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
+import { advertisedDeliveryLimits } from "./advertised-limits.ts";
+import { DeliveryBusyError, DeliveryError, MAX_DELIVERY_BYTES, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
@@ -550,6 +551,8 @@ export function parseReset(body: unknown): { account_id: string; request_id: str
 }
 
 export function createIngestApp(deps: IngestAppDeps) {
+  // INGEST_ADVERTISED_MAX_RECORDS (advertised-limits.ts): the one resolved limits object every publish site reads.
+  const advertised = advertisedDeliveryLimits(deps.deliver.advertisedMaxRecords);
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
@@ -757,7 +760,7 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
   });
 
-  app.get("/v1/delivery/limits", (c) => c.json({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings() }));
+  app.get("/v1/delivery/limits", (c) => c.json({ ...advertised, contentEncodings: contentEncodings() }));
 
   // Cloud's deployment-order interlock. This reads an RPC created atomically with the
   // turn-fence tables/functions, so new Worker code against old ingest code OR an old
@@ -834,7 +837,7 @@ export function createIngestApp(deps: IngestAppDeps) {
         emit({ ...fields, outcome: "accepted_queued", count: prepared.records.length, duration_ms: Date.now() - started, bytes_raw: read.bytes });
         completed({ outcome: "accepted_queued" }, prepared.records.length);
         c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
-        return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+        return c.json({ ...prepared.receipt, limits: { ...advertised, contentEncodings: contentEncodings() } });
       }
       // Self-host "on": never a synchronous fallback (that would put SQL back on the request path).
       if (asyncMode === "on" && selfhostAdmission) throw new IngestUnavailable("admission_witness", witness ? "admission_not_queueable" : "privacy_journal_unavailable");
@@ -851,7 +854,7 @@ export function createIngestApp(deps: IngestAppDeps) {
           completed({ outcome: "legacy_replay" }, prepared.records.length);
           c.header(ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY);
           // receiptId is supplied explicitly: a stored receipt without a string one falls back to the prepared receipt's id.
-          return c.json({ ...stored.receipt, receiptId: typeof stored.receipt.receiptId === "string" ? stored.receipt.receiptId : prepared.receipt.receiptId, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
+          return c.json({ ...stored.receipt, receiptId: typeof stored.receipt.receiptId === "string" ? stored.receipt.receiptId : prepared.receipt.receiptId, limits: { ...advertised, contentEncodings: contentEncodings() } });
         }
       }
       if (!c.get("custody") && custodyMode === "frozen-supabase") c.set("custody", await frozenWitness(await batchWitnessInput(tenant, batch)));

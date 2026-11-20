@@ -221,6 +221,41 @@ test("buffer lock controls: absent renders nothing, on renders, anything else re
   expect(privateIngestVersionReadback(both, fromBoth.active, fromBoth.version)).toMatchObject({ phase: "baseline-drain" });
 });
 
+// Advertised records-per-batch limit (advertised-limits.ts): a cutover control; acceptance stays 500 either way.
+test("advertised max records control: env shape, profile check, and add / change / remove at a held phase", () => {
+  expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain("advertisedMaxRecords");
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ADVERTISED_MAX_RECORDS: "100" })).toEqual({ advertisedMaxRecords: 100 });
+  expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ADVERTISED_MAX_RECORDS: "" })).toEqual({});
+  for (const v of ["0", "501", "0100", "+100", "-1", " 100", "100 ", "1e2", "100.0", "abc", "1000"])
+    expect(code(() => privateIngestCutoverFromEnv({ PRIVATE_INGEST_ADVERTISED_MAX_RECORDS: v }))).toBe("private_ingest_profile_advertised_max_records");
+  for (const phase of ["baseline-drain", "step-4-async-on"] as const)
+    expect(privateIngestReleasePhase(at(phase, { advertisedMaxRecords: 100 }))).toBe(phase);
+  for (const bad of [0, 501, 12.5, "100"])
+    expect(code(() => privateIngestReleasePhase(at("baseline-drain", { advertisedMaxRecords: bad } as never)))).toBe("private_ingest_profile_advertised_max_records");
+  const plain = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250 });
+  const lower = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, advertisedMaxRecords: 100 });
+  const lowest = at("baseline-drain", { claimTimeoutBusy: "on", claimLockWaitMs: 250, advertisedMaxRecords: 50 });
+  const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+  const fromPlain = live(plain), fromLower = live(lower);
+  expect(privateIngestTransitionReadback(lower, fromPlain.active, fromPlain.version)).toMatchObject(pass);  // add
+  expect(privateIngestTransitionReadback(lowest, fromLower.active, fromLower.version)).toMatchObject(pass); // change
+  expect(privateIngestTransitionReadback(plain, fromLower.active, fromLower.version)).toMatchObject(pass);  // remove (rollback)
+  expect(privateIngestVersionReadback(lower, fromLower.active, fromLower.version)).toMatchObject({ phase: "baseline-drain" });
+  expect(code(() => privateIngestVersionReadback(lowest, fromLower.active, fromLower.version))).not.toBeNull();
+  for (const bad of [
+    [{ name: "INGEST_ADVERTISED_MAX_RECORDS", type: "plain_text", text: "0" }],
+    [{ name: "INGEST_ADVERTISED_MAX_RECORDS", type: "plain_text", text: "501" }],
+    [{ name: "INGEST_ADVERTISED_MAX_RECORDS", type: "plain_text", text: "1e2" }],
+    [{ name: "INGEST_ADVERTISED_MAX_RECORDS", type: "secret_text" }],
+  ]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+  const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
+  expect(workflow).toContain("PRIVATE_INGEST_ADVERTISED_MAX_RECORDS: ${{ vars.PRIVATE_INGEST_ADVERTISED_MAX_RECORDS }}");
+  expect(workflow.split("\npermissions:")[0]).not.toContain("PRIVATE_INGEST_ADVERTISED_MAX_RECORDS");
+});
+
 // Per-origin claim fence (migration 20261105062010): a cutover control like the claim lock controls.
 test("origin claim fence control: env shape, and add / remove at a held phase", () => {
   expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_ORIGIN_CLAIM_FENCE: "on" })).toEqual({ originClaimFence: "on" });
