@@ -356,3 +356,18 @@ describe("062156 draws happen at main's logical point; the replay draws nothing"
     expect(seq(on)).toBe(seq(off));
   });
 });
+
+describe("062156 the per-scope state decides after the first existence read (history owner's case)", () => {
+  test("A, B, A with A's publications row missing: A draws 1 then 2, B 1; equal to main; the sequence advances by 4", async () => {
+    const f = await fixture();
+    const c = await capture(f, [S("aba1", "s-ab-A", 2), S("aba2", "s-ab-B", 2), S("aba3", "s-ab-A", 2)]);
+    const { off, on } = await both(f, [commit(c.payload)], (g) => history(g, { sessions: ["s-ab-A", "s-ab-B"] }));
+    committed(on);
+    // Draw accounting for this batch: A first (row absent) 1, B first (row absent) 1, A again (row now "exists") 2.
+    const pubs = Object.fromEntries(rows(on, "sessions.session_replay_publications").filter((x) => x.session_id.startsWith("s-ab-")).map((x) => [x.session_id, Number(x.epoch)]));
+    expect(pubs["s-ab-A"]! - pubs["s-ab-B"]!).toBe(2);
+    expect(rows(on, "sessions.ingest_history_required_scopes").filter((x) => x.session_id.startsWith("s-ab-")).map((x) => [x.session_id, Number(x.request_version)]).sort())
+      .toEqual([["s-ab-A", 2], ["s-ab-B", 1]]);
+    expect(invalidations(off)).toBe(3);
+  });
+});
