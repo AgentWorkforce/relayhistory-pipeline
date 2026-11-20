@@ -516,6 +516,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.staged_facts_v1 and function sessions.staged_facts_reconcile_v1",
     sql: "SELECT to_regclass('sessions.staged_facts_v1') IS NOT NULL AND to_regprocedure('sessions.staged_facts_reconcile_v1(bigint,uuid,text,text,text,text[],text,boolean,bigint)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062155_lazy_ack_set_based.sql": {
+    evidence: "replacement: staged ACK carries the gated set-based twin of its per-record loop (bulls96.lazy_ack_set_based)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%current_setting(''bulls96.lazy_ack_set_based'',true)%' AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
