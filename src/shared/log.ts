@@ -37,6 +37,9 @@ const SUMMARY_INPUT_FIELDS = [
 /** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */
 const STREAM_BUDGET_FIELDS = ["max_read_bytes", "max_read_events", "largest_streamed_scope_bytes", "largest_streamed_scope_events"];
 
+/** The search pass's phase timers and write counters (session-pipeline/consumer.ts). */
+const SEARCH_PHASE_FIELDS = ["source_read_ms", "index_scan_ms", "locked_apply_ms", "write_calls", "write_batches"];
+
 export const ALLOWED_LOG_FIELDS = new Set([
   // The staged run summary line: the pass was answered from a cached size refusal (search-index.ts StagedRefusals).
   "cached_refusal",
@@ -94,6 +97,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // `streaming` is on / off only (STREAMING_VALUES), the budgets bounded counts (STREAM_BUDGET_FIELDS).
   "streaming",
   ...STREAM_BUDGET_FIELDS,
+  ...SEARCH_PHASE_FIELDS,
   // The ingest origin claim fence fallback (src/session-ingest/ledger-sql.ts originScoped): epoch ms until which the
   // isolate uses the per-user functions; a bounded integer.
   "fallback_until_ms",
@@ -125,6 +129,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...STREAM_BUDGET_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
+  ...SEARCH_PHASE_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SUMMARY_INPUT_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
