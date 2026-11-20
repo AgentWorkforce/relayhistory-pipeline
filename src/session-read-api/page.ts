@@ -23,6 +23,7 @@ import {
   type OriginMode,
   buildWorkspacePartialSessionsQuery,
   PARTIAL_SESSIONS_CAP,
+  PARTIAL_SESSION_MAX_PAGES,
   PAGE_BYTE_BUDGET,
   ROW_OVERHEAD_BYTES,
   candidatePosition,
@@ -271,6 +272,17 @@ export interface WorkspacePartials {
   overflow: boolean;
 }
 
+export type WorkspacePartialMode = "refuse" | "skip";
+
+const compareUtf8 = (a: string, b: string) => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+
+function partialScanBound(mode: WorkspacePartialMode): WorkspacePartials {
+  if (mode === "refuse") return { sessions: [], overflow: true };
+  throw new SearchIndexError("unavailable", true, "partial_page_cap");
+}
+
+const firstPartial = (sessions: Set<string>): WorkspacePartials => ({ sessions: [...sessions].sort(compareUtf8).slice(0, 1), overflow: false });
+
 /**
  * The partial sessions a workspace search must not answer without: those of
  * the token's org that belong to the token's workspace. The state table has
@@ -289,42 +301,55 @@ export interface WorkspacePartials {
  * would not do: the events a partial session is missing are not candidates.
  *
  * Org-wide state is keyset-paged so sibling workspaces cannot consume this
- * workspace's bound. Each page is attributed by existing event rows and then
- * live pointers; only attributed sessions count toward the cap.
+ * workspace's session bound. Each page is attributed by existing event rows
+ * and then live pointers; only attributed sessions count toward the cap.
+ * Refuse mode needs only one attribution and maps an undecided scan bound to
+ * overflow (501 fallback). Skip mode needs the complete exclusion set, so the
+ * same scan bound is unavailable (503).
  */
-export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, workspaceId: string): Promise<WorkspacePartials> {
-  if (deps.adapter) {
-    const result = await adapterPartials(deps, orgId, workspaceId);
-    return { sessions: [...result.sessions], overflow: result.overflow };
-  }
-  if (!deps.ch) throw new Error("read search binding missing");
-  return deadline(deps, async (signal) => {
-    const sessions = new Set<string>();
-    let after = "";
-    while (true) {
-      if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
-      const q = buildWorkspacePartialSessionsQuery(deps.ch!.database, orgId, workspaceId, after);
-      const rows = await deps.ch!.select<{ session_id: string; in_workspace: number | string }>(q.query, {
-        settings: { ...READ_SETTINGS },
-        timeoutMs: deps.timeoutMs ?? 3_000,
-        params: q.params,
-      });
-      if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
-      for (const row of rows) {
-        if (!row.session_id || row.session_id <= after) throw new SearchIndexError("unavailable", true);
-        if (Number(row.in_workspace) === 1) sessions.add(row.session_id);
-      }
-      const withoutRows = rows.filter((row) => Number(row.in_workspace) !== 1).map((row) => row.session_id);
-      if (withoutRows.length > 0) {
-        const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, withoutRows);
-        if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
-        for (const id of withoutRows) if (pointed.has(id)) sessions.add(id);
-      }
-      if (sessions.size > PARTIAL_SESSIONS_CAP) return { sessions: [], overflow: true };
-      if (rows.length < PARTIAL_SESSIONS_CAP) return { sessions: [...sessions], overflow: false };
-      after = rows[rows.length - 1]!.session_id;
+export async function partialSessionsInWorkspace(deps: PageDeps, orgId: string, workspaceId: string, mode: WorkspacePartialMode = "skip"): Promise<WorkspacePartials> {
+  try {
+    if (deps.adapter) {
+      const result = await adapterPartials(deps, orgId, workspaceId);
+      return { sessions: [...result.sessions], overflow: result.overflow };
     }
-  });
+    if (!deps.ch) throw new Error("read search binding missing");
+    return await deadline(deps, async (signal) => {
+      const sessions = new Set<string>();
+      let after: string | undefined;
+      let pages = 0;
+      while (true) {
+        if (pages >= PARTIAL_SESSION_MAX_PAGES) return partialScanBound(mode);
+        if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+        const q = buildWorkspacePartialSessionsQuery(deps.ch!.database, orgId, workspaceId, after);
+        const rows = await deps.ch!.select<{ session_id: string; in_workspace: number | string }>(q.query, {
+          settings: { ...READ_SETTINGS },
+          timeoutMs: deps.timeoutMs ?? 3_000,
+          params: q.params,
+        });
+        pages++;
+        if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+        for (const row of rows) {
+          if (!row.session_id || row.session_id.includes("\uFFFD") || after !== undefined && compareUtf8(row.session_id, after) <= 0) throw new SearchIndexError("unavailable", true, "partial_page_order");
+          if (Number(row.in_workspace) === 1) sessions.add(row.session_id);
+        }
+        if (mode === "refuse" && sessions.size > 0) return firstPartial(sessions);
+        const withoutRows = rows.filter((row) => Number(row.in_workspace) !== 1).map((row) => row.session_id);
+        if (withoutRows.length > 0) {
+          const pointed = await deps.liveness.livePointerSessions(orgId, workspaceId, withoutRows);
+          if (signal.aborted) throw new SearchIndexError("unavailable", true, "timeout");
+          for (const id of withoutRows) if (pointed.has(id)) sessions.add(id);
+        }
+        if (mode === "refuse" && sessions.size > 0) return firstPartial(sessions);
+        if (sessions.size > PARTIAL_SESSIONS_CAP) return { sessions: [], overflow: true };
+        if (rows.length < PARTIAL_SESSIONS_CAP) return { sessions: [...sessions].sort(compareUtf8), overflow: false };
+        after = rows[rows.length - 1]!.session_id;
+      }
+    });
+  } catch (error) {
+    if (mode === "refuse" && error instanceof SearchIndexError && error.detail === "timeout") return { sessions: [], overflow: true };
+    throw error;
+  }
 }
 
 async function deadline<T>(deps: PageDeps, work: (signal: AbortSignal) => Promise<T>): Promise<T> {

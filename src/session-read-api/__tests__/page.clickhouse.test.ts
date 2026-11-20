@@ -340,7 +340,7 @@ suite("readEventPage on ClickHouse", () => {
     await recordState(ch, scope("w-never"), 2, 1, true, t(4));
 
     // w-here indexed earlier, then a partial pass: its row in ws-a attributes it.
-    // The remaining rowless org partials are still checked against ws-a's pointers.
+    // The remaining org partials without a ws-a row are still checked against ws-a's pointers.
     await recordState(ch, scope("w-here"), 3, 0, false, t(5));
     const asked = memoryLiveness();
     expect(await partialSessionsInWorkspace({ ch, liveness: asked.liveness }, org, "ws-a")).toEqual({ sessions: ["w-here"], overflow: false });

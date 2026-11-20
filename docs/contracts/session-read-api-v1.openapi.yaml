@@ -258,7 +258,10 @@ paths:
         default) the first page is 501 `session_partial` /
         `session_partial_unbounded`. The unbounded condition counts only
         partial sessions attributed to the requested workspace, not sibling
-        workspaces in the same organization.
+        workspaces in the same organization. Default refuse mode returns on
+        the first attributed session; if its bounded attribution scan cannot
+        decide, it returns `session_partial_unbounded` so the caller falls
+        back. Skip mode returns 503 when that scan cannot complete safely.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}

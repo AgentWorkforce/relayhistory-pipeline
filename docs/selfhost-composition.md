@@ -484,7 +484,9 @@ search answer 200 anyway, with `incomplete` (`session_partial` plus the partial 
 `session_partial_unbounded` with no list) and the `X-Sessions-Read-Incomplete` header. Each page, cursor pages
 included, checks again and leaves out the listed sessions' rows, so a session indexed while small and partial
 since never serves stale rows. `session_partial_unbounded` lists nothing and excludes nothing, so its pages may
-still hold stale rows. A search backend that cannot exclude sessions refuses `skip` at startup. On the Postgres or
+still hold stale rows. The ClickHouse attribution scan is limited to 32 pages and 3 s: default refuse mode maps
+either undecided bound to 501 `session_partial_unbounded` for fallback, while skip mode returns 503 because it
+cannot safely construct the exclusion list. A search backend that cannot exclude sessions refuses `skip` at startup. On the Postgres or
 OpenSearch search path a session is partial while its index state is not complete and current: its first index pass
 has not run yet, it is too large for the limits (`scope_too_large`), or a new upload moved its directory epoch and the
 re-index has not run yet. So with `skip` a session that is being written to drops out of search results until its
