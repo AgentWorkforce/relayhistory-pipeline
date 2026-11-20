@@ -53,6 +53,10 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "route", "correlation_id",
   // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
   "db_error_class", "db_error_code", "db_error_basis", "error_name",
+  // The pg Client 'error' line's closed message shape, the first frame's function name and the
+  // client phase (DB_ERROR_DETAIL_VALUES, FRAME_NAME_SHAPE, DB_CLIENT_PHASE_VALUES; anything else is
+  // dropped; the mirrors are pinned in src/session-ingest/__tests__/db-error-class.test.ts).
+  "db_error_detail", "error_frame", "db_client_phase",
   // ...and a 55000's closed refusal class (db-refusal-class.ts; DB_REFUSAL_VALUES, anything else dropped;
   // the mirror is pinned in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "db_refusal",
@@ -154,6 +158,9 @@ export const DB_REFUSAL_VALUES: ReadonlySet<string> = new Set([
   "user_privacy_authority", "ack_seal", "native_custody_identity_changed", "source_row_privacy_fenced",
   "custody_privacy_inconsistent", "user_seal_missing", "receipt_proof_missing", "publication_transition", "other",
 ]);
+/** `db_error_detail` / `db_client_phase` mirror session-ingest db-error-class.ts DB_ERROR_DETAILS / DB_CLIENT_PHASES. */
+export const DB_ERROR_DETAIL_VALUES: ReadonlySet<string> = new Set(["socket_closed", "stream_state", "read_property", "not_function", "other", "none"]);
+export const DB_CLIENT_PHASE_VALUES: ReadonlySet<string> = new Set(["active", "ending"]);
 /** `client_kind` / `client_os` mirror session-ingest client-agent.ts CLIENT_KINDS / CLIENT_OSES (pinned in ingest-refusal-log.test.ts). */
 export const CLIENT_KIND_VALUES: ReadonlySet<string> = new Set(["desktop", "other"]);
 export const CLIENT_OS_VALUES: ReadonlySet<string> = new Set(["macos", "linux", "windows", "other"]);
@@ -166,13 +173,16 @@ const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
+  ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],
 ]);
 /** Shaped fields: emitted only when the string matches its pattern AND the scrubber leaves it unchanged (else
  * dropped). `client_version` is a release version (client-agent.ts CLIENT_VERSION, pinned equal in
  * ingest-refusal-log.test.ts): never a token, hostname or hex id. */
 export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Za-z.]{1,16})?$/;
 export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
-const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE]]);
+/** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
+export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
+const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;

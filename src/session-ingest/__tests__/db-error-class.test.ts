@@ -1,7 +1,7 @@
 /** Closed DB-client error classification for the private ingest Worker's 503 attribution.
  * Diagnostic only: status/retry/timeout/pool/connection behavior is unchanged. */
 import { afterEach, describe, expect, test } from "bun:test";
-import { DB_ERROR_BASES, DB_ERROR_CLASSES, DB_ERROR_CODE_FALLBACK, classifyDbError, dbClientErrorFields, dbErrorDiagnosis, dbErrorName } from "../db-error-class.ts";
+import { DB_ERROR_BASES, DB_ERROR_CLASSES, DB_ERROR_CODE_FALLBACK, FRAME_NAME, classifyDbError, dbClientErrorFields, dbErrorDiagnosis, dbErrorName } from "../db-error-class.ts";
 import { ALLOWED_LOG_FIELDS, log, logLine } from "../../shared/log.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
 import { ledgerErrorCode, sqlLedger } from "../ledger-sql.ts";
@@ -95,7 +95,7 @@ describe("dbErrorName / dbClientErrorFields: only closed values leave", () => {
       expect(d).toEqual({ db_error_class: "unknown", db_error_code: "db_error", db_error_basis: "none" });
       expect(classifyDbError(err({ code: key }))).toBe("unknown");
       const f = dbClientErrorFields(err({ code: key, name: key }));
-      expect(f).toEqual({ error_code: "db_error", db_error_class: "unknown", db_error_basis: "none", error_name: "other" });
+      expect(f).toEqual({ error_code: "db_error", db_error_class: "unknown", db_error_basis: "none", error_name: "other", db_error_detail: "none", error_frame: expect.stringMatching(FRAME_NAME) });
       const parsed = JSON.parse(logLine("error", "session ingest db error", f)) as Record<string, unknown>;
       for (const k of ["error_code", "db_error_class", "db_error_basis", "error_name"]) expect(typeof parsed[k]).toBe("string");
     }
@@ -106,14 +106,15 @@ describe("dbErrorName / dbClientErrorFields: only closed values leave", () => {
     const fallback = { error_code: "db_error", db_error_class: "unknown", db_error_basis: "none", error_name: "other" };
     for (const e of throwingErrors()) {
       expect(() => dbClientErrorFields(e)).not.toThrow();
-      expect(dbClientErrorFields(e)).toEqual(fallback);
+      // error_frame is a closed sentinel or the test's own function name (a real stack may survive).
+      expect(dbClientErrorFields(e)).toEqual({ ...fallback, db_error_detail: "none", error_frame: expect.stringMatching(FRAME_NAME) });
       expect(classifyDbError(e)).toBe("unknown");
       expect(dbErrorName(e)).toBe("other");
       expect(() => log.error("session ingest db error", dbClientErrorFields(e))).not.toThrow();
     }
     // Only the throwing property is lost: a safe code next to a throwing message still classifies.
     const partial = Object.defineProperty(Object.assign(new Error(), { code: "ECONNRESET" }), "message", { get() { throw new Error(SECRET); } });
-    expect(dbClientErrorFields(partial)).toEqual({ error_code: "ECONNRESET", db_error_class: "reset", db_error_basis: "code", error_name: "Error" });
+    expect(dbClientErrorFields(partial)).toEqual({ error_code: "ECONNRESET", db_error_class: "reset", db_error_basis: "code", error_name: "Error", db_error_detail: "none", error_frame: expect.stringMatching(FRAME_NAME) });
   });
 
   test("statement timeout (57014) and idle-in-transaction kill (25P03) keep distinct safe codes, apart from code-less drops", () => {
@@ -152,6 +153,9 @@ describe("dbErrorName / dbClientErrorFields: only closed values leave", () => {
     expect(ALLOWED_LOG_FIELDS.has("db_error_class")).toBe(true);
     expect(ALLOWED_LOG_FIELDS.has("error_name")).toBe(true);
     expect(ALLOWED_LOG_FIELDS.has("error_message")).toBe(false);
+    // The pg 'error' line's added fields are closed or shaped (pg-client-end-error.test.ts); still no stack text.
+    for (const k of ["db_error_detail", "error_frame", "db_client_phase"]) expect(ALLOWED_LOG_FIELDS.has(k)).toBe(true);
+    for (const k of ["error_stack", "stack"]) expect(ALLOWED_LOG_FIELDS.has(k)).toBe(false);
   });
 });
 

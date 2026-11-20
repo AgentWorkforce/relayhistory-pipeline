@@ -13,6 +13,17 @@
  *   db_refusal      SQLSTATE 55000 only: the closed refusal class from the message's known
  *                   prefix (db-refusal-class.ts DB_REFUSALS; unmatched is "other")
  *   error_name     an allowlisted constructor name, else "other"
+ * and, on the pg Client 'error' line only (dbClientErrorFields):
+ *   db_error_detail  a closed shape of the message (DB_ERROR_DETAILS), e.g. workerd's
+ *                    "This socket has been closed." is socket_closed; never the text
+ *   error_frame      the FUNCTION NAME of the first stack frame below the error's own
+ *                    "<name>: <message>" header, only when it is a dotted JS identifier of
+ *                    at most 64 chars (FRAME_NAME); "anonymous", "none" or "other" otherwise.
+ *                    No file, line, column, URL or message text; a stack whose header does
+ *                    not equal the error's own name and message is "other", so text inside a
+ *                    message can never be read as a frame
+ *   db_client_phase  active | ending, supplied by the caller: whether the client's end() had
+ *                    already been called when the event fired
  * The error's message, stack, connection string/URL, query text, any other code value or
  * any user/session data are never returned, logged or interpolated.
  *
@@ -95,7 +106,7 @@ export interface DbErrorSnapshot { readonly code?: string; readonly message?: st
 type Snapshot = DbErrorSnapshot;
 
 /** One read of a property; any throw (getter, proxy trap, revoked proxy) reads as absent. */
-function readString(target: unknown, key: "code" | "message" | "name"): string | undefined {
+function readString(target: unknown, key: "code" | "message" | "name" | "stack"): string | undefined {
   try {
     if (target === null || (typeof target !== "object" && typeof target !== "function")) return undefined;
     const value: unknown = (target as Record<string, unknown>)[key];
@@ -173,14 +184,94 @@ export function dbErrorName(error: unknown): string {
   return name !== undefined && NAME_SET.has(name) ? name : "other";
 }
 
-/** The log fields for a pg Client 'error' event: the safe code, the class, its basis and an
- * allowlisted name. Never throws (it runs inside the pg 'error' listener). */
-export function dbClientErrorFields(error: unknown): { error_code: string; db_error_class: DbErrorClass; db_error_basis: DbErrorBasis; error_name: string } {
+/** Closed shapes of a pg Client 'error' message. Matched in RAM on the bounded, lower-cased
+ * snapshot; only the label leaves. First match wins; a message matching none is "other",
+ * a missing or empty one "none". */
+export type DbErrorDetail = "socket_closed" | "stream_state" | "read_property" | "not_function" | "other" | "none";
+export const DB_ERROR_DETAILS: readonly DbErrorDetail[] = Object.freeze(["socket_closed", "stream_state", "read_property", "not_function", "other", "none"]);
+const MESSAGE_DETAIL: readonly (readonly [RegExp, DbErrorDetail])[] = [
+  // workerd cloudflare:sockets, e.g. a read pending when Socket.close() ran.
+  [/socket (?:has been|has already been|is|was) closed/, "socket_closed"],
+  // workerd/WHATWG streams: a locked, released, closed or errored reader/writer.
+  [/locked to a reader|locked to a writer|releaselock|reader has been released|writer has been released|stream (?:has been|is|was) (?:closed|errored|locked)/, "stream_state"],
+  [/cannot (?:read|set) propert/, "read_property"],
+  [/is not a function/, "not_function"],
+];
+
+export type DbClientPhase = "active" | "ending";
+export const DB_CLIENT_PHASES: readonly DbClientPhase[] = Object.freeze(["active", "ending"]);
+
+/** A function name that may be logged: dotted JS identifiers, at most 64 chars. */
+export const FRAME_NAME = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
+const FRAME_NAME_MAX = 64;
+const STACK_SCAN_MAX = 4096;
+const FRAME_LINE_MAX = 512;
+/** V8 frame lines: "    at [async ][new ]<fn>[ [as <alias>]] (<location>)" or "    at [async ]<location>". */
+const FRAME_WITH_FN = /^\s+at (?:async )?(?:new )?(.+?)(?: \[as [^\]]*\])? \(/;
+const FRAME_BARE = /^\s+at /;
+
+function detailOf(message: string | undefined): DbErrorDetail {
+  if (message === undefined || message === "") return "none";
+  for (const [pattern, detail] of MESSAGE_DETAIL) if (pattern.test(message)) return detail;
+  return "other";
+}
+
+/** The first frame's function name, or a fixed sentinel. Never throws, never returns text
+ * that fails FRAME_NAME. The stack's header is removed by equality with the error's own
+ * name and message (read once each), so a message carrying "\n    at x (" cannot forge a frame.
+ * Residual: a message rewritten after the stack was captured to a prefix of itself that ends just
+ * before such a line could still expose one identifier-shaped token. Neither pg, pg-protocol,
+ * pg-cloudflare nor this package rewrites an Error's message that way. */
+export function errorFrame(error: unknown): string {
+  try {
+    const stack = readString(error, "stack");
+    if (stack === undefined || stack === "") return "none";
+    const name = readString(error, "name") ?? "Error";
+    const message = readString(error, "message") ?? "";
+    const header = message === "" ? name : `${name}: ${message}`;
+    if (!stack.startsWith(header)) return "other";
+    const rest = stack.slice(header.length, header.length + STACK_SCAN_MAX);
+    if (rest !== "" && rest[0] !== "\n") return "other";
+    for (const full of rest.split("\n")) {
+      if (full === "") continue;
+      // A frame line is short; the cap keeps the lazy match linear-ish on a hostile stack.
+      const line = full.slice(0, FRAME_LINE_MAX);
+      if (!FRAME_BARE.test(line)) return "other";
+      const fn = FRAME_WITH_FN.exec(line)?.[1];
+      if (fn === undefined) return "anonymous";
+      return fn.length <= FRAME_NAME_MAX && FRAME_NAME.test(fn) ? fn : "other";
+    }
+    return "none";
+  } catch {
+    return "other";
+  }
+}
+
+export type DbClientErrorFields = {
+  error_code: string;
+  db_error_class: DbErrorClass;
+  db_error_basis: DbErrorBasis;
+  error_name: string;
+  db_error_detail: DbErrorDetail;
+  error_frame: string;
+  db_client_phase?: DbClientPhase;
+};
+
+/** The log fields for a pg Client 'error' event: the safe code, the class, its basis, an
+ * allowlisted name, the closed message shape, the first frame's function name and (when the
+ * caller knows it) whether the client was already ending. Never throws (it runs inside the
+ * pg 'error' listener). */
+export function dbClientErrorFields(error: unknown, phase?: DbClientPhase): DbClientErrorFields {
+  const withPhase = (f: DbClientErrorFields): DbClientErrorFields => (phase === "active" || phase === "ending" ? { ...f, db_client_phase: phase } : f);
   try {
     const s = snapshot(error);
     const d = diagnose(s);
-    return { error_code: d.db_error_code, db_error_class: d.db_error_class, db_error_basis: d.db_error_basis, error_name: s.name !== undefined && NAME_SET.has(s.name) ? s.name : "other" };
+    return withPhase({
+      error_code: d.db_error_code, db_error_class: d.db_error_class, db_error_basis: d.db_error_basis,
+      error_name: s.name !== undefined && NAME_SET.has(s.name) ? s.name : "other",
+      db_error_detail: detailOf(s.message), error_frame: errorFrame(error),
+    });
   } catch {
-    return { error_code: DB_ERROR_CODE_FALLBACK, db_error_class: "unknown", db_error_basis: "none", error_name: "other" };
+    return withPhase({ error_code: DB_ERROR_CODE_FALLBACK, db_error_class: "unknown", db_error_basis: "none", error_name: "other", db_error_detail: "none", error_frame: "other" });
   }
 }
