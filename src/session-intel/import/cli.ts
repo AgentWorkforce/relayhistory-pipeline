@@ -215,6 +215,8 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (stats.codexPrefixRecordsDropped || stats.codexChildrenWithoutTaskBoundary)
     io.err(`import: warning: dropped ${stats.codexPrefixRecordsDropped} Codex child prefix records; `
       + `${stats.codexChildrenWithoutTaskBoundary} children had no verified own task boundary`);
+  if (stats.codexCodeModeShellUnparsed)
+    io.err(`import: warning: ${stats.codexCodeModeShellUnparsed} Codex code-mode calls had unsupported or bounded-out shell syntax; commit coverage is incomplete`);
   // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);
