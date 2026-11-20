@@ -138,6 +138,11 @@ export interface SessionPipelineInputs {
    */
   skipCurrent?: boolean;
   /**
+   * Default off. `true` renders SEARCH_INDEX_PREREAD_ENABLED=true: the legacy ClickHouse whole-read
+   * path reads its source and index before the search lock. Requires searchIndex.
+   */
+  searchPreRead?: boolean;
+  /**
    * Default off. `true` renders SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage makes its object-store
    * reads (manifest, move probe) before taking the session's lock and re-validates under it, so the lock
    * transaction holds SQL only (pointer.ts indexPreRead).
@@ -316,7 +321,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "pointerPreRead") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "legacyReadSource" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "relayfacts" && k !== "schedules" && k !== "streamReconcile" && k !== "summaryRegen" && k !== "skipCurrent" && k !== "searchPreRead" && k !== "pointerPreRead") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -336,6 +341,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
   if (v.skipCurrent !== undefined && typeof v.skipCurrent !== "boolean") refuse("transcriptStore.sessionPipeline.skipCurrent must be a boolean");
   if (v.skipCurrent === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipCurrent requires searchIndex: true");
+  if (v.searchPreRead !== undefined && typeof v.searchPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.searchPreRead must be a boolean");
+  if (v.searchPreRead === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.searchPreRead requires searchIndex: true");
   if (v.pointerPreRead !== undefined && typeof v.pointerPreRead !== "boolean") refuse("transcriptStore.sessionPipeline.pointerPreRead must be a boolean");
   // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
   if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
@@ -689,6 +696,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
     // Only when armed: a stage without skipCurrent: true renders nothing and never skips.
     ...(i.p.skipCurrent === true ? { SEARCH_INDEX_SKIP_CURRENT_ENABLED: "true" } : {}),
+    // Only when armed: a stage without searchPreRead: true keeps the whole search pass under its lock.
+    ...(i.p.searchPreRead === true ? { SEARCH_INDEX_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without pointerPreRead: true renders nothing and reads under the lock as before.
     ...(i.p.pointerPreRead === true ? { SESSION_POINTER_PREREAD_ENABLED: "true" } : {}),
     // Only when armed: a stage without streamReconcile.enabled renders none of these and never streams.

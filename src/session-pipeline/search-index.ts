@@ -202,6 +202,13 @@ export interface SearchIndexDeps {
    * `skipped`, reason `already_current`, nothing written. Absent: every pass exactly as before.
    */
   skipCurrent?: boolean;
+  /**
+   * SEARCH_INDEX_PREREAD_ENABLED=true: for the legacy ClickHouse whole-read path without output
+   * facts, read the canonical source and scan the index before the search transaction, then apply
+   * only after the source stamp is unchanged under the existing locks. Staged, streamed, adapter
+   * and output-facts paths deliberately keep the base behavior.
+   */
+  preRead?: boolean;
 }
 
 /** Additive phase counters for the existing search-pass log line. Durations are wall milliseconds. */
@@ -513,7 +520,87 @@ async function livePointerSnapshot(tx: SqlExecutor, scope: SessionScope): Promis
   return { keys: rows.map((r) => r.manifest_key), epoch: rows[0]?.event_epoch ?? "0", canonicalId:canonicalId??scope.sessionId };
 }
 
+const SEARCH_SCOPE_CHANGED = Symbol("search_scope_changed");
+
+interface SearchPreRead {
+  stamp: SourceStamp;
+  siblingKeys: string[];
+  at: Date;
+  version: number;
+  fromMs: number;
+  s3: Awaited<ReturnType<typeof readCanonicalScope>>;
+  scan?: Awaited<ReturnType<SearchProjectionIo["scan"]>>;
+}
+
+const sourceStampEqual = (a: SourceStamp, b: SourceStamp): boolean =>
+  a.canonicalId === b.canonicalId && a.epoch === b.epoch && a.manifestFingerprint === b.manifestFingerprint;
+
+async function currentSourceStamp(tx: SqlExecutor, scope: SessionScope, snapshot: { canonicalId: string; epoch: string }): Promise<SourceStamp> {
+  return { canonicalId: snapshot.canonicalId, epoch: snapshot.epoch, manifestFingerprint: await sourceFingerprint(tx, scope, snapshot.canonicalId) };
+}
+
+/** Flag-on capture: SQL snapshot only; every object/index read happens after this transaction commits. */
+async function captureSearchPreRead(scope: SessionScope, deps: SearchIndexDeps, limits: SearchIndexLimits): Promise<SearchPreRead | undefined> {
+  const captured = await deps.transact(async (tx) => {
+    const snapshot = await livePointerSnapshot(tx, scope);
+    if (!snapshot.keys.length || layoutComponent(snapshot.canonicalId) !== scope.sessionId) return undefined;
+    const { rows: siblings } = await tx.query<{ manifest_key: string }>(`SELECT manifest_key FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,
+      [scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId]);
+    const siblingKeys = siblings.map((r) => r.manifest_key);
+    if (!siblingKeys.length) return undefined;
+    return { snapshot, siblingKeys, stamp: await currentSourceStamp(tx, scope, snapshot) };
+  });
+  if (!captured) return undefined;
+  const at = (deps.now ?? (() => new Date()))();
+  const version = at.getTime();
+  const io = observedProjectionIo(legacyProjectionIo(deps.ch!), deps.metrics);
+  const fromMs = await io.fromMs(at);
+  const s3 = await measurePhase(deps.metrics, "sourceReadMs", () =>
+    readCanonicalScope(scope, captured.siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, captured.snapshot.canonicalId));
+  const complete = captured.siblingKeys.length && s3.complete && s3.directorySessionId === captured.snapshot.canonicalId && s3.events !== null;
+  const scan = complete ? await io.scan(scope, captured.snapshot.canonicalId, fromMs, limits.maxRows) : undefined;
+  return { stamp: captured.stamp, siblingKeys: captured.siblingKeys, at, version, fromMs, s3, ...(scan ? { scan } : {}) };
+}
+
+/** The optional skip-current gate stays ahead of every flag-on source or index read. */
+async function preReadSkipCurrent(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult | undefined> {
+  if (!deps.skipCurrent) return undefined;
+  return deps.transact(async (tx) => {
+    const { rows: got } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+    if (!got[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["scope_busy"] };
+    const snapshot = await livePointerSnapshot(tx, scope);
+    const { rows: canonicalLock } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events", scope.orgId, scope.workspaceId, scope.harness, snapshot.canonicalId].join("\u001f")]);
+    if (!canonicalLock[0]?.ok) return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, busy: true, reasons: ["canonical_scope_busy"] };
+    if (!snapshot.keys.length || layoutComponent(snapshot.canonicalId) !== scope.sessionId) return undefined;
+    return (await alreadyCurrent(tx, scope, snapshot, snapshot.keys.length))
+      ? { manifests: snapshot.keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] }
+      : undefined;
+  });
+}
+
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
+  // These paths need their existing transaction-bound service/facts/stream contracts. The flag is
+  // accepted but deliberately leaves them on the byte-identical base path.
+  if (!deps.preRead || deps.adapter || deps.staged || deps.stream || deps.outputFacts || deps.outputFactsStore)
+    return indexSearchScopeBase(scope, deps);
+  const skipped = await preReadSkipCurrent(scope, deps);
+  if (skipped) return skipped;
+  const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const prepared = await captureSearchPreRead(scope, deps, limits);
+    // Empty, erased, malformed-canonical and alias-only scopes keep the unmodified locked path.
+    if (!prepared) return indexSearchScopeBase(scope, deps);
+    const applied = await indexSearchScopeBase(scope, deps, prepared);
+    if (applied !== SEARCH_SCOPE_CHANGED) return applied;
+  }
+  // Sustained churn is an optimization miss, not a new queue failure/DLQ route.
+  return indexSearchScopeBase(scope, deps);
+}
+
+function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult>;
+function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared: SearchPreRead): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED>;
+async function indexSearchScopeBase(scope: SessionScope, deps: SearchIndexDeps, prepared?: SearchPreRead): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
   // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
@@ -531,9 +618,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   const lockedStarted = Date.now();
   const sourceBefore = deps.metrics?.sourceReadMs ?? 0;
   const scanBefore = deps.metrics?.indexScanMs ?? 0;
-  let first: SearchIndexResult;
+  let first: SearchIndexResult | typeof SEARCH_SCOPE_CHANGED;
   try {
-    first = await deps.transact(async (tx): Promise<SearchIndexResult> => {
+    first = await deps.transact(async (tx): Promise<SearchIndexResult | typeof SEARCH_SCOPE_CHANGED> => {
     const rawIo = deps.adapter
       ? deps.staged
         ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
@@ -553,8 +640,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const keys = pointerSnapshot.keys;
     const { rows: canonicalLock } = await tx.query<{ok:boolean}>("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS ok", [["96bulls:directory-events",scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId].join("\u001f")]);
     if (!canonicalLock[0]?.ok) return {manifests:0,rows:0,inserted:0,deleted:0,complete:false,busy:true,reasons:["canonical_scope_busy"]};
-    const at = now();
-    const version = at.getTime();
+    const at = prepared?.at ?? now();
+    const version = prepared?.version ?? at.getTime();
     // A stale DB alias is not authority to delete another canonical session.
     if(layoutComponent(pointerSnapshot.canonicalId)!==scope.sessionId){
       await invalidateDirectoryEvents(tx,scope);
@@ -564,6 +651,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     const {rows:siblings}=await tx.query<{manifest_key:string}>(`SELECT manifest_key FROM sessions.session_index
       WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4 AND deleted_at IS NULL ORDER BY session_id,machine_id`,[scope.orgId,scope.workspaceId,scope.harness,pointerSnapshot.canonicalId]);
     const siblingKeys=siblings.map(r=>r.manifest_key);
+    if (prepared && !sourceStampEqual(await currentSourceStamp(tx, scope, pointerSnapshot), prepared.stamp)) return SEARCH_SCOPE_CHANGED;
     if(!keys.length&&siblingKeys.length){
       // Erasing one alias must never erase a live canonical sibling.
       await invalidateDirectoryEvents(tx,scope);
@@ -603,8 +691,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     // mismatch, alias still live, erase), before any object read or index query.
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
-    const fromMs = await io.fromMs(at);
-    const s3 = await measurePhase(deps.metrics, "sourceReadMs", () =>
+    const fromMs = prepared?.fromMs ?? await io.fromMs(at);
+    const s3 = prepared?.s3 ?? await measurePhase(deps.metrics, "sourceReadMs", () =>
       readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
     // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
     // facts store and no staged run, a too-large scope stays incomplete (scope_too_large) as before.
@@ -667,7 +755,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         await io.record(scope, s3.revision, 0, false, at, pointerSnapshot.canonicalId);
         return { manifests: s3.manifests, rows: 0, inserted: 0, deleted: 0, complete: false, reasons: [...s3.reasons, error.budget] };
       }
-    } else scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+    } else scan = prepared?.scan ?? await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
     const chRows = scan.rows;
     const truncated = scan.truncated;
     const existing = new Map<string, ScopeIdentity[]>();

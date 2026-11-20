@@ -12,6 +12,7 @@ import { writerTransactionSql } from "../transaction-sql.ts";
 import {
   consumerServiceConfig,
   consumerServiceEnabled,
+  consumerSearchPreReadFromEnv,
   parseConsumerSecret,
   strictMinutes,
 } from "../consumer-config.ts";
@@ -165,6 +166,14 @@ describe("consumer service config", () => {
     expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: "true" }))).toMatchObject({ enabled: true, originLabels: true });
     for (const raw of ["", "false", "TRUE", " true", "1", "on"])
       expect(consumerServiceConfig(env({ MESSAGE_ORIGIN_LABELS_ENABLED: raw }))).toMatchObject({ enabled: true, originLabels: false });
+  });
+  test("SEARCH_INDEX_PREREAD_ENABLED: exact true is on, false/unset is off, malformed refuses; dormant reads nothing", () => {
+    expect(consumerServiceConfig(env())).toMatchObject({ enabled: true, searchPreRead: false });
+    expect(consumerServiceConfig(env({ SEARCH_INDEX_PREREAD_ENABLED: "true" }))).toMatchObject({ enabled: true, searchPreRead: true });
+    for (const raw of [undefined, "", "false"]) expect(consumerSearchPreReadFromEnv({ SEARCH_INDEX_PREREAD_ENABLED: raw })).toBe(false);
+    for (const raw of ["1", "TRUE", " true", "on"])
+      expect(() => consumerServiceConfig(env({ SEARCH_INDEX_PREREAD_ENABLED: raw }))).toThrow("SEARCH_INDEX_PREREAD_ENABLED must be true or false");
+    expect(consumerServiceConfig({ SEARCH_INDEX_PREREAD_ENABLED: "nope" })).toEqual({ enabled: false });
   });
   test("serve() logs the streaming reconcile startup line before any connection opens", async () => {
     // serve() resolves SEARCH_INDEX_STREAMING_ENABLED and logs it before refusing a mismatched
