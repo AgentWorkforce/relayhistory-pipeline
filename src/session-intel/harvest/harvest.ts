@@ -12,6 +12,22 @@ import { bump, counter, HarvestError, LIST_MODE_HEADER, LIST_SERVED_BY_HEADER, R
 import { IMPORT_BOUNDS, projectKey, repoRelativePath } from "../import/normalize.ts";
 import { isoTime } from "../replay/util.ts";
 
+/**
+ * The repository name from a catalog remote URL, never its credentials: the query and fragment and any
+ * `user[:password]@` are dropped first, and a URL with no path after its host (or with an `@` still left in it)
+ * gives null, since its last segment could be the secret itself.
+ */
+export function repoKey(url: string): string | null {
+  let u = url.trim().replace(/[?#].*$/su, "");
+  u = u.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/iu, "$1");
+  const scp = /^[^/@:]+@[^/:]+:(.+)$/u.exec(u);
+  if (scp) u = scp[1]!;
+  if (u.includes("@")) return null;
+  const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/iu, "");
+  if (!path.replace(/\//gu, "")) return null;
+  return projectKey(u, null);
+}
+
 export const STATE_FILE = "harvest-state.jsonl";
 export const STATE_FORMAT = "session-intel-harvest-state/1";
 export const RECEIPT_FILE = "coverage.json";
@@ -260,7 +276,7 @@ export function frameRow(raw: unknown, workspace: string): FrameRow {
   return {
     source, sessionId, firstTs, lastTs,
     projectId: str(raw.projectId),
-    repo: catalog && str(catalog.repoUrl, 2_048) ? projectKey(catalog.repoUrl as string, null) : null,
+    repo: catalog && str(catalog.repoUrl, 2_048) ? repoKey(catalog.repoUrl as string) : null,
     gitBranch: catalog ? str(catalog.gitBranch) : null,
     parentSessionIds: parents,
     catalog: catalog !== null,

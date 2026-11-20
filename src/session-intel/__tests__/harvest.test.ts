@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { HARVEST_ROUTES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
 import { EXIT_CAPPED, failureMessage, main, type HarvestIo } from "../harvest/cli.ts";
-import { RECEIPT_FILE, sessionFacts, STATE_FILE, type FrameRow } from "../harvest/harvest.ts";
+import { RECEIPT_FILE, repoKey, sessionFacts, STATE_FILE, type FrameRow } from "../harvest/harvest.ts";
 import { Hasher, IMPORT_BOUNDS } from "../import/normalize.ts";
 import { mappingPath } from "../import/writer.ts";
 import { main as replayMain } from "../replay/cli.ts";
@@ -300,6 +300,22 @@ describe("harvest", () => {
       expect(written(o)).not.toContain(TOKEN.slice(0, 16));
     }
     expect(redact(`a ${TOKEN} b ${TOKEN.slice(0, 40)}`, TOKEN)).not.toContain(TOKEN.slice(0, 16));
+    // A message cut at the start carries the token's tail; that is redacted too.
+    expect(redact(`x ${TOKEN.slice(-40)} y`, TOKEN)).not.toContain(TOKEN.slice(-16));
+  });
+
+  test("a catalog repo URL yields the repository name, never its credentials", () => {
+    expect(repoKey("https://example.invalid/fixture-org/acme-api.git")).toBe("acme-api");
+    expect(repoKey("https://FIXTURE_CRED_user:FIXTURE_CRED_pass@example.invalid/fixture-org/acme-api.git")).toBe("acme-api");
+    expect(repoKey("git@example.invalid:fixture-org/acme-api.git")).toBe("acme-api");
+    // No path after the host: the last segment would be the password or the host; nothing is kept.
+    expect(repoKey("https://FIXTURE_CRED_user:FIXTURE_CRED_pass@example.invalid")).toBeNull();
+    expect(repoKey("https://FIXTURE_CRED_tok@example.invalid/")).toBeNull();
+    // A query or fragment never becomes the name.
+    expect(repoKey("https://example.invalid/fixture-org/acme-api?access_token=FIXTURE_CRED_tok")).toBe("acme-api");
+    expect(repoKey("https://example.invalid/fixture-org/acme-api#FIXTURE_CRED_tok")).toBe("acme-api");
+    // An `@` left after stripping userinfo is refused rather than guessed.
+    expect(repoKey("https://example.invalid/a@FIXTURE_CRED_tok")).toBeNull();
   });
 
   test("a response for another workspace is refused, by header or by a row's catalog", async () => {
