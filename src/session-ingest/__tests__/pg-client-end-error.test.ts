@@ -165,6 +165,35 @@ describe("the new closed fields: frames, shapes and mirrors", () => {
     expect(errorFrame(withStack("Error", "m", `Error: mX\n    at realFn (y.js:2:2)`))).toBe("other");
   });
 
+  test("dbClientErrorFields reads message once: a getter that changes its text cannot pass a forged frame", () => {
+    // First read: a frame-shaped line inside the message; every later read: "pre". The stack's header
+    // is "Error: pre", so a second read of the message would leave "    at secretTok" as the first frame.
+    let reads = 0;
+    const e = new Error("pre");
+    Object.defineProperty(e, "message", { get: () => (reads++ === 0 ? "pre\n    at secretTok (x:1:1)" : "pre") });
+    Object.defineProperty(e, "stack", { value: "Error: pre\n    at secretTok (x:1:1)\n    at real (y:1:1)" });
+    const fields = dbClientErrorFields(e, "active");
+    expect(reads).toBe(1);
+    // The one read text is the header, so the stack's next line is "    at real": the frame is "real",
+    // and the detail is the closed shape of that same text ("other").
+    expect(fields.error_frame).toBe("real");
+    expect(fields.db_error_detail).toBe("other");
+    expect(logLine("error", "session ingest db error", fields)).not.toContain("secretTok");
+  });
+
+  test("a pg-protocol style DatabaseError (name set after super) cannot forge a frame from its message", () => {
+    class DatabaseError extends Error {
+      constructor(message: string) { super(message); this.name = "error"; }
+    }
+    const e = new DatabaseError("terminating connection\n    at forged (z:1:1)");
+    const fields = dbClientErrorFields(e, "active");
+    // The stack was captured as "Error: ..." before the rename, so its header differs from
+    // "error: ..." and nothing from the stack is trusted.
+    expect(fields.error_frame).not.toBe("forged");
+    expect(fields.error_frame).toBe("other");
+    expect(logLine("error", "session ingest db error", fields)).not.toContain("forged");
+  });
+
   test("frame forms: async/new/alias, anonymous, none, and anything outside the identifier shape", () => {
     const at = (frame: string) => errorFrame(withStack("TypeError", "m", `TypeError: m\n${frame}`));
     expect(at("    at async Promise.all (index 0)")).toBe("Promise.all");

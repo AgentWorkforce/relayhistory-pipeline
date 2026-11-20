@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, STORE_CAUSE_VALUES, errorFields, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, FRAME_NAME_SHAPE, STORE_CAUSE_VALUES, errorFields, log, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
 import { STORE_TRANSPORT_CAUSES } from "../vendor.ts";
 import { send } from "../../../packages/object-store/src/core.ts";
 import { ObjectStoreError, storeTransportCause } from "../../../packages/object-store/src/errors.ts";
@@ -149,4 +149,29 @@ test("receipt_tag / attempt_tag: 8 lowercase hex only, anything else dropped", (
     expect(sanitizeLogField(f, "0a1b2c3d")).toBe("0a1b2c3d");
     for (const bad of ["0A1B2C3D", "0a1b2c3", "0a1b2c3d4", "96bulls/.admission-inbox/org/v1", 12345678, null]) expect(sanitizeLogField(f, bad)).toBeUndefined();
   }
+});
+
+test("error_frame: a frame-shaped value the scrubber changes is dropped, and the line is still written", () => {
+  // The synthetic key-shaped value the span scrub test above plants: a valid identifier, but scrubbed.
+  const planted = "AKIAABCDEFGHIJKLMNOP";
+  expect(FRAME_NAME_SHAPE.test(planted)).toBe(true);
+  expect(sanitizeLogField("error_frame", planted)).toBeUndefined();
+  expect(sanitizeLogField("error_frame", "CloudflareSocket._listen")).toBe("CloudflareSocket._listen");
+  const fields = { error_frame: planted, error_name: "TypeError", db_error_detail: "socket_closed" };
+  const parsed = JSON.parse(logLine("error", "session ingest db error", fields)) as Record<string, unknown>;
+  expect(parsed).not.toHaveProperty("error_frame");
+  expect(parsed).toMatchObject({ level: "error", message: "session ingest db error", error_name: "TypeError", db_error_detail: "socket_closed" });
+  // log.error writes exactly one line to stderr, without the planted value.
+  const written: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    log.error("session ingest db error", fields);
+  } finally {
+    process.stderr.write = original;
+  }
+  expect(written).toHaveLength(1);
+  expect(written[0]).toContain("session ingest db error");
+  expect(written[0]).not.toContain(planted);
+  expect(JSON.parse(written[0]!)).not.toHaveProperty("error_frame");
 });
