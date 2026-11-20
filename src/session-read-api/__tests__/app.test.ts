@@ -4,6 +4,7 @@
  * queries it is asked; result-level behaviour is in page.clickhouse.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { logLine } from "../../shared/log.ts";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { ClickHouseError } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import { SearchIndexError } from "@rhc/search-index/contracts.ts";
@@ -661,7 +662,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
       const skipped = api({ ch: makeCh(), liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true });
       r = await skipped.get("/v1/events?workspace=ws-a&q=needle&limit=20");
       expect(r.status).toBe(503);
-      expect(skipped.logs.find((entry) => entry.reason === "unavailable")).toMatchObject({ detail: "partial_page_order", status: 503 });
+      expect(skipped.logs.find((entry) => entry.reason === "unavailable")).toMatchObject({ error_detail: "partial_page_order", status: 503 });
     }
   });
 
@@ -678,7 +679,9 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     const timedOut = api({ ch: hanging(), liveness: memoryLiveness().liveness, timeoutMs: 5, searchSkipsPartialSessions: true });
     r = await timedOut.get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(503);
-    expect(timedOut.logs.find((entry) => entry.reason === "unavailable")).toMatchObject({ detail: "timeout", status: 503 });
+    const timeoutLog = timedOut.logs.find((entry) => entry.reason === "unavailable")!;
+    expect(timeoutLog).toMatchObject({ error_detail: "timeout", status: 503 });
+    expect(JSON.parse(logLine("info", "session read", timeoutLog))).toMatchObject({ error_detail: "timeout", status: 503 });
 
     const capped = Array.from({ length: PARTIAL_SESSION_MAX_PAGES * PARTIAL_SESSIONS_CAP }, (_, i) => `c-${String(i).padStart(6, "0")}`);
     r = await api({ ch: stubCh({ partial: capped }).ch, liveness: memoryLiveness().liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
@@ -687,7 +690,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     const pageCapped = api({ ch: stubCh({ partial: capped }).ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true });
     r = await pageCapped.get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(503);
-    expect(pageCapped.logs.find((entry) => entry.reason === "unavailable")).toMatchObject({ detail: "partial_page_cap", status: 503 });
+    expect(pageCapped.logs.find((entry) => entry.reason === "unavailable")).toMatchObject({ error_detail: "partial_page_cap", status: 503 });
   });
 
   test("a page-two live-pointer failure remains unavailable", async () => {
@@ -747,7 +750,9 @@ describe("responses", () => {
 
     const unknown = api({ ch: stubCh({ fail: new SearchIndexError("unavailable", true, "secret-backend-detail") }).ch });
     await unknown.get("/v1/events?workspace=ws-a&q=x&limit=20");
-    expect(unknown.logs.find((entry) => entry.reason === "unavailable")).not.toHaveProperty("detail");
+    const unknownFields = unknown.logs.find((entry) => entry.reason === "unavailable")!;
+    expect(unknownFields).not.toHaveProperty("error_detail");
+    expect(JSON.parse(logLine("info", "session read", unknownFields))).not.toHaveProperty("error_detail");
   });
 });
 

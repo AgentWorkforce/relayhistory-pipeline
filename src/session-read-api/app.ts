@@ -756,7 +756,7 @@ export function createReadApi(deps: ReadApiDeps) {
     const detail = error instanceof SearchIndexError && (error.detail === "timeout" || error.detail === "partial_page_cap" || error.detail === "partial_page_order")
       ? error.detail
       : undefined;
-    log({ route: c.req.routePath, reason: "unavailable", error_code: (error as { name?: string })?.name ?? "error", ...(detail ? { detail } : {}), status: 503, correlation_id: correlationId });
+    log({ route: c.req.routePath, reason: "unavailable", error_code: (error as { name?: string })?.name ?? "error", ...(detail ? { error_detail: detail } : {}), status: 503, correlation_id: correlationId });
     return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
   };
 
