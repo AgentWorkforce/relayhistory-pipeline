@@ -285,6 +285,10 @@ describe("path scrubbing", () => {
     expect(projectKey(null, "/Users/fixture-user/work/acme-api/")).toBe("acme-api");
     expect(projectKey(null, "/Users/fixture-user")).toBeNull();
     expect(projectKey(null, null)).toBeNull();
+    // A remote's credentials never become the key: with nothing safe in the remote, the cwd decides.
+    expect(projectKey("https://FIXTURE_CRED_user:FIXTURE_CRED_pass@example.invalid", "/x/acme-api")).toBe("acme-api");
+    expect(projectKey("https://example.invalid/fixture-co/acme-api?token=FIXTURE_CRED_tok", null)).toBe("acme-api");
+    expect(projectKey("example.invalid:FIXTURE_CRED_tok", null)).toBeNull();
   });
 });
 

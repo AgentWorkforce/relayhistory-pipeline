@@ -161,10 +161,36 @@ export function repoRelativePath(raw: string, cwd: string | null): string | null
   return out.length <= IMPORT_BOUNDS.path ? out : null;
 }
 
-/** The customer's repository or project name: the last segment of a remote URL, or the cwd's basename. */
+const REPO_NAME = /^[a-z0-9._-]{1,200}$/u;
+
+/**
+ * The repository name from a remote, never its credentials. A `scheme://` URL keeps only its path (the authority,
+ * with any `user[:password]@`, is dropped); `[user@]host:path` needs a `/` in its path (`host:SECRET` gives
+ * nothing); anything else is a local path. Query, fragment and `;params` are cut. A remote with whitespace, a
+ * control character or a percent escape, an `@` left in its path, or a last segment that is not a plain name
+ * (`[a-z0-9._-]`) gives null rather than a guess. Shared by the import and the harvester so the two cannot drift.
+ */
+export function repoNameFromRemote(remote: string): string | null {
+  const raw = slashes(remote.trim());
+  if (!raw || /[\s\u0000-\u001f\u007f%]/u.test(raw)) return null;
+  let path: string;
+  const url = /^[a-z][a-z0-9+.-]*:\/\/[^/]*(.*)$/isu.exec(raw);
+  const scp = url ? null : /^(?:[^/@:]+@)?[^/@:]+:(.*)$/su.exec(raw);
+  if (url) path = url[1]!;
+  else if (scp) {
+    if (!scp[1]!.includes("/")) return null;
+    path = scp[1]!;
+  } else path = raw;
+  path = path.replace(/[?#;].*$/su, "");
+  if (path.includes("@")) return null;
+  const name = path.split("/").filter(Boolean).pop()?.replace(/\.git$/iu, "").toLowerCase();
+  return name && REPO_NAME.test(name) ? name : null;
+}
+
+/** The customer's repository or project name: from a remote URL ({@link repoNameFromRemote}), or the cwd's basename. */
 export function projectKey(remote: string | null, cwd: string | null): string | null {
-  const fromRemote = remote ? trimSlash(slashes(remote.trim())).replace(/\.git$/iu, "").split(/[/:]/u).filter(Boolean).pop() : undefined;
-  if (fromRemote) return fromRemote.toLowerCase();
+  const fromRemote = remote ? repoNameFromRemote(remote) : null;
+  if (fromRemote) return fromRemote;
   if (!cwd) return null;
   const c = trimSlash(slashes(cwd.trim()));
   // A home directory itself is a user name, not a project.
@@ -182,7 +208,8 @@ export class Hasher {
   private h(domain: string, value: string, hex: number) {
     return createHmac("sha256", this.salt).update(`${domain}\u0000${value}`).digest("hex").slice(0, hex);
   }
-  session(harness: ImportHarness, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
+  /** `harness` is an import format's harness, or a read-API source name (the harvest, src/session-intel/harvest). */
+  session(harness: string, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
   project(key: string) { return `p_${this.h("project", key, 24)}`; }
   repo(key: string) { return `r_${this.h("repo", key, 24)}`; }
   branch(b: string | null) { return b ? `b_${this.h("branch", canonicalBranch(b), 16)}` : null; }
@@ -283,7 +310,7 @@ export class SessionBuilder {
   readonly outcomes: Outcome[] = [];
   readonly usage: Usage[] = [];
 
-  constructor(readonly harness: ImportHarness, public sourceId: string, private readonly stats: ImportStats) {}
+  constructor(readonly harness: string, public sourceId: string, private readonly stats: ImportStats) {}
 
   touch(ts: string, at: LineRef) {
     if (!this.first || ts < this.first) this.first = ts;
@@ -353,7 +380,7 @@ export class SessionBuilder {
 export interface Tenant { orgId: string; workspaceId: string }
 
 export interface MappedSession {
-  harness: ImportHarness;
+  harness: string;
   sessionId: string;
   sourceSessionId: string;
   sourceParentIds: string[];
