@@ -60,7 +60,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // User-Agent, never its text (CLIENT_KIND_VALUES, CLIENT_OS_VALUES, CLIENT_VERSION_SHAPE; mirrors pinned
   // in src/session-ingest/__tests__/ingest-refusal-log.test.ts).
   "client_kind", "client_version", "client_os",
-  // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014 only. Read API buffered fence
+  // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014, plus 40P01 for a buffer stage converted
+  // to 429 (BufferLockBusy). The buffer lock retry line (deliver.ts BufferLockRetryFields): the failed retry's
+  // SQLSTATE. Origin fence fallback (ledger-sql.ts): 42883. Read API buffered fence
   // logs (src/session-read-api/app.ts): the two-char SQLSTATE class only (BufferedFenced.sqlstateClass).
   "sqlstate",
   // Read API buffered search gate (src/session-read-api/app.ts gatedPage): bounded counts only,

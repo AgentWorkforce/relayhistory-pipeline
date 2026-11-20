@@ -5,13 +5,15 @@
  * - BUSY on: the 429 `BufferLockBusy` (a `ClaimLockBusy`: `delivery_busy`, Retry-After in CLAIM_LOCK_RETRY_AFTER)
  *   instead of the 503; the route line keeps the real stage and `ledger_lock_timeout`; the lock alert still fires.
  * - RETRY on: the same call with the same input once more after a 50..250 ms pause (injected random + sleep);
- *   a second failure propagates as before (503, or with BUSY the 429).
+ *   a second failure propagates as before (503, or with BUSY the 429). Each retry, and only a retry, writes one
+ *   `ingest.buffer_lock_retry` warn line (stage, the causing SQLSTATE, outcome, and the second failure's codes).
+ * - BUSY on: a converted 40P01 also raises the lock alert (55P03 always did); a 40P01 that stays 503 does not.
  * Nothing else converts or retries: no other cause, no other stage. Both off: byte-identical (golden).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, lockAlertFields, SYNC_SCOPE } from "../app.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
-import { BUFFER_LOCK_RETRY_PAUSE_MS, BufferLockBusy, CLAIM_LOCK_RETRY_AFTER, ClaimLockBusy, deliverBatch, IngestUnavailable } from "../deliver.ts";
+import { BUFFER_LOCK_RETRY_PAUSE_MS, BufferLockBusy, type BufferLockRetryFields, CLAIM_LOCK_RETRY_AFTER, ClaimLockBusy, deliverBatch, IngestUnavailable } from "../deliver.ts";
 import { dbErrorDiagnosis } from "../db-error-class.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
@@ -23,7 +25,7 @@ const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
 const enc = (s: string) => new TextEncoder().encode(s);
 
-type Flags = { bufferLockBusy?: true; bufferLockRetry?: true; claimLockBusy?: true; claimTimeoutBusy?: true; random?: () => number; sleep?: (ms: number) => Promise<void> };
+type Flags = { bufferLockBusy?: true; bufferLockRetry?: true; claimLockBusy?: true; claimTimeoutBusy?: true; random?: () => number; sleep?: (ms: number) => Promise<void>; bufferLockRetryLog?: (fields: BufferLockRetryFields) => void };
 type Stage = "buffer_intent" | "buffer_receipt";
 const METHOD = { buffer_intent: "prepareBufferStage", buffer_receipt: "commitBuffered" } as const;
 
@@ -70,10 +72,12 @@ async function recovery(failures: Partial<Record<Stage, unknown[]>>, flags: Flag
   }
   arm?.(ledger);
   const sleeps: number[] = [];
+  const retries: BufferLockRetryFields[] = [];
   let randoms = 0;
   const seams = {
     random: flags.random ?? (() => { randoms++; return 0.5; }),
     sleep: flags.sleep ?? (async (ms: number) => { sleeps.push(ms); }),
+    bufferLockRetryLog: flags.bufferLockRetryLog ?? ((fields: BufferLockRetryFields) => { retries.push(fields); }),
   };
   const logged: Record<string, unknown>[] = [];
   const app = createIngestApp({
@@ -91,7 +95,7 @@ async function recovery(failures: Partial<Record<Stage, unknown[]>>, flags: Flag
   return {
     status: res.status, retryAfter: res.headers.get("retry-after"), text, json: JSON.parse(text) as { error?: { code: string } },
     route: logged.find((f) => f.route === "delivery.recovery")!, alerts: logged.filter((f) => f.route === "ingest.lock_alert"),
-    calls, sleeps, randoms: () => randoms,
+    calls, sleeps, retries, randoms: () => randoms,
   };
 }
 
@@ -120,6 +124,7 @@ describe("both flags off (golden)", () => {
         expect(r.alerts).toEqual(code === "55P03" ? [{ route: "ingest.lock_alert", stage: ALERT_STAGE[stage], sqlstate: "55P03" }] : []);
         expect(r.calls[stage].length).toBe(1);
         expect(r.sleeps).toEqual([]);
+        expect(r.retries).toEqual([]);
         expect(r.randoms()).toBe(0);
       }
   });
@@ -139,6 +144,7 @@ describe("both flags off (golden)", () => {
       expect(r.calls.buffer_intent.length).toBe(1);
       expect(r.calls.buffer_receipt.length).toBe(1);
       expect(r.sleeps).toEqual([]);
+      expect(r.retries).toEqual([]);
       expect(r.randoms()).toBe(0);
     }
   });
@@ -154,10 +160,12 @@ describe("INGEST_BUFFER_LOCK_BUSY", () => {
         const after = Number(r.retryAfter);
         expect(Number.isInteger(after) && after >= CLAIM_LOCK_RETRY_AFTER.min && after <= CLAIM_LOCK_RETRY_AFTER.max).toBe(true);
         expect(r.route).toMatchObject({ outcome: "delivery_busy", stage, error_code: "ledger_lock_timeout", db_error_code: code, correlation_id: "corr-buffer-lock" });
-        expect(r.alerts).toEqual(code === "55P03" ? [{ route: "ingest.lock_alert", stage: ALERT_STAGE[stage], sqlstate: "55P03" }] : []);
+        // The converted wait stays visible to the lock alert for 55P03 AND 40P01 (the DB-error alert counts only 503s).
+        expect(r.alerts).toEqual([{ route: "ingest.lock_alert", stage: ALERT_STAGE[stage], sqlstate: code }]);
         expect(r.text).not.toContain(TENANT.orgId);
         expect(r.calls[stage].length).toBe(1); // BUSY alone never retries
         expect(r.sleeps).toEqual([]);
+        expect(r.retries).toEqual([]);
       }
   });
 
@@ -230,6 +238,22 @@ describe("INGEST_BUFFER_LOCK_BUSY", () => {
     const claim = new ClaimLockBusy("ledger_lock_timeout", d, 7);
     expect([claim.stage, claim.lock]).toEqual(["claim", "ledger_claim"]);
   });
+
+  test("lock alert for 40P01: only a buffer-stage BufferLockBusy (the flag's conversion); the 503 and the claim stay as before", () => {
+    const deadlock = dbErrorDiagnosis(Object.assign(new Error(""), { code: "40P01" }));
+    for (const stage of STAGES) {
+      for (const mode of ["buffered", "canonical", undefined])
+        expect(lockAlertFields(new BufferLockBusy(stage, "ledger_lock_timeout", deadlock, 7), mode)).toEqual({ route: "ingest.lock_alert", stage: ALERT_STAGE[stage], sqlstate: "40P01" });
+      // Flag off: the same 40P01 is a 503 IngestUnavailable, counted by the DB-error alert and (as before) no lock alert.
+      expect(lockAlertFields(new IngestUnavailable(stage, "ledger_lock_timeout", deadlock), "buffered")).toBeUndefined();
+    }
+    // Claim alerting unchanged: a 40P01 claim converted by INGEST_CLAIM_LOCK_BUSY still emits no lock alert.
+    expect(lockAlertFields(new ClaimLockBusy("ledger_lock_timeout", deadlock, 7), "buffered")).toBeUndefined();
+    expect(lockAlertFields(new IngestUnavailable("claim", "ledger_lock_timeout", deadlock), "buffered")).toBeUndefined();
+    // Other SQLSTATEs on a BufferLockBusy do not alert (only 55P03 / 57014 / converted 40P01).
+    for (const code of ["40001", "55000", "08006"])
+      expect(lockAlertFields(new BufferLockBusy("buffer_receipt", "ledger_lock_timeout", dbErrorDiagnosis(Object.assign(new Error(""), { code })), 7), "buffered")).toBeUndefined();
+  });
 });
 
 describe("INGEST_BUFFER_LOCK_RETRY", () => {
@@ -243,6 +267,9 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
         expect(r.calls[stage].length).toBe(2);
         expect(r.calls[stage][1]).toEqual(r.calls[stage][0]);
         expect(r.alerts).toEqual([]);
+        // The one trace of the absorbed lock wait: exactly one retry line, closed fields only.
+        expect(r.retries).toEqual([{ route: "ingest.buffer_lock_retry", stage, db_error_code: code, outcome: "ok" }]);
+        expect(JSON.stringify(r.retries)).not.toContain(TENANT.orgId);
         expect(r.sleeps).toEqual([150]); // 50 + floor(0.5 * 201)
         expect(r.randoms()).toBe(1);
         // The other stage ran once, as normal.
@@ -260,6 +287,7 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
       expect(off.route).toMatchObject({ outcome: "delivery_unavailable", stage, error_code: "ledger_lock_timeout", db_error_code: "40P01" });
       expect(off.calls[stage].length).toBe(2);
       expect(off.sleeps.length).toBe(1);
+      expect(off.retries).toEqual([{ route: "ingest.buffer_lock_retry", stage, db_error_code: "55P03", outcome: "failed", error_code: "ledger_lock_timeout", sqlstate: "40P01" }]);
 
       const on = await recovery({ [stage]: [a, a, a] }, { ...RETRY, ...BUSY });
       expect(on.status).toBe(429);
@@ -268,6 +296,7 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
       expect(on.alerts).toEqual([{ route: "ingest.lock_alert", stage: ALERT_STAGE[stage], sqlstate: "55P03" }]);
       expect(on.calls[stage].length).toBe(2);
       expect(on.sleeps.length).toBe(1);
+      expect(on.retries).toEqual([{ route: "ingest.buffer_lock_retry", stage, db_error_code: "55P03", outcome: "failed", error_code: "ledger_lock_timeout", sqlstate: "55P03" }]);
       expect(on.randoms()).toBe(2); // the pause, then the Retry-After
     }
   });
@@ -277,6 +306,7 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
     expect(r.status).toBe(503);
     expect(r.route).toMatchObject({ stage: "buffer_receipt", error_code: "ledger_timeout", db_error_code: "57014" });
     expect(r.calls.buffer_receipt.length).toBe(2);
+    expect(r.retries).toEqual([{ route: "ingest.buffer_lock_retry", stage: "buffer_receipt", db_error_code: "55P03", outcome: "failed", error_code: "ledger_timeout", sqlstate: "57014" }]);
   });
 
   test("on: never a retry for any other cause or stage; no pause, no jitter", async () => {
@@ -286,6 +316,7 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
         expect(r.status).toBe(503);
         expect(r.calls[stage].length).toBe(1);
         expect(r.sleeps).toEqual([]);
+        expect(r.retries).toEqual([]);
         expect(r.randoms()).toBe(0);
       }
     let claims = 0;
@@ -294,6 +325,39 @@ describe("INGEST_BUFFER_LOCK_RETRY", () => {
     expect(claim.status).toBe(503);
     expect(claims).toBe(1);
     expect(claim.sleeps).toEqual([]);
+    expect(claim.retries).toEqual([]);
+  });
+
+  test("the retry line: one warn line through the shared logger by default, allowlisted fields only; a throwing logger changes nothing", async () => {
+    const written: string[] = [];
+    const write = process.stderr.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    let r: Awaited<ReturnType<typeof recovery>>;
+    try {
+      // No seam: deliver's default (log.warn) writes the line.
+      const s = scratchStore();
+      cleanups.push(s.done);
+      let n = 0;
+      const ledger = Object.assign(new MemoryLedger(), {
+        prepareBufferStage: async () => { if (n++ === 0) throw await ledgerError("40P01"); return { stageToken: "00000000-0000-4000-8000-000000000003", expiresAt: new Date(Date.now() + 60_000).toISOString() }; },
+        commitBuffered: async () => { throw await ledgerError("08006"); },
+      });
+      await deliverBatch({ ledger, target: { store: s.store, keyRoot: "96bulls", sleep: async () => {} }, acceptanceMode: "buffered", ...RETRY, sleep: async () => {} } as never,
+        TENANT, await batch([record({ record_id: "w1" })])).then(() => null, (e: unknown) => e);
+    } finally {
+      process.stderr.write = write;
+    }
+    const lines = written.flatMap((w) => w.split("\n")).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => l.route === "ingest.buffer_lock_retry");
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toMatchObject({ level: "warn", message: "session ingest buffer lock retry", route: "ingest.buffer_lock_retry", stage: "buffer_intent", db_error_code: "40P01", outcome: "ok" });
+    expect(Object.keys(lines[0]!).sort()).toEqual(["db_error_code", "deployment", "deployment_id", "level", "message", "outcome", "route", "service", "stage", "ts"]);
+    expect(JSON.stringify(lines)).not.toContain(TENANT.orgId);
+    expect(JSON.stringify(lines)).not.toContain(TENANT.workspaceId);
+
+    // A throwing logger never changes the delivery.
+    r = await recovery({ buffer_receipt: [await ledgerError("55P03")] }, { ...RETRY, bufferLockRetryLog: () => { throw new Error("logger down"); } });
+    expect(r.status).toBe(200);
+    expect(r.calls.buffer_receipt.length).toBe(2);
   });
 
   test("the pause takes the injected random and sleep: 50..250 ms inclusive; out-of-range jitter falls back to the minimum", async () => {

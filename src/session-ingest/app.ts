@@ -45,7 +45,7 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { prepareForAdmission } from "./admission-core.ts";
 import { clientFields } from "./client-agent.ts";
 import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
@@ -362,16 +362,21 @@ function unavailableFields(error: unknown): Record<string, unknown> {
  * alert from the operator/DB logs. */
 export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "set_live" | "control_changed" | "lazy_clear";
 const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
+/** A buffer-stage deadlock converted to 429 by INGEST_BUFFER_LOCK_BUSY=on (BufferLockBusy only): with the flag off
+ * the same 40P01 is a 503 that the DB-error alert counts (ingest-error-alert.ts), so the conversion must not hide it. */
+const BUFFER_BUSY_ALERT_SQLSTATES = new Set(["40P01"]);
 
 /** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
  * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only.
  * A claim lock wait refused as 429 (ClaimLockBusy, INGEST_CLAIM_LOCK_BUSY=on) still alerts for 55P03
  * (a 40P01 alerts in neither flag state); a claim statement timeout refused as 429
- * (INGEST_CLAIM_TIMEOUT_BUSY=on) still alerts for 57014. */
+ * (INGEST_CLAIM_TIMEOUT_BUSY=on) still alerts for 57014. A buffer-stage lock wait refused as 429
+ * (BufferLockBusy, INGEST_BUFFER_LOCK_BUSY=on) alerts for 55P03 and also for 40P01, which only that conversion
+ * would otherwise remove from every alert; a buffer-stage 40P01 503 (flag off) stays as before (no lock alert). */
 export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
   if (!(error instanceof IngestUnavailable || error instanceof ClaimLockBusy)) return undefined;
   const sqlstate = error.db?.db_error_code;
-  if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
+  if (sqlstate === undefined || !(LOCK_ALERT_SQLSTATES.has(sqlstate) || (error instanceof BufferLockBusy && BUFFER_BUSY_ALERT_SQLSTATES.has(sqlstate)))) return undefined;
   const stage: LockAlertStage | undefined =
     error.stage === "claim" && acceptanceMode === "buffered" ? "lazy_claim"
       : error.stage === "buffer_receipt" ? "staged_ack"
@@ -386,7 +391,9 @@ function dbFields(db: DbErrorDiagnosis | undefined): Record<string, unknown> {
 
 function failure(c: Context<Env>, error: unknown) {
   const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
-  // A busy refusal is retryable and wrote nothing durable; tell the client when (relayhistory's header).
+  // A busy refusal is retryable; tell the client when (relayhistory's header). A slot or claim refusal wrote
+  // nothing durable; a BufferLockBusy at buffer_receipt leaves the committed claim, the staged object and the
+  // stage-intent row, which the retry resumes or expiry/GC reclaims.
   if (safe instanceof DeliveryBusyError) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Held for consent: a long wait, and the 503 keeps every released Desktop's batch on disk for the retry.
   if (safe instanceof UploadConsentRequired) c.header("Retry-After", String(safe.retryAfterSeconds));

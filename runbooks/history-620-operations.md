@@ -180,6 +180,20 @@ sees the flag only when the stack sets that input; without it the flag is inert 
 same out-of-band Worker version secret note as for `INGEST_CLAIM_LOCK_BUSY` applies. Not read by
 the self-host server (follow-up).
 
+Buffer-stage lock wait (two flags, both default off, buffered acceptance only; stack inputs
+`sessionIngest.bufferLockBusy: "on"` / `sessionIngest.bufferLockRetry: "on"`, omit for off): they act
+only on a `buffer_intent` / `buffer_receipt` ledger call that failed with `error_code`
+`ledger_lock_timeout` (55P03 / 40P01). `INGEST_BUFFER_LOCK_RETRY=on` re-issues that call once after
+50-250 ms and writes one warn line per retry, `route` = `ingest.buffer_lock_retry`, with `stage`,
+`db_error_code` (the SQLSTATE that caused the retry) and `outcome` `ok` or `failed` (then also the second
+failure's `error_code` and `sqlstate`); no tenant data, no ids. A retry that succeeds leaves no other trace
+(no lock alert, a normal route line), so watch this line when the flag is on. `INGEST_BUFFER_LOCK_BUSY=on`
+answers a lock wait still standing with 429 `delivery_busy` (`Retry-After` 5-10 s) instead of the 503. The
+DB-error rate alert counts only 503s, so for a converted wait the `ingest.lock_alert` `staged_intent` /
+`staged_ack` line fires for 40P01 as well as 55P03 (a 40P01 that stays 503 is unchanged). Time bound: one
+attempt that ends in 55P03 / 40P01 can take up to the 5 s `statement_timeout` (the 2 s `lock_timeout` is per
+lock acquisition), so a retry adds at most about 5.25 s per stage and about 10.5 s when both stages retry.
+
 Claim lock wait (off unless set; production sets it): with `INGEST_CLAIM_LOCK_WAIT_MS` (25..2000; stack input
 `sessionIngest.claimLockWaitMs`) each claim attempt runs in its own short transaction, `BEGIN;
 SELECT set_config('lock_timeout', '<ms>ms', true), set_config('idle_in_transaction_session_timeout',
