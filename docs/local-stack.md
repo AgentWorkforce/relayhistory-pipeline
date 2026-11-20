@@ -151,6 +151,7 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 2 GiB (scopes up to 512 MiB stream); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES` (capped at 2 GiB) to 2 GiB. A scope streams only when four times its size fits both budgets; with both budgets at that floor no scope streams (startup warns). Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
 | `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default 2000000 (scopes up to 500000 records stream; size the pod for about 2 GB on top of its usual limit, about 3 KB per record, measured); accepted from four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS` (capped at 2000000) to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
 | `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Default on since Phase 3 slice 4 (unset or `""`; off with `false`, or unset with `SEARCH_INDEX_STREAMING_ENABLED=false`, one info line; see "Upgrading to the default-on image (Phase 3)" below). On, the staged reconcile, Phase 3 slice 1: paged index scans (past the cap the reason is `stream_keyed_records_cap`, not `search_index_truncated`; at the defaults no more rows are read than before), streaming budgets per pass instead of summed, and an interim cap of 500000 records read per pass or index rows per scan (never below `SEARCH_INDEX_MAX_ROWS`), so sessions above 500000 records stay incomplete until a later slice; see "Staged reconcile (Phase 3), slice 1" below. A scope that would stream runs as a staged run instead (migration 20261105062110 required; startup refuses without it; see "Staged reconcile (Phase 3), staged runs"). `true` fails startup unless streaming resolves on; with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` it starts and stages the facts of a too-large scope ("Staged output facts" below; migration `20261105062140` required); any other value fails startup. Never read by the hosted Lambda or the large-read worker. |
+| `SEARCH_INDEX_PREREAD_ENABLED` | hosted session-pipeline Lambda and enabled self-host consumer | Default off: unset, `""` or `false` changes nothing; exactly `true` requests the search pre-read; any other value fails startup. In this slice only the hosted legacy ClickHouse whole-read path, without streaming or output facts, uses it. Portable adapters (including self-host), staged reconcile, streaming and output-facts paths remain on their base locked path; see "Hosted Lambda: search reads before its lock" below. The stack renders it only from `transcriptStore.sessionPipeline.searchPreRead: true`, which requires `searchIndex: true`. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -805,6 +806,36 @@ With the flag on, an unchanged session keeps whatever its index holds until its 
 the flag off (`false`): every event then re-reads its session as before. Any re-projection or backfill of old
 sessions needs the flag off for its whole run; there is no version to bump instead
 (`event_projection_version` is fixed at 1).
+
+### Hosted Lambda: search reads before its lock
+
+`SEARCH_INDEX_PREREAD_ENABLED` (stack input `transcriptStore.sessionPipeline.searchPreRead`, which needs
+`searchIndex: true`) is **default off**: unset, `""` and `false` preserve the base path; exactly `true` is on; any
+other value fails init naming the variable. The self-host consumer accepts the same strict environment grammar,
+but its portable adapter remains on the base path in this slice. `SEARCH_INDEX_STAGED_RECONCILE_ENABLED`, hosted
+or self-host streaming, and either ClickHouse or Postgres output facts also remain on the base path. There is no
+silent mixture: only the legacy ClickHouse whole-read path with none of those modes selected pre-reads.
+
+On that path, the skip-current proof still runs first; a skipped scope makes no object-store or ClickHouse call.
+Otherwise a short transaction captures the canonical id, live-pointer fingerprint and directory epoch, then
+commits. With no live pointer it goes directly to the unchanged locked erase path. For a live scope the canonical
+S3 read and ClickHouse window/index scan run with no Postgres transaction open. The existing scope and canonical
+locks are then taken and the stamp is read again. Equal, the existing upsert, exact-position delete, directory,
+catalog and state writes run under the locks against the prepared read; changed, the pre-read is repeated once. A
+second change falls back to the unmodified base path, so contention does not create a new retry or DLQ outcome.
+Erasure, including staged-run and facts cleanup, is not moved or edited.
+
+Two passes can capture the same source stamp and scan the same old index before applying serially. That is safe for
+this slice because upserts are versioned and deletes name the old exact position: repeating the same source plan
+neither resurrects the old position nor removes the new one. The race test forces both scans to finish before
+either apply. A later lease-backed slice remains the target for moving writes outside the lock.
+
+The normal flag-on path uses at most one Postgres connection per scope at a time: a short capture transaction, no
+database connection during S3/ClickHouse reads, then the one locked apply transaction. The additive search log
+fields `source_read_ms`, `index_scan_ms`, `locked_apply_ms`, `write_calls` and `write_batches` measure the split in
+both flag modes. Before this flag is enabled anywhere, compare the runtime role's idle-in-transaction count in
+`pg_stat_activity` before and after at the same concurrency, together with those phase fields. No stack or install
+sets the flag by default.
 
 ### Hosted Lambda: pointer stage reads before its lock
 

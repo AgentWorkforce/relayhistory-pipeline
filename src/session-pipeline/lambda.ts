@@ -145,6 +145,8 @@ export interface LambdaEnv {
   originLabelsEnabled?: boolean;
   /** SEARCH_INDEX_SKIP_CURRENT_ENABLED=true: skip a pass a complete pass already covers (search-index.ts alreadyCurrent). Default off. */
   skipCurrentEnabled?: boolean;
+  /** SEARCH_INDEX_PREREAD_ENABLED=true: read a legacy ClickHouse whole scope before its search lock. Default off. */
+  searchPreReadEnabled?: boolean;
   /** SESSION_POINTER_PREREAD_ENABLED=true: the pointer stage reads before its scope lock (pointer.ts indexPreRead). Default off. */
   pointerPreReadEnabled?: boolean;
   /**
@@ -229,6 +231,10 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   const skipCurrent = searchIndexSkipCurrentFromEnv(env);
   if (skipCurrent && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SEARCH_INDEX_PREREAD_ENABLED: strict grammar, default off; on needs the search stage.
+  const searchPreRead = searchIndexPreReadFromEnv(env);
+  if (searchPreRead && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_PREREAD_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   // SESSION_POINTER_PREREAD_ENABLED: strict grammar, default off.
   const pointerPreRead = pointerPreReadFromEnv(env);
   // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
@@ -252,6 +258,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     originLabelsEnabled: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
     ...(skipCurrent ? { skipCurrentEnabled: true } : {}),
+    ...(searchPreRead ? { searchPreReadEnabled: true } : {}),
     ...(pointerPreRead ? { pointerPreReadEnabled: true } : {}),
     ...(searchStreamCh ? { searchStreamCh } : {}),
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
@@ -524,6 +531,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       ...(env.originLabelsEnabled ? { originLabels: true as const } : {}),
       // Default off; on, a pass the session directory proves current returns before any read (already_current).
       ...(env.skipCurrentEnabled ? { skipCurrent: true as const } : {}),
+      ...(env.searchPreReadEnabled ? { preRead: true as const } : {}),
       // Default off (SEARCH_INDEX_STREAMING_CH=1, ClickHouse only); the deadline is set per invocation.
       ...(env.searchStreamCh && !binding ? { stream: { maxReadBytes: env.searchStreamCh.maxReadBytes, maxReadEvents: env.searchStreamCh.maxReadEvents } } : {}),
     };
@@ -1010,6 +1018,17 @@ export function searchIndexSkipCurrentFromEnv(env: Record<string, string | undef
   if (value === undefined || value === "" || value === "false") return false;
   if (value === "true") return true;
   throw new Error("session pipeline: SEARCH_INDEX_SKIP_CURRENT_ENABLED must be true or false");
+}
+
+/**
+ * SEARCH_INDEX_PREREAD_ENABLED for the hosted Lambda: unset, "" and "false" are off; exactly
+ * "true" is on; anything else fails init naming the variable, never the value.
+ */
+export function searchIndexPreReadFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SEARCH_INDEX_PREREAD_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SEARCH_INDEX_PREREAD_ENABLED must be true or false");
 }
 
 /**

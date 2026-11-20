@@ -99,3 +99,11 @@ test("skip-current unset: SQL, ClickHouse calls, reads, results and log records 
     expect(golden[s.name]![1]!.reads as number).toBeGreaterThan(0);
   }
 }, 300_000);
+
+test("search pre-read absent or false: the same SQL, reads, index calls, writes, results and logs match the golden", async () => {
+  const golden = JSON.parse(readFileSync(GOLDEN, "utf8")) as Record<string, Entry[]>;
+  for (const s of SCENARIOS) {
+    const explicitOff = { ...s, runs: s.runs.map((run) => ({ ...run, preRead: false })) };
+    expect(await record(explicitOff)).toEqual(golden[s.name]!);
+  }
+}, 300_000);

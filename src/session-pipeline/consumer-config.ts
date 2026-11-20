@@ -54,6 +54,10 @@
  *   MESSAGE_ORIGIN_LABELS_ENABLED             enabled only: exactly "true" labels who wrote
  *                                   each event in the index rows (actor_name /
  *                                   subagent_id, docs/message-origin.md); default off.
+ *   SEARCH_INDEX_PREREAD_ENABLED              enabled only: unset | "" | "false" is off;
+ *                                   exactly "true" requests the search pre-read. The portable
+ *                                   adapter/staged/output-facts paths stay on the base path.
+ *                                   Anything else fails startup.
  *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
  *                                   case-sensitive) also writes output facts
  *                                   (sessions.session_event_facts /
@@ -127,6 +131,7 @@ export const CONSUMER_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 export const CONSUMER_KEY_PREFIX_VAR = "PIPELINE_KEY_PREFIX";
 export const CONSUMER_TLS_PROFILE_VAR = "SESSION_POSTGRES_TLS_PROFILE";
 export const CONSUMER_OUTPUT_FACTS_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS";
+export const CONSUMER_SEARCH_PREREAD_VAR = "SEARCH_INDEX_PREREAD_ENABLED";
 
 export interface ConsumerSecret {
   hoopdb_url: string;
@@ -153,6 +158,8 @@ export type ConsumerServiceConfig =
       outputFacts: boolean;
       /** MESSAGE_ORIGIN_LABELS_ENABLED is exactly "true" (default off): index rows label who wrote each event. */
       originLabels: boolean;
+      /** SEARCH_INDEX_PREREAD_ENABLED is exactly "true" (default off). */
+      searchPreRead: boolean;
       /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
       analytics?: AnalyticsConfig;
     };
@@ -172,6 +179,14 @@ export function strictMinutes(env: NodeJS.ProcessEnv, name: string, fallback: nu
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 1) throw new Error(`96bulls: ${name} must be an integer number of minutes, at least 1`);
   return value;
+}
+
+/** Strict default-off grammar shared with the hosted flag: exact true/false, no trimming. */
+export function consumerSearchPreReadFromEnv(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[CONSUMER_SEARCH_PREREAD_VAR];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`pipeline consumer: ${CONSUMER_SEARCH_PREREAD_VAR} must be true or false`);
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -226,6 +241,7 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
     enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
     outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
     originLabels: messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]),
+    searchPreRead: consumerSearchPreReadFromEnv(env),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
   };
 }

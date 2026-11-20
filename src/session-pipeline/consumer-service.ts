@@ -1262,6 +1262,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     ...(searchStaged ? { staged: searchStaged } : {}),
     ...outputFactsDeps(config),
     ...(config.originLabels ? { originLabels: true as const } : {}),
+    ...(config.searchPreRead ? { preRead: true as const } : {}),
   };
 
   let lastRun = 0;
