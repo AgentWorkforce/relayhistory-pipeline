@@ -1,0 +1,286 @@
+{
+ "transactionEnd": "COMMIT",
+ "batches": "fresh",
+ "question": "records per commit (500/250/100/50) vs the receipt seat-clock hold, on main (no 062155/062156), history switch live with no managed scopes",
+ "workload": "8 concurrent uploaders (distinct users/origins); 40,000 fresh synthetic records per cell; two rotations (r0 500->50, r1 50->500); no client retry simulated",
+ "timedBoundaries": {
+  "latencyThroughCommit": "per batch: from BEGIN (with SET LOCAL lock_timeout 2s / statement_timeout 5s / ROLE ingest) through SELECT sessions.ingest_origin_commit_buffered_batch(payload) (the commit plus the staged ACK) to the end of COMMIT, on a direct PostgreSQL connection",
+  "clockWait": "NOTICE timestamps immediately before and after the seat-clock lock line inside the ACK",
+  "holdClockToCommitEnd": "from the NOTICE after the clock lock to the client-observed end of COMMIT",
+  "span": "from the barrier (every worker warmed) to the last worker drained",
+  "notTimed": "HTTP request handling, prepareDelivery, the claim and the stage are PRE-STAGED before the timed window (each batch is claimed and staged through the real deliver path, its commit payload captured, then committed during the run). Their cost per batch (and so per record at small n) is NOT in these numbers."
+ },
+ "postgres": {
+  "server_version": "16.15",
+  "fsync": "on",
+  "synchronous_commit": "on",
+  "wal_sync_method": "open_datasync",
+  "full_page_writes": "on",
+  "commit_delay": 0,
+  "shared_buffers": "16384 (8kB pages)",
+  "deadlock_timeout": "500ms",
+  "log_lock_waits": "on",
+  "durabilityCaveat": "local laptop, macOS: fsync without F_FULLFSYNC does not force data to stable media, so COMMIT cost is understated relative to a production server; no network round trip between client and server"
+ },
+ "status": "Local evidence only. A local real COMMIT does not establish production end-to-end cost. r0 n=500 is the first cell of the run (cold) and is an outlier against its r1 twin.",
+ "cells": [
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "k": 10,
+   "tag": "size-n500-c8-r0",
+   "attempts": 80,
+   "okClient": 60,
+   "durableBatches": 60,
+   "durableDecisionRows": 30000,
+   "newSeats": 30000,
+   "wallSecondsInclDrain": 27.11,
+   "durableRecordsPerSec": 1107,
+   "latencyThroughCommit": {
+    "p50": 1485.4,
+    "p95": 3336.5,
+    "max": 4375.6
+   },
+   "clockWait": {
+    "p50": 1176,
+    "p95": 1910.2,
+    "max": 3479
+   },
+   "holdClockToCommitEnd": {
+    "p50": 113.6,
+    "p95": 2676.6
+   },
+   "durableAcksPerSec": 2.2,
+   "errors": {
+    "55P03": 20
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 250,
+   "k": 20,
+   "tag": "size-n250-c8-r0",
+   "attempts": 160,
+   "okClient": 160,
+   "durableBatches": 160,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 8.65,
+   "durableRecordsPerSec": 4626,
+   "latencyThroughCommit": {
+    "p50": 404.3,
+    "p95": 425.8,
+    "max": 443.3
+   },
+   "clockWait": {
+    "p50": 352.2,
+    "p95": 372.6,
+    "max": 390.4
+   },
+   "holdClockToCommitEnd": {
+    "p50": 49.9,
+    "p95": 53.6
+   },
+   "durableAcksPerSec": 18.5,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 100,
+   "k": 50,
+   "tag": "size-n100-c8-r0",
+   "attempts": 400,
+   "okClient": 400,
+   "durableBatches": 400,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 8.81,
+   "durableRecordsPerSec": 4538,
+   "latencyThroughCommit": {
+    "p50": 166.1,
+    "p95": 206.1,
+    "max": 233.4
+   },
+   "clockWait": {
+    "p50": 144.2,
+    "p95": 180.1,
+    "max": 205.1
+   },
+   "holdClockToCommitEnd": {
+    "p50": 20.1,
+    "p95": 24.8
+   },
+   "durableAcksPerSec": 45.4,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 50,
+   "k": 100,
+   "tag": "size-n50-c8-r0",
+   "attempts": 800,
+   "okClient": 800,
+   "durableBatches": 800,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 8.97,
+   "durableRecordsPerSec": 4457,
+   "latencyThroughCommit": {
+    "p50": 85.3,
+    "p95": 105.3,
+    "max": 117.7
+   },
+   "clockWait": {
+    "p50": 73.9,
+    "p95": 91.3,
+    "max": 103.9
+   },
+   "holdClockToCommitEnd": {
+    "p50": 10.3,
+    "p95": 12.9
+   },
+   "durableAcksPerSec": 89.1,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 50,
+   "k": 100,
+   "tag": "size-n50-c8-r1",
+   "attempts": 800,
+   "okClient": 800,
+   "durableBatches": 800,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 9.31,
+   "durableRecordsPerSec": 4297,
+   "latencyThroughCommit": {
+    "p50": 87.4,
+    "p95": 110,
+    "max": 255.7
+   },
+   "clockWait": {
+    "p50": 75.6,
+    "p95": 94.8,
+    "max": 242.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 10.5,
+    "p95": 12.2
+   },
+   "durableAcksPerSec": 85.9,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 100,
+   "k": 50,
+   "tag": "size-n100-c8-r1",
+   "attempts": 400,
+   "okClient": 400,
+   "durableBatches": 400,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 8.86,
+   "durableRecordsPerSec": 4516,
+   "latencyThroughCommit": {
+    "p50": 168.1,
+    "p95": 198.5,
+    "max": 213.5
+   },
+   "clockWait": {
+    "p50": 146.1,
+    "p95": 170.8,
+    "max": 191.8
+   },
+   "holdClockToCommitEnd": {
+    "p50": 20.5,
+    "p95": 24.5
+   },
+   "durableAcksPerSec": 45.2,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 250,
+   "k": 20,
+   "tag": "size-n250-c8-r1",
+   "attempts": 160,
+   "okClient": 160,
+   "durableBatches": 160,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 9.7,
+   "durableRecordsPerSec": 4122,
+   "latencyThroughCommit": {
+    "p50": 433.4,
+    "p95": 554.7,
+    "max": 689
+   },
+   "clockWait": {
+    "p50": 376.7,
+    "p95": 493.1,
+    "max": 633.7
+   },
+   "holdClockToCommitEnd": {
+    "p50": 53.1,
+    "p95": 67.5
+   },
+   "durableAcksPerSec": 16.5,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "inactive",
+   "c": 8,
+   "n": 500,
+   "k": 10,
+   "tag": "size-n500-c8-r1",
+   "attempts": 80,
+   "okClient": 80,
+   "durableBatches": 80,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 10.43,
+   "durableRecordsPerSec": 3834,
+   "latencyThroughCommit": {
+    "p50": 871.4,
+    "p95": 1297.7,
+    "max": 1309.9
+   },
+   "clockWait": {
+    "p50": 761.8,
+    "p95": 1162.5,
+    "max": 1195.6
+   },
+   "holdClockToCommitEnd": {
+    "p50": 108.1,
+    "p95": 145
+   },
+   "durableAcksPerSec": 7.7,
+   "errors": {},
+   "takerErrors": {}
+  }
+ ]
+}

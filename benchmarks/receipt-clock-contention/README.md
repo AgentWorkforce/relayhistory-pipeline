@@ -31,6 +31,7 @@ a `*.test.ts`, and nothing is imported by `src/`.
 | `h-diff.bench.ts` | PGlite: loop vs H-rounds on the same input; reports every table, column and sequence that differs. |
 | `contention.ts` | C workers replaying one prepared batch each (`ROLLBACK`). Clock wait is measured from NOTICE timestamps around the clock lock line. |
 | `contention-commit.ts` | C workers committing fresh, unique batches (`COMMIT`); durable rows are counted after the drain. |
+| `contention-size.ts` | As `contention-hx.ts` on main's ACK only (no candidate): the same fresh records committed at different batch sizes. Claim and stage are pre-staged; only the commit (with its ACK) through COMMIT is timed. |
 | `contention-hx.ts` | As `contention-commit.ts`, for the 062156 candidate (gate on vs off), with distinct-scope states, per-worker `application_name` for `log_lock_waits`, and optional clock takers. Needs a checkout carrying 062156 (`review/receipt-clock-fix-h-exact`). |
 | `locktimeout.mjs` | Scratch table: `lock_timeout` applies per lock acquisition, not to the whole wait. |
 | `upgrade.mjs` | Scratch table: a `FOR KEY SHARE` holder's upgrade to `FOR NO KEY UPDATE` with a queued `FOR UPDATE` waiter. |
@@ -45,13 +46,15 @@ a `*.test.ts`, and nothing is imported by `src/`.
 | `run4a-real-commit-fresh.json` | COMMIT | fresh | Primary evidence (C=4/8). |
 | `run4b-real-commit-fresh.json` | COMMIT | fresh | Primary evidence (C=8/16). Absolute numbers differ 1.5-2.5x from run 4a: compare only within one run. |
 | `run5-h-exact-real-commit-fresh.json` | COMMIT | fresh | 062156 candidate vs gate off, two rotations per cell; lock timeouts by stage from `log_lock_waits`. Hold p50 is the stable signal; throughput and error counts swing between rotations. |
+| `run6-batch-size-real-commit-fresh.json` | COMMIT | fresh | Batch sizes 500/250/100/50 on main, 40,000 records per cell, two rotations. Timed boundary: BEGIN through COMMIT of the commit+ACK; HTTP/prepare/claim/stage pre-staged and untimed. Local macOS durability (see the file). |
 | `breakdown-single-connection.json` | ROLLBACK | single batch per cell | Single-connection breakdown by history state. |
 | `amplifiers-single-connection.json` | ROLLBACK | single batch per cell | Amplifier fixtures and the H variant, single connection. |
 | `h-equality-matrix.json` | ROLLBACK (PGlite) | n/a | Loop vs H-rounds stored differences. `authority_id` differences are fixture UUIDs. |
 
 ## What these results do not establish
 
-- Production hold times, network round-trips or fsync.
+- Production hold times, network round-trips or fsync (the local server runs on macOS, where fsync does not force stable media).
+- The per-batch cost of HTTP, prepare, claim and stage in the batch-size run (run 6): those steps were pre-staged, not timed.
 - Which stage each `55P03` hit in runs 1-4 (`log_lock_waits` was off; run 5 has it).
 - Stable absolute numbers on this host.
 - An absence of `40P01` beyond the schedules that were run.
