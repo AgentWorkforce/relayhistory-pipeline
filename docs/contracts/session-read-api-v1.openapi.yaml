@@ -256,12 +256,13 @@ paths:
         sessions. `session_partial_unbounded` lists and excludes nothing, so
         its pages may hold stale rows of a partial session. Otherwise (the
         default) the first page is 501 `session_partial` /
-        `session_partial_unbounded`. The unbounded condition counts only
-        partial sessions attributed to the requested workspace, not sibling
-        workspaces in the same organization. Default refuse mode returns on
-        the first attributed session; if its bounded attribution scan cannot
-        decide, it returns `session_partial_unbounded` so the caller falls
-        back. Skip mode returns 503 when that scan cannot complete safely.
+        `session_partial_unbounded`. Only partial sessions attributed to the
+        requested workspace count toward the 1000-session result bound;
+        sibling-workspace sessions can still exhaust the bounded attribution
+        scan. Default refuse mode returns on the first attributed session; an
+        empty, malformed or non-advancing id, the 32-page bound or the 3 s
+        deadline returns `session_partial_unbounded` so the caller falls back.
+        Skip mode returns 503 when that scan cannot complete safely.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}
