@@ -1,0 +1,781 @@
+{
+ "transactionEnd": "COMMIT",
+ "batches": "fresh",
+ "status": "Candidate 062156 (gate on, \"hx\") vs the same build gate off (\"loop\"); two rotations per cell (r0 loop first, r1 hx first). Rotations disagree in 3 of 6 pairs for throughput/errors; hold p50 is the stable signal.",
+ "lockTimeoutsByStage": {
+  "shared-n500-c8-hx-r0|statement|statement timeout|seat_clock": 1,
+  "shared-n500-c8-hx-r0|statement|statement timeout|": 1,
+  "shared-n500-c8-hx-r1|lock|tuple-lock stage|seat_clock": 1,
+  "shared-n500-c8-hx-r1|lock|transaction stage|seat_clock": 10,
+  "shared-n500-c8-hx-r1|statement|statement timeout|": 1,
+  "distinct10-n500-c8-hx-r0|lock|tuple-lock stage|seat_clock": 1,
+  "distinct10-n500-c8-hx-r0|lock|transaction stage|seat_clock": 5,
+  "distinct10-n500-c8-loop-r1|statement|statement timeout|": 10,
+  "distinct10-n500-c8-loop-r1|lock|transaction stage|seat_clock": 8,
+  "distinct10-n500-c8-loop-r1|statement|statement timeout|seat_clock": 4,
+  "perRecord-n500-c8-loop-r0|statement|statement timeout|": 4,
+  "shared-n100-c16-loop-r0|statement|statement timeout|": 15,
+  "shared-n100-c16-loop-r0|statement|statement timeout|seat_clock": 7,
+  "shared-n100-c16-loop-r0|lock|transaction stage|seat_clock": 29,
+  "shared-n100-c16-hx-r0|statement|statement timeout|": 2,
+  "shared-n100-c16-hx-r0|statement|statement timeout|seat_clock": 9,
+  "shared-n100-c16-hx-r0|lock|transaction stage|seat_clock": 3,
+  "rcfhx-taker|lock|no context|": 2,
+  "rcfhx-taker|lock|tuple-lock stage|seat_clock": 2,
+  "takers-shared-n500-c8-loop|statement|statement timeout|seat_clock": 2,
+  "takers-shared-n500-c8-loop|statement|statement timeout|": 2,
+  "rcfhx-taker|lock|transaction stage|seat_clock": 2
+ },
+ "cells": [
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "shared-n500-c8-loop-r0",
+   "attempts": 80,
+   "okClient": 80,
+   "durableBatches": 80,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 25.77,
+   "durableRecordsPerSec": 1552,
+   "latencyThroughCommit": {
+    "p50": 2361.5,
+    "p95": 2849.2,
+    "max": 2890.4
+   },
+   "clockWait": {
+    "p50": 2051.6,
+    "p95": 2465.8,
+    "max": 2554.2
+   },
+   "holdClockToCommitEnd": {
+    "p50": 279.2,
+    "p95": 409.1
+   },
+   "durableAcksPerSec": 3.1,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "shared-n500-c8-hx-r0",
+   "attempts": 80,
+   "okClient": 78,
+   "durableBatches": 78,
+   "durableDecisionRows": 39000,
+   "newSeats": 39000,
+   "wallSecondsInclDrain": 20.68,
+   "durableRecordsPerSec": 1886,
+   "latencyThroughCommit": {
+    "p50": 1450.1,
+    "p95": 4071.8,
+    "max": 4972.6
+   },
+   "clockWait": {
+    "p50": 1260.1,
+    "p95": 3889.6,
+    "max": 4845.7
+   },
+   "holdClockToCommitEnd": {
+    "p50": 174.5,
+    "p95": 466.8
+   },
+   "durableAcksPerSec": 3.8,
+   "errors": {
+    "57014": 2
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "shared-n500-c8-hx-r1",
+   "attempts": 80,
+   "okClient": 68,
+   "durableBatches": 68,
+   "durableDecisionRows": 34000,
+   "newSeats": 34000,
+   "wallSecondsInclDrain": 21.99,
+   "durableRecordsPerSec": 1546,
+   "latencyThroughCommit": {
+    "p50": 1344.6,
+    "p95": 3947.4,
+    "max": 5108.5
+   },
+   "clockWait": {
+    "p50": 1165.1,
+    "p95": 3692,
+    "max": 4780.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 167.9,
+    "p95": 983
+   },
+   "durableAcksPerSec": 3.1,
+   "errors": {
+    "57014": 1,
+    "55P03": 11
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "shared-n500-c8-loop-r1",
+   "attempts": 80,
+   "okClient": 80,
+   "durableBatches": 80,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 28.37,
+   "durableRecordsPerSec": 1410,
+   "latencyThroughCommit": {
+    "p50": 2541,
+    "p95": 3966,
+    "max": 4565.9
+   },
+   "clockWait": {
+    "p50": 2179.9,
+    "p95": 3618.2,
+    "max": 4268.7
+   },
+   "holdClockToCommitEnd": {
+    "p50": 296.9,
+    "p95": 465.4
+   },
+   "durableAcksPerSec": 2.8,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct10",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "distinct10-n500-c8-loop-r0",
+   "attempts": 80,
+   "okClient": 80,
+   "durableBatches": 80,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 22.31,
+   "durableRecordsPerSec": 1793,
+   "latencyThroughCommit": {
+    "p50": 1688,
+    "p95": 2453.9,
+    "max": 2636.9
+   },
+   "clockWait": {
+    "p50": 1475.8,
+    "p95": 2223.2,
+    "max": 2404.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 208.8,
+    "p95": 247.3
+   },
+   "durableAcksPerSec": 3.6,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "distinct10",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "distinct10-n500-c8-hx-r0",
+   "attempts": 80,
+   "okClient": 74,
+   "durableBatches": 74,
+   "durableDecisionRows": 37000,
+   "newSeats": 37000,
+   "wallSecondsInclDrain": 23.27,
+   "durableRecordsPerSec": 1590,
+   "latencyThroughCommit": {
+    "p50": 1651.1,
+    "p95": 3668.5,
+    "max": 5137.3
+   },
+   "clockWait": {
+    "p50": 1405.2,
+    "p95": 3315.7,
+    "max": 4479.2
+   },
+   "holdClockToCommitEnd": {
+    "p50": 192.3,
+    "p95": 828.6
+   },
+   "durableAcksPerSec": 3.2,
+   "errors": {
+    "55P03": 6
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "distinct10",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "distinct10-n500-c8-hx-r1",
+   "attempts": 80,
+   "okClient": 80,
+   "durableBatches": 80,
+   "durableDecisionRows": 40000,
+   "newSeats": 40000,
+   "wallSecondsInclDrain": 14.09,
+   "durableRecordsPerSec": 2839,
+   "latencyThroughCommit": {
+    "p50": 1261.8,
+    "p95": 1319.8,
+    "max": 1341.2
+   },
+   "clockWait": {
+    "p50": 1102.3,
+    "p95": 1149.8,
+    "max": 1174.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 157.3,
+    "p95": 169.9
+   },
+   "durableAcksPerSec": 5.7,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "distinct10",
+   "n": 500,
+   "c": 8,
+   "k": 10,
+   "takers": false,
+   "tag": "distinct10-n500-c8-loop-r1",
+   "attempts": 80,
+   "okClient": 58,
+   "durableBatches": 58,
+   "durableDecisionRows": 29000,
+   "newSeats": 29000,
+   "wallSecondsInclDrain": 33.97,
+   "durableRecordsPerSec": 854,
+   "latencyThroughCommit": {
+    "p50": 1786.3,
+    "p95": 4680.1,
+    "max": 5104
+   },
+   "clockWait": {
+    "p50": 1597.6,
+    "p95": 4913.6,
+    "max": 4952.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 227.3,
+    "p95": 1050.5
+   },
+   "durableAcksPerSec": 1.7,
+   "errors": {
+    "57014": 14,
+    "55P03": 8
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "perRecord",
+   "n": 500,
+   "c": 8,
+   "k": 5,
+   "takers": false,
+   "tag": "perRecord-n500-c8-loop-r0",
+   "attempts": 40,
+   "okClient": 36,
+   "durableBatches": 36,
+   "durableDecisionRows": 18000,
+   "newSeats": 18000,
+   "wallSecondsInclDrain": 15.15,
+   "durableRecordsPerSec": 1188,
+   "latencyThroughCommit": {
+    "p50": 1750.6,
+    "p95": 4386.4,
+    "max": 5044.8
+   },
+   "clockWait": {
+    "p50": 1671.9,
+    "p95": 4789.5,
+    "max": 4908.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 221.7,
+    "p95": 1136.4
+   },
+   "durableAcksPerSec": 2.4,
+   "errors": {
+    "57014": 4
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "perRecord",
+   "n": 500,
+   "c": 8,
+   "k": 5,
+   "takers": false,
+   "tag": "perRecord-n500-c8-hx-r0",
+   "attempts": 40,
+   "okClient": 40,
+   "durableBatches": 40,
+   "durableDecisionRows": 20000,
+   "newSeats": 20000,
+   "wallSecondsInclDrain": 13.15,
+   "durableRecordsPerSec": 1521,
+   "latencyThroughCommit": {
+    "p50": 1972.3,
+    "p95": 2077.8,
+    "max": 2081.2
+   },
+   "clockWait": {
+    "p50": 1713.1,
+    "p95": 1814.1,
+    "max": 1823.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 246.4,
+    "p95": 267.2
+   },
+   "durableAcksPerSec": 3,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "perRecord",
+   "n": 500,
+   "c": 8,
+   "k": 5,
+   "takers": false,
+   "tag": "perRecord-n500-c8-hx-r1",
+   "attempts": 40,
+   "okClient": 40,
+   "durableBatches": 40,
+   "durableDecisionRows": 20000,
+   "newSeats": 20000,
+   "wallSecondsInclDrain": 14.79,
+   "durableRecordsPerSec": 1353,
+   "latencyThroughCommit": {
+    "p50": 2505.1,
+    "p95": 2779.4,
+    "max": 2872.8
+   },
+   "clockWait": {
+    "p50": 2187,
+    "p95": 2376.6,
+    "max": 2554.7
+   },
+   "holdClockToCommitEnd": {
+    "p50": 286.6,
+    "p95": 406.7
+   },
+   "durableAcksPerSec": 2.7,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "perRecord",
+   "n": 500,
+   "c": 8,
+   "k": 5,
+   "takers": false,
+   "tag": "perRecord-n500-c8-loop-r1",
+   "attempts": 40,
+   "okClient": 40,
+   "durableBatches": 40,
+   "durableDecisionRows": 20000,
+   "newSeats": 20000,
+   "wallSecondsInclDrain": 17.37,
+   "durableRecordsPerSec": 1151,
+   "latencyThroughCommit": {
+    "p50": 2778.8,
+    "p95": 2881,
+    "max": 2925.2
+   },
+   "clockWait": {
+    "p50": 2425.5,
+    "p95": 2527.6,
+    "max": 2542.6
+   },
+   "holdClockToCommitEnd": {
+    "p50": 337.5,
+    "p95": 430
+   },
+   "durableAcksPerSec": 2.3,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 100,
+   "c": 8,
+   "k": 30,
+   "takers": false,
+   "tag": "shared-n100-c8-loop-r0",
+   "attempts": 240,
+   "okClient": 240,
+   "durableBatches": 240,
+   "durableDecisionRows": 24000,
+   "newSeats": 24000,
+   "wallSecondsInclDrain": 19.47,
+   "durableRecordsPerSec": 1233,
+   "latencyThroughCommit": {
+    "p50": 593.3,
+    "p95": 658.6,
+    "max": 1101.7
+   },
+   "clockWait": {
+    "p50": 517.6,
+    "p95": 582.4,
+    "max": 1025
+   },
+   "holdClockToCommitEnd": {
+    "p50": 73.3,
+    "p95": 80.5
+   },
+   "durableAcksPerSec": 12.3,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 100,
+   "c": 8,
+   "k": 30,
+   "takers": false,
+   "tag": "shared-n100-c8-hx-r0",
+   "attempts": 240,
+   "okClient": 240,
+   "durableBatches": 240,
+   "durableDecisionRows": 24000,
+   "newSeats": 24000,
+   "wallSecondsInclDrain": 23.31,
+   "durableRecordsPerSec": 1029,
+   "latencyThroughCommit": {
+    "p50": 658.8,
+    "p95": 1192.2,
+    "max": 1475.8
+   },
+   "clockWait": {
+    "p50": 571.7,
+    "p95": 1104.5,
+    "max": 1302.6
+   },
+   "holdClockToCommitEnd": {
+    "p50": 78.1,
+    "p95": 155
+   },
+   "durableAcksPerSec": 10.3,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 100,
+   "c": 8,
+   "k": 30,
+   "takers": false,
+   "tag": "shared-n100-c8-hx-r1",
+   "attempts": 240,
+   "okClient": 240,
+   "durableBatches": 240,
+   "durableDecisionRows": 24000,
+   "newSeats": 24000,
+   "wallSecondsInclDrain": 18.6,
+   "durableRecordsPerSec": 1291,
+   "latencyThroughCommit": {
+    "p50": 562,
+    "p95": 767.4,
+    "max": 1174.2
+   },
+   "clockWait": {
+    "p50": 490.4,
+    "p95": 665.8,
+    "max": 1100.1
+   },
+   "holdClockToCommitEnd": {
+    "p50": 68.9,
+    "p95": 89.6
+   },
+   "durableAcksPerSec": 12.9,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 100,
+   "c": 8,
+   "k": 30,
+   "takers": false,
+   "tag": "shared-n100-c8-loop-r1",
+   "attempts": 240,
+   "okClient": 240,
+   "durableBatches": 240,
+   "durableDecisionRows": 24000,
+   "newSeats": 24000,
+   "wallSecondsInclDrain": 22.94,
+   "durableRecordsPerSec": 1046,
+   "latencyThroughCommit": {
+    "p50": 657.1,
+    "p95": 822.8,
+    "max": 1752.8
+   },
+   "clockWait": {
+    "p50": 573.4,
+    "p95": 717.6,
+    "max": 1667.6
+   },
+   "holdClockToCommitEnd": {
+    "p50": 80.3,
+    "p95": 97.8
+   },
+   "durableAcksPerSec": 10.5,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 100,
+   "c": 16,
+   "k": 20,
+   "takers": false,
+   "tag": "shared-n100-c16-loop-r0",
+   "attempts": 320,
+   "okClient": 269,
+   "durableBatches": 269,
+   "durableDecisionRows": 26900,
+   "newSeats": 26900,
+   "wallSecondsInclDrain": 49.7,
+   "durableRecordsPerSec": 541,
+   "latencyThroughCommit": {
+    "p50": 1810.1,
+    "p95": 3395.1,
+    "max": 4442.8
+   },
+   "clockWait": {
+    "p50": 1713.1,
+    "p95": 4190.8,
+    "max": 4976.6
+   },
+   "holdClockToCommitEnd": {
+    "p50": 107.5,
+    "p95": 378.8
+   },
+   "durableAcksPerSec": 5.4,
+   "errors": {
+    "57014": 22,
+    "55P03": 29
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 100,
+   "c": 16,
+   "k": 20,
+   "takers": false,
+   "tag": "shared-n100-c16-hx-r0",
+   "attempts": 320,
+   "okClient": 306,
+   "durableBatches": 306,
+   "durableDecisionRows": 30600,
+   "newSeats": 30600,
+   "wallSecondsInclDrain": 33.24,
+   "durableRecordsPerSec": 920,
+   "latencyThroughCommit": {
+    "p50": 1084.7,
+    "p95": 2206.3,
+    "max": 4917.5
+   },
+   "clockWait": {
+    "p50": 1010.4,
+    "p95": 2110.3,
+    "max": 4986.4
+   },
+   "holdClockToCommitEnd": {
+    "p50": 65.1,
+    "p95": 161.9
+   },
+   "durableAcksPerSec": 9.2,
+   "errors": {
+    "57014": 11,
+    "55P03": 3
+   },
+   "takerErrors": {}
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 100,
+   "c": 16,
+   "k": 20,
+   "takers": false,
+   "tag": "shared-n100-c16-hx-r1",
+   "attempts": 320,
+   "okClient": 320,
+   "durableBatches": 320,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 26.48,
+   "durableRecordsPerSec": 1209,
+   "latencyThroughCommit": {
+    "p50": 1031.2,
+    "p95": 2183.9,
+    "max": 2579.8
+   },
+   "clockWait": {
+    "p50": 969.6,
+    "p95": 2093.5,
+    "max": 2492.3
+   },
+   "holdClockToCommitEnd": {
+    "p50": 61,
+    "p95": 122.7
+   },
+   "durableAcksPerSec": 12.1,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 100,
+   "c": 16,
+   "k": 20,
+   "takers": false,
+   "tag": "shared-n100-c16-loop-r1",
+   "attempts": 320,
+   "okClient": 320,
+   "durableBatches": 320,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 36.29,
+   "durableRecordsPerSec": 882,
+   "latencyThroughCommit": {
+    "p50": 1554.3,
+    "p95": 2660.3,
+    "max": 3260.7
+   },
+   "clockWait": {
+    "p50": 1449.9,
+    "p95": 2525.6,
+    "max": 3133
+   },
+   "holdClockToCommitEnd": {
+    "p50": 93.3,
+    "p95": 160
+   },
+   "durableAcksPerSec": 8.8,
+   "errors": {},
+   "takerErrors": {}
+  },
+  {
+   "variant": "loop",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 8,
+   "takers": true,
+   "tag": "takers-shared-n500-c8-loop",
+   "attempts": 64,
+   "okClient": 60,
+   "durableBatches": 60,
+   "durableDecisionRows": 30000,
+   "newSeats": 30000,
+   "wallSecondsInclDrain": 39.17,
+   "durableRecordsPerSec": 766,
+   "latencyThroughCommit": {
+    "p50": 3992.7,
+    "p95": 4780.7,
+    "max": 5033.6
+   },
+   "clockWait": {
+    "p50": 3528.5,
+    "p95": 4354,
+    "max": 4580.5
+   },
+   "holdClockToCommitEnd": {
+    "p50": 482.7,
+    "p95": 851.4
+   },
+   "durableAcksPerSec": 1.5,
+   "errors": {
+    "57014": 4
+   },
+   "takerErrors": {
+    "55P03": 4
+   }
+  },
+  {
+   "variant": "hx",
+   "state": "shared",
+   "n": 500,
+   "c": 8,
+   "k": 8,
+   "takers": true,
+   "tag": "takers-shared-n500-c8-hx",
+   "attempts": 64,
+   "okClient": 64,
+   "durableBatches": 64,
+   "durableDecisionRows": 32000,
+   "newSeats": 32000,
+   "wallSecondsInclDrain": 32.08,
+   "durableRecordsPerSec": 998,
+   "latencyThroughCommit": {
+    "p50": 3789.6,
+    "p95": 4533,
+    "max": 5024.2
+   },
+   "clockWait": {
+    "p50": 3303.7,
+    "p95": 4057.8,
+    "max": 4520.8
+   },
+   "holdClockToCommitEnd": {
+    "p50": 436.5,
+    "p95": 715.1
+   },
+   "durableAcksPerSec": 2,
+   "errors": {},
+   "takerErrors": {
+    "55P03": 2
+   }
+  }
+ ]
+}
