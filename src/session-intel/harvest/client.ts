@@ -65,7 +65,7 @@ export function redact(text: string, token: string | undefined): string {
 }
 
 /** Whether a short value shares any run of 8 characters with the token: it may carry a fragment of it. */
-const carriesTokenFragment = (v: string, token: string): boolean => {
+export const carriesTokenFragment = (v: string, token: string): boolean => {
   for (let i = 0; i + 8 <= v.length; i++) if (token.includes(v.slice(i, i + 8))) return true;
   return false;
 };

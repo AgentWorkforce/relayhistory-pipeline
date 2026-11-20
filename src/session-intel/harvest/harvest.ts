@@ -9,24 +9,11 @@ import { createReadStream } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { bump, counter, HarvestError, LIST_MODE_HEADER, LIST_SERVED_BY_HEADER, READ_BACKEND_HEADER, RequestCapReached, type ClientStats, type ReadApiClient } from "./client.ts";
-import { IMPORT_BOUNDS, projectKey, repoRelativePath } from "../import/normalize.ts";
+import { IMPORT_BOUNDS, repoNameFromRemote, repoRelativePath } from "../import/normalize.ts";
 import { isoTime } from "../replay/util.ts";
 
-/**
- * The repository name from a catalog remote URL, never its credentials: the query and fragment and any
- * `user[:password]@` are dropped first, and a URL with no path after its host (or with an `@` still left in it)
- * gives null, since its last segment could be the secret itself.
- */
-export function repoKey(url: string): string | null {
-  let u = url.trim().replace(/[?#].*$/su, "");
-  u = u.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/iu, "$1");
-  const scp = /^[^/@:]+@[^/:]+:(.+)$/u.exec(u);
-  if (scp) u = scp[1]!;
-  if (u.includes("@")) return null;
-  const path = u.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/iu, "");
-  if (!path.replace(/\//gu, "")) return null;
-  return projectKey(u, null);
-}
+/** The repository name from a catalog remote URL, never its credentials ({@link repoNameFromRemote}). */
+export const repoKey = (url: string): string | null => repoNameFromRemote(url);
 
 export const STATE_FILE = "harvest-state.jsonl";
 export const STATE_FORMAT = "session-intel-harvest-state/1";
