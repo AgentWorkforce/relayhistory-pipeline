@@ -8,15 +8,17 @@ const SHELL = new Set(["exec_command", "shell_command", "shell", "local_shell"])
 export interface StaticShells { commands: Array<string | string[]>; incomplete: boolean }
 
 function method(node: ts.Node): string | null {
-  if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression) || node.expression.questionDotToken
+  if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)
     || !ts.isIdentifier(node.expression.expression) || node.expression.expression.text !== "tools") return null;
   return SHELL.has(node.expression.name.text) ? node.expression.name.text : null;
 }
 function hiddenFlow(n: ts.Node): boolean {
   return ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isIfStatement(n)
     || ts.isSwitchStatement(n) || ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n)
-    || ts.isWhileStatement(n) || ts.isDoStatement(n) || ts.isConditionalExpression(n)
-    || (ts.isBinaryExpression(n) && [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken].includes(n.operatorToken.kind));
+    || ts.isWhileStatement(n) || ts.isDoStatement(n) || ts.isConditionalExpression(n) || ts.isTryStatement(n)
+    || ((ts.isCallExpression(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) && ts.isOptionalChain(n))
+    || (ts.isBinaryExpression(n) && [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken,
+      ts.SyntaxKind.AmpersandAmpersandEqualsToken, ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken].includes(n.operatorToken.kind));
 }
 
 /** Supported: unconditional tools.<shell>({cmd|command: literal, or immutable top-level const string}). */
@@ -29,12 +31,14 @@ export function codeModeShells(source: string): StaticShells {
     // Pinned TypeScript supplies parser diagnostics on SourceFile; fail closed if unavailable.
     const diagnostics = (file as ts.SourceFile & { parseDiagnostics?: readonly unknown[] }).parseDiagnostics;
     if (!diagnostics || diagnostics.length) return none(true);
-    const bindings = new Map<string, number>(), constants = new Map<string, string>();
+    const bindings = new Map<string, number>(), constants = new Map<string, { value: string; availableAt: number }>();
+    const nodes: ts.Node[] = [];
     let count = 0, knownCalls = 0, toolsWritten = false;
     const todo: ts.Node[] = [file];
     while (todo.length) {
       const n = todo.pop()!;
       if (++count > CODE_MODE_BOUNDS.nodes) return none(true);
+      nodes.push(n);
       if (method(n)) knownCalls++;
       if ((ts.isVariableDeclaration(n) || ts.isParameter(n) || ts.isBindingElement(n) || ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n)
         || ts.isImportSpecifier(n) || ts.isImportClause(n) || ts.isNamespaceImport(n) || ts.isImportEqualsDeclaration(n))
@@ -50,7 +54,10 @@ export function codeModeShells(source: string): StaticShells {
     const literal = (node: ts.Expression, depth = 0): string | null => {
       if (depth > CODE_MODE_BOUNDS.depth) return null;
       if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text.length <= CODE_MODE_BOUNDS.command ? node.text : null;
-      if (ts.isIdentifier(node)) return constants.get(node.text) ?? null;
+      if (ts.isIdentifier(node)) {
+        const entry = constants.get(node.text);
+        return entry && node.pos >= entry.availableAt ? entry.value : null;
+      }
       if (ts.isParenthesizedExpression(node)) return literal(node.expression, depth + 1);
       if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
         const a = literal(node.left, depth + 1), b = literal(node.right, depth + 1);
@@ -60,8 +67,18 @@ export function codeModeShells(source: string): StaticShells {
     };
     for (const statement of file.statements) if (ts.isVariableStatement(statement) && (statement.declarationList.flags & ts.NodeFlags.Const)) {
       for (const d of statement.declarationList.declarations) if (ts.isIdentifier(d.name) && bindings.get(d.name.text) === 1 && d.initializer) {
-        const value = literal(d.initializer); if (value !== null) constants.set(d.name.text, value);
+        const value = literal(d.initializer); if (value !== null) constants.set(d.name.text, { value, availableAt: d.end });
       }
+    }
+    // Bottom-up, bounded control-transfer barriers. Do not assume statements
+    // after a possible throw/return/break/continue execute. Function/class bodies
+    // have their own execution context and cannot terminate an enclosing list.
+    const transfers = new WeakSet<ts.Node>();
+    for (const node of nodes.reverse()) {
+      if (ts.isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) continue;
+      let transfer = ts.isThrowStatement(node) || ts.isReturnStatement(node) || ts.isBreakStatement(node) || ts.isContinueStatement(node);
+      ts.forEachChild(node, (child) => { if (transfers.has(child)) transfer = true; });
+      if (transfer) transfers.add(node);
     }
     const commands: StaticShells["commands"] = [];
     let visitedCalls = 0, incomplete = false;
@@ -92,7 +109,14 @@ export function codeModeShells(source: string): StaticShells {
         } else incomplete = true;
       }
       // Preserve source order despite the iterative stack.
-      const children: ts.Node[] = []; ts.forEachChild(n, (child) => { children.push(child); }); todo.push(...children.reverse());
+      const children: ts.Node[] = [];
+      if (ts.isSourceFile(n) || ts.isBlock(n)) {
+        for (const statement of n.statements) {
+          children.push(statement);
+          if (transfers.has(statement)) break;
+        }
+      } else ts.forEachChild(n, (child) => { children.push(child); });
+      todo.push(...children.reverse());
     }
     return { commands, incomplete: incomplete || visitedCalls !== knownCalls };
   } catch { return none(true); } // Parser stack/shape failures yield missing evidence, never execution or a content-bearing error.

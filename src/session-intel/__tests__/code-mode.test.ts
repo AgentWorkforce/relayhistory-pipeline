@@ -32,6 +32,20 @@ for (const [name, input] of [
   ["uncalled function", "function f(){tools.exec_command({cmd:'git commit'})}"],
   ["conditional call", "if(false)tools.exec_command({cmd:'git commit'})"],
   ["short circuit", "false && tools.exec_command({cmd:'git commit'})"],
+  ["logical or assignment", "const x=true; x ||= tools.exec_command({cmd:'git commit'})"],
+  ["nullish assignment", "let x=1; x ??= tools.exec_command({cmd:'git commit'})"],
+  ["logical and assignment", "let x=false; x &&= tools.exec_command({cmd:'git commit'})"],
+  ["optional argument call", "x?.(tools.exec_command({cmd:'git commit'}))"],
+  ["optional index", "o?.[tools.exec_command({cmd:'git commit'})]"],
+  ["optional tool call", "tools.exec_command?.({cmd:'git commit'})"],
+  ["optional tool namespace", "tools?.exec_command({cmd:'git commit'})"],
+  ["after throw", "throw new Error('fixture'); tools.exec_command({cmd:'git commit'})"],
+  ["after nested throw", "{ { throw new Error('fixture'); } } tools.exec_command({cmd:'git commit'})"],
+  ["after possible throw", "if (guard) throw new Error('fixture'); tools.exec_command({cmd:'git commit'})"],
+  ["after return", "return; tools.exec_command({cmd:'git commit'})"],
+  ["after labelled break", "fixture: { break fixture; tools.exec_command({cmd:'git commit'}) }"],
+  ["try body", "try { tools.exec_command({cmd:'git commit'}) } catch {}"],
+  ["const used before declaration", "tools.exec_command({cmd}); const cmd='git commit'"],
   ["malformed code", "tools.exec_command({cmd:'git commit'"],
 ] as const) test(`unsupported ${name} is counted as incomplete rather than guessed`, () => {
   expect(codeModeShells(input)).toEqual({ commands: [], incomplete: true });
@@ -65,4 +79,18 @@ test("ambiguous, rejected, unrelated and bounded-out output never invents a SHA"
   for (let i = 0; i < 100_000; i++) nested = [nested];
   expect(codexCommitSha(nested)).toBeNull();
   expect(codexCommitSha([line, line])).toBe("abcdef12");
+});
+
+test("transfer barriers preserve earlier attempts and ignore transfers in uncalled functions", () => {
+  expect(codeModeShells("tools.exec_command({cmd:'git commit'}); throw new Error('fixture'); tools.exec_command({cmd:'git commit -m unreachable'})"))
+    .toEqual({ commands: ["git commit"], incomplete: true });
+  expect(codeModeShells("function helper(){ return; } tools.exec_command({cmd:'git commit'})"))
+    .toEqual({ commands: ["git commit"], incomplete: false });
+  expect(codeModeShells("const base='git '; const cmd=base+'commit'; tools.exec_command({cmd})"))
+    .toEqual({ commands: ["git commit"], incomplete: false });
+});
+
+test("parser and source failures are incomplete even before shell calls can be recognized", () => {
+  expect(codeModeShells(" ".repeat(CODE_MODE_BOUNDS.input + 1))).toEqual({ commands: [], incomplete: true });
+  expect(codeModeShells("// exec_command\nconst =")).toEqual({ commands: [], incomplete: true });
 });
