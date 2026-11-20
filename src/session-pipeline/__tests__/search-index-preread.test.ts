@@ -4,6 +4,7 @@
  * before the transaction starts. Synthetic, secret-free fixtures only.
  */
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { exportStreamScope, generate, SCOPE } from "../../session-read-api/__tests__/stream-fixture.ts";
 import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { closeReplayTemplate, warmReplayTemplate } from "./replay-fixture.ts";
@@ -52,6 +53,29 @@ test("skip-current stays first: a current scope pays no source read or index cal
   const reads = r.reads.count, calls = r.fake.calls.length;
   const result = await indexSearchScope(SCOPE, r.search({ preRead: true, skipCurrent: true }));
   expect(result).toMatchObject({ complete: true, skipped: true, reasons: ["already_current"] });
+  expect(r.reads.count).toBe(reads);
+  expect(r.fake.calls).toHaveLength(calls);
+});
+
+test("skip-current off: a busy scope returns before any source or ClickHouse read", async () => {
+  const { r } = await rig();
+  const reads = r.reads.count, calls = r.fake.calls.length;
+  const held = <T,>(work: (tx: SqlExecutor) => Promise<T>) =>
+    r.transact((tx) => work({
+      query: (sql: string, params?: unknown[]) =>
+        sql.includes("pg_try_advisory_xact_lock") ? Promise.resolve({ rows: [{ ok: false }] }) as never : tx.query(sql, params),
+    }));
+  expect(await indexSearchScope(SCOPE, r.search({ preRead: true, skipCurrent: false, transact: held })))
+    .toMatchObject({ busy: true, reasons: ["scope_busy"] });
+  expect(r.reads.count).toBe(reads);
+  expect(r.fake.calls).toHaveLength(calls);
+});
+
+test("a missing ClickHouse binding takes the base validation path", async () => {
+  const { r } = await rig();
+  const reads = r.reads.count, calls = r.fake.calls.length;
+  await expect(indexSearchScope(SCOPE, { ...r.search({ preRead: true }), ch: undefined }))
+    .rejects.toThrow("search requires exactly one service binding");
   expect(r.reads.count).toBe(reads);
   expect(r.fake.calls).toHaveLength(calls);
 });

@@ -817,8 +817,10 @@ or self-host streaming, and either ClickHouse or Postgres output facts also rema
 silent mixture: only the legacy ClickHouse whole-read path with none of those modes selected pre-reads.
 
 On that path, the skip-current proof still runs first; a skipped scope makes no object-store or ClickHouse call.
-Otherwise a short transaction captures the canonical id, live-pointer fingerprint and directory epoch, then
-commits. With no live pointer it goes directly to the unchanged locked erase path. For a live scope the canonical
+Otherwise a short transaction takes the existing scope and canonical try-locks and captures the canonical id,
+live-pointer fingerprint and directory epoch, then commits. A busy scope therefore returns before any S3 or
+ClickHouse read even when skip-current is off. With no live pointer it goes directly to the unchanged locked erase
+path. For a live scope the canonical
 S3 read and ClickHouse window/index scan run with no Postgres transaction open. The existing scope and canonical
 locks are then taken and the stamp is read again. Equal, the existing upsert, exact-position delete, directory,
 catalog and state writes run under the locks against the prepared read; changed, the pre-read is repeated once. A
@@ -829,6 +831,11 @@ Two passes can capture the same source stamp and scan the same old index before 
 this slice because upserts are versioned and deletes name the old exact position: repeating the same source plan
 neither resurrects the old position nor removes the new one. The race test forces both scans to finish before
 either apply. A later lease-backed slice remains the target for moving writes outside the lock.
+
+A buffered row that lands in ClickHouse after this pass's pre-read scan is not among this pass's stale-row deletes;
+the next delivered or scheduled reconcile pass sees and heals it. The source stamp does not need pointer-style
+timestamps or tombstones for ABA protection: every supported live-pointer key, revision, canonical-id or deletion
+change monotonically increments the directory epoch, while the fingerprint independently binds the current live set.
 
 The normal flag-on path uses at most one Postgres connection per scope at a time: a short capture transaction, no
 database connection during S3/ClickHouse reads, then the one locked apply transaction. The additive search log
