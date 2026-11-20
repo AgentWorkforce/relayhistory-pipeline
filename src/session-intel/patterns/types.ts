@@ -2,8 +2,8 @@
 import type { Snapshot, SnapshotSession } from "../replay/snapshot.ts";
 
 export const PATTERN_FORMAT = "session-intel-patterns/1";
-export const ANALYSIS_VERSION = "1";
-export const ANALYSIS_BOUNDS = { inputs: 16, sessions: 100_000, facts: 500_000, pairs: 10_000, evidencePairs: 3, groups: 50, members: 20 } as const;
+export const ANALYSIS_VERSION = "2";
+export const ANALYSIS_BOUNDS = { inputs: 16, sessions: 100_000, facts: 500_000, pairs: 10_000, evidencePairs: 3, groups: 50, members: 20, files: 50, repositories: 1_000 } as const;
 export interface Corpus {
   inputs: Array<{ manifestSha256: string; sessions: number; coverage: "not_declared" | "declared_verified" | "declared_gap" }>;
   sessions: SnapshotSession[];
@@ -28,7 +28,7 @@ export interface PatternCandidate {
   lastObservedAt: string;
   closestGapMs: number;
   sessionSpanOverlapMs: number;
-  parentLink: "observed" | "not_observed";
+  parentLink: "direct" | "shared_parent" | "not_observed";
   branchRelation: "same" | "different" | "unknown" | "mixed";
   evidence: EvidencePair[];
 }
@@ -44,6 +44,7 @@ export interface PatternReport {
   coverage: {
     workspaceCompleteness: "not_established";
     quality: "not_evaluated";
+    sessionsOutsideWindow: number; filesTotal: number; filesOmitted: number; groupsTotal: number; groupsOmitted: number; repositoriesTotal: number; repositoriesOmitted: number;
     factsOutsideWindow: number; duplicateWrites: number; sessionsWithoutScope: number;
     comparisons: number; scanComplete: boolean; reasons: string[];
     candidatePairsRetained: number; candidatesOmittedFromReport: number;

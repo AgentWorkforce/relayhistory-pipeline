@@ -1,9 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, statSync, symlinkSync, existsSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, readFileSync, statSync, symlinkSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { main } from "../patterns/cli.ts";
 import { sha256Hex } from "../replay/util.ts";
-import { session, tmp, writeSnapshot } from "./helpers.ts";
+import { session, tmp as makeTmp, writeSnapshot } from "./helpers.ts";
+
+const ownDirs: string[] = [];
+const tmp = () => { const dir = makeTmp(); ownDirs.push(dir); return dir; };
+afterAll(() => { for (const dir of ownDirs) rmSync(dir, { recursive: true, force: true }); });
 
 const now = new Date("2026-11-02T00:00:00Z");
 const io = () => ({ now, out: (_: string) => {} });
@@ -47,4 +51,15 @@ describe("offline pattern CLI", () => {
     expect(await main(["--snapshot", dir, "--out", out, "--max-comparisons", "1"], io())).toBe(3);
     expect(JSON.parse(readFileSync(join(out, "report.json"), "utf8")).coverage).toMatchObject({ scanComplete: false, reasons: ["comparison_budget"] });
   });
+});
+
+test("bare repositories, malformed retention and tampered input hashes fail before output", async () => {
+  const base = tmp(), bare = join(base, "fixture.git"), out = join(bare, "report");
+  mkdirSync(bare); mkdirSync(join(bare, "objects")); mkdirSync(join(bare, "refs")); writeFileSync(join(bare, "HEAD"), "ref: refs/heads/main\n");
+  await expect(main(["--snapshot", source(), "--out", out], io())).rejects.toThrow("outside every repository");
+  const dir = source(), target = join(tmp(), "report");
+  await expect(main(["--snapshot", dir, "--out", target, "--delete-by", "November 5, 2026"], io())).rejects.toThrow("ISO timestamp");
+  writeFileSync(join(dir, "sessions.jsonl"), "tampered fixture");
+  await expect(main(["--snapshot", dir, "--out", target], io())).rejects.toThrow();
+  expect(existsSync(target)).toBe(false);
 });

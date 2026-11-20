@@ -45,13 +45,15 @@ coverage match. Use it only for exports collected with a known shared namespace.
 Independently salted exports cannot be joined by assuming their ids are comparable.
 The report preserves that assertion and never claims workspace completeness.
 
-Defaults: 30-minute nearby-edit window, 200,000 event comparisons, 100 review cases.
+Defaults: 30-minute nearby-edit window, 200,000 cross-session event comparisons, 100 review cases.
 Options: `--nearby-ms` (0–86,400,000), `--max-comparisons` (1–5,000,000),
 `--max-candidates` (1–1,000). After loading with the existing reader's byte bounds,
 the analysis accepts at most 16 snapshots, 100,000 session rows and 500,000 total
 facts (before deduplication). Discovery retains at most 10,000 candidate pairs;
 each carries at most three event pairs. Groups use retained edges, show at most
-50 groups and 20 member references each. The report distinguishes censored discovery
+50 groups and 20 member references each, 50 file rows and 1,000 repository/project
+rows. All omitted row counts are reported. Same-session writes use a linear sliding
+queue and do not consume the comparison budget. The report distinguishes censored discovery
 from omitted display rows. Budget censoring writes a usable report and exits 3;
 it must not be described as an exhaustive scan.
 
@@ -61,7 +63,10 @@ is an edit intent, not a verified successful filesystem mutation. Session spans
 measure first-to-last records, not continuous activity. Equal paths in different
 repositories are not compared. Unscoped sessions remain in coverage but cannot
 produce file-based pairs. Parent links are observed metadata, not proof that work
-was planned; missing links are not proof of independence.
+was planned; missing links are not proof of independence. Direct parent links and
+shared-parent links are distinguished. Sessions wholly outside the window without
+in-window facts are excluded from profile denominators and counted separately.
+Repeated manifest inputs are refused; equal sessions in distinct manifests dedupe.
 Commit facts may have unknown keys; the profile separately counts keys shaped
 like Git SHA abbreviations. Even those keys do not establish success, merge status
 or harm without an independent source.
@@ -69,7 +74,10 @@ or harm without an independent source.
 ## Private outputs and reproducibility
 
 The new output directory is mode 0700 and its files are 0600. Existing outputs,
-including symlinks, are never reused; outputs inside any checkout are refused.
+including symlinks, are never reused. Existing checkout and bare-repository markers
+are checked through resolved ancestors, and rechecked after creation. Run in a
+private parent directory you own; this marker guard is not a filesystem sandbox
+against concurrent same-user path replacement.
 `report.json`, `report.md` and `review-queue.json` are pinned by a final manifest
 with hashes, input digests, definition/configuration hash, implementation-source
 digest and retention deadline. Candidate ids remain stable when display limits

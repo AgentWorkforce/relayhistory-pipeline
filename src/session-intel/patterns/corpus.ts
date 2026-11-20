@@ -13,7 +13,10 @@ export function buildCorpus(inputs: readonly Snapshot[], options: { sameIdentity
   const rows = new Map<string, Corpus["sessions"][number]>();
   let tenant: string | undefined, duplicates = 0, facts = 0;
   if (inputs.reduce((n, s) => n + s.sessions.length, 0) > ANALYSIS_BOUNDS.sessions) throw new PatternError("analysis input row budget exceeded");
+  const manifests = new Set<string>();
   for (const input of inputs) {
+    if (manifests.has(input.manifestSha256)) throw new PatternError("repeated input manifest");
+    manifests.add(input.manifestSha256);
     if (input.manifest.deleteBy <= now) throw new PatternError("input past deleteBy; delete it rather than analyse it");
     if (input.manifest.window.since !== window.since || input.manifest.window.until !== window.until)
       throw new PatternError("joined snapshots must have exactly the same window");
