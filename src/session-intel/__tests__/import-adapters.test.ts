@@ -65,6 +65,29 @@ describe("claude code adapter, hostile records", () => {
 });
 
 describe("codex adapter", () => {
+  for (const tool of ["shell", "exec_command", "local_shell_call"] as const) {
+    for (const example of [
+      { name: "over-64-KiB output", output: "[fixture abcdef12] commit\n" + "x".repeat(64 * 1024), sha: null },
+      { name: "two distinct SHA summaries", output: "[fixture abcdef12] one\n[fixture 12345678] two", sha: null },
+      { name: "plain output at output time", output: "[fixture abcdef12] commit", sha: "abcdef12" },
+      { name: "output array at output time", output: [{ type: "input_text", text: JSON.stringify({ output: "[fixture abcdef12] commit" }) }], sha: "abcdef12" },
+    ]) test(`${tool} commit policy: ${example.name}`, async () => {
+      const dir = tmp("si-imp-plain-shell-policy-");
+      const call = tool === "local_shell_call"
+        ? { type: tool, call_id: "plain-call", action: { type: "exec", command: ["git", "commit", "-m", "fixture"] } }
+        : { type: "function_call", name: tool, call_id: "plain-call", arguments: JSON.stringify({ command: "git commit -m fixture" }) };
+      writeFileSync(join(dir, "plain.jsonl"), [
+        { timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } },
+        { timestamp: at("09:01"), type: "response_item", payload: call },
+        { timestamp: at("09:03"), type: "response_item", payload: { type: tool === "local_shell_call" ? "local_shell_call_output" : "function_call_output", call_id: "plain-call", output: example.output } },
+      ].map((r) => JSON.stringify(r)).join("\n"));
+      const set = await read(dir, readCodex), b = [...set.byKey.values()][0]!;
+      expect(facts(b).commits).toEqual([[example.sha, example.sha ? at("09:03") : at("09:01")]]);
+      expect(b.commits[0]!.at.line).toBe(example.sha ? 3 : 2);
+      expect(set.stats.codexCodeModeShellUnparsed).toBe(0);
+    });
+  }
+
   test("code-mode static git commit attempts pair with their matching text-block outputs", async () => {
     const dir = tmp("si-imp-code-mode-commit-");
     const code = "const cmd = 'git add src/new.ts && git commit -m fixture'; text(await tools.exec_command({cmd}));";

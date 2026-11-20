@@ -62,7 +62,7 @@ export interface ImportStats {
   codexPrefixRecordsDropped: number;
   /** Children with copied-context metadata whose own task boundary could not be verified. */
   codexChildrenWithoutTaskBoundary: number;
-  /** Outer code-mode calls with recognized shell syntax that could not be fully extracted statically. */
+  /** Outer code-mode calls with incomplete extraction, including parser/size failures before shell recognition. */
   codexCodeModeShellUnparsed: number;
 }
 
