@@ -153,6 +153,7 @@ async function record(s: Scenario, off: OffEnv = "false"): Promise<Entry[]> {
       search: { ...base, ...extra, ...stagedFrom(off, extra) },
     };
     const lines: Entry[] = [];
+    let phaseMetricError: string | undefined;
     const stdout = process.stdout.write, stderr = process.stderr.write;
     const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
       ((chunk: unknown, ...rest: unknown[]) => {
@@ -160,7 +161,14 @@ async function record(s: Scenario, off: OffEnv = "false"): Promise<Entry[]> {
           if (line.startsWith("{"))
             try {
               // The search stage's records; the pointer stage's carry a random traceparent.
-              const { ts: _ts, duration_ms: _d, ...entry } = JSON.parse(line) as Entry;
+              const parsed = JSON.parse(line) as Entry;
+              if (parsed.message === "search index reconciled")
+                for (const field of ["source_read_ms", "index_scan_ms", "locked_apply_ms", "write_calls", "write_batches"])
+                  if (typeof parsed[field] !== "number" || (parsed[field] as number) < 0) phaseMetricError = `missing search phase metric ${field}`;
+              // Commit 1 adds phase metrics to both flag modes. Validate them above, then remove
+              // their nondeterministic durations from this pre-existing flag-off golden.
+              const { ts: _ts, duration_ms: _d, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
+                write_calls: _wc, write_batches: _wb, ...entry } = parsed;
               if (entry.stage === "search-index") lines.push(entry);
             } catch {}
         return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
@@ -174,6 +182,7 @@ async function record(s: Scenario, off: OffEnv = "false"): Promise<Entry[]> {
       process.stdout.write = stdout;
       process.stderr.write = stderr;
     }
+    if (phaseMetricError) throw new Error(phaseMetricError);
     for (const line of lines) out.push({ log: line });
   }
   return out;

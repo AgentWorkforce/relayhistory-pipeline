@@ -51,13 +51,21 @@ async function record(s: Scenario): Promise<Entry[]> {
     r.fake.calls.length = 0;
     const reads = r.reads.count;
     const lines: Entry[] = [];
+    let phaseMetricError: string | undefined;
     const stdout = process.stdout.write, stderr = process.stderr.write;
     const tap = (w: typeof process.stdout.write, stream: NodeJS.WriteStream) =>
       ((chunk: unknown, ...rest: unknown[]) => {
         for (const line of String(chunk).split("\n"))
           if (line.startsWith("{"))
             try {
-              const { ts: _ts, duration_ms: _d, ...entry } = JSON.parse(line) as Entry;
+              const parsed = JSON.parse(line) as Entry;
+              if (parsed.message === "search index reconciled")
+                for (const field of ["source_read_ms", "index_scan_ms", "locked_apply_ms", "write_calls", "write_batches"])
+                  if (typeof parsed[field] !== "number" || (parsed[field] as number) < 0) phaseMetricError = `missing search phase metric ${field}`;
+              // Additive timing fields are validated above, then removed from the pre-existing
+              // flag-off behavior golden because wall time is intentionally nondeterministic.
+              const { ts: _ts, duration_ms: _d, source_read_ms: _sr, index_scan_ms: _is, locked_apply_ms: _la,
+                write_calls: _wc, write_batches: _wb, ...entry } = parsed;
               if (entry.stage === "search-index") lines.push(entry);
             } catch {}
         return (w as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
@@ -71,6 +79,7 @@ async function record(s: Scenario): Promise<Entry[]> {
       process.stdout.write = stdout;
       process.stderr.write = stderr;
     }
+    if (phaseMetricError) throw new Error(phaseMetricError);
     out.push({ run: i, result, reads: r.reads.count - reads, sql: [...r.sql], clickhouse: [...r.fake.calls], log: lines });
   }
   return out;

@@ -13,7 +13,7 @@
 import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
-import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
+import { indexSearchScope, searchIndexPhaseMetrics, type SearchIndexDeps } from "./search-index.ts";
 import { LEGACY_PROVENANCE_INVALID } from "../session-read-api/legacy-provenance.ts";
 import { captureRefusal, classifyReplayFailure, produceCanonicalReplay, type ReplayProducerDeps } from "./replay-publication.ts";
 import type { LargeJobState, LargeRoute } from "./large-read-worker.ts";
@@ -171,8 +171,16 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
     for (const { scope, messageIds, manifestKey } of scopes.values()) {
       if (delegated.has(scopeId(scope)) || messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
+      const phase = searchIndexPhaseMetrics();
+      const phaseFields = () => ({
+        source_read_ms: phase.sourceReadMs,
+        index_scan_ms: phase.indexScanMs,
+        locked_apply_ms: phase.lockedApplyMs,
+        write_calls: phase.writeCalls,
+        write_batches: phase.writeBatches,
+      });
       try {
-        const result = await indexSearchScope(scope, deps.search);
+        const result = await indexSearchScope(scope, { ...deps.search, metrics: phase });
         if (result.busy) {
           // The running pass may have read S3 before this event's write: run again later.
           if (!deps.requeue) throw new Error("scope busy and no requeue");
@@ -184,7 +192,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           // SEARCH_INDEX_SKIP_CURRENT_ENABLED: a complete pass already covers the live source set; done, not retried.
           log.info("search index skipped", {
             stage: "search-index", org_id: scope.orgId, workspace_id: scope.workspaceId, harness: scope.harness, session_id: scope.sessionId,
-            reason: result.reasons.join(","), duration_ms: Date.now() - started,
+            reason: result.reasons.join(","), ...phaseFields(), duration_ms: Date.now() - started,
           });
           continue;
         }
@@ -219,6 +227,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           deleted: result.deleted,
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
+          ...phaseFields(),
           duration_ms: Date.now() - started,
         });
       } catch (error) {
@@ -228,6 +237,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           session_id: scope.sessionId,
           ...errorFields(error),
           ...searchIndexErrorDetail(error),
+          ...phaseFields(),
           duration_ms: Date.now() - started,
         });
         for (const id of messageIds) failed.add(id);

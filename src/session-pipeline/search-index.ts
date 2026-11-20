@@ -112,6 +112,8 @@ export interface SearchIndexDeps {
   adapter?: SearchServiceBinding;
   /** The deployment prefix of an org's keys, e.g. `96bulls/<org>`. */
   prefixFor(orgId: string): string;
+  /** Per-pass observability sink. The consumer creates a fresh one for each scope. */
+  metrics?: SearchIndexPhaseMetrics;
   decompress?: (stored: Uint8Array, maxOutputLength: number) => Uint8Array;
   now?: () => Date;
   limits?: Partial<SearchIndexLimits>;
@@ -200,6 +202,53 @@ export interface SearchIndexDeps {
    * `skipped`, reason `already_current`, nothing written. Absent: every pass exactly as before.
    */
   skipCurrent?: boolean;
+}
+
+/** Additive phase counters for the existing search-pass log line. Durations are wall milliseconds. */
+export interface SearchIndexPhaseMetrics {
+  sourceReadMs: number;
+  indexScanMs: number;
+  lockedApplyMs: number;
+  writeCalls: number;
+  writeBatches: number;
+}
+
+export const searchIndexPhaseMetrics = (): SearchIndexPhaseMetrics => ({
+  sourceReadMs: 0,
+  indexScanMs: 0,
+  lockedApplyMs: 0,
+  writeCalls: 0,
+  writeBatches: 0,
+});
+
+async function measurePhase<T>(metrics: SearchIndexPhaseMetrics | undefined, field: "sourceReadMs" | "indexScanMs", work: () => Promise<T>): Promise<T> {
+  if (!metrics) return work();
+  const started = Date.now();
+  try { return await work(); }
+  finally { metrics[field] += Date.now() - started; }
+}
+
+/** Observe the search binding without changing its calls, arguments, order or results. */
+function observedProjectionIo(io: SearchProjectionIo, metrics: SearchIndexPhaseMetrics | undefined): SearchProjectionIo {
+  if (!metrics) return io;
+  const write = async <T>(batches: number, work: () => Promise<T>): Promise<T> => {
+    metrics.writeCalls += 1;
+    metrics.writeBatches += batches;
+    return work();
+  };
+  return {
+    ...io,
+    fromMs: (at) => measurePhase(metrics, "indexScanMs", () => io.fromMs(at)),
+    scan: (scope, canonicalId, fromMs, limit) => measurePhase(metrics, "indexScanMs", () => io.scan(scope, canonicalId, fromMs, limit)),
+    ...(io.scanPages ? {
+      scanPages: (scope, canonicalId, fromMs, pageSize, maxRows, between) =>
+        measurePhase(metrics, "indexScanMs", () => io.scanPages!(scope, canonicalId, fromMs, pageSize, maxRows, between)),
+    } : {}),
+    upsert: (rows, scope, canonicalId) => write(rows.length ? 1 : 0, () => io.upsert(rows, scope, canonicalId)),
+    remove: (scope, positions) => write(positions.length ? 1 : 0, () => io.remove(scope, positions)),
+    erase: (scope, canonicalId) => write(1, () => io.erase(scope, canonicalId)),
+    record: (scope, revision, rows, complete, at, canonicalId) => write(1, () => io.record(scope, revision, rows, complete, at, canonicalId)),
+  };
 }
 
 /** SearchIndexDeps.staged: the staged reconcile's interim bound. */
@@ -479,12 +528,18 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   // leaves this transaction without a write and runs as a staged run, outside it, in its own
   // committed batches (stagedSearchScope).
   let handoff: StagedHandoff | undefined;
-  const first = await deps.transact(async (tx): Promise<SearchIndexResult> => {
-    const io = deps.adapter
+  const lockedStarted = Date.now();
+  const sourceBefore = deps.metrics?.sourceReadMs ?? 0;
+  const scanBefore = deps.metrics?.indexScanMs ?? 0;
+  let first: SearchIndexResult;
+  try {
+    first = await deps.transact(async (tx): Promise<SearchIndexResult> => {
+    const rawIo = deps.adapter
       ? deps.staged
         ? adapterProjectionIo(deps.adapter, tx, { pagedScan: true })
         : adapterProjectionIo(deps.adapter, tx)
       : legacyProjectionIo(deps.ch!);
+    const io = observedProjectionIo(rawIo, deps.metrics);
     const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
     const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
@@ -549,7 +604,8 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if (deps.skipCurrent && (await alreadyCurrent(tx, scope, pointerSnapshot, keys.length, deps.outputFacts ? deps.ch : undefined)))
       return { manifests: keys.length, rows: 0, inserted: 0, deleted: 0, complete: true, skipped: true, reasons: [ALREADY_CURRENT] };
     const fromMs = await io.fromMs(at);
-    const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
+    const s3 = await measurePhase(deps.metrics, "sourceReadMs", () =>
+      readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId));
     // Output facts need the whole read, or the staged run's facts hooks (Postgres store only): with a
     // facts store and no staged run, a too-large scope stays incomplete (scope_too_large) as before.
     const stagedFacts = !!deps.outputFactsStore && !!deps.staged && !!deps.adapter;
@@ -715,7 +771,14 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       reasons: [...s3.reasons, ...(truncated ? [stagedScan ? STREAM_KEYED_RECORDS_CAP : deps.adapter ? "search_index_truncated" : "clickhouse_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
       ...(outputFacts ? { outputFacts } : {}),
     };
-  });
+    });
+  } finally {
+    if (deps.metrics) {
+      const source = deps.metrics.sourceReadMs - sourceBefore;
+      const scan = deps.metrics.indexScanMs - scanBefore;
+      deps.metrics.lockedApplyMs += Math.max(0, Date.now() - lockedStarted - source - scan);
+    }
+  }
   return handoff ? stagedSearchScope(scope, deps, limits, handoff) : first;
 }
 
