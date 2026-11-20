@@ -900,6 +900,13 @@ there. Removing or redriving them is a separate step. The legacy seed proof (`in
 rows, so keep the flag off on any install that still runs either. Turning it on is an operator decision; no stack or
 install sets it by default.
 
+Two limits while it is on. The reconcile pass still lists `_none/_origin` manifests changed within its lookback and
+re-queues each one on every run, because no pointer row ever matches; each is then ignored again, a bounded churn
+like the `_babysitter` buckets. And because delete events are ignored, a `_none/_origin` row written before the flag
+can keep pointing at a manifest that no longer exists. Where such a scope is partial, the self-host consumer's
+stale-projection pass keeps re-sending its key and it is ignored each time, so the scope stays partial until the row
+is removed. Clean up such rows before enabling the flag.
+
 In the no-op-delete race, the pointer inserted from the stale pre-read can remain live for the requeue delay
 (60 seconds in the hosted Lambda) plus queue lag before that reconcile tombstones it. The same batch's search pass
 does not make that stale pointer ready: the missing manifest makes the pass incomplete (`manifest_missing`), it
