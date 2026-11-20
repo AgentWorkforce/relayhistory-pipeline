@@ -1,11 +1,16 @@
 /** Synthetic observations: descriptive candidates must never turn themselves into outcome labels. */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { analyseCorpus } from "../patterns/analyse.ts";
 import { buildCorpus } from "../patterns/corpus.ts";
 import { reportMarkdown, reviewQueue } from "../patterns/report.ts";
 import { loadSnapshot, parseSession, type Snapshot } from "../replay/snapshot.ts";
 import { canonicalJson } from "../replay/util.ts";
-import { session, tmp, writeSnapshot } from "./helpers.ts";
+import { session, tmp as makeTmp, writeSnapshot } from "./helpers.ts";
+
+const ownDirs: string[] = [];
+const tmp = () => { const dir = makeTmp(); ownDirs.push(dir); return dir; };
+afterAll(() => { for (const dir of ownDirs) rmSync(dir, { recursive: true, force: true }); });
 
 const now = new Date("2026-11-02T00:00:00Z");
 const ts = (minute: string) => `2026-11-01T09:${minute}:00.000Z`;
@@ -25,15 +30,16 @@ describe("pattern corpus", () => {
   test("multi-input identity assertions do not become coverage proof; equal duplicates dedupe, conflicts fail", () => {
     const a = snapshot([s("one")]);
     expect(() => buildCorpus([a, a], { now })).toThrow("identity-space");
-    const c = buildCorpus([a, a], { now, sameIdentitySpace: true });
+    expect(() => buildCorpus([a, a], { now, sameIdentitySpace: true })).toThrow("repeated input");
+    const c = buildCorpus([a, snapshot([s("one")], "c".repeat(64))], { now, sameIdentitySpace: true });
     expect([c.sessions.length, c.duplicateSessions, c.identity]).toEqual([1, 1, "operator_asserted_shared_namespace"]);
     expect(analyseCorpus(c).coverage.workspaceCompleteness).toBe("not_established");
-    expect(() => buildCorpus([a, snapshot([s("one", { writes: [w("x", "01")] })])], { now, sameIdentitySpace: true })).toThrow("conflicting duplicate");
+    expect(() => buildCorpus([a, snapshot([s("one", { writes: [w("x", "01")] })], "c".repeat(64))], { now, sameIdentitySpace: true })).toThrow("conflicting duplicate");
   });
   test("tenant/workspace, expiry and window mismatch fail closed without exposing identifiers", () => {
     expect(() => buildCorpus([snapshot([s("a"), s("b", { workspaceId: "other-fixture" })])], { now })).toThrow("one tenant");
     expect(() => buildCorpus([snapshot([])], { now: new Date("2026-11-10") })).toThrow("deleteBy");
-    const a = snapshot([]), b = snapshot([]); b.manifest.window.until = ts("29");
+    const a = snapshot([]), b = snapshot([], "c".repeat(64)); b.manifest.window.until = ts("29");
     expect(() => buildCorpus([a, b], { sameIdentitySpace: true, now })).toThrow("same window");
   });
 });
@@ -46,7 +52,7 @@ describe("descriptive patterns", () => {
     const r = analyse([a, b]);
     expect(r.candidates).toHaveLength(1);
     const c = r.candidates[0]!;
-    expect(c).toMatchObject({ review: "unreviewed", eventPairs: 4, sharedFiles: 1, parentLink: "observed", branchRelation: "mixed", closestGapMs: 0 });
+    expect(c).toMatchObject({ review: "unreviewed", eventPairs: 4, sharedFiles: 1, parentLink: "shared_parent", branchRelation: "mixed", closestGapMs: 0 });
     expect(c.evidence).toHaveLength(3);
     expect(c.evidence[0]!.a.eventId).toBe("a1");
     expect(c.firstObservedAt).toBe(ts("01"));
@@ -109,4 +115,32 @@ describe("descriptive patterns", () => {
     expect(r.profile.all).toMatchObject({ commits: 2, shaShapedCommits: 1 });
     expect(r.limitations.some((l) => l.includes("not independent proof"))).toBe(true);
   });
+});
+
+test("busy same-session activity cannot consume the cross-session budget or hide later files", () => {
+  const r = analyse([s("busy", { writes: Array.from({ length: 700 }, (_, i) => w(`busy-${i}`, "01", "src/a.ts")) }),
+    s("later-a", { writes: [w("later-a", "02", "src/z.ts")] }), s("later-b", { writes: [w("later-b", "03", "src/z.ts")] })], { maxComparisons: 1 });
+  expect(r.coverage).toMatchObject({ comparisons: 1, scanComplete: true });
+  expect(r.candidates).toHaveLength(1);
+  expect(r.candidates[0]!.participants.map((p) => p.sessionId)).toEqual(["later-a", "later-b"]);
+});
+
+test("window eviction keeps exact nearby boundaries and direct links differ from siblings", () => {
+  const r = analyse([s("a", { writes: [w("old", "00"), w("near", "10")] }),
+    s("b", { writes: [w("b", "11")], parentSessionIds: ["a"] })], { nearbyMs: 60_000 });
+  expect(r.coverage.comparisons).toBe(1);
+  expect(r.candidates[0]).toMatchObject({ parentLink: "direct", eventPairs: 1 });
+});
+
+test("all omitted display rows are counted and outside-window sessions do not dilute coverage", () => {
+  const rows = Array.from({ length: 1001 }, (_, i) => s(`repo-${i}`, { repo: `fixture-${i}`, writes: [w(`write-${i}`, "01")] }));
+  rows.push(s("old", { createdAt: "2026-10-31T09:00:00.000Z", lastActivityAt: "2026-10-31T09:01:00.000Z" }));
+  const r = analyse(rows);
+  expect(r.coverage).toMatchObject({ repositoriesTotal: 1001, repositoriesOmitted: 1, filesTotal: 1001, filesOmitted: 951, sessionsOutsideWindow: 1 });
+  expect(r.profile.all.sessions).toBe(1001);
+  expect(r.input.sessions).toBe(1002);
+  expect(r.profile.byRepository).toHaveLength(1000);
+  const groups = analyse(Array.from({ length: 102 }, (_, i) => s(`group-${i}`, { writes: [w(`group-write-${i}`, "01", `src/pair-${Math.floor(i / 2)}.ts`)] })));
+  expect(groups.coverage).toMatchObject({ groupsTotal: 51, groupsOmitted: 1 });
+  expect(groups.activityGroups).toHaveLength(50);
 });

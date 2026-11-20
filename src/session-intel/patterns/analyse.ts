@@ -27,10 +27,9 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
   const byHarness = new Map<string, ProfileRow>(), byRepository = new Map<string, ProfileRow>();
   const all = blank("all"), files = new Map<string, FileActivity>(), days = new Map<string, { writes: number; sessions: Set<string> }>();
   const spanEdges: Array<[number, number]> = [];
-  let factsOutsideWindow = 0, duplicateWrites = 0, sessionsWithoutScope = 0, zeroLengthSpans = 0;
+  let sessionsOutsideWindow = 0, factsOutsideWindow = 0, duplicateWrites = 0, sessionsWithoutScope = 0, zeroLengthSpans = 0;
   for (const s of corpus.sessions) {
     const scope = scopeOf(s), key = refKey(s), seen = new Map<string, string>();
-    if (!scope) sessionsWithoutScope++;
     let writes = 0;
     for (const w of s.writes) {
       if (!inWindow(w.ts)) { factsOutsideWindow++; continue; }
@@ -57,15 +56,19 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
     const commits = count(s.commits), outcomes = count(s.outcomes), claims = count(s.claims);
     const shaShapedCommits = s.commits.filter((c) => inWindow(c.ts) && /^[a-f0-9]{7,64}$/iu.test(c.sha)).length;
     const summaries = count(s.summaryTimeline) > 0;
-    count(s.usage); // Count censored usage facts too, without interpreting usage as wasted work.
+    const usage = count(s.usage); // Coverage only; not interpreted as wasted work.
+    const start = Math.max(Date.parse(s.createdAt), Date.parse(corpus.window.since));
+    const end = Math.min(Date.parse(s.lastActivityAt), Date.parse(corpus.window.until));
+    if (start >= end && !inWindow(s.createdAt) && !(writes || commits || outcomes || claims || summaries || usage)) {
+      sessionsOutsideWindow++; continue;
+    }
+    if (!scope) sessionsWithoutScope++;
     for (const p of [all, row(byHarness, s.harness), row(byRepository, scope ? JSON.stringify(scope) : "unscoped")]) {
       p.sessions++; p.writes += writes; p.commits += commits; p.outcomes += outcomes; p.claims += claims;
       p.shaShapedCommits += shaShapedCommits;
       if (writes) p.sessionsWithWrites++; if (commits) p.sessionsWithCommits++; if (outcomes) p.sessionsWithOutcomes++;
       if (claims) p.sessionsWithClaims++; if (summaries) p.sessionsWithSummaries++;
     }
-    const start = Math.max(Date.parse(s.createdAt), Date.parse(corpus.window.since));
-    const end = Math.min(Date.parse(s.lastActivityAt), Date.parse(corpus.window.until));
     if (start === end) zeroLengthSpans++;
     if (start < end) spanEdges.push([start, 1], [end, -1]);
   }
@@ -76,54 +79,74 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
   let comparisons = 0, comparisonLimit = false, pairLimit = false;
   scan: for (const [, file] of [...files].sort(([a], [b]) => textCompare(a, b))) {
     const events = file.events.sort((a, b) => a.ms - b.ms || textCompare(refKey(a.session), refKey(b.session)) || textCompare(a.eventId, b.eventId));
-    for (let i = 0; i < events.length; i++) for (let j = i - 1; j >= 0 && events[i]!.ms - events[j]!.ms <= nearbyMs; j--) {
-      if (comparisons >= maxComparisons) { comparisonLimit = true; break scan; }
-      comparisons++;
-      let a = events[j]!, b = events[i]!;
-      if (refKey(a.session) === refKey(b.session)) continue;
-      if (textCompare(refKey(a.session), refKey(b.session)) > 0) [a, b] = [b, a];
-      const id = sha256Hex(canonicalJson(["nearby_shared_file_activity", ANALYSIS_VERSION, nearbyMs, file.scope, ref(a.session), ref(b.session)]));
-      const observed = a.at > b.at ? a.at : b.at;
-      if (!held.has(id)) {
-        if (held.size >= ANALYSIS_BOUNDS.pairs) { pairLimit = true; continue; }
-        const linked = a.session.harness === b.session.harness && (a.session.parentSessionIds.includes(b.session.sessionId)
-          || b.session.parentSessionIds.includes(a.session.sessionId)
-          || a.session.parentSessionIds.some((p) => b.session.parentSessionIds.includes(p)));
-        held.set(id, { paths: new Set(), branches: new Set(), candidate: {
-          id, kind: "nearby_shared_file_activity", review: "unreviewed", scope: file.scope,
-          participants: [ref(a.session), ref(b.session)], sharedFiles: 0, eventPairs: 0,
-          firstObservedAt: observed, lastObservedAt: observed, closestGapMs: Math.abs(a.ms - b.ms),
-          sessionSpanOverlapMs: Math.max(0, Math.min(Date.parse(a.session.lastActivityAt), Date.parse(b.session.lastActivityAt), Date.parse(corpus.window.until))
-            - Math.max(Date.parse(a.session.createdAt), Date.parse(b.session.createdAt), Date.parse(corpus.window.since))),
-          parentLink: linked ? "observed" : "not_observed", branchRelation: "unknown", evidence: [],
-        } });
+    // Sliding per-session queues avoid visiting quadratic same-session pairs. Every
+    // other-session queue visited contains a comparison charged to the budget.
+    const active = new Map<string, { events: Write[]; head: number }>();
+    let left = 0;
+    for (const current of events) {
+      while (left < events.length && current.ms - events[left]!.ms > nearbyMs) {
+        const old = events[left++]!, key = refKey(old.session), queue = active.get(key)!;
+        queue.head++;
+        if (queue.head === queue.events.length) active.delete(key);
       }
-      const h = held.get(id)!, c = h.candidate;
-      h.paths.add(file.path); c.sharedFiles = h.paths.size; c.eventPairs++;
-      c.firstObservedAt = c.firstObservedAt < observed ? c.firstObservedAt : observed;
-      c.lastObservedAt = c.lastObservedAt > observed ? c.lastObservedAt : observed;
-      c.closestGapMs = Math.min(c.closestGapMs, Math.abs(a.ms - b.ms));
-      h.branches.add(a.branch && b.branch ? a.branch === b.branch ? "same" : "different" : "unknown");
-      c.branchRelation = h.branches.size > 1 ? "mixed" : [...h.branches][0] as PatternCandidate["branchRelation"];
-      const evidence = (w: Write) => ({ session: ref(w.session), eventId: w.eventId, path: w.path, at: w.at });
-      c.evidence.push({ a: evidence(a), b: evidence(b) });
-      c.evidence.sort(evidenceCompare); c.evidence.length = Math.min(c.evidence.length, ANALYSIS_BOUNDS.evidencePairs);
+      const ownKey = refKey(current.session);
+      for (const [key, queue] of active) {
+        if (key === ownKey) continue;
+        for (let j = queue.head; j < queue.events.length; j++) {
+          if (comparisons >= maxComparisons) { comparisonLimit = true; break scan; }
+          comparisons++;
+          let a = queue.events[j]!, b = current;
+          if (textCompare(refKey(a.session), refKey(b.session)) > 0) [a, b] = [b, a];
+          const id = sha256Hex(canonicalJson(["nearby_shared_file_activity", ANALYSIS_VERSION, nearbyMs, file.scope, ref(a.session), ref(b.session)]));
+          const observed = a.at > b.at ? a.at : b.at;
+          if (!held.has(id)) {
+            if (held.size >= ANALYSIS_BOUNDS.pairs) { pairLimit = true; continue; }
+            const sameHarness = a.session.harness === b.session.harness;
+            const direct = sameHarness && (a.session.parentSessionIds.includes(b.session.sessionId) || b.session.parentSessionIds.includes(a.session.sessionId));
+            const sibling = sameHarness && a.session.parentSessionIds.some((p) => b.session.parentSessionIds.includes(p));
+            held.set(id, { paths: new Set(), branches: new Set(), candidate: {
+              id, kind: "nearby_shared_file_activity", review: "unreviewed", scope: file.scope,
+              participants: [ref(a.session), ref(b.session)], sharedFiles: 0, eventPairs: 0,
+              firstObservedAt: observed, lastObservedAt: observed, closestGapMs: Math.abs(a.ms - b.ms),
+              sessionSpanOverlapMs: Math.max(0, Math.min(Date.parse(a.session.lastActivityAt), Date.parse(b.session.lastActivityAt), Date.parse(corpus.window.until))
+                - Math.max(Date.parse(a.session.createdAt), Date.parse(b.session.createdAt), Date.parse(corpus.window.since))),
+              parentLink: direct ? "direct" : sibling ? "shared_parent" : "not_observed", branchRelation: "unknown", evidence: [],
+            } });
+          }
+          const h = held.get(id)!, c = h.candidate;
+          h.paths.add(file.path); c.sharedFiles = h.paths.size; c.eventPairs++;
+          c.firstObservedAt = c.firstObservedAt < observed ? c.firstObservedAt : observed;
+          c.lastObservedAt = c.lastObservedAt > observed ? c.lastObservedAt : observed;
+          c.closestGapMs = Math.min(c.closestGapMs, Math.abs(a.ms - b.ms));
+          h.branches.add(a.branch && b.branch ? a.branch === b.branch ? "same" : "different" : "unknown");
+          c.branchRelation = h.branches.size > 1 ? "mixed" : [...h.branches][0] as PatternCandidate["branchRelation"];
+          const evidence = (w: Write) => ({ session: ref(w.session), eventId: w.eventId, path: w.path, at: w.at });
+          c.evidence.push({ a: evidence(a), b: evidence(b) });
+          c.evidence.sort(evidenceCompare); c.evidence.length = Math.min(c.evidence.length, ANALYSIS_BOUNDS.evidencePairs);
+        }
+      }
+      if (!active.has(ownKey)) active.set(ownKey, { events: [], head: 0 });
+      active.get(ownKey)!.events.push(current);
     }
   }
   const candidates = [...held.values()].map((h) => h.candidate).sort((a, b) => b.sharedFiles - a.sharedFiles || a.closestGapMs - b.closestGapMs || textCompare(a.id, b.id));
   const reasons = [...(comparisonLimit ? ["comparison_budget"] : []), ...(pairLimit ? ["candidate_pair_budget"] : [])];
+  const groups = activityGroups(candidates);
   const { sessions: _, ...input } = corpus;
   return {
     format: PATTERN_FORMAT, definition, input: { ...input, sessions: corpus.sessions.length },
-    coverage: { workspaceCompleteness: "not_established", quality: "not_evaluated", factsOutsideWindow, duplicateWrites, sessionsWithoutScope,
+    coverage: { workspaceCompleteness: "not_established", quality: "not_evaluated", sessionsOutsideWindow,
+      filesTotal: files.size, filesOmitted: Math.max(0, files.size - ANALYSIS_BOUNDS.files),
+      repositoriesTotal: byRepository.size, repositoriesOmitted: Math.max(0, byRepository.size - ANALYSIS_BOUNDS.repositories),
+      groupsTotal: groups.length, groupsOmitted: Math.max(0, groups.length - ANALYSIS_BOUNDS.groups), factsOutsideWindow, duplicateWrites, sessionsWithoutScope,
       comparisons, scanComplete: reasons.length === 0, reasons, candidatePairsRetained: candidates.length, candidatesOmittedFromReport: Math.max(0, candidates.length - maxCandidates) },
     profile: { all, byHarness: [...byHarness.values()].sort((a, b) => textCompare(a.key, b.key)),
-      byRepository: [...byRepository.values()].sort((a, b) => b.sessions - a.sessions || textCompare(a.key, b.key)), peakSessionSpans, zeroLengthSpans,
+      byRepository: [...byRepository.values()].sort((a, b) => b.sessions - a.sessions || textCompare(a.key, b.key)).slice(0, ANALYSIS_BOUNDS.repositories), peakSessionSpans, zeroLengthSpans,
       days: [...days].sort(([a], [b]) => textCompare(a, b)).map(([day, d]) => ({ day, writes: d.writes, sessionsWithWrites: d.sessions.size })),
       files: [...files.values()].sort((a, b) => b.sessions.size - a.sessions.size || b.events.length - a.events.length || textCompare(JSON.stringify([a.scope, a.path]), JSON.stringify([b.scope, b.path])))
-        .slice(0, 50).map((f) => ({ scope: f.scope, path: f.path, writes: f.events.length, sessions: f.sessions.size, harnesses: f.harnesses.size })),
+        .slice(0, ANALYSIS_BOUNDS.files).map((f) => ({ scope: f.scope, path: f.path, writes: f.events.length, sessions: f.sessions.size, harnesses: f.harnesses.size })),
     },
-    candidates: candidates.slice(0, maxCandidates), activityGroups: activityGroups(candidates),
+    candidates: candidates.slice(0, maxCandidates), activityGroups: groups.slice(0, ANALYSIS_BOUNDS.groups),
     limitations: [
       "Exploratory pool, not a representative or independently labelled workspace study. Input receipt declarations do not establish workspace completeness.",
       "Write facts are edit intents, not confirmation of filesystem success. Nearby file activity is not proof of duplicate work, conflict or harm.",
@@ -158,5 +181,5 @@ function activityGroups(candidates: PatternCandidate[]): PatternReport["activity
     groups.push({ id: sha256Hex(canonicalJson(members)), sessions: members.length, candidateEdges: degree / 2,
       members: members.slice(0, ANALYSIS_BOUNDS.members).map((k) => refs.get(k)!), membersOmitted: Math.max(0, members.length - ANALYSIS_BOUNDS.members) });
   }
-  return groups.sort((a, b) => b.sessions - a.sessions || textCompare(a.id, b.id)).slice(0, ANALYSIS_BOUNDS.groups);
+  return groups.sort((a, b) => b.sessions - a.sessions || textCompare(a.id, b.id));
 }

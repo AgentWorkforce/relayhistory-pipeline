@@ -4,8 +4,8 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { loadSnapshot } from "../replay/snapshot.ts";
-import { sha256Hex } from "../replay/util.ts";
+import { loadSnapshot, SnapshotError } from "../replay/snapshot.ts";
+import { isoTime, sha256Hex } from "../replay/util.ts";
 import { analyseCorpus } from "./analyse.ts";
 import { buildCorpus, PatternError } from "./corpus.ts";
 import { reportMarkdown, reviewQueue } from "./report.ts";
@@ -23,7 +23,7 @@ function outputPath(value: string | undefined): string {
   while (!existsSync(parent)) { tail.unshift(basename(parent)); parent = dirname(parent); }
   let ancestor = realpathSync(parent);
   for (;;) {
-    if (existsSync(join(ancestor, ".git"))) throw new PatternError("outputs belong outside every repository");
+    if (existsSync(join(ancestor, ".git")) || (existsSync(join(ancestor, "HEAD")) && existsSync(join(ancestor, "objects")) && existsSync(join(ancestor, "refs")))) throw new PatternError("outputs belong outside every repository");
     const next = dirname(ancestor); if (next === ancestor) break; ancestor = next;
   }
   return join(realpathSync(parent), ...tail);
@@ -40,10 +40,18 @@ export async function main(argv: string[], io: PatternIo = { out: (line) => cons
   const number = (raw: string | undefined) => { if (raw === undefined) return undefined; if (!/^\d{1,9}$/u.test(raw)) throw new PatternError("numeric options must be bounded nonnegative integers"); return Number(raw); };
   const out = outputPath(v.out), now = io.now ?? new Date();
   const snapshots = [];
-  for (const path of v.snapshot) snapshots.push(await loadSnapshot(path, { now }));
+  for (const path of v.snapshot) {
+    try { snapshots.push(await loadSnapshot(path, { now })); }
+    catch (error) {
+      if (error instanceof SnapshotError && error.message.startsWith("snapshot: past its deleteBy")) throw new PatternError("input past deleteBy; delete it rather than analyse it");
+      throw error;
+    }
+  }
   const corpus = buildCorpus(snapshots, { sameIdentitySpace: v["same-identity-space"], now });
   if (v["delete-by"] !== undefined) {
-    const time = Date.parse(v["delete-by"]);
+    let time: number;
+    try { time = Date.parse(isoTime(v["delete-by"], "deleteBy")); }
+    catch { throw new PatternError("--delete-by requires an ISO timestamp"); }
     if (!Number.isFinite(time) || time <= now.getTime() || time > Date.parse(corpus.deleteBy)) throw new PatternError("--delete-by must be in the future and may only shorten input retention");
     corpus.deleteBy = new Date(time).toISOString();
   }
@@ -53,6 +61,7 @@ export async function main(argv: string[], io: PatternIo = { out: (line) => cons
   await mkdir(dirname(out), { recursive: true, mode: 0o700 });
   await mkdir(out, { mode: 0o700 }); // Exclusive: existing outputs are never replaced.
   try {
+    if (outputPath(out) !== out) throw new PatternError("output parent changed during creation");
     for (const [name, text] of Object.entries(data)) await writeFile(join(out, name), text, { mode: 0o600, flag: "wx" });
     await writeFile(join(out, "manifest.json"), serialise({ format: "session-intel-pattern-artifacts/1", createdAt: now.toISOString(), deleteBy: corpus.deleteBy,
       definitionHash: report.definition.hash, inputs: corpus.inputs,
