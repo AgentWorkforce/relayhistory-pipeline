@@ -233,6 +233,44 @@ const row = (id: string, kind: CurrentClaim["kind"], title: string, ev: [string,
   ({ id, kind, title, supersedes, evidence: ev.map(([source, session_id, created_at]) => ({ source, session_id, created_at })) });
 const SCOPE = { orgId: "org-a", workspaceId: "ws-a" };
 
+describe("mutation guards (lander mutants T3, T7, T8, T12)", () => {
+  const snap = snapshot({ constraints: [claim("No new migrations until the renumber lands.", ["h0"])] });
+  const records = extractClaimRecords(snap);
+  const fresh = row("new", "constraint", "No new migrations until the renumber lands.", [["claude", "sess-root", "2026-11-18T12:00:01Z"]]);
+  test("T3: a repeated claim in one batch keeps the EARLIEST observed time, in either order", () => {
+    const refs = [ref("late", "assistant-message", "sess-root", "2026-11-18T10:00:00Z"), ref("early", "assistant-message", "sess-root", "2026-11-18T09:00:00Z")];
+    for (const order of [["late", "early"], ["early", "late"]]) {
+      const [r] = extractClaimRecords(snapshot({ intents: order.map((id) => claim("Add the reader.", [id])) }, { refs }));
+      expect([order.join(","), r!.observed_at]).toEqual([order.join(","), "2026-11-18T09:00:00.000Z"]);
+    }
+  });
+  test("T7: evidence written at exactly analyzedAt is not older than the analysis: nothing superseded", async () => {
+    const { port, calls } = fakePort([fresh, row("old", "constraint", "No migrations.", [["claude", "sess-root", "2026-11-18T12:00:00.000Z"]])]);
+    expect(await supersedeDroppedClaims(port, SCOPE, snap, records)).toBe(0);
+    expect(calls.filter((c) => c.startsWith("supersede"))).toEqual([]);
+    // One millisecond earlier is older: superseded.
+    const { port: p2 } = fakePort([fresh, row("old", "constraint", "No migrations.", [["claude", "sess-root", "2026-11-18T11:59:59.999Z"]])]);
+    expect(await supersedeDroppedClaims(p2, SCOPE, snap, records)).toBe(1);
+  });
+  test("T8: a full read page supersedes nothing, even when exactly one candidate qualifies in it", async () => {
+    // The page holds the new claim, one qualifying candidate, and others that are not candidates (another session).
+    const others = Array.from({ length: CLAIMS_READ_MAX - 2 }, (_, i) => row(`x${i}`, "constraint", `Other ${i}.`, [["claude", "sess-other", "2026-11-18T11:00:00Z"]]));
+    const page = [fresh, row("old", "constraint", "No migrations.")].concat(others);
+    expect(page.length).toBe(CLAIMS_READ_MAX);
+    const { port, calls } = fakePort(page);
+    expect(await supersedeDroppedClaims(port, SCOPE, snap, records)).toBe(0);
+    expect(calls.filter((c) => c.startsWith("supersede"))).toEqual([]);
+    // One row fewer: the same candidate is superseded.
+    const { port: p2 } = fakePort(page.slice(0, -1));
+    expect(await supersedeDroppedClaims(p2, SCOPE, snap, records)).toBe(1);
+  });
+  test("T12: a candidate without evidence rows is never superseded (an empty list proves nothing)", async () => {
+    const { port, calls } = fakePort([fresh, row("old", "constraint", "No migrations.", [])]);
+    expect(await supersedeDroppedClaims(port, SCOPE, snap, records)).toBe(0);
+    expect(calls.filter((c) => c.startsWith("supersede"))).toEqual([]);
+  });
+});
+
 describe("supersedeDroppedClaims: only the narrow, unambiguous case", () => {
   const snap = snapshot({ constraints: [claim("No new migrations until the renumber lands.", ["h0"])] });
   const records = extractClaimRecords(snap);
