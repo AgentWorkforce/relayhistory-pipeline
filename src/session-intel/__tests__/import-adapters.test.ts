@@ -90,6 +90,26 @@ describe("codex adapter", () => {
     expect((globalThis as Record<string, unknown>)[key]).toBeUndefined();
   });
 
+  test("code-mode is_error accepts only booleans and malformed values never abort the import", async () => {
+    const dir = tmp("si-imp-code-mode-error-flag-");
+    // Build the deeply nested JSON directly to exercise an invalid error flag
+    // without serializing it in this fixture or forwarding it to the projection.
+    const flags = ["true", "false", "null", '"true"', '"false"', "1", "0", "[]", '{"failed":true}', "[".repeat(10_000) + "0" + "]".repeat(10_000)];
+    const calls = flags.map((flag, i) => {
+      const patch = `*** Begin Patch\n*** Add File: src/flag-${i}.ts\n+example\n*** End Patch`;
+      const row = JSON.stringify({ timestamp: at("09:01"), type: "response_item", payload: { type: i % 2 ? "function_call" : "custom_tool_call", name: "exec", call_id: `flag-${i}`, input: `tools.apply_patch(${JSON.stringify(patch)})`, arguments: JSON.stringify({ input: `tools.apply_patch(${JSON.stringify(patch)})` }) } });
+      return row.slice(0, -2) + `,"is_error":${flag}}}`;
+    });
+    writeFileSync(join(dir, "exec.jsonl"), [
+      JSON.stringify({ timestamp: at("09:00"), type: "session_meta", payload: { id: CODEX_SID, cwd: "/work/acme-api" } }),
+      ...calls,
+    ].join("\n"));
+    const set = await read(dir, readCodex);
+    expect(set.byKey.size).toBe(1);
+    expect(facts([...set.byKey.values()][0]!).writes).toEqual(flags.slice(1).map((_, i) => [`src/flag-${i + 1}.ts`, at("09:01")]));
+    expect(set.stats.malformedLines).toBe(0);
+  });
+
   test("code-mode comments, quoted code, dynamic templates, oversize input and failed calls give no paths", async () => {
     const dir = tmp("si-imp-code-mode-negative-");
     const patch = "*** Begin Patch\n*** Add File: src/ignored.ts\n+example\n*** End Patch";
