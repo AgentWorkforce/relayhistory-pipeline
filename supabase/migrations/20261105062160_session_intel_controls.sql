@@ -16,7 +16,8 @@ CREATE TABLE sessions.session_intel_controls (
   UNIQUE NULLS NOT DISTINCT (scope, org_id, workspace_id, feature)
 );
 ALTER TABLE sessions.session_intel_controls ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.session_intel_controls FROM PUBLIC, anon, authenticated, service_role, bulls96_read_api;
+REVOKE ALL ON sessions.session_intel_controls FROM PUBLIC, anon, authenticated, service_role, bulls96_read_api,
+  search_consumer_runtime, bulls96_session_ingest, bulls96_session_ingest_seeder;
 
 CREATE FUNCTION sessions.session_intel_controls_v1(p_org_id text, p_workspace_id text)
 RETURNS TABLE (feature text, enabled boolean)
@@ -37,5 +38,6 @@ BEGIN
     ORDER BY f.name;
 END $controls$;
 REVOKE ALL ON FUNCTION sessions.session_intel_controls_v1(text,text)
-  FROM PUBLIC, anon, authenticated, service_role, bulls96_read_api;
+  FROM PUBLIC, anon, authenticated, service_role, bulls96_read_api,
+    search_consumer_runtime, bulls96_session_ingest, bulls96_session_ingest_seeder;
 GRANT EXECUTE ON FUNCTION sessions.session_intel_controls_v1(text,text) TO service_role;

@@ -192,3 +192,9 @@ Three PRs, each with tests and each doc-linked to this proposal (a fourth, the w
 Before any production enablement, a **replay harness** runs the worker's scan over the frozen snapshot process in `docs/coordination-overlap-detection.md`: harvest, ground truth from outcomes, and blind adjudication. It steps a simulated clock through the window, records every advisory it would have sent and when, and reports precision and lead time per urgency row against the labeled incidents and hard negatives. Those numbers, not this document, decide whether any flag is proposed for enablement.
 
 The harness is [session-intel-replay.md](session-intel-replay.md).
+
+When adopting the controls migration with an already-enabled advisor, apply the
+migration first, have the owner insert both global and workspace opt-in rows
+for `advisor` and (if intended) `dm`, verify the getter, then deploy the controls
+reader. Deploying that reader before the rows deliberately stops the advisor.
+Migration application and enablement on a real database require separate approval.

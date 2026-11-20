@@ -38,6 +38,17 @@ describe("session intelligence controls", () => {
     }
   });
 
+  test("diagnostics retain only validated SQLSTATE, never error text or arbitrary codes", async () => {
+    for (const [code, expected] of [["42883", "42883"], ["private-error-code", undefined]] as const) {
+      const warnings: unknown[] = [];
+      const reader = sessionIntelControls(sql(async () => { throw Object.assign(new Error("private message"), { code }); }), {
+        warn: (reason, state) => warnings.push([reason, state]),
+      });
+      allOff(await reader.read("org", "ws"));
+      expect(warnings).toEqual([["unavailable", expected]]);
+    }
+  });
+
   for (const rejects of [false, true]) test(`a timed-out query is bounded and a late ${rejects ? "rejection" : "completion"} permits a fresh read`, async () => {
     let finish!: (result: unknown) => void;
     let calls = 0;

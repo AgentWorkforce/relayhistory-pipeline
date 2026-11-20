@@ -12,6 +12,23 @@ pull. Existing advisories remain readable and ackable. The getter also returns
 `conflicts`, `claims` and `regen` for their owning workers to integrate separately;
 this change does not wire those workers or put controls in the summary path.
 
+## Rollout order
+
+For an installation whose advisor is already running, use this order:
+
+1. Apply migration `062160` through the normal approved migration process.
+2. Through the database-owner connection, insert the reviewed global and exact
+   workspace rows for each feature intended to remain enabled. Both `advisor`
+   rows are required for advisory writes; DMs additionally need both `dm` rows
+   and their environment gate. Check the getter for every intended workspace.
+3. Deploy the controls-aware worker code, preserving the intended environment
+   gates. Missing rows, an unavailable getter or an unapplied migration keep
+   the new code off; deploying it first stops the corresponding advisory work.
+
+This sequence enables nothing by itself and grants no deployment or migration
+approval. For a new installation, leave both controls and environment gates off
+until its operator explicitly opts in the intended scope.
+
 The runtime can execute the SECURITY DEFINER getter but cannot read or write
 the table. An operator writes settings through its database-owner connection.
 Use an operator label in `updated_by`, never a person's identity or a credential.
@@ -43,11 +60,21 @@ WHERE scope='global' AND feature='advisor';
 
 Settings are not cached between scans. The client times out after two seconds;
 an error, missing function, timeout or malformed row set returns all features
-off and logs a fixed reason with `count=1`, without the database's error text.
+off and logs a fixed reason with `count=1` and a validated SQLSTATE when available,
+without the database's error text.
 Only one control query can be outstanding per reader, so an unresponsive
 database cannot accumulate queries on successive ticks. A flip takes effect
 when the next scan reads the workspace controls; it does not cancel a scan
 already in progress. Ingest, summaries and the read API do not read this gate.
+The JavaScript timeout does not cancel the database statement. If it never
+settles, that reader remains busy and off. Server-side statement timeout or
+connection cancellation belongs to the deployment's connection policy; this
+reader does not change session settings on a shared pool.
+
+Offline replay uses an explicit, hash-recorded feature map for visible snapshot
+tenants. Unknown or not-yet-visible tenants are off. That counterfactual map is
+not a read of deployed controls; separate workspace-policy simulations need
+separate replay configurations.
 
 The pipeline e2e's `coordination.advisories` step opts in its synthetic workspace,
 proves a disabled scan writes nothing, and flips it on while the worker remains

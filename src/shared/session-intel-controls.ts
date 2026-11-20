@@ -11,14 +11,15 @@ export const controlsOff = (): SessionIntelControls => new Map(SESSION_INTEL_FEA
 export interface SessionIntelControlsReader {
   read(orgId: string, workspaceId: string): Promise<SessionIntelControls>;
 }
+type ControlWarning = "unavailable" | "timeout" | "busy" | "malformed";
 
 /** One reader per pool. A hung query cannot create an unbounded queue of new queries. */
 export function sessionIntelControls(db: SqlQuery, opts: {
   timeoutMs?: number;
-  warn?: (reason: "unavailable" | "timeout" | "busy" | "malformed") => void;
+  warn?: (reason: ControlWarning, sqlstate?: string) => void;
 } = {}): SessionIntelControlsReader {
   let busy = false;
-  const warn = opts.warn ?? ((reason) => log.warn("session intelligence controls off", { reason, count: 1 }));
+  const warn = opts.warn ?? ((reason: ControlWarning, sqlstate?: string) => log.warn("session intelligence controls off", { reason, count: 1, ...(sqlstate ? { sqlstate } : {}) }));
   return {
     async read(orgId, workspaceId) {
       if (busy) { warn("busy"); return controlsOff(); }
@@ -43,8 +44,10 @@ export function sessionIntelControls(db: SqlQuery, opts: {
           enabled.set(row.feature as SessionIntelFeature, row.enabled);
         }
         return enabled;
-      } catch {
-        warn("unavailable"); return controlsOff();
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code;
+        warn("unavailable", typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code) ? code : undefined);
+        return controlsOff();
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
