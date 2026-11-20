@@ -90,6 +90,9 @@ scans and the user-erase inventory never see it. Rows exist only inside an in-fl
 - Origin-scoped claim/stage/commit: origin advisory → `(961996,50000)` S (fence-row INSERT trigger) → fence row S
   → seat clock → `(org,ws,origin)` native advisory → slot rows.
 - Controls: `50000` S → fence row X. Erase: `50000` X → fence row X.
+- Staged ACK inside the commit (`ingest_lazy_ack_batch`, either body of `20261105062155`): fence row → seat clock
+  `NO KEY UPDATE` → `(org,ws,origin)` native advisory → stage row → slot rows (in the loop's first-lock order) →
+  seats → slot updates → decisions.
 
 The new key is only ever taken first, and only by `enter`. A flag-off call (or a mixed fleet during rollout) never
 takes it. So it adds no cycle. Re-entrant `ingest_lock_fences` calls inside one claim find the row already

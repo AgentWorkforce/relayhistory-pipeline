@@ -38,6 +38,13 @@ The ACK lock order is therefore fence -> clock -> origin -> slot, the same as th
 ACK and a same-origin claim of another user cannot deadlock on native slots. A same-origin claim
 that runs while a staged ACK is in flight waits for that ACK's transaction on the origin lock.
 
+Since 062155 the staged ACK carries a second, set-based body for its per-record loop, selected by the
+function-local setting `bulls96.lazy_ack_set_based` (installed `off`; see
+[docs/design/lazy-ack-set-based.md](../docs/design/lazy-ack-set-based.md)). Lock order and modes are
+unchanged in both modes. For history, the set body issues one single-row slot `UPDATE` per accept, in
+the loop's order, whenever `ingest_history_switch.live` is true, so `ingest_history_native_changed`
+fires exactly as it does for the loop. Only with the switch off does it batch the slot `UPDATE`s by round.
+
 ## Kill switch (usable at any time, including after installs)
 
 ```sql

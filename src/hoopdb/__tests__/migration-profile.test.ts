@@ -2710,7 +2710,22 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062140 is newest: 062130's down refuses (55000) while it is applied; its checksum-pinned down drops its
+    // 20261105062155 is newest: 062140's down refuses (55000) while it is applied; its checksum-pinned down restores
+    // 043800's staged-ACK body exactly (proconfig back to search_path only, no gate) and drops its ledger row, and
+    // refuses on a rerun.
+    const LAB = "upstream:20261105062155_lazy_ack_set_based.sql";
+    const ACK_SIG = "sessions.ingest_lazy_ack_batch(jsonb)";
+    expect(await names()).toContain(LAB);
+    expect((await db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK_SIG])).rows[0]!.c)
+      .toEqual(["search_path=pg_catalog, pg_temp", "bulls96.lazy_ack_set_based=off"]);
+    expect((await failure(rollback("20261105062140_staged_output_facts.down.sql")))?.code).toBe("55000");
+    await rollback("20261105062155_lazy_ack_set_based.down.sql");
+    expect(await names()).not.toContain(LAB);
+    expect((await procSrc(ACK_SIG)).s).toBe(bodyOf("20261105043800_lazy_ack_clock_no_key_update.sql", "ingest_lazy_ack_batch", "$lazy_ack_batch$"));
+    expect((await db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK_SIG])).rows[0]!.c)
+      .toEqual(["search_path=pg_catalog, pg_temp"]);
+    expect((await failure(rollback("20261105062155_lazy_ack_set_based.down.sql")))?.code).toBe("55000");
+    // 20261105062140 is then newest: 062130's down refuses (55000) while it is applied; its checksum-pinned down drops its
     // trigger on the 062110 run table, its two tables, its eight functions and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(SOF);
     expect((await failure(rollback("20261105062130_analysis_cutover_source_revision.down.sql")))?.code).toBe("55000");

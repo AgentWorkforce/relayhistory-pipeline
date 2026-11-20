@@ -14,6 +14,7 @@ import { bufferedGcSingleCandidate } from "../../../scripts/sessions-function-bo
 import { lazySourceTables, originalBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-source-tables.ts";
 import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
 import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
+import { lazyAckSetBased, originalBodies as originalAckSetBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-set-based.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scripts/sessions-function-boundary/lanes/buffered-search-gate-retired-witness.ts";
 import { createHash } from "node:crypto";
@@ -96,6 +97,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105059000_ingest_publication_gcs_provider.down.sql",
       "supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql",
       "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql",
+      "supabase/rollbacks/20261105062155_lazy_ack_set_based.down.sql",
     ]);
   });
 
@@ -240,6 +242,30 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("WHERE singleton FOR UPDATE;v_last:=c.last_seat;");
     expect(down).not.toContain("FOR NO KEY UPDATE");
     expect(down).not.toContain("FUNCTION sessions.ingest_lazy_records"); // only the ACK is restored (its comment names the claim fn)
+    expect(down).toContain("pg_advisory_xact_lock(961996,1)");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 062155 gated set-based staged ACK changes no ACL/boundary/verifier capability and derives its exact guarded rollback to 043800", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== lazyAckSetBased), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105062155_lazy_ack_set_based.down.sql";
+    for (const [path, value] of Object.entries(without.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((p) => !(p in without.outputs))).toEqual([downPath]);
+    expect(withLane.summary.boundarySHA).toBe(without.summary.boundarySHA);
+    expect(withLane.summary.lanes["lazy-ack-set-based"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, lazyAckSetBased.migration!), "utf8")).digest("hex"));
+    const bodies = originalAckSetBodies(readFileSync(join(root, "supabase/migrations/20261105043800_lazy_ack_clock_no_key_update.sql"), "utf8"));
+    expect(bodies).toHaveLength(1);
+    expect(down).toContain(bodies[0]!);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(bodies[0]!));
+    // The exact 043800 body: clock NO KEY UPDATE, no gate, and a SET list of search_path only (proconfig loses the gate).
+    expect(down).toContain("WHERE singleton FOR NO KEY UPDATE;v_last:=c.last_seat;");
+    expect(down).not.toContain("bulls96.lazy_ack_set_based");
+    expect(down).toContain("LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_batch$");
     expect(down).toContain("pg_advisory_xact_lock(961996,1)");
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
