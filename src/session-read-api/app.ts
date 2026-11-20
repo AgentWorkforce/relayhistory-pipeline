@@ -1086,10 +1086,13 @@ export function createReadApi(deps: ReadApiDeps) {
       // lacks, so the search starts at relayhistory. Partial sessions of other
       // workspaces of the org cannot hold this workspace's rows and do not count
       // (page.ts partialSessionsInWorkspace says how one is attributed).
-      // With searchSkipsPartialSessions the search answers anyway and says so:
+      // Refuse mode needs only a yes/no answer and stops at the first attributed
+      // session. If its bounded scan cannot decide, it returns unbounded so the
+      // caller still falls back. With searchSkipsPartialSessions the search
+      // answers anyway and says so:
       // an install with no relayhistory has nowhere to fall back to, and one
       // partial session would otherwise turn search off for the workspace. The
-      // check runs on EVERY page (one state query) and the listed sessions' rows
+      // check runs on EVERY page and the listed sessions' rows
       // are excluded, so a session indexed while small that later grew past the
       // bound never serves its stale rows on any page. Recomputed, not carried in
       // the cursor: the list can be PARTIAL_SESSIONS_CAP ids long, and a cursor
@@ -1097,14 +1100,14 @@ export function createReadApi(deps: ReadApiDeps) {
       // excluded: that answer is session_partial_unbounded and may hold stale rows.
       let incomplete: SearchIncomplete | undefined;
       if (deps.searchSkipsPartialSessions === true) {
-        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
+        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId, "skip");
         if (partials.overflow) incomplete = { reason: "session_partial_unbounded" };
         else if (partials.sessions.length > 0) {
           incomplete = { reason: "session_partial", sessions: partials.sessions };
           base.excludeSessionIds = partials.sessions;
         }
       } else if (cursor === undefined) {
-        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
+        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId, "refuse");
         if (partials.overflow) throw unsupported("session_partial_unbounded");
         if (partials.sessions.length > 0) throw unsupported("session_partial");
       }

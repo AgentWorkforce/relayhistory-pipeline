@@ -35,6 +35,8 @@ export const SESSION_STATE_TABLE = "search_ingest_session_state";
  * count toward this cap.
  */
 export const PARTIAL_SESSIONS_CAP = 1000;
+/** Maximum org-wide state pages one workspace partial check may scan. */
+export const PARTIAL_SESSION_MAX_PAGES = 32;
 /** Legacy search semantics: q matches the first 4096 characters of content, or the task title. */
 export const CONTENT_PREFIX_CHARS = 4096;
 /** The ngrams(3) text index answers queries this long or longer. */
@@ -130,13 +132,13 @@ LIMIT {cap:UInt32}`;
  * the requested workspace; sibling workspaces therefore cannot exhaust its
  * bound.
  */
-export function buildWorkspacePartialSessionsQuery(database: string, orgId: string, workspaceId: string, after = "", limit = PARTIAL_SESSIONS_CAP): Built {
+export function buildWorkspacePartialSessionsQuery(database: string, orgId: string, workspaceId: string, after?: string, limit = PARTIAL_SESSIONS_CAP): Built {
   const partial = `SELECT session_id FROM ${qualifiedTable(database, SESSION_STATE_TABLE)}
 WHERE org_id = {org:String}
 GROUP BY session_id
 HAVING argMax(needs_full, synced_at) = 1`;
-  const page = `SELECT session_id FROM (${partial})
-WHERE session_id > {after:String}
+  const afterWhere = after === undefined ? "" : "\nWHERE session_id > {after:String}";
+  const page = `SELECT session_id FROM (${partial})${afterWhere}
 ORDER BY session_id
 LIMIT {page:UInt32}`;
   const query = `SELECT session_id, toUInt8(session_id IN (
@@ -146,7 +148,7 @@ LIMIT {page:UInt32}`;
 FROM (${page})
 ORDER BY session_id
 `;
-  return { query, params: { org: orgId, ws: workspaceId, after, page: limit } };
+  return { query, params: { org: orgId, ws: workspaceId, ...(after === undefined ? {} : { after }), page: limit } };
 }
 
 /** Sort-key predicates shared by both round trips. */

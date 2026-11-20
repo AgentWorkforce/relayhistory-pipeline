@@ -10,7 +10,7 @@ import { AuthError, continuationUntil, createReadApi, type VerifiedIdentity } fr
 import { relayAuthVerifier } from "../auth.ts";
 import { encodeCursor } from "../cursor.ts";
 import { handleUrlEvent, parseCompleteSince, parseReadApiSecret } from "../lambda.ts";
-import { PARTIAL_SESSIONS_CAP, buildCandidateQuery } from "../queries.ts";
+import { PARTIAL_SESSIONS_CAP, PARTIAL_SESSION_MAX_PAGES, buildCandidateQuery } from "../queries.ts";
 import { memoryLiveness } from "./support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
@@ -59,6 +59,8 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   const params: Record<string, unknown>[] = [];
   /** The candidate query's inlined exclusion list (applied to its rows and the newest rows, as the SQL does unless ignoreExclusion). */
   let excluded = new Set<string>();
+  const compareUtf8 = (a: string, b: string) => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+  const partial = [...(rows.partial ?? [])].sort(compareUtf8);
   const keep = (list: unknown[] | undefined) => (list ?? []).filter((r) => rows.ignoreExclusion || !excluded.has((r as { session_id: string }).session_id));
   const ch: ClickHouseClient = {
     database: "relay_search",
@@ -70,9 +72,9 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
       if (rows.fail) throw rows.fail;
       if (query.includes("in_workspace")) {
         const inWs = new Set(rows.partialInWorkspace ?? []);
-        const after = String(options?.params?.after ?? "");
+        const after = query.includes("WHERE session_id > {after:String}") ? String(options?.params?.after) : undefined;
         const page = Number(options?.params?.page ?? PARTIAL_SESSIONS_CAP);
-        return [...(rows.partial ?? [])].sort().filter((session_id) => session_id > after).slice(0, page).map((session_id) => ({ session_id, in_workspace: inWs.has(session_id) ? 1 : 0 })) as T[];
+        return partial.filter((session_id) => after === undefined || compareUtf8(session_id, after) > 0).slice(0, page).map((session_id) => ({ session_id, in_workspace: inWs.has(session_id) ? 1 : 0 })) as T[];
       }
       if (query.includes("search_ingest_session_state")) {
         const session = options?.params?.session;
@@ -90,7 +92,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   return { ch, queries, eventQueries, params, eventParams };
 }
 
-function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string>; messageOrigin?: boolean } = {}) {
+function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string>; messageOrigin?: boolean; timeoutMs?: number } = {}) {
   const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: over.verify ?? (async (t) => {
@@ -103,6 +105,7 @@ function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?:
     ...(over.searchSkipsPartialSessions ? { searchSkipsPartialSessions: true } : {}),
     ...(over.corsAllowedOrigins ? { corsAllowedOrigins: over.corsAllowedOrigins } : {}),
     ...(over.messageOrigin ? { messageOrigin: true } : {}),
+    ...(over.timeoutMs === undefined ? {} : { timeoutMs: over.timeoutMs }),
     log: (f) => logs.push(f),
   });
   const get = (path: string, token: string | null = "good") =>
@@ -256,15 +259,15 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
   });
 
   test("a workspace search starts at relayhistory while a session of its workspace is partial", async () => {
-    // A row in this workspace is attributed in ClickHouse; rowless siblings
-    // are still checked so skip mode can return the complete attributed set.
+    // A row in this workspace is enough for refuse mode; it does not spend time
+    // attributing the remaining siblings (skip mode still collects the full set).
     const rowHere = stubCh({ partial: ["s-row", "s-elsewhere"], partialInWorkspace: ["s-row"] });
     const noPointers = memoryLiveness();
     let r = await api({ ch: rowHere.ch, liveness: noPointers.liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(501);
     expect((await body(r)).error.reason).toBe("session_partial");
     expect(rowHere.eventQueries()).toHaveLength(0);
-    expect(noPointers.calls.livePointerSessions).toEqual([["s-elsewhere"]]);
+    expect(noPointers.calls.livePointerSessions).toEqual([]);
     // No row anywhere yet (every pass was partial), but a live pointer here: still this workspace's.
     const pointerHere = stubCh({ partial: ["s-1", "s-elsewhere"] });
     const pointers = memoryLiveness({ createdAt: { "codex\u0000s-1": 1 } });
@@ -304,7 +307,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
 
     test("unset and false keep the 501, with neither the header nor the field", async () => {
       for (const over of [{}, { searchSkipsPartialSessions: false }]) {
-        for (const [partial, reason] of [[["s-row"], "session_partial"], [Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-${i}`), "session_partial_unbounded"]] as const) {
+        for (const [partial, reason] of [[["s-row"], "session_partial"], [Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-${i}`), "session_partial"]] as const) {
           const stub = stubCh({ partial: [...partial], partialInWorkspace: [...partial] });
           const { get, logs } = api({ ch: stub.ch, liveness: memoryLiveness().liveness, ...over });
           const r = await get(SEARCH);
@@ -341,6 +344,45 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
       const entry = logs.find((l) => l.reason === "session_partial_unbounded_skipped");
       expect(entry).toMatchObject({ status: 200 });
       expect("partial_sessions" in entry!).toBe(false);
+    });
+
+    test("exactly the cap is decided, sorted, and not overflow", async () => {
+      const exact = Array.from({ length: PARTIAL_SESSIONS_CAP }, (_, i) => `s-${String(PARTIAL_SESSIONS_CAP - i).padStart(4, "0")}`);
+      const r = await skip(stubCh({ partial: exact, partialInWorkspace: exact }).ch).get(SEARCH);
+      expect(r.status).toBe(200);
+      const incomplete = (await body(r)).incomplete;
+      expect(incomplete.reason).toBe("session_partial");
+      expect(incomplete.sessions).toHaveLength(PARTIAL_SESSIONS_CAP);
+      expect(incomplete.sessions).toEqual([...exact].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))));
+    });
+
+    test("event and pointer attribution across pages is sorted and excluded", async () => {
+      const siblings = Array.from({ length: PARTIAL_SESSIONS_CAP - 1 }, (_, i) => `m-${String(i).padStart(4, "0")}`);
+      const partial = ["a-pointer", ...siblings, "z-event"];
+      const base = memoryLiveness();
+      const liveness = {
+        ...base.liveness,
+        livePointerSessions: async (_org: string, _workspace: string, ids: string[]) => new Set(ids.filter((id) => id === "a-pointer")),
+      };
+      const stub = stubCh({ partial, partialInWorkspace: ["z-event"] });
+      const r = await skip(stub.ch, { liveness }).get(SEARCH);
+      expect(r.status).toBe(200);
+      expect((await body(r)).incomplete).toEqual({ reason: "session_partial", sessions: ["a-pointer", "z-event"] });
+      expect(stub.eventQueries()[0]).toContain("session_id NOT IN ['a-pointer','z-event']");
+    });
+
+    test("pointer-attributed sessions across pages count toward overflow", async () => {
+      const partial = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `p-${String(i).padStart(4, "0")}`);
+      const base = memoryLiveness();
+      const calls: number[] = [];
+      const liveness = {
+        ...base.liveness,
+        livePointerSessions: async (_org: string, _workspace: string, ids: string[]) => { calls.push(ids.length); return new Set(ids); },
+      };
+      const r = await skip(stubCh({ partial }).ch, { liveness }).get(SEARCH);
+      expect(r.status).toBe(200);
+      expect((await body(r)).incomplete).toEqual({ reason: "session_partial_unbounded" });
+      expect(calls).toEqual([PARTIAL_SESSIONS_CAP, 1]);
     });
 
     // Rows of a session indexed while small, then partial (grown past the bound): stale.
@@ -565,22 +607,89 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     const statePages = queries.map((query, i) => ({ query, params: params[i]! })).filter(({ query }) => query.includes("in_workspace"));
     expect(statePages).toHaveLength(2);
     expect(statePages.every(({ query }) => query.includes("HAVING argMax(needs_full, synced_at) = 1"))).toBe(true);
-    expect(statePages.every(({ query }) => query.includes("WHERE session_id > {after:String}"))).toBe(true);
+    expect(statePages[0]!.query).not.toContain("WHERE session_id > {after:String}");
+    expect(statePages[1]!.query).toContain("WHERE session_id > {after:String}");
     expect(statePages.every(({ query }) => query.includes("WHERE org_id = {org:String} AND workspace_id = {ws:String} AND session_id IN"))).toBe(true);
-    expect(statePages.map(({ params }) => params.after)).toEqual(["", [...many].sort()[PARTIAL_SESSIONS_CAP - 1]]);
+    expect(statePages.map(({ params }) => params.after)).toEqual([undefined, [...many].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))[PARTIAL_SESSIONS_CAP - 1]]);
     expect(statePages.map(({ params }) => params.page)).toEqual([PARTIAL_SESSIONS_CAP, PARTIAL_SESSIONS_CAP]);
     expect(calls.livePointerSessions.map((ids) => ids.length)).toEqual([PARTIAL_SESSIONS_CAP, 1]);
   });
 
-  test("more partial sessions in this workspace than one check lists is not decided", async () => {
+  test("refuse mode returns on the first attributed partial instead of exhausting the org", async () => {
     const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-here-${i}`);
     const { ch, eventQueries } = stubCh({ partial: many, partialInWorkspace: many });
     const { liveness, calls } = memoryLiveness();
     const r = await api({ ch, liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
     expect(r.status).toBe(501);
-    expect((await body(r)).error.reason).toBe("session_partial_unbounded");
+    expect((await body(r)).error.reason).toBe("session_partial");
     expect(eventQueries()).toHaveLength(0);
     expect(calls.livePointerSessions).toEqual([]);
+  });
+
+  test("an own-workspace partial on page two still starts at relayhistory", async () => {
+    const siblings = Array.from({ length: PARTIAL_SESSIONS_CAP }, (_, i) => `a-${String(i).padStart(4, "0")}`);
+    const own = "z-own";
+    const stub = stubCh({ partial: [...siblings, own], partialInWorkspace: [own] });
+    const live = memoryLiveness();
+    const r = await api({ ch: stub.ch, liveness: live.liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(501);
+    expect((await body(r)).error.reason).toBe("session_partial");
+    expect(live.calls.livePointerSessions.map((ids) => ids.length)).toEqual([PARTIAL_SESSIONS_CAP]);
+    expect(stub.eventQueries()).toHaveLength(0);
+  });
+
+  test("ClickHouse byte ordering advances across a BMP/non-BMP page boundary", async () => {
+    const before = Array.from({ length: PARTIAL_SESSIONS_CAP - 1 }, (_, i) => `a-${String(i).padStart(4, "0")}`);
+    const partial = [...before, "\uE000", "\u{10000}"];
+    const r = await api({ ch: stubCh({ partial }).ch, liveness: memoryLiveness().liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(200);
+  });
+
+  test("a non-advancing page, empty id, or replacement id is unavailable", async () => {
+    const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `n-${String(i).padStart(4, "0")}`);
+    const repeated = stubCh({ partial: many });
+    const original = repeated.ch.select.bind(repeated.ch);
+    repeated.ch.select = (async (query: string, options?: { params?: Record<string, unknown> }) => {
+      if (query.includes("in_workspace") && options?.params?.after !== undefined) return [{ session_id: String(options.params.after), in_workspace: 0 }];
+      return original(query, options);
+    }) as ClickHouseClient["select"];
+    for (const ch of [repeated.ch, stubCh({ partial: [""] }).ch, stubCh({ partial: ["bad\uFFFDid"] }).ch]) {
+      expect((await api({ ch, liveness: memoryLiveness().liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20")).status).toBe(503);
+    }
+  });
+
+  test("deadline and page cap preserve fallback in refuse mode but stay unavailable in skip mode", async () => {
+    const hanging = () => {
+      const stub = stubCh();
+      const original = stub.ch.select.bind(stub.ch);
+      stub.ch.select = (async (query: string, options?: { params?: Record<string, unknown> }) => query.includes("in_workspace") ? new Promise(() => {}) : original(query, options)) as ClickHouseClient["select"];
+      return stub.ch;
+    };
+    let r = await api({ ch: hanging(), liveness: memoryLiveness().liveness, timeoutMs: 5 }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(501);
+    expect((await body(r)).error.reason).toBe("session_partial_unbounded");
+    r = await api({ ch: hanging(), liveness: memoryLiveness().liveness, timeoutMs: 5, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(503);
+
+    const capped = Array.from({ length: PARTIAL_SESSION_MAX_PAGES * PARTIAL_SESSIONS_CAP }, (_, i) => `c-${String(i).padStart(6, "0")}`);
+    r = await api({ ch: stubCh({ partial: capped }).ch, liveness: memoryLiveness().liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(501);
+    expect((await body(r)).error.reason).toBe("session_partial_unbounded");
+    r = await api({ ch: stubCh({ partial: capped }).ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(503);
+  });
+
+  test("a page-two live-pointer failure remains unavailable", async () => {
+    const partial = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `l-${String(i).padStart(4, "0")}`);
+    const base = memoryLiveness();
+    let calls = 0;
+    const liveness = {
+      ...base.liveness,
+      livePointerSessions: async () => { if (++calls === 2) throw new Error("pointer lookup failed"); return new Set<string>(); },
+    };
+    const r = await api({ ch: stubCh({ partial }).ch, liveness }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(503);
+    expect(calls).toBe(2);
   });
 
   test("the partial check is bound to the token's org and checked when pagination starts, not on cursor pages", async () => {
