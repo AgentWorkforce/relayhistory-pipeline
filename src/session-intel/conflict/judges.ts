@@ -106,6 +106,10 @@ export function pathMatches(pattern: string, path: string): boolean {
     segs.push(seg);
   }
   if (!segs.length) return false;
+  // A leading `**` is implied, so a lone `*` first segment (`*/migrations/*`) means "under any directory, or
+  // none": treat it as `**`, or the pattern would never match at the repo root.
+  if (segs[0] === "*") segs[0] = "**";
+  if (segs[1] === "**" && segs[0] === "**") segs.splice(1, 1);
   if (segs[0] !== "**") segs.unshift("**");
   if (!pat.includes("*")) segs.push("**");
   const subject = target.split("/").filter(Boolean);
