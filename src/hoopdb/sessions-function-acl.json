@@ -1130,6 +1130,15 @@
       "service_role:EXECUTE",
       "authenticated:EXECUTE"
     ],
+    "sessions.lazy_ack_history_intents(text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,text,bigint)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.lazy_ack_history_replay(text[],integer[],bigint[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.lazy_ack_history_scope_lock(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.legacy_export_privacy_authority_ready()": [
       "<owner>:EXECUTE",
       "bulls96_legacy_export_privacy:EXECUTE"
