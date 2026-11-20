@@ -46,6 +46,13 @@ for (const [name, input] of [
   ["after labelled break", "fixture: { break fixture; tools.exec_command({cmd:'git commit'}) }"],
   ["try body", "try { tools.exec_command({cmd:'git commit'}) } catch {}"],
   ["const used before declaration", "tools.exec_command({cmd}); const cmd='git commit'"],
+  ["object binding default", "const {a = tools.exec_command({cmd:'git commit -m x'})} = {a:1}"],
+  ["array binding default", "const [a = tools.exec_command({cmd:'git commit -m x'})] = [1]"],
+  ["array assignment default", "let a; [a = tools.exec_command({cmd:'git commit -m x'})] = [1]"],
+  ["object shorthand assignment default", "let a; ({a = tools.exec_command({cmd:'git commit -m x'})} = {a:1})"],
+  ["object property assignment default", "let a; ({b: a = tools.exec_command({cmd:'git commit -m x'})} = {b:1})"],
+  ["nested assignment default", "let a; ({b: [a = tools.exec_command({cmd:'git commit -m x'})]} = {b:[1]})"],
+  ["with binding", "with(o){tools.exec_command({cmd:'git commit -m x'})}"],
   ["malformed code", "tools.exec_command({cmd:'git commit'"],
 ] as const) test(`unsupported ${name} is counted as incomplete rather than guessed`, () => {
   expect(codeModeShells(input)).toEqual({ commands: [], incomplete: true });
@@ -93,4 +100,13 @@ test("transfer barriers preserve earlier attempts and ignore transfers in uncall
 test("parser and source failures are incomplete even before shell calls can be recognized", () => {
   expect(codeModeShells(" ".repeat(CODE_MODE_BOUNDS.input + 1))).toEqual({ commands: [], incomplete: true });
   expect(codeModeShells("// exec_command\nconst =")).toEqual({ commands: [], incomplete: true });
+});
+
+test("ordinary array/object expressions and scalar assignments are not destructuring defaults", () => {
+  for (const source of [
+    "let a; [a = tools.exec_command({cmd:'git commit'})]",
+    "let a; ({b: a = tools.exec_command({cmd:'git commit'})})",
+    "let a; a = tools.exec_command({cmd:'git commit'})",
+    "let a,b; [a = tools.exec_command({cmd:'git commit'}), b = tools.exec_command({cmd:'git status'})]",
+  ]) expect(codeModeShells(source)).toEqual({ commands: source.includes("git status") ? ["git commit", "git status"] : ["git commit"], incomplete: false });
 });

@@ -12,10 +12,35 @@ function method(node: ts.Node): string | null {
     || !ts.isIdentifier(node.expression.expression) || node.expression.expression.text !== "tools") return null;
   return SHELL.has(node.expression.name.text) ? node.expression.name.text : null;
 }
-function hiddenFlow(n: ts.Node): boolean {
+/** Is this '=' a conditional default inside a destructuring assignment target? */
+function assignmentDefault(n: ts.Node, cache: WeakMap<ts.Node, boolean>): boolean {
+  if (!ts.isBinaryExpression(n) || n.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+  const path: ts.Node[] = [];
+  let at: ts.Node = n, result = false;
+  for (;;) {
+    const known = cache.get(at);
+    if (known !== undefined) { result = known; break; }
+    path.push(at);
+    const parent = at.parent;
+    if (!parent) break;
+    if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && parent.left === at) {
+      result = true; break;
+    }
+    if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent) || ts.isParenthesizedExpression(parent)
+      || (ts.isPropertyAssignment(parent) && parent.initializer === at)) at = parent;
+    else break;
+  }
+  for (const node of path) cache.set(node, result);
+  return result;
+}
+
+function hiddenFlow(n: ts.Node, assignmentPatterns: WeakMap<ts.Node, boolean>): boolean {
   return ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n) || ts.isIfStatement(n)
     || ts.isSwitchStatement(n) || ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n)
-    || ts.isWhileStatement(n) || ts.isDoStatement(n) || ts.isConditionalExpression(n) || ts.isTryStatement(n)
+    || ts.isWhileStatement(n) || ts.isDoStatement(n) || ts.isConditionalExpression(n) || ts.isTryStatement(n) || ts.isWithStatement(n)
+    || (ts.isBindingElement(n) && n.initializer !== undefined)
+    || (ts.isShorthandPropertyAssignment(n) && n.objectAssignmentInitializer !== undefined)
+    || assignmentDefault(n, assignmentPatterns)
     || ((ts.isCallExpression(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) && ts.isOptionalChain(n))
     || (ts.isBinaryExpression(n) && [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken,
       ts.SyntaxKind.AmpersandAmpersandEqualsToken, ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken].includes(n.operatorToken.kind));
@@ -82,10 +107,11 @@ export function codeModeShells(source: string): StaticShells {
     }
     const commands: StaticShells["commands"] = [];
     let visitedCalls = 0, incomplete = false;
+    const assignmentPatterns = new WeakMap<ts.Node, boolean>();
     todo.push(file);
     while (todo.length) {
       const n = todo.pop()!;
-      if (hiddenFlow(n)) continue;
+      if (hiddenFlow(n, assignmentPatterns)) continue;
       if (method(n) && ts.isCallExpression(n)) {
         visitedCalls++;
         const arg = n.arguments[0];
