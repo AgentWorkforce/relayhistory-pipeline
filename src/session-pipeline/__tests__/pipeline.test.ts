@@ -709,8 +709,12 @@ describe("search index from S3", () => {
     // A live pointer whose manifest is gone (its delete is in flight): no deletes.
     const ghost = manifestKey(loc("srv_gone"));
     keys = [...keys, ghost];
+    const beforeMissing = sb.calls.length;
     expect(await indexSearchScope(scope, searchDeps(ch.ch, sb.transact))).toMatchObject({ complete: false, deleted: 0, reasons: ["manifest_missing"] });
     expect(ch.final()).toHaveLength(1);
+    const missingCalls = sb.calls.slice(beforeMissing);
+    expect(missingCalls.some((sql) => sql.includes("event_projection_ready=false"))).toBe(true);
+    expect(ch.state.at(-1)?.needs_full).toBe(1);
 
     // Erasure: no live pointer left, every row of the scope goes.
     keys = [];
