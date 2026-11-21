@@ -303,7 +303,9 @@ export const STEPS: readonly Step[] = [
       await io.editFence(keys.fence, (fence) => ({ next: previousFence.state === "present" || fence.version > 0 ? null : fence, result: undefined }));
       const read = await io.readFence(keys.fence);
       must(read.state === "present", "buffered fixture has no current S3 fence");
-      if (previousFence.state === "present") must(read.version === previousFence.version, "buffered fixture changed an existing fence");
+      if (previousFence.state === "present") must(read.fence.version === previousFence.fence.version
+        && read.version.eTag === previousFence.version.eTag && read.version.version === previousFence.version.version,
+      "buffered fixture changed an existing fence");
       const fence = read.fence, sessionHash = sessionKeyHash(SOURCE, f.sessionId);
       const putJson = (key: string, value: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(value)));
       await putJson(orgFenceAuthorityKey(KEY_ROOT, TENANT_B.org), { ...FENCE_AUTHORITY, orgId: TENANT_B.org });
