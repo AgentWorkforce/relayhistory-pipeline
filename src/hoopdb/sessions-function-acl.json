@@ -1130,6 +1130,9 @@
       "service_role:EXECUTE",
       "authenticated:EXECUTE"
     ],
+    "sessions.lazy_ack_t2_set_mode(text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.legacy_export_privacy_authority_ready()": [
       "<owner>:EXECUTE",
       "bulls96_legacy_export_privacy:EXECUTE"
