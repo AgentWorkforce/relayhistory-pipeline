@@ -317,11 +317,26 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     const f = await fixture();
     const callers = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
       WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql') AND p.oid<>'sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure
-       AND regexp_replace(p.prosrc,'--[^\n]*','','g') ~ 'ingest_lazy_ack_batch[(](?!jsonb[)])' ORDER BY 1`)).rows.map((r) => r.f);
+       AND regexp_replace(regexp_replace(coalesce(p.prosrc,'')||' '||coalesce(pg_get_function_sqlbody(p.oid),''),'--[^\n]*','','g'),
+         'ingest_lazy_ack_batch\\s*[(]\\s*jsonb\\s*[)]','','gi') ~* 'ingest_lazy_ack_batch' ORDER BY 1`)).rows.map((r) => r.f);
+    // Any remaining mention counts: a call with whitespace before the paren, a dynamic EXECUTE/format string, or a
+    // BEGIN ATOMIC (SQL-standard) body read through pg_get_function_sqlbody. Only exact '(jsonb)' signatures are removed.
     // (A signature reference, 'ingest_lazy_ack_batch(jsonb)' as in set_mode/set_gate, is not a call.)
     expect(callers).toEqual(["sessions.ingest_receipt_seat_ack()"]);
+    // The pin is not evaded by a space before the paren in a dynamic EXECUTE, nor by a SQL-standard (BEGIN ATOMIC) body.
+    await f.db.exec(`BEGIN;
+      CREATE FUNCTION sessions.t2_pin_probe_dyn() RETURNS void LANGUAGE plpgsql AS $p$ BEGIN
+        EXECUTE format('SELECT sessions.ingest_lazy_ack_batch (%L::jsonb)','{}'); END $p$;
+      CREATE FUNCTION sessions.t2_pin_probe_atomic() RETURNS void LANGUAGE sql BEGIN ATOMIC SELECT sessions.ingest_lazy_ack_batch('{}'::jsonb); END;`);
+    try {
+      const probe = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p
+        WHERE p.proname LIKE 't2\\_pin\\_probe\\_%' AND regexp_replace(regexp_replace(coalesce(p.prosrc,'')||' '||coalesce(pg_get_function_sqlbody(p.oid),''),'--[^\n]*','','g'),
+          'ingest_lazy_ack_batch\\s*[(]\\s*jsonb\\s*[)]','','gi') ~* 'ingest_lazy_ack_batch' ORDER BY 1`)).rows.map((r) => r.f);
+      expect(probe).toEqual(["sessions.t2_pin_probe_atomic()", "sessions.t2_pin_probe_dyn()"]);
+    } finally { await f.db.exec("ROLLBACK"); }
     const sqlCallers = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p
-      WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='sql') AND p.prosrc ~ 'ingest_lazy_ack_batch'`)).rows;
+      WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='sql')
+       AND (coalesce(p.prosrc,'')||' '||coalesce(pg_get_function_sqlbody(p.oid),'')) ~* 'ingest_lazy_ack_batch'`)).rows;
     expect(sqlCallers).toEqual([]);
     const triggers = (await f.db.query<{ t: string }>(`SELECT tgrelid::regclass::text||'.'||tgname t FROM pg_trigger
       WHERE tgfoid='sessions.ingest_receipt_seat_ack()'::regprocedure AND NOT tgisinternal ORDER BY 1`)).rows.map((r) => r.t);
