@@ -17,6 +17,7 @@ import { parseArgs } from "node:util";
 import { buildPacket, parsePacketKey, parseVerdicts, verdictMarkdown, verdictReport } from "./adjudicate.ts";
 import { CONFLICT_MODEL_DETECTOR, CONFLICT_RULE_DETECTOR, ruleConflictDetector } from "../conflict/detector.ts";
 import { ADVISOR_DETECTOR_NAME, advisorDetector, type ReplayDetector } from "./detector.ts";
+import { ACTION_SCOPED_DETECTOR, actionScopedDetector } from "./action-scoped.ts";
 import { parseLabels, type Split } from "./labels.ts";
 import { DEFAULT_INTERVAL_MS, parseReplayResult, replaySnapshot, type ReplayResult } from "./replay.ts";
 import { labelsDigest, recordHeldoutScoring, scoreMarkdown, scoreReplay } from "./score.ts";
@@ -80,13 +81,16 @@ function replayMarkdown(r: ReplayResult): string {
 }
 
 /**
- * The detectors a replay runs: `coordination-advisor` (the default) and `conflict-rule`. `conflict-model` needs
+ * The default remains `coordination-advisor`; `action-scoped-outcomes` is an explicit separate experiment.
+ * `conflict-rule` is also available. `conflict-model` needs
  * a model transport, which this offline CLI does not have: it is refused rather than run without one.
  */
-export function replayDetectors(list: string | undefined): ReplayDetector[] {
+export function replayDetectors(list: string | undefined, options: { now?: Date } = {}): ReplayDetector[] {
   const names = (list ?? ADVISOR_DETECTOR_NAME).split(",").map((n) => n.trim()).filter(Boolean);
   if (!names.length || new Set(names).size !== names.length) throw new Error("--detectors must name each detector once");
+  if (names.includes(ACTION_SCOPED_DETECTOR) && names.length !== 1) throw new Error("action-scoped-outcomes requires a separate run from session-scoped detectors");
   return names.map((n) => {
+    if (n === ACTION_SCOPED_DETECTOR) return actionScopedDetector(options);
     if (n === ADVISOR_DETECTOR_NAME) return advisorDetector();
     if (n === CONFLICT_RULE_DETECTOR) return ruleConflictDetector();
     if (n === CONFLICT_MODEL_DETECTOR) throw new Error(`--detectors: ${CONFLICT_MODEL_DETECTOR} needs a model transport, which the offline CLI has none of; run it from code with an injected transport`);
@@ -119,7 +123,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     const gap = coverageGap(snapshot);
     if (gap && values["allow-incomplete-coverage"] !== true)
       throw new Error(`${gap}; refused. Pass --allow-incomplete-coverage to replay it anyway (the replay is then incomplete and never held-out scored)`);
-    const result = await replaySnapshot(snapshot, { detectors: replayDetectors(values.detectors), intervalMs });
+    const result = await replaySnapshot(snapshot, { detectors: replayDetectors(values.detectors, { now: io.now }), intervalMs });
     if (gap) result.incomplete = [...result.incomplete, gap];
     // A workspace scan that failed or a row the store refused means alerts may be missing; alerts.json says so.
     const incomplete = result.incomplete;
