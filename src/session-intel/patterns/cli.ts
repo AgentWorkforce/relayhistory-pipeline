@@ -11,7 +11,7 @@ import { buildCorpus, PatternError } from "./corpus.ts";
 import { reportMarkdown, reviewQueue } from "./report.ts";
 
 export interface PatternIo { out(line: string): void; now?: Date }
-const USAGE = "usage: patterns/cli.ts --snapshot <dir> [--snapshot <dir> --same-identity-space] --out <new-private-dir> [--nearby-ms N --max-comparisons N --max-candidates N --delete-by ISO]";
+const USAGE = "usage: patterns/cli.ts --snapshot <dir> [--snapshot <dir> --same-identity-space] --out <new-private-dir> [--action-scope] [--nearby-ms N --max-comparisons N --max-candidates N --delete-by ISO]";
 const serialise = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
 
 /** Refuse outputs under any checkout, including via a symlink, and never reuse an output directory. */
@@ -33,6 +33,7 @@ export async function main(argv: string[], io: PatternIo = { out: (line) => cons
   let v;
   try { v = parseArgs({ args: argv, strict: true, allowPositionals: false, options: {
     snapshot: { type: "string", multiple: true }, out: { type: "string" }, "same-identity-space": { type: "boolean" },
+    "action-scope": { type: "boolean" },
     "nearby-ms": { type: "string" }, "max-comparisons": { type: "string" }, "max-candidates": { type: "string" }, "delete-by": { type: "string" }, help: { type: "boolean" },
   } }).values; } catch { throw new PatternError("invalid arguments; values are never echoed"); }
   if (v.help) { io.out(USAGE); return 0; }
@@ -47,7 +48,7 @@ export async function main(argv: string[], io: PatternIo = { out: (line) => cons
       throw error;
     }
   }
-  const corpus = buildCorpus(snapshots, { sameIdentitySpace: v["same-identity-space"], now });
+  const corpus = buildCorpus(snapshots, { sameIdentitySpace: v["same-identity-space"], actionScope: v["action-scope"], now });
   if (v["delete-by"] !== undefined) {
     let time: number;
     try { time = Date.parse(isoTime(v["delete-by"], "deleteBy")); }
@@ -65,7 +66,7 @@ export async function main(argv: string[], io: PatternIo = { out: (line) => cons
     for (const [name, text] of Object.entries(data)) await writeFile(join(out, name), text, { mode: 0o600, flag: "wx" });
     await writeFile(join(out, "manifest.json"), serialise({ format: "session-intel-pattern-artifacts/1", createdAt: now.toISOString(), deleteBy: corpus.deleteBy,
       definitionHash: report.definition.hash, inputs: corpus.inputs,
-      implementationSha256: sha256Hex(["./types.ts", "./corpus.ts", "./analyse.ts", "./report.ts", "./cli.ts", "../replay/snapshot.ts", "../replay/util.ts"]
+      implementationSha256: sha256Hex(["./types.ts", "./corpus.ts", "./analyse.ts", "./report.ts", "./cli.ts", "./action-scope.ts", "../import/provenance.ts", "../replay/snapshot.ts", "../replay/util.ts"]
         .map((name) => sha256Hex(readFileSync(new URL(name, import.meta.url)))).join("\n")),
       files: Object.fromEntries(Object.entries(data).map(([name, text]) => [name, sha256Hex(text)])),
     }), { mode: 0o600, flag: "wx" });

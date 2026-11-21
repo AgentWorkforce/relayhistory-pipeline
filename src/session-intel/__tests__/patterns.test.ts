@@ -5,7 +5,7 @@ import { analyseCorpus } from "../patterns/analyse.ts";
 import { buildCorpus } from "../patterns/corpus.ts";
 import { reportMarkdown, reviewQueue } from "../patterns/report.ts";
 import { loadSnapshot, parseSession, type Snapshot } from "../replay/snapshot.ts";
-import { canonicalJson } from "../replay/util.ts";
+import { canonicalJson, sha256Hex } from "../replay/util.ts";
 import { session, tmp as makeTmp, writeSnapshot } from "./helpers.ts";
 
 const ownDirs: string[] = [];
@@ -21,6 +21,11 @@ function snapshot(rows: unknown[], digest = "a".repeat(64)): Snapshot {
     window: { since: ts("00"), until: ts("30") }, files: { "sessions.jsonl": "b".repeat(64) } }, sessions: rows.map((r) => parseSession(r, "fixture")) };
 }
 const analyse = (rows: unknown[], opts = {}) => analyseCorpus(buildCorpus([snapshot(rows)], { now }), opts);
+
+test("default-off legacy report remains byte-identical to the pinned pre-consumer golden", () => {
+  const input = snapshot([session("golden", { writes: [{ path: "src/a.ts", ts: ts("01"), eventId: "w1", kind: "write", branch: null }] })]);
+  expect(sha256Hex(canonicalJson(analyseCorpus(buildCorpus([input], { now }))))).toBe("ec31d7316bdcfbc63076a51a4d644d667c07ecfc0625132a94a38646ffa210a1");
+});
 
 describe("pattern corpus", () => {
   test("verified fixtures load through the existing snapshot reader", async () => {

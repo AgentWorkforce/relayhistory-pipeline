@@ -45,6 +45,53 @@ coverage match. Use it only for exports collected with a known shared namespace.
 Independently salted exports cannot be joined by assuming their ids are comparable.
 The report preserves that assertion and never claims workspace completeness.
 
+### Per-action repository scope (opt-in)
+
+Add `--action-scope` to consume the importer's `action-provenance.json` public
+sidecar. Every input must list it in its snapshot manifest. The consumer checks
+its digest, capture definition, byte/record bounds, retention and exact
+`sessions.jsonl` digest, and joins each record by harness, original session id,
+fact kind, event id and fact time. Dangling/duplicate records, ambiguous source
+facts or inconsistent declarations fail before output. Duplicate sessions in
+multiple snapshots must have identical action provenance, including missing
+records. The namespace assertion still applies to all salted identities.
+
+This mode emits `session-intel-patterns/2`, definition `3-action-scope`. Legacy
+analysis remains the default and keeps its `/1` report shape and definition.
+Snapshot and sidecar formats are unchanged. Manifests pin implementation sources;
+the analysis definition hash covers mode, version and numeric discovery parameters.
+
+Repository rows count writes, commits and outcomes by their individual scope
+claims. A session can appear in several repository rows, retaining its original
+identity and parent links. Do not sum those rows' session counts. Claims, summaries
+and session branch metadata have no action binding and are excluded from the
+repository rows; overall and harness coverage still count them. Equal file activity
+requires both the declared repository identity and its repository-relative target
+token. The evidence retains the original snapshot path and event reference.
+
+Missing records, unattributed and conflicting claims never inherit the final
+session repository or project. Flat Codex projection writes still lack nested-call
+scope: this consumer does not repair that capture gap. Missing target tokens cannot
+produce file pairs. The report counts these gaps and late declarations explicitly.
+The supplied sidecar is a set of operator/trace claims, not an independent origin
+or successful-edit verification.
+
+The descriptive analysis is retrospective: a later operator map can associate old
+actions, but this gives no early-warning credit. Candidate `firstObservedAt` and
+`lastObservedAt` use the latest scope availability of each paired observation;
+evidence keeps both fact time and availability. Nearby time gaps and daily activity
+still describe fact time. The shared action resolver accepts
+an explicit causal clock and hides an action's scope until `availableAt < now`,
+including equality and output-pairing delays. It is tested here but **not wired into
+production-parity replay**. That integration must handle multi-repository sessions,
+claims and output attribution without inventing session ids or backdating evidence.
+Do not evaluate scoped alert quality using the legacy replay's session scope.
+
+The consumer opens no private map, raw trace, credential or repository. It runs no
+Git, model, network or database operation. Sidecars must be recaptured/rebound to
+new session bytes for a derivative snapshot (for example after adding claims);
+copying a sidecar with an old `sessionsSha256` into that derivative is refused.
+
 Defaults: 30-minute nearby-edit window, 200,000 cross-session event comparisons, 100 review cases.
 Options: `--nearby-ms` (0–86,400,000), `--max-comparisons` (1–5,000,000),
 `--max-candidates` (1–1,000). After loading with the existing reader's byte bounds,
