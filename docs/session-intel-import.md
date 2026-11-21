@@ -178,3 +178,17 @@ The adapters were initially written from public documentation and general knowle
 - **OpenTelemetry GenAI spans** (`gen_ai.*` semantic conventions) as a fourth adapter, out of scope for this slice.
 - **The upload path.** Import into canonical sessions through the upload path, scrubbed by relayscrubber at ingest, and make re-imports idempotent there (M4-1 in full).
 - **M4-2.** A batch runner: backfill the analysis and claims, then replay, then the report.
+
+
+## Per-action scope evidence (capture only)
+
+`--action-provenance` adds a manifest-pinned, hashed action-scope sidecar and
+private location reverse mappings. `--repository-map <private-file>` also enables
+it and supplies explicit operator repository declarations. The importer never
+runs Git or probes directories named in traces. Missing or dynamic scopes remain
+unattributed; a basename hint is not promoted to a canonical repository.
+
+The default output remains byte-identical. Opting in also preserves the legacy
+session bytes: replay does not consume this sidecar yet. Repository claims and
+their availability times are evidence to review, not independently verified
+outcomes or alert-quality proof. See the [capture contract and map format](../src/session-intel/import/action-provenance.md).

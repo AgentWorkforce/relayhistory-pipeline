@@ -9,7 +9,7 @@
  * The salt comes from stdin (`op read 'op://...' | bun run ... --salt-stdin ...`), so it is never on disk,
  * in argv or in the shell history. `--salt-file <path>` is a fallback; exactly one of the two is required.
  */
-import { constants, existsSync, realpathSync } from "node:fs";
+import { constants, existsSync, readFileSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { basename, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,10 +17,11 @@ import { parseArgs } from "node:util";
 import { ADAPTERS, FORMATS, SessionSet, type ImportFormat } from "./adapters.ts";
 import { ImportError, listInputFiles } from "./io.ts";
 import { emptyStats, Hasher, IMPORT_BOUNDS, toSnapshotSession, type ImportStats, type MappedSession, type SessionBuilder, type Tenant } from "./normalize.ts";
+import { actionArtifacts, readRepositoryMap, repositoryResolver, type ActionExport, type RepositoryRoot } from "./provenance.ts";
 import { checkDeleteBy, WINDOW_TAIL_MS, writeImport } from "./writer.ts";
 import { isInside, realPathOf } from "../replay/cli.ts";
 import { SnapshotError } from "../replay/snapshot.ts";
-import { isoTime, textCompare } from "../replay/util.ts";
+import { isoTime, sha256Hex, textCompare } from "../replay/util.ts";
 
 /** The salt source for --salt-stdin: process.stdin by default; tests inject a stream. */
 export interface SaltInput extends AsyncIterable<Buffer | string> { isTTY?: boolean }
@@ -129,21 +130,22 @@ export function keepWindow(builders: SessionBuilder[], stats: ImportStats): Sess
   return kept;
 }
 
-export interface Row { line: string; harness: string; sessionId: string; createdAt: string; lastActivityAt: string; mapped: MappedSession }
+export interface Row { line: string; harness: string; sessionId: string; createdAt: string; lastActivityAt: string; mapped: MappedSession; provenance?: ActionExport }
 
 /** The snapshot lines, sorted; refuses an import in which two source sessions hash to the same id. */
-export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, tenant: Tenant, stats: ImportStats): Row[] {
+export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, tenant: Tenant, stats: ImportStats, repositoryRoots: readonly RepositoryRoot[] = []): Row[] {
   const rows: Row[] = [];
+  const resolveRoot = repositoryResolver(repositoryRoots);
   const seen = new Set<string>();
   for (const b of builders) {
-    const r = toSnapshotSession(b, hasher, tenant);
+    const r = toSnapshotSession(b, hasher, tenant, resolveRoot);
     if (!r) continue;
     const line = JSON.stringify(r.line);
     if (Buffer.byteLength(line) > IMPORT_BOUNDS.lineBytes) { stats.oversizeSessions++; continue; }
     const k = `${r.session.harness}\u0000${r.session.sessionId}`;
     if (seen.has(k)) throw new ImportError("two source sessions hash to the same id; use another salt");
     seen.add(k);
-    rows.push({ line, harness: r.session.harness, sessionId: r.session.sessionId, createdAt: r.session.createdAt, lastActivityAt: r.session.lastActivityAt, mapped: r.mapped });
+    rows.push({ line, harness: r.session.harness, sessionId: r.session.sessionId, createdAt: r.session.createdAt, lastActivityAt: r.session.lastActivityAt, mapped: r.mapped, ...(r.provenance ? { provenance: r.provenance } : {}) });
     stats.writes += r.session.writes.length; stats.commits += r.session.commits.length;
     stats.outcomes += r.session.outcomes.length; stats.usage += r.session.usage.length;
   }
@@ -154,6 +156,7 @@ export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, te
 
 const OPTIONS = {
   format: { type: "string" }, in: { type: "string" }, out: { type: "string" }, "salt-file": { type: "string" }, "salt-stdin": { type: "boolean" },
+  "action-provenance": { type: "boolean" }, "repository-map": { type: "string" },
   "delete-by": { type: "string" }, org: { type: "string" }, workspace: { type: "string" },
 } as const;
 
@@ -189,14 +192,20 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (isInside(input, out) || isInside(out, input)) throw new ImportError("--out and --in must not contain each other");
   const salt = fromStdin ? await readSaltStdin(io.stdin ?? process.stdin) : await readSaltFile(values["salt-file"]!, repoRoot);
 
+  const captureProvenance = values["action-provenance"] === true || values["repository-map"] !== undefined;
+  let repositoryMap;
+  if (values["repository-map"]) {
+    if (isInside(repoRoot, realpathSync(resolve(values["repository-map"])))) throw new ImportError("repository map belongs outside the repository");
+    repositoryMap = await readRepositoryMap(resolve(values["repository-map"]), now);
+  }
   const stats = emptyStats();
   const files = await listInputFiles(input);
   if (!files.length) throw new ImportError("--in holds no .jsonl files");
-  const set = new SessionSet(stats, new Date(now.getTime() + FUTURE_SKEW_MS).toISOString());
+  const set = new SessionSet(stats, new Date(now.getTime() + FUTURE_SKEW_MS).toISOString(), captureProvenance);
   for (let i = 0; i < files.length; i++) await ADAPTERS[format](files[i]!, i, set);
 
   const hasher = new Hasher(salt);
-  const rows = buildRows(keepWindow([...set.byKey.values()], stats), hasher, tenant, stats);
+  const rows = buildRows(keepWindow([...set.byKey.values()], stats), hasher, tenant, stats, repositoryMap?.roots);
   if (!rows.length) throw new ImportError("no session with a valid timestamp was found");
   const since = rows.reduce((m, r) => r.createdAt < m ? r.createdAt : m, rows[0]!.createdAt);
   const last = rows.reduce((m, r) => r.lastActivityAt > m ? r.lastActivityAt : m, rows[0]!.lastActivityAt);
@@ -204,9 +213,15 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
 
   const projects: Record<string, string> = {};
   for (const r of rows) if (r.mapped.sourceProject) projects[hasher.project(r.mapped.sourceProject)] = r.mapped.sourceProject;
+  const actions = captureProvenance ? actionArtifacts(rows.flatMap((r) => r.provenance ? [r.provenance] : []), deleteBy, repositoryMap?.sha256 ?? null, {
+    sessionsSha256: sha256Hex(`${rows.map((r) => r.line).join("\n")}\n`),
+    implementationSha256: sha256Hex(["./cli.ts", "./provenance.ts", "./normalize.ts", "./adapters.ts", "./code-mode.ts", "./git.ts", "./io.ts", "./writer.ts", "./action-provenance.md", "../replay/snapshot.ts", "../replay/util.ts", "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts"]
+      .map((name) => sha256Hex(readFileSync(new URL(name, import.meta.url)))).join("\n")),
+  }) : null;
   const { mapping } = await writeImport({
     out, lines: rows.map((r) => r.line), window: { since, until }, deleteBy, now,
-    mapping: { inputFiles: files.map((f) => relative(input, f) || basename(f)), sessions: rows.map((r) => r.mapped), projects, tenant, stats },
+    ...(actions ? { extraFiles: { "action-provenance.json": actions.body } } : {}),
+    mapping: { inputFiles: files.map((f) => relative(input, f) || basename(f)), sessions: rows.map((r) => r.mapped), projects, tenant, stats, ...(actions ? { extra: { actionProvenance: actions.privateMapping } } : {}) },
   });
   // Every dropped or clamped count gets a warning, not only the window's.
   if (stats.untimedRecords || stats.futureTimestamps || stats.outOfWindowSessions || stats.outOfWindowFacts || stats.clampedSessions)
@@ -217,6 +232,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
       + `${stats.codexChildrenWithoutTaskBoundary} children had no verified own task boundary`);
   if (stats.codexCodeModeShellUnparsed)
     io.err(`import: warning: ${stats.codexCodeModeShellUnparsed} Codex code-mode calls had unsupported or bounded-out shell syntax; commit coverage is incomplete`);
+  if (actions) io.err("import: action provenance is capture-only; repository claims are not independently verified and existing replay does not consume this sidecar");
   // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);

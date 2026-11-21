@@ -6,6 +6,8 @@ import { isRecord } from "../replay/util.ts";
 export const CODE_MODE_BOUNDS = { input: 1024 * 1024, nodes: 20_000, commands: 32, command: 64 * 1024, output: 64 * 1024, outputNodes: 512, depth: 8 } as const;
 const SHELL = new Set(["exec_command", "shell_command", "shell", "local_shell"]);
 export interface StaticShells { commands: Array<string | string[]>; incomplete: boolean }
+export interface StaticShellCall { command: string | string[]; workdir: { kind: "inherit" | "literal" | "unknown"; value: string | null } }
+export interface StaticShellCalls { calls: StaticShellCall[]; incomplete: boolean }
 
 function method(node: ts.Node): string | null {
   if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)
@@ -26,7 +28,8 @@ function assignmentDefault(n: ts.Node, cache: WeakMap<ts.Node, boolean>): boolea
     if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken && parent.left === at) {
       result = true; break;
     }
-    if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent) || ts.isParenthesizedExpression(parent) || ts.isSpreadElement(parent)
+    if (ts.isArrayLiteralExpression(parent) || ts.isObjectLiteralExpression(parent) || ts.isParenthesizedExpression(parent)
+      || ts.isSpreadElement(parent) || ts.isSpreadAssignment(parent)
       || (ts.isPropertyAssignment(parent) && parent.initializer === at)) at = parent;
     else break;
   }
@@ -47,8 +50,8 @@ function hiddenFlow(n: ts.Node, assignmentPatterns: WeakMap<ts.Node, boolean>): 
 }
 
 /** Supported: unconditional tools.<shell>({cmd|command: literal, or immutable top-level const string}). */
-export function codeModeShells(source: string): StaticShells {
-  const none = (incomplete: boolean): StaticShells => ({ commands: [], incomplete });
+export function codeModeShellCalls(source: string): StaticShellCalls {
+  const none = (incomplete: boolean): StaticShellCalls => ({ calls: [], incomplete });
   if (Buffer.byteLength(source) > CODE_MODE_BOUNDS.input) return none(true);
   if (!/\b(?:exec_command|shell_command|local_shell|shell)\b/u.test(source)) return none(false);
   try {
@@ -105,7 +108,7 @@ export function codeModeShells(source: string): StaticShells {
       ts.forEachChild(node, (child) => { if (transfers.has(child)) transfer = true; });
       if (transfer) transfers.add(node);
     }
-    const commands: StaticShells["commands"] = [];
+    const calls: StaticShellCall[] = [];
     let visitedCalls = 0, incomplete = false;
     const assignmentPatterns = new WeakMap<ts.Node, boolean>();
     todo.push(file);
@@ -117,20 +120,32 @@ export function codeModeShells(source: string): StaticShells {
         const arg = n.arguments[0];
         if (n.arguments.length !== 1 || !arg || !ts.isObjectLiteralExpression(arg)) { incomplete = true; continue; }
         let value: ts.Expression | null = null, unsafe = false;
+        let directory: ts.Expression | null = null, directorySeen = false, directoryUnknown = false;
         for (const p of arg.properties) {
           if (ts.isSpreadAssignment(p) || !p.name || ts.isComputedPropertyName(p.name)) { unsafe = true; break; }
           const name = ts.isIdentifier(p.name) || ts.isStringLiteral(p.name) ? p.name.text : null;
+          if (name === "workdir" || name === "cwd" || name === "working_directory") {
+            if (name !== "workdir") directoryUnknown = true;
+            if (directorySeen) directoryUnknown = true;
+            directorySeen = true;
+            directory = ts.isPropertyAssignment(p) ? p.initializer : ts.isShorthandPropertyAssignment(p) ? p.name : null;
+            if (!directory) directoryUnknown = true;
+            continue;
+          }
           if (name !== "cmd" && name !== "command") continue;
           if (value) { unsafe = true; break; }
           value = ts.isPropertyAssignment(p) ? p.initializer : ts.isShorthandPropertyAssignment(p) ? p.name : null;
           if (!value) { unsafe = true; break; }
         }
         if (unsafe || !value) { incomplete = true; continue; }
+        const dir = directory ? literal(directory) : null;
+        const workdir: StaticShellCall["workdir"] = !directorySeen ? { kind: "inherit", value: null }
+          : !directoryUnknown && dir !== null ? { kind: "literal", value: dir } : { kind: "unknown", value: null };
         const text = literal(value);
-        if (text !== null) commands.push(text);
+        if (text !== null) calls.push({ command: text, workdir });
         else if (ts.isArrayLiteralExpression(value) && value.elements.length <= CODE_MODE_BOUNDS.commands) {
           const parts = value.elements.map((e) => ts.isSpreadElement(e) ? null : literal(e));
-          if (parts.every((s): s is string => s !== null) && parts.join(" ").length <= CODE_MODE_BOUNDS.command) commands.push(parts);
+          if (parts.every((s): s is string => s !== null) && parts.join(" ").length <= CODE_MODE_BOUNDS.command) calls.push({ command: parts, workdir });
           else incomplete = true;
         } else incomplete = true;
       }
@@ -144,8 +159,14 @@ export function codeModeShells(source: string): StaticShells {
       } else ts.forEachChild(n, (child) => { children.push(child); });
       todo.push(...children.reverse());
     }
-    return { commands, incomplete: incomplete || visitedCalls !== knownCalls };
+    return { calls, incomplete: incomplete || visitedCalls !== knownCalls };
   } catch { return none(true); } // Parser stack/shape failures yield missing evidence, never execution or a content-bearing error.
+}
+
+/** Legacy command-only API: structured scope extraction does not change its result shape. */
+export function codeModeShells(source: string): StaticShells {
+  const { calls, incomplete } = codeModeShellCalls(source);
+  return { commands: calls.map((call) => call.command), incomplete };
 }
 
 /** A unique SHA in known text/output envelopes; rejected, ambiguous or censored evidence stays unknown. */
