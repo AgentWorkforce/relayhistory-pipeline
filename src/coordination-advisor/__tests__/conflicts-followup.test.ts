@@ -107,6 +107,24 @@ describe("M1: the pair cooldown is per source class", () => {
     expect(restarted.inCooldown(pairKey(A, B), "high", T0 + 20, "advisor")).toBe(true);
   });
 
+  test("durable rows with both classes held: neither class's cooldown is extended by the other's write", () => {
+    const COOL = 6 * 3_600_000, later = T0 + 30 * 60_000;
+    const l = limits();
+    l.touchPair(pairKey(A, B), "high", T0, "advisor");
+    l.touchPair(pairKey(A, B), "high", later, "conflict");
+    // The durable latest row for the pair is the conflict's write (a few ms after this process's clock).
+    l.seed([{ kind: "pair", recipient: A, peer: B, urgency: "high", latestAt: later + 5 }], later + 10);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + COOL, "advisor")).toBe(false);
+    expect(l.inCooldown(pairKey(A, B), "high", T0 + COOL, "conflict")).toBe(true);
+    expect(l.inCooldown(pairKey(A, B), "high", later + COOL, "conflict")).toBe(false);
+    // One class held: the durable row is that class's, as before (the advisor's, with conflicts off).
+    const one = limits();
+    one.touchPair(pairKey(A, B), "high", T0);
+    one.seed([{ kind: "pair", recipient: A, peer: B, urgency: "high", latestAt: T0 + 60_000 }], T0 + 60_000);
+    expect(one.inCooldown(pairKey(A, B), "high", T0 + COOL + 30_000)).toBe(true);
+    expect(one.inCooldown(pairKey(A, B), "high", T0 + COOL + 30_000, "conflict")).toBe(false);
+  });
+
   test("a tick-N conflict does not suppress a collision that first appears in tick N+1 on the same pair", async () => {
     const store = new DurableStore([cand("a"), cand("b")]);
     store.claimRows.set("ws", parseClaimRows([constraintRow("a")]));

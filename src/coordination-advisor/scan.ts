@@ -238,9 +238,10 @@ const sourceOf = (a: Advisory | ConflictAdvisory): CooldownSource => "rows" in a
 
 /** Applies the limits and writes one workspace's advisories; DMs HIGH rows that were newly written. Exported for tests. */
 export async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Array<Advisory | ConflictAdvisory>, now: number, stats: ScanStats) {
-  // The pair cooldown is per source class (rubric.ts AdvisorLimits): a conflict row never cools down a collision
-  // or overlap row for the pair, in this tick or a later one, nor the reverse; within a class it is exactly as
-  // before. Conflicts off, every advisory is the advisor's: the cooldown is as it was.
+  // The pair cooldown is per source class (rubric.ts AdvisorLimits): a conflict row written by this process never
+  // cools down a collision or overlap row for the pair, in this tick or a later one, nor the reverse; within a class
+  // it is exactly as before. After a restart, durable rows (062070 carries no class) hold back both classes for up
+  // to one pair cooldown (6 hours by default). Conflicts off, every advisory is the advisor's: as it was.
   for (const a of orderAdvisories(advisories)) {
     const pair = pairKey(a.lanes[0], a.lanes[1]);
     const source = sourceOf(a);

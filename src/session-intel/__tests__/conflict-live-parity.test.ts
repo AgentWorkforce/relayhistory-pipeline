@@ -78,6 +78,13 @@ describe("live wiring in replay", () => {
       session("act", { writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }], claims: [constraint("09:12")] }),
     ]);
     expect(both(r)).toEqual(["claude:act+claude:own constraint_violation high 09:42"]);
+    // H-2: the constraint's founder writes later, the restater never does: no conflict, live or offline.
+    const founder = await run([
+      session("own", { usage: usage("own"), writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }],
+        claims: [constraint("09:10")] }),
+      session("act", { usage: usage("act"), claims: [constraint("09:12")] }),
+    ]);
+    expect(both(founder)).toEqual([]);
   });
 
   test("three sessions, one record: a session that joined an older intent is timed by its own claim, live and offline", async () => {

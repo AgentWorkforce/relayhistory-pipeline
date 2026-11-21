@@ -213,7 +213,8 @@ const levelKey = (pair: string, urgency: Urgency, bucket: CooldownBucket) => `${
  * Per-pair cooldown, per urgency and per source class, and per-recipient hourly cap. A HIGH write starts the HIGH
  * cooldown and a LOW write the LOW one; a HIGH advisory waits only on the HIGH cooldown, so a LOW never holds back a
  * HIGH, while a LOW waits on either. A source class waits only on its own writes (and on durable state it cannot
- * attribute), so a conflict row never holds back a collision row for the pair, nor the reverse. The source defaults
+ * attribute: after a restart, up to one pair cooldown), so a conflict row in this process never holds back a
+ * collision row for the pair, nor the reverse. The source defaults
  * to `advisor`: with conflicts off, every write and check is the advisor's and the cooldown is exactly as before.
  * In memory, merged with durable state by `seed` when a reader for it exists; the upsert (never re-inserts an
  * existing row, never touches an acked one) keeps a DM from repeating.
@@ -254,12 +255,15 @@ export class AdvisorLimits {
   seed(rows: RecentAdvisory[], now: number): void {
     for (const r of rows) {
       if (r.kind === "pair") {
-        // A durable pair row carries no source class. When this process holds the pair's cooldown for a class at
-        // that urgency, the row is its own write: it keeps that class's later time (the advisor's only, with
-        // conflicts off: exactly as before). Otherwise (a restart) it holds back both classes.
+        // A durable pair row carries no source class. When this process holds the pair's cooldown for exactly one
+        // class at that urgency, the row is that class's write and keeps its later time (the advisor's, with
+        // conflicts off: exactly as before). When it holds both, the row cannot be attributed: each class keeps
+        // its own time (a durable time is never given to the other class). When it holds neither (a restart), the
+        // row goes to `any`, which holds back both classes until it ages out (the pair cooldown, 6 hours by default).
         const pair = pairKey(r.recipient, r.peer);
-        const own = (["advisor", "conflict"] as const).map((b) => levelKey(pair, r.urgency, b)).filter((k) => this.pairs.has(k));
-        for (const k of own.length ? own : [levelKey(pair, r.urgency, "any")]) this.touch(k, r.latestAt);
+        const held = (["advisor", "conflict"] as const).map((b) => levelKey(pair, r.urgency, b)).filter((k) => this.pairs.has(k));
+        if (held.length === 1) this.touch(held[0]!, r.latestAt);
+        else if (!held.length) this.touch(levelKey(pair, r.urgency, "any"), r.latestAt);
         continue;
       }
       const k = refKey(r.recipient);

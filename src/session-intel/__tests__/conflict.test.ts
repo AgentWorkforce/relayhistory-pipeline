@@ -250,8 +250,9 @@ describe("a claim shared by both sessions (replay)", () => {
   test("B restates A's constraint (one recordId) and then writes against it: still a constraint_violation", () => {
     const b = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
       actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
-    expect([...b.excluded]).toEqual([]);
-    expect([...b.input.a.claims, ...b.input.b.claims].map((c) => [c.id, c.shared])).toEqual([["claude:s-a#k1", true], ["claude:s-b#k9", true]]);
+    // Only the earliest holder's copy is kept (marked shared); the restater's copy is left out as shared.
+    expect([...b.excluded]).toEqual([["claude:s-b#k9", "shared"]]);
+    expect([...b.input.a.claims, ...b.input.b.claims].map((c) => [c.id, c.shared])).toEqual([["claude:s-a#k1", true]]);
     const out = ruleClassify(b.input);
     expect(out).toEqual({ verdict: "constraint_violation", claimIds: ["claude:s-a#k1"], actionId: "claude:s-b@w1" });
     const v = validateCitations(b, out);
@@ -263,6 +264,16 @@ describe("a claim shared by both sessions (replay)", () => {
     const early = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
       actor("09:05", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
     expect(ruleClassify(early.input).verdict).not.toBe("constraint_violation");
+    // H-2: the founder of a shared constraint writes later: none (never flagged through the restater's copy).
+    const founderWrites = built(actor("09:40", { claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }),
+      { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] });
+    expect(ruleClassify(founderWrites.input).verdict).toBe("none");
+    expect(validateCitations(founderWrites, { verdict: "constraint_violation", claimIds: ["claude:s-b#k9"], actionId: "claude:s-a@w1" })).toEqual({ ok: false, reason: "shared" });
+    // A tie (both copies at one time): neither is known to be the author, so neither is cited.
+    const tie = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
+      actor("09:40", { claims: [claim("k9", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
+    expect([...tie.excluded.values()]).toEqual(["shared", "shared"]);
+    expect(ruleClassify(tie.input).verdict).toBe("none");
     // A shared session-scope constraint stays out, as before.
     const ss = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "session", recordId: "rec-1" })] },
       actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "session", recordId: "rec-1" })] }));
