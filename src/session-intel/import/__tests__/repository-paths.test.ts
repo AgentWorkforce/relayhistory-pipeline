@@ -90,6 +90,20 @@ describe("versioned repository-path capture", () => {
     deep.capture(deep.writes[0]!, { ...actionContext(root.directory, "tool_workdir", line, at("01")), target: `${root.directory}/${"a/".repeat(400)}file.ts` });
     expect(capture(deep).provenance!.records[0]!.repositoryPath).toBeNull();
   });
+  test("mapped home roots never collapse different subtrees into one repository path", () => {
+    for (const directory of ["/home/fixture-person", "/Users/fixture-person", "/var/home/fixture-person", "/export/home/fixture-person", "/mnt/c/Users/fixture-person", "C:/Users/fixture-person", "/root"]) {
+      const paths = ["Documents/one/src/a.ts", "Projects/two/src/a.ts"];
+      const records = paths.map((path) => capture(builder(`${directory}/${path}`), [{ ...root, directory }]).provenance!.records[0]!);
+      expect(records.map((r) => r.repositoryPath)).toEqual([null, null]);
+      // Scope and exact target evidence survive: only the lossy semantic path is unavailable.
+      expect(records[0]!.repository).toBe(h.repo(root.repository));
+      expect(records[0]!.repositoryTarget).not.toBeNull();
+      expect(records[0]!.repositoryTarget).not.toBe(records[1]!.repositoryTarget);
+      expect(records[0]!.availableAt).toBe(at("10"));
+      expect(capture(builder(`${directory}/api/Documents/one/src/a.ts`), [{ ...root, directory: `${directory}/api` }]).provenance!.records[0]!.repositoryPath)
+        .toBe(scrubPath(paths[0]!, h));
+    }
+  });
   test("artifact versions cannot silently mix path fields; format2 stays capture-only", () => {
     const out = capture(builder("src/a.ts")), old = toSnapshotSession(builder("src/a.ts"), h, tenant, [root])!;
     expect(() => actionArtifacts([out.provenance!], deleteBy, null, pins)).toThrow("requested path format");
@@ -105,6 +119,23 @@ describe("versioned repository-path capture", () => {
       expect(() => actionArtifacts([{ records: [bad], locations: {} }], deleteBy, null, pins, { repositoryPaths: true })).toThrow("invalid type");
     }
   });
+});
+
+test("action-provenance alone or with an operator map keeps the accepted /1 shape", async () => {
+  const base = temp(), input = join(base, "fixture.jsonl"), map = join(base, "roots.json");
+  writeFileSync(input, JSON.stringify({ sessionId: "fixture", ts: at("01"), kind: "write", cwd: root.directory, files: ["src/a.ts"] }));
+  writeFileSync(map, JSON.stringify({ format: "session-intel-repository-map/1", roots: [root] }), { mode: 0o600 });
+  for (const [i, options] of [["--action-provenance"], ["--action-provenance", "--repository-map", map]].entries()) {
+    const out = join(base, `capture-${i}`);
+    expect(await main(["--format", "generic", "--in", input, "--out", out, "--salt-stdin", "--delete-by", deleteBy, ...options],
+      { now, out: () => {}, err: () => {}, stdin: (async function* () { yield salt; })() })).toBe(0);
+    const loaded = await loadSnapshot(out, { now }), sidecar = JSON.parse(loaded.extraFiles!["action-provenance.json"]!);
+    expect(sidecar.format).toBe(PROVENANCE_FORMAT);
+    expect(sidecar).not.toHaveProperty("repositoryPathEncoding");
+    expect(sidecar.records).toHaveLength(1);
+    expect(sidecar.records.every((r: Record<string, unknown>) => !Object.hasOwn(r, "repositoryPath"))).toBe(true);
+    expect(readActionScope(loaded, now).size).toBe(1);
+  }
 });
 
 test("CLI uses the same salt, private map and receipt, with default and /1 session bytes unchanged", async () => {

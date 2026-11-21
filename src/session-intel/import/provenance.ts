@@ -226,6 +226,7 @@ export function actionRecord(context: ActionContext | null, identity: Pick<Actio
   const repository = conflict ? null : mapped?.repository ?? declared?.repository ?? null;
   const id = context ? hasher.location("record", JSON.stringify([identity.harness, identity.sessionId, identity.eventId, c.directory, c.startingDirectory, c.target, repository, claims, c.at, c.evidenceRef])) : null;
   const hint = c.directory ? posix.basename(c.directory) : null;
+  // Defence in depth: current producers never give projection or non-write facts individual write paths.
   const repositoryPath = options.encodeRepositoryPath && identity.kind === "write" && repository && mapped && c.target
     && c.target !== mapped.directory && contains(mapped.directory, c.target) && c.source !== "code_mode_projection"
     ? options.encodeRepositoryPath(posix.relative(mapped.directory, c.target), mapped.directory) : null;

@@ -133,7 +133,11 @@ the same repository can produce the same path and target tokens, without probing
 either checkout. A trace-only repository declaration without a map root does not
 provide the new path. Missing/conflicting/projection scope, rejected paths and
 commits/outcomes get null; unsafe paths and encoded paths over the existing
-4,096-character path bound never bypass M4 guards. Availability still includes
+4,096-character path bound never bypass M4 guards. A mapped root that is a home
+directory itself also gives null: M4's home-root anchoring could collapse distinct
+subtrees and cannot establish this field's root-relative identity. A checkout
+inside a home directory is still eligible under the existing path guards.
+Availability still includes
 the map's `observedAt`; the new path never backdates an action's evidence.
 
 No new salt, key file or reverse-map file is introduced. The same private mapping
