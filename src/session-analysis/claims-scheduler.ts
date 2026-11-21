@@ -9,7 +9,12 @@
  *
  * Per session it also needs the M3-1 'claims' control on for the workspace (src/shared/session-intel-controls.ts,
  * fail-closed: any error reads as off, counted). The candidates query already narrows to workspaces whose
- * control row is on; the control is read again here through the shared reader, which decides.
+ * control row is on; the control is read again here through the shared reader, and session_analysis_schedule_v1
+ * checks it once more in the database (`control_off`, counted as skipped_control).
+ *
+ * The control also stops scheduled jobs already queued: before the worker runs a claimed job,
+ * scheduledJobGate asks session_analysis_schedule_job_v1 whether the scheduler enqueued it and, if so, whether the
+ * control is still on; off, the job is failed with `claims_control_off` (not retried) and no provider call is made.
  *
  * Enqueue is sessions.session_analysis_schedule_v1 (migration 20261105062180): the same admission checks as a
  * user request (analysis_request_v1's own blocks), plus the durable budgets, counted in its ledger under the
@@ -88,6 +93,34 @@ export const CANDIDATES_SQL =
   "SELECT org_id, workspace_id, session_id FROM sessions.session_analysis_schedule_candidates_v1($1, $2, $3)";
 export const SCHEDULE_SQL =
   "SELECT sessions.session_analysis_schedule_v1($1, $2, $3, $4, $5, $6, $7, $8) AS r";
+export const SCHEDULED_JOB_SQL = "SELECT sessions.session_analysis_schedule_job_v1($1::uuid) AS gate";
+
+/** runAnalysisJob's admit hook: run the claimed job, or fail it with a controlled code before any provider call. */
+export type AnalysisJobAdmission = { run: true } | { run: false; code: string; retryable: boolean };
+
+/**
+ * The worker's gate for scheduled jobs. A job the scheduler did not enqueue always runs. A scheduled job runs only
+ * while its workspace 'claims' control is on; off is `claims_control_off`, not retried. Without migration 062180
+ * (42883) no job is scheduled, so every job runs. Any other error fails the job as retryable
+ * (`claims_scheduler_gate_failed`): the control is default-deny, and the job is tried again after its backoff.
+ */
+export function scheduledJobGate(db: SqlExecutor, counts?: Record<string, number>): (job: { id: string }) => Promise<AnalysisJobAdmission> {
+  const count = (k: string) => { if (counts) counts[k] = (counts[k] ?? 0) + 1; };
+  return async (job) => {
+    let gate: unknown;
+    try {
+      gate = (await db.query<{ gate: unknown }>(SCHEDULED_JOB_SQL, [job.id])).rows[0]?.gate;
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === "42883") return { run: true };
+      count("scheduled_gate_failed");
+      return { run: false, code: "claims_scheduler_gate_failed", retryable: true };
+    }
+    if (gate === "unscheduled" || gate === "on") return { run: true };
+    if (gate === "off") { count("scheduled_control_off"); return { run: false, code: "claims_control_off", retryable: false }; }
+    count("scheduled_gate_failed");
+    return { run: false, code: "claims_scheduler_gate_failed", retryable: true };
+  };
+}
 
 export interface ClaimsSchedulerCounts {
   selected: number;
@@ -137,6 +170,7 @@ export async function claimsSchedulerTick(deps: {
       const outcome = r?.outcome;
       if (outcome === "enqueued") counts.enqueued += 1;
       else if (outcome === "over_budget") counts.skipped_budget += 1;
+      else if (outcome === "control_off") counts.skipped_control += 1;
       else if (outcome === "in_flight" || outcome === "reused" || outcome === "not_found") counts.skipped += 1;
       else counts.failed += 1;
     } catch {
@@ -166,7 +200,8 @@ export function withClaimsScheduler<T>(
         last = at;
         try {
           const c = await scheduler.run();
-          log.info("claims scheduler tick", {
+          // A pass with any failure is a warning (same fields), so alerting on warn sees it.
+          (c.failed > 0 ? log.warn : log.info)("claims scheduler tick", {
             stage: "claims-scheduler",
             selected: c.selected, enqueued: c.enqueued, skipped_budget: c.skipped_budget,
             skipped_control: c.skipped_control, skipped: c.skipped, failed: c.failed,

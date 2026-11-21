@@ -227,15 +227,28 @@ export async function runAnalysisJob(
      * Its errors are contained: it never changes the job's outcome. Absent = nothing runs.
      */
     onCompleted?: (job: AnalysisJob, output: AnalysisJobOutput) => Promise<void>;
+    /**
+     * Runs once after the claim, before any evidence read or provider call (claims-scheduler.ts scheduledJobGate).
+     * `run: false` fails the job with its controlled code (lease-fenced, as any failure) and returns "cancelled".
+     * Absent = every claimed job runs, as before.
+     */
+    admit?: (job: AnalysisJob) => Promise<{ run: true } | { run: false; code: string; retryable: boolean }>;
   },
   options: { jobId?: string; leaseSeconds?: number } = {},
-): Promise<"idle" | "completed" | "failed" | "lease-lost"> {
+): Promise<"idle" | "completed" | "failed" | "cancelled" | "lease-lost"> {
   const job = await store.claim({
     ...(options.jobId ? { jobId: options.jobId } : {}),
     leaseSeconds: options.leaseSeconds ?? ANALYSIS_LEASE_SECONDS,
   });
   if (!job) return "idle";
   if (!job.leaseToken) throw new Error("Claimed analysis has no lease token");
+  if (deps.admit) {
+    const admission = await deps.admit(job);
+    if (!admission.run) {
+      const saved = await store.fail({ jobId: job.id, leaseToken: job.leaseToken, error: admission.code, retryable: admission.retryable });
+      return saved ? "cancelled" : "lease-lost";
+    }
+  }
   let completed: AnalysisJobOutput;
   try {
     const output = await processSessionAnalysis(job, deps);

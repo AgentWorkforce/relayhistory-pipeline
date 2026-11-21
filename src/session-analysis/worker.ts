@@ -179,6 +179,13 @@ export function analysisTick(deps: {
    */
   claims?: ClaimsPort;
   /**
+   * The scheduled-job gate (claims-scheduler.ts scheduledJobGate), wired with the claims port: a job the claims
+   * scheduler enqueued is failed as `claims_control_off` instead of run while its workspace 'claims' control is
+   * off (counted `cancelled` and `scheduled_control_off`). Absent = every claimed job runs, as before.
+   */
+  scheduledJobGate?: (db: SqlExecutor, counts: Record<string, number>) => (job: AnalysisJob) => Promise<
+    { run: true } | { run: false; code: string; retryable: boolean }>;
+  /**
    * The EKS runner's drain signal (runner.ts): true once SIGTERM arrived, so no further job is
    * claimed in this tick; the job in flight still finishes. Absent (the Lambda) = never stops early.
    */
@@ -203,6 +210,7 @@ export function analysisTick(deps: {
         eraser: deps.eraser,
         onError: () => { counts.sweep_failed = (counts.sweep_failed ?? 0) + 1; },
       });
+    const admit = deps.scheduledJobGate?.(deps.db, counts);
     for (let i = 0; i < deps.config.batch; i += 1) {
       if (deps.stopping?.()) break;
       const outcome = await runAnalysisJob(
@@ -213,6 +221,7 @@ export function analysisTick(deps: {
           assumeNoLegacyTurns: deps.config.assumeNoLegacyTurns,
           cutoverProof: deps.config.cutoverProof,
           ...(deps.decisionRecords ? { onCompleted: relayfactsHook(deps.decisionRecords, deps.claims, counts) } : {}),
+          ...(admit ? { admit } : {}),
         },
         { leaseSeconds: deps.config.leaseSeconds },
       );

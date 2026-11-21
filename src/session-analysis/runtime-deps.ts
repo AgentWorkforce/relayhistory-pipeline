@@ -19,6 +19,7 @@ import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migrat
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import { sessionIntelControls } from "../shared/session-intel-controls.ts";
 import { postgresClaimsPort, sessionIntelClaimsEnabled } from "./claims.ts";
+import { scheduledJobGate } from "./claims-scheduler.ts";
 import { decisionRecordsEnabled, postgresDecisionRecordsSink } from "./decision-records.ts";
 import { analysisConfig, type analysisTick } from "./worker.ts";
 
@@ -74,7 +75,9 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
     ...(decisionRecordsEnabled(env)
       ? {
           decisionRecords: postgresDecisionRecordsSink(inputs.db),
-          ...(sessionIntelClaimsEnabled(env) ? { claims: postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db)) } : {}),
+          ...(sessionIntelClaimsEnabled(env)
+            ? { claims: postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db)), scheduledJobGate }
+            : {}),
         }
       : {}),
     transact: inputs.transact,

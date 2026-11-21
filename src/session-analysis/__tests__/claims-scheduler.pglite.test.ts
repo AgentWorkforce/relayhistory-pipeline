@@ -1,8 +1,9 @@
 /**
- * 20261105062180 (provisional) claims scheduler, on PGlite with the full migration plan: analysis_request_v1 keeps
- * 046000's behaviour (parity against the restored 046000 body), the scheduler admission's checks and every
- * budget, retention, the ledger's erase paths, the live-session candidates and the grants; plus the TS tick
- * against the real functions.
+ * 20261105062180 claims scheduler, on PGlite with the full migration plan: analysis_request_v1 keeps 046000's
+ * behaviour (parity against the restored 046000 body), the scheduler admission's checks and every budget, the
+ * claims control and the READ COMMITTED guard, retention, the ledger across erases (spend is never refunded), the
+ * live-session candidates (round-robin across workspaces, failed sessions wait) and the grants; the worker's
+ * scheduled-job gate; the rollback's refusal and override, executed; plus the TS tick against the real functions.
  */
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
@@ -18,7 +19,12 @@ import {
   SESSION_ANALYSIS_MODEL_VERSION, SESSION_ANALYSIS_RESULT_SCHEMA_VERSION, SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
   SESSION_ANALYSIS_SUMMARY_VERSION, SESSION_ANALYSIS_VERSION,
 } from "../versions.ts";
-import { claimsSchedulerSettings, claimsSchedulerTick, CLAIMS_SCHEDULER_RESERVE_TOKENS } from "../claims-scheduler.ts";
+import { claimsSchedulerSettings, claimsSchedulerTick, CLAIMS_SCHEDULER_RESERVE_TOKENS, scheduledJobGate } from "../claims-scheduler.ts";
+import { runAnalysisJob } from "../processor.ts";
+import { PGlite as MigrationPGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
+import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
+import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
+import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { sessionIntelControls } from "../../shared/session-intel-controls.ts";
 import { MIGRATION_SENTINELS } from "../../hoopdb/migration-sentinels.ts";
 
@@ -30,6 +36,7 @@ const DOWN = read("supabase/rollbacks/20261105062180_claims_scheduler.down.sql")
 const ORIGINAL = read("supabase/migrations/20261105046000_analysis_jobs.sql");
 const SCHEDULE = "sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)";
 const CANDIDATES = "sessions.session_analysis_schedule_candidates_v1(integer,integer,integer)";
+const JOB = "sessions.session_analysis_schedule_job_v1(uuid)";
 
 const code = async (p: Promise<unknown>) =>
   ((await p.then(() => null, (e: unknown) => e)) as { code?: string } | null)?.code ?? null;
@@ -66,8 +73,12 @@ const candidates = (active = 7200, interval = 600, limit = 50) =>
   asRole("service_role", async () => (await pg.query<{ org_id: string; workspace_id: string; session_id: string }>(
     `SELECT org_id, workspace_id, session_id FROM ${CANDIDATES.replace(/\(.*$/, "")}($1,$2,$3)`, [active, interval, limit])).rows
     .map((r) => `${r.org_id}/${r.workspace_id}/${r.session_id}`));
+/** Ledger rows, keyed by their job's session; a row whose job was erased has no session ("-"). */
 const ledger = async () => (await pg.query<{ k: string; reserved: number }>(
-  "SELECT org_id || '/' || workspace_id || '/' || session_id k, reserved_tokens::int reserved FROM sessions.session_analysis_schedule_ledger_v1 ORDER BY id")).rows;
+  `SELECT coalesce(j.org_id || '/' || j.workspace_id || '/' || j.session_id, l.org_id || '/' || l.workspace_id || '/-') k,
+          l.reserved_tokens::int reserved
+     FROM sessions.session_analysis_schedule_ledger_v1 AS l LEFT JOIN sessions.session_analysis_jobs_v2 AS j ON j.id = l.analysis_job_id
+    ORDER BY l.id`)).rows;
 const jobs = async () => (await pg.query<{ k: string; status: string }>(
   "SELECT org_id || '/' || workspace_id || '/' || session_id k, status FROM sessions.session_analysis_jobs_v2 ORDER BY created_at, id")).rows;
 const key = (session: string, ws = KEY.workspaceId, org = KEY.orgId) => ({ ...KEY, orgId: org, workspaceId: ws, sessionId: session });
@@ -155,9 +166,13 @@ describe("062180: analysis_request_v1 keeps 046000's behaviour", () => {
 });
 
 describe("062180: the scheduler admission", () => {
+  beforeEach(async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true], ["workspace", "org-z", "ws-z", true]]);
+  });
+
   test("grants: service_role (and the runtime role) only; helpers owner-only; the ledger has RLS and no table privilege", async () => {
     const can = async (role: string, fn: string) => (await pg.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok;
-    for (const fn of [SCHEDULE, CANDIDATES]) {
+    for (const fn of [SCHEDULE, CANDIDATES, JOB]) {
       expect(await can("service_role", fn)).toBe(true);
       for (const role of ["anon", "authenticated", "bulls96_read_api", "bulls96_analysis_admit", "search_consumer_runtime"]) expect([fn, role, await can(role, fn)]).toEqual([fn, role, false]);
       const r = (await pg.query<{ secdef: boolean; cfg: string[]; pub: boolean }>("SELECT prosecdef secdef, proconfig cfg, EXISTS(SELECT 1 FROM aclexplode(proacl) a WHERE a.grantee=0) pub FROM pg_proc WHERE oid=$1::regprocedure", [fn])).rows[0]!;
@@ -232,16 +247,54 @@ describe("062180: the scheduler admission", () => {
     expect((await ledger()).map((r) => r.k)).toEqual(["org-a/ws-a/s-2"]);
   });
 
-  test("erase: the ledger never outlives its job (tombstone forget, C3 purge, any job delete)", async () => {
+  test("erase never refunds spend: cap 1, s-1 enqueued, s-2 over budget; after s-1's jobs are erased s-2 stays over budget", async () => {
     await pointer(pg, { key: key("s-2") });
-    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
-    expect(await schedule({ session: "s-2" })).toMatchObject({ outcome: "enqueued" });
+    expect(await schedule({}, { hourly: 1 })).toMatchObject({ outcome: "enqueued" });
+    expect(await schedule({ session: "s-2" }, { hourly: 1 })).toEqual({ outcome: "over_budget", reason: "workspace_hourly" });
     // The operator erases (per session and per user) tombstone or delete the pointers; the forget trigger removes
-    // the session's jobs, and the ledger rows go with them.
+    // the session's jobs. The ledger row stays, without its job, and still counts.
     await pg.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 's-1'");
-    expect((await ledger()).map((r) => r.k)).toEqual(["org-a/ws-a/s-2"]);
+    expect(await jobs()).toEqual([]);
+    expect(await ledger()).toEqual([{ k: "org-a/ws-a/-", reserved: CLAIMS_SCHEDULER_RESERVE_TOKENS }]);
+    expect(await schedule({ session: "s-2" }, { hourly: 1 })).toEqual({ outcome: "over_budget", reason: "workspace_hourly" });
+    expect(await schedule({ session: "s-2" }, { daily: 1 })).toEqual({ outcome: "over_budget", reason: "global_daily" });
+    expect(await schedule({ session: "s-2" }, { ceiling: CLAIMS_SCHEDULER_RESERVE_TOKENS })).toEqual({ outcome: "over_budget", reason: "daily_tokens" });
+    expect((await ledger()).length).toBe(1);
+    // The kept row holds no session identity at all: there is no session column, and its job id is gone.
+    const cols = (await pg.query<{ c: string }>("SELECT column_name c FROM information_schema.columns WHERE table_schema='sessions' AND table_name='session_analysis_schedule_ledger_v1' ORDER BY ordinal_position")).rows.map((r) => r.c);
+    expect(cols).toEqual(["id", "org_id", "workspace_id", "analysis_job_id", "reserved_tokens", "created_at"]);
+    expect((await pg.query<{ n: number }>("SELECT count(*)::int n FROM sessions.session_analysis_schedule_ledger_v1 WHERE analysis_job_id IS NULL")).rows[0]!.n).toBe(1);
+    // Any other job delete (the C3 purge, a direct delete) keeps the spend the same way.
+    expect(await schedule({ session: "s-2" }, { hourly: 2 })).toMatchObject({ outcome: "enqueued" });
     await pg.query("DELETE FROM sessions.session_analysis_jobs_v2");
+    expect(await ledger()).toEqual([{ k: "org-a/ws-a/-", reserved: CLAIMS_SCHEDULER_RESERVE_TOKENS }, { k: "org-a/ws-a/-", reserved: CLAIMS_SCHEDULER_RESERVE_TOKENS }]);
+    expect(await schedule({ session: "s-2" }, { hourly: 2 })).toEqual({ outcome: "over_budget", reason: "workspace_hourly" });
+  });
+
+  test("the claims control: off globally or for the workspace is control_off, before any lock, and writes nothing", async () => {
+    await controls([["workspace", "org-a", "ws-a", false]]);
+    expect(await schedule()).toEqual({ outcome: "control_off" });
+    await controls([["workspace", "org-a", "ws-a", true], ["global", null, null, false]]);
+    expect(await schedule()).toEqual({ outcome: "control_off" });
+    // No workspace row at all (another workspace with a pointer): off.
+    await controls([["global", null, null, true]]);
+    await pointer(pg, { key: key("q-1", "ws-q") });
+    expect(await schedule({ ws: "ws-q", session: "q-1" })).toEqual({ outcome: "control_off" });
     expect(await ledger()).toEqual([]);
+    expect(await jobs()).toEqual([]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+  });
+
+  test("READ COMMITTED only: under REPEATABLE READ or SERIALIZABLE the admission refuses (25000) and writes nothing", async () => {
+    for (const level of ["REPEATABLE READ", "SERIALIZABLE"]) {
+      await pg.exec(`BEGIN ISOLATION LEVEL ${level}`);
+      try {
+        await pg.exec("SET LOCAL ROLE service_role");
+        expect(await code(pg.query(`SELECT ${SCHEDULE.replace(/\(.*$/, "")}('org-a','ws-a','s-1',5,40,600,5600000,1000) AS r`))).toBe("25000");
+      } finally { await pg.exec("ROLLBACK"); }
+    }
+    expect(await ledger()).toEqual([]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
   });
 });
 
@@ -274,6 +327,63 @@ describe("062180: live-session candidates", () => {
     await pg.query("UPDATE sessions.session_index SET last_activity_at = now() - interval '30 minutes' WHERE session_id = 's-1'");
     expect(await candidates()).toEqual([]);                     // no activity since the analysis
   });
+
+  test("a session whose last analysis failed waits for new activity (it is not re-enqueued every interval)", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET status = 'failed', updated_at = now() - interval '15 minutes'");
+    await pg.query("UPDATE sessions.session_analysis_schedule_ledger_v1 SET created_at = now() - interval '20 minutes'");
+    await pg.query("UPDATE sessions.session_index SET last_activity_at = now() - interval '30 minutes' WHERE session_id = 's-1'");
+    expect(await candidates()).toEqual([]);                     // failed after the last activity
+    await pg.query("UPDATE sessions.session_index SET last_activity_at = now() - interval '1 minute' WHERE session_id = 's-1'");
+    expect(await candidates()).toEqual(["org-a/ws-a/s-1"]);     // new activity since the failure
+  });
+
+  test("round-robin across workspaces: 55 live sessions in ws-a and one older in ws-b; ws-b is read and enqueued", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true], ["workspace", "org-a", "ws-b", true]]);
+    for (let i = 2; i <= 55; i += 1) await pointer(pg, { key: key(`s-${i}`) });
+    await pointer(pg, { key: key("b-1", "ws-b") });
+    await pg.query("UPDATE sessions.session_index SET last_activity_at = now() - interval '90 minutes' WHERE workspace_id = 'ws-b'");
+    const list = await candidates(7200, 600, 50);
+    expect(list.length).toBe(50);
+    // Round 1 is each workspace's newest (newest first), so ws-b's only session is second, not starved.
+    expect(list[1]).toBe("org-a/ws-b/b-1");
+    expect(list.filter((k) => k.startsWith("org-a/ws-a/")).length).toBe(49);
+    const db = { query: (t: string, p?: unknown[]) => asRole("service_role", () => pg.query(t, p as never)) } as never;
+    const counts = await claimsSchedulerTick({ db, controls: sessionIntelControls(db), settings: claimsSchedulerSettings({}) });
+    expect(counts).toEqual({ selected: 50, enqueued: 6, skipped_budget: 44, skipped_control: 0, skipped: 0, failed: 0 });
+    expect((await ledger()).map((r) => r.k)).toContain("org-a/ws-b/b-1");
+  });
+});
+
+describe("062180: the worker's scheduled-job gate", () => {
+  test("a queued scheduled job whose control is turned off is cancelled before any evidence read or provider call; other jobs run", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    const db = { query: (t: string, p?: unknown[]) => asRole("service_role", () => pg.query(t, p as never)) } as never;
+    const counts: Record<string, number> = {};
+    const gate = scheduledJobGate(db, counts);
+    const id = (await pg.query<{ id: string }>("SELECT id::text id FROM sessions.session_analysis_jobs_v2")).rows[0]!.id;
+    expect(await gate({ id })).toEqual({ run: true });
+    await controls([["workspace", "org-a", "ws-a", false]]);
+    expect(await gate({ id })).toEqual({ run: false, code: "claims_control_off", retryable: false });
+    const store = postgresAnalysisJobStore({ db: hoopDb(pg), store: createFsStore({ root: mkdtempSync(join(tmpdir(), "claims-gate-")) }), anchorManifestKey: async () => "unused" });
+    let touched = 0;
+    const untouchable = new Proxy({}, { get: () => { touched += 1; throw new Error("must not be read"); } }) as never;
+    expect(await runAnalysisJob(store, { evidence: untouchable, transport: untouchable, admit: gate })).toBe("cancelled");
+    expect(touched).toBe(0);
+    expect((await pg.query("SELECT status, last_error, attempts FROM sessions.session_analysis_jobs_v2")).rows).toEqual([{ status: "failed", last_error: "claims_control_off", attempts: 1 }]);
+    expect(counts).toEqual({ scheduled_control_off: 2 }); // the direct gate call above, and the worker's
+    // The spend stays (the job was enqueued); a user-requested job, with no ledger row, is unscheduled and runs.
+    expect((await ledger()).length).toBe(1);
+    await pointer(pg, { key: key("s-2") });
+    expect((await request("s-2")).outcome).toBe("accepted");
+    const userJob = (await pg.query<{ id: string }>("SELECT id::text id FROM sessions.session_analysis_jobs_v2 WHERE session_id = 's-2'")).rows[0]!.id;
+    expect(await gate({ id: userJob })).toEqual({ run: true });
+    expect(await gate({ id: "00000000-0000-4000-8000-000000000000" })).toEqual({ run: true });
+    // The gate reads as service_role only.
+    expect(await code(asRole("bulls96_read_api", () => pg.query(`SELECT ${JOB.replace(/\(.*$/, "")}($1::uuid)`, [id])))).toBe("42501");
+  });
 });
 
 describe("the scheduler tick against the real functions", () => {
@@ -302,5 +412,49 @@ describe("062180 rollback", () => {
     expect(DOWN).toContain(bodyOf(ORIGINAL, "analysis_request_v1", "$request$"));
     expect(DOWN).toContain("claims_scheduler.rollback_drop_ledger");
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
+  });
+
+  test("executed: refuses (55000) while a ledger row exists unless the override is exactly 'true'; then drops everything and restores 046000", async () => {
+    const STEP = "upstream:20261105062180_claims_scheduler.sql";
+    const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
+    const db = new MigrationPGlite({ extensions: { btree_gin, pg_trgm } });
+    const client: MigrationClient = { async query<R>(text: string, params?: unknown[]) {
+      if (params?.length) return (await db.query<R>(text, params)) as { rows: R[] };
+      return { rows: ((await db.exec(text)).at(-1)?.rows ?? []) as R[] };
+    } };
+    const refusal = async (sql: string) => {
+      const e = await db.exec(sql).then(() => null, (err: { code?: string; message?: string }) => err);
+      await db.exec("ROLLBACK");
+      return e === null ? null : { code: e.code, message: e.message };
+    };
+    try {
+      await runMigrations(client, { profile: LOCAL });
+      const later = (await plan(LOCAL)).filter((x) => x.name.startsWith("upstream:") && x.name > STEP).map((x) => x.name);
+      expect(later).toEqual(["upstream:20261105062190_coordination_advisories_pending_priority.sql"]);
+      expect((await refusal(DOWN))?.message).toContain("a later migration is applied");
+      await db.exec(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"));
+      // An empty ledger needs no override; one row of spend (here an erased job's) refuses.
+      await db.query("INSERT INTO sessions.session_analysis_schedule_ledger_v1 (org_id, workspace_id, reserved_tokens) VALUES ('org-a','ws-a',1)");
+      const refused = await refusal(DOWN);
+      expect(refused?.code).toBe("55000");
+      expect(refused?.message).toContain("ledger rows exist");
+      for (const v of ["on", "TRUE", "1", "yes", ""]) {
+        await db.exec(`SET claims_scheduler.rollback_drop_ledger = '${v}'`);
+        expect([v, (await refusal(DOWN))?.code]).toEqual([v, "55000"]);
+      }
+      await db.exec("RESET claims_scheduler.rollback_drop_ledger");
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.session_analysis_schedule_ledger_v1")).rows[0]!.n).toBe(1);
+      await db.exec("SET claims_scheduler.rollback_drop_ledger = 'true'");
+      await db.exec(DOWN);
+      await db.exec("RESET claims_scheduler.rollback_drop_ledger");
+      expect((await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.analysis_request_v1(text,text,text,text)'::regprocedure")).rows[0]!.s)
+        .toBe(bodyOf(ORIGINAL, "analysis_request_v1", "$request$"));
+      for (const fn of [SCHEDULE, CANDIDATES, JOB, "sessions.session_analysis_admit_live_v1(text,text,text)", "sessions.session_analysis_admit_job_v1(text,text,text)"])
+        expect([fn, (await db.query<{ r: string | null }>("SELECT to_regprocedure($1)::text r", [fn])).rows[0]!.r]).toEqual([fn, null]);
+      expect((await db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_analysis_schedule_ledger_v1')::text r")).rows[0]!.r).toBeNull();
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [STEP])).rows[0]!.n).toBe(0);
+      expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
+      expect((await refusal(DOWN))?.message).toContain("own applied checksum required");
+    } finally { await db.close(); }
   });
 });
