@@ -1100,6 +1100,38 @@ test("real tree: the 062190 priority-first advisories reader is a read-API funct
   expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
 });
 
+test("real tree: the 062220 advisory instance keeps v1's grants: upsert_v2 is a worker (and runtime) function, ack_v2 and pending_for_v3 read-API only, the fenced v1 ACLs unchanged, and an extra grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const step = "upstream:20261105062220_coordination_advisories_incarnation.sql";
+  expect(s.split.held).toContain(step);
+  const last = s.split.held.at(-1)!;
+  const tail = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tail.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(step);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  const upsert = "sessions.coordination_advisories_upsert_v2(text,text,jsonb)";
+  const readers = ["sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)", "sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)"];
+  const can = async (role: string, fn: string) => (await s.db.query<{ ok: boolean }>("SELECT has_function_privilege($1, $2, 'EXECUTE') ok", [role, fn])).rows[0]!.ok;
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(upsert);
+  for (const role of ["history_rt", "service_role"]) expect([role, await can(role, upsert)]).toEqual([role, true]);
+  expect(await can("bulls96_read_api", upsert)).toBe(false);
+  for (const fn of readers) {
+    expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn);
+    for (const role of ["history_rt", "service_role"]) expect([role, fn, await can(role, fn)]).toEqual([role, fn, false]);
+    expect(await can("bulls96_read_api", fn)).toBe(true);
+  }
+  // The three fenced v1 mutators keep 062000's ACL (CREATE OR REPLACE keeps it).
+  for (const [fn, role] of [["sessions.coordination_advisories_upsert_v1(text,text,jsonb)", "service_role"],
+    ["sessions.coordination_advisories_mark_delivered_v1(text,text,text,text,text)", "service_role"],
+    ["sessions.coordination_advisories_ack_v1(text,text,text,text,text)", "bulls96_read_api"]] as const)
+    expect([fn, await can(role, fn)]).toEqual([fn, true]);
+  await s.db.exec(`GRANT EXECUTE ON FUNCTION ${readers[0]} TO service_role`);
+  expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${readers[0]}: `))).toBe(true);
+});
+
 test("real tree: the live gate excuses only absent signatures a held, unledgered step creates", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);

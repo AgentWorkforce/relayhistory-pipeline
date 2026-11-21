@@ -98,14 +98,15 @@ describe("20261105062000 coordination advisories", () => {
     expect(MIGRATION_SENTINELS[STEP]?.evidence).toContain("coordination_advisories");
     expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(true);
     const runtime = RUNTIME_APPLICATION_FUNCTIONS.filter((f) => f.startsWith("sessions.coordination_advisories_")
-      // 062070 adds recent_v1 under the same stem; its own test covers it.
-      && !f.startsWith("sessions.coordination_advisories_recent_v1(")).sort();
+      // 062070 adds recent_v1 and 062220 upsert_v2 under the same stem; their own tests cover them.
+      && !f.startsWith("sessions.coordination_advisories_recent_v1(") && !f.startsWith("sessions.coordination_advisories_upsert_v2(")).sort();
     expect(runtime).toEqual([MARK, SWEEP, UPSERT].sort());
     // Columns: no transcript body, every id and tenant column NOT NULL.
     const cols = (await db.query<{ column_name: string; is_nullable: string }>(
       "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_schema='sessions' AND table_name='coordination_advisories' ORDER BY ordinal_position")).rows;
-    expect(cols.map((c) => c.column_name)).toEqual(["advisory_id", "org_id", "workspace_id", "harness", "session_id", "peer_harness", "peer_session_id", "urgency", "kind", "artifact", "evidence", "created_at", "delivered_at", "acked_at", "status"]);
-    expect(cols.filter((c) => c.is_nullable === "YES").map((c) => c.column_name)).toEqual(["delivered_at", "acked_at"]);
+    // 062220 appends the nullable instance column (incarnation); its own test covers it.
+    expect(cols.map((c) => c.column_name)).toEqual(["advisory_id", "org_id", "workspace_id", "harness", "session_id", "peer_harness", "peer_session_id", "urgency", "kind", "artifact", "evidence", "created_at", "delivered_at", "acked_at", "status", "incarnation"]);
+    expect(cols.filter((c) => c.is_nullable === "YES").map((c) => c.column_name)).toEqual(["delivered_at", "acked_at", "incarnation"]);
   });
 
   test("1. grants: PUBLIC cannot execute; each role runs only its own functions; no runtime role has a table privilege", async () => {
@@ -243,6 +244,9 @@ describe("20261105062000 coordination advisories", () => {
     expect(await ack("org-a", "ws-a", hex(9), "claude", "sess-a")).toBe(true);
     expect(await upsert("org-a", "ws-a", [adv({ advisory_id: hex(9), urgency: "high" })])).toEqual({ inserted: 0, upgraded: 0, skipped: 1 });
     expect((await row(hex(9)))!.urgency).toBe("low");
+    // With 062220 applied, every v1-written row is a legacy row (incarnation NULL): the v1 writer, ack and
+    // mark-delivered behave exactly as above, and the promotion kept NULL.
+    expect((await db.query<{ i: string | null }>("SELECT DISTINCT incarnation::text i FROM sessions.coordination_advisories")).rows).toEqual([{ i: null }]);
   });
 
   test("5. retention: old unacked rows are expired then deleted, old acked rows deleted, younger rows untouched", async () => {

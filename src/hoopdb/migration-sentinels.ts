@@ -536,6 +536,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.coordination_advisories_pending_for_v2",
     sql: "SELECT to_regprocedure('sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062220_coordination_advisories_incarnation.sql": {
+    evidence: "column sessions.coordination_advisories.incarnation and functions sessions.coordination_advisories_upsert_v2, _ack_v2 and _pending_for_v3",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.coordination_advisories') AND attname = 'incarnation' AND NOT attisdropped) AND to_regprocedure('sessions.coordination_advisories_upsert_v2(text,text,jsonb)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

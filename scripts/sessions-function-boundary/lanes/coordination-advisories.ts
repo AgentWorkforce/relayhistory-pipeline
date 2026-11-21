@@ -3,6 +3,8 @@
  * Five SECURITY DEFINER entry points over sessions.coordination_advisories
  * (docs/coordination-live-advisories.md): upsert, mark-delivered and sweep for the worker (service_role);
  * pending-for and ack for bulls96_read_api, pinned to its request scope. No runtime role has a table privilege.
+ * 062220 (lane coordination-advisories-incarnation) replaces upsert_v1, mark_delivered_v1 and ack_v1 with bodies fenced
+ * to legacy rows (incarnation IS NULL); the ACL entries stay here.
  */
 import type { LaneManifest } from "../types.ts";
 

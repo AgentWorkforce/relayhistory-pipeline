@@ -232,6 +232,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105062180_claims_scheduler.sql",
       // The priority-first advisories reader: one read-API function; no G4 function names it, no ingest path calls it.
       "20261105062190_coordination_advisories_pending_priority.sql",
+      // The advisory instance: a nullable column on the advisories table, three advisor/read-API functions and the
+      // three fenced v1 bodies; no G4 function names them, no ingest path calls them.
+      "20261105062220_coordination_advisories_incarnation.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

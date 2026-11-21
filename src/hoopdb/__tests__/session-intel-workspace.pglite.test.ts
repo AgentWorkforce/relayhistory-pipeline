@@ -208,15 +208,17 @@ describe("20261105062170 session intelligence workspace readers", () => {
 });
 
 describe("20261105062170 rollback", () => {
-  test("checksum-pinned; 062190 comes off first; 062160's down refuses under it; it drops both readers and its ledger row only, and refuses on a rerun", async () => {
+  test("checksum-pinned; 062220 and 062190 come off first; 062160's down refuses under it; it drops both readers and its ledger row only, and refuses on a rerun", async () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
     const db = await migrated();
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      // 20261105062180 (claims scheduler) and 20261105062190 (the priority-first advisories reader) are the later steps:
-      // this down refuses under them; they come off first (062190, then 062180).
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062180_claims_scheduler.sql", "upstream:20261105062190_coordination_advisories_pending_priority.sql"]);
+      // 20261105062180 (claims scheduler), 20261105062190 (the priority-first advisories reader) and 20261105062220 (the
+      // advisory instance) are the later steps: this down refuses under them; they come off first (062220, 062190, then 062180).
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062180_claims_scheduler.sql", "upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062220_coordination_advisories_incarnation.sql"]);
+      expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql"));
       expect(await message(DOWN)).toContain("a later migration is applied");
       await db.exec(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"));
       expect(await message(DOWN)).toContain("a later migration is applied");

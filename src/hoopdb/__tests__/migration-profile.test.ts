@@ -2654,6 +2654,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SIW = "upstream:20261105062170_session_intel_workspace.sql";
     const CSC = "upstream:20261105062180_claims_scheduler.sql";
     const CAP = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
+    const CAI = "upstream:20261105062220_coordination_advisories_incarnation.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2715,7 +2716,27 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105062190 is newest: 062180's down refuses (55000) while it is applied; its checksum-pinned down drops only
+    // 20261105062220 is newest: 062190's down refuses (55000) while it is applied; its checksum-pinned down restores
+    // 062000's exact upsert_v1, mark_delivered_v1 and ack_v1 bodies, drops upsert_v2, ack_v2, pending_for_v3 and the
+    // incarnation column and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(CAI);
+    expect((await failure(rollback("20261105062190_coordination_advisories_pending_priority.down.sql")))?.code).toBe("55000");
+    const fenced = [
+      ["sessions.coordination_advisories_upsert_v1(text,text,jsonb)", "coordination_advisories_upsert_v1", "$coordination_advisories_upsert$"],
+      ["sessions.coordination_advisories_mark_delivered_v1(text,text,text,text,text)", "coordination_advisories_mark_delivered_v1", "$coordination_advisories_mark_delivered$"],
+      ["sessions.coordination_advisories_ack_v1(text,text,text,text,text)", "coordination_advisories_ack_v1", "$coordination_advisories_ack$"],
+    ] as const;
+    for (const [sig, name, tag] of fenced) {
+      expect((await procSrc(sig)).s).toBe(bodyOf("20261105062220_coordination_advisories_incarnation.sql", name, tag));
+      expect((await procSrc(sig)).s).toContain("incarnation IS NULL");
+    }
+    await rollback("20261105062220_coordination_advisories_incarnation.down.sql");
+    expect(await names()).not.toContain(CAI);
+    for (const [sig, name, tag] of fenced) expect(await procSrc(sig)).toEqual({ s: bodyOf("20261105062000_coordination_advisories.sql", name, tag), d: true });
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.coordination_advisories_upsert_v2(text,text,jsonb)'), to_regprocedure('sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)'), to_regprocedure('sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)'))")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid = 'sessions.coordination_advisories'::regclass AND attname = 'incarnation' AND NOT attisdropped")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062220_coordination_advisories_incarnation.down.sql")))?.code).toBe("55000");
+    // 20261105062190 is then newest: 062180's down refuses (55000) while it is applied; its checksum-pinned down drops only
     // the priority-first reader (v1 stays) and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CAP);
     expect((await failure(rollback("20261105062180_claims_scheduler.down.sql")))?.code).toBe("55000");
