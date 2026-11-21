@@ -209,6 +209,22 @@ describe("READ_API_ADVISORY_INSTANCE_ENABLED on", () => {
   });
 });
 
+describe("instance switch on, 062220 not applied", () => {
+  test("the GET and an instance ack answer 503 and log the missing function by name", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const undefinedFn = () => Promise.reject(Object.assign(new Error("function does not exist"), { code: "42883" }));
+    const source: AdvisoriesSource = { pending: async () => [], ack: async () => false, pendingInstances: undefinedFn, ackInstance: undefinedFn };
+    const app = createReadApi({
+      verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0, directoryWorkspaces: new Set([ID.workspaceId]),
+      coordinationAdvisories: { enabled: true, source }, advisoryInstance: true, log: (f: Record<string, unknown>) => { lines.push(f); },
+    } as never);
+    expect((await app.request(base, { headers: auth })).status).toBe(503);
+    expect((await post(app as never, ackBody({ incarnation: INC1 }))).status).toBe(503);
+    expect(lines.filter((l) => String(l.reason).endsWith("_missing")).map((l) => [l.reason, l.error_code, l.status]))
+      .toEqual([["coordination_advisories_pending_for_v3_missing", "42883", 503], ["coordination_advisories_ack_v2_missing", "42883", 503]]);
+  });
+});
+
 describe("sqlCoordinationAdvisories: the 062220 statements", () => {
   type Client = { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }>; release(): void };
   function pool(answer: (text: string) => unknown[]) {

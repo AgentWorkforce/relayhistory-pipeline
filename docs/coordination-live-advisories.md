@@ -212,7 +212,9 @@ Lambda and read Worker). Off: the GET and the ack are byte-identical to before (
   matches it exactly; any other value (including `coordination-advisories/1`) is legacy. With the switch on the
   order is priority-first (v3 is v2's order) whatever `READ_API_ADVISORY_PRIORITY_ENABLED` says; that switch still
   decides the `priority`, `notifyEligible` and `delivery` fields. There is no fallback: with the switch on and
-  `062220` absent the GET fails (503), so turn the switch off before rolling `062220` back.
+  `062220` absent the GET fails (503, logged with reason `coordination_advisories_pending_for_v3_missing`; an ack
+  with an incarnation logs `coordination_advisories_ack_v2_missing`), so apply `062220` before turning the switch on
+  and turn it off before rolling `062220` back.
 - the ack body accepts `{"source", "sessionId", "incarnation"}`. With a UUID `incarnation` (either case), ack_v2:
   `200 {"contract":"advisories/v3","result":"acked"}`, `200 {...,"result":"already_acked"}`, or `404 not_found` on
   no match (the same 404 as v1: nothing is disclosed about which case it was). A malformed one is `400`. Without
@@ -227,11 +229,32 @@ Lambda and read Worker). Off: the GET and the ack are byte-identical to before (
 generation-aware slice (a fenced `mark_delivered_v2`): the advisor refuses to start with this flag and
 `COORDINATION_ADVISOR_RELAY_DM_ENABLED` both on.
 
-**Rollout order (each step is Khaliq's call).** Apply `062220` (changes nothing: both flags off, v1 writes NULL and
-old clients keep acking). Turn `READ_API_ADVISORY_INSTANCE_ENABLED` on (legacy rows show `incarnation: null`; old
-clients ignore the contract value). Ship ack-v2 Desktops. Only then turn `COORDINATION_ADVISOR_INCARNATION_ENABLED`
-on, with the DM flag off: from then on new rows are protected and an old client's v1 ack on them is a `404`. Back
-out in the reverse order.
+**Rollout order (each step is Khaliq's call).**
+
+1. Apply `062220` first, before the read flag (changes nothing: both flags off, v1 writes NULL and old clients keep
+   acking).
+2. Turn `READ_API_ADVISORY_INSTANCE_ENABLED` on (legacy rows show `incarnation: null`). **Precondition:** deployed
+   clients do not exact-match `coordination-advisories/1`. The additive promise above is that unknown *fields* are
+   ignored; the `contract` value itself changes to `advisories/v3`, so a client that compares it to the old value
+   breaks. The pipeline's own e2e does (`e2e/pipeline/coordination.ts` checks `contract === "coordination-advisories/1"`),
+   so that check holds only with the read flag off.
+3. Ship ack-v2 Desktops. **Precondition for step 4 (an activation gate for Khaliq, not a landing blocker):** evidence
+   of the deployed ack-v2 Desktop share. Once the writer flag is on, a client that sends no incarnation gets `404` on
+   every ack of a new row, so the advisory stays listed for it until it expires.
+4. Only then turn `COORDINATION_ADVISOR_INCARNATION_ENABLED` on, with the DM flag off. From then on new rows are
+   protected and an old client's v1 ack on them is a `404`. A legacy (NULL) LOW row that is already `delivered` is
+   converted when it is promoted: reset to `pending` with a new incarnation.
+
+**During a rolling deploy** with v1 and v2 writers running, a v1 HIGH meeting a v2-inserted LOW row is skipped
+(counted skipped: the fence) and the row stays LOW until v2's next scan promotes it.
+
+**Backout is not the reverse order once the writer flag has been on.** Turn the writer flag off **first**. The rows
+it wrote keep their incarnation for up to 7 days (until the sweep deletes them): `upsert_v1` never promotes them (a
+HIGH finding is counted skipped), and `pending_for_v1`/`v2` still list them. So keep `READ_API_ADVISORY_INSTANCE_ENABLED`
+on until those rows have aged out (7 days after the writer flag went off), or apply the `062220` down (which drops
+the column and makes every row legacy again; Khaliq's decision). If the read flag is turned off earlier, those rows
+are listed without an incarnation and cannot be acked by anyone: an ack with `incarnation` is a `400` (the switch-off
+body rule) and one without is a `404` (v1 is fenced), until they expire.
 
 ### Push: HIGH by Relay DM
 
@@ -266,7 +289,7 @@ SQL and the next-tick stop contract.
 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | off | The GET and ack routes |
 | `COORDINATION_ADVISOR_RELAY_DM_ENABLED` | off | HIGH Relay DMs (also needs the sender credential) |
 | `READ_API_ADVISORY_PRIORITY_ENABLED` | off | Exactly `true`: priority-first order through `062190`'s `pending_for_v2` (v1 fallback while it is absent) and the `priority`, `notifyEligible` and `delivery` item fields; also `priority` and `notifyEligible` on the workspace view's alerts. Off: v1 only and the pre-M3-7 responses |
-| `READ_API_ADVISORY_INSTANCE_ENABLED` | off | Exactly `true`: the advisory instance on the advisories routes (`062220`): contract `advisories/v3`, each item's `incarnation`, and an ack with an `incarnation` through `ack_v2`. Off: byte-identical responses and the v1 ack (see "Advisory instances") |
+| `READ_API_ADVISORY_INSTANCE_ENABLED` | off | Exactly `true`: the advisory instance on the advisories routes (`062220`): contract `advisories/v3`, each item's `incarnation`, and an ack with an `incarnation` through `ack_v2`. Instance mode is priority-first whatever `READ_API_ADVISORY_PRIORITY_ENABLED` says. Needs `062220` applied first (else 503, logged `coordination_advisories_pending_for_v3_missing`). Off: byte-identical responses and the v1 ack (see "Advisory instances") |
 | `COORDINATION_ADVISOR_INCARNATION_ENABLED` | off | Exactly `true`: the advisor writes through `upsert_v2` (an incarnation per row, rotated on promotion). Refused together with `COORDINATION_ADVISOR_RELAY_DM_ENABLED` (instance mode has no DM). On only after ack-v2 Desktops ship |
 | `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible: true` for the listed `<kind>:<urgency>` rows (see "Priority and delivery"); each row needs its eval result and Khaliq's OK |
 | `SESSION_INTEL_CONFLICTS_ENABLED` | off | The conflict rows (see "Conflict rows"); also needs the workspace's `conflicts` control |
