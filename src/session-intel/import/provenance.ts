@@ -51,12 +51,13 @@ export function directoryPath(value: unknown, base: string | null = null): strin
         else if (part && part !== ".") depth++;
       }
     }
-    const normalized = posix.normalize(path);
+    let normalized = posix.normalize(path);
+    if (windows && /^[A-Za-z]:$/u.test(normalized)) normalized += "/";
     if (windows && !/^[A-Za-z]:\//u.test(normalized)) return null;
     if (!windows && !normalized.startsWith("/")) return null;
     return /^[A-Za-z]:\/$/u.test(normalized) ? normalized : normalized.replace(/\/$/u, "") || "/";
   }
-  return base ? directoryPath(`${base}/${path}`) : null;
+  return base ? directoryPath(`${base.replace(/\/$/u, "")}/${path}`) : null;
 }
 const contains = (root: string, path: string) => path === root || path.startsWith(`${root}/`);
 
