@@ -1134,6 +1134,9 @@
       "service_role:EXECUTE",
       "authenticated:EXECUTE"
     ],
+    "sessions.lazy_ack_t2_set_gate(text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.lazy_ack_t2_set_mode(text)": [
       "<owner>:EXECUTE"
     ],

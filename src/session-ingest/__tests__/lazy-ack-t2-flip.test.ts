@@ -98,7 +98,7 @@ describe("flipLazyAckT2Mode", () => {
     let n = 0;
     const q: FlipQuery = async () => { n++; return { rows: [{ old: "main" }] }; };
     for (const bad of [{ budgetMs: 0 }, { budgetMs: -1 }, { budgetMs: NaN }, { budgetMs: Infinity }, { maxAttempts: 0 }, { maxAttempts: 1.5 },
-      { maxAttempts: Infinity }, { backoffMs: -1 }, { backoffMs: NaN }, { maxBackoffMs: Infinity }])
+      { maxAttempts: Infinity }, { backoffMs: -1 }, { backoffMs: NaN }, { maxBackoffMs: Infinity }, { maxBackoffMs: -1 }])
       await expect(lazyAckT2Outcome(q, "t2", { ...clock(), ...bad })).rejects.toThrow(TypeError);
     expect(n).toBe(0); // nothing dispatched for invalid options
     // Smallest valid bounds: exactly one attempt, dispatched even though the budget is tiny.

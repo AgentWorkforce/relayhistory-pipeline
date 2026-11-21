@@ -21,6 +21,8 @@
  *   CYC  set_live(true)'s lock shape (clock FOR UPDATE, then a session_directory write that needs 50000 shared) while
  *        flips are attempted and an ACK holding 50000 shared waits on the clock: with no queued exclusive the write is
  *        granted at once, even with lock_timeout below deadlock_timeout.
+ *   GATE fenced->off (lazy_ack_t2_set_gate) and main->t2 (set_mode) overlapping, in both orders: the second is busy
+ *        (fail-fast, nothing changed); after the first commits, the second is refused; no sequence ends off/t2.
  *   UP   T2 ACK A plans under KEY SHARE, then its upgrade waits on T2 ACK B (another origin, NO KEY UPDATE to commit);
  *        B commits; A's upgrade reads B's last_seat (fresh); seats contiguous and unique; no 40P01.
  */
@@ -35,6 +37,8 @@ import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 import { FLIP_STATEMENT, lazyAckT2FlipOutcome as flipLazyAckT2Mode, type FlipMode, type FlipOptions } from "../lazy-ack-t2-flip.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
+// pg-proof sets SESSION_INGEST_TEST_PG_REQUIRED=1: there an unset URL is a failure, never a skip.
+if (process.env.SESSION_INGEST_TEST_PG_REQUIRED === "1" && !url) throw Error("SESSION_INGEST_TEST_PG_URL required (SESSION_INGEST_TEST_PG_REQUIRED=1)");
 if (url) {
   const u = new URL(url);
   if (!["postgresql:", "postgres:"].includes(u.protocol) || !["127.0.0.1", "localhost", "[::1]"].includes(u.hostname) || u.username !== "postgres" ||
@@ -347,6 +351,46 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
         try { expect(await commitIn(C.c, p)).toEqual({ ok: true, kind: "committed", calls: to === "t2" ? 1 : 2 }); await C.c.query("COMMIT"); } finally { await C.end(); }
       } finally { await reset(); }
     }, 60000);
+
+  /** The supported gate change and the flip overlap: one is open (holding 50000 exclusive), the other is tried. */
+  const call = async (sql: string) => { try { return { ok: true as const, v: (await pool.query(sql)).rows[0].o as string }; } catch (e: any) { return { ok: false as const, code: String(e.code), message: String(e.message) }; } };
+  const gateMode = async () => ({
+    gate: (await pool.query("SELECT (SELECT c FROM unnest(proconfig) c WHERE c LIKE 'bulls96.lazy\\_ack\\_t2=%') g FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].g as string,
+    mode: await mode(),
+  });
+  test("GATE-A: fenced->off tried while main->t2 is open: busy (fail-fast); after t2 commits, off is refused; never off/t2", async () => {
+    expect((await call("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).ok).toBe(true);
+    try {
+      const F = await conn("gate-a-flip");
+      try {
+        expect((await F.c.query("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main"); // open, holding 50000 X
+        const t0 = performance.now();
+        expect(await call("SELECT sessions.lazy_ack_t2_set_gate('off') o")).toMatchObject({ ok: false, code: "55P03", message: expect.stringContaining("gate unchanged") });
+        expect(performance.now() - t0).toBeLessThan(500);
+        await F.c.query("COMMIT");
+      } finally { await F.end(); }
+      expect(await gateMode()).toEqual({ gate: "bulls96.lazy_ack_t2=fenced", mode: "t2" });
+      expect(await call("SELECT sessions.lazy_ack_t2_set_gate('off') o")).toMatchObject({ ok: false, code: "55000", message: expect.stringContaining("only while the mode is main") });
+      expect(await gateMode()).toEqual({ gate: "bulls96.lazy_ack_t2=fenced", mode: "t2" });
+    } finally { await setMode("main"); expect((await call("SELECT sessions.lazy_ack_t2_set_gate('off') o")).ok).toBe(true); }
+  }, 60000);
+
+  test("GATE-B: main->t2 tried while fenced->off is open: busy (fail-fast); after off commits, t2 is refused; never off/t2", async () => {
+    expect((await call("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).ok).toBe(true);
+    try {
+      const G = await conn("gate-b-gate");
+      try {
+        expect((await G.c.query("SELECT sessions.lazy_ack_t2_set_gate('off') o")).rows[0].o).toBe("fenced"); // open, holding 50000 X
+        const t0 = performance.now();
+        expect(await call("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).toMatchObject({ ok: false, code: "55P03", message: expect.stringContaining("mode unchanged") });
+        expect(performance.now() - t0).toBeLessThan(500);
+        await G.c.query("COMMIT");
+      } finally { await G.end(); }
+      expect(await gateMode()).toEqual({ gate: "bulls96.lazy_ack_t2=off", mode: "main" });
+      expect(await call("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).toMatchObject({ ok: false, code: "55000", message: expect.stringContaining("requires the gate fenced first") });
+      expect(await gateMode()).toEqual({ gate: "bulls96.lazy_ack_t2=off", mode: "main" });
+    } finally { await setMode("main"); }
+  }, 60000);
 
   test("UP: a T2 ACK whose upgrade waits on another origin's T2 ACK reads that ACK's last_seat after it commits; seats contiguous", async () => {
     const pa = await prepared("up-u1", "up-o1"), pb = await prepared("up-u2", "up-o2");
