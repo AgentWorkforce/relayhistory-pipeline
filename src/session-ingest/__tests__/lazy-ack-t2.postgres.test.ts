@@ -32,7 +32,7 @@ import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts"
 import { batch, record, scratchStore, TENANT } from "./support.ts";
 import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
-import { FLIP_STATEMENT, flipLazyAckT2Mode, type FlipMode, type FlipOptions } from "../lazy-ack-t2-flip.ts";
+import { FLIP_STATEMENT, lazyAckT2FlipOutcome as flipLazyAckT2Mode, type FlipMode, type FlipOptions } from "../lazy-ack-t2-flip.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 if (url) {
@@ -101,7 +101,8 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
   async function conn(app: string, iso = "READ COMMITTED") {
     const c = new pg.Client({ connectionString: target, application_name: app }); await c.connect();
     const pid = (await c.query("SELECT pg_backend_pid() p")).rows[0].p as number;
-    await c.query(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL lock_timeout='15s';SET LOCAL statement_timeout='30s'`);
+    // track_functions per transaction (the owner connection is a superuser): no dependence on the server's setting.
+    await c.query(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL lock_timeout='15s';SET LOCAL statement_timeout='30s';SET LOCAL track_functions='pl'`);
     return { c, pid, end: async () => { await c.query("ROLLBACK").catch(() => {}); await c.end(); } };
   }
   /** One commit as the runtime role in c's open transaction; returns its result kind and the trigger calls it made. */
@@ -152,7 +153,6 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       capturedAt: "2026-11-04T00:00:00.000000Z", sourceSequences: ["sessions.delivery_catalog_acceptance_seq", "sessions.delivery_projection_acceptance_seq"].map((sequenceRegclass, i) => ({ sequenceRegclass, sequenceOid: String(i + 1), allocatedHighWater: "9007199254740993", isCalled: true, incrementBy: "1", cycle: false })),
       allocatedHighWater: "9007199254740993", generation, sourceIdentitySha256: identity, sourceProofSha256: "d".repeat(64) })]);
     await pool.query("UPDATE sessions.ingest_history_switch SET live=false WHERE singleton");
-    expect((await pool.query("SHOW track_functions")).rows[0].track_functions).not.toBe("none");
   }, 300000);
   afterAll(async () => {
     await pool?.end(); scratch?.done();
