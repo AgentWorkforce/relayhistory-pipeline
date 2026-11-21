@@ -542,8 +542,9 @@ describe("062180 rollback", () => {
     try {
       await runMigrations(client, { profile: LOCAL });
       const later = (await plan(LOCAL)).filter((x) => x.name.startsWith("upstream:") && x.name > STEP).map((x) => x.name);
-      expect(later).toEqual(["upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql"]);
+      expect(later).toEqual(["upstream:20261105062190_coordination_advisories_pending_priority.sql", "upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql"]);
       expect((await refusal(DOWN))?.message).toContain("a later migration is applied");
+      await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
       await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));
       expect((await refusal(DOWN))?.message).toContain("a later migration is applied");
       await db.exec(read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql"));
