@@ -169,7 +169,6 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     expect(first[0]!.advisoryId).toBe(hex(11));
     expect(warns).toEqual([]);
     // 20261105062200 (session list readiness) sits above 062190: its down runs first.
-    await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
     await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));
     await db.exec(DOWN);
     const fallback = await source.pending(recipient);
@@ -179,17 +178,15 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
 });
 
 describe("20261105062190 rollback", () => {
-  test("checksum-pinned; 062210 then 062200 come off first; 062180's down (and 062170's) refuses under it; it drops only v2 and its ledger row; a rerun refuses", async () => {
+  test("checksum-pinned; 062200 comes off first; 062180's down (and 062170's) refuses under it; it drops only v2 and its ledger row; a rerun refuses", async () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
     const db = await migrated();
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      // 20261105062200 (session list readiness) and 20261105062210 (T2 staged ACK) are the later steps: this down refuses
-      // under them; they come off first, newest first.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql"]);
+      // 20261105062200 (session list readiness) is the one later step: this down refuses under it; it comes off first.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql"]);
       expect(await message(DOWN)).toContain("a later migration is applied");
-      await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
       await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));
       expect(await message(sqlFile("supabase/rollbacks/20261105062180_claims_scheduler.down.sql"))).toContain("a later migration is applied");
       expect(await message(read("supabase/rollbacks/20261105062170_session_intel_workspace.down.sql"))).toContain("a later migration is applied");
