@@ -40,7 +40,7 @@ export type ClaimKind = "intent" | "constraint" | "decision";
 export type ClaimScope = "session" | "project" | "repo";
 export const CLAIM_SCOPES: readonly ClaimScope[] = ["session", "project", "repo"];
 /**
- * Read by the M2 conflict detectors (src/session-intel/conflict/); the advisor never reads claims. `id` is
+ * Read by the M2 conflict detectors (src/session-intel/conflict/) and, when conflicts are on, by the live advisor. `id` is
  * unique within its session (absent, it is `c<index>`, the claim's position in its line). `supersededAt`, when
  * set, is when a later claim or a decision record retired it; an as-of view shows it only once it is past.
  * `scope`, `id` and `supersededAt` are optional in the file, so a snapshot without them still loads as /1.
@@ -51,7 +51,8 @@ export interface SnapshotClaim {
   topic?: string;
   /**
    * The stored claim record this claim belongs to (a relayfacts claim or decision id). Two sessions holding a claim
-   * with the same recordId share one claim (its evidence spans both): agreement, never a conflict. Optional.
+   * with the same recordId share one claim (its evidence spans both): agreement, never an intent_conflict or an
+   * overlap; a shared constraint can still be violated by a write. Optional.
    */
   recordId?: string;
 }

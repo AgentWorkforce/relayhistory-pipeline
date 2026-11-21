@@ -48,7 +48,7 @@ They are deterministic, and they apply whichever judge answers.
 Before the judge, in the input builder:
 
 - **A superseded claim is never used.** It is left out of the input, and citing it gives `none` (`superseded`).
-- **A shared claim is agreement.** A claim with the same `recordId` on both sides (one stored claim whose evidence spans both sessions) is left out of both sides (`shared`), and citing it gives `none`.
+- **A shared claim is agreement, not a conflict.** A claim with the same `recordId` on both sides (one stored claim whose evidence spans both sessions) never makes an `intent_conflict` or an `overlap` (`shared`). A shared constraint still counts against a write: if one side restates the other's constraint and then writes against it, that is a `constraint_violation`, and the shared constraint is the one cited.
 - **A `session`-scope constraint never propagates.** It is left out (`session_scope`). Only `project` and `repo` constraints reach the judge.
 - Claims that name none of the pair's shared topics are left out (`off_topic`).
 - Actions are the visible writes in a shared topic. A commit or an outcome carries no path, so it counts only in the event of such a write (and is then that same action); any other commit or outcome of the side is never an action.
