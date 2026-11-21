@@ -84,6 +84,14 @@ export type ExclusionReason = "superseded" | "session_scope" | "off_topic" | "sh
 
 export interface BuiltInput { input: JudgeInput; excluded: Map<string, ExclusionReason> }
 
+/**
+ * How claim times may be read. `statement` (the default, the replay snapshot): a claim's `at` is when its session
+ * stated it, so a shared constraint's earliest holder is its author. `ingest` (the live advisor): `at` is only when
+ * the claim was recorded for that session, which need not follow statement order, so the author of a shared
+ * constraint cannot be told from a restater and neither side's copy is cited.
+ */
+export interface BuildOptions { claimTimes?: "statement" | "ingest" }
+
 export const claimRef = (sessionRef: string, claimId: string) => `${sessionRef}#${claimId}`;
 export const actionRef = (sessionRef: string, eventId: string) => `${sessionRef}@${eventId}`;
 
@@ -93,7 +101,8 @@ export const actionRef = (sessionRef: string, eventId: string) => `${sessionRef}
  * shared topics. Actions are the visible writes in a shared topic, and the commits and outcomes in such a
  * write's event (they carry no path, so they are in the topic only through it).
  */
-export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
+export function buildJudgeInput(c: ConflictCandidate, now: Date, opts: BuildOptions = {}): BuiltInput {
+  const ingestTimes = opts.claimTimes === "ingest";
   const nowIso = now.toISOString();
   const topics = new Set(c.topics);
   const excluded = new Map<string, ExclusionReason>();
@@ -109,6 +118,7 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
   // (the side whose copy is strictly earlier; a tie keeps neither): it may be cited only as the constraint of a
   // violation (validateCitations), never in an intent_conflict or an overlap. So the session that restated it can
   // still violate it, and its author is never flagged against its own constraint through the restater's copy.
+  // With ingest times only (BuildOptions), neither copy is kept: the earliest ingested holder need not be the author.
   const records = (v: ConflictCandidate["a"]) => {
     const m = new Map<string, string>();
     for (const cl of v.claims) if (cl.recordId !== undefined && isLiveClaim(cl, nowIso)) {
@@ -119,7 +129,11 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
   };
   const recA = records(c.a), recB = records(c.b);
   const shared = new Set([...recA.keys()].filter((r) => recB.has(r)));
-  const firstHolder = (name: SideName, recordId: string) => name === "a" ? recA.get(recordId)! < recB.get(recordId)! : recB.get(recordId)! < recA.get(recordId)!;
+  const firstHolder = (name: SideName, recordId: string) => {
+    if (ingestTimes) return false;
+    const mine = (name === "a" ? recA : recB).get(recordId)!, theirs = (name === "a" ? recB : recA).get(recordId)!;
+    return mine < theirs;
+  };
   const side = (name: SideName): JudgeSide => {
     const v = name === "a" ? c.a : c.b;
     const ref = refString(v.session);

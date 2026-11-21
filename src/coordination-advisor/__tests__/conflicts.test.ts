@@ -91,11 +91,25 @@ describe("a claim shared by both sessions (live)", () => {
     expect(liveConflictAdvisories("ws", sessions, NOW).advisories).toEqual([]);
   });
 
-  test("the actor restates the owner's constraint (one record) and then writes against it: a HIGH constraint_violation", () => {
-    const both = row("c1", "constraint", CV, "owner", { evidence: evidence(["owner", -60], ["actor", -55]) });
-    const sessions = liveSessions([cand("owner"), cand("actor")], [lane("actor", [["supabase/migrations/1.sql", -20]])], parseClaimRows([both]), NOW);
-    const { advisories } = liveConflictAdvisories("ws", sessions, NOW);
-    expect(advisories.map((a) => [a.kind, a.urgency, a.rows.map((r) => r.recipient.sessionId)])).toEqual([["constraint_violation", "high", ["actor", "owner"]]]);
+  // Live claim times are ingest times: with two holders of one constraint record, the author cannot be told from the
+  // restater, so neither copy is cited (conservative: a possible missed violation, never a false one).
+  const sharedConstraint = (first: [string, number], second: [string, number], writer: string) => {
+    const both = row("c1", "constraint", CV, first[0], { evidence: evidence(first, second) });
+    const sessions = liveSessions([cand("owner"), cand("actor")], [lane(writer, [["supabase/migrations/1.sql", -20]])], parseClaimRows([both]), NOW);
+    const [c] = conflictCandidates(sessions, NOW).candidates;
+    return { built: buildJudgeInput(c!, NOW, { claimTimes: "ingest" }), advisories: liveConflictAdvisories("ws", sessions, NOW).advisories };
+  };
+  test("the probe: the restater's evidence ingested before the author's, the author writes later: no constraint_violation", () => {
+    const { built, advisories } = sharedConstraint(["actor", -60], ["owner", -55], "owner");
+    expect([...built.excluded.values()]).toEqual(["shared", "shared"]);
+    expect(advisories.filter((a) => a.kind === "constraint_violation")).toEqual([]);
+  });
+  test("in ingest order: the author first, the author writes later: no constraint_violation", () => {
+    expect(sharedConstraint(["owner", -60], ["actor", -55], "owner").advisories.filter((a) => a.kind === "constraint_violation")).toEqual([]);
+  });
+  test("the restater writes against the shared constraint: live, neither copy is cited (no row)", () => {
+    for (const order of [[["owner", -60], ["actor", -55]], [["actor", -60], ["owner", -55]]] as Array<[[string, number], [string, number]]>)
+      expect(sharedConstraint(order[0], order[1], "actor").advisories).toEqual([]);
   });
 });
 

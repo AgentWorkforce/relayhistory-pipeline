@@ -264,6 +264,12 @@ describe("a claim shared by both sessions (replay)", () => {
     const early = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
       actor("09:05", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
     expect(ruleClassify(early.input).verdict).not.toBe("constraint_violation");
+    // With ingest times only (the live advisor), neither copy is kept: the earliest ingested holder need not be the author.
+    const r = cands([view("s-a", NOW, { claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }),
+      view("s-b", NOW, actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }))]);
+    const ingest = buildJudgeInput(r.candidates[0]!, new Date(at(NOW)), { claimTimes: "ingest" });
+    expect([...ingest.excluded]).toEqual([["claude:s-a#k1", "shared"], ["claude:s-b#k9", "shared"]]);
+    expect(ruleClassify(ingest.input).verdict).toBe("none");
     // H-2: the founder of a shared constraint writes later: none (never flagged through the restater's copy).
     const founderWrites = built(actor("09:40", { claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }),
       { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] });

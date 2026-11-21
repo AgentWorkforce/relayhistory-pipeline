@@ -50,6 +50,11 @@ describe("live wiring in replay", () => {
   const t = (hm: string) => `2026-11-01T${hm}:00.000Z`;
   const conflicts = (r: Awaited<ReturnType<typeof replaySnapshot>>) =>
     r.alerts.filter((a) => isConflictKind(a.kind)).map((a) => `${a.detector} ${a.pair.join("+")} ${a.kind} ${a.urgency} ${a.sentAt.slice(11, 16)}`).sort();
+  const split = (r: Awaited<ReturnType<typeof replaySnapshot>>) => {
+    const all = conflicts(r);
+    const of = (d: string) => all.filter((x) => x.startsWith(`${d} `)).map((x) => x.slice(d.length + 1));
+    return { live: of("coordination-advisor"), offline: of("conflict-rule") };
+  };
   const both = (r: Awaited<ReturnType<typeof replaySnapshot>>) => {
     const all = conflicts(r);
     const of = (d: string) => all.filter((x) => x.startsWith(`${d} `)).map((x) => x.slice(d.length + 1));
@@ -60,7 +65,7 @@ describe("live wiring in replay", () => {
     { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
   const usage = (id: string) => [{ ts: t("09:05"), eventId: `u-${id}`, tokens: 1, costUsdMicros: 1 }];
 
-  test("a shared intent (one recordId) is agreement: no conflict, live or offline; a shared constraint written against is a violation", async () => {
+  test("a shared intent (one recordId) is agreement: no conflict, live or offline; a shared constraint is cited offline only", async () => {
     const intent = (recordId: string, hm: string) => ({ id: "i1", at: t(hm), kind: "intent", scope: "project", recordId,
       text: "Add pagination to the list route in src/catalog.", confidence: 1, evidenceIds: ["e1"] });
     const pair = (recB: string) => run([
@@ -70,14 +75,17 @@ describe("live wiring in replay", () => {
     ]);
     expect(both(await pair("rec-1"))).toEqual([]);
     expect(both(await pair("rec-2"))).toEqual(["claude:act+claude:own overlap low 09:14"]);
-    // The constraint restated by the writer (one record) is still broken by its later write.
+    // The constraint restated by the writer (one record), then broken by its later write. Offline (statement times)
+    // the earlier holder's copy is cited: a violation. Live, claim times are ingest times, so the author cannot be
+    // told from the restater and neither copy is cited: no row (conservative: a possible missed violation, never a
+    // false one).
     const constraint = (hm: string) => ({ id: "k1", at: t(hm), kind: "constraint", scope: "project", recordId: "rec-k",
       text: "No new migrations under supabase/migrations until the 062 renumber lands.", confidence: 1, evidenceIds: ["e1"] });
     const r = await run([
       session("own", { usage: usage("own"), claims: [constraint("09:10")] }),
       session("act", { writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }], claims: [constraint("09:12")] }),
     ]);
-    expect(both(r)).toEqual(["claude:act+claude:own constraint_violation high 09:42"]);
+    expect(split(r)).toEqual({ live: [], offline: ["claude:act+claude:own constraint_violation high 09:42"] });
     // H-2: the constraint's founder writes later, the restater never does: no conflict, live or offline.
     const founder = await run([
       session("own", { usage: usage("own"), writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }],

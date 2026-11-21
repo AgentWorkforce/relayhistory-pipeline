@@ -239,7 +239,8 @@ export function liveConflictAdvisories(workspaceId: string, sessions: readonly A
   for (const cand of candidates) {
     stats.steps += sizeOf(cand.a) + sizeOf(cand.b);
     if (stats.steps > stepBudget) return { advisories: [], stats, overBudget: "steps" };
-    const built = buildJudgeInput(cand, now);
+    // Live claim times are ingest times (claimTimeFor): a shared constraint's author is unknown, so it is not cited.
+    const built = buildJudgeInput(cand, now, { claimTimes: "ingest" });
     const constraints = (s: JudgeSide) => s.claims.filter((c) => c.kind === "constraint").length;
     stats.steps += constraints(built.input.a) * built.input.b.actions.length + constraints(built.input.b) * built.input.a.actions.length;
     if (stats.steps > stepBudget) return { advisories: [], stats, overBudget: "steps" };
