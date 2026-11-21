@@ -88,6 +88,8 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
     if (typeof payload !== "string") throw Error("payload_not_captured");
     return payload;
   }
+  // Out-of-protocol override (bare ALTER), used only where a schedule needs the gate changed while an ingest transaction
+  // is open (PRE) or on purpose; the supported path, lazy_ack_t2_set_gate, would be busy there by design.
   const setGate = (v: "off" | "fenced") => pool.query(`ALTER FUNCTION ${ACK} SET bulls96.lazy_ack_t2='${v}'`);
   const mode = async () => (await pool.query("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows[0].mode as string;
   const setMode = async (m: FlipMode) => { expect((await flipLazyAckT2Mode((sql, p) => pool.query(sql, p as never[]) as never, m, { budgetMs: 5000 })).result).toBe("switched"); };
@@ -162,7 +164,8 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
     await pool?.end(); scratch?.done();
     if (admin) { if (name) await admin.query("DROP DATABASE IF EXISTS " + name + " WITH(FORCE)"); await admin.end(); }
   }, 60000);
-  const reset = async () => { await setGate("off"); await setMode("main"); };
+  // The supported order back: mode main first, then the gate off through lazy_ack_t2_set_gate.
+  const reset = async () => { await setMode("main"); await pool.query("SELECT sessions.lazy_ack_t2_set_gate('off')"); };
 
   test("S1: a busy flip queues nothing: a same-origin ACK of another user still passes 50000 while a fenced main ACK is paused", async () => {
     const pa = await prepared("s1-u1", "s1-o"), pb = await prepared("s1-u2", "s1-o"), pc = await prepared("s1-u3", "s1-o");

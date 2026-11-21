@@ -151,6 +151,8 @@ describe.skipIf(!url)("062210 rollback vs a paused fenced ACK (owned PostgreSQL)
       expect(locks.some((l) => l.locktype === "advisory" && Number(l.classid) === 961996 && Number(l.objid) === 50000 && l.mode === "ShareLock" && l.granted)).toBe(true);
       expect(locks.filter((l) => !l.granted).map((l) => [l.locktype, Number(l.objid)])).toEqual([["advisory", PAUSE_KEY]]);
       expect(locks.some((l) => l.rel === "sessions.lazy_ack_t2_mode")).toBe(false);
+      // Bare ALTER on purpose (out of protocol): the premise is a gate set off while this ACK is open; the supported
+      // lazy_ack_t2_set_gate would be busy here, which is itself the protection.
       await pool.query(`ALTER FUNCTION ${ACK} SET bulls96.lazy_ack_t2='off'`);
       expect((await pool.query("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows[0].mode).toBe("main");
       let finished = false;
