@@ -150,19 +150,20 @@ sidecar and private map retain their existing byte/count limits,
 permissions and deletion deadline.
 
 The current `/1` action-scope consumer deliberately refuses a `/2` sidecar rather
-than silently interpreting or dropping the new field. A separately reviewed offline
-per-repository detector adapter will consume it, preserving original session refs
-and claim times. This export does not change production detectors, live capture,
-claims, snapshots, replay, routes or feature gates.
+than silently interpreting or dropping the new field. The explicit offline
+[`action-scoped-outcomes` adapter](../../../docs/session-intel-action-replay.md)
+consumes `/2` per repository, preserving original session refs and claim times.
+This export does not change production detectors, live capture, claims, snapshot
+types, the default replay, routes or feature gates.
 
 The export is opt-in to preserve the existing CLI contract. Without it, the
 snapshot and private mapping keep their previous shapes. With it, legacy session
 bytes still do not change. The sidecar explicitly says `capture_only`,
 `legacySessionScopeUnchanged: true` and `consumedByReplay: false`. The separately
-opted-in descriptive patterns consumer supports `/1`; replay, snapshot types and
-views will consume scope evidence in a separately ordered follow-up;
-this slice does not repair their existing session-scope assumptions or establish
-alert quality.
+opted-in descriptive patterns consumer supports `/1`. The separately selected
+`action-scoped-outcomes` replay supports `/2` for hypothetical T1/T2 outcomes;
+snapshot types, views and the default replay retain their existing session-scope
+semantics. Neither export nor replay establishes alert quality.
 
 Capture is bounded to 100,000 provenance facts and 16 MiB of captured context,
 with 16 MiB bounds on the sidecar

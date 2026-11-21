@@ -62,6 +62,13 @@ These gap counts cover all input actions, including actions outside the replay
 window. Such runs are incomplete, return CLI exit code 1, and are refused for
 held-out scoring. A complete run only means these checks found no known gap;
 it does not certify representative workspace coverage or independent labels.
+Code callers may tighten `findingLimit` and `perCallFindingLimit`; defaults stay
+unchanged, larger limits are refused, and effective values appear in report
+parameters. A saturated per-call result is incomplete because truncation cannot
+be excluded. The rejected count is an upper bound on distinct rejected starts:
+an evicted bounded-out ancestry lookup can be counted again. Detector evidence
+does not carry a harness field, so same-session-id evidence is matched against
+both recipients; ambiguous matches can only delay `alertAt`, never advance it.
 
 Use the report's diagnostics, detector parameters and source digest when
 comparing experiments. Claim extraction and independently adjudicated outcomes

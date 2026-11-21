@@ -33,8 +33,11 @@ test("explicit CLI consumes the actual /2 importer output with late action scope
   ].map((e) => JSON.stringify(e)).join("\n"));
   writeFileSync(map, JSON.stringify({ format: "session-intel-repository-map/1", roots: [{ directory: "/fixture/repo", repository: "example.test/team/repo", observedAt: at("10") }] }), { mode: 0o600 });
   const args = ["--format", "generic", "--in", input, "--salt-stdin", "--delete-by", "2026-11-10T00:00:00.000Z", "--action-repository-paths"];
-  const captureIo = () => ({ ...io(), stdin: (async function* () { yield "synthetic-offline-cli-salt"; })() });
+  const warnings: string[] = [];
+  const captureIo = () => ({ ...io(), err: (line: string) => { warnings.push(line); }, stdin: (async function* () { yield "synthetic-offline-cli-salt"; })() });
   expect(await importMain([...args, "--repository-map", map, "--out", capture], captureIo())).toBe(0);
+  expect(warnings.some((line) => line.includes("version-2 action repository paths require the explicit offline action-scoped-outcomes adapter"))).toBe(true);
+  expect(warnings.some((line) => line.includes("until its separate adapter update"))).toBe(false);
   const out = join(base, "out");
   expect(await main(["replay", "--snapshot", capture, "--out", out, "--detectors", ACTION_SCOPED_DETECTOR, "--interval-ms", "60000"], io())).toBe(0);
   const result = parseReplayResult(JSON.parse(readFileSync(join(out, "alerts.json"), "utf8")));
@@ -50,6 +53,7 @@ test("explicit CLI consumes the actual /2 importer output with late action scope
 });
 
 test("action-scoped mode refuses mixed session-scoped detectors and legacy captures", async () => {
+  expect(() => replayDetectors("unknown-fixture")).toThrow("coordination-advisor, conflict-rule, action-scoped-outcomes");
   expect(() => replayDetectors(`${ACTION_SCOPED_DETECTOR},coordination-advisor`)).toThrow("separate run");
   const fixture = new URL("./fixtures/snapshot", import.meta.url).pathname;
   await expect(main(["replay", "--snapshot", fixture, "--out", join(temp(), "out"), "--detectors", ACTION_SCOPED_DETECTOR], io())).rejects.toThrow("provenance");
