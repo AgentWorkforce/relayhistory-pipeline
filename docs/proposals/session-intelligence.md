@@ -135,9 +135,11 @@ that is the number that matters.
 
 ## Delivery
 
-- **HIGH → Agent Relay DM** from the pipeline service identity, using the existing sender
-  (`relay-sender.ts`) and template rules: ids, kinds, artifacts and scrub-clean claim excerpts only.
-  It also stays on the pull path until acked.
+- **HIGH → Agent Relay DM (superseded).** The pipeline-side DM (M3-8) is dropped: HIGH alerts reach the recipient's
+  own Desktop (Desktop-local delivery, below) and stay on the pull path until acked; instance mode has no DM until a
+  later generation-aware slice. What follows records why the DM path was set aside. Originally: a DM from the pipeline
+  service identity, using the existing sender (`relay-sender.ts`) and template rules (ids, kinds, artifacts and
+  scrub-clean claim excerpts only).
   - **The DM transport is not verified.** `relay-sender.ts` was never tested against a live relay.
     Sending is Relaycast's: every sender is a Relaycast agent with its own token, and a DM names the
     recipient agent. Only Cloud can resolve a (harness, session id) to that agent, from Desktop's
@@ -359,7 +361,7 @@ scope. "Gate" names what needs Khaliq's explicit OK.
 | M3-8 DM transport contract ([session-intel-dm-transport.md](../session-intel-dm-transport.md)): **dropped**. The server-side DM is replaced by Desktop-local delivery (P1 injected by Desktop's poll, see Delivery); instance mode has no DM until a later generation-aware slice. The contract doc stays as background only; no Relaycast service identity or token is requested | none | none | none |
 | M3-9 Desktop notification to the human, ranked by priority (see [Priority and the human notice](#priority-and-the-human-notice)) | relay-app's agent (Desktop), sessions-intel-lead (the `priority` field) | The tiers, dedup and caps as specified; off by default behind a Desktop setting; never blocks a turn | **Live notices in any real install: Khaliq OK** |
 | M3-10 Hosted client read token for Desktop: Desktop's token code returns nothing for the hosted site today (`tokens.rs` `hosted_site()`), so the Desktop pull path, and with it turn-end delivery, P1 injection and the human notice, works on self-host only | Cloud owner (Khaliq to name), with layered-control and relay-app | A reviewed hosted route that issues a read-scoped token to Desktop, reused until expiry | **New credential path: Khaliq OK** |
-| M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy, and the DM credential: Khaliq OK** |
+| M3-6 Stage 0 ready-to-flip packet (hosted plan steps 1 to 9 for our workspace) | sessions-intel-lead | Evidence list complete | **Each flip and deploy: Khaliq OK** (no DM credential: M3-8's server-side DM is dropped) |
 
 ### M4: Enterprise trace import
 
