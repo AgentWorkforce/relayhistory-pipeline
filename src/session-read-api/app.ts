@@ -2193,6 +2193,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const correlationId = c.get("correlationId");
       const view = await workspaceView({
         orgId: identity.orgId, workspaceId: identity.workspaceId, now: Date.now(), source: intel.source, directory: deps.directory,
+        shortSummary: deps.listShortSummary === true,
         ...(deps.advisoryNotifyRows ? { notifyRows: deps.advisoryNotifyRows } : {}),
         log: (fields) => log({ route: c.req.routePath, ...fields, correlation_id: correlationId }),
       });

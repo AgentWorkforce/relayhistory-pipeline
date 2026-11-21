@@ -19,6 +19,8 @@ import { parseAdvisoryNotifyRows } from "../advisory-priority.ts";
 const ID: VerifiedIdentity = { userId: "u", orgId: "org", workspaceId: "ws", scopes: ["rth:read"] };
 const auth = { authorization: "Bearer good" };
 const verify = async (token: string) => {
+  // "noscope": a valid token without rth:read (any other scope only).
+  if (token === "noscope") return { ...ID, scopes: ["rth:sync"] };
   if (token !== "good") throw new AuthError(401, "invalid_token", "invalid");
   return ID;
 };
@@ -87,9 +89,10 @@ function memorySource(init: { alerts?: SessionIntelAlertRow[]; claims?: SessionI
 
 const api = (opts: {
   enabled?: boolean; source?: SessionIntelSource; directory?: Directory | null; canary?: ReadonlySet<string> | "*"; logs?: Record<string, unknown>[];
-  notifyRows?: ReadonlySet<string>;
+  notifyRows?: ReadonlySet<string>; listShortSummary?: boolean;
 } = {}) => createReadApi({
   ...(opts.notifyRows ? { advisoryNotifyRows: opts.notifyRows } : {}),
+  ...(opts.listShortSummary === undefined ? {} : { listShortSummary: opts.listShortSummary }),
   verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0,
   directoryWorkspaces: opts.canary ?? new Set([ID.workspaceId]),
   ...(opts.directory === null ? {} : { directory: opts.directory ?? memoryDirectory([dirRow(1)]).directory }),
@@ -137,6 +140,16 @@ describe("GET /v1/session-intel/workspace: gate, auth and scope", () => {
     expect((await get(api({ enabled: true, source: mem.source, canary: "*" }))).status).toBe(200);
   });
 
+  test("a valid token without rth:read is 403 forbidden, before any read", async () => {
+    const mem = memorySource({ alerts: [alertRow(1)] });
+    const dir = memoryDirectory([dirRow(1)]);
+    const { status, body } = await get(api({ enabled: true, source: mem.source, directory: dir.directory }), PATH, { authorization: "Bearer noscope" });
+    expect(status).toBe(403);
+    expect(body.error).toEqual({ code: "forbidden", message: "missing required scope: rth:read" });
+    expect(mem.calls).toEqual([]);
+    expect(dir.calls).toEqual([]);
+  });
+
   test("tenant: every read is the token's org and workspace; a directory row of another tenant refuses the response", async () => {
     const mem = memorySource();
     const dir = memoryDirectory([dirRow(1), dirRow(2, { org_id: "org-b" }), dirRow(3, { workspace_id: "ws-b" })]);
@@ -175,13 +188,13 @@ describe("GET /v1/session-intel/workspace: the view", () => {
   const claims: SessionIntelClaimRow[] = [
     { source: "claude", sessionId: "s-5", kind: "intent", title: "Add the workspace route", updatedAt: minutesAgo(4).toISOString() },
     { source: "claude", sessionId: "s-5", kind: "decision", title: "Use 501 when off", updatedAt: minutesAgo(3).toISOString() },
-    { source: "claude", sessionId: "s-180", kind: "decision", title: "Slot 062170 is provisional", updatedAt: minutesAgo(200).toISOString() },
+    { source: "claude", sessionId: "s-180", kind: "decision", title: "Slot 062170 is assigned", updatedAt: minutesAgo(200).toISOString() },
   ];
 
   test("contract, alerts, status, handoffs and coverage; field sets exact; class mapped", async () => {
     const mem = memorySource({ alerts: [alertRow(1), alertRow(2, { urgency: "low", kind: "concurrent_edit", deliveredAt: minutesAgo(1).toISOString() })], claims });
     const dir = memoryDirectory(rows);
-    const { status, body } = await get(api({ enabled: true, source: mem.source, directory: dir.directory }));
+    const { status, body } = await get(api({ enabled: true, source: mem.source, directory: dir.directory, listShortSummary: true }));
     expect(status).toBe(200);
     expect(Object.keys(body).sort()).toEqual(["alerts", "contract", "coverage", "handoffs", "nextCursor", "status"]);
     expect(body.contract).toBe(SESSION_INTEL_CONTRACT);
@@ -205,7 +218,7 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     expect(body.handoffs.map((s: any) => s.sessionId)).toEqual(["s-10", "s-180", `s-${60 * 24 * 3}`]);
     expect(Object.keys(body.handoffs[0]).sort()).toEqual(["decisions", "hasClaims", "lastActivityAt", "openIntents", "sessionId", "shortSummary", "source", "state", "summaryAt", "title"]);
     expect(body.handoffs[0]).toMatchObject({ shortSummary: null, summaryAt: null, state: "done", decisions: [], hasClaims: false });
-    expect(body.handoffs[1]).toMatchObject({ decisions: ["Slot 062170 is provisional"], openIntents: [], hasClaims: true });
+    expect(body.handoffs[1]).toMatchObject({ decisions: ["Slot 062170 is assigned"], openIntents: [], hasClaims: true });
     expect(body.coverage).toEqual({
       sessionsActive: 2, sessionsWithSummary: 2, sessionsWithClaims: 1,
       claimsNewestAt: minutesAgo(3).toISOString(), summariesNewestAt: minutesAgo(6).toISOString(),
@@ -221,11 +234,28 @@ describe("GET /v1/session-intel/workspace: the view", () => {
     expect(claimCall.limit).toBe(40);
   });
 
+  test("short summaries follow the list route's gate: served only with listShortSummary true; otherwise null, coverage null, a note", async () => {
+    const view = async (listShortSummary?: boolean) =>
+      (await get(api({ enabled: true, source: memorySource({ claims }).source, directory: memoryDirectory(rows).directory,
+        ...(listShortSummary === undefined ? {} : { listShortSummary }) }))).body;
+    const on = await view(true);
+    expect(on.status[0]).toMatchObject({ sessionId: "s-5", shortSummary: "scrubbed summary 5", summaryAt: minutesAgo(6).toISOString() });
+    expect(on.coverage).toMatchObject({ sessionsWithSummary: 2, summariesNewestAt: minutesAgo(6).toISOString() });
+    expect(on.coverage.notes).not.toContain(SESSION_INTEL_NOTES.summariesNotServed);
+    for (const off of [undefined, false]) {
+      const body = await view(off);
+      expect([...body.status, ...body.handoffs].every((s: any) => s.shortSummary === null && s.summaryAt === null)).toBe(true);
+      expect(body.coverage).toMatchObject({ sessionsActive: 2, sessionsWithSummary: null, summariesNewestAt: null });
+      expect(body.coverage.notes).toContain(SESSION_INTEL_NOTES.summariesNotServed);
+      expect(JSON.stringify(body)).not.toContain("scrubbed summary");
+    }
+  });
+
   test("a failed claims read (an error, 42883 or not migrated) degrades the view: intents empty, hasClaims and the claims coverage null, a note", async () => {
     for (const init of [{ claimsFail: Object.assign(new Error("no fn"), { code: "42883" }) }, { claimsFail: new Error("timeout") }, { claimsNull: true }]) {
       const logs: Record<string, unknown>[] = [];
       const mem = memorySource({ alerts: [alertRow(1)], claims, ...init });
-      const { status, body } = await get(api({ enabled: true, source: mem.source, directory: memoryDirectory(rows).directory, logs }));
+      const { status, body } = await get(api({ enabled: true, source: mem.source, directory: memoryDirectory(rows).directory, logs, listShortSummary: true }));
       expect(status).toBe(200);
       expect(body.alerts.length).toBe(1);
       expect(body.status.map((s: any) => [s.sessionId, s.openIntents, s.hasClaims])).toEqual([["s-5", [], null], ["s-20", [], null]]);

@@ -15,7 +15,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062170_session_intel_workspace.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session intelligence workspace: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062170_session_intel_workspace.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'d0af3c837663c5006cfa8040c8d56fedb224fb3b22d0c3fdc7e20ff99ac2c1df'
+ IF NOT FOUND OR v_sha<>'0004f27029b3bb6e776e92433a9ee531ae00277e2587ccd5a356de7cf53065a5'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session intelligence workspace: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.session_intel_workspace_alerts_v1(text,text,integer),

@@ -1,4 +1,4 @@
--- Slot 20261105062170 (PROVISIONAL: the lander assigns the slot). Session Intelligence M3-4a, the workspace view's
+-- Slot 20261105062170 (assigned). Session Intelligence M3-4a, the workspace view's
 -- two read-API readers (docs/session-intel-workspace-api.md): GET /v1/session-intel/workspace reads the workspace's
 -- open advisories and its sessions' current intent and decision titles through them. Enables nothing: the route is
 -- off unless READ_API_SESSION_INTEL_ENABLED is exactly "true". Code only: applying this to any real database needs

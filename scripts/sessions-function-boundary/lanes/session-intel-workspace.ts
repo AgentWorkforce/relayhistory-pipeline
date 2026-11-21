@@ -1,5 +1,5 @@
 /**
- * Lane: session-intel-workspace (slot 062170, provisional).
+ * Lane: session-intel-workspace (slot 062170).
  * The two read-only SECURITY DEFINER readers behind GET /v1/session-intel/workspace
  * (docs/session-intel-workspace-api.md): the workspace's open advisories and its sessions' current intent and
  * decision titles, for bulls96_read_api only, pinned to its request scope. No role gets a table privilege.
