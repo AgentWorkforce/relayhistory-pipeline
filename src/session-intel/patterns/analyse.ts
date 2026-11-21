@@ -2,6 +2,7 @@
 import type { SnapshotSession } from "../replay/snapshot.ts";
 import { canonicalJson, sha256Hex, textCompare } from "../replay/util.ts";
 import { PatternError } from "./corpus.ts";
+import { resolveAction, type ActionKind } from "./action-scope.ts";
 import { ANALYSIS_BOUNDS, ANALYSIS_VERSION, PATTERN_FORMAT, type AnalysisOptions, type Corpus, type EvidencePair, type PatternCandidate, type PatternReport, type ProfileRow, type SessionRef } from "./types.ts";
 
 const ref = (s: SnapshotSession): SessionRef => ({ harness: s.harness, sessionId: s.sessionId });
@@ -10,10 +11,10 @@ const scopeOf = (s: SnapshotSession): PatternCandidate["scope"] | null => s.repo
 const blank = (key: string): ProfileRow => ({ key, sessions: 0, sessionsWithWrites: 0, sessionsWithCommits: 0, sessionsWithOutcomes: 0, sessionsWithClaims: 0, sessionsWithSummaries: 0, writes: 0, commits: 0, shaShapedCommits: 0, outcomes: 0, claims: 0 });
 const row = (map: Map<string, ProfileRow>, key: string) => { if (!map.has(key)) map.set(key, blank(key)); return map.get(key)!; };
 const boundedInt = (n: number, min: number, max: number) => { if (!Number.isSafeInteger(n) || n < min || n > max) throw new PatternError("analysis parameter outside its integer bounds"); return n; };
-interface Write { session: SnapshotSession; path: string; at: string; ms: number; eventId: string; branch: string | null }
+interface Write { session: SnapshotSession; path: string; at: string; ms: number; eventId: string; branch: string | null; availableAt?: string }
 interface FileActivity { scope: PatternCandidate["scope"]; path: string; events: Write[]; sessions: Set<string>; harnesses: Set<string> }
 interface Held { candidate: PatternCandidate; paths: Set<string>; branches: Set<string> }
-const evidenceTime = (e: EvidencePair) => e.a.at > e.b.at ? e.a.at : e.b.at;
+const evidenceTime = (e: EvidencePair) => (e.a.availableAt ?? e.a.at) > (e.b.availableAt ?? e.b.at) ? e.a.availableAt ?? e.a.at : e.b.availableAt ?? e.b.at;
 const evidenceCompare = (a: EvidencePair, b: EvidencePair) => textCompare(evidenceTime(a), evidenceTime(b)) || textCompare(canonicalJson(a), canonicalJson(b));
 
 /** Pattern definitions and parameters are versioned independently of alert scoring. */
@@ -21,15 +22,31 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
   const nearbyMs = boundedInt(options.nearbyMs ?? 30 * 60_000, 0, 24 * 60 * 60_000);
   const maxComparisons = boundedInt(options.maxComparisons ?? 200_000, 1, 5_000_000);
   const maxCandidates = boundedInt(options.maxCandidates ?? 100, 1, 1_000);
-  const parameters = { version: ANALYSIS_VERSION, nearbyMs, maxComparisons, maxCandidates };
+  const parameters = { version: corpus.actionScope ? "3-action-scope" : ANALYSIS_VERSION, nearbyMs, maxComparisons, maxCandidates };
   const definition = { ...parameters, hash: sha256Hex(canonicalJson(parameters)) };
   const inWindow = (ts: string) => ts >= corpus.window.since && ts < corpus.window.until;
   const byHarness = new Map<string, ProfileRow>(), byRepository = new Map<string, ProfileRow>();
   const all = blank("all"), files = new Map<string, FileActivity>(), days = new Map<string, { writes: number; sessions: Set<string> }>();
   const spanEdges: Array<[number, number]> = [];
   let sessionsOutsideWindow = 0, factsOutsideWindow = 0, duplicateWrites = 0, sessionsWithoutScope = 0, zeroLengthSpans = 0;
+  const scopeCoverage: PatternReport["coverage"]["actionScope"] = corpus.actionScope ? { mode: "retrospective_action_claims", records: 0, missing: 0, unattributed: 0, conflicting: 0, late: 0, writesWithoutTarget: 0, claimsWithoutActionScope: 0 } : undefined;
   for (const s of corpus.sessions) {
     const scope = scopeOf(s), key = refKey(s), seen = new Map<string, string>();
+    const scopedRows = new Map<string, ProfileRow>();
+    const profileAction = (kind: ActionKind, fact: { eventId: string; ts: string; sha?: string }) => {
+      const r = resolveAction(corpus.actionScope!, s, kind, fact);
+      if (r.status === "missing") scopeCoverage!.missing++;
+      else scopeCoverage!.records++;
+      if (r.status === "unattributed") scopeCoverage!.unattributed++;
+      if (r.status === "conflicting_claims") scopeCoverage!.conflicting++;
+      if (r.availableAt && r.availableAt > fact.ts) scopeCoverage!.late++;
+      if (kind === "write" && !r.target) scopeCoverage!.writesWithoutTarget++;
+      const p = row(scopedRows, r.repository ? JSON.stringify({ kind: "repo", value: r.repository }) : "unscoped");
+      if (kind === "write") p.writes++;
+      if (kind === "commit") { p.commits++; if (/^[a-f0-9]{7,64}$/iu.test(fact.sha ?? "")) p.shaShapedCommits++; }
+      if (kind === "outcome") p.outcomes++;
+      return r;
+    };
     let writes = 0;
     for (const w of s.writes) {
       if (!inWindow(w.ts)) { factsOutsideWindow++; continue; }
@@ -43,17 +60,26 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
       const day = w.ts.slice(0, 10);
       if (!days.has(day)) days.set(day, { writes: 0, sessions: new Set() });
       days.get(day)!.writes++; days.get(day)!.sessions.add(key);
-      if (!scope) continue;
-      const fileKey = JSON.stringify([scope.kind, scope.value, w.path]);
-      if (!files.has(fileKey)) files.set(fileKey, { scope, path: w.path, events: [], sessions: new Set(), harnesses: new Set() });
+      const action = corpus.actionScope ? profileAction("write", w) : null;
+      const fileScope = action ? action.repository ? { kind: "repo" as const, value: action.repository } : null : scope;
+      const path = action ? action.target : w.path;
+      if (!fileScope || !path) continue;
+      const fileKey = JSON.stringify([fileScope.kind, fileScope.value, path]);
+      if (!files.has(fileKey)) files.set(fileKey, { scope: fileScope, path, events: [], sessions: new Set(), harnesses: new Set() });
       const file = files.get(fileKey)!;
-      file.events.push({ session: s, path: w.path, at: w.ts, ms: Date.parse(w.ts), eventId: w.eventId, branch: w.branch ?? s.branch });
+      file.events.push({ session: s, path: w.path, at: w.ts, ms: Date.parse(w.ts), eventId: w.eventId, branch: action ? null : w.branch ?? s.branch,
+        ...(action?.availableAt ? { availableAt: action.availableAt } : {}) });
       file.sessions.add(key); file.harnesses.add(s.harness);
     }
     const count = (facts: Array<{ ts?: string; at?: string }>) => facts.filter((f) => {
       const ok = inWindow((f.ts ?? f.at)!); if (!ok) factsOutsideWindow++; return ok;
     }).length;
     const commits = count(s.commits), outcomes = count(s.outcomes), claims = count(s.claims);
+    if (corpus.actionScope) {
+      for (const f of s.commits) if (inWindow(f.ts)) profileAction("commit", f);
+      for (const f of s.outcomes) if (inWindow(f.ts)) profileAction("outcome", f);
+      scopeCoverage!.claimsWithoutActionScope += claims;
+    }
     const shaShapedCommits = s.commits.filter((c) => inWindow(c.ts) && /^[a-f0-9]{7,64}$/iu.test(c.sha)).length;
     const summaries = count(s.summaryTimeline) > 0;
     const usage = count(s.usage); // Coverage only; not interpreted as wasted work.
@@ -62,12 +88,20 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
     if (start >= end && !inWindow(s.createdAt) && !(writes || commits || outcomes || claims || summaries || usage)) {
       sessionsOutsideWindow++; continue;
     }
-    if (!scope) sessionsWithoutScope++;
-    for (const p of [all, row(byHarness, s.harness), row(byRepository, scope ? JSON.stringify(scope) : "unscoped")]) {
+    if (corpus.actionScope ? ![...scopedRows.keys()].some((k) => k !== "unscoped") : !scope) sessionsWithoutScope++;
+    for (const p of [all, row(byHarness, s.harness), ...(!corpus.actionScope ? [row(byRepository, scope ? JSON.stringify(scope) : "unscoped")] : [])]) {
       p.sessions++; p.writes += writes; p.commits += commits; p.outcomes += outcomes; p.claims += claims;
       p.shaShapedCommits += shaShapedCommits;
       if (writes) p.sessionsWithWrites++; if (commits) p.sessionsWithCommits++; if (outcomes) p.sessionsWithOutcomes++;
       if (claims) p.sessionsWithClaims++; if (summaries) p.sessionsWithSummaries++;
+    }
+    if (corpus.actionScope) {
+      if (!scopedRows.size) scopedRows.set("unscoped", blank("unscoped"));
+      for (const own of scopedRows.values()) {
+        const p = row(byRepository, own.key);
+        p.sessions++; p.writes += own.writes; p.commits += own.commits; p.outcomes += own.outcomes; p.shaShapedCommits += own.shaShapedCommits;
+        if (own.writes) p.sessionsWithWrites++; if (own.commits) p.sessionsWithCommits++; if (own.outcomes) p.sessionsWithOutcomes++;
+      }
     }
     if (start === end) zeroLengthSpans++;
     if (start < end) spanEdges.push([start, 1], [end, -1]);
@@ -97,8 +131,9 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
           comparisons++;
           let a = queue.events[j]!, b = current;
           if (textCompare(refKey(a.session), refKey(b.session)) > 0) [a, b] = [b, a];
-          const id = sha256Hex(canonicalJson(["nearby_shared_file_activity", ANALYSIS_VERSION, nearbyMs, file.scope, ref(a.session), ref(b.session)]));
-          const observed = a.at > b.at ? a.at : b.at;
+          const id = sha256Hex(canonicalJson(["nearby_shared_file_activity", parameters.version, nearbyMs, file.scope, ref(a.session), ref(b.session)]));
+          const aKnown = a.availableAt ?? a.at, bKnown = b.availableAt ?? b.at;
+          const observed = aKnown > bKnown ? aKnown : bKnown;
           if (!held.has(id)) {
             if (held.size >= ANALYSIS_BOUNDS.pairs) { pairLimit = true; continue; }
             const sameHarness = a.session.harness === b.session.harness;
@@ -120,7 +155,7 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
           c.closestGapMs = Math.min(c.closestGapMs, Math.abs(a.ms - b.ms));
           h.branches.add(a.branch && b.branch ? a.branch === b.branch ? "same" : "different" : "unknown");
           c.branchRelation = h.branches.size > 1 ? "mixed" : [...h.branches][0] as PatternCandidate["branchRelation"];
-          const evidence = (w: Write) => ({ session: ref(w.session), eventId: w.eventId, path: w.path, at: w.at });
+          const evidence = (w: Write) => ({ session: ref(w.session), eventId: w.eventId, path: w.path, at: w.at, ...(w.availableAt ? { availableAt: w.availableAt } : {}) });
           c.evidence.push({ a: evidence(a), b: evidence(b) });
           c.evidence.sort(evidenceCompare); c.evidence.length = Math.min(c.evidence.length, ANALYSIS_BOUNDS.evidencePairs);
         }
@@ -132,14 +167,15 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
   const candidates = [...held.values()].map((h) => h.candidate).sort((a, b) => b.sharedFiles - a.sharedFiles || a.closestGapMs - b.closestGapMs || textCompare(a.id, b.id));
   const reasons = [...(comparisonLimit ? ["comparison_budget"] : []), ...(pairLimit ? ["candidate_pair_budget"] : [])];
   const groups = activityGroups(candidates);
-  const { sessions: _, ...input } = corpus;
+  const { sessions: _, actionScope: _actions, ...input } = corpus;
   return {
-    format: PATTERN_FORMAT, definition, input: { ...input, sessions: corpus.sessions.length },
+    format: corpus.actionScope ? "session-intel-patterns/2" : PATTERN_FORMAT, definition, input: { ...input, sessions: corpus.sessions.length },
     coverage: { workspaceCompleteness: "not_established", quality: "not_evaluated", sessionsOutsideWindow,
       filesTotal: files.size, filesOmitted: Math.max(0, files.size - ANALYSIS_BOUNDS.files),
       repositoriesTotal: byRepository.size, repositoriesOmitted: Math.max(0, byRepository.size - ANALYSIS_BOUNDS.repositories),
       groupsTotal: groups.length, groupsOmitted: Math.max(0, groups.length - ANALYSIS_BOUNDS.groups), factsOutsideWindow, duplicateWrites, sessionsWithoutScope,
-      comparisons, scanComplete: reasons.length === 0, reasons, candidatePairsRetained: candidates.length, candidatesOmittedFromReport: Math.max(0, candidates.length - maxCandidates) },
+      comparisons, scanComplete: reasons.length === 0, reasons, candidatePairsRetained: candidates.length, candidatesOmittedFromReport: Math.max(0, candidates.length - maxCandidates),
+      ...(scopeCoverage ? { actionScope: scopeCoverage } : {}) },
     profile: { all, byHarness: [...byHarness.values()].sort((a, b) => textCompare(a.key, b.key)),
       byRepository: [...byRepository.values()].sort((a, b) => b.sessions - a.sessions || textCompare(a.key, b.key)).slice(0, ANALYSIS_BOUNDS.repositories), peakSessionSpans, zeroLengthSpans,
       days: [...days].sort(([a], [b]) => textCompare(a, b)).map(([day, d]) => ({ day, writes: d.writes, sessionsWithWrites: d.sessions.size })),
@@ -148,6 +184,12 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
     },
     candidates: candidates.slice(0, maxCandidates), activityGroups: groups.slice(0, ANALYSIS_BOUNDS.groups),
     limitations: [
+      ...(scopeCoverage ? [
+        "Repository rows use per-action operator/trace declarations, not independently verified origins. One session may contribute to several repository rows; do not sum their session counts.",
+        "This is retrospective mapping: late scope claims can form candidates but receive no early-warning credit. Production-parity replay does not yet consume action scope.",
+        "Missing/conflicting action scope never falls back to session repository/project. Writes need a repository-relative target token; flat code-mode projections cannot provide it.",
+        "Repository rows exclude claims, summaries and session branch metadata: these have no per-action repository binding. Overall/harness coverage still includes them.",
+      ] : []),
       "Exploratory pool, not a representative or independently labelled workspace study. Input receipt declarations do not establish workspace completeness.",
       "Write facts are edit intents, not confirmation of filesystem success. Nearby file activity is not proof of duplicate work, conflict or harm.",
       "Commit facts can be attempts with unknown keys. SHA-shaped keys are metadata, not independent proof of successful or merged changes.",

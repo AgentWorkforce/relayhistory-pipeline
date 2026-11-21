@@ -18,6 +18,10 @@ export function reportMarkdown(r: PatternReport): string {
     `Window: ${r.input.window.since} to ${r.input.window.until}. Delete by ${r.input.deleteBy}.`,
     `${r.input.sessions} unique sessions; ${r.input.duplicateSessions} identical duplicates removed; ${r.input.inputs.length} input snapshots.`,
     `Discovery scan: ${r.coverage.scanComplete ? "within its declared budgets" : "CENSORED"}; ${r.coverage.comparisons} comparisons. Workspace completeness is not established.`, "",
+    ...(r.coverage.actionScope ? [
+      `Scope mode: ${r.coverage.actionScope.mode}. ${r.coverage.actionScope.records} in-window action records; ${r.coverage.actionScope.missing} missing, ${r.coverage.actionScope.unattributed} unattributed, ${r.coverage.actionScope.conflicting} conflicting; ${r.coverage.actionScope.late} available after fact time.`,
+      `${r.coverage.actionScope.writesWithoutTarget} writes lack a comparable repository target; ${r.coverage.actionScope.claimsWithoutActionScope} claims have no per-action scope. Late declarations are retrospective evidence, not early warnings.`, "",
+    ] : []),
     "## Evidence coverage", "", "| Harness | Sessions | With edits | With commits | With outcomes | With claims | Edit facts |", "|---|---:|---:|---:|---:|---:|---:|",
     ...r.profile.byHarness.map((p) => `| ${cell(p.key)} | ${p.sessions} | ${p.sessionsWithWrites} | ${p.sessionsWithCommits} | ${p.sessionsWithOutcomes} | ${p.sessionsWithClaims} | ${p.writes} |`), "",
     `Total: ${a.writes} distinct edit-intent facts, ${a.commits} commit facts (${a.shaShapedCommits} with SHA-shaped keys), ${a.outcomes} outcome facts and ${a.claims} claims.`,
