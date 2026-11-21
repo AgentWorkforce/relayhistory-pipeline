@@ -128,6 +128,8 @@ async function runCell(cell: Cell) {
     const baseRows = Number((await pool.query("SELECT count(*)::bigint n FROM sessions.ingest_lazy_ack_decisions")).rows[0].n);
     // ---- measured window ----
     const lat: number[] = [], failures: Record<string, number> = {}, ctlWait: number[] = [], ctlFail: Record<string, number> = {};
+    const ctlAttempts: Array<{ startMs: number; endMs: number; outcome: string; afterWindow: boolean }> = [];
+    let ctlTimeouts: { statement_timeout: string; lock_timeout: string } | null = null;
     let okBatches = 0, attemptedBatches = 0, attemptedRecords = 0;
     const samples = new Map<string, number>(); let sampleTicks = 0;
     const t0 = performance.now(), end = Date.now() + SECONDS * 1000;
@@ -149,9 +151,18 @@ async function runCell(cell: Cell) {
         if (stopNow()) break;
         const c = await pool.connect();
         const s = performance.now();
-        try { await c.query("BEGIN;SET LOCAL application_name='control-lazy_clear';SET LOCAL lock_timeout='2s'"); await c.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'selection')", [body]); await c.query("COMMIT"); ctlWait.push(performance.now() - s); }
-        catch (e: any) { ctlFail[String(e?.code ?? "error")] = (ctlFail[String(e?.code ?? "error")] ?? 0) + 1; await c.query("ROLLBACK").catch(() => {}); }
-        finally { c.release(); }
+        let outcome = "ok";
+        try {
+          await c.query("BEGIN;SET LOCAL application_name='control-lazy_clear';SET LOCAL lock_timeout='2s'");
+          if (!ctlTimeouts) ctlTimeouts = (await c.query("SELECT current_setting('statement_timeout') statement_timeout,current_setting('lock_timeout') lock_timeout")).rows[0];
+          await c.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'selection')", [body]); await c.query("COMMIT"); ctlWait.push(performance.now() - s);
+        }
+        catch (e: any) { outcome = String(e?.code ?? "error"); ctlFail[outcome] = (ctlFail[outcome] ?? 0) + 1; await c.query("ROLLBACK").catch(() => {}); }
+        finally {
+          c.release();
+          const e = performance.now();
+          ctlAttempts.push({ startMs: Math.round(s - t0), endMs: Math.round(e - t0), outcome, afterWindow: e - t0 > SECONDS * 1000 });
+        }
       }
     };
     const sampler = async () => {
@@ -181,7 +192,8 @@ async function runCell(cell: Cell) {
         }
       } finally { s.release(); }
     };
-    await Promise.all([...Array.from({ length: C }, (_, w) => worker(w)), control(), sampler()]);
+    let drainEndMs = 0;
+    await Promise.all([...Array.from({ length: C }, (_, w) => worker(w).then(() => { drainEndMs = Math.max(drainEndMs, performance.now() - t0); })), control(), sampler()]);
     const measuredMs = performance.now() - t0;
     const committedRows = Number((await pool.query("SELECT count(*)::bigint n FROM sessions.ingest_lazy_ack_decisions")).rows[0].n) - baseRows;
     space.peakDb = Math.max(space.peakDb, Number((await pool.query("SELECT pg_database_size(current_database())::bigint b")).rows[0].b));
@@ -191,6 +203,8 @@ async function runCell(cell: Cell) {
       durableRecordsPerSec: Math.round(committedRows / (measuredMs / 1000)),
       failures,
       latencyMs: { n: lat.length, p50: pct(lat, 0.5), p95: pct(lat, 0.95), p99: pct(lat, 0.99), max: pct(lat, 1) },
+      window: { windowMs: SECONDS * 1000, workersDrainedAtMs: Math.round(drainEndMs) },
+      controlAttempts: ctlAttempts, controlTimeouts: ctlTimeouts,
       control: { entrypoint: "sessions.ingest_lazy_clear(selection disable, control user)", n: ctlWait.length, p50: pct(ctlWait, 0.5), p95: pct(ctlWait, 0.95), max: pct(ctlWait, 1), failures: ctlFail },
       lockSamples: { ticks: sampleTicks, sampleMs: SAMPLE_MS, top: [...samples.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25) },
       space: { freeStart: free0, minFree: space.minFree, peakDbBytes: space.peakDb, peakWalBytes: space.peakWal, stoppedForSpace: space.stoppedForSpace },
