@@ -18,24 +18,24 @@
 -- The flip barrier is (961996,50000), the existing operator-erase gate. Every ingest_lock_fences call takes it SHARED
 -- (050010's statement trigger on ingest_fence_owners, including ON CONFLICT), and this ACK calls ingest_lock_fences as
 -- its second statement, BEFORE it selects its body, so every invocation holds 50000 shared from before selection to the
--- end of its outer transaction. lazy_ack_t2_set_mode takes 50000 EXCLUSIVE before it updates the row, so it waits until
--- every transaction that entered ingest_lock_fences has ended, including:
+-- end of its outer transaction. lazy_ack_t2_set_mode only TRY-locks 50000 EXCLUSIVE (then the mode row FOR UPDATE
+-- NOWAIT, in that order; nothing else can lock the row: it is owner-only), so it succeeds only at an instant when no
+-- transaction that entered ingest_lock_fences (and no erase) is open, including:
 --   - an invocation that selected main and is paused before the clock;
 --   - a transaction paused after its ACK, before COMMIT;
 --   - a claim holding the clock KEY SHARE that later enters an ACK;
 --   - a multi-call transaction.
--- A queued exclusive request blocks new shared requests, so nothing new starts during the drain. Same in both
--- directions. A timed-out flip (lock_timeout) rolls back with the mode unchanged. The mode row is read UNLOCKED: no
--- flip can commit while the reader holds 50000 shared, and fenced mode refuses anything but READ COMMITTED BEFORE
--- reading it (a REPEATABLE READ snapshot taken before a flip could still see the old mode). Compatibility consequence:
--- with proconfig 'fenced', a non-READ COMMITTED commit fails 55000 in either mode; the Worker and self-host run read
--- committed. Initial transition: off -> fenced changes nothing while the row says 'main'; the first real change is a
--- flip, which drains everything. Cost of a flip: a brief GLOBAL ingest pause (claims, prepares and commits queue behind
--- the exclusive request) for up to the longest in-flight transaction; run it with a short lock_timeout and retry. Never
--- flip during an operator erase (same key, taken exclusive by the erase). The ALTER, the flip and the apply are
--- real-database operations and Khaliq's own decisions. OPEN (fence sign-off pending): transactions that take a lock an
--- ACK can wait on BEFORE their first ingest_lock_fences call (062010's origin-claim advisory key) can form a cycle with a
--- queued flip; the inventory and real-PostgreSQL schedules are owed before this fence is review-ready.
+-- When busy it raises 55P03 at once with nothing changed, and it never QUEUES an exclusive request: no ingest pause
+-- while it retries and no queue-order edge in any lock cycle. A successful flip holds 50000 exclusive until its own
+-- COMMIT (run it as one autocommit statement), so writers arriving in that window wait for that commit only. Same in
+-- both directions. The mode row is read UNLOCKED by the ACK: no flip can commit while the reader holds 50000 shared,
+-- and fenced mode refuses anything but READ COMMITTED BEFORE reading it (a REPEATABLE READ snapshot taken before a flip
+-- could still see the old mode). Compatibility consequence: with proconfig 'fenced', a non-READ COMMITTED commit fails
+-- 55000 in either mode; the Worker and self-host run read committed. Initial transition: off -> fenced changes nothing
+-- while the row says 'main'. Operator: src/session-ingest/lazy-ack-t2-flip.ts retries with bounded backoff, one
+-- autocommit statement per attempt, and returns "no_switch" (mode unchanged) when its budget runs out; it never
+-- falls back to waiting. Never flip during an operator erase (same key). The ALTER, the flip and the apply are
+-- real-database operations and Khaliq's own decisions.
 --
 -- Mode 't2', exactly:
 --   prefix as main up to the clock; the clock FOR KEY SHARE (not NO KEY UPDATE); origin lock, stage row, attempt
@@ -82,15 +82,19 @@ INSERT INTO sessions.lazy_ack_t2_mode(singleton,mode) VALUES(true,'main');
 ALTER TABLE sessions.lazy_ack_t2_mode ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.lazy_ack_t2_mode FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
--- The only writer of the mode row. Takes the flip barrier (961996,50000) EXCLUSIVE first (drains every transaction that
--- entered ingest_lock_fences), then updates the row. Run it in its own transaction, with a short lock_timeout.
+-- The only writer of the mode row. TRY-locks the flip barrier (961996,50000) EXCLUSIVE: it succeeds only when no
+-- transaction that entered ingest_lock_fences (or an erase) is open, and it never waits. Run it alone in its own
+-- transaction; retry with bounded backoff outside the transaction; if the budget runs out, report no switch.
 CREATE FUNCTION sessions.lazy_ack_t2_set_mode(p_mode text)RETURNS text
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_tx_set_mode$
 DECLARE v_old text;
 BEGIN
  IF p_mode IS NULL OR p_mode NOT IN('main','t2') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='T2 staged ACK: mode must be main or t2';END IF;
- PERFORM pg_advisory_xact_lock(961996,50000);
- SELECT mode INTO STRICT v_old FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE;
+ -- Try-lock only: never QUEUE an exclusive request (a queued one would pause every new fence call and add a
+ -- queue-order edge to any cycle). Busy -> 55P03 at once, nothing changed; the caller retries in a NEW transaction.
+ IF NOT pg_try_advisory_xact_lock(961996,50000) THEN
+  RAISE EXCEPTION USING ERRCODE='55P03',MESSAGE='T2 staged ACK: flip barrier busy (an ingest or erase transaction is open); mode unchanged, retry';END IF;
+ SELECT mode INTO STRICT v_old FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;
  UPDATE sessions.lazy_ack_t2_mode SET mode=p_mode WHERE singleton;
  RETURN v_old;
 END $lazy_ack_tx_set_mode$;

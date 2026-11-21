@@ -222,7 +222,11 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
   test("the runtime role cannot select T2: ALTER FUNCTION, the flip function and the mode table are refused; session values are overridden", async () => {
     const f = await fixture();
     for (const stmt of [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`, "SELECT sessions.lazy_ack_t2_set_mode('t2')", "UPDATE sessions.lazy_ack_t2_mode SET mode='t2'",
-      "SELECT mode FROM sessions.lazy_ack_t2_mode", "INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'t2')"]) {
+      "SELECT mode FROM sessions.lazy_ack_t2_mode", "INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'t2')",
+      // No runtime lock on the mode row in any mode: only the flip (after its 50000 try-lock) can lock it.
+      "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR UPDATE", "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR NO KEY UPDATE",
+      "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR SHARE", "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR KEY SHARE",
+      "LOCK TABLE sessions.lazy_ack_t2_mode IN ACCESS SHARE MODE", "DELETE FROM sessions.lazy_ack_t2_mode", "TRUNCATE sessions.lazy_ack_t2_mode"]) {
       await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
       try { await expect(f.db.exec(stmt)).rejects.toMatchObject({ code: "42501" }); } finally { await f.db.exec("ROLLBACK"); }
     }
@@ -259,6 +263,15 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
         } finally { await f.db.exec("ROLLBACK"); }
       }
     }
+  });
+  test("lazy_ack_t2_set_mode only TRY-locks 50000 (never queues), then the mode row NOWAIT, in that order", async () => {
+    const f = await fixture();
+    const src = ((await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid='sessions.lazy_ack_t2_set_mode(text)'::regprocedure")).rows[0].prosrc as string).replace(/--[^\n]*/g, "");
+    const tryLock = src.indexOf("IF NOT pg_try_advisory_xact_lock(961996,50000) THEN"), row = src.indexOf("FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;");
+    expect(tryLock).toBeGreaterThan(-1);
+    expect(row).toBeGreaterThan(tryLock);
+    expect(src.split("lazy_ack_t2_mode").length - 1).toBe(2); // the locking read and the UPDATE, both after the try-lock
+    expect(src).not.toMatch(/pg_advisory_xact_lock\(|pg_advisory_lock\(|lock_timeout/);
   });
   test("lazy_ack_t2_set_mode: returns the old mode, refuses anything but main/t2 (22023) and leaves the row unchanged", async () => {
     const f = await fixture();

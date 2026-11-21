@@ -1,24 +1,28 @@
 /**
- * Opt-in OWNED PostgreSQL (SESSION_INGEST_TEST_PG_URL, loopback fixture only): multi-connection schedules for
- * 20261105062210_lazy_ack_t2 (proconfig bulls96.lazy_ack_t2, mode row sessions.lazy_ack_t2_mode). Serial parity is the
- * PGlite suite's claim. Every commit goes through the production entry point ingest_origin_commit_buffered_batch
- * (062010 origin-claim fence on), as the runtime role, at READ COMMITTED unless stated. Which body ran is read in the
- * committing transaction itself: with the history switch off, main fires the slot statement trigger once per accept
- * (2 here), T2 once per round (1).
- *   S1   fenced, mode main: ACK A (user 1) paused at the clock after its mode read; a flip to t2 queues behind A's
- *        (961996,50000) shared hold; ACK B (user 2, SAME origin) queues behind the flip. A runs main and commits; the flip
- *        commits only after A; B then reads the committed mode ('t2') in its post-lock statement and runs T2.
- *   PRE  a genuinely pre-ALTER invocation (gate off when it started, paused at the clock); the owner ALTERs the gate to
- *        fenced and queues a flip: the flip waits for the pre-ALTER transaction (main's ACK also calls
- *        ingest_lock_fences), which runs main.
- *   S2   one outer transaction with two ACKs: the first holds 50000 shared, a flip queues, the second ACK in the same
- *        transaction re-enters 50000 (already held, granted), reads the unchanged mode and commits; then the flip.
- *   RR   a REPEATABLE READ snapshot pinned before a flip, used after it: refused 55000 in both directions (main->t2 and
- *        t2->main) before any mode read; also when the row says main.
- *   TO   a flip that times out (lock_timeout) behind a held ACK leaves the mode unchanged, and a fenced ACK queued
- *        behind the flip proceeds with the OLD mode.
- *   UP   T2 ACK A (origin 1) plans under KEY SHARE, then its upgrade waits on T2 ACK B (origin 2, NO KEY UPDATE held to
- *        commit); B commits; A's upgrade reads B's last_seat (fresh), seats are contiguous and unique, no 40P01.
+ * Opt-in OWNED PostgreSQL (SESSION_INGEST_TEST_PG_URL, a loopback fixture; skipped with no connection attempt when the
+ * variable is unset): multi-connection schedules for 20261105062210_lazy_ack_t2 (proconfig bulls96.lazy_ack_t2, mode row
+ * sessions.lazy_ack_t2_mode, try-lock-only flip sessions.lazy_ack_t2_set_mode). Serial parity is the PGlite suite's
+ * claim. Every commit goes through the production entry point ingest_origin_commit_buffered_batch (062010 origin-claim
+ * fence on), as the runtime role, at READ COMMITTED unless stated. Every flip attempt is ONE autocommit statement (the
+ * operator path, lazy-ack-t2-flip.ts). Which body ran is read in the committing transaction: with the history switch off,
+ * main fires the slot statement trigger once per accept (2 here), T2 once per round (1).
+ *   S1   a fenced main ACK paused at the clock (holding 50000 shared): a flip attempt is refused at once, the mode is
+ *        unchanged and NO exclusive request is queued, so another user's ACK on the same origin still passes 50000; after
+ *        both commit the flip succeeds and the next ACK reads 't2' and runs T2.
+ *   PRE  a genuinely pre-ALTER invocation (gate off when it started) makes the first flip after the ALTER busy.
+ *   S2   one transaction with two ACKs: a flip attempt between them is busy; the second ACK keeps 'main'.
+ *   RR   a REPEATABLE READ snapshot pinned before a flip is refused after it (55000), both directions.
+ *   WIN  a successful flip holds 50000 exclusive until its COMMIT: a writer arriving in that window waits for exactly
+ *        that commit and then runs the new body; acquisition through COMMIT is measured.
+ *   ROW  the mode row busy: the attempt takes 50000, fails NOWAIT on the row, and its transaction ends before the reply;
+ *        a writer then takes 50000 shared at once; the operator loop returns no_switch.
+ *   ERA  an erase-shaped exclusive 50000 holder: attempts are refused at once; the budget ends in no_switch.
+ *   BUD  a held ingest transaction longer than the budget: no_switch, mode unchanged; then switched after it ends.
+ *   CYC  set_live(true)'s lock shape (clock FOR UPDATE, then a session_directory write that needs 50000 shared) while
+ *        flips are attempted and an ACK holding 50000 shared waits on the clock: with no queued exclusive the write is
+ *        granted at once, even with lock_timeout below deadlock_timeout.
+ *   UP   T2 ACK A plans under KEY SHARE, then its upgrade waits on T2 ACK B (another origin, NO KEY UPDATE to commit);
+ *        B commits; A's upgrade reads B's last_seat (fresh); seats contiguous and unique; no 40P01.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import pg from "pg";
@@ -28,6 +32,7 @@ import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts"
 import { batch, record, scratchStore, TENANT } from "./support.ts";
 import { runMigrations, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
+import { FLIP_STATEMENT, flipLazyAckT2Mode, type FlipMode, type FlipOptions } from "../lazy-ack-t2-flip.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 if (url) {
@@ -81,7 +86,7 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
   }
   const setGate = (v: "off" | "fenced") => pool.query(`ALTER FUNCTION ${ACK} SET bulls96.lazy_ack_t2='${v}'`);
   const mode = async () => (await pool.query("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows[0].mode as string;
-  const setMode = async (m: "main" | "t2") => { await pool.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [m]); };
+  const setMode = async (m: FlipMode) => { expect((await flipLazyAckT2Mode((sql, p) => pool.query(sql, p as never[]) as never, m, { budgetMs: 5000 })).result).toBe("switched"); };
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   /** Wait until backend pid is blocked on a heavyweight lock. */
   async function lockWaiting(pid: number, ms = 10000) {
@@ -109,20 +114,21 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       return { ok: true as const, kind: r.kind as string, calls: ((await c.query(CALLS)).rows[0].n as number) - before };
     } catch (e: any) { return { ok: false as const, code: String(e.code), message: String(e.message) }; }
   }
-  /** The owner's flip in its own transaction; resolves with the old mode or the error. */
-  async function flip(to: "main" | "t2", lockTimeout = "15s") {
-    const f = await conn("t2-flip");
-    const done = (async () => {
-      try {
-        await f.c.query(`SET LOCAL lock_timeout='${lockTimeout}'`);
-        const old = (await f.c.query("SELECT sessions.lazy_ack_t2_set_mode($1) o", [to])).rows[0].o as string;
-        await f.c.query("COMMIT");
-        return { ok: true as const, old, at: Date.now() };
-      } catch (e: any) { await f.c.query("ROLLBACK").catch(() => {}); return { ok: false as const, code: String(e.code), at: Date.now() }; }
-      finally { await f.c.end(); }
-    })();
-    return { pid: f.pid, done };
+  /** One operator attempt: ONE autocommit statement (its transaction ends before the reply), timed. */
+  async function tryFlip(to: FlipMode) {
+    const t0 = performance.now();
+    try { const old = (await pool.query(FLIP_STATEMENT, [to])).rows[0].old as string; return { ok: true as const, old, ms: performance.now() - t0 }; }
+    catch (e: any) { return { ok: false as const, code: String(e.code), message: String(e.message), ms: performance.now() - t0 }; }
   }
+  const operatorFlip = (to: FlipMode, opts: FlipOptions = {}) => flipLazyAckT2Mode((sql, p) => pool.query(sql, p as never[]) as never, to, opts);
+  const queuedAdvisory = async () => Number((await pool.query("SELECT count(*) n FROM pg_locks WHERE locktype='advisory' AND NOT granted")).rows[0].n);
+  const busyFlip = async (to: FlipMode) => {
+    const r = await tryFlip(to);
+    expect(r).toMatchObject({ ok: false, code: "55P03", message: expect.stringContaining("flip barrier busy") });
+    expect(r.ms).toBeLessThan(500); // refused at once, never waits
+    expect(await queuedAdvisory()).toBe(0); // and no exclusive request is left queued
+    return r;
+  };
   /** Owner holds the clock FOR UPDATE: any ACK pauses at its clock lock, AFTER its fence call and mode read. */
   async function clockBlocker() {
     const b = await conn("t2-clock-blocker");
@@ -154,8 +160,8 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
   }, 60000);
   const reset = async () => { await setGate("off"); await setMode("main"); };
 
-  test("S1: a paused fenced main ACK holds the flip; a same-origin ACK of another user queued behind the flip runs T2", async () => {
-    const pa = await prepared("s1-u1", "s1-o"), pb = await prepared("s1-u2", "s1-o");
+  test("S1: a busy flip queues nothing: a same-origin ACK of another user still passes 50000 while a fenced main ACK is paused", async () => {
+    const pa = await prepared("s1-u1", "s1-o"), pb = await prepared("s1-u2", "s1-o"), pc = await prepared("s1-u3", "s1-o");
     await setGate("fenced");
     try {
       const blocker = await clockBlocker();
@@ -163,26 +169,27 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       try {
         const ra = commitIn(A.c, pa);
         await lockWaiting(A.pid); // at the clock: mode already read ('main'), 50000 shared held
-        const F = await flip("t2");
-        await lockWaiting(F.pid); // queued exclusive behind A
+        await busyFlip("t2");
         const rb = commitIn(B.c, pb);
-        await lockWaiting(B.pid); // queued for 50000 shared behind the flip (or its origin key behind A)
+        await lockWaiting(B.pid);
+        // B is past the barrier: it waits on the clock (a tuple/transaction lock), not on any advisory lock.
+        expect((await pool.query("SELECT locktype FROM pg_locks WHERE pid=$1 AND NOT granted", [B.pid])).rows.map((x) => x.locktype)).not.toContain("advisory");
+        await busyFlip("t2");
         expect(await mode()).toBe("main");
         await blocker.release();
-        expect(await ra).toEqual({ ok: true, kind: "committed", calls: 2 }); // main's loop
-        await sleep(200);
-        expect(await mode()).toBe("main"); // A has not committed: the flip still waits
-        const aCommitted = Date.now(); await A.c.query("COMMIT");
-        const f = await F.done;
-        expect(f).toMatchObject({ ok: true, old: "main" });
-        expect(f.at).toBeGreaterThanOrEqual(aCommitted);
-        expect(await rb).toEqual({ ok: true, kind: "committed", calls: 1 }); // T2: one round, fresh post-lock mode read
+        expect(await ra).toEqual({ ok: true, kind: "committed", calls: 2 });
+        await A.c.query("COMMIT");
+        expect(await rb).toEqual({ ok: true, kind: "committed", calls: 2 });
+        await busyFlip("t2"); // B still open
         await B.c.query("COMMIT");
       } finally { await A.end(); await B.end(); }
+      expect(await operatorFlip("t2")).toMatchObject({ result: "switched", from: "main", to: "t2" });
+      const C = await conn("s1-C");
+      try { expect(await commitIn(C.c, pc)).toEqual({ ok: true, kind: "committed", calls: 1 }); await C.c.query("COMMIT"); } finally { await C.end(); }
     } finally { await reset(); }
   }, 60000);
 
-  test("PRE: an invocation that started with the gate off is drained by the first flip after the ALTER", async () => {
+  test("PRE: an invocation that started with the gate off makes the first flip after the ALTER busy", async () => {
     const pa = await prepared("pre-u1", "pre-o1");
     const blocker = await clockBlocker();
     const A = await conn("pre-A");
@@ -190,30 +197,136 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       const ra = commitIn(A.c, pa);
       await lockWaiting(A.pid); // gate off: no mode read; main's ACK already took 50000 shared in ingest_lock_fences
       await setGate("fenced");
-      const F = await flip("t2");
-      await lockWaiting(F.pid);
+      await busyFlip("t2");
       await blocker.release();
       expect(await ra).toEqual({ ok: true, kind: "committed", calls: 2 });
-      await sleep(200);
-      expect(await mode()).toBe("main");
+      await busyFlip("t2");
       await A.c.query("COMMIT");
-      expect(await F.done).toMatchObject({ ok: true, old: "main" });
+      expect(await tryFlip("t2")).toMatchObject({ ok: true, old: "main" });
     } finally { await A.end(); await reset(); }
   }, 60000);
 
-  test("S2: two ACKs in one outer transaction straddling a queued flip: the second re-enters 50000 and keeps the old mode", async () => {
+  test("S2: two ACKs in one transaction: a flip attempt between them is busy; the second ACK keeps 'main'", async () => {
     const p1 = await prepared("s2-u1", "s2-o1"), p2 = await prepared("s2-u1", "s2-o2");
     await setGate("fenced");
     try {
       const A = await conn("s2-A");
       try {
         expect(await commitIn(A.c, p1)).toEqual({ ok: true, kind: "committed", calls: 2 });
-        const F = await flip("t2");
-        await lockWaiting(F.pid);
-        expect(await commitIn(A.c, p2)).toEqual({ ok: true, kind: "committed", calls: 2 }); // still main, no wait, no 40P01
+        await busyFlip("t2");
+        expect(await commitIn(A.c, p2)).toEqual({ ok: true, kind: "committed", calls: 2 });
         await A.c.query("COMMIT");
-        expect(await F.done).toMatchObject({ ok: true, old: "main" });
       } finally { await A.end(); }
+      expect(await tryFlip("t2")).toMatchObject({ ok: true, old: "main" });
+    } finally { await reset(); }
+  }, 60000);
+
+  test("WIN: a successful flip holds 50000 exclusive until its COMMIT; a writer arriving in that window waits for that commit, then runs T2", async () => {
+    const pb = await prepared("win-u1", "win-o1");
+    await setGate("fenced");
+    try {
+      // The operator path: one autocommit statement, acquisition through COMMIT.
+      const auto = await tryFlip("t2"); expect(auto).toMatchObject({ ok: true, old: "main" });
+      const back = await tryFlip("main"); expect(back).toMatchObject({ ok: true, old: "t2" });
+      console.log(JSON.stringify({ case: "WIN", autocommitFlipMs: [auto.ms, back.ms].map((x) => Math.round(x * 10) / 10) }));
+      // The same window held open on purpose, so a writer can arrive inside it.
+      const F = await conn("win-F"), B = await conn("win-B");
+      try {
+        expect((await F.c.query("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main");
+        const rb = commitIn(B.c, pb);
+        await lockWaiting(B.pid);
+        expect((await pool.query("SELECT locktype FROM pg_locks WHERE pid=$1 AND NOT granted", [B.pid])).rows.map((x) => x.locktype)).toEqual(["advisory"]);
+        await sleep(100);
+        const t0 = performance.now(); await F.c.query("COMMIT");
+        expect(await rb).toEqual({ ok: true, kind: "committed", calls: 1 }); // reads the committed 't2'
+        console.log(JSON.stringify({ case: "WIN", writerReleasedAfterCommitMs: Math.round((performance.now() - t0) * 10) / 10 }));
+        await B.c.query("COMMIT");
+      } finally { await F.end(); await B.end(); }
+    } finally { await reset(); }
+  }, 60000);
+
+  test("ROW: mode row busy: the attempt takes 50000, fails NOWAIT on the row, ends its transaction; a writer then takes 50000 at once", async () => {
+    const pb = await prepared("row-u1", "row-o1");
+    await setGate("fenced");
+    try {
+      const H = await conn("row-holder"); // owner only: the runtime role cannot lock this row (PGlite gate test)
+      const B = await conn("row-B");
+      try {
+        await H.c.query("SELECT 1 FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE");
+        const r = await tryFlip("t2");
+        expect(r).toMatchObject({ ok: false, code: "55P03", message: expect.stringContaining('could not obtain lock on row in relation "lazy_ack_t2_mode"') });
+        expect(r.ms).toBeLessThan(500);
+        expect((await pool.query("SELECT count(*)::int n FROM pg_locks WHERE locktype='advisory' AND objid=50000 AND classid=961996")).rows[0].n).toBe(0);
+        const t0 = performance.now();
+        expect(await commitIn(B.c, pb)).toEqual({ ok: true, kind: "committed", calls: 2 });
+        const wMs = performance.now() - t0;
+        console.log(JSON.stringify({ case: "ROW", failedAttemptMs: Math.round(r.ms * 10) / 10, writerAfterMs: Math.round(wMs * 10) / 10 }));
+        expect(wMs).toBeLessThan(2000);
+        await B.c.query("COMMIT");
+        const nr = await operatorFlip("t2", { budgetMs: 300 });
+        expect(nr).toMatchObject({ result: "no_switch", reason: "barrier_busy_budget_exhausted" });
+        expect(nr.attempts).toBeGreaterThan(1);
+        expect(await queuedAdvisory()).toBe(0);
+      } finally { await H.end(); await B.end(); }
+      expect(await mode()).toBe("main");
+    } finally { await reset(); }
+  }, 60000);
+
+  test("ERA: an erase-shaped exclusive 50000 holder: every attempt is refused at once; the budget ends in no_switch", async () => {
+    const E = await conn("era-E");
+    try {
+      await E.c.query("SELECT pg_advisory_xact_lock(961996,50000)");
+      await busyFlip("t2");
+      const nr = await operatorFlip("t2", { budgetMs: 300 });
+      expect(nr).toMatchObject({ result: "no_switch", to: "t2" });
+      expect(await queuedAdvisory()).toBe(0);
+    } finally { await E.end(); }
+    expect(await mode()).toBe("main");
+  }, 60000);
+
+  test("BUD: an ingest transaction held past the budget gives no_switch with the mode unchanged; switched once it ends", async () => {
+    const pa = await prepared("bud-u1", "bud-o1");
+    await setGate("fenced");
+    try {
+      const A = await conn("bud-A");
+      try {
+        expect(await commitIn(A.c, pa)).toEqual({ ok: true, kind: "committed", calls: 2 });
+        const nr = await operatorFlip("t2", { budgetMs: 500 });
+        expect(nr).toMatchObject({ result: "no_switch", to: "t2", reason: "barrier_busy_budget_exhausted" });
+        expect(nr.elapsedMs).toBeGreaterThanOrEqual(500);
+        expect(nr.elapsedMs).toBeLessThan(1500);
+        expect(await mode()).toBe("main");
+        const later = operatorFlip("t2", { budgetMs: 5000 });
+        await sleep(300); await A.c.query("COMMIT");
+        expect(await later).toMatchObject({ result: "switched", from: "main", to: "t2" });
+      } finally { await A.end(); }
+    } finally { await reset(); }
+  }, 60000);
+
+  test("CYC: set_live(true)'s lock shape vs flip attempts: no queued exclusive, so the directory write is granted at once (lock_timeout below deadlock_timeout)", async () => {
+    const pa = await prepared("cyc-u1", "cyc-o1");
+    await setGate("fenced");
+    try {
+      const X = await conn("cyc-X"), A = await conn("cyc-A");
+      try {
+        await X.c.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE");
+        const ra = commitIn(A.c, pa);
+        await lockWaiting(A.pid); // A holds 50000 shared and waits on X's clock lock
+        expect((await operatorFlip("t2", { budgetMs: 300 })).result).toBe("no_switch");
+        await busyFlip("t2");
+        const dt = Number.parseInt((await pool.query("SHOW deadlock_timeout")).rows[0].deadlock_timeout);
+        const lt = Math.max(1, Math.floor(dt / 5));
+        await X.c.query(`SET LOCAL lock_timeout='${lt}ms'`);
+        const t0 = performance.now();
+        await X.c.query("UPDATE sessions.session_directory SET state=state WHERE false"); // 050010 trigger: 50000 shared
+        const xMs = performance.now() - t0;
+        console.log(JSON.stringify({ case: "CYC", lockTimeoutMs: lt, deadlockTimeoutMs: dt, directoryWriteMs: Math.round(xMs * 10) / 10 }));
+        expect(xMs).toBeLessThan(lt);
+        await X.c.query("COMMIT");
+        expect(await ra).toEqual({ ok: true, kind: "committed", calls: 2 });
+        await A.c.query("COMMIT");
+      } finally { await X.end(); await A.end(); }
+      expect(await mode()).toBe("main");
     } finally { await reset(); }
   }, 60000);
 
@@ -225,7 +338,7 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
         const R = await conn("rr-R", "REPEATABLE READ");
         try {
           expect((await R.c.query("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows[0].mode).toBe(from); // snapshot pinned
-          expect(await (await flip(to)).done).toMatchObject({ ok: true, old: from });
+          expect(await tryFlip(to)).toMatchObject({ ok: true, old: from });
           const r = await commitIn(R.c, p);
           expect(r).toMatchObject({ ok: false, code: "55000", message: expect.stringContaining("the fenced staged ACK requires read committed") });
         } finally { await R.end(); }
@@ -234,30 +347,6 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
         try { expect(await commitIn(C.c, p)).toEqual({ ok: true, kind: "committed", calls: to === "t2" ? 1 : 2 }); await C.c.query("COMMIT"); } finally { await C.end(); }
       } finally { await reset(); }
     }, 60000);
-
-  test("TO: a flip timing out behind a held ACK leaves the mode unchanged; an ACK queued behind it proceeds with the old mode", async () => {
-    const pa = await prepared("to-u1", "to-o1"), pb = await prepared("to-u2", "to-o2");
-    await setGate("fenced");
-    try {
-      const A = await conn("to-A"), B = await conn("to-B");
-      try {
-        expect(await commitIn(A.c, pa)).toEqual({ ok: true, kind: "committed", calls: 2 }); // holds 50000 shared to COMMIT
-        const F = await flip("t2", "1s");
-        await lockWaiting(F.pid);
-        const rb = commitIn(B.c, pb);
-        await lockWaiting(B.pid); // behind the queued exclusive
-        expect(await F.done).toMatchObject({ ok: false, code: "55P03" });
-        expect(await mode()).toBe("main");
-        // B is past the barrier now; in main mode it then waits on A's clock NO KEY UPDATE (main serializes ACKs).
-        const waitsOn = async () => (await pool.query("SELECT locktype FROM pg_locks WHERE pid=$1 AND NOT granted", [B.pid])).rows.map((x) => x.locktype as string);
-        for (const end = Date.now() + 10000; Date.now() < end && !(await waitsOn()).includes("transactionid");) await sleep(15);
-        expect(await waitsOn()).toEqual(["transactionid"]);
-        await A.c.query("COMMIT");
-        expect(await rb).toEqual({ ok: true, kind: "committed", calls: 2 });
-        await B.c.query("COMMIT");
-      } finally { await A.end(); await B.end(); }
-    } finally { await reset(); }
-  }, 60000);
 
   test("UP: a T2 ACK whose upgrade waits on another origin's T2 ACK reads that ACK's last_seat after it commits; seats contiguous", async () => {
     const pa = await prepared("up-u1", "up-o1"), pb = await prepared("up-u2", "up-o2");
@@ -282,44 +371,4 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       } finally { await A.end(); await B.end(); }
     } finally { await reset(); }
   }, 60000);
-  /**
-   * CYC: the shape of ingest_history_set_live(true) (026000: clock FOR UPDATE, later a session_directory UPDATE whose
-   * 050010 statement trigger takes 50000 shared). X holds the clock FOR UPDATE; ACK A takes 50000 shared in
-   * ingest_lock_fences and waits on the clock (X); an exclusive 50000 request E queues behind A; X's directory write
-   * then requests 50000 shared, which conflicts with the QUEUED E (a soft edge X->E). Cycle X->E->A->X. Runs with E =
-   * the T2 flip and E = a plain exclusive advisory holder shaped like the operator erase (main today, gate off).
-   */
-  for (const kind of ["flip", "erase-shaped (gate off: main today)"] as const)
-    test(`CYC ${kind}: the queue is rearranged (soft deadlock), no 40P01; everything completes`, async () => {
-      const pa = await prepared(`cyc-${kind.length}`, `cyc-o-${kind.length}`);
-      if (kind === "flip") await setGate("fenced");
-      try {
-        const X = await conn("cyc-X"), A = await conn("cyc-A");
-        try {
-          await X.c.query("SELECT 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR UPDATE");
-          const ra = commitIn(A.c, pa);
-          await lockWaiting(A.pid);
-          let E: { pid: number; done: Promise<{ ok: boolean; code?: string; at: number }> };
-          if (kind === "flip") E = await flip("t2");
-          else {
-            const e = await conn("cyc-erase");
-            E = { pid: e.pid, done: e.c.query("SELECT pg_advisory_xact_lock(961996,50000)").then(async () => { await e.c.query("COMMIT"); await e.c.end(); return { ok: true, at: Date.now() }; },
-              async (err: any) => { await e.end(); return { ok: false, code: String(err.code), at: Date.now() }; }) };
-          }
-          await lockWaiting(E.pid);
-          const t0 = Date.now();
-          let xr: string;
-          try { await X.c.query("UPDATE sessions.session_directory SET state=state WHERE false"); xr = "ok"; } catch (err: any) { xr = String(err.code); }
-          const xWait = Date.now() - t0;
-          const dt = Number.parseInt((await pool.query("SHOW deadlock_timeout")).rows[0].deadlock_timeout);
-          console.log(JSON.stringify({ kind, x: xr, xWaitMs: xWait, deadlockTimeoutMs: dt }));
-          expect(xr).toBe("ok");
-          expect(xWait).toBeGreaterThanOrEqual(dt * 0.8); // granted by the detector's queue rearrangement, after deadlock_timeout
-          await X.c.query("COMMIT");
-          expect(await ra).toMatchObject({ ok: true, kind: "committed", calls: 2 });
-          await A.c.query("COMMIT");
-          expect(await E.done).toMatchObject({ ok: true });
-        } finally { await X.end(); await A.end(); }
-      } finally { await reset(); }
-    }, 60000);
 });
