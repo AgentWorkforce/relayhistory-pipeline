@@ -44,7 +44,8 @@ if (!url) throw Error("SESSION_INGEST_TEST_PG_URL (an owned loopback fixture) is
 const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return isIP(x) === 4 ? x.split(".")[0] === "127" : isIP(x) === 6 && x === "::1"; };
 { const u = new URL(url); if (!loopback(u.hostname) || u.password) throw Error("loopback throwaway fixture only"); }
 type Cell = { arm: "main" | "t2"; n: number };
-const plan = JSON.parse(process.argv[2] ?? "{}") as { c?: number; seconds?: number; controlMs?: number; sampleMs?: number; stopFreeBytes?: number; scratchPath?: string; cells: Cell[] };
+const plan = JSON.parse(process.argv[2] ?? "{}") as { c?: number; seconds?: number; controlMs?: number; sampleMs?: number; stopFreeBytes?: number; scratchPath?: string; control?: "ordered" | "lazy_clear"; cells: Cell[] };
+const CONTROL = plan.control ?? "ordered";
 const C = plan.c ?? 8, SECONDS = plan.seconds ?? 20, CONTROL_MS = plan.controlMs ?? 500, SAMPLE_MS = plan.sampleMs ?? 50;
 const STOP_FREE = plan.stopFreeBytes ?? 1_200_000_000, SCRATCH_PATH = plan.scratchPath ?? "/private/tmp";
 const epoch = "3".repeat(64), identity = "c".repeat(64);
@@ -79,7 +80,7 @@ async function runCell(cell: Cell) {
     await pool.query("SELECT sessions.ingest_history_set_live(true)");
     const historyState = (await pool.query("SELECT (SELECT live FROM sessions.ingest_history_switch) live,(SELECT count(*)::int FROM sessions.ingest_history_scope_current) managed")).rows[0];
     // Per-call transaction as the runtime role; the stage label goes into application_name for the sampler.
-    const stageOf = (sql: string) => sql.includes("claim") ? "claim" : sql.includes("prepare") ? "prepare" : sql.includes("commit") ? "commit" : "other";
+    const stageOf = (sql: string) => sql.includes("set_session_uploads") || sql.includes("reset_uploaded") ? "control" : sql.includes("claim") ? "claim" : sql.includes("prepare") ? "prepare" : sql.includes("commit") ? "commit" : "other";
     const ledgerFor = (w: number, onFail: (stage: string, code: string) => void) => sqlLedger(async (sql, params) => {
       const c = await pool.connect();
       const stage = stageOf(sql);
@@ -128,7 +129,8 @@ async function runCell(cell: Cell) {
     const baseRows = Number((await pool.query("SELECT count(*)::bigint n FROM sessions.ingest_lazy_ack_decisions")).rows[0].n);
     // ---- measured window ----
     const lat: number[] = [], failures: Record<string, number> = {}, ctlWait: number[] = [], ctlFail: Record<string, number> = {};
-    const ctlAttempts: Array<{ startMs: number; endMs: number; outcome: string; afterWindow: boolean }> = [];
+    const ctlAttempts: Array<{ startMs: number; endMs: number; outcome: string; afterWindow: boolean; lockWaitMs?: number }> = [];
+    let ctlCurrent = -1; const ctlLockTicks: number[] = [];
     let ctlTimeouts: { statement_timeout: string; lock_timeout: string } | null = null;
     let okBatches = 0, attemptedBatches = 0, attemptedRecords = 0;
     const samples = new Map<string, number>(); let sampleTicks = 0;
@@ -144,25 +146,48 @@ async function runCell(cell: Cell) {
         catch { /* counted by stage in the ledger wrapper */ }
       }
     };
+    // Control. "ordered": the full ordered-control entrypoint (ledger.applyOrderedControl -> ingest_set_session_uploads,
+    // relayhistory-cloud control witness as in lazy-custody.pglite.test.ts), as the runtime role with the Worker's budgets
+    // (lock_timeout 2s, statement_timeout 5s), a selection disable of a fresh session of the control user per attempt.
+    // "lazy_clear": sessions.ingest_lazy_clear as the owner (run 1 and run 2).
+    let ctlLastCode = "";
+    const ctlLedger = ledgerFor(CTL, (_stage, code) => { ctlLastCode = code; });
+    let ctlSeq = 0;
+    async function sign(witness: unknown) { return { witness, sourceDigest: (await pool.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(witness)])).rows[0].d as string }; }
+    async function orderedControl() {
+      const tenant = tenantOf(CTL), payload = { origin_id: originOf(CTL), sessions: [{ source: "claude", session_id: `mb-ctl-${++ctlSeq}` }], enabled: false };
+      const v = String(BigInt((await pool.query("SELECT coalesce(max(version),0)::text AS n FROM sessions.ingest_control_receipts WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3", [tenant.orgId, tenant.workspaceId, tenant.userId])).rows[0].n as string) + 1n);
+      const digest = (await pool.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,'selection',$5::jsonb)::text,'UTF8')),'hex') AS d", [epoch, tenant.orgId, tenant.workspaceId, tenant.userId, JSON.stringify(payload)])).rows[0].d as string;
+      const control = { epoch, version: v, digest, kind: "selection" as const };
+      const custody = await sign({ version: 1, issuer: "relayhistory-cloud", sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: "a".repeat(64), tenant, originId: payload.origin_id, batchId: null, batchDigest: null,
+        sourceControlVersion: v, pending: true, pendingControl: control, privacyVersion: String(BigInt(v) - 1n), originalRecordCount: 0, candidateCount: 0, records: [], privacy: v === "1" ? { complete: true, deletions: [], resets: [] } : null });
+      return ctlLedger.applyOrderedControl!({ tenant, originId: payload.origin_id, sessions: payload.sessions.map((x) => [x.source, x.session_id] as [string, string]), enabled: false, control, custody } as never);
+    }
     const control = async () => {
       const body = JSON.stringify({ tenant: tenantOf(CTL), originId: originOf(CTL), enabled: false, sessions: [["claude", "mb-control-none"]] });
       while (!stopNow()) {
         await sleep(CONTROL_MS);
         if (stopNow()) break;
-        const c = await pool.connect();
         const s = performance.now();
         let outcome = "ok";
-        try {
-          await c.query("BEGIN;SET LOCAL application_name='control-lazy_clear';SET LOCAL lock_timeout='2s'");
-          if (!ctlTimeouts) ctlTimeouts = (await c.query("SELECT current_setting('statement_timeout') statement_timeout,current_setting('lock_timeout') lock_timeout")).rows[0];
-          await c.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'selection')", [body]); await c.query("COMMIT"); ctlWait.push(performance.now() - s);
+        ctlCurrent = ctlAttempts.length; ctlLockTicks[ctlCurrent] = 0; ctlLastCode = "";
+        if (CONTROL === "ordered") {
+          if (!ctlTimeouts) ctlTimeouts = { statement_timeout: "5s (SET LOCAL, runtime role)", lock_timeout: "2s (SET LOCAL, runtime role)" };
+          try { const r: any = await orderedControl(); if (r?.control?.outcome !== "applied") outcome = "not_applied:" + String(r?.control?.outcome); ctlWait.push(performance.now() - s); }
+          catch (e: any) { outcome = ctlLastCode || String(e?.code ?? e?.name ?? "error"); ctlFail[outcome] = (ctlFail[outcome] ?? 0) + 1; }
+        } else {
+          const c = await pool.connect();
+          try {
+            await c.query("BEGIN;SET LOCAL application_name='control-lazy_clear';SET LOCAL lock_timeout='2s'");
+            if (!ctlTimeouts) ctlTimeouts = (await c.query("SELECT current_setting('statement_timeout') statement_timeout,current_setting('lock_timeout') lock_timeout")).rows[0];
+            await c.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'selection')", [body]); await c.query("COMMIT"); ctlWait.push(performance.now() - s);
+          }
+          catch (e: any) { outcome = String(e?.code ?? "error"); ctlFail[outcome] = (ctlFail[outcome] ?? 0) + 1; await c.query("ROLLBACK").catch(() => {}); }
+          finally { c.release(); }
         }
-        catch (e: any) { outcome = String(e?.code ?? "error"); ctlFail[outcome] = (ctlFail[outcome] ?? 0) + 1; await c.query("ROLLBACK").catch(() => {}); }
-        finally {
-          c.release();
-          const e = performance.now();
-          ctlAttempts.push({ startMs: Math.round(s - t0), endMs: Math.round(e - t0), outcome, afterWindow: e - t0 > SECONDS * 1000 });
-        }
+        const e = performance.now();
+        ctlAttempts.push({ startMs: Math.round(s - t0), endMs: Math.round(e - t0), outcome, afterWindow: e - t0 > SECONDS * 1000, lockWaitMs: (ctlLockTicks[ctlCurrent] ?? 0) * SAMPLE_MS });
+        ctlCurrent = -1;
       }
     };
     const sampler = async () => {
@@ -174,6 +199,7 @@ async function runCell(cell: Cell) {
           const r = (await s.query(`SELECT w.application_name app,l.locktype,l.mode,l.relation::regclass::text rel,l.classid,l.objid,l.objsubid,
               (SELECT coalesce(array_agg(DISTINCT coalesce(nullif(b.application_name,''),'?')),'{}') FROM pg_stat_activity b WHERE b.pid=ANY(pg_blocking_pids(w.pid))) blockers
             FROM pg_stat_activity w JOIN pg_locks l ON l.pid=w.pid AND NOT l.granted WHERE w.datname=current_database()`)).rows;
+          if (ctlCurrent >= 0 && r.some((x) => /control/.test(String(x.app)))) ctlLockTicks[ctlCurrent] = (ctlLockTicks[ctlCurrent] ?? 0) + 1;
           for (const x of r) {
             const stage = String(x.app).replace(/^w\d+-/, "");
             const obj = x.locktype === "advisory" ? (keyNames.get(`${x.classid}/${x.objid}/${x.objsubid}`) ?? `unmapped(${x.classid}/${x.objid}/${x.objsubid})`).replace(/\(w\d+\)/, "")
@@ -205,7 +231,7 @@ async function runCell(cell: Cell) {
       latencyMs: { n: lat.length, p50: pct(lat, 0.5), p95: pct(lat, 0.95), p99: pct(lat, 0.99), max: pct(lat, 1) },
       window: { windowMs: SECONDS * 1000, workersDrainedAtMs: Math.round(drainEndMs) },
       controlAttempts: ctlAttempts, controlTimeouts: ctlTimeouts,
-      control: { entrypoint: "sessions.ingest_lazy_clear(selection disable, control user)", n: ctlWait.length, p50: pct(ctlWait, 0.5), p95: pct(ctlWait, 0.95), max: pct(ctlWait, 1), failures: ctlFail },
+      control: { entrypoint: CONTROL === "ordered" ? "ledger.applyOrderedControl -> sessions.ingest_set_session_uploads (selection disable, runtime role, 2s/5s)" : "sessions.ingest_lazy_clear(selection disable, control user, owner)", n: ctlWait.length, p50: pct(ctlWait, 0.5), p95: pct(ctlWait, 0.95), max: pct(ctlWait, 1), failures: ctlFail },
       lockSamples: { ticks: sampleTicks, sampleMs: SAMPLE_MS, top: [...samples.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25) },
       space: { freeStart: free0, minFree: space.minFree, peakDbBytes: space.peakDb, peakWalBytes: space.peakWal, stoppedForSpace: space.stoppedForSpace },
     };
