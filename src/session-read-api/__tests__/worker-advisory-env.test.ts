@@ -1,11 +1,12 @@
 /**
  * The read Worker's advisory env plumbing (packages/session-read-worker/src/index.ts): the M3-7 priority switch
- * (READ_API_ADVISORY_PRIORITY_ENABLED) and the notify rows reach the read API, the v1-fallback warning is wired, and a
+ * (READ_API_ADVISORY_PRIORITY_ENABLED), the 062220 instance switch (READ_API_ADVISORY_INSTANCE_ENABLED) and the notify
+ * rows reach the read API, the v1-fallback warning is wired, and a
  * malformed READ_API_ADVISORY_NOTIFY_ROWS fails only the advisory routes (503) while every other route is served.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { handle, workerAdvisoryDeps, type Env } from "../../../packages/session-read-worker/src/index.ts";
-import { PENDING_SQL, PENDING_V2_SQL } from "../coordination-advisories.ts";
+import { PENDING_SQL, PENDING_V2_SQL, PENDING_V3_SQL } from "../coordination-advisories.ts";
 import type { TenantRunner } from "../liveness.ts";
 
 const recipient = { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" };
@@ -38,6 +39,25 @@ describe("workerAdvisoryDeps", () => {
     expect(deps).toMatchObject({ advisoryNotifyRows: rows, advisoryPriority: true });
     await deps.coordinationAdvisories!.source.pending(recipient);
     expect(r.texts).toEqual([PENDING_V2_SQL]);
+  });
+
+  test("the 062220 instance switch: exactly true sets advisoryInstance (the GET reads pending_for_v3); anything else leaves the deps and the statement unchanged", async () => {
+    for (const value of [undefined, "", "1", "TRUE", "false"]) {
+      const r = runner();
+      const deps = workerAdvisoryDeps({ READ_API_COORDINATION_ADVISORIES_ENABLED: "true", READ_API_ADVISORY_INSTANCE_ENABLED: value }, r.run, new Set());
+      expect([value, Object.keys(deps)]).toEqual([value, ["coordinationAdvisories"]]);
+      await deps.coordinationAdvisories!.source.pending(recipient);
+      expect(r.texts).toEqual([PENDING_SQL]);
+    }
+    expect(workerAdvisoryDeps({ READ_API_ADVISORY_INSTANCE_ENABLED: "true" }, runner().run, new Set())).toEqual({ advisoryInstance: true });
+    const r = runner();
+    const deps = workerAdvisoryDeps({ READ_API_COORDINATION_ADVISORIES_ENABLED: "true", READ_API_ADVISORY_INSTANCE_ENABLED: "true" }, r.run, new Set());
+    expect(deps).toMatchObject({ advisoryInstance: true });
+    expect("advisoryPriority" in deps).toBe(false);
+    await deps.coordinationAdvisories!.source.pendingInstances!(recipient);
+    expect(r.texts).toEqual([PENDING_V3_SQL]);
+    // The Worker never acks: the instance ack is refused like the v1 one.
+    await expect(deps.coordinationAdvisories!.source.ackInstance!(recipient, "9f3c2a71d04be6e5", "00000000-0000-4000-8000-000000000000")).rejects.toThrow(/self-host service only/);
   });
 
   test("the v1 fallback warning is wired to the warn log, and the absent-v2 cache is shared across per-request sources", async () => {

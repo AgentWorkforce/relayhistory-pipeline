@@ -106,7 +106,7 @@ import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
-import { ADVISORIES_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
+import { ADVISORIES_CONTRACT, ADVISORIES_INSTANCE_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
 import { SessionIntelUnsupported, workspaceView, type SessionIntelSource } from "./session-intel-workspace.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
@@ -342,6 +342,13 @@ export interface ReadApiDeps {
    * ordering. Absent or false: both routes answer exactly as before M3-7.
    */
   advisoryPriority?: boolean;
+  /**
+   * READ_API_ADVISORY_INSTANCE_ENABLED (exactly "true"; 062220): the advisories GET reads pending_for_v3 and answers
+   * contract "advisories/v3" with each item's `incarnation` (null on a legacy row); the ack POST also accepts
+   * `incarnation` and then acks that instance through ack_v2 (200 {result: "acked" | "already_acked"}, 404 no match).
+   * Absent or false: both routes answer exactly as before (contract coordination-advisories/1, no incarnation, ack v1).
+   */
+  advisoryInstance?: boolean;
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /**
@@ -550,6 +557,8 @@ const bad = (message: string) => new HttpError(400, "bad_request", message);
 export const ADVISORY_ACK_PATH = /^\/v1\/coordination\/advisories\/[^/]+\/ack$/u;
 /** The ack body is {"source","sessionId"}; anything larger is refused before it is parsed. */
 export const ADVISORY_ACK_MAX_BODY_BYTES = 8 * 1024;
+/** An ack's `incarnation` (062220): a UUID in its canonical 8-4-4-4-12 hex form, either case. */
+const ADVISORY_INCARNATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 /**
  * `origin` on /v1/events: only events this label wrote (message-origin.ts), e.g.
@@ -2298,9 +2307,15 @@ export function createReadApi(deps: ReadApiDeps) {
       const recipient = recipientOf(identity, exactlyOnce(c, "source"), exactlyOnce(c, "sessionId"));
       const status = single(c, "status") ?? "pending";
       if (status !== "pending") throw bad("status must be pending");
-      const rows = await advisories.source.pending(recipient);
+      const instance = deps.advisoryInstance === true;
+      if (instance && !advisories.source.pendingInstances) throw new Error("coordination advisories: the instance reader is not wired");
+      const rows = instance ? await advisories.source.pendingInstances!(recipient) : await advisories.source.pending(recipient);
       log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
-      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map((row) => advisoryItem(row, deps.advisoryNotifyRows, deps.advisoryPriority === true)), nextCursor: null });
+      return c.json({
+        contract: instance ? ADVISORIES_INSTANCE_CONTRACT : ADVISORIES_CONTRACT,
+        advisories: rows.slice(0, 10).map((row) => advisoryItem(row, deps.advisoryNotifyRows, deps.advisoryPriority === true, instance)),
+        nextCursor: null,
+      });
     } catch (error) {
       return fail(c, error);
     }
@@ -2325,9 +2340,24 @@ export function createReadApi(deps: ReadApiDeps) {
           throw bad("body must be JSON");
         }
         if (typeof body !== "object" || body === null || Array.isArray(body)) throw bad("body must be a JSON object");
+        const instance = deps.advisoryInstance === true;
         const { source, sessionId, ...rest } = body as Record<string, unknown>;
-        if (Object.keys(rest).length > 0) throw bad("body accepts source and sessionId only");
+        // Switch off: `incarnation` is an unknown key like any other (the pre-062220 400).
+        const { incarnation: given, ...others } = rest;
+        const incarnation = instance ? given : undefined;
+        if (Object.keys(instance ? others : rest).length > 0) throw bad(instance ? "body accepts source, sessionId and incarnation only" : "body accepts source and sessionId only");
         const recipient = recipientOf(identity, source, sessionId);
+        // Instance switch on and an incarnation given: ack exactly that instance (062220 ack_v2). Absent or null (a
+        // legacy row's item carries null): the v1 ack below, which matches legacy rows only.
+        if (incarnation !== undefined && incarnation !== null) {
+          if (typeof incarnation !== "string" || !ADVISORY_INCARNATION.test(incarnation)) throw bad("incarnation must be a UUID");
+          if (!advisories.source.ackInstance) throw new Error("coordination advisories: the instance ack is not wired");
+          const result = await advisories.source.ackInstance(recipient, advisoryId, incarnation.toLowerCase());
+          // 404 whether the id is unknown, another recipient's, a legacy row, or a stale instance: nothing is disclosed.
+          if (result === "no_match") throw new HttpError(404, "not_found", "advisory not found");
+          log({ route: c.req.routePath, reason: result === "acked" ? "coordination_advisory_acked" : "coordination_advisory_already_acked", correlation_id: c.get("correlationId") });
+          return c.json({ contract: ADVISORIES_INSTANCE_CONTRACT, result }, 200);
+        }
         // 404 whether the id is unknown or belongs to another recipient: nothing is disclosed.
         if (!(await advisories.source.ack(recipient, advisoryId))) throw new HttpError(404, "not_found", "advisory not found");
         log({ route: c.req.routePath, reason: "coordination_advisory_acked", correlation_id: c.get("correlationId") });

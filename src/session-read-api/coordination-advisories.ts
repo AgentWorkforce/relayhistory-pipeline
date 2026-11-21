@@ -4,7 +4,8 @@
  * both behind READ_API_COORDINATION_ADVISORIES_ENABLED (exactly "true").
  *
  * Both call the 20261105062000 SECURITY DEFINER functions granted to bulls96_read_api, with the
- * tenant settings bound. The GET runs in the read pool's READ ONLY transaction. The ack is the
+ * tenant settings bound (062190's pending_for_v2 with READ_API_ADVISORY_PRIORITY_ENABLED; 062220's pending_for_v3 and
+ * ack_v2 with READ_API_ADVISORY_INSTANCE_ENABLED). The GET runs in the read pool's READ ONLY transaction. The ack is the
  * read API's only write here: one READ WRITE transaction on the same read-role pool, because the
  * role defaults to read-only transactions. No transcript text is read or returned.
  */
@@ -13,6 +14,12 @@ import { TENANT_SETTINGS_SQL, type SqlQuery, type TenantRunner } from "./livenes
 import { advisoryNotifyEligible, advisoryPriority } from "./advisory-priority.ts";
 
 export const ADVISORIES_CONTRACT = "coordination-advisories/1";
+/**
+ * The advisory-instance contract (20261105062220, READ_API_ADVISORY_INSTANCE_ENABLED): every item carries
+ * `incarnation` (a UUID, or null on a legacy row) AND the ack with an incarnation is enforced by ack_v2. A client
+ * matches it exactly; any other value (including ADVISORIES_CONTRACT) means legacy: no incarnation, v1 ack.
+ */
+export const ADVISORIES_INSTANCE_CONTRACT = "advisories/v3";
 /** pending_for_v1 returns at most 10 rows; the route never serves more. */
 export const ADVISORIES_PAGE_MAX = 10;
 
@@ -37,7 +44,12 @@ export interface AdvisoryRow {
   createdAt: string;
   /** Set once the HIGH DM was sent (mark_delivered_v1); a listed row is never acked, so only the DM sets it. */
   deliveredAt: string | null;
+  /** Only from pendingInstances (062220's pending_for_v3): the row's instance, null on a legacy row. */
+  incarnation?: string | null;
 }
+
+/** ack_v2's three-way answer. */
+export type AdvisoryAckInstanceResult = "acked" | "already_acked" | "no_match";
 
 export interface AdvisoryRecipient {
   orgId: string;
@@ -51,6 +63,13 @@ export interface AdvisoriesSource {
   pending(recipient: AdvisoryRecipient): Promise<AdvisoryRow[]>;
   /** True when a row matched the recipient (also when it was already acked). */
   ack(recipient: AdvisoryRecipient, advisoryId: string): Promise<boolean>;
+  /**
+   * READ_API_ADVISORY_INSTANCE_ENABLED only (062220): the recipient's open advisories with their incarnation,
+   * priority-first (pending_for_v3), at most 10.
+   */
+  pendingInstances?(recipient: AdvisoryRecipient): Promise<AdvisoryRow[]>;
+  /** READ_API_ADVISORY_INSTANCE_ENABLED only (062220): ack exactly one instance (ack_v2). */
+  ackInstance?(recipient: AdvisoryRecipient, advisoryId: string, incarnation: string): Promise<AdvisoryAckInstanceResult>;
 }
 
 type PoolClient = { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }>; release(): void };
@@ -96,6 +115,12 @@ const V2_INSTALLED_SQL = "SELECT to_regprocedure($1) IS NOT NULL AS installed";
 /** How long a "pending_for_v2 is not installed" answer is trusted, and the fallback warning's minimum spacing. */
 export const PENDING_V2_ABSENT_TTL_MS = 60_000;
 const ACK_SQL = "SELECT sessions.coordination_advisories_ack_v1($1, $2, $3, $4, $5) AS ok";
+/** 20261105062220: pending_for_v2's rows and order plus each row's incarnation (instance switch on only). */
+export const PENDING_V3_SQL = `${PENDING_COLUMNS}, incarnation
+  FROM sessions.coordination_advisories_pending_for_v3($1, $2, $3, $4, $5)`;
+/** 20261105062220: the one-instance ack (instance switch on, and the POST carried an incarnation). */
+export const ACK_V2_SQL = "SELECT sessions.coordination_advisories_ack_v2($1, $2, $3, $4, $5, $6::uuid) AS result";
+const ACK_RESULTS: ReadonlySet<string> = new Set(["acked", "already_acked", "no_match"]);
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : new Date(String(v)).toISOString());
 
@@ -103,6 +128,22 @@ function evidenceOf(raw: unknown): AdvisoryEvidence[] {
   const list = typeof raw === "string" ? JSON.parse(raw) : raw;
   if (!Array.isArray(list)) return [];
   return list.map((e) => ({ sessionId: String(e?.sessionId ?? ""), eventId: String(e?.eventId ?? ""), ts: String(e?.ts ?? ""), kind: String(e?.kind ?? "") }));
+}
+
+function rowOf(row: Record<string, unknown>): AdvisoryRow {
+  return {
+    advisoryId: String(row.advisory_id),
+    harness: String(row.harness),
+    sessionId: String(row.session_id),
+    peerHarness: String(row.peer_harness),
+    peerSessionId: String(row.peer_session_id),
+    urgency: row.urgency === "high" ? "high" as const : "low" as const,
+    kind: String(row.kind),
+    artifact: String(row.artifact),
+    evidence: evidenceOf(row.evidence),
+    createdAt: iso(row.created_at),
+    deliveredAt: row.delivered_at === null || row.delivered_at === undefined ? null : iso(row.delivered_at),
+  };
 }
 
 /**
@@ -166,24 +207,29 @@ export function sqlCoordinationAdvisories(
           rows = await fallback(r);
         }
       }
-      return rows.slice(0, ADVISORIES_PAGE_MAX).map((row) => ({
-        advisoryId: String(row.advisory_id),
-        harness: String(row.harness),
-        sessionId: String(row.session_id),
-        peerHarness: String(row.peer_harness),
-        peerSessionId: String(row.peer_session_id),
-        urgency: row.urgency === "high" ? "high" as const : "low" as const,
-        kind: String(row.kind),
-        artifact: String(row.artifact),
-        evidence: evidenceOf(row.evidence),
-        createdAt: iso(row.created_at),
-        deliveredAt: row.delivered_at === null || row.delivered_at === undefined ? null : iso(row.delivered_at),
-      }));
+      return rows.slice(0, ADVISORIES_PAGE_MAX).map(rowOf);
     },
     ack: (r, advisoryId) =>
       write(r.orgId, r.workspaceId, async (q: SqlQuery) => {
         const { rows } = await q.query<{ ok: boolean }>(ACK_SQL, [r.orgId, r.workspaceId, advisoryId, r.source, r.sessionId]);
         return rows[0]?.ok === true;
+      }),
+    // 062220. No fallback: with the instance switch on, a database without pending_for_v3 / ack_v2 is an error
+    // (fail closed; turn the switch off before rolling 062220 back).
+    pendingInstances: async (r) => {
+      const rows = await read(r.orgId, r.workspaceId, async (q: SqlQuery) =>
+        (await q.query<Record<string, unknown>>(PENDING_V3_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId, ADVISORIES_PAGE_MAX])).rows);
+      return rows.slice(0, ADVISORIES_PAGE_MAX).map((row) => ({
+        ...rowOf(row),
+        incarnation: row.incarnation === null || row.incarnation === undefined ? null : String(row.incarnation),
+      }));
+    },
+    ackInstance: (r, advisoryId, incarnation) =>
+      write(r.orgId, r.workspaceId, async (q: SqlQuery) => {
+        const { rows } = await q.query<{ result: string }>(ACK_V2_SQL, [r.orgId, r.workspaceId, advisoryId, r.source, r.sessionId, incarnation]);
+        const result = rows[0]?.result;
+        if (typeof result !== "string" || !ACK_RESULTS.has(result)) throw new Error("coordination advisories: unexpected ack_v2 result");
+        return result as AdvisoryAckInstanceResult;
       }),
   };
 }
@@ -196,7 +242,7 @@ export function sqlCoordinationAdvisories(
  * never acked) only the DM path (coordination_advisories_mark_delivered_v1) sets it, the ack sets it only on rows
  * this GET no longer lists. Switch off: exactly the pre-M3-7 item, none of the three.
  */
-export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> = new Set(), priority = false) {
+export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> = new Set(), priority = false, instance = false) {
   const firstSeen = row.evidence.map((e) => e.ts).filter((ts) => ts !== "").sort()[0] ?? row.createdAt;
   const base = {
     advisoryId: row.advisoryId,
@@ -211,11 +257,15 @@ export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> =
     }),
     evidence: row.evidence,
   };
-  if (priority !== true) return base;
-  return {
+  // Instance switch (READ_API_ADVISORY_INSTANCE_ENABLED): `incarnation` last, null on a legacy row. notifyEligible is
+  // still the row's own (kind, urgency): evaluated per row on every GET, so a re-created or promoted instance of an
+  // allowlisted class is eligible afresh; nothing is carried from an earlier instance.
+  const withInstance = <T extends object>(item: T) => instance === true ? { ...item, incarnation: row.incarnation ?? null } : item;
+  if (priority !== true) return withInstance(base);
+  return withInstance({
     ...base,
     priority: advisoryPriority(row),
     notifyEligible: advisoryNotifyEligible(row, notifyRows),
     delivery: { dm: row.deliveredAt !== null, deliveredAt: row.deliveredAt },
-  };
+  });
 }
