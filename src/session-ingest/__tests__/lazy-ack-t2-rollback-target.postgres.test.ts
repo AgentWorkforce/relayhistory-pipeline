@@ -4,7 +4,8 @@
  * LAZY_ACK_T2_ROLLBACK_TARGET_TREE: a checkout of the rollback target commit (the tree without 062210, e.g. a
  * `git worktree add --detach <dir> <target sha>` with its own `bun install --frozen-lockfile`). Skipped otherwise.
  *
- * Schedule: apply this tree as the owner; stage a delivery (claim and stage committed, the commit not yet run); the
+ * Schedule: apply this tree as the owner; roll back every slot later than 062210 (discovered in reverse filename
+ * order, each from its real down file as the owner; a later slot without a down fails the test); stage a delivery (claim and stage committed, the commit not yet run); the
  * down as the owner; the commit is refused while readiness is pending (55000 'generation not ready'); then the
  * operator's readiness restoration, all as the owner, with the TARGET tree's own code: (1) its migrator (nothing
  * applied: 062210 is not in that tree; phase 2 marks PASS at its generation), (2) its generation rebind of the lazy
@@ -21,7 +22,7 @@ import { sqlLedger } from "../ledger-sql.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { batch, record, scratchStore, TENANT } from "./support.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
-import { migrateAsOwner, ownedLoopbackUrl, ownerDatabase, ownerProfile, roleReceipt, OWNER_ROLE } from "./owner-role-harness.ts";
+import { laterSlotDowns, migrateAsOwner, ownedLoopbackUrl, ownerDatabase, ownerProfile, rollBackLaterSlots, roleReceipt, OWNER_ROLE } from "./owner-role-harness.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL, tree = process.env.LAZY_ACK_T2_ROLLBACK_TARGET_TREE;
 ownedLoopbackUrl(url);
@@ -59,6 +60,12 @@ describe.skipIf(!url || !tree)("062210 rollback to the target tree (062210 absen
     const log: Record<string, unknown> = {};
     try {
       await migrateAsOwner(db.ownerUrl);
+      // 062210's down refuses while a later slot is applied: those come off first, newest first, as the owner.
+      const later = laterSlotDowns("20261105062210_lazy_ack_t2").map((s) => s.name);
+      expect(later.length).toBeGreaterThan(0);
+      log.laterRolledBack = await rollBackLaterSlots(db.ownerUrl, "20261105062210_lazy_ack_t2");
+      expect(log.laterRolledBack).toEqual(later);
+      expect(Number((await fx.query("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE \"C\" > 'upstream:20261105062210_lazy_ack_t2.sql'")).rows[0].n)).toBe(0);
       const G = (await derivedSchemaAssets()).expected.generation as string, H = (await target.derived()).expected.generation as string;
       expect(G).not.toBe(H);
       await owner.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [JSON.stringify({ baselineMode: "lazy-current", generation: G, sourceIdentitySha256: identity, controlEpoch: epoch,

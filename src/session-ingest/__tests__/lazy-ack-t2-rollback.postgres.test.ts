@@ -22,6 +22,9 @@
  *           while holding 50000 exclusive; nothing changed.
  *   MARKER  a reader holding the validation marker FOR SHARE (before its own 50000, as the publisher does): the down
  *           fails fast instead of holding 50000 exclusive while it waits on that reader.
+ *   LATER   after the full migrate the down refuses (55000, verbatim) while a later slot (062220) is applied, nothing
+ *           changed; every other case first rolls back each later slot (discovered: reverse filename order, real down
+ *           files, as the owner; a later slot without a down fails the suite) and a reapply restores the full ledger.
  *   Not exercised: an ACK admitted while the marker is not 'pass' (044030 apply-window admission, off by default). Its
  *   guard takes no marker lock, so DEP's dependency does not hold for it; the shipped down's protection there is the
  *   source argument that it too holds 50000 S from its ingest_lock_fences call.
@@ -33,7 +36,7 @@ import { deliverBatch } from "../deliver.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { deliveryAccount, prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { batch, record, scratchStore, TENANT } from "./support.ts";
-import { migrateAsOwner, ownedLoopbackUrl, ownerDatabase, roleReceipt, OWNER_ROLE } from "./owner-role-harness.ts";
+import { laterSlotDowns, migrateAsOwner, ownedLoopbackUrl, ownerDatabase, rollBackLaterSlots, roleReceipt, OWNER_ROLE } from "./owner-role-harness.ts";
 import { derivedSchemaAssets } from "../../session-pipeline/derived-schema.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
@@ -44,6 +47,8 @@ const epoch = "3".repeat(64), identity = "c".repeat(64);
 const COMMIT = "SELECT sessions.ingest_origin_commit_buffered_batch($1::jsonb) AS result";
 const ACK = "sessions.ingest_lazy_ack_batch(jsonb)";
 const DOWN = readFileSync("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql", "utf8");
+/** 062210's down refuses while a later slot is applied: scratchDb rolls those back first (owner-role-harness.ts). */
+const T2_SLOT = "20261105062210_lazy_ack_t2";
 const MAIN_BODY = (() => {
   const m = readFileSync("supabase/migrations/20261105043800_lazy_ack_clock_no_key_update.sql", "utf8")
     .match(/CREATE OR REPLACE FUNCTION sessions\.ingest_lazy_ack_batch\(p jsonb\)[\s\S]*?AS \$lazy_ack_batch\$([\s\S]*?)\$lazy_ack_batch\$;/);
@@ -57,8 +62,11 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
   // One scratch database at a time: the migrator's role check refuses while another database grants to the runtime roles.
   afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); }, 60000);
 
-  /** A fresh scratch database with every migration, the policy, the seat clock and the test-only pause trigger. */
-  async function scratchDb() {
+  /**
+   * A fresh scratch database with every migration, the policy, the seat clock and the test-only pause trigger. Then,
+   * unless keepLater, every slot later than 062210 is rolled back (newest first, as the owner), so 062210 is newest.
+   */
+  async function scratchDb(opts: { keepLater?: boolean } = {}) {
     const db = await ownerDatabase(url!, "t2rb");
     const target = db.fixtureUrl;
     const pool = new pg.Pool({ connectionString: db.ownerUrl, max: 10 }); // the owner login
@@ -73,6 +81,15 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     const migrate = async (o: { target?: string } = {}) => migrateAsOwner(db.ownerUrl, o);
     const log: unknown[] = [];
     await migrate();
+    const ledgerNames = async () => (await fx.query("SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' ORDER BY name COLLATE \"C\"")).rows.map((r) => r.name as string);
+    const fullLedger = await ledgerNames();
+    const later = laterSlotDowns(T2_SLOT).map((s) => s.name);
+    expect(later.length).toBeGreaterThan(0);
+    for (const n of later) expect(fullLedger).toContain(n);
+    if (!opts.keepLater) {
+      expect(await rollBackLaterSlots(db.ownerUrl, T2_SLOT)).toEqual(later);
+      expect((await ledgerNames()).filter((n) => n > "upstream:" + T2_SLOT + ".sql")).toEqual([]);
+    }
     const generation = (await derivedSchemaAssets()).expected.generation;
     await pool.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch,
       privacyBaselineSha256: "a".repeat(64), retentionContractSha256: "b".repeat(64), sourceProofSha256: "d".repeat(64), validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" })]);
@@ -175,8 +192,21 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
       const raw = await batch([record({ record_id: `rb-one-${++serial}`, revision: 2, session_id: "s-one", origin_id: origin })], { batch_id: `rb-one-b${serial}`, account_id: await deliveryAccount(t), origin_id: origin });
       return (await deliverBatch({ ledger: ledgerFor(), acceptanceMode: "buffered", target: { store: scratch.store, keyRoot: "96bulls" }, custody: await custody(t, raw) } as never, t, raw)).outcome;
     };
-    return { pool, fx, down, downReceipts, state, pausedAck, conn, lockWaiting, migrate, asRuntime, deliverOne, preparedPayload: prepared, log };
+    return { pool, fx, down, downReceipts, state, pausedAck, conn, lockWaiting, migrate, asRuntime, deliverOne, preparedPayload: prepared, log, ledgerNames, fullLedger, later, ownerUrl: db.ownerUrl };
   }
+
+  test("LATER: with a later slot (062220) still applied the down refuses verbatim and changes nothing; after the later downs it succeeds", async () => {
+    const d = await scratchDb({ keepLater: true });
+    expect(d.later).toContain("upstream:20261105062220_coordination_advisories_incarnation.sql");
+    const before = await d.state(), ledgerBefore = await d.ledgerNames();
+    expect(ledgerBefore).toEqual(d.fullLedger);
+    expect(await d.down(DOWN)).toEqual({ code: "55000", message: "lazy ack T2: a later migration is applied; roll it back first" });
+    expect(await d.state()).toEqual(before);
+    expect(await d.ledgerNames()).toEqual(ledgerBefore);
+    expect(await rollBackLaterSlots(d.ownerUrl, T2_SLOT)).toEqual(d.later);
+    expect(await d.down(DOWN)).toBeNull();
+    expect(await d.state()).toMatchObject({ table: null, ledger: 0, t2Body: false });
+  }, 180000);
 
   test("DEP: without its quiescence step the down still cannot drop the table under the ACK: it waits on the marker row the ACK's guard holds FOR SHARE (no queued ingest pause)", async () => {
     const d = await scratchDb();
@@ -328,6 +358,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     const re = await d.migrate();
     log.reapply = re;
     expect(await d.state()).toEqual(intact);
+    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots (062220) included
     expect(await d.deliverOne("life-u1", "life-o1")).toBe("accepted_buffered");
     log.downUsers = [...new Set(d.downReceipts)];
     log.server = (await d.fx.query("SHOW server_version")).rows[0].server_version;
@@ -417,6 +448,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     // to the rollback target with 062210 absent, is lazy-ack-t2-rollback-target.postgres.test.ts.
     await d.migrate();
     expect(await d.state()).toMatchObject({ table: "sessions.lazy_ack_t2_mode", row: [{ singleton: true, gate: "off", mode: "main" }], ledger: 1, marker: "pass", t2Body: true });
+    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots (062220) included
     expect((await d.state()).marker).toBe("pass");
     const R = await d.conn("t2-first-entry-retry");
     try {

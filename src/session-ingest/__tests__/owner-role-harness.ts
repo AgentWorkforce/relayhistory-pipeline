@@ -15,7 +15,7 @@
  * One owner role per cluster (roles are cluster-global and the bootstrap chain is idempotent); one fresh database per
  * suite. The URL must be the fixture superuser on a loopback host and the postgres database, without a password.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import pg from "pg";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { runMigrations, type MigrationProfile, type RunOptions } from "../../hoopdb/migrate.ts";
@@ -78,6 +78,42 @@ export async function ownerDatabase(adminUrl: string, prefix = "t2g"): Promise<O
       try { await a.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); } finally { await a.end(); }
     },
   };
+}
+
+/**
+ * Every migration slot later than `slot` (a filename stem such as "20261105062210_lazy_ack_t2"), discovered by listing
+ * supabase/migrations, newest first (reverse filename order), each paired with its down in supabase/rollbacks. A later
+ * slot without a down file throws: the caller cannot roll back past it, so the test must fail, never skip.
+ */
+export function laterSlotDowns(slot: string): Array<{ stem: string; name: string; down: string }> {
+  const dir = (d: string) => new URL("../../../supabase/" + d + "/", import.meta.url);
+  const downs = new Set(readdirSync(dir("rollbacks")).filter((f) => f.endsWith(".down.sql")));
+  const later = readdirSync(dir("migrations")).filter((f) => /^\d{14}_.*\.sql$/.test(f)).map((f) => f.slice(0, -4))
+    .filter((stem) => stem > slot).sort().reverse();
+  const missing = later.filter((stem) => !downs.has(stem + ".down.sql"));
+  if (missing.length) throw Error("later_slot_without_down: " + missing.join(", "));
+  return later.map((stem) => ({ stem, name: "upstream:" + stem + ".sql", down: readFileSync(new URL(stem + ".down.sql", dir("rollbacks")), "utf8") }));
+}
+
+/**
+ * Roll back every slot later than `slot` (laterSlotDowns), newest first, each from its real down file on its own OWNER
+ * login (asserted non-superuser). Any failure throws with the slot named; returns the ledger names rolled back.
+ */
+export async function rollBackLaterSlots(ownerUrl: string, slot: string): Promise<string[]> {
+  const done: string[] = [];
+  for (const { stem, name, down } of laterSlotDowns(slot)) {
+    const c = new pg.Client({ connectionString: ownerUrl, application_name: "later-slot-down" }); await c.connect();
+    try {
+      const who = await roleReceipt(c);
+      if (who.current_user !== OWNER_ROLE || who.rolsuper || who.rolbypassrls) throw Error("owner_login_required");
+      try { await c.query(down); }
+      catch (e: any) { await c.query("ROLLBACK").catch(() => {}); throw Error(`later_slot_down_failed: ${stem}: ${e.code} ${e.message}`); }
+      if ((await c.query("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name=$1", [name])).rows[0].n !== 0)
+        throw Error(`later_slot_down_left_ledger_row: ${stem}`);
+    } finally { await c.end(); }
+    done.push(name);
+  }
+  return done;
 }
 
 /** runMigrations as the owner login (no shim, no bootstrap). */

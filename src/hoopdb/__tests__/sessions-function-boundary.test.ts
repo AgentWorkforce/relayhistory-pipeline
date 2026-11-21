@@ -22,6 +22,7 @@ import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary
 import { ingestClaimSessionsReader } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions-reader.ts";
 import { ingestOriginClaimFence, originalBodies as originalOriginFenceBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-origin-claim-fence.ts";
 import { turnsSelectionOriginGuard } from "../../../scripts/sessions-function-boundary/lanes/turns-selection-origin-guard.ts";
+import { coordinationAdvisoriesIncarnation, originalBodies as originalAdvisoryBodies } from "../../../scripts/sessions-function-boundary/lanes/coordination-advisories-incarnation.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -97,6 +98,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql",
       "supabase/rollbacks/20261105062060_turns_selection_origin_guard.down.sql",
       "supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql",
+      "supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql",
     ]);
   });
 
@@ -296,6 +298,40 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("a later migration is applied");
     expect(down).toContain("own applied checksum required");
     expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 062220 advisory instance lane owns three SECDEF functions with v1's grants, keeps the three fenced v1 ACLs and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((lane) => lane !== coordinationAdvisoriesIncarnation), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql";
+    expect(withLane.summary.lanes["coordination-advisories-incarnation"]).toEqual({ functions: 3, replaces: 3, grants: 3 });
+    const acl = JSON.parse(withLane.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    const before = JSON.parse(without.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    // Same grants as the v1 siblings, no wider.
+    expect(acl["sessions.coordination_advisories_upsert_v2(text,text,jsonb)"]).toEqual(before["sessions.coordination_advisories_upsert_v1(text,text,jsonb)"]);
+    expect(acl["sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)"]).toEqual(before["sessions.coordination_advisories_ack_v1(text,text,text,text,text)"]);
+    expect(acl["sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)"]).toEqual(before["sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)"]);
+    for (const sig of ["sessions.coordination_advisories_upsert_v1(text,text,jsonb)", "sessions.coordination_advisories_ack_v1(text,text,text,text,text)",
+      "sessions.coordination_advisories_mark_delivered_v1(text,text,text,text,text)"]) expect(acl[sig]).toEqual(before[sig]);
+    const guards = withLane.outputs[GUARDS_PATH]!;
+    expect(guards).toContain('"sessions.coordination_advisories_upsert_v2(text,text,jsonb)"');
+    expect(guards).not.toContain('"sessions.coordination_advisories_ack_v2(');
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, coordinationAdvisoriesIncarnation.migration!), "utf8")).digest("hex"));
+    const original = readFileSync(join(root, "supabase/migrations/20261105062000_coordination_advisories.sql"), "utf8");
+    const bodies = originalAdvisoryBodies(original);
+    expect(bodies.length).toBe(3);
+    for (const b of bodies) {
+      expect(down).toContain(b);
+      expect(original).toContain(b.replace("CREATE OR REPLACE FUNCTION", "CREATE FUNCTION"));
+      expect(b).not.toContain("incarnation");
+    }
+    expect(down).toContain("ALTER TABLE sessions.coordination_advisories DROP COLUMN incarnation;");
+    expect(down).toContain("DROP FUNCTION sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid);");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+    expect(() => originalAdvisoryBodies(original.replace("$coordination_advisories_ack$;", "$coordination_advisories_ack$ ;"))).toThrow(/ack_v1 body missing/);
   });
 
   test("041000 privacy authority: exactly two ingest-callable SECDEF functions; the rollback restores the 010000 mirror and the 040000 lazy bodies verbatim behind its guards", async () => {
