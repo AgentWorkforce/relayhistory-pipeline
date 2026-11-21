@@ -192,3 +192,13 @@ The default output remains byte-identical. Opting in also preserves the legacy
 session bytes: replay does not consume this sidecar yet. Repository claims and
 their availability times are evidence to review, not independently verified
 outcomes or alert-quality proof. See the [capture contract and map format](../src/session-intel/import/action-provenance.md).
+
+`--action-repository-paths` enables a version-2 capture sidecar with nullable
+per-action `repositoryPath`. It reuses the existing `repoRelativePath` and salted
+`scrubPath` policy above, including migration numbers and hot paths, with the same
+salt and private map receipt. A write needs an unambiguous action target inside an
+explicit operator map root; missing/conflicting/projection scope and non-write
+facts have no path. Late map declarations retain their availability time. This
+flag does not alter session bytes, and without it `/1` exports keep their shape.
+The current `/1` action-scope consumer refuses `/2` until its separate adapter
+update; this is capture only, without live or replay integration.

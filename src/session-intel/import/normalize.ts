@@ -429,7 +429,7 @@ const byTs = <T extends { ts: string }>(xs: T[]) => xs.map((x, i) => [x, i] as c
  * timestamp at all. `createdAt` and `lastActivityAt` are the earliest and latest timestamped record, which
  * bound every fact (the M0 loader's createdAt..lastActivityAt rule). The summary and claims stay empty.
  */
-export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Tenant, repositoryRoots: readonly RepositoryRoot[] | RepositoryResolver = []):
+export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Tenant, repositoryRoots: readonly RepositoryRoot[] | RepositoryResolver = [], options: { repositoryPaths?: boolean } = {}):
   { line: Record<string, unknown>; session: SnapshotSession; mapped: MappedSession; provenance?: ActionExport } | null {
   if (!b.first || !b.last) return null;
   const key = b.project ?? projectKey(b.remote, b.cwd);
@@ -443,10 +443,18 @@ export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Ten
   const resolveRoot = typeof repositoryRoots === "function" ? repositoryRoots : repositoryResolver(repositoryRoots);
   let provenanceBytes = 0;
   const scrub = (raw: string) => { const h = scrubPath(raw, hasher); paths[h] = raw; return h; };
+  const encodeRepositoryPath = options.repositoryPaths ? (relative: string, root: string) => {
+    const normalized = repoRelativePath(relative, root);
+    if (!normalized) return null;
+    const encoded = scrubPath(normalized, hasher);
+    if (encoded.length > IMPORT_BOUNDS.path) return null;
+    paths[encoded] = normalized;
+    return encoded;
+  } : undefined;
   const ev = (prefix: string, i: number, at: LineRef, fact?: { ts: string }, kind?: "write" | "commit" | "outcome") => {
     const id = `${prefix}${i + 1}`; events.push([id, at.file, at.line]);
     if (b.captureProvenance && fact && kind) {
-      const action = actionRecord(b.contextFor(fact), { harness: b.harness, sessionId, eventId: id, kind, factAt: fact.ts }, hasher, resolveRoot);
+      const action = actionRecord(b.contextFor(fact), { harness: b.harness, sessionId, eventId: id, kind, factAt: fact.ts }, hasher, resolveRoot, { encodeRepositoryPath });
       provenanceBytes += Buffer.byteLength(JSON.stringify(action.record)) + (action.location ? Buffer.byteLength(JSON.stringify(action.location)) : 0);
       if (provenanceBytes > PROVENANCE_BOUNDS.exportBytes || provenance.records.length >= PROVENANCE_BOUNDS.actions)
         throw new ImportError("action provenance export exceeds its bound; use a smaller explicit input frame");

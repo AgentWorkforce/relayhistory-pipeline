@@ -169,6 +169,9 @@ test("opt-in CLI sidecar is manifest-pinned, private, capture-only and leaves le
   const loaded = await loadSnapshot(out, { now }), body = loaded.extraFiles!["action-provenance.json"]!, parsed = JSON.parse(body);
   expect(loaded.manifest.files["action-provenance.json"]).toBe(sha256Hex(body));
   expect(parsed).toMatchObject({ status: "capture_only", consumedByReplay: false, legacySessionScopeUnchanged: true, deleteBy });
+  expect(parsed.format).toBe("session-intel-action-provenance/1");
+  expect(parsed).not.toHaveProperty("repositoryPathEncoding");
+  expect(parsed.records.every((r: Record<string, unknown>) => !Object.hasOwn(r, "repositoryPath"))).toBe(true);
   expect(parsed.records).toHaveLength(2);
   expect(parsed.sessionsSha256).toBe(loaded.manifest.files["sessions.jsonl"]);
   expect(parsed.implementationSha256).toMatch(/^[a-f0-9]{64}$/u);

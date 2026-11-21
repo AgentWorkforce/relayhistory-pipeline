@@ -133,12 +133,12 @@ export function keepWindow(builders: SessionBuilder[], stats: ImportStats): Sess
 export interface Row { line: string; harness: string; sessionId: string; createdAt: string; lastActivityAt: string; mapped: MappedSession; provenance?: ActionExport }
 
 /** The snapshot lines, sorted; refuses an import in which two source sessions hash to the same id. */
-export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, tenant: Tenant, stats: ImportStats, repositoryRoots: readonly RepositoryRoot[] = []): Row[] {
+export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, tenant: Tenant, stats: ImportStats, repositoryRoots: readonly RepositoryRoot[] = [], options: { repositoryPaths?: boolean } = {}): Row[] {
   const rows: Row[] = [];
   const resolveRoot = repositoryResolver(repositoryRoots);
   const seen = new Set<string>();
   for (const b of builders) {
-    const r = toSnapshotSession(b, hasher, tenant, resolveRoot);
+    const r = toSnapshotSession(b, hasher, tenant, resolveRoot, options);
     if (!r) continue;
     const line = JSON.stringify(r.line);
     if (Buffer.byteLength(line) > IMPORT_BOUNDS.lineBytes) { stats.oversizeSessions++; continue; }
@@ -157,6 +157,7 @@ export function buildRows(builders: Iterable<SessionBuilder>, hasher: Hasher, te
 const OPTIONS = {
   format: { type: "string" }, in: { type: "string" }, out: { type: "string" }, "salt-file": { type: "string" }, "salt-stdin": { type: "boolean" },
   "action-provenance": { type: "boolean" }, "repository-map": { type: "string" },
+  "action-repository-paths": { type: "boolean" },
   "delete-by": { type: "string" }, org: { type: "string" }, workspace: { type: "string" },
 } as const;
 
@@ -192,7 +193,8 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (isInside(input, out) || isInside(out, input)) throw new ImportError("--out and --in must not contain each other");
   const salt = fromStdin ? await readSaltStdin(io.stdin ?? process.stdin) : await readSaltFile(values["salt-file"]!, repoRoot);
 
-  const captureProvenance = values["action-provenance"] === true || values["repository-map"] !== undefined;
+  const repositoryPaths = values["action-repository-paths"] === true;
+  const captureProvenance = repositoryPaths || values["action-provenance"] === true || values["repository-map"] !== undefined;
   if (values["repository-map"] !== undefined && !values["repository-map"].trim()) throw new ImportError("--repository-map must name a private file");
   let repositoryMap;
   if (values["repository-map"]) {
@@ -206,7 +208,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   for (let i = 0; i < files.length; i++) await ADAPTERS[format](files[i]!, i, set);
 
   const hasher = new Hasher(salt);
-  const rows = buildRows(keepWindow([...set.byKey.values()], stats), hasher, tenant, stats, repositoryMap?.roots);
+  const rows = buildRows(keepWindow([...set.byKey.values()], stats), hasher, tenant, stats, repositoryMap?.roots, { repositoryPaths });
   if (!rows.length) throw new ImportError("no session with a valid timestamp was found");
   const since = rows.reduce((m, r) => r.createdAt < m ? r.createdAt : m, rows[0]!.createdAt);
   const last = rows.reduce((m, r) => r.lastActivityAt > m ? r.lastActivityAt : m, rows[0]!.lastActivityAt);
@@ -218,7 +220,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
     sessionsSha256: sha256Hex(`${rows.map((r) => r.line).join("\n")}\n`),
     implementationSha256: sha256Hex(["./cli.ts", "./provenance.ts", "./normalize.ts", "./adapters.ts", "./code-mode.ts", "./git.ts", "./io.ts", "./writer.ts", "./action-provenance.md", "../replay/snapshot.ts", "../replay/util.ts", "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts"]
       .map((name) => sha256Hex(readFileSync(new URL(name, import.meta.url)))).join("\n")),
-  }) : null;
+  }, { repositoryPaths }) : null;
   const { mapping } = await writeImport({
     out, lines: rows.map((r) => r.line), window: { since, until }, deleteBy, now,
     ...(actions ? { extraFiles: { "action-provenance.json": actions.body } } : {}),
@@ -234,6 +236,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   if (stats.codexCodeModeShellUnparsed)
     io.err(`import: warning: ${stats.codexCodeModeShellUnparsed} Codex code-mode calls had unsupported or bounded-out shell syntax; commit coverage is incomplete`);
   if (actions) io.err("import: action provenance is capture-only; repository claims are not independently verified and existing replay does not consume this sidecar");
+  if (repositoryPaths) io.err("import: version-2 action repository paths are capture-only; the version-1 action-scope consumer refuses them until its separate adapter update");
   // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);

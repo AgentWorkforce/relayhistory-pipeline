@@ -2,10 +2,13 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { posix } from "node:path";
-import { ImportError, type LineRef } from "./normalize.ts";
+import { ImportError, IMPORT_BOUNDS, type LineRef } from "./normalize.ts";
 import { isoTime, isRecord, onlyKeys, sha256Hex, textCompare } from "../replay/util.ts";
 
 export const PROVENANCE_FORMAT = "session-intel-action-provenance/1";
+export const PROVENANCE_PATH_FORMAT = "session-intel-action-provenance/2";
+/** Names the existing M4 import policy, not a different path vocabulary. */
+export const REPOSITORY_PATH_ENCODING = "m4-import-salted-segments/1";
 export const PROVENANCE_BOUNDS = { command: 64 * 1024, tokens: 4096, mapBytes: 2 * 1024 * 1024, roots: 10_000, exportBytes: 16 * 1024 * 1024, captureBytes: 16 * 1024 * 1024, actions: 100_000 } as const;
 export type DirectorySource = "tool_workdir" | "session_cwd" | "record_cwd" | "generic_event" | "code_mode_projection" | "unknown";
 export interface ActionContext {
@@ -29,6 +32,8 @@ export interface ActionRecord {
   repository: string | null; repositoryTarget: string | null; repositoryBasis: "operator_declared" | "trace_declared" | "unattributed" | "conflicting_claims";
   repositoryClaims: Array<{ repository: string; basis: "operator_declared" | "trace_declared"; availableAt: string }>;
   availableAt: string; repositoryHint: string | null;
+  /** /2 only: the existing import's repoRelativePath + scrubPath vocabulary. Null means unavailable. */
+  repositoryPath?: string | null;
 }
 export interface PrivateActionLocation { directory: string | null; startingDirectory: string | null; target: string | null; repository: string | null; source: LineRef; output: LineRef | null; claims: Array<{ repository: string; basis: "operator_declared" | "trace_declared"; observedAt: string }> }
 export interface CaptureBudget { sizes: WeakMap<object, number>; count: number; bytes: number }
@@ -205,7 +210,8 @@ export function actionContext(directory: unknown, source: DirectorySource, at: L
 
 /** No status here means independently verified: these are explicit operator/trace claims only. */
 export function actionRecord(context: ActionContext | null, identity: Pick<ActionRecord, "harness" | "sessionId" | "eventId" | "kind" | "factAt">,
-  hasher: { location(domain: "record" | "directory" | "target" | "repository-target" | "basename-hint", value: string): string; repo(value: string): string }, roots: readonly RepositoryRoot[] | RepositoryResolver = []): { record: ActionRecord; location: PrivateActionLocation | null } {
+  hasher: { location(domain: "record" | "directory" | "target" | "repository-target" | "basename-hint", value: string): string; repo(value: string): string }, roots: readonly RepositoryRoot[] | RepositoryResolver = [],
+  options: { encodeRepositoryPath?: (relative: string, root: string) => string | null } = {}): { record: ActionRecord; location: PrivateActionLocation | null } {
   const c = context ?? actionContext(null, "unknown", { file: 0, line: 0 }, identity.factAt);
   const path = c.target ?? c.directory;
   const resolveRoot = typeof roots === "function" ? roots : repositoryResolver(roots);
@@ -220,6 +226,9 @@ export function actionRecord(context: ActionContext | null, identity: Pick<Actio
   const repository = conflict ? null : mapped?.repository ?? declared?.repository ?? null;
   const id = context ? hasher.location("record", JSON.stringify([identity.harness, identity.sessionId, identity.eventId, c.directory, c.startingDirectory, c.target, repository, claims, c.at, c.evidenceRef])) : null;
   const hint = c.directory ? posix.basename(c.directory) : null;
+  const repositoryPath = options.encodeRepositoryPath && identity.kind === "write" && repository && mapped && c.target
+    && c.target !== mapped.directory && contains(mapped.directory, c.target) && c.source !== "code_mode_projection"
+    ? options.encodeRepositoryPath(posix.relative(mapped.directory, c.target), mapped.directory) : null;
   return {
     record: { ...identity, sourceAt: c.observedAt, location: id, effectiveLocation: c.directory ? hasher.location("directory", c.directory) : null, startingLocation: c.startingDirectory ? hasher.location("directory", c.startingDirectory) : null, target: c.target ? hasher.location("target", c.target) : null, source: c.source, reason: c.reason,
       repository: repository ? hasher.repo(repository) : null,
@@ -227,17 +236,22 @@ export function actionRecord(context: ActionContext | null, identity: Pick<Actio
       repositoryBasis: conflict ? "conflicting_claims" : mapped ? "operator_declared" : declared ? "trace_declared" : "unattributed",
       repositoryClaims: claims.map((claim) => ({ repository: hasher.repo(claim.repository), basis: claim.basis, availableAt: claim.observedAt })),
       availableAt: [identity.factAt, c.observedAt, c.evidenceAt ?? c.observedAt, ...claims.map((claim) => claim.observedAt)].sort().at(-1)!,
-      repositoryHint: !repository && hint && hint !== "/" && !/^[A-Za-z]:$/u.test(hint) ? hasher.location("basename-hint", hint) : null },
+      repositoryHint: !repository && hint && hint !== "/" && !/^[A-Za-z]:$/u.test(hint) ? hasher.location("basename-hint", hint) : null,
+      ...(options.encodeRepositoryPath ? { repositoryPath } : {}) },
     location: id ? { directory: c.directory, startingDirectory: c.startingDirectory, target: c.target, repository, source: { ...c.at }, output: c.evidenceRef ? { ...c.evidenceRef } : null, claims } : null,
   };
 }
 
 /** Capture-only extension: existing /1 session records and replay consumers are deliberately untouched. */
-export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: string, repositoryMap: { sha256: string; fingerprint: string } | null, pins: { sessionsSha256: string; implementationSha256: string }) {
+export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: string, repositoryMap: { sha256: string; fingerprint: string } | null, pins: { sessionsSha256: string; implementationSha256: string }, options: { repositoryPaths?: boolean } = {}) {
   const records: ActionRecord[] = [], locations: Record<string, PrivateActionLocation> = Object.create(null);
   let bytes = 0, privateBytes = 0;
   for (const data of exports) {
     for (const record of data.records) {
+      if (Object.hasOwn(record, "repositoryPath") !== (options.repositoryPaths === true))
+        throw new ImportError("action provenance records must match the requested path format");
+      if (options.repositoryPaths && record.repositoryPath !== null && (typeof record.repositoryPath !== "string" || !record.repositoryPath.length || record.repositoryPath.length > IMPORT_BOUNDS.path))
+        throw new ImportError("action provenance repository path exceeds its bound or has an invalid type");
       bytes += Buffer.byteLength(JSON.stringify(record)) + 1;
       if (records.length >= PROVENANCE_BOUNDS.actions || bytes > PROVENANCE_BOUNDS.exportBytes)
         throw new ImportError("action provenance export exceeds its bound; use a smaller explicit input frame");
@@ -253,8 +267,10 @@ export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: strin
       locations[id] = location;
     }
   }
-  const definition = { format: PROVENANCE_FORMAT, rules: "static-action-scope/1", bounds: PROVENANCE_BOUNDS, identity: "repository-origin-claim/1", status: "capture_only", legacySessionScopeUnchanged: true,
-    consumedByReplay: false, trust: "operator-and-trace-claims-not-independent-verification" };
+  const format = options.repositoryPaths ? PROVENANCE_PATH_FORMAT : PROVENANCE_FORMAT;
+  const definition = { format, rules: "static-action-scope/1", bounds: PROVENANCE_BOUNDS, identity: "repository-origin-claim/1", status: "capture_only", legacySessionScopeUnchanged: true,
+    consumedByReplay: false, trust: "operator-and-trace-claims-not-independent-verification",
+    ...(options.repositoryPaths ? { repositoryPathEncoding: REPOSITORY_PATH_ENCODING } : {}) };
   if (![pins.sessionsSha256, pins.implementationSha256].every((pin) => /^[a-f0-9]{64}$/u.test(pin))) throw new ImportError("action provenance requires exact session and implementation digests");
   if (repositoryMap && (!/^[a-f0-9]{64}$/u.test(repositoryMap.sha256) || !/^m_[a-f0-9]{64}$/u.test(repositoryMap.fingerprint)))
     throw new ImportError("action provenance requires a private map digest and salted public fingerprint");
@@ -263,7 +279,7 @@ export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: strin
     unattributed: records.filter((r) => r.repository === null).length, conflictingClaims: records.filter((r) => r.repositoryBasis === "conflicting_claims").length, availableAfterFact: records.filter((r) => r.availableAt > r.factAt).length };
   const body = `${JSON.stringify({ ...definition, ...pins, counts, definitionSha256: sha256Hex(JSON.stringify(definition)), deleteBy, repositoryMapFingerprint: repositoryMap?.fingerprint ?? null, records })}\n`;
   if (Buffer.byteLength(body) > PROVENANCE_BOUNDS.exportBytes) throw new ImportError("action provenance artifact exceeds its bound; use a smaller explicit input frame");
-  const privateMapping = { format: PROVENANCE_FORMAT, repositoryMapSha256: repositoryMap?.sha256 ?? null, locations };
+  const privateMapping = { format, repositoryMapSha256: repositoryMap?.sha256 ?? null, locations };
   if (Buffer.byteLength(JSON.stringify(privateMapping)) > PROVENANCE_BOUNDS.exportBytes)
     throw new ImportError("private action provenance map exceeds its bound; use a smaller explicit input frame");
   return { body, privateMapping };

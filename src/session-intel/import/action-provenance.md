@@ -105,11 +105,58 @@ Arbitrary runtime effects, aliases, shell initialization and historical symlink
 changes are not proved by this static analysis. This is evidence about intent,
 not filesystem success, authorship, merge state or harmful overlap.
 
+## Version 2 repository paths (explicit capture opt-in)
+
+`--action-repository-paths` also enables action provenance and emits
+`session-intel-action-provenance/2` in the same `action-provenance.json` file.
+Every record has a nullable `repositoryPath`; the definition names its encoding
+as `m4-import-salted-segments/1`. This names the existing M4 import normalization,
+not a new path form or scrub rule. Without this flag, both the normal import and
+`--action-provenance`/`--repository-map` exports keep their previous behavior and
+the latter keep the `/1` sidecar shape. A `/1` record cannot carry the new field;
+mixed-format exports fail.
+
+The field is emitted only for a write with an unambiguous repository claim,
+an explicit matching operator-map root, and an individual target strictly inside
+that root. Its root-relative path passes through the existing `repoRelativePath`
+and `scrubPath` functions with the import's same Hasher and salt. Source/migration
+directory names, migration numbers, known hot-path names and allowed extensions
+use the existing closed vocabulary; other segments use the existing 12-hex HMAC.
+For example, `supabase/migrations/0042_add_index.sql` keeps the migration number
+as `supabase/migrations/0042_<12 hex>.sql`. The real T1 detector can read that
+number; no replay adapter is introduced by this capture slice.
+
+The opaque, case-preserving `repositoryTarget` remains the exact target identity.
+The new path follows M4's lowercasing comparison policy, so it is semantic detector
+input, not proof of exact filesystem identity. Different repository roots claiming
+the same repository can produce the same path and target tokens, without probing
+either checkout. A trace-only repository declaration without a map root does not
+provide the new path. Missing/conflicting/projection scope, rejected paths and
+commits/outcomes get null; unsafe paths and encoded paths over the existing
+4,096-character path bound never bypass M4 guards. Availability still includes
+the map's `observedAt`; the new path never backdates an action's evidence.
+
+No new salt, key file or reverse-map file is introduced. The same private mapping
+keeps the hashed path's normalized relative spelling in its existing session
+`paths` map and the action's original target/context in `actionProvenance.locations`.
+The existing mapping receipt binds the snapshot manifest, which pins the sidecar
+and session bytes. The public sidecar uses M4's documented clear-name exceptions
+and hashed segments; arbitrary path spellings stay in the private map. The
+sidecar and private map retain their existing byte/count limits,
+permissions and deletion deadline.
+
+The current `/1` action-scope consumer deliberately refuses a `/2` sidecar rather
+than silently interpreting or dropping the new field. A separately reviewed offline
+per-repository detector adapter will consume it, preserving original session refs
+and claim times. This export does not change production detectors, live capture,
+claims, snapshots, replay, routes or feature gates.
+
 The export is opt-in to preserve the existing CLI contract. Without it, the
 snapshot and private mapping keep their previous shapes. With it, legacy session
 bytes still do not change. The sidecar explicitly says `capture_only`,
-`legacySessionScopeUnchanged: true` and `consumedByReplay: false`. Replay, snapshot
-types and views will consume this evidence in the separately ordered follow-up;
+`legacySessionScopeUnchanged: true` and `consumedByReplay: false`. The separately
+opted-in descriptive patterns consumer supports `/1`; replay, snapshot types and
+views will consume scope evidence in a separately ordered follow-up;
 this slice does not repair their existing session-scope assumptions or establish
 alert quality.
 
