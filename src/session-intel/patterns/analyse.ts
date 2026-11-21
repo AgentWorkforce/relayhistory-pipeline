@@ -188,7 +188,7 @@ export function analyseCorpus(corpus: Corpus, options: AnalysisOptions = {}): Pa
         "Repository rows use per-action operator/trace declarations, not independently verified origins. One session may contribute to several repository rows; do not sum their session counts.",
         "This is retrospective mapping: late scope claims can form candidates but receive no early-warning credit. Production-parity replay does not yet consume action scope.",
         "Missing/conflicting action scope never falls back to session repository/project. Writes need a repository-relative target token; flat code-mode projections cannot provide it.",
-        "Repository rows exclude claims, summaries and session branch metadata: these have no per-action repository binding. Overall/harness coverage still includes them.",
+        "Repository rows exclude claims, summaries and session and write branch metadata: these have no per-action repository binding. Overall/harness coverage still includes them.",
       ] : []),
       "Exploratory pool, not a representative or independently labelled workspace study. Input receipt declarations do not establish workspace completeness.",
       "Write facts are edit intents, not confirmation of filesystem success. Nearby file activity is not proof of duplicate work, conflict or harm.",

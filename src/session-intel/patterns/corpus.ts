@@ -16,11 +16,12 @@ export function buildCorpus(inputs: readonly Snapshot[], options: { sameIdentity
   const scopeRows = new Map<string, string>();
   let tenant: string | undefined, duplicates = 0, facts = 0;
   if (inputs.reduce((n, s) => n + s.sessions.length, 0) > ANALYSIS_BOUNDS.sessions) throw new PatternError("analysis input row budget exceeded");
-  // Charge the entire frame before a sidecar reader builds any per-fact index.
-  for (const input of inputs) for (const s of input.sessions) {
+  const charge = (s: Corpus["sessions"][number]) => {
     facts += s.writes.length + s.commits.length + s.outcomes.length + s.claims.length + s.usage.length + s.summaryTimeline.length;
     if (facts > ANALYSIS_BOUNDS.facts) throw new PatternError("analysis input fact budget exceeded; use a smaller explicit frame");
-  }
+  };
+  // Action mode needs a frame bound before indexing. Legacy keeps its original validation order.
+  if (actionScope) for (const input of inputs) for (const s of input.sessions) charge(s);
   const manifests = new Set<string>();
   for (const input of inputs) {
     if (manifests.has(input.manifestSha256)) throw new PatternError("repeated input manifest");
@@ -38,6 +39,7 @@ export function buildCorpus(inputs: readonly Snapshot[], options: { sameIdentity
       perSession.get(sk)!.push([key, r]);
     }
     for (const s of input.sessions) {
+      if (!actionScope) charge(s);
       const ownTenant = JSON.stringify([s.orgId, s.workspaceId]);
       tenant ??= ownTenant;
       if (tenant !== ownTenant) throw new PatternError("analysis must contain one tenant and workspace");

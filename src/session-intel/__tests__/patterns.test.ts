@@ -2,6 +2,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { analyseCorpus } from "../patterns/analyse.ts";
+import { ANALYSIS_BOUNDS } from "../patterns/types.ts";
 import { buildCorpus } from "../patterns/corpus.ts";
 import { reportMarkdown, reviewQueue } from "../patterns/report.ts";
 import { loadSnapshot, parseSession, type Snapshot } from "../replay/snapshot.ts";
@@ -46,6 +47,24 @@ describe("pattern corpus", () => {
     expect(() => buildCorpus([snapshot([])], { now: new Date("2026-11-10") })).toThrow("deleteBy");
     const a = snapshot([]), b = snapshot([], "c".repeat(64)); b.manifest.window.until = ts("29");
     expect(() => buildCorpus([a, b], { sameIdentitySpace: true, now })).toThrow("same window");
+  });
+  test("flag-off preserves legacy validation order for multiply-invalid inputs", () => {
+    const over = snapshot([s("over")]);
+    // A repeated reference keeps this fixture cheap; the budget counts rows before deduplication.
+    over.sessions[0]!.writes = Array(ANALYSIS_BOUNDS.facts + 1).fill(w("too-many", "01"));
+    const expired = structuredClone(over); expired.manifest.deleteBy = now.toISOString();
+    expect(() => buildCorpus([expired], { now })).toThrow("past deleteBy");
+    expect(() => buildCorpus([expired], { actionScope: true, now })).toThrow("fact budget");
+    const one = snapshot([]), mismatch = structuredClone(over); mismatch.manifestSha256 = "c".repeat(64); mismatch.manifest.window.until = ts("29");
+    expect(() => buildCorpus([one, mismatch], { sameIdentitySpace: true, now })).toThrow("same window");
+    const valid = snapshot([s("same")]), repeated = structuredClone(over); repeated.manifestSha256 = valid.manifestSha256;
+    expect(() => buildCorpus([valid, repeated], { sameIdentitySpace: true, now })).toThrow("repeated input");
+    const firstOver = snapshot([s("bad-tenant", { workspaceId: "another-tenant" })], "d".repeat(64)); firstOver.sessions[0]!.writes = over.sessions[0]!.writes;
+    // Within a session legacy charges before checking its tenant.
+    expect(() => buildCorpus([valid, firstOver], { sameIdentitySpace: true, now })).toThrow("fact budget");
+    const tenantBeforeLaterBudget = snapshot([s("a"), s("bad", { workspaceId: "another-tenant" }), s("later")]);
+    tenantBeforeLaterBudget.sessions[2]!.writes = over.sessions[0]!.writes;
+    expect(() => buildCorpus([tenantBeforeLaterBudget], { now })).toThrow("one tenant");
   });
 });
 
