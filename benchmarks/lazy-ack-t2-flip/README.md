@@ -59,3 +59,49 @@ production success.
 **Uploads:** no failures in any valid cell. Each flip cell's throughput falls between its two controls or above both (C=4, n=500), so no stall can be attributed to failed tries.
 
 **Reading:** under sustained back-to-back load from 4 or more uploaders, a 50000 try-lock rarely finds an instant with no shared holder. Production transactions are longer, so that instant is rarer there.
+
+## Matched main vs T2 (`matched-bench.ts`, `results/matched-*.json`)
+
+Plan:
+- The same tree serves both arms. main = gate off (043800's body); t2 = set_gate('fenced') then set_mode('t2').
+- History is live with no managed scope.
+- 8 workers, fresh n-record batches through the real upload path, 15 s per cell.
+- A fresh database per cell, dropped afterwards.
+- Two rotations in opposite order (`matched-run1-plan.json`).
+- Control: every 500 ms, `sessions.ingest_lazy_clear` (a selection disable for a control user). That is a real control entrypoint, taking ingest_lock_fences and then the seat clock FOR UPDATE, the clock lock control_changed takes. It is not the full ordered-control path.
+- Lock samples: every 50 ms, each ungranted lock, with the waiter's stage and the blockers' stages. transactionid waits are 'attribution unknown'.
+
+Space: the pilot (`matched-pilot.json`) and one full-size sizing cell (`matched-sizing.json`) came first. Peak database 200-274 MB and WAL ≤ 419 MB per cell. Free space never went below 2.37 GB; the stop threshold was 1.2 GB.
+
+Durable records/s, counted from committed rows; each cell's figure is listed in run order:
+
+| n | main | t2 |
+|---|---|---|
+| 500 | 3942, 3378 | 4751, 3782 |
+| 250 | 3873, 3947 | 4927, 4377 |
+
+Uploads: every attempted record was committed in both arms. There were zero claim, prepare or commit failures.
+
+Upload latency p95 (the number in brackets is how many deliveries are at or above it):
+
+| n | main | t2 |
+|---|---|---|
+| 500 | 1859 (7), 2448 (6) | 1342 (8), 2195 (6) |
+| 250 | 1019 (12), 1268 (13) | 678 (16), 796 (14) |
+
+**Control: a large T2 regression.** The lazy_clear control completed far less often per 15 s cell, and each completion took much longer:
+
+| | main | t2 |
+|---|---|---|
+| Completions per cell | 7-9 | 1-2 |
+| Wait per completion | p50 0.8-1.8 s, max 4.3 s | 8.9-14.9 s |
+
+One t2 attempt timed out (55P03).
+
+Lock samples:
+- main: commits queue on the seat clock row (tuple ExclusiveLock on sessions.ingest_receipt_seat_clock), and the control waits in that same queue.
+- t2: no clock tuple queue. Commits wait on transactionid behind other commits (the NO KEY UPDATE upgrade). The control waits on transactionid behind commits almost every sample.
+
+Reading: the control's FOR UPDATE must wait for every KEY SHARE holder, and under t2 each commit holds KEY SHARE through its planning. New KEY SHARE lockers join the existing share lock instead of queueing behind the waiting FOR UPDATE, so the control starves while commits overlap. This is the clock-control starvation the 062210 header names, measured here.
+
+This run does not show production magnitudes: the transactions are local and the run had 8 workers. It also does not show the full ordered-control path.

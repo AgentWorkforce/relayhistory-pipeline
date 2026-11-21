@@ -1,0 +1,190 @@
+{
+ "host": "local loopback PostgreSQL 16 (throwaway)",
+ "plan": {
+  "c": 8,
+  "seconds": 15,
+  "stopFreeBytes": 1000000000,
+  "cells": [
+   {
+    "arm": "main",
+    "n": 500
+   }
+  ]
+ },
+ "rows": [
+  {
+   "cell": {
+    "arm": "main",
+    "n": 500
+   },
+   "c": 8,
+   "seconds": 15,
+   "measuredMs": 16031,
+   "history": {
+    "live": true,
+    "managed": 0
+   },
+   "gate": "bulls96.lazy_ack_t2=off",
+   "mode": "main",
+   "attempted": {
+    "batches": 119,
+    "records": 59500
+   },
+   "ok": {
+    "batches": 119
+   },
+   "committedRows": 59500,
+   "durableRecordsPerSec": 3712,
+   "failures": {},
+   "latencyMs": {
+    "n": 119,
+    "p50": {
+     "v": 1050.2,
+     "atOrAbove": 60
+    },
+    "p95": {
+     "v": 1879.8,
+     "atOrAbove": 6
+    },
+    "p99": {
+     "v": 2204.3,
+     "atOrAbove": 2
+    },
+    "max": {
+     "v": 2485.4,
+     "atOrAbove": 1
+    }
+   },
+   "control": {
+    "entrypoint": "sessions.ingest_lazy_clear(selection disable, control user)",
+    "n": 7,
+    "p50": {
+     "v": 1390.1,
+     "atOrAbove": 4
+    },
+    "p95": {
+     "v": 3852.7,
+     "atOrAbove": 1
+    },
+    "max": {
+     "v": 3852.7,
+     "atOrAbove": 1
+    },
+    "failures": {}
+   },
+   "lockSamples": {
+    "ticks": 235,
+    "sampleMs": 50,
+    "top": [
+     [
+      "commit | transactionid ShareLock | attribution unknown | blocked by commit",
+      183
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+control-lazy_clear",
+      137
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+control-lazy_clear",
+      132
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+control-lazy_clear",
+      120
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by control-lazy_clear",
+      111
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit",
+      106
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit",
+      81
+     ],
+     [
+      "control-lazy_clear | transactionid ShareLock | attribution unknown | blocked by claim",
+      80
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit+control-lazy_clear",
+      62
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit",
+      50
+     ],
+     [
+      "control-lazy_clear | transactionid ShareLock | attribution unknown | blocked by commit",
+      32
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit",
+      27
+     ],
+     [
+      "control-lazy_clear | tuple AccessExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit",
+      22
+     ],
+     [
+      "control-lazy_clear | tuple AccessExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit",
+      18
+     ],
+     [
+      "control-lazy_clear | tuple AccessExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit",
+      12
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit+commit",
+      6
+     ],
+     [
+      "control-lazy_clear | tuple AccessExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit",
+      6
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by -",
+      5
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit+commit+control-lazy_clear",
+      5
+     ],
+     [
+      "control-lazy_clear | tuple AccessExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit+commit",
+      4
+     ],
+     [
+      "claim | extend ExclusiveLock | extend | blocked by -",
+      3
+     ],
+     [
+      "commit | transactionid ShareLock | attribution unknown | blocked by -",
+      3
+     ],
+     [
+      "commit | tuple ExclusiveLock | sessions.ingest_receipt_seat_clock | blocked by commit+commit+commit+commit+commit+commit",
+      2
+     ],
+     [
+      "commit | transactionid ShareLock | attribution unknown | blocked by control-lazy_clear",
+      2
+     ],
+     [
+      "claim | extend ExclusiveLock | extend | blocked by commit",
+      2
+     ]
+    ]
+   },
+   "space": {
+    "freeStart": 2937237504,
+    "minFree": 2521579520,
+    "peakDbBytes": 218086423,
+    "peakWalBytes": 301989888,
+    "stoppedForSpace": false
+   }
+  }
+ ]
+}

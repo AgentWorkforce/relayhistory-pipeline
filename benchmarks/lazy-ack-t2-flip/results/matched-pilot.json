@@ -1,0 +1,187 @@
+{
+ "host": "local loopback PostgreSQL 16 (throwaway)",
+ "plan": {
+  "c": 2,
+  "seconds": 8,
+  "cells": [
+   {
+    "arm": "main",
+    "n": 50
+   },
+   {
+    "arm": "t2",
+    "n": 50
+   }
+  ]
+ },
+ "rows": [
+  {
+   "cell": {
+    "arm": "main",
+    "n": 50
+   },
+   "c": 2,
+   "seconds": 8,
+   "measuredMs": 8149,
+   "history": {
+    "live": true,
+    "managed": 0
+   },
+   "gate": "bulls96.lazy_ack_t2=off",
+   "mode": "main",
+   "attempted": {
+    "batches": 417,
+    "records": 20850
+   },
+   "ok": {
+    "batches": 417
+   },
+   "committedRows": 20850,
+   "durableRecordsPerSec": 2558,
+   "failures": {},
+   "latencyMs": {
+    "n": 417,
+    "p50": {
+     "v": 37.6,
+     "atOrAbove": 209
+    },
+    "p95": {
+     "v": 44.6,
+     "atOrAbove": 21
+    },
+    "p99": {
+     "v": 59.8,
+     "atOrAbove": 5
+    },
+    "max": {
+     "v": 96.4,
+     "atOrAbove": 1
+    }
+   },
+   "control": {
+    "entrypoint": "sessions.ingest_lazy_clear(selection disable, control user)",
+    "n": 15,
+    "p50": {
+     "v": 8.9,
+     "atOrAbove": 8
+    },
+    "p95": {
+     "v": 26.7,
+     "atOrAbove": 1
+    },
+    "max": {
+     "v": 26.7,
+     "atOrAbove": 1
+    },
+    "failures": {}
+   },
+   "lockSamples": {
+    "ticks": 153,
+    "sampleMs": 50,
+    "top": [
+     [
+      "commit | transactionid ShareLock | attribution unknown | blocked by commit",
+      1
+     ],
+     [
+      "control-lazy_clear | transactionid ShareLock | attribution unknown | blocked by claim",
+      1
+     ]
+    ]
+   },
+   "space": {
+    "freeStart": 2982084608,
+    "minFree": 2827902976,
+    "peakDbBytes": 98130967,
+    "peakWalBytes": 134217728,
+    "stoppedForSpace": false
+   }
+  },
+  {
+   "cell": {
+    "arm": "t2",
+    "n": 50
+   },
+   "c": 2,
+   "seconds": 8,
+   "measuredMs": 8133,
+   "history": {
+    "live": true,
+    "managed": 0
+   },
+   "gate": "bulls96.lazy_ack_t2=fenced",
+   "mode": "t2",
+   "attempted": {
+    "batches": 399,
+    "records": 19950
+   },
+   "ok": {
+    "batches": 399
+   },
+   "committedRows": 19950,
+   "durableRecordsPerSec": 2453,
+   "failures": {},
+   "latencyMs": {
+    "n": 399,
+    "p50": {
+     "v": 39.9,
+     "atOrAbove": 200
+    },
+    "p95": {
+     "v": 47.9,
+     "atOrAbove": 20
+    },
+    "p99": {
+     "v": 56,
+     "atOrAbove": 4
+    },
+    "max": {
+     "v": 62,
+     "atOrAbove": 1
+    }
+   },
+   "control": {
+    "entrypoint": "sessions.ingest_lazy_clear(selection disable, control user)",
+    "n": 12,
+    "p50": {
+     "v": 16.4,
+     "atOrAbove": 6
+    },
+    "p95": {
+     "v": 800.4,
+     "atOrAbove": 1
+    },
+    "max": {
+     "v": 800.4,
+     "atOrAbove": 1
+    },
+    "failures": {}
+   },
+   "lockSamples": {
+    "ticks": 153,
+    "sampleMs": 50,
+    "top": [
+     [
+      "control-lazy_clear | transactionid ShareLock | attribution unknown | blocked by commit",
+      17
+     ],
+     [
+      "control-lazy_clear | transactionid ShareLock | attribution unknown | blocked by claim",
+      12
+     ],
+     [
+      "commit | transactionid ShareLock | attribution unknown | blocked by commit",
+      6
+     ]
+    ]
+   },
+   "space": {
+    "freeStart": 2931253248,
+    "minFree": 2833276928,
+    "peakDbBytes": 93174807,
+    "peakWalBytes": 134217728,
+    "stoppedForSpace": false
+   }
+  }
+ ]
+}
