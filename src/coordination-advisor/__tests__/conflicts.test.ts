@@ -9,7 +9,7 @@ import { buildJudgeInput } from "../../session-intel/conflict/classify.ts";
 import { conflictCandidates } from "../../session-intel/conflict/candidates.ts";
 import { ruleClassify } from "../../session-intel/conflict/judges.ts";
 import {
-  conflictAdvisoryId, liveConflictAdvisories, liveSessions, mergeConflicts, parseClaimRows, rowsFor, type ClaimRow, type ConflictAdvisory,
+  claimTimeFor, conflictAdvisoryId, liveConflictAdvisories, liveSessions, mergeConflicts, parseClaimRows, rowsFor, type ClaimRow, type ConflictAdvisory,
 } from "../conflicts.ts";
 import { conflictExcerpts, scrubCleanExcerpt } from "../excerpts.ts";
 import type { Advisory, CandidateLane } from "../rubric.ts";
@@ -76,19 +76,53 @@ describe("the live mapping onto the shared classifier", () => {
 });
 
 describe("a claim shared by both sessions (live)", () => {
-  test("its evidence spans both: agreement, excluded from both sides as shared, never cited", () => {
-    const both = row("c1", "constraint", CV, "owner", { evidence: [
-      { id: 1, source: "claude", session_id: "owner", created_at: at(-60) }, { id: 2, source: "claude", session_id: "actor", created_at: at(-55) },
-    ] });
-    const sessions = liveSessions([cand("owner"), cand("actor")], [lane("actor", [["supabase/migrations/1.sql", -20]])], parseClaimRows([both]), NOW);
-    expect(sessions.map((s) => s.claims.map((c) => c.recordId))).toEqual([["c1"], ["c1"]]);
+  const evidence = (...xs: Array<[string, number]>) => xs.map(([session, min], i) => ({ id: i + 1, source: "claude", session_id: session, created_at: at(min) }));
+  test("a shared intent is agreement: excluded from both sides as shared, never cited", () => {
+    const both = row("i1", "intent", "Add pagination to the list route in supabase/migrations.", "owner", { evidence: evidence(["owner", -60], ["actor", -55]) });
+    const sessions = liveSessions([cand("owner"), cand("actor")], [lane("owner", [["supabase/migrations/0.sql", -40]]), lane("actor", [["supabase/migrations/1.sql", -20]])],
+      parseClaimRows([both]), NOW);
+    expect(sessions.map((s) => s.claims.map((c) => c.recordId))).toEqual([["i1"], ["i1"]]);
     const [c] = conflictCandidates(sessions, NOW).candidates;
     const built = buildJudgeInput(c!, NOW);
     expect([...built.excluded.values()]).toEqual(["shared", "shared"]);
     expect([...built.input.a.claims, ...built.input.b.claims]).toEqual([]);
-    expect(validateCitations(built, { verdict: "constraint_violation", claimIds: ["claude:owner#c1"], actionId: "claude:actor@actor--20" }))
+    expect(validateCitations(built, { verdict: "overlap", claimIds: ["claude:owner#i1", "claude:actor#i1"], actionId: null }))
       .toEqual({ ok: false, reason: "shared" });
     expect(liveConflictAdvisories("ws", sessions, NOW).advisories).toEqual([]);
+  });
+
+  test("the actor restates the owner's constraint (one record) and then writes against it: a HIGH constraint_violation", () => {
+    const both = row("c1", "constraint", CV, "owner", { evidence: evidence(["owner", -60], ["actor", -55]) });
+    const sessions = liveSessions([cand("owner"), cand("actor")], [lane("actor", [["supabase/migrations/1.sql", -20]])], parseClaimRows([both]), NOW);
+    const { advisories } = liveConflictAdvisories("ws", sessions, NOW);
+    expect(advisories.map((a) => [a.kind, a.urgency, a.rows.map((r) => r.recipient.sessionId)])).toEqual([["constraint_violation", "high", ["actor", "owner"]]]);
+  });
+});
+
+describe("a claim's time is per session (H1)", () => {
+  const ev = (session: string, min: number, id = 1) => ({ id, source: "claude", session_id: session, created_at: at(min) });
+  test("the founder keeps observed_at; a session that joined an older record gets its own evidence time", () => {
+    const [r] = parseClaimRows([row("i1", "intent", "x in supabase/migrations", "fnd", { observed_at: at(-50), evidence: [ev("fnd", -45), ev("join", -10, 2), ev("join", -5, 3)] })]);
+    expect(claimTimeFor(r!, "claude", "fnd")).toBe(at(-50));
+    expect(claimTimeFor(r!, "claude", "join")).toBe(at(-10));
+    const s = liveSessions([cand("fnd"), cand("join")], [], [r!], NOW);
+    expect(s.map((x) => [x.session.sessionId, x.claims.map((c) => c.at)])).toEqual([["fnd", [at(-50)]], ["join", [at(-10)]]]);
+    // No observed_at (a decision): created_at for the founder; a joiner still its own evidence.
+    const [d] = parseClaimRows([row("d1", "decision", "y", "fnd", { created_at: at(-40), evidence: [ev("fnd", -40), ev("join", -12, 2)] })]);
+    expect([claimTimeFor(d!, "claude", "fnd"), claimTimeFor(d!, "claude", "join")]).toEqual([at(-40), at(-12)]);
+    // A founder whose own evidence is earlier than the row's time (a replay row built from a joiner first) keeps its own.
+    const [e] = parseClaimRows([row("e1", "intent", "z", "join", { observed_at: at(-10), evidence: [ev("join", -10), ev("fnd", -50, 2)] })]);
+    expect([claimTimeFor(e!, "claude", "fnd"), claimTimeFor(e!, "claude", "join")]).toEqual([at(-50), at(-10)]);
+  });
+
+  test("a write made before the joining session stated the intent is not after its claim: LOW, not HIGH", () => {
+    const decision = row("d1", "decision", "Advisories return 501 when the flag is off in src/advisories.", "own", { topic: "src-advisories", created_at: at(-70),
+      evidence: [ev("own", -70)] });
+    const intent = row("i1", "intent", "Return 404 when the flag is off in src/advisories routes.", "fnd", { topic: "src-advisories", observed_at: at(-60),
+      evidence: [ev("fnd", -60), ev("join", -10, 2)] });
+    const sessions = liveSessions([cand("own"), cand("fnd"), cand("join")], [lane("join", [["src/advisories/route.ts", -30]])], parseClaimRows([decision, intent]), NOW);
+    const byPair = Object.fromEntries(liveConflictAdvisories("ws", sessions, NOW).advisories.map((a) => [a.lanes.map((l) => l.sessionId).sort().join("+"), `${a.kind}/${a.urgency}`]));
+    expect(byPair).toEqual({ "fnd+own": "intent_conflict/low", "join+own": "intent_conflict/low" });
   });
 });
 

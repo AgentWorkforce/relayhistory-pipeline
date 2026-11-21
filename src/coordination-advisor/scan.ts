@@ -15,11 +15,11 @@ import { sessionIntelControls, type SessionIntelControls } from "../shared/sessi
 import type { RelaySender } from "./relay-sender.ts";
 import {
   ADVISOR_DETECTOR_PARAMS, AdvisorLimits, CANDIDATE_WINDOW_MS, highAdvisories, lowAdvisories, orderAdvisories,
-  pairKey, refKey, truncatedStreams, type Advisory, type CandidateLane, type RecentAdvisory, type SessionRef,
+  pairKey, refKey, truncatedStreams, type Advisory, type CandidateLane, type CooldownSource, type RecentAdvisory, type SessionRef,
 } from "./rubric.ts";
 import {
   CLAIMS_LIMIT, CLAIMS_SQL, claimsSince, liveConflictAdvisories, liveSessions, mergeConflicts, parseClaimRows,
-  type ClaimRow, type ConflictAdvisory,
+  type ClaimRow, type ConflictAdvisory, type LiveConflictBounds,
 } from "./conflicts.ts";
 import { conflictExcerpts } from "./excerpts.ts";
 import { advisoryMessage } from "./template.ts";
@@ -179,6 +179,8 @@ export interface ScanDeps {
   sender?: RelaySender;
   /** SESSION_INTEL_CONFLICTS_ENABLED. Absent or false: the scan is exactly as before (no claims read, no conflict code). */
   conflicts?: boolean;
+  /** Overrides the live conflict path's CPU bounds (tests). */
+  conflictBounds?: LiveConflictBounds;
 }
 
 export interface ScanStats {
@@ -189,6 +191,8 @@ export interface ScanStats {
   /** Conflicts on only: conflict advisories found, and workspaces whose conflicts were skipped (fail-open). */
   conflicts?: number;
   conflictsSkipped?: number;
+  /** Advisories skipped because their DM text could not be built; present only when one was. */
+  messageFailed?: number;
 }
 
 const emptyStats = (): ScanStats => ({
@@ -229,31 +233,41 @@ function rowFor(a: Advisory, recipient: SessionRef, peer: SessionRef): AdvisoryR
   };
 }
 
-/** Applies the limits and writes one workspace's advisories; DMs HIGH rows that were newly written. */
-async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Array<Advisory | ConflictAdvisory>, now: number, stats: ScanStats) {
-  // Conflicts on: each advisory is checked against the pair state the tick started with, plus what its OWN source
-  // (the advisor, or the conflict detector) touched this tick. Two sources for one pair in one tick both go through
-  // (a collision and a conflict); within a source the check is exactly today's. Every write touches the pair as
-  // before, so across ticks the cooldown is unchanged. Conflicts off: the live state, as before.
-  const start = deps.conflicts === true ? deps.limits.cooldownSnapshot() : null;
-  const sourceTouched = new Set<string>();
-  const touchedKey = (src: string, urgency: string, pair: string) => `${src}\u0002${urgency}\u0002${pair}`;
-  const inCooldown = (a: Advisory, pair: string) => {
-    if (!start) return deps.limits.inCooldown(pair, a.urgency, now);
-    if (start.inCooldown(pair, a.urgency, now)) return true;
-    if (deps.limits.pairCooldownMs <= 0) return false;
-    const src = "rows" in a ? "conflict" : "advisor";
-    return sourceTouched.has(touchedKey(src, "high", pair)) || (a.urgency === "low" && sourceTouched.has(touchedKey(src, "low", pair)));
-  };
+/** The cooldown source class of an advisory: the conflict detector's rows, or the advisor's (collision and overlap). */
+const sourceOf = (a: Advisory | ConflictAdvisory): CooldownSource => "rows" in a ? "conflict" : "advisor";
+
+/** Applies the limits and writes one workspace's advisories; DMs HIGH rows that were newly written. Exported for tests. */
+export async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advisories: Array<Advisory | ConflictAdvisory>, now: number, stats: ScanStats) {
+  // The pair cooldown is per source class (rubric.ts AdvisorLimits): a conflict row never cools down a collision
+  // or overlap row for the pair, in this tick or a later one, nor the reverse; within a class it is exactly as
+  // before. Conflicts off, every advisory is the advisor's: the cooldown is as it was.
   for (const a of orderAdvisories(advisories)) {
     const pair = pairKey(a.lanes[0], a.lanes[1]);
-    if (inCooldown(a, pair)) { stats.cooldown++; continue; }
-    let attempted = false;
+    const source = sourceOf(a);
+    if (deps.limits.inCooldown(pair, a.urgency, now, source)) { stats.cooldown++; continue; }
     // A conflict advisory names its own rows (a fleet conflict: the orchestrator only; a repo-policy owner: none).
     const rows: ReadonlyArray<readonly [SessionRef, SessionRef]> = "rows" in a
       ? (a as ConflictAdvisory).rows.map((r) => [r.recipient, r.peer] as const)
       : [[a.lanes[0], a.lanes[1]], [a.lanes[1], a.lanes[0]]];
-    for (const [recipient, peer] of rows) {
+    // The DM texts are built before anything is written: an advisory whose text cannot be built (an error in the
+    // template or the excerpts) is skipped and counted, with no row written, and the workspace goes on.
+    let texts: string[] | null = null;
+    if (a.urgency === "high" && deps.sender) {
+      try {
+        texts = rows.map(([recipient, peer]) => advisoryMessage({
+          advisoryId: a.advisoryId, urgency: a.urgency, kind: a.kind, artifact: a.artifact,
+          harness: recipient.harness, sessionId: recipient.sessionId, peerHarness: peer.harness, peerSessionId: peer.sessionId,
+          firstSeen: a.evidence.map((e) => e.ts).sort()[0] ?? new Date(now).toISOString(),
+          ...("rows" in a ? { claimIds: (a as ConflictAdvisory).claimIds, excerpts: conflictExcerpts(a as ConflictAdvisory) } : {}),
+        }));
+      } catch (err) {
+        stats.messageFailed = (stats.messageFailed ?? 0) + 1;
+        log.warn("coordination advisor message failed; advisory skipped", { org_id: orgId, workspace_id: workspaceId, kind: a.kind, ...errorFields(err) });
+        continue;
+      }
+    }
+    let attempted = false;
+    for (const [i, [recipient, peer]] of rows.entries()) {
       if (!deps.limits.underCap(recipient, now)) { stats.capped++; continue; }
       attempted = true;
       let result: UpsertResult;
@@ -270,15 +284,9 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
       if (result.inserted + result.upgraded === 0) { stats.existing++; continue; }
       stats.written++;
       deps.limits.recordSent(recipient, now);
-      if (a.urgency !== "high" || !deps.sender) continue;
-      const text = advisoryMessage({
-        advisoryId: a.advisoryId, urgency: a.urgency, kind: a.kind, artifact: a.artifact,
-        harness: recipient.harness, sessionId: recipient.sessionId, peerHarness: peer.harness, peerSessionId: peer.sessionId,
-        firstSeen: a.evidence.map((e) => e.ts).sort()[0] ?? new Date(now).toISOString(),
-        ...("rows" in a ? { claimIds: (a as ConflictAdvisory).claimIds, excerpts: conflictExcerpts(a as ConflictAdvisory) } : {}),
-      });
+      if (!texts || !deps.sender) continue;
       try {
-        await deps.sender.send({ orgId, workspaceId, to: recipient, text, advisoryId: a.advisoryId });
+        await deps.sender.send({ orgId, workspaceId, to: recipient, text: texts[i]!, advisoryId: a.advisoryId });
       } catch (err) {
         // Not delivered: the row stays pending and the pull path still serves it.
         stats.dmFailed++;
@@ -288,10 +296,7 @@ async function deliver(deps: ScanDeps, orgId: string, workspaceId: string, advis
       stats.dmSent++;
       await deps.store.markDelivered(orgId, workspaceId, a.advisoryId, recipient);
     }
-    if (attempted) {
-      deps.limits.touchPair(pair, a.urgency, now);
-      sourceTouched.add(touchedKey("rows" in a ? "conflict" : "advisor", a.urgency, pair));
-    }
+    if (attempted) deps.limits.touchPair(pair, a.urgency, now, source);
   }
 }
 
@@ -312,8 +317,9 @@ async function seedLimits(deps: ScanDeps, orgId: string, workspaceId: string, no
 /**
  * The workspace's conflict advisories, or null when they are skipped. Fail-open for the advisor: a claims read
  * that fails (any error, including 42883 when 062150 is not applied), a read that may be cut (CLAIMS_LIMIT rows),
- * truncated facts, or any error in the conflict code skips conflicts for this workspace with a counted warning;
- * the collision and overlap rows go on.
+ * truncated facts, a workspace over the live path's CPU bounds (conflicts.ts CONFLICT_MAX_INPUTS and
+ * CONFLICT_STEP_BUDGET), or any error in the conflict code skips conflicts for this workspace with a counted
+ * warning; the collision and overlap rows go on.
  */
 async function workspaceConflicts(deps: ScanDeps, orgId: string, workspaceId: string, since: Date, now: Date,
   lanes: CandidateLane[], live: Parameters<typeof liveSessions>[1], factsTruncated: boolean, stats: ScanStats): Promise<ConflictAdvisory[] | null> {
@@ -333,7 +339,9 @@ async function workspaceConflicts(deps: ScanDeps, orgId: string, workspaceId: st
   }
   if (claims.length >= CLAIMS_LIMIT) return skip(`claims read truncated at ${CLAIMS_LIMIT}`);
   try {
-    const { advisories } = liveConflictAdvisories(workspaceId, liveSessions(lanes, live, claims, now), now);
+    const result = liveConflictAdvisories(workspaceId, liveSessions(lanes, live, claims, now), now, deps.conflictBounds);
+    if (result.overBudget) return skip(`conflict budget exceeded (${result.overBudget})`);
+    const { advisories } = result;
     stats.conflicts = (stats.conflicts ?? 0) + advisories.length;
     return advisories;
   } catch (err) {

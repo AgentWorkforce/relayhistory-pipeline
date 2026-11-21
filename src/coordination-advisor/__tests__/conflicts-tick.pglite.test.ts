@@ -244,6 +244,26 @@ describe("conflict rows in the advisor tick (pglite, 062150 and 062160 applied)"
     expect(await dup()).toHaveLength(4);
   });
 
+  test("a tick-N conflict does not hold back a collision that first appears in tick N+1 (durable limits through 062070)", async () => {
+    for (const s of ["nx-a", "nx-b"]) await db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, project_id)
+       VALUES ('org',$1,'claude',$2,$3,$4,'proj-nx')`, [WS, s, at(-120), at(-5)]);
+    await claim([{ kind: "constraint", scope: "project", topic: "supabase-migrations", title: "Hold nx migrations", statement: CV,
+      observed_at: at(-50), evidence: [ev("nx-a")] }]);
+    let second = false;
+    const withNx = () => [...facts(), lane("nx-a", "proj-nx", second ? [["supabase/migrations/062171_nx.sql", -1]] : []),
+      lane("nx-b", "proj-nx", [["supabase/migrations/062171_nx.sql", -20]])];
+    const limits = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 10 });
+    const run = (now: Date) => scanOnce({ workspaces: "*", store: sqlAdvisorStore(asService(db)), backend: backend(withNx), conflicts: true, limits,
+      sender: new ContractRelayFake() }, now);
+    const nx = async () => (await rows()).filter((r) => r.session_id.startsWith("nx-")).map((r) => `${r.session_id}/${r.kind}/${r.urgency}`);
+    await run(NOW);
+    expect(await nx()).toEqual(["nx-a/constraint_violation/high", "nx-b/constraint_violation/high"]);
+    second = true;
+    expect(await run(new Date(NOW.getTime() + 2 * 60_000))).toMatchObject({ failed: 0 });
+    expect(await nx()).toEqual(["nx-a/constraint_violation/high", "nx-a/duplicate_work/high", "nx-b/constraint_violation/high", "nx-b/duplicate_work/high"]);
+  });
+
   test("the cooldown and the per-recipient cap hold for conflict rows", async () => {
     const limits = new AdvisorLimits({ pairCooldownMs: 6 * 3_600_000, sessionHourlyCap: 10 });
     await scan({ limits });

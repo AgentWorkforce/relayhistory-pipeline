@@ -37,6 +37,11 @@ export interface JudgeClaim {
   evidenceIds: string[];
   /** The pair's shared topics this claim names. Never empty: off-topic claims are not in the input. */
   topics: string[];
+  /**
+   * Present (true) on a stored claim both sessions hold (one recordId): a shared propagating constraint, the only
+   * shared claim kept in the input. Citable only as the constraint of a constraint_violation.
+   */
+  shared?: true;
 }
 
 export interface JudgeAction {
@@ -69,8 +74,12 @@ export interface PairJudge {
   judge(input: JudgeInput): Promise<JudgeOutput>;
 }
 
-/** Why a live-or-not claim was kept out of the judge's input. */
-/** `shared`: the same stored claim (one recordId) is held by both sessions: that is agreement, never a conflict. */
+/**
+ * Why a live-or-not claim was kept out of the judge's input. `shared`: the same stored claim (one recordId) is
+ * held by both sessions: that is agreement, never an intent_conflict or an overlap. A shared propagating
+ * constraint is the exception: it stays in the input (JudgeClaim.shared), because a session that
+ * restates a constraint and then writes against it still violates it.
+ */
 export type ExclusionReason = "superseded" | "session_scope" | "off_topic" | "shared";
 
 export interface BuiltInput { input: JudgeInput; excluded: Map<string, ExclusionReason> }
@@ -94,8 +103,10 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
     return m;
   };
   const knownA = known(c.a), knownB = known(c.b);
-  // A stored claim whose evidence spans both sessions appears on both sides with one recordId: it is left out of
-  // both, so it can never be cited (it would be a self-conflict in disguise, or an "overlap" with itself).
+  // A stored claim whose evidence spans both sessions appears on both sides with one recordId. An intent or a
+  // decision is left out of both, so it can never be cited (it would be a self-conflict in disguise, or an
+  // "overlap" with itself). A propagating constraint stays on both sides, marked shared: it may be cited only as
+  // the constraint of a violation (validateCitations), never in an intent_conflict or an overlap.
   const records = (v: ConflictCandidate["a"]) => new Set(v.claims.filter((cl) => cl.recordId !== undefined && isLiveClaim(cl, nowIso)).map((cl) => cl.recordId!));
   const recA = records(c.a), recB = records(c.b);
   const shared = new Set([...recA].filter((r) => recB.has(r)));
@@ -107,11 +118,13 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
     for (const cl of v.claims) {
       const id = claimRef(ref, cl.id);
       if (!isLiveClaim(cl, nowIso)) { if (cl.at < nowIso) excluded.set(id, "superseded"); continue; }
-      if (cl.recordId !== undefined && shared.has(cl.recordId)) { excluded.set(id, "shared"); continue; }
+      const isShared = cl.recordId !== undefined && shared.has(cl.recordId);
+      if (isShared && (cl.kind !== "constraint" || cl.scope === "session")) { excluded.set(id, "shared"); continue; }
       if (cl.kind === "constraint" && cl.scope === "session") { excluded.set(id, "session_scope"); continue; }
       const mine = topicsOfClaim(cl, otherKnown).filter((t) => topics.has(t)).sort(textCompare);
-      if (!mine.length) { excluded.set(id, "off_topic"); continue; }
-      claims.push({ id, side: name, kind: cl.kind, scope: cl.scope, text: cl.text, at: cl.at, evidenceIds: [...cl.evidenceIds], topics: mine });
+      if (!mine.length) { excluded.set(id, isShared ? "shared" : "off_topic"); continue; }
+      claims.push({ id, side: name, kind: cl.kind, scope: cl.scope, text: cl.text, at: cl.at, evidenceIds: [...cl.evidenceIds], topics: mine,
+        ...(isShared ? { shared: true as const } : {}) });
     }
     const actions: JudgeAction[] = [];
     for (const w of v.writes) {
@@ -129,7 +142,10 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
     const seen = new Set<string>();
     const unique = actions.filter((x) => !seen.has(x.id) && (seen.add(x.id), true))
       .sort((x, y) => textCompare(x.ts, y.ts) || textCompare(x.id, y.id));
-    claims.sort((x, y) => textCompare(x.at, y.at) || textCompare(x.id, y.id));
+    // Shared claims last, so a judge that cites a side's earliest claim (the rule judge's overlap) cites the same
+    // claim it would with the shared one absent.
+    const sharedRank = (x: JudgeClaim) => x.shared ? 1 : 0;
+    claims.sort((x, y) => sharedRank(x) - sharedRank(y) || textCompare(x.at, y.at) || textCompare(x.id, y.id));
     return { ref, claims, actions: unique };
   };
   return { input: { topics: [...c.topics], fleet: c.fleet, a: side("a"), b: side("b") }, excluded };
@@ -137,12 +153,16 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
 
 /**
  * Whether any valid citation is possible: claims on both sides, or a propagating constraint on one side and an
- * action on the other. When not, no judge is asked (and no model budget is spent).
+ * action on the other. When not, no judge is asked (and no model budget is spent). A shared claim
+ * (JudgeClaim.shared) counts only as a constraint: claims on both sides means unshared claims on both sides, or a
+ * constraint on one side and an intent or decision on the other.
  */
 export function citable(input: JudgeInput): boolean {
-  if (input.a.claims.length && input.b.claims.length) return true;
+  const own = (s: JudgeSide) => s.claims.some((c) => !c.shared);
+  if (own(input.a) && own(input.b)) return true;
   const constraint = (s: JudgeSide) => s.claims.some((c) => c.kind === "constraint");
-  return (constraint(input.a) && input.b.actions.length > 0) || (constraint(input.b) && input.a.actions.length > 0);
+  const target = (s: JudgeSide) => s.actions.length > 0 || s.claims.some((c) => c.kind !== "constraint" && !c.shared);
+  return (constraint(input.a) && target(input.b)) || (constraint(input.b) && target(input.a));
 }
 
 export type VetoReason =
@@ -227,7 +247,8 @@ export function validateCitations(built: BuiltInput, out: JudgeOutput): Validate
     if (action && action.ts < constraint.at) return { ok: false, reason: "action_before_constraint" };
     return { ok: true, verdict: out.verdict, c: { verdict: out.verdict, claims, action, constraint } };
   }
-  // intent_conflict and overlap: exactly one claim from each side.
+  // intent_conflict and overlap: exactly one claim from each side, neither of them shared (agreement).
+  if (claims.some((c) => c.shared)) return { ok: false, reason: "shared" };
   if (claims.length !== 2 || claims[0]!.side === claims[1]!.side) return { ok: false, reason: claims.length === 2 ? "self_conflict" : "bad_citation" };
   if (out.verdict === "intent_conflict") {
     if (claims.some((c) => c.kind === "constraint")) return { ok: false, reason: "bad_citation" };

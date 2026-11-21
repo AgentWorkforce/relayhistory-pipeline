@@ -47,20 +47,50 @@ describe("live wiring in replay", () => {
     expect(ctlOff.alerts.some((a) => isConflictKind(a.kind))).toBe(false);
   });
 
-  test("a claim shared by both sessions (one recordId) is agreement: no conflict, live or offline", async () => {
-    const t = (hm: string) => `2026-11-01T${hm}:00.000Z`;
-    const constraint = (recordId: string) => ({ id: "k1", at: t("09:10"), kind: "constraint", scope: "project", recordId,
+  const t = (hm: string) => `2026-11-01T${hm}:00.000Z`;
+  const conflicts = (r: Awaited<ReturnType<typeof replaySnapshot>>) =>
+    r.alerts.filter((a) => isConflictKind(a.kind)).map((a) => `${a.detector} ${a.pair.join("+")} ${a.kind} ${a.urgency} ${a.sentAt.slice(11, 16)}`).sort();
+  const both = (r: Awaited<ReturnType<typeof replaySnapshot>>) => {
+    const all = conflicts(r);
+    const of = (d: string) => all.filter((x) => x.startsWith(`${d} `)).map((x) => x.slice(d.length + 1));
+    expect(of("coordination-advisor")).toEqual(of("conflict-rule"));
+    return of("conflict-rule");
+  };
+  const run = async (sessions: unknown[]) => replaySnapshot(await loadSnapshot(writeSnapshot(tmp(), sessions), { now: new Date("2026-11-18T00:00:00Z") }),
+    { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
+  const usage = (id: string) => [{ ts: t("09:05"), eventId: `u-${id}`, tokens: 1, costUsdMicros: 1 }];
+
+  test("a shared intent (one recordId) is agreement: no conflict, live or offline; a shared constraint written against is a violation", async () => {
+    const intent = (recordId: string, hm: string) => ({ id: "i1", at: t(hm), kind: "intent", scope: "project", recordId,
+      text: "Add pagination to the list route in src/catalog.", confidence: 1, evidenceIds: ["e1"] });
+    const pair = (recB: string) => run([
+      session("own", { usage: usage("own"), writes: [{ path: "src/catalog/list.ts", ts: t("09:20"), eventId: "w0", kind: "tool_result", branch: null }],
+        claims: [intent("rec-1", "09:10")] }),
+      session("act", { writes: [{ path: "src/catalog/page.ts", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }], claims: [intent(recB, "09:12")] }),
+    ]);
+    expect(both(await pair("rec-1"))).toEqual([]);
+    expect(both(await pair("rec-2"))).toEqual(["claude:act+claude:own overlap low 09:14"]);
+    // The constraint restated by the writer (one record) is still broken by its later write.
+    const constraint = (hm: string) => ({ id: "k1", at: t(hm), kind: "constraint", scope: "project", recordId: "rec-k",
       text: "No new migrations under supabase/migrations until the 062 renumber lands.", confidence: 1, evidenceIds: ["e1"] });
-    const mk = (recordB: string) => loadSnapshot(writeSnapshot(tmp(), [
-      session("own", { usage: [{ ts: t("09:05"), eventId: "u1", tokens: 1, costUsdMicros: 1 }], claims: [constraint("rec-1")] }),
-      session("act", { writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }],
-        claims: [{ ...constraint(recordB), at: t("09:12") }] }),
-    ]), { now: new Date("2026-11-18T00:00:00Z") });
-    const conflicts = (r: Awaited<ReturnType<typeof replaySnapshot>>) => r.alerts.filter((a) => isConflictKind(a.kind)).map((a) => `${a.detector} ${a.kind}`);
-    const shared = await replaySnapshot(await mk("rec-1"), { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
-    expect(conflicts(shared)).toEqual([]);
-    // Control: the same claims as two different records do conflict (the holder's constraint, the other's write).
-    const apart = await replaySnapshot(await mk("rec-2"), { detectors: [advisorDetector({ conflicts: true }), ruleConflictDetector()] });
-    expect(conflicts(apart)).toEqual(expect.arrayContaining(["conflict-rule constraint_violation", "coordination-advisor constraint_violation"]));
+    const r = await run([
+      session("own", { usage: usage("own"), claims: [constraint("09:10")] }),
+      session("act", { writes: [{ path: "supabase/migrations/062140_x.sql", ts: t("09:40"), eventId: "w1", kind: "tool_result", branch: null }], claims: [constraint("09:12")] }),
+    ]);
+    expect(both(r)).toEqual(["claude:act+claude:own constraint_violation high 09:42"]);
+  });
+
+  test("three sessions, one record: a session that joined an older intent is timed by its own claim, live and offline", async () => {
+    // fnd states the intent at 09:20; join wrote at 09:30 and joins the same record at 10:00. join's write came
+    // before its intent, so (join, own) is a LOW intent_conflict, not a HIGH.
+    const intent = (hm: string) => ({ id: "i1", at: t(hm), kind: "intent", scope: "project", recordId: "rec-i",
+      text: "Return 404 when the flag is off in src/advisories routes.", confidence: 1, evidenceIds: [`e-${hm}`] });
+    const r = await run([
+      session("own", { usage: usage("own"), claims: [{ id: "d1", at: t("09:15"), kind: "decision", scope: "project",
+        text: "Advisories return 501 when the flag is off in src/advisories.", confidence: 1, evidenceIds: ["e-d"] }] }),
+      session("fnd", { usage: usage("fnd"), claims: [intent("09:20")] }),
+      session("join", { writes: [{ path: "src/advisories/route.ts", ts: t("09:30"), eventId: "w1", kind: "tool_result", branch: null }], claims: [intent("10:00")] }),
+    ]);
+    expect(both(r)).toEqual(["claude:fnd+claude:own intent_conflict low 09:22", "claude:join+claude:own intent_conflict low 10:02"]);
   });
 });
