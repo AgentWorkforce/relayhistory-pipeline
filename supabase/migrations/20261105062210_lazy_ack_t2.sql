@@ -32,10 +32,13 @@
 -- and fenced mode refuses anything but READ COMMITTED BEFORE reading it (a REPEATABLE READ snapshot taken before a flip
 -- could still see the old mode). Compatibility consequence: with proconfig 'fenced', a non-READ COMMITTED commit fails
 -- 55000 in either mode; the Worker and self-host run read committed. Initial transition: off -> fenced changes nothing
--- while the row says 'main'. Operator: src/session-ingest/lazy-ack-t2-flip.ts retries with bounded backoff, one
--- autocommit statement per attempt, and returns "no_switch" (mode unchanged) when its budget runs out; it never
--- falls back to waiting. Never flip during an operator erase (same key). The ALTER, the flip and the apply are
--- real-database operations and Khaliq's own decisions.
+-- while the row says 'main'. Operator: src/session-ingest/lazy-ack-t2-flip.ts, ONE bounded attempt sequence per
+-- operator action in a naturally quiet window, one autocommit statement per attempt. Exhausted: no switch (mode
+-- unchanged). Reply lost: indeterminate; reconcile before any further attempt. No queued fallback, no admission stop,
+-- no automatic repeat. Under sustained concurrent uploads the try-lock rarely finds a free instant (local bench), and
+-- that applies equally to flipping BACK to main: rolling the mode back is not immediate. The down migration refuses
+-- unless the mode is 'main' and the gate is not 'fenced'. Never flip during an operator erase (same key). The ALTER,
+-- the flip, the rollback and the apply are real-database operations and Khaliq's own decisions.
 --
 -- Mode 't2', exactly:
 --   prefix as main up to the clock; the clock FOR KEY SHARE (not NO KEY UPDATE); origin lock, stage row, attempt

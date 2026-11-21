@@ -273,6 +273,32 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     expect(src.split("lazy_ack_t2_mode").length - 1).toBe(2); // the locking read and the UPDATE, both after the try-lock
     expect(src).not.toMatch(/pg_advisory_xact_lock\(|pg_advisory_lock\(|lock_timeout/);
   });
+  test("the down refuses unless the mode is main and the gate is not fenced; then restores 043800 exactly", async () => {
+    const f = await fixture();
+    const { readFileSync } = await import("node:fs");
+    const DOWN = readFileSync("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql", "utf8");
+    // The PGlite fixture has no migrator ledger: a minimal one with this file's own checksum, as the real migrator records it.
+    const sha = (await import("node:crypto")).createHash("sha256").update(readFileSync(MIG, "utf8")).digest("hex");
+    // (the fixture's marker table, privacy-authority-support.ts, lacks the updated_at the real one has)
+    await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL);
+      ALTER TABLE sessions.__96bulls_role_validation ADD COLUMN IF NOT EXISTS updated_at timestamptz`);
+    await f.db.query("INSERT INTO sessions.__96bulls_migrations VALUES('upstream:20261105062210_lazy_ack_t2.sql',$1)", [sha]);
+    const attempt = async () => { const e = await f.db.exec(DOWN).then(() => null, (x: any) => x); if (e) await f.db.exec("ROLLBACK"); return e; };
+    const alter = (v: string) => f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`);
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
+    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
+    await alter("fenced");
+    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
+    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the gate is fenced") });
+    expect(await f.db.query<any>("SELECT to_regclass('sessions.lazy_ack_t2_mode') r").then((r) => r.rows[0].r)).toBe("sessions.lazy_ack_t2_mode");
+    await alter("off");
+    expect(await attempt()).toBeNull();
+    expect((await f.db.query<any>("SELECT to_regclass('sessions.lazy_ack_t2_mode') r")).rows[0].r).toBeNull();
+    const p = (await f.db.query<any>("SELECT proconfig,prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0];
+    expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp"]);
+    expect(p.prosrc).toBe(ackBody(readFileSync(MAIN_MIG, "utf8")));
+  });
   test("lazy_ack_t2_set_mode: returns the old mode, refuses anything but main/t2 (22023) and leaves the row unchanged", async () => {
     const f = await fixture();
     for (const bad of ["T2", "off", "fenced", "", " t2"])

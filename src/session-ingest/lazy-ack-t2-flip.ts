@@ -10,6 +10,14 @@
  * "switched" and throws LazyAckT2FlipNotSwitched (carrying the outcome) otherwise; lazyAckT2FlipOutcome returns it.
  * The caller passes the query function (its own connection); this module opens nothing and logs nothing.
  *
+ * Operator procedure (062210 review): ONE bounded attempt sequence per operator action, in a naturally quiet window.
+ *   - no_switch: no switch; nothing changed. Do not loop on this helper; decide again later.
+ *   - indeterminate: reconcile first (read the mode, confirm no other flip ran) before any further attempt.
+ *   There is no queued fallback, no admission stop and no automatic repeat-until-success. Flipping back to main uses
+ *   the same try-lock and can starve under load too: a rollback of the mode is not immediate.
+ * Options must be finite and bounded: budgetMs > 0, maxAttempts an integer >= 1, backoffs >= 0 (TypeError otherwise).
+ * The first attempt is always dispatched (a valid budget is > 0, so it starts before the deadline).
+ *
  * budgetMs is a RETRY-START deadline: no attempt starts at or after start + budgetMs (it is checked after every
  * backoff sleep, so a late timer cannot add an attempt). An attempt already sent before the deadline is allowed to
  * finish; it never waits on a lock (try-lock and NOWAIT), so it ends within one round trip.
@@ -84,6 +92,9 @@ export async function lazyAckT2FlipOutcome(query: FlipQuery, to: FlipMode, opts:
   if (to !== "main" && to !== "t2") throw new TypeError("lazy_ack_t2 flip: mode must be main or t2");
   const budgetMs = opts.budgetMs ?? 10_000, maxAttempts = opts.maxAttempts ?? 200;
   const base = opts.backoffMs ?? 5, cap = opts.maxBackoffMs ?? 200;
+  if (!Number.isFinite(budgetMs) || budgetMs <= 0) throw new TypeError("lazy_ack_t2 flip: budgetMs must be a finite number > 0");
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new TypeError("lazy_ack_t2 flip: maxAttempts must be an integer >= 1");
+  if (!Number.isFinite(base) || base < 0 || !Number.isFinite(cap) || cap < 0) throw new TypeError("lazy_ack_t2 flip: backoffMs and maxBackoffMs must be finite numbers >= 0");
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = opts.now ?? (() => performance.now()), random = opts.random ?? Math.random;
   const start = now();

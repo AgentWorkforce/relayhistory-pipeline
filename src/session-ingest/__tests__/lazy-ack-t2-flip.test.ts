@@ -1,6 +1,6 @@
 /** lazy-ack-t2-flip.ts: one autocommit statement per attempt, bounded backoff, "no_switch" as a clean result. */
 import { describe, expect, test } from "bun:test";
-import { FLIP_STATEMENT, LazyAckT2FlipNotSwitched, MODE_READBACK, flipLazyAckT2Mode as throwingFlip, isConnectionLoss, isFlipBusy, lazyAckT2FlipOutcome as flipLazyAckT2Mode, type FlipQuery } from "../lazy-ack-t2-flip.ts";
+import { FLIP_STATEMENT, LazyAckT2FlipNotSwitched, MODE_READBACK, flipLazyAckT2Mode as throwingFlip, isConnectionLoss, isFlipBusy, lazyAckT2FlipOutcome as flipLazyAckT2Mode, lazyAckT2FlipOutcome as lazyAckT2Outcome, type FlipQuery } from "../lazy-ack-t2-flip.ts";
 
 const busy = () => Object.assign(Error("T2 staged ACK: flip barrier busy (an ingest or erase transaction is open); mode unchanged, retry"), { code: "55P03" });
 const rowBusy = () => Object.assign(Error('could not obtain lock on row in relation "lazy_ack_t2_mode"'), { code: "55P03" });
@@ -93,5 +93,19 @@ describe("flipLazyAckT2Mode", () => {
     expect(ind).toBeInstanceOf(LazyAckT2FlipNotSwitched);
     expect(ind.name).toBe("LazyAckT2FlipIndeterminate");
     expect(ind.outcome).toMatchObject({ result: "indeterminate", observedMode: "t2" });
+  });
+  test("options must be finite and bounded; with valid options the first attempt is always dispatched", async () => {
+    let n = 0;
+    const q: FlipQuery = async () => { n++; return { rows: [{ old: "main" }] }; };
+    for (const bad of [{ budgetMs: 0 }, { budgetMs: -1 }, { budgetMs: NaN }, { budgetMs: Infinity }, { maxAttempts: 0 }, { maxAttempts: 1.5 },
+      { maxAttempts: Infinity }, { backoffMs: -1 }, { backoffMs: NaN }, { maxBackoffMs: Infinity }])
+      await expect(lazyAckT2Outcome(q, "t2", { ...clock(), ...bad })).rejects.toThrow(TypeError);
+    expect(n).toBe(0); // nothing dispatched for invalid options
+    // Smallest valid bounds: exactly one attempt, dispatched even though the budget is tiny.
+    let t = 0;
+    const busyOnce: FlipQuery = async () => { n++; t += 5; throw busy(); };
+    expect(await lazyAckT2Outcome(busyOnce, "t2", { budgetMs: 1, maxAttempts: 1, now: () => t, sleep: async () => {} }))
+      .toMatchObject({ result: "no_switch", attempts: 1 });
+    expect(n).toBe(1);
   });
 });
