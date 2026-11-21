@@ -444,6 +444,8 @@ export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Ten
   let provenanceBytes = 0;
   const scrub = (raw: string) => { const h = scrubPath(raw, hasher); paths[h] = raw; return h; };
   const encodeRepositoryPath = options.repositoryPaths ? (relative: string, root: string) => {
+    // M4 anchors paths from a home-root cwd; that cannot establish this field's root-relative identity.
+    if (isHomeRoot(root)) return null;
     const normalized = repoRelativePath(relative, root);
     if (!normalized) return null;
     const encoded = scrubPath(normalized, hasher);
