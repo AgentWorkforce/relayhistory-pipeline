@@ -168,6 +168,25 @@ describe("session read api: inputs, grants and env", () => {
         expect(() => assertSessionReadApiInputs({ completeSince: "epoch", [k]: bad }, refuse)).toThrow(new RegExp(`${k} must be a boolean`));
   });
 
+  it("list readiness: env present only when switched on, exactly \"true\"; the input is a boolean; independent of the short summary", () => {
+    const names = sessionReadApiNames(STAGE);
+    for (const p of [{ completeSince: "epoch" }, { completeSince: "epoch", listReadiness: false }, { completeSince: "epoch", listShortSummary: true }]) {
+      const env = sessionReadApiEnv({ stage: STAGE, names, p }) as Record<string, string>;
+      expect("READ_API_LIST_READINESS_ENABLED" in env).toBe(false);
+    }
+    const off = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch" } }) as Record<string, string>;
+    const on = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", listReadiness: true } }) as Record<string, string>;
+    expect(on.READ_API_LIST_READINESS_ENABLED).toBe("true");
+    expect("READ_API_LIST_SHORT_SUMMARY_ENABLED" in on).toBe(false);
+    // Switching it on adds exactly one variable.
+    const { READ_API_LIST_READINESS_ENABLED: _added, ...rest } = on;
+    expect(rest).toEqual(off);
+    const refuse = (why: string): never => { throw new Error(why); };
+    assertSessionReadApiInputs({ completeSince: "epoch", listReadiness: true }, refuse);
+    for (const bad of ["true", 1, null])
+      expect(() => assertSessionReadApiInputs({ completeSince: "epoch", listReadiness: bad }, refuse)).toThrow(/listReadiness must be a boolean/);
+  });
+
   it("relayfacts: env present only when switched on, exactly \"true\"; the input is a boolean", () => {
     const names = sessionReadApiNames(STAGE);
     const base = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch" } }) as Record<string, string>;

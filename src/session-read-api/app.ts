@@ -31,7 +31,11 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *   GET /v1/sessions                session list without `q`, from the Supabase directory;
  *                                   opt-in includeShortSummary=recorded adds shortSummary and
  *                                   shortSummaryGeneratedAt (READ_API_LIST_SHORT_SUMMARY_ENABLED=true,
- *                                   deps.listShortSummary; otherwise 501 param_includeShortSummary)
+ *                                   deps.listShortSummary; otherwise 501 param_includeShortSummary);
+ *                                   opt-in includeReadiness=true adds eventsReady and eventsProjectedAt,
+ *                                   readyOnly=true keeps only search-projection-ready rows (in SQL)
+ *                                   (READ_API_LIST_READINESS_ENABLED=true, deps.listReadiness; otherwise
+ *                                   501 param_includeReadiness / param_readyOnly)
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
  *                                   brief-summary.ts, migration 20261105056000)
@@ -127,6 +131,7 @@ import {
   decodeCompositeListCursor,
   decodeListCursor,
   decodeQueryCursor,
+  decodeReadyListCursor,
   directoryPage,
   encodeCompositeListCursor,
   LIST_CURSOR_PREFIX,
@@ -259,6 +264,15 @@ export interface ReadApiDeps {
    * 501 `param_includeShortSummary`; without the param the list shape is unchanged either way.
    */
   listShortSummary?: boolean;
+  /**
+   * READ_API_LIST_READINESS_ENABLED=true (exactly "true"): GET /v1/sessions serves the opt-ins
+   * includeReadiness=true (eventsReady, eventsProjectedAt) and readyOnly=true (only rows whose search
+   * projection is ready, filtered in SQL before the keyset and limit), through the 062200 readiness
+   * functions. Not true = either param, with any value, is a 501 `param_includeReadiness` /
+   * `param_readyOnly`; without both params the list is the pre-readiness one either way (same
+   * functions, SQL, rows and cursors).
+   */
+  listReadiness?: boolean;
   /**
    * READ_API_SUMMARY_SEARCH_ENABLED=true (exactly "true"): GET /v1/sessions/summaries/search finds
    * sessions whose title or scrubbed short summary contains `q`, with ClickHouse
@@ -446,6 +460,13 @@ const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
 /** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
 const SESSION_USERS_PARAMS: ReadonlySet<string> = new Set(["workspace", "lastTsAfter", "lastTsBefore"]);
+/**
+ * GET /v1/sessions with READ_API_LIST_READINESS_ENABLED=true and readyOnly=true: `applied` on every 200 whose rows
+ * the readiness predicate filtered. The positive signal a client must check: a reader built before list readiness
+ * ignores readyOnly and answers 200 unfiltered, without this header. Never sent otherwise.
+ */
+export const READY_ONLY_HEADER = "X-Relayhistory-Ready-Only";
+
 const LIST_UNSUPPORTED_PARAMS = ["q", "search", "project", "noProject", "kind", "taskRef", "noTaskRef", "tag", "since", "until"];
 
 /** relayhistory lib/recall.ts limits. */
@@ -704,7 +725,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}`);
+        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}${deps.listReadiness === true ? `, ${READY_ONLY_HEADER}` : ""}`);
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -1273,7 +1294,10 @@ export function createReadApi(deps: ReadApiDeps) {
     if (fenced) c.header(BUFFERED_HEADER, "fenced");
     if (bufferedItems.length) c.header(BUFFERED_IDS_HEADER, bufferedIdsHeader(bufferedItems));
     return {
-      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row, q.metadata) : bufferedSessionSummary(i.row, identity.userId))),
+      // includeReadiness: a buffered row has no directory row, so it is never search-projection ready.
+      sessions: merged.items.map((i) => (i.kind === "canonical"
+        ? sessionFromDirectoryRow(i.row, q.metadata)
+        : { ...bufferedSessionSummary(i.row, identity.userId), ...(q.metadata.includeReadiness ? { eventsReady: false, eventsProjectedAt: null } : {}) })),
       nextCursor,
     };
   }
@@ -1307,6 +1331,19 @@ export function createReadApi(deps: ReadApiDeps) {
       throw bad("the q date terms do not overlap the requested time window");
   }
 
+  /**
+   * includeReadiness / readyOnly on GET /v1/sessions. With deps.listReadiness not true the param, with
+   * any value, is 501 `param_<name>`, as an unsupported list param. With it on: absent = false, exactly
+   * "true" = true, repeated or any other value ("false", "1", "", "TRUE") = 400, as includeShortSummary
+   * answers 400 for anything but "recorded": an opt-in has one spelling, so a typo never reads as "off".
+   */
+  function readinessParam(c: Context, name: "includeReadiness" | "readyOnly"): boolean {
+    if (!c.req.queries(name)?.length) return false;
+    if (deps.listReadiness !== true) throw unsupported(`param_${name}`);
+    if (single(c, name) !== "true") throw bad(`${name} must be true`);
+    return true;
+  }
+
   app.get("/v1/sessions", async (c) => {
     try {
       const identity = c.get("identity");
@@ -1319,9 +1356,12 @@ export function createReadApi(deps: ReadApiDeps) {
       const includeShortSummary = single(c, "includeShortSummary");
       if (includeShortSummary !== undefined && includeShortSummary !== "recorded") throw bad("includeShortSummary must be recorded");
       if (includeShortSummary !== undefined && deps.listShortSummary !== true) throw unsupported("param_includeShortSummary");
+      const includeReadiness = readinessParam(c, "includeReadiness");
+      const readyOnly = readinessParam(c, "readyOnly");
       const metadata: DirectoryListMetadata = {
         ...(includeAgentName === "recorded" ? { includeAgentName } : {}),
         ...(includeShortSummary === "recorded" ? { includeShortSummary } : {}),
+        ...(includeReadiness ? { includeReadiness: true as const } : {}),
       };
       const queryOn = deps.sessionQuery === true;
       for (const p of LIST_UNSUPPORTED_PARAMS) if (!(queryOn && (p === "q" || p === "search")) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
@@ -1360,16 +1400,18 @@ export function createReadApi(deps: ReadApiDeps) {
       const ob = ownerBufferedFor(identity);
       // Buffered rows have no search document: a q read never drops them silently.
       if (terms && ob !== undefined) throw unsupported("q_with_buffered");
-      const withBuffered = ob !== undefined && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
+      // readyOnly: buffered rows have no directory row, so they are never ready; the page is canonical only.
+      const withBuffered = ob !== undefined && !readyOnly && !agent && !projectContains && (users.length === 0 || users.includes(identity.userId));
       if (sources.length) args.sources = sources;
       if (notSources.length) args.notSources = notSources;
       if (users.length) args.userIds = users;
       if (agent) args.agent = agent;
       if (projectContains) args.projectContains = projectContains;
       for (const [k, v] of Object.entries(bounds)) if (v) args[k as keyof typeof bounds] = v;
+      if (includeReadiness || readyOnly) args.readiness = { readyOnly };
       if (terms) {
-        // A q page continues only from a `b96q1:` cursor of the same query and filters.
-        const fingerprint = queryFingerprint(terms, args);
+        // A q page continues only from a `b96q1:` cursor of the same query, filters and readyOnly.
+        const fingerprint = queryFingerprint(terms, args, readyOnly);
         const qCursor = decodeQueryCursor(single(c, "cursor"));
         if (qCursor === "foreign" && single(c, "cursor")?.startsWith(LIST_CURSOR_PREFIX)) throw new CursorError("invalid_cursor");
         if (qCursor === "foreign") throw new CursorError("foreign_cursor");
@@ -1378,13 +1420,17 @@ export function createReadApi(deps: ReadApiDeps) {
         const rows = await directory.query(identity.orgId, identity.workspaceId, { ...args, terms });
         if (rows === null) throw unsupported("directory_not_migrated");
         const page = directoryPage(rows, identity, limit, fingerprint, metadata);
+        if (readyOnly) c.header(READY_ONLY_HEADER, "applied");
         return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
       // With q on, a `b96q1:` cursor belongs to a q read only.
       if (queryOn && single(c, "cursor")?.startsWith(QUERY_CURSOR_PREFIX)) throw new CursorError("invalid_cursor");
-      // The composite cursor exists only on the buffered path; otherwise main's decoder, exactly.
+      // The composite cursor exists only on the buffered path; a readyOnly page's cursor carries its
+      // marker (decodeReadyListCursor); otherwise main's decoder, exactly.
       const composite = withBuffered ? decodeCompositeListCursor(single(c, "cursor")) : undefined;
-      const cursor = withBuffered ? (typeof composite === "object" ? composite.canonical : composite) : decodeListCursor(single(c, "cursor"));
+      const cursor = withBuffered
+        ? (typeof composite === "object" ? composite.canonical : composite)
+        : readyOnly ? decodeReadyListCursor(single(c, "cursor")) : decodeListCursor(single(c, "cursor"));
       if (cursor === "foreign") throw new CursorError("foreign_cursor");
       if (cursor === "invalid") throw new CursorError("invalid_cursor");
       if (cursor) args.cursor = cursor;
@@ -1394,7 +1440,8 @@ export function createReadApi(deps: ReadApiDeps) {
         const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds, metadata });
         return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
       }
-      const page = directoryPage(rows, identity, limit, undefined, metadata);
+      const page = directoryPage(rows, identity, limit, undefined, metadata, readyOnly);
+      if (readyOnly) c.header(READY_ONLY_HEADER, "applied");
       return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return directoryFail(c, error);

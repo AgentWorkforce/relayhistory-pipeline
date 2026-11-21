@@ -61,12 +61,18 @@ export const READ_API_BRIEF_SUMMARY_ENABLED = "READ_API_BRIEF_SUMMARY_ENABLED";
 export const READ_API_RELAYFACTS_ENABLED = "READ_API_RELAYFACTS_ENABLED";
 /** GET /v1/sessions: serve the opt-in includeShortSummary=recorded list extension. */
 export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_ENABLED";
+/**
+ * GET /v1/sessions: serve the opt-ins includeReadiness=true (eventsReady, eventsProjectedAt) and readyOnly=true
+ * (search-projection-ready rows only, filtered in SQL) through migration 062200's readiness functions. Exactly
+ * "true" (exactTrueFlag); anything else = either param is 501 param_includeReadiness / param_readyOnly. Default off.
+ */
+export const READ_API_LIST_READINESS_ENABLED = "READ_API_LIST_READINESS_ENABLED";
 /** GET /v1/sessions/summaries/search: ClickHouse summary search (clickhouse/summary-search-query.ts). Default off. */
 export const READ_API_SUMMARY_SEARCH_ENABLED = "READ_API_SUMMARY_SEARCH_ENABLED";
 /** GET /v1/sessions/:sessionId/sources: the live sources of one session id (session-sources.ts). Default off. */
 export const READ_API_SESSION_SOURCES_ENABLED = "READ_API_SESSION_SOURCES_ENABLED";
 
-/** READ_API_BRIEF_SUMMARY_ENABLED / READ_API_LIST_SHORT_SUMMARY_ENABLED: only the exact string "true" enables, as coordinationOverlapsEnabled. */
+/** READ_API_BRIEF_SUMMARY_ENABLED / READ_API_LIST_SHORT_SUMMARY_ENABLED / READ_API_LIST_READINESS_ENABLED: only the exact string "true" enables, as coordinationOverlapsEnabled. */
 export function exactTrueFlag(raw: unknown): boolean {
   return raw === "true";
 }

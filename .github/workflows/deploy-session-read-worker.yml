@@ -82,6 +82,10 @@ name: deploy session-read-worker
 # list_short_summary=on adds --var READ_API_LIST_SHORT_SUMMARY_ENABLED:true (the GET /v1/sessions
 # includeShortSummary=recorded extension). off (the default) renders neither var, so the Worker
 # answers 501 summary_not_configured / param_includeShortSummary exactly as before these inputs.
+# list_readiness=on adds --var READ_API_LIST_READINESS_ENABLED:true (the GET /v1/sessions
+# includeReadiness=true / readyOnly=true opt-ins; migration 20261105062200 must be applied first, or
+# those requests answer 501 directory_not_migrated). off (the default) renders no var: either param
+# answers 501 param_includeReadiness / param_readyOnly, and the list is unchanged.
 # Neither is preserved from live: once one is on, a later profile/preserve dispatch must repeat
 # it (the live-settings guard refuses a dispatch that would drop it). Dispatch is Khaliq's call.
 # summary_fallback=on (only with brief_summary=on) adds --var READ_API_SUMMARY_FALLBACK_ENABLED:true:
@@ -199,6 +203,11 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      list_readiness:
+        description: GET /v1/sessions includeReadiness=true / readyOnly=true (READ_API_LIST_READINESS_ENABLED=true; needs migration 062200); off = no var, 501 param_includeReadiness / param_readyOnly. Not preserved from live; repeat it on later dispatches
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       summary_fallback:
         description: GET /v1/sessions/:id/summary Bob Costas fallback + kind=long (READ_API_SUMMARY_FALLBACK_ENABLED=true; needs brief_summary=on and the SUMMARY_MASTER_KEYS secret); off = no var, route unchanged. Not preserved from live
         type: choice
@@ -276,6 +285,7 @@ jobs:
       # Brief summaries (default off); on adds the exact "true" var on the deploy command only.
       BRIEF_SUMMARY: ${{ inputs.brief_summary }}
       LIST_SHORT_SUMMARY: ${{ inputs.list_short_summary }}
+      LIST_READINESS: ${{ inputs.list_readiness }}
       SUMMARY_FALLBACK: ${{ inputs.summary_fallback }}
       SUMMARY_SEARCH: ${{ inputs.summary_search }}
       RELAYFACTS: ${{ inputs.relayfacts }}
@@ -320,6 +330,7 @@ jobs:
           test "$ORIGIN" = "https://sessions-read.agentrelay.com" || fail "SESSION_READ_ORIGIN must be https://sessions-read.agentrelay.com"
           case "$BRIEF_SUMMARY" in off|on) ;; *) fail 'brief_summary must be "off" or "on"' ;; esac
           case "$LIST_SHORT_SUMMARY" in off|on) ;; *) fail 'list_short_summary must be "off" or "on"' ;; esac
+          case "$LIST_READINESS" in off|on) ;; *) fail 'list_readiness must be "off" or "on"' ;; esac
           case "$SUMMARY_FALLBACK" in off|on) ;; *) fail 'summary_fallback must be "off" or "on"' ;; esac
           case "$SUMMARY_SEARCH" in off|on) ;; *) fail 'summary_search must be "off" or "on"' ;; esac
           case "$RELAYFACTS" in off|on) ;; *) fail 'relayfacts must be "off" or "on"' ;; esac
@@ -398,6 +409,7 @@ jobs:
           bun run scripts/resolve-deploy-profile.ts --check-live-version
           brief_summary=""; if [ "$BRIEF_SUMMARY" = "on" ]; then brief_summary=true; fi
           list_short_summary=""; if [ "$LIST_SHORT_SUMMARY" = "on" ]; then list_short_summary=true; fi
+          list_readiness=""; if [ "$LIST_READINESS" = "on" ]; then list_readiness=true; fi
           summary_fallback=""; if [ "$SUMMARY_FALLBACK" = "on" ]; then summary_fallback=true; fi
           summary_search=""; if [ "$SUMMARY_SEARCH" = "on" ]; then summary_search=true; fi
           relayfacts=""; if [ "$RELAYFACTS" = "on" ]; then relayfacts=true; fi
@@ -411,6 +423,7 @@ jobs:
             ${TIMING_ASSUME_NO_TURNS:+--var "READ_API_TIMING_ASSUME_NO_TURNS:$TIMING_ASSUME_NO_TURNS"} \
             ${brief_summary:+--var "READ_API_BRIEF_SUMMARY_ENABLED:$brief_summary"} \
             ${list_short_summary:+--var "READ_API_LIST_SHORT_SUMMARY_ENABLED:$list_short_summary"} \
+            ${list_readiness:+--var "READ_API_LIST_READINESS_ENABLED:$list_readiness"} \
             ${summary_fallback:+--var "READ_API_SUMMARY_FALLBACK_ENABLED:$summary_fallback"} \
             ${summary_search:+--var "READ_API_SUMMARY_SEARCH_ENABLED:$summary_search"} \
             ${relayfacts:+--var "READ_API_RELAYFACTS_ENABLED:$relayfacts"} \

@@ -23,6 +23,14 @@
  * the strict @relayhistory/cloud-client 0.2.0 `sessionsResponse` Cloud validates with.
  * Activity uses the directory's SPAN semantics (a session counts on every UTC day from
  * its first to its last activity), as relayhistory's LIST_BACKEND=supabase does.
+ *
+ * List readiness (READ_API_LIST_READINESS_ENABLED=true and a caller opt-in, includeReadiness=true
+ * or readyOnly=true): the list and q reads call list_session_directory_readiness_for /
+ * query_session_directory_readiness_for (supabase/migrations/20261105062200_session_directory_list_readiness.sql)
+ * instead, which return the same rows plus events_ready / event_projected_at and, with readyOnly,
+ * apply the readiness predicate in SQL before the keyset and LIMIT. Without `readiness` in the
+ * args the SQL text, the function and the parameters are exactly the pre-readiness ones. A
+ * readyOnly plain page's cursor carries READY_LIST_CURSOR_MARKER (see encodeReadyListCursor).
  */
 import type { TenantRunner } from "./liveness.ts";
 import type { SessionQueryTerms } from "./list-query.ts";
@@ -60,6 +68,10 @@ export interface DirectoryListRow {
   short_summary_generated_at: Date | string | null;
   catalog_projected_at: Date | string | null;
   projected_at: Date | string | null;
+  /** Readiness reads only (062200): event_projection_ready AND event_projection_version = 1. */
+  events_ready?: boolean;
+  /** Readiness reads only (062200): the last event projection, as stored (may be set on a row not ready again). */
+  event_projected_at?: Date | string | null;
 }
 
 export interface DirectoryActivityRow {
@@ -91,6 +103,12 @@ export interface DirectoryListArgs {
   sessionKeys?: Array<{ harness: string; sessionId: string }>;
   /** Page size, 1..200; the function returns up to limit + 1 rows. */
   limit: number;
+  /**
+   * Present only for a readiness read (READ_API_LIST_READINESS_ENABLED=true and includeReadiness=true or
+   * readyOnly=true): call the 062200 readiness function, with p_ready_only = readyOnly. Absent: the
+   * pre-readiness function and SQL, byte for byte.
+   */
+  readiness?: { readyOnly: boolean };
 }
 
 export interface DirectoryCursor {
@@ -179,6 +197,32 @@ export const DIRECTORY_QUERY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') A
     p_workspace_id => $1, ${QUERY_TERM_ARGS},
     p_since => $24, p_until => $25)`;
 
+export const LIST_READINESS_FOR_SIGNATURE =
+  "sessions.list_session_directory_readiness_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer, boolean)";
+export const QUERY_READINESS_FOR_SIGNATURE =
+  "sessions.query_session_directory_readiness_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer, boolean)";
+
+/** `text` with `from` (which must occur exactly once) replaced: a drifted statement fails at load, never silently. */
+function swapOnce(text: string, from: string, to: string): string {
+  if (text.split(from).length !== 2) throw new Error(`session directory: readiness statement anchor not found once: ${from}`);
+  return text.replace(from, to);
+}
+
+const READINESS_COLUMNS = `,
+       events_ready, event_projected_at`;
+
+/** DIRECTORY_LIST_SQL over the 062200 readiness function: the same columns plus readiness, $17 = p_ready_only. */
+export const DIRECTORY_LIST_READINESS_SQL = swapOnce(swapOnce(swapOnce(DIRECTORY_LIST_SQL,
+  "short_summary_generated_at, catalog_projected_at, projected_at\n", `short_summary_generated_at, catalog_projected_at, projected_at${READINESS_COLUMNS}\n`),
+  "FROM sessions.list_session_directory_for(", "FROM sessions.list_session_directory_readiness_for("),
+  "p_session_ids => $16)", "p_session_ids => $16, p_ready_only => $17)");
+
+/** DIRECTORY_QUERY_SQL over the 062200 readiness function: the same columns plus readiness, $28 = p_ready_only. */
+export const DIRECTORY_QUERY_READINESS_SQL = swapOnce(swapOnce(swapOnce(DIRECTORY_QUERY_SQL,
+  "short_summary_generated_at, catalog_projected_at, projected_at\n", `short_summary_generated_at, catalog_projected_at, projected_at${READINESS_COLUMNS}\n`),
+  "FROM sessions.query_session_directory_for(", "FROM sessions.query_session_directory_readiness_for("),
+  "p_limit => $27)", "p_limit => $27, p_ready_only => $28)");
+
 export const USERS_FOR_SIGNATURE = "sessions.session_directory_users_for(text, timestamptz, timestamptz, integer)";
 /** The most users GET /v1/sessions/users returns (the function's p_limit 1..1000). */
 export const DIRECTORY_USERS_MAX = 1000;
@@ -216,17 +260,19 @@ export function sqlDirectory(run: TenantRunner): Directory {
   return {
     async query(orgId, workspaceId, a) {
       return run(orgId, workspaceId, async (q) => {
-        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [QUERY_FOR_SIGNATURE]);
+        const readiness = a.readiness;
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [readiness ? QUERY_READINESS_FOR_SIGNATURE : QUERY_FOR_SIGNATURE]);
         if (!installed.rows[0]?.installed) return null;
+        const params = [
+          workspaceId,
+          ...queryParams(a),
+          a.cursor?.lastActivityAt ?? null,
+          a.cursor?.sessionId ?? null,
+          a.cursor?.harness ?? null,
+          a.limit,
+        ];
         const r = await q
-          .query<DirectoryListRow>(DIRECTORY_QUERY_SQL, [
-            workspaceId,
-            ...queryParams(a),
-            a.cursor?.lastActivityAt ?? null,
-            a.cursor?.sessionId ?? null,
-            a.cursor?.harness ?? null,
-            a.limit,
-          ])
+          .query<DirectoryListRow>(readiness ? DIRECTORY_QUERY_READINESS_SQL : DIRECTORY_QUERY_SQL, readiness ? [...params, readiness.readyOnly] : params)
           .catch(mapPgError);
         return r.rows;
       });
@@ -243,11 +289,11 @@ export function sqlDirectory(run: TenantRunner): Directory {
     },
     async list(orgId, workspaceId, a) {
       return run(orgId, workspaceId, async (q) => {
-        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [LIST_FOR_SIGNATURE]);
+        const readiness = a.readiness;
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [readiness ? LIST_READINESS_FOR_SIGNATURE : LIST_FOR_SIGNATURE]);
         if (!installed.rows[0]?.installed) return null;
         const iso = (d: Date | undefined) => (d ? d.toISOString() : null);
-        const r = await q
-          .query<DirectoryListRow>(DIRECTORY_LIST_SQL, [
+        const params: unknown[] = [
             workspaceId,
             a.sources?.length ? a.sources : null,
             a.notSources?.length ? a.notSources : null,
@@ -264,7 +310,9 @@ export function sqlDirectory(run: TenantRunner): Directory {
             a.limit,
             a.sessionKeys?.length ? a.sessionKeys.map((k) => k.harness) : null,
             a.sessionKeys?.length ? a.sessionKeys.map((k) => k.sessionId) : null,
-          ])
+          ];
+        const r = await q
+          .query<DirectoryListRow>(readiness ? DIRECTORY_LIST_READINESS_SQL : DIRECTORY_LIST_SQL, readiness ? [...params, readiness.readyOnly] : params)
           .catch(mapPgError);
         return r.rows;
       });
@@ -387,6 +435,36 @@ export function decodeListCursor(raw: string | undefined): DirectoryCursor | und
 }
 
 /**
+ * A readyOnly plain list page's cursor (READ_API_LIST_READINESS_ENABLED, readyOnly=true): the same
+ * `b96s1:` wire with a fourth element, this string: `[lastActivityAt, sessionId, harness, "ready1"]`.
+ * It binds the readyOnly state without touching any other cursor: decodeListCursor (exactly 3
+ * elements) and decodeCompositeListCursor (an array as the 4th element) both refuse it as
+ * "invalid", so replaying it without readyOnly is invalid_cursor; and a readyOnly read accepts only
+ * this shape (decodeReadyListCursor), so a plain or composite cursor replayed with readyOnly is
+ * invalid_cursor too. includeReadiness alone never changes a cursor.
+ */
+export const READY_LIST_CURSOR_MARKER = "ready1";
+
+export function encodeReadyListCursor(c: DirectoryCursor): string {
+  return LIST_CURSOR_PREFIX + btoa(JSON.stringify([c.lastActivityAt, c.sessionId, c.harness, READY_LIST_CURSOR_MARKER])).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+/** undefined: no cursor; "foreign": not ours; "invalid": ours but not a readyOnly cursor, or malformed. */
+export function decodeReadyListCursor(raw: string | undefined): DirectoryCursor | undefined | "foreign" | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  if (!raw.startsWith(LIST_CURSOR_PREFIX)) return "foreign";
+  try {
+    const b64 = raw.slice(LIST_CURSOR_PREFIX.length).replace(/-/gu, "+").replace(/_/gu, "/");
+    const v = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    if (Array.isArray(v) && v.length === 4 && validCanonical(v) && v[3] === READY_LIST_CURSOR_MARKER)
+      return { lastActivityAt: v[0], sessionId: v[1], harness: v[2] };
+  } catch {
+    // fall through
+  }
+  return "invalid";
+}
+
+/**
  * q list cursors (READ_API_SESSION_QUERY): `b96q1:` + `[lastActivityAt, sessionId, harness,
  * fingerprint]`, the fingerprint being list-query.ts queryFingerprint of the query that made the
  * page. The route honours one only for the same query.
@@ -458,6 +536,18 @@ export interface DirectoryListMetadata {
   includeAgentName?: "recorded";
   /** includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true): the recorded short summary. */
   includeShortSummary?: "recorded";
+  /**
+   * includeReadiness=true (READ_API_LIST_READINESS_ENABLED=true): eventsReady and eventsProjectedAt, the
+   * row's search-projection state (062200 events_ready / event_projected_at). Not a readability claim.
+   */
+  includeReadiness?: true;
+}
+
+/** The two readiness fields of a readiness row; a value outside their shape is a parse error. */
+function readinessFields(row: DirectoryListRow): { eventsReady: boolean; eventsProjectedAt: string | null } {
+  if (typeof row.events_ready !== "boolean") throw new DirectoryError("parse");
+  const at = row.event_projected_at ?? null;
+  return { eventsReady: row.events_ready, eventsProjectedAt: at === null ? null : iso(at) };
 }
 
 /** The SQL producer's bound (migration 20261030020000): char_length(short_summary) <= 1000 code points. */
@@ -506,6 +596,7 @@ export function sessionFromDirectoryRow(row: DirectoryListRow, metadata: Directo
   if (row.title !== null && row.title !== undefined && row.title.length > 90) throw new DirectoryError("parse");
   const agentName = metadata.includeAgentName === "recorded" ? recordedAgentName(row) : undefined;
   const shortSummary = metadata.includeShortSummary === "recorded" ? recordedShortSummary(row) : undefined;
+  const readiness = metadata.includeReadiness === true ? readinessFields(row) : undefined;
   return {
     title: row.title ?? null,
     // shortSummary is not sent by default: Cloud validates with the strict
@@ -537,13 +628,17 @@ export function sessionFromDirectoryRow(row: DirectoryListRow, metadata: Directo
     ...(catalog ? { catalog } : {}),
     ...(agentName === undefined ? {} : { agentName }),
     ...(shortSummary === undefined ? {} : shortSummary),
+    ...(readiness === undefined ? {} : readiness),
   };
 }
 
 export type DirectorySession = ReturnType<typeof sessionFromDirectoryRow>;
 
-/** One page: rows rechecked against the tenant, limit + 1 trimmed into a cursor (a `b96q1:` one for a q page). */
-export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number, queryFingerprint?: string, metadata: DirectoryListMetadata = {}) {
+/**
+ * One page: rows rechecked against the tenant, limit + 1 trimmed into a cursor (a `b96q1:` one for a q
+ * page; a readyOnly plain page's carries READY_LIST_CURSOR_MARKER).
+ */
+export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number, queryFingerprint?: string, metadata: DirectoryListMetadata = {}, readyOnly = false) {
   if (rows.length > limit + 1) throw new DirectoryError("parse");
   for (const row of rows) if (row.org_id !== tenant.orgId || row.workspace_id !== tenant.workspaceId) throw new DirectoryError("tenant_mismatch");
   const hasMore = rows.length > limit;
@@ -554,7 +649,9 @@ export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: strin
     const ts = last.cursor_ts;
     if (typeof ts !== "string" || !CURSOR_TS.test(ts)) throw new DirectoryError("parse");
     const position = { lastActivityAt: ts, sessionId: last.session_id, harness: last.harness };
-    nextCursor = queryFingerprint === undefined ? encodeListCursor(position) : encodeQueryCursor({ ...position, fingerprint: queryFingerprint });
+    nextCursor = queryFingerprint !== undefined
+      ? encodeQueryCursor({ ...position, fingerprint: queryFingerprint })
+      : readyOnly ? encodeReadyListCursor(position) : encodeListCursor(position);
   }
   return { sessions: visible.map((row) => sessionFromDirectoryRow(row, metadata)), nextCursor };
 }

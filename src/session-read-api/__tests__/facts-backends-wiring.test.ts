@@ -169,6 +169,41 @@ describe("brief-summary and list short-summary flags (READ_API_BRIEF_SUMMARY_ENA
   });
 });
 
+describe("list readiness flag (READ_API_LIST_READINESS_ENABLED)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("the hosted Lambda and the self-host service wire listReadiness only for the exact \"true\", independent of the short-summary flag", async () => {
+    for (const value of [undefined, "", "1", "TRUE", "True", "yes", " true", "true ", "false"]) {
+      const env = value === undefined ? {} : { READ_API_LIST_READINESS_ENABLED: value };
+      for (const built of [await buildLambda(env), await build({ ...ENV, ...env })]) {
+        try {
+          expect([value, built.deps.listReadiness]).toEqual([value, undefined]);
+        } finally {
+          await built.close();
+        }
+      }
+    }
+    for (const built of [await buildLambda({ READ_API_LIST_READINESS_ENABLED: "true" }), await build({ ...ENV, READ_API_LIST_READINESS_ENABLED: "true" })]) {
+      try {
+        expect(built.deps.listReadiness).toBe(true);
+        expect(built.deps.listShortSummary).toBeUndefined();
+      } finally {
+        await built.close();
+      }
+    }
+    const short = await build({ ...ENV, READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
+    try {
+      expect(short.deps.listReadiness).toBeUndefined();
+    } finally {
+      await short.close();
+    }
+  });
+});
+
 describe("coordination advisories wiring", () => {
   test("only the exact \"true\" wires the advisories source; the ack opens READ WRITE on the read pool", async () => {
     for (const flag of [undefined, "", "false", "1", "TRUE"]) {

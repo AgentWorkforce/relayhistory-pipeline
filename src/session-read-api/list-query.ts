@@ -291,9 +291,11 @@ export interface QueryFingerprintArgs {
 /**
  * The query a `b96q1:` cursor belongs to: sha256 of the canonical JSON of the parsed terms and
  * the list filters (never the cursor or limit), first 32 hex characters. A cursor is only
- * honoured for the query that produced it.
+ * honoured for the query that produced it. `readyOnly` (READ_API_LIST_READINESS_ENABLED,
+ * readyOnly=true) appends one element only when true, so every fingerprint without it is
+ * unchanged and a cursor replayed across a readyOnly change mismatches (invalid_cursor).
  */
-export function queryFingerprint(terms: SessionQueryTerms, args: QueryFingerprintArgs): string {
+export function queryFingerprint(terms: SessionQueryTerms, args: QueryFingerprintArgs, readyOnly = false): string {
   const sorted = (v: string[] | undefined) => [...(v ?? [])].sort();
   const time = (d: Date | undefined) => (d ? d.toISOString() : null);
   const canonical = [
@@ -304,6 +306,7 @@ export function queryFingerprint(terms: SessionQueryTerms, args: QueryFingerprin
     terms.active ?? null, time(terms.lastTsAfter), time(terms.lastTsBefore),
     sorted(args.sources), sorted(args.notSources), args.projectContains ?? null, sorted(args.userIds), args.agent ?? null,
     time(args.lastTsAfter), time(args.lastTsBefore), time(args.firstTsAfter), time(args.firstTsBefore),
+    ...(readyOnly ? ["ready1"] : []),
   ];
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 32);
 }

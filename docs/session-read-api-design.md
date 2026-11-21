@@ -475,6 +475,58 @@ then drops a live variable silently (true of every summary input).
 
 **Read transaction isolation (`READ_API_REPEATABLE_READ`, default off).** Every Worker read (timing, turns, babysitter evidence, owner-buffered, liveness, directory, brief titles and the buffered search gate) runs in a tenant-bound read-only transaction opened by `requestTenantRunner`. Unset, `0` or any value other than exactly `1` keeps `BEGIN READ ONLY` at READ COMMITTED, the behaviour before this flag. `1` opens `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`. Read-only REPEATABLE READ transactions never fail serialization. The flag exists because Hyperdrive's handling of it is not yet proven. With the flag off, the two chunks of up to 500 hits in one owner's gate call each see their own snapshot. Each chunk is still one statement judged against one consistent state and still fails closed on that state, so no hit passes a check it failed. But a commit between the chunks (a deletion, reset or fence bump, say) can leave hits of the same owner on one page judged against different states: an earlier chunk may admit a hit that a later chunk would have dropped. With the flag on, both chunks share the transaction's one snapshot, so the page is judged against a single state.
 
+### `GET /v1/sessions` list readiness (`READ_API_LIST_READINESS_ENABLED`, default off)
+
+Cloud lists sessions from this API and needs to tell, or filter, the sessions whose search projection is
+complete. Migration `20261105062200_session_directory_list_readiness.sql` adds two new functions beside the list
+functions the route calls, `sessions.list_session_directory_readiness_for` (beside 034000's
+`list_session_directory_for`) and `sessions.query_session_directory_readiness_for` (beside 046010's
+`query_session_directory_for`). They return the same rows plus `events_ready` (`event_projection_ready AND
+event_projection_version = 1`) and `event_projected_at`, and take `p_ready_only`. SECURITY DEFINER, pinned
+`search_path`, EXECUTE for `bulls96_read_api` only, as their neighbours. No existing function, table or index
+changes.
+
+Two caller opt-ins, served only with the server flag exactly `true` (`exactTrueFlag`; the Lambda, the self-host
+service and the Worker read it alike):
+
+- `includeReadiness=true`: each session also carries `eventsReady` (boolean) and `eventsProjectedAt` (ISO 8601
+  or `null`, the last completed projection as stored, so it can be set while `eventsReady` is false). Rows, order
+  and cursor are unchanged.
+- `readyOnly=true`: only the ready sessions. The predicate is in the SQL, before `ORDER BY`, the keyset and
+  `LIMIT p_limit + 1`, so a page is full whenever it has a `nextCursor`, and nothing repeats or is skipped. It
+  applies to `q` reads too. Each 200 carries `X-Relayhistory-Ready-Only: applied`. **A client must check this
+  header: readers older than this change ignore the param and answer 200 unfiltered, without it.**
+
+Grammar: only the exact `true` turns either on. With the flag on, any other value (`false`, `1`, empty, `TRUE`)
+or a repeated param is 400 (`<name> must be true`), as `includeShortSummary` answers 400 for anything but
+`recorded`: an opt-in has one spelling, so a typo never silently reads as off. With the flag off the param, with
+any value, is 501 `param_includeReadiness` / `param_readyOnly`. That check comes before the value check, unlike
+`includeShortSummary`, so a flag-off reader gives one answer for every value. Without either param the list is the
+pre-readiness one whatever the flag says: same functions, same SQL text, same rows, cursors and bytes
+(`src/session-read-api/__tests__/fixtures/list-readiness-flag-off.golden.json`, recorded on the base commit).
+
+Cursors: a `readyOnly` plain page's cursor is the `b96s1:` wire with a fourth element, `"ready1"`. The
+pre-readiness decoders refuse it as they are, and a `readyOnly` read accepts only that form, so replaying a
+cursor across a `readyOnly` change, in either direction, is 400 `cursor is not valid`, never a silent
+continuation. A `q` page's fingerprint gains one element only when `readyOnly` is true, so every other `b96q1:`
+fingerprint is unchanged. `includeReadiness` never changes a cursor.
+
+Owner-buffered rows have no directory row. `includeReadiness` keeps the union and reports them `eventsReady:
+false`, `eventsProjectedAt: null`. `readyOnly` serves the canonical page only: no buffered read and no
+`X-Relayhistory-Buffered*` headers. **A `readyOnly` page never shows a just-uploaded buffered session.**
+
+Readiness is search-projection state (the directory row's `event_projection_ready` with projection version 1). It does not prove that the session's exact or context reads work: those use pointer liveness. `readyOnly` therefore hides, for good, sessions too large to index, scopes over budget, sessions with persistent canonical metadata errors and every session on an install with no indexer; and, briefly, every active session after each upload (a pointer write makes the row not ready until the next index pass).
+
+Counts: `GET /v1/sessions` returns no count or total. `GET /v1/sessions/activity`, the users aggregate and the
+summary counts are unchanged and count every session, ready or not, so they can be larger than what a
+`readyOnly` walk lists.
+
+Rollout: apply `20261105062200` first. With the flag on and the migration absent (or rolled back) either param
+is 501 `directory_not_migrated` and every other list request is unchanged. Worker deploy input: `list_readiness=on`
+adds `--var READ_API_LIST_READINESS_ENABLED:true`; off (the default) renders no variable; not preserved from live.
+Hosted Lambda: `transcriptStore.sessionReadApi.listReadiness: true` renders the variable; absent, the env is
+unchanged.
+
 ## 9. Session analysis on the Worker (lane F1, `READ_API_ANALYSIS_ENABLED`, default off)
 
 The analysis contract (`GET` / `POST /v1/sessions/:sessionId/analysis`, `src/session-read-api/app.ts`, migration `20261105046000`) was wired only on the hosted Lambda (`lambda.ts`, `sqlAnalysisSource`). The Worker now wires the same `AnalysisDeps` (`packages/session-read-worker/src/index.ts` `analysisDeps`), behind one flag. This is a different lane from `/v1/canonical/analyses/` (`analysis-cache.ts`), which is unchanged.

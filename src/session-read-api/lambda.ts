@@ -49,6 +49,9 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true", either entry) serves the opt-in
  * includeShortSummary=recorded on GET /v1/sessions; otherwise that param is 501
  * `param_includeShortSummary` and the list shape is unchanged.
+ * READ_API_LIST_READINESS_ENABLED (exactly "true", either entry) serves the opt-ins
+ * includeReadiness=true and readyOnly=true on GET /v1/sessions (migration 20261105062200); otherwise
+ * either param is 501 `param_includeReadiness` / `param_readyOnly` and the list is unchanged.
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true", ClickHouse backend only) serves GET
  * /v1/sessions/summaries/search over the owner-applied session_brief_documents table; otherwise 501
  * `summary_search_not_configured`.
@@ -91,7 +94,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
@@ -625,6 +628,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
+  const listReadiness = exactTrueFlag(env[READ_API_LIST_READINESS_ENABLED]);
   const summarySearch = exactTrueFlag(env[READ_API_SUMMARY_SEARCH_ENABLED]);
   const messageOrigin = messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]);
   // The self-host service never inherits the hosted Supabase pin by omission.
@@ -739,6 +743,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(briefSummaryWired ? { briefSummary: sqlBriefSummary(poolTenantRunner(pool as never)) } : {}),
     ...(exactTrueFlag(env[READ_API_RELAYFACTS_ENABLED]) ? { relayfacts: sqlRelayfacts(poolTenantRunner(pool as never)) } : {}),
     ...(listShortSummary ? { listShortSummary: true } : {}),
+    ...(listReadiness ? { listReadiness: true } : {}),
     ...(summarySearch ? { summarySearch: true } : {}),
     ...(exactTrueFlag(env[READ_API_SESSION_SOURCES_ENABLED]) ? { sessionSources: sqlSessionSources(poolTenantRunner(pool as never)) } : {}),
     ...(messageOrigin ? { messageOrigin: true } : {}),

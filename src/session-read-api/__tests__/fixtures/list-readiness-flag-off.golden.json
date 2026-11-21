@@ -1,0 +1,470 @@
+[
+  {
+    "request": "/v1/sessions?workspace=ws-a",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-1\",\"sessionId\":\"s-1\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-03T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-03T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-1\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-03T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":null,\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          50,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96s1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          2,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&cursor=b96s1%3AWyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96s1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "2026-10-04T12:00:00.000001Z",
+          "s-2",
+          "codex",
+          2,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&source=codex&notSource=claude&user=u-1&agent=Lead&projectContains=acme&lastTsAfter=2026-09-01T00:00:00Z&lastTsBefore=2026-11-01T00:00:00Z&firstTsAfter=2026-09-01T00:00:00Z&firstTsBefore=2026-11-01T00:00:00Z",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96s1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          [
+            "codex"
+          ],
+          [
+            "claude"
+          ],
+          "acme",
+          [
+            "u-1"
+          ],
+          "Lead",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          null,
+          null,
+          null,
+          2,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&source=codex&notSource=claude&user=u-1&agent=Lead&projectContains=acme&lastTsAfter=2026-09-01T00:00:00Z&lastTsBefore=2026-11-01T00:00:00Z&firstTsAfter=2026-09-01T00:00:00Z&firstTsBefore=2026-11-01T00:00:00Z&cursor=b96s1%3AWyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96s1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          [
+            "codex"
+          ],
+          [
+            "claude"
+          ],
+          "acme",
+          [
+            "u-1"
+          ],
+          "Lead",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-10-04T12:00:00.000001Z",
+          "s-2",
+          "codex",
+          2,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&includeShortSummary=recorded",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0},\"shortSummary\":\"Recorded summary\",\"shortSummaryGeneratedAt\":\"2026-10-03T00:00:00.000Z\"},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0},\"shortSummary\":\"Recorded summary\",\"shortSummaryGeneratedAt\":\"2026-10-03T00:00:00.000Z\"}],\"nextCursor\":\"b96s1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCJd\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.list_session_directory_for(\n    p_workspace_id => $1, p_sources => $2, p_not_sources => $3, p_project_contains => $4,\n    p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,\n    p_first_ts_after => $9, p_first_ts_before => $10,\n    p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,\n    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)",
+        "params": [
+          "ws-a",
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          2,
+          null,
+          null
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&q=hello%20world%20-draft%20source%3Acodex",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96q1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsIjRkNDNiOGYxYmEyMjY2MDQwNjQ1Zjk2Mzg5YTk3MTJlIl0\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.query_session_directory_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.query_session_directory_for(\n    p_workspace_id => $1, p_free => $2, p_not_free => $3, p_title => $4, p_not_title => $5,\n    p_project => $6, p_not_project => $7, p_harness => $8, p_not_harness => $9,\n    p_agent_terms => $10, p_not_agent_terms => $11, p_id => $12, p_not_id => $13, p_active => $14,\n    p_sources => $15, p_not_sources => $16, p_project_contains => $17, p_user_ids => $18, p_agent => $19,\n    p_last_ts_after => $20, p_last_ts_before => $21, p_first_ts_after => $22, p_first_ts_before => $23,\n    p_cursor_last_activity_at => $24, p_cursor_session_id => $25, p_cursor_harness => $26, p_limit => $27)",
+        "params": [
+          "ws-a",
+          [
+            "hello",
+            "world"
+          ],
+          [
+            "draft"
+          ],
+          null,
+          null,
+          null,
+          null,
+          [
+            "codex"
+          ],
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&q=hello%20world%20-draft%20source%3Acodex&cursor=b96q1%3AWyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsIjRkNDNiOGYxYmEyMjY2MDQwNjQ1Zjk2Mzg5YTk3MTJlIl0",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96q1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsIjRkNDNiOGYxYmEyMjY2MDQwNjQ1Zjk2Mzg5YTk3MTJlIl0\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.query_session_directory_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.query_session_directory_for(\n    p_workspace_id => $1, p_free => $2, p_not_free => $3, p_title => $4, p_not_title => $5,\n    p_project => $6, p_not_project => $7, p_harness => $8, p_not_harness => $9,\n    p_agent_terms => $10, p_not_agent_terms => $11, p_id => $12, p_not_id => $13, p_active => $14,\n    p_sources => $15, p_not_sources => $16, p_project_contains => $17, p_user_ids => $18, p_agent => $19,\n    p_last_ts_after => $20, p_last_ts_before => $21, p_first_ts_after => $22, p_first_ts_before => $23,\n    p_cursor_last_activity_at => $24, p_cursor_session_id => $25, p_cursor_harness => $26, p_limit => $27)",
+        "params": [
+          "ws-a",
+          [
+            "hello",
+            "world"
+          ],
+          [
+            "draft"
+          ],
+          null,
+          null,
+          null,
+          null,
+          [
+            "codex"
+          ],
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          "2026-10-04T12:00:00.000001Z",
+          "s-2",
+          "codex",
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&q=hello&source=codex&user=u-1&lastTsAfter=2026-09-01T00:00:00Z&lastTsBefore=2026-11-01T00:00:00Z&firstTsAfter=2026-09-01T00:00:00Z&firstTsBefore=2026-11-01T00:00:00Z",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96q1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsImM3ZDdlOTI1NTQ4MTk1Nzc1MjQwYWUzMGI1NTYwMDdjIl0\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.query_session_directory_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.query_session_directory_for(\n    p_workspace_id => $1, p_free => $2, p_not_free => $3, p_title => $4, p_not_title => $5,\n    p_project => $6, p_not_project => $7, p_harness => $8, p_not_harness => $9,\n    p_agent_terms => $10, p_not_agent_terms => $11, p_id => $12, p_not_id => $13, p_active => $14,\n    p_sources => $15, p_not_sources => $16, p_project_contains => $17, p_user_ids => $18, p_agent => $19,\n    p_last_ts_after => $20, p_last_ts_before => $21, p_first_ts_after => $22, p_first_ts_before => $23,\n    p_cursor_last_activity_at => $24, p_cursor_session_id => $25, p_cursor_harness => $26, p_limit => $27)",
+        "params": [
+          "ws-a",
+          [
+            "hello"
+          ],
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          [
+            "codex"
+          ],
+          null,
+          null,
+          [
+            "u-1"
+          ],
+          null,
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          null,
+          null,
+          null,
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&q=hello&source=codex&user=u-1&lastTsAfter=2026-09-01T00:00:00Z&lastTsBefore=2026-11-01T00:00:00Z&firstTsAfter=2026-09-01T00:00:00Z&firstTsBefore=2026-11-01T00:00:00Z&cursor=b96q1%3AWyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsImM3ZDdlOTI1NTQ4MTk1Nzc1MjQwYWUzMGI1NTYwMDdjIl0",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"sessions\":[{\"title\":\"Title s-3\",\"sessionId\":\"s-3\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-05T12:00:00.123Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-05T12:00:00.123Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-3\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-05T12:00:00.123Z\",\"parentSessionIds\":[],\"childSessionCount\":0}},{\"title\":\"Title s-2\",\"sessionId\":\"s-2\",\"userIds\":[\"u-1\"],\"source\":\"codex\",\"projectId\":\"github.com/acme/api\",\"machineIds\":[\"m-1\"],\"firstTs\":\"2026-10-01T00:00:00.000Z\",\"lastTs\":\"2026-10-04T12:00:00.000Z\",\"workState\":{\"status\":\"active\",\"updatedAt\":\"2026-10-04T12:00:00.000Z\"},\"eventCount\":12,\"kinds\":[],\"models\":[\"gpt-5\"],\"taskTitle\":\"Fix the thing\",\"summary\":\"Fix the thing\",\"summarySource\":\"task_title\",\"taskRefs\":[],\"totalCostUsdMicros\":null,\"totalInputTokens\":100,\"totalOutputTokens\":7,\"totalReasoningTokens\":0,\"totalCacheReadTokens\":0,\"totalCacheCreateTokens\":0,\"totalCacheCreate5mTokens\":null,\"totalCacheCreate1hTokens\":null,\"catalog\":{\"workspaceId\":\"ws-a\",\"title\":\"Title s-2\",\"gitBranch\":null,\"repoUrl\":null,\"initialCommit\":null,\"projectKey\":null,\"projectKeyMethod\":null,\"models\":[\"gpt-5\"],\"originator\":null,\"agentVersion\":null,\"firstActivityAt\":\"2026-10-01T00:00:00.000Z\",\"lastActivityAt\":\"2026-10-04T12:00:00.000Z\",\"parentSessionIds\":[],\"childSessionCount\":0}}],\"nextCursor\":\"b96q1:WyIyMDI2LTEwLTA0VDEyOjAwOjAwLjAwMDAwMVoiLCJzLTIiLCJjb2RleCIsImM3ZDdlOTI1NTQ4MTk1Nzc1MjQwYWUzMGI1NTYwMDdjIl0\",\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.query_session_directory_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer)"
+        ]
+      },
+      {
+        "text": "SELECT org_id, workspace_id, harness, session_id,\n       created_at, last_activity_at,\n       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts,\n       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,\n       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,\n       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,\n       short_summary_generated_at, catalog_projected_at, projected_at\n  FROM sessions.query_session_directory_for(\n    p_workspace_id => $1, p_free => $2, p_not_free => $3, p_title => $4, p_not_title => $5,\n    p_project => $6, p_not_project => $7, p_harness => $8, p_not_harness => $9,\n    p_agent_terms => $10, p_not_agent_terms => $11, p_id => $12, p_not_id => $13, p_active => $14,\n    p_sources => $15, p_not_sources => $16, p_project_contains => $17, p_user_ids => $18, p_agent => $19,\n    p_last_ts_after => $20, p_last_ts_before => $21, p_first_ts_after => $22, p_first_ts_before => $23,\n    p_cursor_last_activity_at => $24, p_cursor_session_id => $25, p_cursor_harness => $26, p_limit => $27)",
+        "params": [
+          "ws-a",
+          [
+            "hello"
+          ],
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          [
+            "codex"
+          ],
+          null,
+          null,
+          [
+            "u-1"
+          ],
+          null,
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-09-01T00:00:00.000Z",
+          "2026-11-01T00:00:00.000Z",
+          "2026-10-04T12:00:00.000001Z",
+          "s-2",
+          "codex",
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&cursor=b96s1:not-a-cursor",
+    "status": 400,
+    "contentType": "application/json",
+    "body": "{\"error\":{\"code\":\"bad_request\",\"message\":\"cursor is not valid\"},\"correlationId\":\"golden-1\"}",
+    "statements": []
+  },
+  {
+    "request": "/v1/sessions?workspace=ws-a&limit=2&cursor=sessions-v2:abc",
+    "status": 501,
+    "contentType": "application/json",
+    "body": "{\"error\":{\"code\":\"unsupported_by_backend\",\"message\":\"cursor was issued by another backend\",\"reason\":\"foreign_cursor\"},\"correlationId\":\"golden-1\"}",
+    "statements": []
+  },
+  {
+    "request": "/v1/sessions/activity?workspace=ws-a&since=2026-10-01T00:00:00Z&until=2026-10-07T00:00:00Z",
+    "status": 200,
+    "contentType": "application/json",
+    "body": "{\"since\":\"2026-10-01T00:00:00.000Z\",\"until\":\"2026-10-07T00:00:00.000Z\",\"days\":[{\"date\":\"2026-10-01\",\"total\":0,\"bySource\":{}},{\"date\":\"2026-10-02\",\"total\":0,\"bySource\":{}},{\"date\":\"2026-10-03\",\"total\":2,\"bySource\":{\"codex\":2}},{\"date\":\"2026-10-04\",\"total\":0,\"bySource\":{}},{\"date\":\"2026-10-05\",\"total\":0,\"bySource\":{}},{\"date\":\"2026-10-06\",\"total\":0,\"bySource\":{}},{\"date\":\"2026-10-07\",\"total\":0,\"bySource\":{}}],\"correlationId\":\"golden-1\"}",
+    "statements": [
+      {
+        "text": "SELECT to_regprocedure($1) IS NOT NULL AS installed",
+        "params": [
+          "sessions.session_directory_activity_for(text, timestamptz, timestamptz)"
+        ]
+      },
+      {
+        "text": "SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions\n  FROM sessions.session_directory_activity_for($1, $2, $3)",
+        "params": [
+          "ws-a",
+          "2026-10-01T00:00:00.000Z",
+          "2026-10-07T00:00:00.000Z"
+        ]
+      }
+    ]
+  }
+]

@@ -14,6 +14,7 @@ import { row } from "../../../src/session-read-api/__tests__/support.ts";
 import { analysisDeps, ANALYSIS_RESULT_REQUEST_BUDGET_BYTES, boundedClickHouse, connectPg, handle, methodAllowed, ownerBufferedDeps, type Env } from "../src/index.ts";
 import { BufferedFenced, BufferedIndexVerifier } from "../../../src/session-read-api/owner-buffered.ts";
 import { BRIEF_SUMMARY_SIGNATURE } from "../../../src/session-read-api/brief-summary.ts";
+import { LIST_FOR_SIGNATURE, LIST_READINESS_FOR_SIGNATURE } from "../../../src/session-read-api/directory.ts";
 import { ANALYSIS_ADMIT_BOUNDS_SQL, ANALYSIS_ADMIT_SQL, ANALYSIS_READ_SQL } from "../../../src/session-read-api/analysis-source.ts";
 import { SESSION_HARNESSES_SQL } from "../../../src/session-read-api/session-turns-source.ts";
 import { TENANT_SETTINGS_SQL } from "../../../src/session-read-api/liveness.ts";
@@ -450,6 +451,46 @@ describe("entry and configuration", () => {
     expect((await body(listOn)).error?.reason).not.toBe("param_includeShortSummary");
     const summaryOff = await call(summary, { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
     expect((await body(summaryOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
+  });
+
+  test("list readiness: default off (501 param_readyOnly / param_includeReadiness, no SQL), on only with the exact string \"true\", then the 062200 readiness function", async () => {
+    const t = tenant();
+    const seen: Array<{ text: string; params?: unknown[] }> = [];
+    // A fake pg client: records every statement; the readiness function reads as not installed.
+    const connect = async () => ({
+      async query(text: string, params?: unknown[]) {
+        seen.push({ text, params });
+        return { rows: text.includes("to_regprocedure") ? [{ installed: false }] : [] };
+      },
+      async end() {},
+    }) as unknown as pg.Client;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, ...over }, ctx, { connect });
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const directorySql = () => seen.filter((q) => q.text.includes("session_directory") || q.text.includes("to_regprocedure"));
+    for (const param of ["readyOnly", "includeReadiness"]) {
+      for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
+        seen.length = 0;
+        const r = await call(`/v1/sessions?workspace=${t.ws}&${param}=true`, { READ_API_LIST_READINESS_ENABLED: flag });
+        expect(r.status, `${param} ${String(flag)}`).toBe(501);
+        expect((await body(r)).error, `${param} ${String(flag)}`).toMatchObject({ code: "unsupported_by_backend", reason: `param_${param}` });
+        expect(directorySql(), `${param} ${String(flag)}`).toHaveLength(0);
+      }
+      seen.length = 0;
+      const on = await call(`/v1/sessions?workspace=${t.ws}&${param}=true`, { READ_API_LIST_READINESS_ENABLED: "true" });
+      expect(on.status).toBe(501);
+      expect((await body(on)).error).toMatchObject({ code: "unsupported_by_backend", reason: "directory_not_migrated" });
+      expect(seen.some((q) => q.params?.includes(LIST_READINESS_FOR_SIGNATURE))).toBe(true);
+      expect(seen.some((q) => q.params?.includes(LIST_FOR_SIGNATURE))).toBe(false);
+    }
+    // On, without either param: the pre-readiness function only.
+    seen.length = 0;
+    await call(`/v1/sessions?workspace=${t.ws}`, { READ_API_LIST_READINESS_ENABLED: "true" });
+    expect(seen.some((q) => q.params?.includes(LIST_FOR_SIGNATURE))).toBe(true);
+    expect(seen.some((q) => q.params?.includes(LIST_READINESS_FOR_SIGNATURE))).toBe(false);
   });
 
   test("summary fallback: off unless exactly \"true\" with the brief flag; on without key material is 501 summary_fallback_not_configured", async () => {

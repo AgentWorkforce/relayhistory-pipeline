@@ -428,6 +428,15 @@ describe("deploy workflow wiring", () => {
     expect(TEMPLATE).not.toContain("READ_API_LIST_SHORT_SUMMARY_ENABLED");
   });
 
+  test("list_readiness: default off; on adds only the exact \"true\" --var to the deploy command; never in the template", () => {
+    expect(WORKFLOW).toMatch(/list_readiness:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("LIST_READINESS: ${{ inputs.list_readiness }}");
+    expect(WORKFLOW).toContain(`case "$LIST_READINESS" in off|on) ;; *) fail 'list_readiness must be "off" or "on"' ;; esac`);
+    expect(WORKFLOW).toContain('list_readiness=""; if [ "$LIST_READINESS" = "on" ]; then list_readiness=true; fi');
+    expect(WORKFLOW).toContain('${list_readiness:+--var "READ_API_LIST_READINESS_ENABLED:$list_readiness"}');
+    expect(TEMPLATE).not.toContain("READ_API_LIST_READINESS_ENABLED");
+  });
+
   test("summary_fallback: default off; on needs brief_summary=on and the SUMMARY_MASTER_KEYS secret, and adds only the exact \"true\" --var", () => {
     expect(WORKFLOW).toMatch(/summary_fallback:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("SUMMARY_FALLBACK: ${{ inputs.summary_fallback }}");

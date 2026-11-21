@@ -52,6 +52,9 @@
  * summary_fallback_not_configured; every other value = the route exactly as without it),
  * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true": the GET /v1/sessions
  * includeShortSummary=recorded extension; every other value = 501 param_includeShortSummary),
+ * READ_API_LIST_READINESS_ENABLED (exactly "true": the GET /v1/sessions includeReadiness=true and
+ * readyOnly=true opt-ins over migration 20261105062200; every other value = 501
+ * param_includeReadiness / param_readyOnly; unset in wrangler.jsonc),
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true": GET /v1/sessions/summaries/search over the
  * owner-applied ClickHouse session_brief_documents; every other value = 501
  * summary_search_not_configured; unset in wrangler.jsonc),
@@ -230,6 +233,8 @@ export interface Env extends CanonicalEnv {
   READ_API_RELAYFACTS_ENABLED?: string;
   /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
   READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
+  /** Exactly "true": serve the GET /v1/sessions includeReadiness=true / readyOnly=true opt-ins; anything else = 501 param_includeReadiness / param_readyOnly. */
+  READ_API_LIST_READINESS_ENABLED?: string;
   READ_API_SUMMARY_SEARCH_ENABLED?: string;
   /** Exactly "true": serve GET /v1/sessions/:sessionId/sources (sqlSessionSources); anything else = 501 sources_not_configured. */
   READ_API_SESSION_SOURCES_ENABLED?: string;
@@ -616,6 +621,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_RELAYFACTS_ENABLED) ? { relayfacts: sqlRelayfacts(tenant.run) } : {}),
     ...(analysis ? { analysis } : {}),
     ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
+    ...(exactTrueFlag(env.READ_API_LIST_READINESS_ENABLED) ? { listReadiness: true } : {}),
     ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
     ...(exactTrueFlag(env.READ_API_SESSION_SOURCES_ENABLED) ? { sessionSources: sqlSessionSources(tenant.run) } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),

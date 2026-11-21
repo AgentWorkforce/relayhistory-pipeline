@@ -128,9 +128,21 @@ paths:
         - {name: firstTsBefore, in: query, schema: {type: string, format: date-time}}
         - $ref: "#/components/parameters/q"
         - $ref: "#/components/parameters/search"
+        - name: includeReadiness
+          in: query
+          description: "List readiness (`READ_API_LIST_READINESS_ENABLED=true`, migration 20261105062200). Only `true`: each session also carries `eventsReady` and `eventsProjectedAt`. Any other value, or the param repeated, is 400. With the flag off the param, with any value, is 501 `param_includeReadiness`. Never changes the rows, the order or the cursor. Readiness is search-projection state; it does not prove that the session's exact or context reads work."
+          schema: {type: string, enum: ["true"]}
+        - name: readyOnly
+          in: query
+          description: "List readiness (`READ_API_LIST_READINESS_ENABLED=true`, migration 20261105062200). Only `true`: only sessions whose search projection is ready, filtered in SQL before the keyset and the limit, so pages and cursors are exact; with `q` too. Any other value, or the param repeated, is 400; with the flag off the param, with any value, is 501 `param_readyOnly`. A readyOnly cursor continues only a readyOnly read (and the reverse): replaying it across a readyOnly change is 400 `cursor is not valid`. Owner-buffered sessions (just uploaded, no directory row) are never listed. A client must check the `X-Relayhistory-Ready-Only` response header: readers older than this change ignore the param and answer 200 unfiltered, without the header. readyOnly hides for good sessions too large to index, scopes over budget, sessions with persistent canonical metadata errors and every session on an install with no indexer, and briefly every active session after each upload."
+          schema: {type: string, enum: ["true"]}
       responses:
         "200":
           description: One page of sessions.
+          headers:
+            X-Relayhistory-Ready-Only:
+              description: "`applied` when `readyOnly=true` filtered this page (`READ_API_LIST_READINESS_ENABLED=true` only). Absent otherwise, and on every reader older than list readiness."
+              schema: {type: string, enum: [applied]}
           content:
             application/json:
               schema:
@@ -639,6 +651,8 @@ components:
         totalInputTokens: {type: integer}
         totalOutputTokens: {type: integer}
         catalog: {type: object, description: Present once the session's catalog is projected.}
+        eventsReady: {type: boolean, description: "Only with `includeReadiness=true`: the session's search (event) projection is complete (event_projection_ready and projection version 1). False for an owner-buffered session. Not a readability claim."}
+        eventsProjectedAt: {type: [string, "null"], format: date-time, description: "Only with `includeReadiness=true`: when the event projection last completed, as stored; it can be set while `eventsReady` is false (a later upload made the session not ready again). Null for an owner-buffered session or one never projected."}
     Turn:
       type: object
       required: [id, sessionId, sessionOwner, turnIndex, role, content, actorName, actorRole, metadata, ts]

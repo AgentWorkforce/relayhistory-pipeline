@@ -81,6 +81,8 @@ interface Harness {
    * session ids, every other query no rows. Absent: every ClickHouse call throws.
    */
   canonical?: { partial?: string[] };
+  /** READ_API_LIST_READINESS_ENABLED=true (deps.listReadiness); default off. */
+  listReadiness?: boolean;
 }
 function api(h: Harness = {}) {
   const logs: Record<string, unknown>[] = [];
@@ -146,6 +148,7 @@ function api(h: Harness = {}) {
     turns,
     ownerBuffered,
     ...(h.selfhost ? { selfhost: {} } : {}),
+    ...(h.listReadiness ? { listReadiness: true } : {}),
   });
   const get = (path: string, signal?: AbortSignal) =>
     signal ? app.request(new Request(`http://localhost${path}`, { headers: { authorization: "Bearer good" }, signal })) : app.request(path, { headers: { authorization: "Bearer good" } });
@@ -1382,6 +1385,59 @@ describe("READ_API_OWNER_BUFFERED_STAGES_PAGED=on: the paged 047020 stage reader
         expect(strip(JSON.parse(text))).toEqual(mainBody);
         expect(text).not.toContain("CHANGED-");
       }
+    }
+  });
+});
+
+describe("GET /v1/sessions list readiness with owner buffered rows (READ_API_LIST_READINESS_ENABLED)", () => {
+  const ready = (over: Partial<DirectoryListRow> & { cursor_ts?: string } = {}) =>
+    dirRow({ events_ready: true, event_projected_at: new Date("2026-10-03T00:00:00Z"), ...over });
+
+  test("includeReadiness keeps the union: canonical rows carry their readiness, a buffered row eventsReady=false / eventsProjectedAt=null", async () => {
+    const gate = scriptedGate(authority("7"));
+    const { get, dirCalls } = api({ gate, listReadiness: true, rows: [ready()], reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    const r = await get(`${L}&includeReadiness=true`);
+    expect(r.status).toBe(200);
+    const b = await json(r);
+    expect(b.sessions.map((s: any) => [s.source, s.sessionId, s.eventsReady, s.eventsProjectedAt])).toEqual([
+      ["claude", SESSION, false, null],
+      ["codex", "s-1", true, "2026-10-03T00:00:00.000Z"],
+    ]);
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBe(`claude:${SESSION}`);
+    expect(r.headers.get("x-relayhistory-ready-only")).toBeNull();
+    expect(gate.calls).toHaveLength(2);
+    expect(dirCalls).toEqual([expect.objectContaining({ readiness: { readyOnly: false } })]);
+  });
+
+  test("readyOnly: canonical page only, no buffered read (gate never called), no X-Relayhistory-Buffered* headers, marked cursor", async () => {
+    const gate = scriptedGate(authority("7"));
+    const rows = [ready({ session_id: "s-3", cursor_ts: "2026-10-03T00:00:00.000000Z" }), ready({ session_id: "s-2", cursor_ts: "2026-10-02T00:00:00.000000Z" })];
+    const { get, dirCalls } = api({ gate, listReadiness: true, rows, reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    const r = await get(`${L}&readyOnly=true&limit=1`);
+    expect(r.status).toBe(200);
+    const b = await json(r);
+    expect(b.sessions.map((s: any) => s.sessionId)).toEqual(["s-3"]);
+    expect(b.sessions[0]).not.toHaveProperty("eventsReady");
+    expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+    expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+    expect(r.headers.get("x-relayhistory-ready-only")).toBe("applied");
+    expect(gate.calls).toHaveLength(0);
+    expect(dirCalls).toEqual([expect.objectContaining({ readiness: { readyOnly: true } })]);
+    expect(decodeCompositeListCursor(b.nextCursor)).toBe("invalid");
+  });
+
+  test("a composite (buffered) cursor replayed with readyOnly is invalid_cursor, and a readyOnly cursor replayed into the union is invalid_cursor", async () => {
+    const { get } = api({ listReadiness: true, rows: [ready()], reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    const composite = encodeCompositeListCursor(undefined, { ts: "2026-11-05T12:05:00.000000Z", sessionId: SESSION, source: "claude" });
+    const r1 = await get(`${L}&readyOnly=true&cursor=${encodeURIComponent(composite)}`);
+    expect(r1.status).toBe(400);
+    expect((await json(r1)).error).toMatchObject({ code: "bad_request", message: "cursor is not valid" });
+    const rows = [ready({ session_id: "s-3", cursor_ts: "2026-10-03T00:00:00.000000Z" }), ready({ session_id: "s-2", cursor_ts: "2026-10-02T00:00:00.000000Z" })];
+    const marked = (await json(await api({ listReadiness: true, rows }).get(`${L}&readyOnly=true&limit=1`))).nextCursor;
+    for (const extra of ["", "&includeReadiness=true"]) {
+      const r2 = await get(`${L}${extra}&cursor=${encodeURIComponent(marked)}`);
+      expect([extra, r2.status]).toEqual([extra, 400]);
+      expect((await json(r2)).error).toMatchObject({ code: "bad_request", message: "cursor is not valid" });
     }
   });
 });
