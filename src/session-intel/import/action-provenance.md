@@ -31,8 +31,10 @@ root, malformed identity, credential-bearing URL or over-budget input is refused
 without echoing values. The most specific lexical root wins. Case and symlinks
 are not guessed: path identity preserves case and no filesystem canonicalization
 of trace paths occurs. Absolute POSIX and drive-letter paths are supported; a
-drive path that normalizes above its drive root is refused, rather than becoming
-a relative path or losing its drive identity. UNC,
+drive path that resolves to its root is preserved as `X:/`; traversal above the
+root is refused, rather than becoming a relative path or losing its drive
+identity. Relative targets also resolve from POSIX `/` without becoming UNC
+paths. UNC,
 home expansion and paths without a resolvable base remain unknown.
 
 The new `action-provenance.json` file is mode 0600 and SHA-pinned in the existing

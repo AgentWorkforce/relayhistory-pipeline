@@ -31,6 +31,9 @@ test("path and repository claim normalization rejects credentials and preserves 
   expect(directoryPath("../other", "/work/home")).toBe("/work/other");
   expect(directoryPath("C:\\work\\repo")).toBe("C:/work/repo");
   expect(directoryPath("C:/")).toBe("C:/");
+  expect(directoryPath("C:/a/..")).toBe("C:/");
+  expect(directoryPath("..", "C:/repo")).toBe("C:/");
+  expect(directoryPath("x", "/")).toBe("/x");
   for (const raw of ["C:/../work", "D:/../work", "C:/../../work", "C:/../D:/work", "C:/../C:/work", "C:relative"]) expect(directoryPath(raw)).toBeNull();
   expect(directoryPath("../../work", "C:/repo")).toBeNull();
   expect(directoryPath("../../C:/work", "C:/repo")).toBeNull();
@@ -257,6 +260,28 @@ test("provenance production modules have no process or Bun shell imports", () =>
     expect(forbiddenImports(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"))).toEqual([]);
 });
 
+test("the map reader imports only explicit file-opening capabilities and has no require or Bun.Glob", () => {
+  const violations = (source: string) => {
+    const file = ts.createSourceFile("fixture.ts", source, ts.ScriptTarget.Latest, true), found: string[] = [];
+    const visit = (node: ts.Node) => {
+      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && /^(?:node:)?fs(?:\/promises)?$/u.test(node.moduleSpecifier.text)) {
+        const allowed = node.moduleSpecifier.text === "node:fs" ? "constants" : node.moduleSpecifier.text === "node:fs/promises" ? "open" : null;
+        const clause = node.importClause, bindings = clause?.namedBindings;
+        if (!allowed || !bindings || !ts.isNamedImports(bindings) || clause?.name || !bindings.elements.length
+          || bindings.elements.some((e) => (e.propertyName ?? e.name).text !== allowed)) found.push("fs capability");
+      }
+      if ((ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "require") || ts.isImportEqualsDeclaration(node)) found.push("require");
+      if ((ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "Bun" && node.name.text === "Glob")
+        || (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "Bun"
+          && ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === "Glob")) found.push("Bun.Glob");
+      ts.forEachChild(node, visit);
+    };
+    visit(file); return found;
+  };
+  expect(violations('import {statfsSync} from "node:fs"; require("fs"); new Bun.Glob("*");')).toHaveLength(3);
+  expect(violations(readFileSync(new URL("../provenance.ts", import.meta.url), "utf8"))).toEqual([]);
+});
+
 test("capture never executes Git or probes a directory controlled by a trace", () => {
   // Isolate module mocks in a child test process; no mocks leak into the other import suites.
   const root = temp(), input = join(root, "fixture.jsonl"), map = join(root, "map.json"), out = join(root, "out"), trace = join(root, "must-not-probe");
@@ -277,12 +302,19 @@ test("capture never executes Git or probes a directory controlled by a trace", (
 import * as fs from "node:fs"; import * as fsp from "node:fs/promises"; import * as cp from "node:child_process";
 const trace=${JSON.stringify(trace)}, forbidden=[];
 function isTrace(v){const s=v instanceof URL?v.pathname:typeof v==="string"?v:null;return s!==null&&(s===trace||s.startsWith(trace+"/"));}
-function guarded(original,kind,keys){const result={...original};for(const key of keys){const fn=original[key];if(typeof fn!=="function")continue;result[key]=(...args)=>{if(kind==="process"||isTrace(args[0])){forbidden.push(kind+":"+key);throw new Error("forbidden synthetic probe");}return Reflect.apply(fn,original,args);};}return {...result,default:result};}
+function guarded(original,kind,keys){const result={...original};for(const key of keys){const fn=original[key];if(typeof fn!=="function")continue;result[key]=(...args)=>{if(kind==="process"||isTrace(args[0])||isTrace(args[1]?.cwd)){forbidden.push(kind+":"+key);throw new Error("forbidden synthetic probe");}return Reflect.apply(fn,original,args);};}return {...result,default:result};}
 const nativeFs={...fs}, nativePromises={...fsp}, nativeProcesses={...cp};
-const promiseGuards=guarded(nativePromises,"fs",["stat","lstat","access","realpath","readlink","readdir","opendir","open","readFile","watch"]);
-mock.module("node:fs",()=>{const g=guarded(nativeFs,"fs",["stat","statSync","lstat","lstatSync","access","accessSync","exists","existsSync","realpath","realpathSync","readlink","readlinkSync","readdir","readdirSync","opendir","opendirSync","open","openSync","readFile","readFileSync","createReadStream","watch","watchFile"]);g.promises=promiseGuards;g.default.promises=promiseGuards;return g;});
-mock.module("node:fs/promises",()=>promiseGuards);
+const promiseGuards=guarded(nativePromises,"fs",["stat","statfs","lstat","access","realpath","readlink","readdir","opendir","open","readFile","watch","glob"]);
+const fsGuards=guarded(nativeFs,"fs",["stat","statSync","statfs","statfsSync","lstat","lstatSync","access","accessSync","exists","existsSync","realpath","realpathSync","readlink","readlinkSync","readdir","readdirSync","opendir","opendirSync","open","openSync","readFile","readFileSync","createReadStream","watch","watchFile","glob","globSync"]);fsGuards.promises=promiseGuards;fsGuards.default.promises=promiseGuards;
+// CommonJS builtins bypass Bun module mocks; patch the saved builtin objects in this child only.
+const cjsFs=require("fs");
+for(const key of Object.keys(fsGuards)){if(typeof fsGuards[key]==="function")cjsFs[key]=fsGuards[key];}
+for(const key of Object.keys(promiseGuards)){if(typeof promiseGuards[key]==="function")cjsFs.promises[key]=promiseGuards[key];}
+mock.module("node:fs",()=>fsGuards);mock.module("fs",()=>fsGuards);
+mock.module("node:fs/promises",()=>promiseGuards);mock.module("fs/promises",()=>promiseGuards);
 mock.module("node:child_process",()=>guarded(nativeProcesses,"process",["exec","execFile","execSync","execFileSync","spawn","spawnSync","fork"]));
+const NativeGlob=Bun.Glob;
+Bun.Glob=class{constructor(pattern){const glob=new NativeGlob(pattern);for(const method of ["scan","scanSync"]){this[method]=(...args)=>{if(isTrace(pattern)||isTrace(args[0]?.cwd)){forbidden.push("fs:Bun.Glob."+method);throw new Error("forbidden synthetic probe");}return glob[method](...args);};}this.match=(...args)=>glob.match(...args);}};
 Bun.$=()=>{forbidden.push("process:Bun.$");throw new Error("forbidden synthetic probe");};
 for(const key of ["spawn","spawnSync"]){Bun[key]=()=>{forbidden.push("process:Bun."+key);throw new Error("forbidden synthetic probe");};}
 for(const key of ["file","write"]){const fn=Bun[key];Bun[key]=(...args)=>{if(isTrace(args[0])){forbidden.push("fs:Bun."+key);throw new Error("forbidden synthetic probe");}return Reflect.apply(fn,Bun,args);};}
@@ -305,6 +337,12 @@ test("only explicitly selected input/map files are read",async()=>{
  expect(()=>guardedFsModule.watch(trace,()=>{})).toThrow("forbidden synthetic probe");
  expect(()=>Bun.$(["git status"])).toThrow("forbidden synthetic probe");
  expect(forbidden.length).toBe(8);
+ const fsAlias=require("fs");let extra=0;
+ expect(()=>fsAlias.statSync(trace)).toThrow("forbidden synthetic probe");extra++;
+ if(typeof fsAlias.statfsSync==="function"){expect(()=>fsAlias.statfsSync(trace)).toThrow("forbidden synthetic probe");extra++;}
+ if(typeof guardedFs.glob==="function"){expect(()=>guardedFs.glob("*",{cwd:trace})).toThrow("forbidden synthetic probe");extra++;}
+ expect(()=>new Bun.Glob("*").scanSync({cwd:trace})).toThrow("forbidden synthetic probe");extra++;
+ expect(forbidden.length).toBe(8+extra);
 });`);
   const result = Bun.spawnSync({ cmd: [process.execPath, "test", child], env: { PATH: process.env.PATH ?? "" }, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(`synthetic probe guard failed: ${result.stderr.toString()}`);
