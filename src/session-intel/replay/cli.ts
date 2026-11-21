@@ -94,7 +94,7 @@ export function replayDetectors(list: string | undefined, options: { now?: Date 
     if (n === ADVISOR_DETECTOR_NAME) return advisorDetector();
     if (n === CONFLICT_RULE_DETECTOR) return ruleConflictDetector();
     if (n === CONFLICT_MODEL_DETECTOR) throw new Error(`--detectors: ${CONFLICT_MODEL_DETECTOR} needs a model transport, which the offline CLI has none of; run it from code with an injected transport`);
-    throw new Error(`--detectors: unknown detector ${JSON.stringify(n.slice(0, 64))} (known: ${ADVISOR_DETECTOR_NAME}, ${CONFLICT_RULE_DETECTOR})`);
+    throw new Error(`--detectors: unknown detector ${JSON.stringify(n.slice(0, 64))} (known: ${ADVISOR_DETECTOR_NAME}, ${CONFLICT_RULE_DETECTOR}, ${ACTION_SCOPED_DETECTOR})`);
   });
 }
 

@@ -2,7 +2,7 @@
 import { expect, test } from "bun:test";
 import { SessionBuilder, Hasher, emptyStats, toSnapshotSession } from "../import/normalize.ts";
 import { actionArtifacts, actionContext, type RepositoryRoot } from "../import/provenance.ts";
-import { actionScopedDetector, ACTION_SCOPED_DETECTOR } from "../replay/action-scoped.ts";
+import { actionScopedDetector, ACTION_SCOPED_DETECTOR, ACTION_REPLAY_BOUNDS } from "../replay/action-scoped.ts";
 import { ActionFrame, ACTION_FRAME_BOUNDS } from "../replay/action-frame.ts";
 import { replaySnapshot } from "../replay/replay.ts";
 import { assertScorable } from "../replay/score.ts";
@@ -146,8 +146,69 @@ test("unchanged ticks avoid rerunning quadratic detection; input order does not 
   const rows = [row("one", [migration("a", "one")]), row("two", [migration("a", "two")])];
   const s = snapshot(rows), d = detector(), view = new ReplayView(s);
   const first = await d.run(view, new Date(at(2))), work = d.diagnostics!(view).work;
+  expect(work).toBe(4 * 2 * 2 + 2); // Two facts and two lanes in one changed repository.
   expect(await d.run(view, new Date(at(3)))).toEqual([]); expect(d.diagnostics!(view).work).toBe(work);
   const other = await replaySnapshot(snapshot([...rows].reverse()), { detectors: [detector()], intervalMs: 60_000 });
   expect(other.alerts).toEqual(first);
   await expect(d.run(view, new Date(at(0)))).rejects.toThrow("backwards");
+});
+
+const eightDays = 8 * 24 * 60;
+test("seven-day pruning removes old writes before a duplicate eight days later", async () => {
+  const s = snapshot([row("one", [migration("a", "one")]), row("two", [migration("a", "two", { minute: eightDays + 1 })])], ["a"], eightDays + 3);
+  const view = new ReplayView(s), d = detector();
+  expect(await d.run(view, new Date(at(2)))).toEqual([]);
+  expect(await d.run(view, new Date(at(eightDays + 2)))).toEqual([]);
+  expect(d.diagnostics!(view).visibleFacts).toBe(1);
+});
+test("scope arriving eight days late is counted but never admitted to the active frame", async () => {
+  const s = snapshot([row("one", [migration("a", "one", { known: eightDays + 1 })]), row("two", [migration("a", "two", { minute: eightDays + 1 })])], ["a"], eightDays + 3);
+  const view = new ReplayView(s), d = detector();
+  expect(await d.run(view, new Date(at(eightDays + 2)))).toEqual([]);
+  expect(d.diagnostics!(view)).toMatchObject({ staleOnArrival: 1, visibleFacts: 1 });
+});
+test("expiry removes a deferred finding before its cooldown ends", async () => {
+  const s = snapshot([row("one", [migration("a", "one"), migration("b", "one")]), row("two", [migration("a", "two"), migration("b", "two")])], ["a", "b"], eightDays + 3);
+  const view = new ReplayView(s), d = detector({ pairCooldownMs: eightDays * 60_000 });
+  expect(await d.run(view, new Date(at(2)))).toHaveLength(1);
+  expect(d.diagnostics!(view).pending).toBe(1);
+  expect(await d.run(view, new Date(at(eightDays + 2)))).toEqual([]);
+  expect(d.diagnostics!(view)).toMatchObject({ pending: 0, visibleFacts: 0 });
+});
+test("global visible-fact cap rejects limit plus one spread across individually small repositories", async () => {
+  const roots = Array.from({ length: 17 }, (_, i) => `repo-${i}`);
+  const events = Array.from({ length: ACTION_FRAME_BOUNDS.visibleFacts + 1 }, (_, i) => ({ repo: roots[i % roots.length]!, path: `src/file-${i}.ts` }));
+  const s = snapshot([row("one", events)], roots, 2);
+  const result = await replaySnapshot(s, { detectors: [detector()], intervalMs: 60_000 });
+  expect(result.alerts).toEqual([]);
+  expect(result.detectors[0]!.diagnostics).toMatchObject({ visibleFacts: ACTION_FRAME_BOUNDS.visibleFacts + 1, rejected: 1, work: 0 });
+  expect(result.incomplete).toContain(`${ACTION_SCOPED_DETECTOR} rejected=1`);
+});
+test("finding-identity cap rejects the second distinct repository finding and reports the tightened cap", async () => {
+  const s = snapshot([row("one", [migration("a", "one"), migration("b", "one")]), row("two", [migration("a", "two"), migration("b", "two")])]);
+  const result = await replaySnapshot(s, { detectors: [detector({ findingLimit: 1 })] });
+  expect(result.alerts).toEqual([]);
+  expect(result.detectors[0]!.diagnostics).toMatchObject({ rejected: 1, findings: 1 });
+  expect(result.detectors[0]!.params.bounds).toEqual({ ...ACTION_REPLAY_BOUNDS, findings: 1 });
+  expect(result.incomplete).toContain(`${ACTION_SCOPED_DETECTOR} rejected=1`);
+});
+test("per-call finding cap refuses a saturated result when two pairs exceed the tightened cap", async () => {
+  const s = snapshot([row("one", [migration("a", "one"), migration("a", "one", { path: "supabase/migrations/0043_one.sql" })]), row("two", [migration("a", "two")]), row("three", [migration("a", "three", { path: "supabase/migrations/0043_three.sql" })])]);
+  const result = await replaySnapshot(s, { detectors: [detector({ perCallFindingLimit: 1 })] });
+  expect(result.alerts).toEqual([]);
+  expect(result.detectors[0]!.diagnostics.rejected).toBeGreaterThan(0);
+  expect(result.detectors[0]!.params.bounds).toEqual({ ...ACTION_REPLAY_BOUNDS, perCallFindings: 1 });
+  expect(result.incomplete).toContain(`${ACTION_SCOPED_DETECTOR} rejected=1`);
+  expect(detector().params.bounds).toEqual({ work: 20_000_000, findings: 10_000, perCallFindings: 65_536 });
+  for (const options of [{ findingLimit: 0 }, { perCallFindingLimit: 0 }, { findingLimit: ACTION_REPLAY_BOUNDS.findings + 1 }, { perCallFindingLimit: ACTION_REPLAY_BOUNDS.perCallFindings + 1 }])
+    expect(() => detector(options)).toThrow("invalid bounded");
+});
+test("ancestor cap admits exactly 256 distinct starts plus parents and refuses 257", () => {
+  for (const count of [ACTION_FRAME_BOUNDS.ancestors, ACTION_FRAME_BOUNDS.ancestors + 1]) {
+    const ancestors = Array.from({ length: count - 1 }, (_, i) => row(`parent-${i}`, [], i ? [`parent-${i - 1}`] : []));
+    const s = snapshot([...ancestors, row("one", [], [`parent-${ancestors.length - 1}`]), row("two", [])]);
+    const frame = new ActionFrame(s, now);
+    expect(frame.planned(`codex:${h.session("codex", "one")}`, `codex:${h.session("codex", "two")}`)).toBe(count === 256 ? false : null);
+    expect(frame.stats.rejected).toBe(count === 256 ? 0 : 1);
+  }
 });

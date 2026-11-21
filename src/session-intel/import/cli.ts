@@ -235,8 +235,8 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
       + `${stats.codexChildrenWithoutTaskBoundary} children had no verified own task boundary`);
   if (stats.codexCodeModeShellUnparsed)
     io.err(`import: warning: ${stats.codexCodeModeShellUnparsed} Codex code-mode calls had unsupported or bounded-out shell syntax; commit coverage is incomplete`);
-  if (actions) io.err("import: action provenance is capture-only; repository claims are not independently verified and existing replay does not consume this sidecar");
-  if (repositoryPaths) io.err("import: version-2 action repository paths are capture-only; the version-1 action-scope consumer refuses them until its separate adapter update");
+  if (actions) io.err(`import: action provenance is capture-only; repository claims are not independently verified and ${repositoryPaths ? "default" : "existing"} replay does not consume this sidecar`);
+  if (repositoryPaths) io.err("import: version-2 action repository paths require the explicit offline action-scoped-outcomes adapter; the version-1 action-scope consumer and default replay remain unchanged");
   // Counts, then the resolved real paths of the snapshot and the mapping (no ids, source paths or text).
   io.out(`import: ${JSON.stringify(stats)}`);
   io.out(`import: snapshot -> ${out}; private mapping -> ${mapping}`);

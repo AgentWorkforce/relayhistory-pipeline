@@ -15,14 +15,17 @@ export const ACTION_REPLAY_BOUNDS = { work: 20_000_000, findings: 10_000, perCal
 interface Candidate { repo: string; alert: ReplayAlert; recipients: [{ harness: string; sessionId: string }, { harness: string; sessionId: string }] }
 interface State { frame: ActionFrame; limits: AdvisorLimits; pending: Map<string, Candidate>; known: Set<string>; emitted: Set<string>; work: number; delivered: number; skippedFleet: number }
 
-export function actionScopedDetector(options: { now?: Date; workBudget?: number; pairCooldownMs?: number; sessionHourlyCap?: number } = {}): ReplayDetector {
+export function actionScopedDetector(options: { now?: Date; workBudget?: number; pairCooldownMs?: number; sessionHourlyCap?: number; findingLimit?: number; perCallFindingLimit?: number } = {}): ReplayDetector {
   const workBudget = options.workBudget ?? ACTION_REPLAY_BOUNDS.work;
+  const findingLimit = options.findingLimit ?? ACTION_REPLAY_BOUNDS.findings;
+  const perCallFindingLimit = options.perCallFindingLimit ?? ACTION_REPLAY_BOUNDS.perCallFindings;
   const pairCooldownMs = options.pairCooldownMs ?? DEFAULT_PAIR_COOLDOWN_SECONDS * 1_000;
   const sessionHourlyCap = options.sessionHourlyCap ?? DEFAULT_SESSION_HOURLY_CAP;
-  if (![workBudget, pairCooldownMs, sessionHourlyCap].every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error("action replay: invalid bounded parameters");
+  if (![workBudget, pairCooldownMs, sessionHourlyCap, findingLimit, perCallFindingLimit].every((n) => Number.isSafeInteger(n) && n > 0)
+    || findingLimit > ACTION_REPLAY_BOUNDS.findings || perCallFindingLimit > ACTION_REPLAY_BOUNDS.perCallFindings) throw new Error("action replay: invalid bounded parameters");
   const states = new WeakMap<ReplayView, State>();
   const params = { scope: "explicit-v2-action-repositories", capabilities: ["T1", "T2"], branches: "unknown", usage: "unattributed", claims: "not_consumed", delivery: "hypothetical_pull", dedupe: "once_per_repository_finding", workBudget, pairCooldownMs, sessionHourlyCap,
-    lookbackMs: ACTION_LOOKBACK_MS, frameBounds: ACTION_FRAME_BOUNDS, bounds: ACTION_REPLAY_BOUNDS,
+    lookbackMs: ACTION_LOOKBACK_MS, frameBounds: ACTION_FRAME_BOUNDS, bounds: { ...ACTION_REPLAY_BOUNDS, findings: findingLimit, perCallFindings: perCallFindingLimit },
     sourceSha256: sha256Hex(SOURCES.map((p) => sha256Hex(readFileSync(new URL(p, import.meta.url)))).join("\n")) };
   return {
     name: ACTION_SCOPED_DETECTOR, version: "1", params,
@@ -40,8 +43,8 @@ export function actionScopedDetector(options: { now?: Date; workBudget?: number;
         const cost = 4 * facts * facts + lanes.length;
         if (cost > workBudget - s.work) { s.frame.reject(); return []; }
         s.work += cost;
-        const output = outcomeFacts.detect({ workspaceId: view.snapshot.sessions[0]?.workspaceId ?? "", window: { since: view.window.since, until: iso }, lanes }, {}, ACTION_REPLAY_BOUNDS.perCallFindings);
-        if (output.findings.length >= ACTION_REPLAY_BOUNDS.perCallFindings) { s.frame.reject(); return []; }
+        const output = outcomeFacts.detect({ workspaceId: view.snapshot.sessions[0]?.workspaceId ?? "", window: { since: view.window.since, until: iso }, lanes }, {}, perCallFindingLimit);
+        if (output.findings.length >= perCallFindingLimit) { s.frame.reject(); return []; }
         const current = new Set<string>();
         for (const f of output.findings) {
           if ((f.kind !== "duplicate_work" && f.kind !== "superseded_work") || f.lanes.length !== 2) continue;
@@ -50,7 +53,7 @@ export function actionScopedDetector(options: { now?: Date; workBudget?: number;
           if (fleet === null || fleet) { s.skippedFleet++; continue; }
           const id = sha256Hex(canonicalJson([repo, f.id]));
           if (!s.known.has(id)) {
-            if (s.known.size >= ACTION_REPLAY_BOUNDS.findings) { s.frame.reject(); return []; }
+            if (s.known.size >= findingLimit) { s.frame.reject(); return []; }
             s.known.add(id);
           }
           current.add(id);

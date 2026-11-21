@@ -48,3 +48,12 @@ test("a semantic path requires attributed mapped write scope and an exact target
   for (const bad of edits) expect(() => readActionScope(snapshot(r, [bad]), now, { repositoryPaths: true })).toThrow("values withheld");
   expect(readActionScope(snapshot(r, [{ ...good, repositoryPath: null }]), now, { repositoryPaths: true }).size).toBe(1);
 });
+test("a commit cannot carry a semantic write path even with an otherwise valid target", () => {
+  const b = new SessionBuilder("codex", "fixture", emptyStats(), true);
+  b.commit("abcdef12", ts, { file: 0, line: 1 }, actionContext(root.directory, "tool_workdir", { file: 0, line: 1 }, ts));
+  const r = toSnapshotSession(b, h, { orgId: "fixture", workspaceId: "fixture" }, [root], { repositoryPaths: true })!;
+  const write = fixture().provenance!.records[0]!;
+  const bad = { ...r.provenance!.records[0]!, repositoryPath: write.repositoryPath, repositoryTarget: write.repositoryTarget };
+  expect(readActionScope(snapshot(r), now, { repositoryPaths: true }).size).toBe(1);
+  expect(() => readActionScope(snapshot(r, [bad]), now, { repositoryPaths: true })).toThrow("values withheld");
+});
