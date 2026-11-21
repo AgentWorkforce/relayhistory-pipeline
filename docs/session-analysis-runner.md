@@ -283,16 +283,22 @@ clamps the same values again.
   and the time, and no session id (the session is read through the job). It references its job `ON DELETE SET
   NULL`: when an erase removes a session's analysis jobs (per-session operator purge, per-user erase, C3 purge, the
   v2 forget trigger) the row stays without its job and keeps counting toward the workspace, daily and token
-  budgets, so an erase never refunds spend. Rows older than 8 days are deleted by the admission function.
+  budgets, so an erase never refunds spend. Rows older than 8 days are pruned only inside
+  `session_analysis_schedule_v1`, opportunistically on each admission; nothing else deletes them, so while the
+  scheduler does not run, old rows simply stay (they no longer count toward any budget, all of which are at most a
+  day long).
 - **Kill switch.** Turning the `claims` control off stops new scheduling (candidates, the tick's own read, and the
   admission's `control_off`) and also stops scheduled jobs already queued: before the worker runs a claimed job
-  (with `SESSION_INTEL_CLAIMS_ENABLED`, the same wiring as the claims writer), it asks
-  `session_analysis_schedule_job_v1` whether the scheduler enqueued it; a scheduled job whose workspace control is
-  off is failed as `claims_control_off` (not retried) with no evidence read and no provider call, counted
-  `cancelled` and `scheduled_control_off`. User-requested jobs are never stopped by it. If the gate's read fails
-  the job is failed retryable (`claims_scheduler_gate_failed`); without migration `062180` (`42883`) every job runs.
-  A worker with `SESSION_INTEL_CLAIMS_ENABLED` off has no gate, so use the control, not only that flag, to stop
-  queued scheduled jobs.
+  (on every worker that runs analysis, the Lambda and this runner, whatever `SESSION_INTEL_CLAIMS_ENABLED` and the
+  scheduler flag say), it asks `session_analysis_schedule_job_v1` whether the scheduler enqueued it; a scheduled
+  job whose workspace control is off is failed as `claims_control_off` (not retried) with no evidence read and no
+  provider call, counted `cancelled` and `scheduled_control_off`. User-requested jobs are never stopped by it.
+  Without migration `062180` (`42883`) every job runs. If the gate's read fails otherwise, the job's request row
+  decides (counted `scheduled_gate_failed`): a user-requested job (it always has one) runs; a job without one (a
+  scheduled job, or a backfill) is failed retryable (`claims_scheduler_gate_failed`) and tried again after its
+  backoff; if that read fails too, the job runs. Known limit: the gate finds a scheduled job through its ledger
+  row, so a scheduled job still queued after its ledger row was pruned (more than 8 days, and only once a later
+  admission ran) reads as unscheduled and runs even with the control off.
 - **Token reservation.** Each job reserves its worst case: `ceil(480 KiB / 4)` input tokens (the engine's
   `MAXIMUM_INPUT_BYTES`) plus 16,384 for the response (the full analysis call has no output cap of its own), that is
   139,264 tokens. It is a reservation, not actual spend; reconciling it against the job's recorded

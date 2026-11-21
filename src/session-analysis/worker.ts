@@ -179,9 +179,10 @@ export function analysisTick(deps: {
    */
   claims?: ClaimsPort;
   /**
-   * The scheduled-job gate (claims-scheduler.ts scheduledJobGate), wired with the claims port: a job the claims
-   * scheduler enqueued is failed as `claims_control_off` instead of run while its workspace 'claims' control is
-   * off (counted `cancelled` and `scheduled_control_off`). Absent = every claimed job runs, as before.
+   * The scheduled-job gate (claims-scheduler.ts scheduledJobGate), wired whenever analysis runs (runtime-deps.ts,
+   * whatever the claims flags say): a job the claims scheduler enqueued is failed as `claims_control_off` instead of
+   * run while its workspace 'claims' control is off (counted `cancelled` and `scheduled_control_off`). Absent =
+   * every claimed job runs, as before.
    */
   scheduledJobGate?: (db: SqlExecutor, counts: Record<string, number>) => (job: AnalysisJob) => Promise<
     { run: true } | { run: false; code: string; retryable: boolean }>;

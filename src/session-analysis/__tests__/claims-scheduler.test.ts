@@ -5,7 +5,7 @@ import { join } from "node:path";
 import {
   CANDIDATES_SQL, CLAIMS_SCHEDULER_BOUNDS, CLAIMS_SCHEDULER_CANDIDATES_MAX, CLAIMS_SCHEDULER_INPUT_BYTES,
   CLAIMS_SCHEDULER_LIVE_SECONDS, CLAIMS_SCHEDULER_RESERVE_TOKENS, claimsSchedulerEnabled, claimsSchedulerSettings,
-  claimsSchedulerTick, SCHEDULE_SQL, SCHEDULED_JOB_SQL, scheduledJobGate, withClaimsScheduler,
+  claimsSchedulerTick, SCHEDULE_SQL, SCHEDULED_JOB_SQL, scheduledJobGate, USER_REQUESTED_JOB_SQL, withClaimsScheduler,
 } from "../claims-scheduler.ts";
 import { log } from "../../shared/log.ts";
 import { runnerTick } from "../runner.ts";
@@ -117,29 +117,49 @@ describe("claimsSchedulerTick", () => {
 });
 
 describe("scheduledJobGate: the worker's check before it runs a claimed job", () => {
-  const gateDb = (answer: unknown) => {
+  const ID = "11111111-1111-4111-8111-111111111111";
+  /** gate: the schedule_job_v1 answer (or an Error); requested: the request-row read's answer (or an Error). */
+  const gateDb = (gate: unknown, requested: unknown = new Error("not asked")) => {
     const calls: Call[] = [];
     return { calls, db: { query: async (text: string, params: unknown[]) => {
       calls.push([text, params]);
+      const answer = text === SCHEDULED_JOB_SQL ? gate : requested;
       if (answer instanceof Error) throw answer;
-      return { rows: [{ gate: answer }] };
+      return { rows: [text === SCHEDULED_JOB_SQL ? { gate: answer } : { requested: answer }] };
     } } as never };
   };
-  test("unscheduled and on run; off cancels (not retried); 42883 runs; any other error or answer fails retryable; counted", async () => {
+  test("unscheduled and on run; off cancels (not retried); 42883 runs; one read only", async () => {
     const counts: Record<string, number> = {};
-    const run = async (answer: unknown) => {
+    for (const [answer, expected] of [
+      ["unscheduled", { run: true }], ["on", { run: true }],
+      ["off", { run: false, code: "claims_control_off", retryable: false }],
+      [Object.assign(new Error("no fn"), { code: "42883" }), { run: true }],
+    ] as const) {
       const g = gateDb(answer);
-      const r = await scheduledJobGate(g.db, counts)({ id: "11111111-1111-4111-8111-111111111111" });
-      expect(g.calls).toEqual([[SCHEDULED_JOB_SQL, ["11111111-1111-4111-8111-111111111111"]]]);
+      expect(await scheduledJobGate(g.db, counts)({ id: ID })).toEqual(expected);
+      expect(g.calls).toEqual([[SCHEDULED_JOB_SQL, [ID]]]);
+    }
+    expect(counts).toEqual({ scheduled_control_off: 1 });
+  });
+  test("a gate read error or unknown answer never stops a user-requested job; only a job without a request row is held back", async () => {
+    const counts: Record<string, number> = {};
+    const down = Object.assign(new Error("down"), { code: "57014" });
+    const run = async (gate: unknown, requested: unknown) => {
+      const g = gateDb(gate, requested);
+      const r = await scheduledJobGate(g.db, counts)({ id: ID });
+      expect(g.calls).toEqual([[SCHEDULED_JOB_SQL, [ID]], [USER_REQUESTED_JOB_SQL, [ID]]]);
       return r;
     };
-    expect(await run("unscheduled")).toEqual({ run: true });
-    expect(await run("on")).toEqual({ run: true });
-    expect(await run("off")).toEqual({ run: false, code: "claims_control_off", retryable: false });
-    expect(await run(Object.assign(new Error("no fn"), { code: "42883" }))).toEqual({ run: true });
-    expect(await run(Object.assign(new Error("down"), { code: "57014" }))).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
-    expect(await run("surprise")).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
-    expect(counts).toEqual({ scheduled_control_off: 1, scheduled_gate_failed: 2 });
+    // User-requested (a request row names the job): runs.
+    expect(await run(down, true)).toEqual({ run: true });
+    expect(await run("surprise", true)).toEqual({ run: true });
+    // No request row (a scheduled job, or a backfill): held back, retryable.
+    expect(await run(down, false)).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
+    expect(await run("surprise", false)).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
+    // Neither read can tell: it runs (a user's analysis is never stopped by the gate).
+    expect(await run(down, down)).toEqual({ run: true });
+    expect(await run(down, null)).toEqual({ run: true });
+    expect(counts).toEqual({ scheduled_gate_failed: 6 });
   });
 });
 
