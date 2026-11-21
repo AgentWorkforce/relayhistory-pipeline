@@ -372,6 +372,8 @@ describe("query_session_directory_for / query_session_directory_activity_for", (
                       LEFT JOIN pg_roles AS r ON r.oid = a.grantee ORDER BY 1) AS grantees
          FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace
         WHERE n.nspname = 'sessions' AND (p.proname LIKE 'query\\_session\\_directory\\_%' OR p.proname LIKE 'session\\_directory\\_query\\_%')
+          -- 20261105062200's readiness variant shares the stem; its own suite checks its ACL.
+          AND p.proname <> 'query_session_directory_readiness_for'
         ORDER BY 1`,
     )).rows;
     const expected = [
@@ -400,7 +402,8 @@ describe("query_session_directory_for / query_session_directory_activity_for", (
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105099000_later_probe.sql'");
     await db.exec(read(DOWN));
     const gone = await db.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND (proname LIKE 'query\\_session\\_directory\\_%' OR proname LIKE 'session\\_directory\\_query\\_%')");
+      // 20261105062200's readiness variant (a later step, applied raw here) shares the stem and is not 046010's.
+      "SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND (proname LIKE 'query\\_session\\_directory\\_%' OR proname LIKE 'session\\_directory\\_query\\_%') AND proname <> 'query_session_directory_readiness_for'");
     expect(gone.rows).toEqual([{ n: 0 }]);
     expect((await db.query("SELECT name FROM sessions.__96bulls_migrations")).rows).toEqual([]);
     // The 034000 functions and the data are untouched.
