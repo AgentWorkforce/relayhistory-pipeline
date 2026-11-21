@@ -238,6 +238,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // T2 staged ACK: replaced 043800 ACK (gate off), one owner-only mode table and two owner-only functions (flip, gate); no G4
       // function names them.
       "20261105062210_lazy_ack_t2.sql",
+      // The advisory instance: a nullable column on the advisories table, three advisor/read-API functions and the
+      // three fenced v1 bodies; no G4 function names them, no ingest path calls them.
+      "20261105062220_coordination_advisories_incarnation.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

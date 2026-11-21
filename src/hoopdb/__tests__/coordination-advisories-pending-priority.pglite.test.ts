@@ -26,6 +26,9 @@ const STEP = `upstream:${FILE}`;
 const SQL = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062190_coordination_advisories_pending_priority.down.sql");
 const V1_SQL = read("supabase/migrations/20261105062000_coordination_advisories.sql");
+// 20261105062220 (the advisory instance) sits above 062210: its down runs first of all.
+const INSTANCE_STEP = "upstream:20261105062220_coordination_advisories_incarnation.sql";
+const INSTANCE_DOWN = read("supabase/rollbacks/20261105062220_coordination_advisories_incarnation.down.sql");
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: false, runtimeRole: "postgres" };
 const V2 = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
 const V1 = "sessions.coordination_advisories_pending_for_v1(text,text,text,text)";
@@ -168,7 +171,9 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     const first = await source.pending(recipient);
     expect(first[0]!.advisoryId).toBe(hex(11));
     expect(warns).toEqual([]);
-    // 20261105062200 (session list readiness) sits above 062190: its down runs first.
+    // 20261105062200 (session list readiness), 062210 (T2 staged ACK) and 062220 (the advisory instance) sit above
+    // 062190: their downs run first, newest first.
+    await db.exec(INSTANCE_DOWN);
     await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
     await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));
     await db.exec(DOWN);
@@ -179,16 +184,17 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
 });
 
 describe("20261105062190 rollback", () => {
-  test("checksum-pinned; 062210 then 062200 come off first; 062180's down (and 062170's) refuses under it; it drops only v2 and its ledger row; a rerun refuses", async () => {
+  test("checksum-pinned; 062220, 062210 then 062200 come off first; 062180's down (and 062170's) refuses under it; it drops only v2 and its ledger row; a rerun refuses", async () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     expect(DOWN).toContain("SET LOCAL lock_timeout='5s'");
     const db = await migrated();
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK").catch(() => {}); return m; };
     try {
-      // 20261105062200 (session list readiness) and 20261105062210 (T2 staged ACK) are the later steps: this down refuses
-      // under them; they come off first, newest first.
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql"]);
+      // 20261105062200 (session list readiness), 20261105062210 (T2 staged ACK) and 20261105062220 (the advisory
+      // instance) are the later steps: this down refuses under them; they come off first, newest first.
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(["upstream:20261105062200_session_directory_list_readiness.sql", "upstream:20261105062210_lazy_ack_t2.sql", INSTANCE_STEP]);
       expect(await message(DOWN)).toContain("a later migration is applied");
+      await db.exec(INSTANCE_DOWN);
       await db.exec(read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")); // 062210 (T2 staged ACK) sits above 062200: first.
       await db.exec(read("supabase/rollbacks/20261105062200_session_directory_list_readiness.down.sql"));
       expect(await message(sqlFile("supabase/rollbacks/20261105062180_claims_scheduler.down.sql"))).toContain("a later migration is applied");

@@ -209,6 +209,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.coordination_advisories_mark_delivered_v1(text,text,text,text,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -221,6 +225,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.coordination_advisories_recent_v1(text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
@@ -230,6 +238,10 @@
       "service_role:EXECUTE"
     ],
     "sessions.coordination_advisories_upsert_v1(text,text,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.coordination_advisories_upsert_v2(text,text,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],

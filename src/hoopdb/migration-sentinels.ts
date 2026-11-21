@@ -544,6 +544,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.lazy_ack_t2_mode and the gated T2 staged ACK (bulls96.lazy_ack_t2)",
     sql: "SELECT to_regclass('sessions.lazy_ack_t2_mode') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%current_setting(''bulls96.lazy_ack_t2'',true)%' AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%') AS applied",
   },
+  "upstream:20261105062220_coordination_advisories_incarnation.sql": {
+    evidence: "column sessions.coordination_advisories.incarnation and functions sessions.coordination_advisories_upsert_v2, _ack_v2 and _pending_for_v3",
+    sql: "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('sessions.coordination_advisories') AND attname = 'incarnation' AND NOT attisdropped) AND to_regprocedure('sessions.coordination_advisories_upsert_v2(text,text,jsonb)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_ack_v2(text,text,text,text,text,uuid)') IS NOT NULL AND to_regprocedure('sessions.coordination_advisories_pending_for_v3(text,text,text,text,integer)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
