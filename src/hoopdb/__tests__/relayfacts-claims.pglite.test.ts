@@ -27,6 +27,9 @@ const FILE = "20261105062150_relayfacts_claims.sql";
 const STEP = `upstream:${FILE}`;
 const SQL = read(`supabase/migrations/${FILE}`);
 const DOWN = read("supabase/rollbacks/20261105062150_relayfacts_claims.down.sql");
+// Later upstream steps that migrated() also applies; their downs come off first (newest first).
+const LATER_STEPS = ["upstream:20261105062210_lazy_ack_t2.sql"];
+const LATER_DOWNS = [read("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql")];
 const MEMORY = read("supabase/migrations/20261105062080_memory_documents.sql");
 const ERASE_SQL = read("supabase/migrations/20261105062090_relayfacts_erase.sql");
 const USER_ERASE_SQL = read("supabase/migrations/20261105062100_relayfacts_user_erase.sql");
@@ -481,7 +484,10 @@ describe("20261105062150 rollback", () => {
     const { decide, claim } = harness(() => db);
     const message = async (sql: string) => { const m = await db.exec(sql).then(() => null, (e: Error) => e.message); await db.exec("ROLLBACK"); return m; };
     try {
-      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP)).toEqual([]);
+      expect((await plan(LOCAL)).filter((s) => s.name.startsWith("upstream:") && s.name > STEP).map((s) => s.name)).toEqual(LATER_STEPS);
+      // 062150's down refuses while a later step is applied; those come off first.
+      expect(await message(DOWN)).toContain("a later migration is applied");
+      for (const down of LATER_DOWNS) await db.exec(down);
       expect(await message(read("supabase/rollbacks/20261105062140_staged_output_facts.down.sql"))).toContain("a later migration is applied");
       await decide("org-a", "ws-a", [rec()]);
       await claim("org-a", "ws-a", [claimRec(), claimRec({ kind: "intent", title: "I" })]);
@@ -514,6 +520,7 @@ describe("20261105062150 rollback", () => {
   test("an empty claims table rolls back without the override", async () => {
     const db = await migrated();
     try {
+      for (const down of LATER_DOWNS) await db.exec(down);
       await db.exec(DOWN);
       expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
     } finally { await db.close(); }
