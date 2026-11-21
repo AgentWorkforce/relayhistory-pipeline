@@ -82,11 +82,19 @@ export function poolTenantWriter(pool: { connect(): Promise<PoolClient> }): Tena
 const PENDING_COLUMNS = `SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
        evidence, created_at, delivered_at`;
 /** 20261105062190: priority-first (P1, other HIGH, LOW, then oldest), so a new P1 is never hidden behind 10 LOW rows. */
-const PENDING_V2_SQL = `${PENDING_COLUMNS}
+export const PENDING_V2_SQL = `${PENDING_COLUMNS}
   FROM sessions.coordination_advisories_pending_for_v2($1, $2, $3, $4, $5)`;
-/** 062000's oldest-first reader: the fallback while 062190 is not applied (42883). */
-const PENDING_SQL = `${PENDING_COLUMNS}
+/** 062000's oldest-first reader with delivered_at: the switch-on fallback while 062190 is not applied. */
+export const PENDING_V1_DELIVERY_SQL = `${PENDING_COLUMNS}
   FROM sessions.coordination_advisories_pending_for_v1($1, $2, $3, $4)`;
+/** 062000's oldest-first reader, exactly as before M3-7: the only statement with the priority switch off. */
+export const PENDING_SQL = `SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
+       evidence, created_at
+  FROM sessions.coordination_advisories_pending_for_v1($1, $2, $3, $4)`;
+export const PENDING_V2_SIGNATURE = "sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)";
+const V2_INSTALLED_SQL = "SELECT to_regprocedure($1) IS NOT NULL AS installed";
+/** How long a "pending_for_v2 is not installed" answer is trusted, and the fallback warning's minimum spacing. */
+export const PENDING_V2_ABSENT_TTL_MS = 60_000;
 const ACK_SQL = "SELECT sessions.coordination_advisories_ack_v1($1, $2, $3, $4, $5) AS ok";
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : new Date(String(v)).toISOString());
@@ -98,32 +106,65 @@ function evidenceOf(raw: unknown): AdvisoryEvidence[] {
 }
 
 /**
- * The source over the read-API functions: `read` READ ONLY, `write` READ WRITE. The GET reads 062190's
- * pending_for_v2 (priority-first, limit ADVISORIES_PAGE_MAX); when that function does not exist (42883: 062190 not
- * applied, or rolled back) it reads 062000's pending_for_v1 (oldest first) in a fresh transaction, and counts the
- * fallback through `warn` (counts only, never an id).
+ * Shared across sources (the Worker builds one per request): until `absentUntil` the v2 reader is known not to be
+ * installed, so the GET goes straight to v1; `warnedAt` spaces the fallback warning; `fallbacks` counts them.
+ */
+export interface PendingV2Cache { absentUntil: number; warnedAt: number; fallbacks: number }
+export const pendingV2Cache = (): PendingV2Cache => ({ absentUntil: -Infinity, warnedAt: -Infinity, fallbacks: 0 });
+
+/**
+ * The source over the read-API functions: `read` READ ONLY, `write` READ WRITE.
+ *
+ * Priority switch off (READ_API_ADVISORY_PRIORITY_ENABLED, the default): the GET issues 062000's pending_for_v1
+ * exactly as before M3-7 (oldest first), whether or not 062190 is applied; pending_for_v2 is never called.
+ *
+ * Switch on: the GET reads 062190's pending_for_v2 (priority-first, limit ADVISORIES_PAGE_MAX). On 42883 it falls
+ * back to pending_for_v1 only when pending_for_v2 (that exact signature) is not installed (to_regprocedure); any
+ * other 42883 (signature drift, a missing dependency) is rethrown. "Not installed" is cached for
+ * PENDING_V2_ABSENT_TTL_MS in `cache`, so a deployment without 062190 does not pay a failed statement and a second
+ * transaction per GET, and the warning (counts only, never an id) is logged at most once per that interval.
  */
 export function sqlCoordinationAdvisories(
-  read: TenantRunner, write: TenantRunner, opts: { warn?: (fields: Record<string, unknown>) => void } = {},
+  read: TenantRunner, write: TenantRunner,
+  opts: { priority?: boolean; warn?: (fields: Record<string, unknown>) => void; cache?: PendingV2Cache; now?: () => number } = {},
 ): AdvisoriesSource {
-  let fallbacks = 0;
-  const pendingWith = (r: AdvisoryRecipient, v2: boolean) =>
+  const cache = opts.cache ?? pendingV2Cache();
+  const now = opts.now ?? Date.now;
+  const pendingWith = (r: AdvisoryRecipient, sql: string) =>
     read(r.orgId, r.workspaceId, async (q: SqlQuery) => {
-      const { rows } = v2
-        ? await q.query<Record<string, unknown>>(PENDING_V2_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId, ADVISORIES_PAGE_MAX])
-        : await q.query<Record<string, unknown>>(PENDING_SQL, [r.orgId, r.workspaceId, r.source, r.sessionId]);
+      const { rows } = sql === PENDING_V2_SQL
+        ? await q.query<Record<string, unknown>>(sql, [r.orgId, r.workspaceId, r.source, r.sessionId, ADVISORIES_PAGE_MAX])
+        : await q.query<Record<string, unknown>>(sql, [r.orgId, r.workspaceId, r.source, r.sessionId]);
       return rows;
     });
+  const v2Installed = (r: AdvisoryRecipient) =>
+    read(r.orgId, r.workspaceId, async (q: SqlQuery) =>
+      (await q.query<{ installed: boolean }>(V2_INSTALLED_SQL, [PENDING_V2_SIGNATURE])).rows[0]?.installed === true);
+  const fallback = async (r: AdvisoryRecipient) => {
+    cache.fallbacks += 1;
+    const at = now();
+    if (at - cache.warnedAt >= PENDING_V2_ABSENT_TTL_MS) {
+      cache.warnedAt = at;
+      opts.warn?.({ reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: cache.fallbacks });
+    }
+    return pendingWith(r, PENDING_V1_DELIVERY_SQL);
+  };
   return {
     pending: async (r) => {
       let rows: Record<string, unknown>[];
-      try {
-        rows = await pendingWith(r, true);
-      } catch (error) {
-        if ((error as { code?: string })?.code !== "42883") throw error;
-        fallbacks += 1;
-        opts.warn?.({ reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks });
-        rows = await pendingWith(r, false);
+      if (opts.priority !== true) {
+        rows = await pendingWith(r, PENDING_SQL);
+      } else if (now() < cache.absentUntil) {
+        rows = await fallback(r);
+      } else {
+        try {
+          rows = await pendingWith(r, PENDING_V2_SQL);
+        } catch (error) {
+          if ((error as { code?: string })?.code !== "42883") throw error;
+          if (await v2Installed(r)) throw error;
+          cache.absentUntil = now() + PENDING_V2_ABSENT_TTL_MS;
+          rows = await fallback(r);
+        }
       }
       return rows.slice(0, ADVISORIES_PAGE_MAX).map((row) => ({
         advisoryId: String(row.advisory_id),
@@ -148,15 +189,16 @@ export function sqlCoordinationAdvisories(
 }
 
 /**
- * The wire item: the stored row plus the same templated message the HIGH DM carries. M3-7 adds two fields,
- * additively under the same contract: `priority` (advisory-priority.ts) and `delivery`. `delivery.dm` is true
- * when delivered_at is set: on a listed row (pending or delivered, never acked) only the DM path
- * (coordination_advisories_mark_delivered_v1) sets it, the ack sets it only on rows this GET no longer lists.
- * `notifyEligible` (also additive): the row's (kind, urgency) is on READ_API_ADVISORY_NOTIFY_ROWS (default empty).
+ * The wire item: the stored row plus the same templated message the HIGH DM carries. With the priority switch on
+ * (READ_API_ADVISORY_PRIORITY_ENABLED), M3-7 adds three fields, additively under the same contract: `priority`
+ * (advisory-priority.ts), `notifyEligible` (the row's (kind, urgency) is on READ_API_ADVISORY_NOTIFY_ROWS, default
+ * empty) and `delivery`. `delivery.dm` is true when delivered_at is set: on a listed row (pending or delivered,
+ * never acked) only the DM path (coordination_advisories_mark_delivered_v1) sets it, the ack sets it only on rows
+ * this GET no longer lists. Switch off: exactly the pre-M3-7 item, none of the three.
  */
-export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> = new Set()) {
+export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> = new Set(), priority = false) {
   const firstSeen = row.evidence.map((e) => e.ts).filter((ts) => ts !== "").sort()[0] ?? row.createdAt;
-  return {
+  const base = {
     advisoryId: row.advisoryId,
     urgency: row.urgency,
     kind: row.kind,
@@ -168,6 +210,10 @@ export function advisoryItem(row: AdvisoryRow, notifyRows: ReadonlySet<string> =
       harness: row.harness, sessionId: row.sessionId, peerHarness: row.peerHarness, peerSessionId: row.peerSessionId, firstSeen,
     }),
     evidence: row.evidence,
+  };
+  if (priority !== true) return base;
+  return {
+    ...base,
     priority: advisoryPriority(row),
     notifyEligible: advisoryNotifyEligible(row, notifyRows),
     delivery: { dm: row.deliveredAt !== null, deliveredAt: row.deliveredAt },

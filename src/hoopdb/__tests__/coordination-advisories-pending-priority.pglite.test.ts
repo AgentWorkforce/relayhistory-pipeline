@@ -153,15 +153,18 @@ describe("20261105062190 coordination_advisories_pending_for_v2", () => {
     expect(SQL).not.toMatch(/pending_for_v1\s*\(/);
   });
 
-  test("the read API's source: v2 against the migrated tree; after the rollback, the v1 fallback with a counted warning", async () => {
+  test("the read API's source: switch off is v1 oldest first even with 062190 applied; on is v2; after the rollback, the v1 fallback with a counted warning", async () => {
     await reset();
     await seed("org-a", "ws-a", [...Array.from({ length: 11 }, () => ({ urgency: "low", kind: "overlap" })), { urgency: "high", kind: "intent_conflict" }]);
     const run: TenantRunner = (org, ws, work) => as("bulls96_read_api", (tx) => work({
       query: async <R,>(text: string, params?: unknown[]) => ({ rows: (await tx.query<R>(text, params)).rows }),
     }), [org, ws]);
     const warns: Record<string, unknown>[] = [];
-    const source = sqlCoordinationAdvisories(run, (() => { throw new Error("no write"); }) as never, { warn: (f) => { warns.push(f); } });
     const recipient = { orgId: "org-a", workspaceId: "ws-a", source: "claude", sessionId: "s-a" };
+    // Applying 062190 alone changes nothing: with the switch off the reader stays 062000's v1, oldest first.
+    const off = await sqlCoordinationAdvisories(run, (() => { throw new Error("no write"); }) as never).pending(recipient);
+    expect(off.map((a) => a.advisoryId)).toEqual(Array.from({ length: 10 }, (_, i) => hex(i)));
+    const source = sqlCoordinationAdvisories(run, (() => { throw new Error("no write"); }) as never, { priority: true, warn: (f) => { warns.push(f); } });
     const first = await source.pending(recipient);
     expect(first[0]!.advisoryId).toBe(hex(11));
     expect(warns).toEqual([]);

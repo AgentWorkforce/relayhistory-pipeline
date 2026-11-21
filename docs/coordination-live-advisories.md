@@ -92,12 +92,17 @@ GET /v1/coordination/advisories?workspace=<id>&source=<harness>&sessionId=<id>&s
 - **Auth, as the overlaps route does.** The workspace comes from the verified identity: `attestWorkspace` requires `workspace` exactly once and equal to the token's workspace. Then `requireCanary(identity, "coordination")` and `rejectUnsupported(c)`.
 - **Parameters.** `source` and `sessionId` are each required exactly once. `status` defaults to `pending`, and `pending` is the only value served in v1.
 - **Contract:** `coordination-advisories/1`, returned as the response's `contract` field, as overlaps returns `coordination-overlaps/1`.
-- **Response.** At most 10 advisories, and `nextCursor` is always `null` in v1. **Order: priority first** (P1, then
-  P2, then P3; oldest first within a priority), from `sessions.coordination_advisories_pending_for_v2` (migration
-  `062190`), so a new P1 is never hidden behind 10 older unacked LOW rows. The bound, the shape and the contract are
-  unchanged; a client must not rely on the order beyond that. Without `062190` (the function is missing, `42883`), the
-  read API falls back to 062000's `pending_for_v1` (oldest first) in a fresh transaction and logs a counted warning,
-  `coordination_advisories_v1_fallback`. The SQL rank and `advisoryPriority` agree on a shared fixture
+- **Response.** At most 10 advisories, and `nextCursor` is always `null` in v1. By default **oldest first**, from
+  062000's `pending_for_v1`, exactly as before M3-7, whether or not migration `062190` is applied (applying it
+  changes no response). With `READ_API_ADVISORY_PRIORITY_ENABLED` exactly `true` (default off; the self-host
+  service, the hosted Lambda and the read Worker): **priority first** (P1, then P2, then P3; oldest first within a
+  priority), from `sessions.coordination_advisories_pending_for_v2` (migration `062190`), so a new P1 is never hidden
+  behind 10 older unacked LOW rows, and each item carries the M3-7 fields below. The bound and the contract are
+  unchanged; a client must not rely on the order beyond that. With the switch on and `062190` not applied, the read
+  API falls back to `pending_for_v1` (oldest first): on `42883` it checks `to_regprocedure` for that exact v2
+  signature and falls back only when the function is absent (any other `42883`, such as signature drift, is an
+  error); "absent" is remembered for 60 s, so the GET then reads v1 directly, and the warning
+  `coordination_advisories_v1_fallback` (with a running count) is logged at most once per 60 s. The SQL rank and `advisoryPriority` agree on a shared fixture
   (`src/hoopdb/__tests__/coordination-advisories-pending-priority.pglite.test.ts`).
 
 ```json
@@ -122,7 +127,8 @@ GET /v1/coordination/advisories?workspace=<id>&source=<harness>&sessionId=<id>&s
 }
 ```
 
-**Priority and delivery (M3-7, additive).** Each item also carries two fields, added under the same contract
+**Priority and delivery (M3-7, additive, behind `READ_API_ADVISORY_PRIORITY_ENABLED`).** With the switch on, each
+item also carries three fields (with it off, none of them, and the bytes are the pre-M3-7 ones), added under the same contract
 `coordination-advisories/1`: clients must ignore fields they do not know, and the original eight keys keep their
 names, meaning and order.
 
@@ -143,8 +149,11 @@ names, meaning and order.
   default**, so nothing is eligible, and adding a row needs that row's eval result against the HIGH bars plus
   Khaliq's OK. Parsing is strict (`advisory-priority.ts` `parseAdvisoryNotifyRows`): spaces around entries and the
   colon are ignored; kinds and urgencies are lowercase and must be known (the advisor's kinds; `high` or `low`); an
-  empty entry, a bad shape, an unknown or uppercase token fails startup on the self-host service and the Lambda, and
-  answers 503 on the read Worker, with an error naming the entry and at most the one bad token.
+  empty entry, a bad shape, an unknown or uppercase token fails startup on the self-host service and the Lambda
+  (every route, fail-closed), and on the read Worker answers 503 on the two routes that read it only
+  (`/v1/coordination/advisories...` and `/v1/session-intel/workspace`); every other Worker route keeps serving.
+  The error names the entry and at most the one bad token. The list is parsed whether or not the priority switch is
+  on.
 - **Dedup.** Desktop dedupes system notifications by `advisoryId` per human per device, recorded across restarts
   (M3-9); until it ships, the pull path is at-least-once and the same advisory can show again on a later turn.
 
@@ -194,6 +203,7 @@ SQL and the next-tick stop contract.
 | `COORDINATION_ADVISOR_ENABLED` | off | The worker's scan and its writes |
 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | off | The GET and ack routes |
 | `COORDINATION_ADVISOR_RELAY_DM_ENABLED` | off | HIGH Relay DMs (also needs the sender credential) |
+| `READ_API_ADVISORY_PRIORITY_ENABLED` | off | Exactly `true`: priority-first order through `062190`'s `pending_for_v2` (v1 fallback while it is absent) and the `priority`, `notifyEligible` and `delivery` item fields; also `priority` and `notifyEligible` on the workspace view's alerts. Off: v1 only and the pre-M3-7 responses |
 | `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible: true` for the listed `<kind>:<urgency>` rows (see "Priority and delivery"); each row needs its eval result and Khaliq's OK |
 | `SESSION_INTEL_CONFLICTS_ENABLED` | off | The conflict rows (see "Conflict rows"); also needs the workspace's `conflicts` control |
 

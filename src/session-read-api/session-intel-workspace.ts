@@ -188,6 +188,8 @@ export interface WorkspaceViewArgs {
   shortSummary: boolean;
   /** READ_API_ADVISORY_NOTIFY_ROWS, parsed; absent = empty (no alert is notify-eligible). */
   notifyRows?: ReadonlySet<string>;
+  /** READ_API_ADVISORY_PRIORITY_ENABLED: alerts carry `priority` and `notifyEligible`. Off: neither field. */
+  priority?: boolean;
   /** Counts and reason codes only. */
   log: (fields: Record<string, unknown>) => void;
 }
@@ -287,8 +289,9 @@ export async function workspaceView(a: WorkspaceViewArgs) {
       urgency: row.urgency,
       kind: row.kind,
       class: cls,
-      priority: advisoryPriority(row),
-      notifyEligible: advisoryNotifyEligible(row, a.notifyRows ?? new Set()),
+      ...(a.priority === true
+        ? { priority: advisoryPriority(row), notifyEligible: advisoryNotifyEligible(row, a.notifyRows ?? new Set()) }
+        : {}),
       artifact: row.artifact,
       sessions: row.pair,
       createdAt: row.createdAt,

@@ -26,6 +26,12 @@ export const READ_API_COORDINATION_OVERLAPS_BACKEND = "READ_API_COORDINATION_OVE
 export const READ_API_COORDINATION_OVERLAPS_ENABLED = "READ_API_COORDINATION_OVERLAPS_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/coordination/advisories and its ack; anything else = 501 `unsupported_by_backend`, reason `advisories_disabled`. */
 export const READ_API_COORDINATION_ADVISORIES_ENABLED = "READ_API_COORDINATION_ADVISORIES_ENABLED";
+/**
+ * Exactly "true" (exactTrueFlag): M3-7 advisory priority. The advisories GET reads 062190's priority-first
+ * pending_for_v2 and its items, and the workspace view's alerts, carry `priority` and `notifyEligible` (the
+ * advisories GET also `delivery`). Anything else: 062000's v1 only and the pre-M3-7 response, 062190 applied or not.
+ */
+export const READ_API_ADVISORY_PRIORITY_ENABLED = "READ_API_ADVISORY_PRIORITY_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/session-intel/workspace; anything else = 501 `unsupported_by_backend`, reason `session_intel_disabled`. */
 export const READ_API_SESSION_INTEL_ENABLED = "READ_API_SESSION_INTEL_ENABLED";
 

@@ -1,8 +1,9 @@
--- Slot 20261105062190 (PROVISIONAL: the lander assigns the slot). Coordination advisories, the pull path ranked by
+-- Slot 20261105062190 (assigned). Coordination advisories, the pull path ranked by
 -- priority (Session Intelligence M3-7 follow-up): 062000's coordination_advisories_pending_for_v1 is ORDER BY
 -- created_at, advisory_id LIMIT 10, so a new HIGH (P1) advisory can sit behind 10 older unacked LOW rows and never
 -- reach the recipient's turn-end pull. This adds a v2 reader that returns the recipient's open advisories
 -- priority-first. v1 is untouched (same body, same grants): a read API without the v2 route keeps working.
+-- Applying this changes no response: the read API calls v2 only with READ_API_ADVISORY_PRIORITY_ENABLED=true.
 -- Code only: applying this to any real database needs Khaliq's separate, explicit OK.
 --
 -- The priority rank is the read API's advisoryPriority (src/session-read-api/advisory-priority.ts), and a shared

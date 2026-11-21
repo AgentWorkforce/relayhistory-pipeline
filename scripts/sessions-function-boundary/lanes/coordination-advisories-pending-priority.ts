@@ -1,5 +1,5 @@
 /**
- * Lane: coordination-advisories-pending-priority (slot 062190, provisional).
+ * Lane: coordination-advisories-pending-priority (slot 062190).
  * The priority-first pull reader, coordination_advisories_pending_for_v2, for bulls96_read_api only, pinned to its
  * request scope (docs/coordination-live-advisories.md, "Priority and delivery"). 062000's v1 is untouched.
  */

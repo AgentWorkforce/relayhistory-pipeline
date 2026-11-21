@@ -89,8 +89,9 @@ function memorySource(init: { alerts?: SessionIntelAlertRow[]; claims?: SessionI
 
 const api = (opts: {
   enabled?: boolean; source?: SessionIntelSource; directory?: Directory | null; canary?: ReadonlySet<string> | "*"; logs?: Record<string, unknown>[];
-  notifyRows?: ReadonlySet<string>; listShortSummary?: boolean;
+  notifyRows?: ReadonlySet<string>; listShortSummary?: boolean; priority?: boolean;
 } = {}) => createReadApi({
+  ...(opts.priority === undefined ? {} : { advisoryPriority: opts.priority }),
   ...(opts.notifyRows ? { advisoryNotifyRows: opts.notifyRows } : {}),
   ...(opts.listShortSummary === undefined ? {} : { listShortSummary: opts.listShortSummary }),
   verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0,
@@ -194,7 +195,7 @@ describe("GET /v1/session-intel/workspace: the view", () => {
   test("contract, alerts, status, handoffs and coverage; field sets exact; class mapped", async () => {
     const mem = memorySource({ alerts: [alertRow(1), alertRow(2, { urgency: "low", kind: "concurrent_edit", deliveredAt: minutesAgo(1).toISOString() })], claims });
     const dir = memoryDirectory(rows);
-    const { status, body } = await get(api({ enabled: true, source: mem.source, directory: dir.directory, listShortSummary: true }));
+    const { status, body } = await get(api({ enabled: true, source: mem.source, directory: dir.directory, listShortSummary: true, priority: true }));
     expect(status).toBe(200);
     expect(Object.keys(body).sort()).toEqual(["alerts", "contract", "coverage", "handoffs", "nextCursor", "status"]);
     expect(body.contract).toBe(SESSION_INTEL_CONTRACT);
@@ -314,18 +315,29 @@ describe("GET /v1/session-intel/workspace: the view", () => {
       ["concurrent_edit", "high", 2], ["stale_base", "high", 2], ["planned_fleet", "high", 3], ["duplicate_work", "low", 3],
     ];
     const mem = memorySource({ alerts: kinds.map(([kind, urgency], i) => alertRow(i + 1, { kind, urgency })) });
-    const { body } = await get(api({ enabled: true, source: mem.source }));
+    const { body } = await get(api({ enabled: true, source: mem.source, priority: true }));
     expect(body.alerts.map((a: any) => [a.kind, a.urgency, a.priority])).toEqual(kinds);
   });
 
   test("notifyEligible on alerts: all false by default, true only for an allowed (kind, urgency); flag off unchanged", async () => {
     const alerts = [alertRow(1), alertRow(2, { urgency: "low" }), alertRow(3, { kind: "superseded_work" })];
     const eligible = async (notifyRows?: ReadonlySet<string>) =>
-      (await get(api({ enabled: true, source: memorySource({ alerts }).source, ...(notifyRows ? { notifyRows } : {}) }))).body.alerts.map((a: any) => a.notifyEligible);
+      (await get(api({ enabled: true, source: memorySource({ alerts }).source, priority: true, ...(notifyRows ? { notifyRows } : {}) }))).body.alerts.map((a: any) => a.notifyEligible);
     expect(await eligible()).toEqual([false, false, false]);
     expect(await eligible(parseAdvisoryNotifyRows("duplicate_work:high"))).toEqual([true, false, false]);
     const off = await get(api({ enabled: false, notifyRows: parseAdvisoryNotifyRows("duplicate_work:high") }));
     expect([off.status, off.body.error.reason]).toEqual([501, "session_intel_disabled"]);
+  });
+
+  test("priority switch off (absent or false): alerts are exactly the pre-M3-7 bytes, no priority or notifyEligible", async () => {
+    const alert = alertRow(1, { createdAt: "2026-11-19T10:04:00.000Z" });
+    const expected = '[{"advisoryId":"0000000000000001","urgency":"high","kind":"duplicate_work","class":"collision","artifact":"supabase/migrations/062130_x.sql","sessions":[{"source":"claude","sessionId":"s-1"},{"source":"codex","sessionId":"s-2"}],"createdAt":"2026-11-19T10:04:00.000Z","deliveredAt":null,"acked":[{"source":"claude","sessionId":"s-1","acked":false},{"source":"codex","sessionId":"s-2","acked":true}],"evidence":[{"sessionId":"s-1","eventId":"e-1","ts":"2026-11-12T09:58:12.000Z","kind":"tool_result"}]}]';
+    for (const priority of [undefined, false]) {
+      const { body } = await get(api({ enabled: true, source: memorySource({ alerts: [alert] }).source, notifyRows: parseAdvisoryNotifyRows("duplicate_work:high"), ...(priority === undefined ? {} : { priority }) }));
+      expect(JSON.stringify(body.alerts)).toBe(expected);
+    }
+    const on = await get(api({ enabled: true, source: memorySource({ alerts: [alert] }).source, priority: true }));
+    expect(on.body.alerts[0]).toMatchObject({ priority: 1, notifyEligible: false });
   });
 
   test("an unmapped alert kind has class null and a note, never a silent none", async () => {
