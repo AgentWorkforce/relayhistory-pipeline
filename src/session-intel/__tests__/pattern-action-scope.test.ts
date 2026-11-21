@@ -82,6 +82,39 @@ describe("manifest-bound action scope", () => {
     input.manifest.files[ACTION_FILE] = sha256Hex(input.extraFiles![ACTION_FILE]!);
     expect(() => readActionScope(input, now)).toThrow("values withheld");
   });
+  test("repository-basis guards reject inconsistent records even with recomputed valid counts", () => {
+    const s = row("a", { writes: [write("w1")] }), valid = fact(s, "write", s.writes[0]!);
+    const a = valid.repository!, b = hasher.repo("example.test/team/b");
+    const claims = [
+      { repository: a, basis: "operator_declared" as const, availableAt: at("01") },
+      { repository: b, basis: "trace_declared" as const, availableAt: at("01") },
+    ];
+    const negatives: ActionRecord[] = [
+      { ...valid, repositoryBasis: "unattributed", repositoryClaims: [], repositoryTarget: null },
+      { ...valid, repositoryBasis: "unattributed", repository: null, repositoryClaims: [claims[0]!], repositoryTarget: null },
+      { ...valid, repositoryBasis: "conflicting_claims", repositoryClaims: claims, repositoryTarget: null },
+      { ...valid, repositoryBasis: "conflicting_claims", repository: null, repositoryClaims: [claims[0]!], repositoryTarget: null },
+      { ...valid, repositoryBasis: "conflicting_claims", repository: null, repositoryClaims: [claims[0]!, { ...claims[1]!, repository: a }], repositoryTarget: null },
+    ];
+    for (const bad of negatives) expect(() => readActionScope(snapshot([s], [bad]), now)).toThrow("values withheld");
+    // Controls: the same public shape with consistent bases does load.
+    expect(readActionScope(snapshot([s], [{ ...valid, repositoryBasis: "unattributed", repository: null, repositoryClaims: [], repositoryTarget: null }]), now).size).toBe(1);
+    expect(readActionScope(snapshot([s], [{ ...valid, repositoryBasis: "conflicting_claims", repository: null, repositoryClaims: claims, repositoryTarget: null }]), now).size).toBe(1);
+  });
+  test("each availability guard rejects independently with otherwise consistent clocks and counts", () => {
+    const s = row("a", { writes: [write("w1", at("02"))] }), valid = fact(s, "write", s.writes[0]!);
+    const earlyClaim = { ...valid.repositoryClaims[0]!, availableAt: at("00") };
+    const negatives: ActionRecord[] = [
+      // availableAt < factAt only: source and claim are already visible.
+      { ...valid, availableAt: at("01"), sourceAt: at("00"), repositoryClaims: [earlyClaim] },
+      // availableAt < sourceAt only: fact and claim are already visible.
+      { ...valid, availableAt: at("03"), sourceAt: at("04"), repositoryClaims: [earlyClaim] },
+      // claim later than availableAt only: source and fact are already visible.
+      { ...valid, repositoryClaims: [{ ...earlyClaim, availableAt: at("03") }] },
+    ];
+    for (const bad of negatives) expect(() => readActionScope(snapshot([s], [bad]), now)).toThrow("values withheld");
+    expect(readActionScope(snapshot([s], [valid]), now).size).toBe(1);
+  });
   test("ambiguous source facts cannot be joined by event id alone", () => {
     const s = row("a", { writes: [write("one"), write("one", at("01"), "different/path.ts")] });
     expect(() => readActionScope(snapshot([s], [fact(s, "write", s.writes[0]!)]), now)).toThrow("values withheld");
@@ -126,6 +159,8 @@ describe("per-action retrospective analysis", () => {
     expect(r.coverage.actionScope).toMatchObject({ records: 3, missing: 1, conflicting: 1, unattributed: 1, writesWithoutTarget: 4 });
     expect(r.profile.all.writes).toBe(4); expect(r.profile.files).toEqual([]);
     expect(r.profile.byRepository.reduce((n, p) => n + p.writes, 0)).toBe(4);
+    expect(r.profile.byRepository.map((p) => p.key).sort()).toEqual(["unscoped", JSON.stringify({ kind: "repo", value: noTarget.repository })].sort());
+    expect(JSON.stringify(r.profile)).not.toContain(s.repo!);
   });
   test("late declarations are descriptive only; causal access rejects equality and earlier clocks", () => {
     const a = row("a", { writes: [write("a1")] }), b = row("b", { writes: [write("b1")] });
@@ -133,6 +168,8 @@ describe("per-action retrospective analysis", () => {
     const scope = readActionScope(input, now), f = a.writes[0]!;
     expect(resolveAction(scope, a, "write", f, new Date(at("02"))).status).toBe("not_available");
     expect(resolveAction(scope, a, "write", f, new Date(at("20"))).repository).toBeNull();
+    expect(resolveAction(scope, a, "write", f, new Date(at("02"))).availableAt).toBeNull();
+    expect(resolveAction(scope, a, "write", f, new Date(at("20"))).availableAt).toBeNull();
     expect(resolveAction(scope, a, "write", f, new Date(Date.parse(at("20")) + 1)).status).toBe("attributed");
     expect(analyse(input).coverage.actionScope!.late).toBe(1);
     expect(analyse(input).candidates).toHaveLength(1);

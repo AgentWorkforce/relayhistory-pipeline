@@ -54,7 +54,9 @@ its digest, capture definition, byte/record bounds, retention and exact
 fact kind, event id and fact time. Dangling/duplicate records, ambiguous source
 facts or inconsistent declarations fail before output. Duplicate sessions in
 multiple snapshots must have identical action provenance, including missing
-records. The namespace assertion still applies to all salted identities.
+records. This check compares the whole record, including location ids: separately
+imported overlapping snapshots can be refused even when their session bytes match;
+it fails closed. The namespace assertion still applies to all salted identities.
 
 This mode emits `session-intel-patterns/2`, definition `3-action-scope`. Legacy
 analysis remains the default and keeps its `/1` report shape and definition.
@@ -63,9 +65,9 @@ the analysis definition hash covers mode, version and numeric discovery paramete
 
 Repository rows count writes, commits and outcomes by their individual scope
 claims. A session can appear in several repository rows, retaining its original
-identity and parent links. Do not sum those rows' session counts. Claims, summaries
-and session branch metadata have no action binding and are excluded from the
-repository rows; overall and harness coverage still count them. Equal file activity
+identity and parent links. Do not sum those rows' session counts. Repository rows
+exclude claims, summaries, and session and write branch metadata, which have no
+action binding; overall and harness coverage still count them. Equal file activity
 requires both the declared repository identity and its repository-relative target
 token. The evidence retains the original snapshot path and event reference.
 

@@ -93,7 +93,7 @@ export interface ResolvedAction {
 export function resolveAction(records: ReadonlyMap<string, ActionRecord>, s: Pick<SnapshotSession, "harness" | "sessionId">, kind: ActionKind, f: { eventId: string; ts: string }, now?: Date): ResolvedAction {
   const r = records.get(actionKey(s, kind, f));
   if (!r) return { repository: null, target: null, availableAt: null, status: "missing" };
-  if (now && r.availableAt >= now.toISOString()) return { repository: null, target: null, availableAt: r.availableAt, status: "not_available" };
+  if (now && r.availableAt >= now.toISOString()) return { repository: null, target: null, availableAt: null, status: "not_available" };
   return { repository: r.repository, target: r.repositoryTarget, availableAt: r.availableAt,
     status: r.repository ? "attributed" : r.repositoryBasis === "conflicting_claims" ? "conflicting_claims" : "unattributed" };
 }
