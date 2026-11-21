@@ -1100,7 +1100,7 @@ test("real tree: the 062190 priority-first advisories reader is a read-API funct
   expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
 });
 
-test("real tree: after the full tree including 062210, the T2 flip function is owner-only, the gate is off, the mode is 'main', the replaced ACK keeps its ACL, and an extra grant is ACL drift", async () => {
+test("real tree: after the full tree including 062210, the T2 flip and gate functions are owner-only, the gate is off, the mode is 'main', the replaced ACK keeps its ACL, and an extra grant is ACL drift", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);
   const T2 = "upstream:20261105062210_lazy_ack_t2.sql";
@@ -1111,18 +1111,17 @@ test("real tree: after the full tree including 062210, the T2 flip function is o
   await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
   expect(await ledger(s.db)).toContain(T2);
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
-  const flip = "sessions.lazy_ack_t2_set_mode(text)";
-  expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(flip);
-  expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(flip);
+  const flip = "sessions.lazy_ack_t2_set_mode(text)", gateFn = "sessions.lazy_ack_t2_set_gate(text)";
+  for (const fn of [flip, gateFn]) { expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn); expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(fn); }
   expect((await s.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.c)
     .toContain("bulls96.lazy_ack_t2=off");
   expect((await s.db.query<{ mode: string }>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
-  for (const role of ["bulls96_session_ingest", "service_role"]) {
-    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${flip} TO ${role}`);
-    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${flip}: `))).toBe(true);
-    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${flip} FROM ${role}`);
+  for (const fn of [flip, gateFn]) for (const role of ["bulls96_session_ingest", "service_role"]) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);
     expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   }
 });

@@ -184,7 +184,7 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
     const priv = (await f.db.query<any>(`SELECT r.rolname,
         has_table_privilege(r.oid,'sessions.lazy_ack_t2_mode','SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') t,
-        has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_mode(text)','EXECUTE') x
+        has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_mode(text)','EXECUTE') OR has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_gate(text)','EXECUTE') x
       FROM pg_roles r WHERE r.rolname IN('bulls96_session_ingest','bulls96_session_ingest_seeder','anon','authenticated','service_role') ORDER BY 1`)).rows;
     expect(priv.length).toBeGreaterThan(0);
     for (const r of priv) expect(r).toEqual({ rolname: r.rolname, t: false, x: false });
@@ -221,7 +221,7 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
   });
   test("the runtime role cannot select T2: ALTER FUNCTION, the flip function and the mode table are refused; session values are overridden", async () => {
     const f = await fixture();
-    for (const stmt of [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`, "SELECT sessions.lazy_ack_t2_set_mode('t2')", "UPDATE sessions.lazy_ack_t2_mode SET mode='t2'",
+    for (const stmt of [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`, "SELECT sessions.lazy_ack_t2_set_mode('t2')", "SELECT sessions.lazy_ack_t2_set_gate('fenced')", "UPDATE sessions.lazy_ack_t2_mode SET mode='t2'",
       "SELECT mode FROM sessions.lazy_ack_t2_mode", "INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'t2')",
       // No runtime lock on the mode row in any mode: only the flip (after its 50000 try-lock) can lock it.
       "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR UPDATE", "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR NO KEY UPDATE",
@@ -230,8 +230,11 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
       await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
       try { await expect(f.db.exec(stmt)).rejects.toMatchObject({ code: "42501" }); } finally { await f.db.exec("ROLLBACK"); }
     }
-    // Mode 't2' committed by the owner: only proconfig 'fenced' may select it; session/local values are overridden.
+    // Mode 't2' committed by the owner (under the fenced gate), then the gate set 'off' (the operator never does that while
+    // the row says 't2'; here it isolates the override): session/local values cannot select the fenced body.
+    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`);
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main");
+    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='off'`);
     try {
       for (const form of [`SET LOCAL ${GATE}='fenced'`, `SELECT set_config('${GATE}','fenced',true)`, `SELECT set_config('${GATE}','fenced',false)`])
         expect({ form, calls: await bodyCalls(f, "s" + form.length, "SELECT 1", form) }).toEqual({ form, calls: 2 });
@@ -242,25 +245,31 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     const alter = (v: string) => `ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`;
     expect(await bodyCalls(f, "m0", alter("off"))).toBe(2);
     expect(await bodyCalls(f, "m1", alter("fenced"))).toBe(2); // mode 'main'
-    expect(await bodyCalls(f, "m2", `${alter("off")};SELECT sessions.lazy_ack_t2_set_mode('t2')`)).toBe(2); // gate off ignores the row
+    expect(await bodyCalls(f, "m2", `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2');${alter("off")}`)).toBe(2); // gate off ignores the row
     expect(await bodyCalls(f, "m3", `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2')`)).toBe(1);
     for (const v of ["FENCED", "on", "t2", " fenced", "fenced ", ""])
-      expect({ v, calls: await bodyCalls(f, "m4" + v.trim().length + v.length, `${alter(v)};SELECT sessions.lazy_ack_t2_set_mode('t2')`) }).toEqual({ v, calls: 2 });
+      expect({ v, calls: await bodyCalls(f, "m4" + v.trim().length + v.length, `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2');${alter(v)}`) }).toEqual({ v, calls: 2 });
     // The flips above were rolled back with their transactions.
     expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
   });
   test("fenced refuses REPEATABLE READ and SERIALIZABLE (either mode) before reading the mode; gate off does not", async () => {
     const f = await fixture();
     for (const iso of ["REPEATABLE READ", "SERIALIZABLE"]) {
-      for (const [prelude, refused] of [[`ALTER FUNCTION ${ACK} SET ${GATE}='off'`, false], [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`, true],
-        [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced';SELECT sessions.lazy_ack_t2_set_mode('t2')`, true]] as const) {
+      // Gate and mode are set by the owner at READ COMMITTED (the operator functions require it), before the RR transaction.
+      for (const [setup, refused] of [[["off", "main"], false], [["fenced", "main"], true], [["fenced", "t2"], true]] as const) {
         const c = await capture(f, [rec("iso-" + ++serial, 2)]);
-        await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};${prelude};SET LOCAL ROLE bulls96_session_ingest`);
+        await f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [setup[0]]);
+        await f.db.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [setup[1]]);
+        await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
         try {
           const q = f.db.query<any>(COMMIT, [c.payload]);
           if (refused) await expect(q).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the fenced staged ACK requires read committed") });
           else expect((await q).rows[0].r.kind).toBe("committed");
-        } finally { await f.db.exec("ROLLBACK"); }
+        } finally {
+          await f.db.exec("ROLLBACK");
+          await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
+          await f.db.query("SELECT sessions.lazy_ack_t2_set_gate('off')");
+        }
       }
     }
   });
@@ -285,10 +294,12 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     await f.db.query("INSERT INTO sessions.__96bulls_migrations VALUES('upstream:20261105062210_lazy_ack_t2.sql',$1)", [sha]);
     const attempt = async () => { const e = await f.db.exec(DOWN).then(() => null, (x: any) => x); if (e) await f.db.exec("ROLLBACK"); return e; };
     const alter = (v: string) => f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`);
+    await alter("fenced");
     await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
     expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
-    await alter("fenced");
+    await alter("off"); // (never done by the operator while the row says 't2'; the down still refuses)
     expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
+    await alter("fenced");
     await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
     expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the gate is fenced") });
     expect(await f.db.query<any>("SELECT to_regclass('sessions.lazy_ack_t2_mode') r").then((r) => r.rows[0].r)).toBe("sessions.lazy_ack_t2_mode");
@@ -299,13 +310,57 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp"]);
     expect(p.prosrc).toBe(ackBody(readFileSync(MAIN_MIG, "utf8")));
   });
+  test("lazy_ack_t2_set_gate: the supported gate change; requires mode main, returns the previous value, owner-only, read committed", async () => {
+    const f = await fixture();
+    const gate = async () => (await f.db.query<any>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].c as string[];
+    const sm = (await f.db.query<any>("SELECT prosecdef,proconfig FROM pg_proc WHERE oid='sessions.lazy_ack_t2_set_gate(text)'::regprocedure")).rows[0];
+    expect(sm).toEqual({ prosecdef: false, proconfig: ["search_path=pg_catalog, pg_temp"] });
+    for (const bad of ["on", "FENCED", "", "t2", "main"])
+      await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [bad])).rejects.toMatchObject({ code: "22023" });
+    await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate(NULL)")).rejects.toMatchObject({ code: "22023" });
+    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).rows[0].o).toBe("off");
+    expect(await gate()).toContain(GATE + "=fenced");
+    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).rows[0].o).toBe("fenced");
+    // mode 't2' (set under the fenced gate): no gate change either way, gate unchanged.
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
+    for (const g of ["off", "fenced"]) {
+      await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [g])).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("only while the mode is main") });
+      expect(await gate()).toContain(GATE + "=fenced");
+    }
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
+    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('off') o")).rows[0].o).toBe("fenced");
+    expect(await gate()).toEqual(["search_path=pg_catalog, pg_temp", GATE + "=off"]);
+    // An out-of-protocol RESET leaves no entry: reported as 'absent', and set_gate restores an explicit value.
+    await f.db.exec(`ALTER FUNCTION ${ACK} RESET ${GATE}`);
+    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('off') o")).rows[0].o).toBe("absent");
+    expect(await gate()).toContain(GATE + "=off");
+    // Both operator functions refuse anything but READ COMMITTED (their reads must follow the try-lock).
+    for (const [iso, stmt] of [["REPEATABLE READ", "SELECT sessions.lazy_ack_t2_set_gate('fenced')"], ["SERIALIZABLE", "SELECT sessions.lazy_ack_t2_set_gate('fenced')"],
+      ["REPEATABLE READ", "SELECT sessions.lazy_ack_t2_set_mode('main')"], ["SERIALIZABLE", "SELECT sessions.lazy_ack_t2_set_mode('main')"]] as const) {
+      await f.db.exec(`BEGIN ISOLATION LEVEL ${iso}`);
+      try { await expect(f.db.exec(stmt)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("requires read committed") }); }
+      finally { await f.db.exec("ROLLBACK"); }
+    }
+    expect(await gate()).toContain(GATE + "=off");
+  });
   test("lazy_ack_t2_set_mode: returns the old mode, refuses anything but main/t2 (22023) and leaves the row unchanged", async () => {
     const f = await fixture();
     for (const bad of ["T2", "off", "fenced", "", " t2"])
       await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [bad])).rejects.toMatchObject({ code: "22023" });
     await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode(NULL)")).rejects.toMatchObject({ code: "22023" });
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('main') o")).rows[0].o).toBe("main");
+    // 't2' only under the fenced gate (review M1): refused (55000) with the gate off or any non-'fenced' value, row unchanged.
+    for (const v of ["off", "FENCED", "on", ""]) {
+      await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`);
+      await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')")).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("requires the gate fenced first") });
+      expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+    }
+    await f.db.exec(`ALTER FUNCTION ${ACK} RESET ${GATE}`); // no gate entry at all: refused too
+    await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')")).rejects.toMatchObject({ code: "55000" });
+    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`);
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main");
+    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='off'`);
+    // 'main' is always allowed (the way back), whatever the gate says.
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('main') o")).rows[0].o).toBe("t2");
     await expect(f.db.query("UPDATE sessions.lazy_ack_t2_mode SET mode='x'")).rejects.toMatchObject({ code: "23514" });
     await expect(f.db.query("INSERT INTO sessions.lazy_ack_t2_mode VALUES(false,'main')")).rejects.toMatchObject({ code: "23514" });

@@ -15,6 +15,11 @@
  *   - indeterminate: reconcile first (read the mode, confirm no other flip ran) before any further attempt.
  *   There is no queued fallback, no admission stop and no automatic repeat-until-success. Flipping back to main uses
  *   the same try-lock and can starve under load too: a rollback of the mode is not immediate.
+ * The gate (ALTER FUNCTION ... SET bulls96.lazy_ack_t2) is not barriered: change it only while the mode is 'main', and
+ * never RESET it (set 'off'). lazy_ack_t2_set_mode refuses 't2' (55000, not retried here) unless the gate is 'fenced'.
+ * Busy is recognised by SQLSTATE 55P03 AND the server's English message text (the function's own message, or the row
+ * NOWAIT message); a server with translated messages (lc_messages other than English) makes every busy a thrown error,
+ * never a retry or a false "switched".
  * Options must be finite and bounded: budgetMs > 0, maxAttempts an integer >= 1, backoffs >= 0 (TypeError otherwise).
  * The first attempt is always dispatched (a valid budget is > 0, so it starts before the deadline).
  *
