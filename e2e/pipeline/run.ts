@@ -99,7 +99,7 @@ async function local(): Promise<boolean> {
     }
   }
   const dump = () => {
-    for (const svc of ["migrate", "roles", ...services]) console.error(`--- ${svc}\n${stack.logs(svc).split("\n").slice(-60).join("\n")}`);
+    for (const svc of ["migrate", "roles", ...services, ...(services.includes("coordination-advisor") ? ["coordination-relay"] : [])]) console.error(`--- ${svc}\n${stack.logs(svc).split("\n").slice(-60).join("\n")}`);
   };
   let results: StepResult[] = [];
   let stackMs = 0;

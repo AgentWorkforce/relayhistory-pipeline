@@ -174,15 +174,17 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
 
   // The configured sender uses a recording HTTP endpoint, never an actual agent.
   // Earlier scans had no dm controls: the runtime flag alone must send nothing.
-  const relay = async (path: string, body?: unknown, bearer = stack.env.E2E_COORDINATION_RELAY_TOKEN!) => {
+  const relay = async (path: string, body?: unknown, bearer: string | null = stack.env.E2E_COORDINATION_RELAY_TOKEN!) => {
     const response = await fetch(stack.urls.coordinationRelay + path, {
       method: body === undefined ? "GET" : "POST",
-      headers: { authorization: `Bearer ${bearer}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { ...(bearer === null ? {} : { authorization: `Bearer ${bearer}` }), ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5_000),
     });
     return { status: response.status, body: await response.json() as { messages?: any[] } };
   };
   check((await relay("/messages", undefined, "wrong-token")).status === 401, "recording transport admitted a bad token");
+  check((await relay("/relay", {}, null)).status === 401, "recording transport admitted an anonymous send");
+  check((await relay("/relay", {}, "wrong-token")).status === 401, "recording transport admitted a send with a bad token");
   check((await relay("/messages")).body.messages?.length === 0, "missing dm controls sent a message");
   stack.sql(`BEGIN;
     INSERT INTO sessions.session_intel_controls(scope,feature,enabled,updated_by) VALUES ('global','dm',true,'fixture');
@@ -192,9 +194,12 @@ export async function proveCoordinationAdvisories(stack: PipelineStack): Promise
     ${fact("dm-high-a", ["src/dm-high/shared.ts"])}${fact("dm-high-b", ["src/dm-high/shared.ts"])}
     ${directory("dm-low-a", "dm-low")}${directory("dm-low-b", "dm-low")}
     ${fact("dm-low-a", ["src/dm-low/a.ts"])}${fact("dm-low-b", ["src/dm-low/b.ts"])} COMMIT;`);
-  await waitFor("recorded HIGH sends and delivered rows", async () => {
-    const high = rows().filter((r) => r[0].startsWith(session("dm-high-")));
-    return high.length === 2 && high.every((r) => r[5] === "delivered") ? true : undefined;
+  await waitFor("recorded HIGH sends, delivered HIGH rows and pending LOW rows", async () => {
+    const current = rows();
+    const high = current.filter((r) => r[0].startsWith(session("dm-high-")));
+    const low = current.filter((r) => r[0].startsWith(session("dm-low-")));
+    return high.length === 2 && high.every((r) => r[5] === "delivered")
+      && low.length === 2 && low.every((r) => r[5] === "pending") ? true : undefined;
   });
   const recorded = (await relay("/messages")).body.messages!;
   check(recorded.length === 2, `expected two HIGH sends, got ${recorded.length}`);
