@@ -32,6 +32,13 @@ export const READ_API_COORDINATION_ADVISORIES_ENABLED = "READ_API_COORDINATION_A
  * advisories GET also `delivery`). Anything else: 062000's v1 only and the pre-M3-7 response, 062190 applied or not.
  */
 export const READ_API_ADVISORY_PRIORITY_ENABLED = "READ_API_ADVISORY_PRIORITY_ENABLED";
+/**
+ * Exactly "true" (exactTrueFlag): the advisory instance (20261105062220). The advisories GET reads pending_for_v3,
+ * answers contract "advisories/v3" and gives each item its `incarnation` (null on a legacy row); an ack POST with an
+ * `incarnation` acks that instance through ack_v2. Anything else: the response bytes and the v1 ack exactly as before.
+ * Needs 062220 applied (no fallback: turn it off before rolling 062220 back).
+ */
+export const READ_API_ADVISORY_INSTANCE_ENABLED = "READ_API_ADVISORY_INSTANCE_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/session-intel/workspace; anything else = 501 `unsupported_by_backend`, reason `session_intel_disabled`. */
 export const READ_API_SESSION_INTEL_ENABLED = "READ_API_SESSION_INTEL_ENABLED";
 
