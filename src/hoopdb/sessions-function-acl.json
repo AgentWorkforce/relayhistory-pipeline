@@ -1512,6 +1512,10 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.session_analysis_schedule_job_v1(uuid)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

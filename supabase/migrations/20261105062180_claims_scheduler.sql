@@ -1,39 +1,48 @@
--- Slot 20261105062180 (PROVISIONAL: confirm with the migration registry owner before landing). Session
--- Intelligence M1-3: the live claims scheduler's store side (docs/session-analysis-runner.md, Claims scheduler).
+-- Slot 20261105062180 (assigned). Session Intelligence M1-3: the live claims scheduler's store side
+-- (docs/session-analysis-runner.md, Claims scheduler).
 -- Enables nothing: the runner calls these only with SESSION_INTEL_CLAIMS_SCHEDULER_ENABLED=true and its other
 -- gates. Code only: applying this to any real database needs Khaliq's separate, explicit OK.
 --
 -- analysis_request_v1 (046000) is replaced with the same signature, ACL, outcomes and order: its lock, evidence
 -- and purge-fence block moves verbatim into session_analysis_admit_live_v1, and its reuse-or-new-job block into
 -- session_analysis_admit_job_v1, so the scheduler reuses them instead of copying them. Both helpers are owner-only
--- (called by the definers as their owner); neither is SECURITY DEFINER.
+-- (called by the definers as their owner); neither is SECURITY DEFINER. Pre-apply check: analysis_request_v1 is
+-- SECURITY DEFINER and now calls the two owner-only helpers as its own owner, so its owner must be the role that
+-- applies this file (the helpers' owner). If they differ, every user analysis request fails 42501. Compare
+-- pg_get_userbyid(proowner) of sessions.analysis_request_v1(text,text,text,text) with current_user first.
 --
 -- session_analysis_schedule_ledger_v1 (new, empty): one row per job the scheduler enqueued, with its worst-case
--- token reservation. It is the scheduler's durable budget (a restart keeps the counts). analysis_job_id references
--- the job ON DELETE CASCADE, so every path that erases a session's analysis jobs (the per-session operator purge,
--- the per-user erase, the C3 purge, the v2 forget trigger) also erases its ledger rows. Rows older than 8 days are
--- deleted by session_analysis_schedule_v1, opportunistically.
+-- token reservation. It is the scheduler's durable budget (a restart keeps the counts). A row holds no session
+-- identity: org, workspace, the job's id, the reservation and the time; the session is read through the job.
+-- analysis_job_id references the job ON DELETE SET NULL, so when any path erases a session's analysis jobs (the
+-- per-session operator purge, the per-user erase, the C3 purge, the v2 forget trigger) the row stays, without its
+-- job, and still counts toward the workspace hourly, global daily and token budgets: an erase never refunds spend.
+-- Rows older than 8 days are deleted by session_analysis_schedule_v1, opportunistically.
 --
--- session_analysis_schedule_v1 (service_role and the runtime role): under the same per-org and per-scope locks as
--- analysis_request_v1, plus one global scheduler lock taken after them, it answers not_found / in_flight /
--- over_budget (workspace_hourly, global_daily, session_interval, daily_tokens) / reused / enqueued. Over budget is
--- a reason, never an error, and writes nothing. It never writes a request row, so it never spends the user
--- request limits (20 sessions per org and 30 per session per UTC day).
+-- session_analysis_schedule_v1 (service_role and the runtime role): refuses (25000) outside READ COMMITTED, since
+-- its budget counts are atomic only when each statement after the locks sees the latest commits. It answers
+-- control_off (the 'claims' control, 062160, is not on globally and for the workspace) before any lock; then,
+-- under the same per-org and per-scope locks as analysis_request_v1, plus one global scheduler lock taken after
+-- them, not_found / in_flight / over_budget (workspace_hourly, global_daily, session_interval, daily_tokens) /
+-- reused / enqueued. Over budget and control off are reasons, never errors, and write nothing. It never writes a
+-- request row, so it never spends the user request limits (20 sessions per org and 30 per session per UTC day).
 -- session_analysis_schedule_candidates_v1 (service_role and the runtime role): live sessions of workspaces whose
--- 'claims' control is on (062160), with no job in flight, activity newer than their last completed analysis, and no
--- completed analysis or scheduled job within the minimum interval.
+-- 'claims' control is on (062160), with no job in flight, activity newer than their last completed or failed
+-- analysis, and no completed analysis or scheduled job within the minimum interval; taken round-robin across
+-- workspaces (each workspace's newest first), so one busy workspace cannot starve the others.
+-- session_analysis_schedule_job_v1 (service_role and the runtime role): for the worker, before it runs a claimed
+-- job: 'unscheduled' (no ledger row names it), else 'on' or 'off' by the job's workspace 'claims' control. The
+-- worker cancels a scheduled job whose control is off instead of running the provider analysis.
 
 CREATE TABLE sessions.session_analysis_schedule_ledger_v1 (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   org_id text NOT NULL CHECK (char_length(org_id) BETWEEN 1 AND 512 AND btrim(org_id) <> ''),
   workspace_id text NOT NULL CHECK (char_length(workspace_id) BETWEEN 1 AND 512 AND btrim(workspace_id) <> ''),
-  session_id text NOT NULL CHECK (char_length(session_id) BETWEEN 1 AND 512 AND btrim(session_id) <> ''),
-  analysis_job_id uuid NOT NULL REFERENCES sessions.session_analysis_jobs_v2 (id) ON DELETE CASCADE,
+  analysis_job_id uuid REFERENCES sessions.session_analysis_jobs_v2 (id) ON DELETE SET NULL,
   reserved_tokens bigint NOT NULL CHECK (reserved_tokens BETWEEN 1 AND 1000000),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX session_analysis_schedule_ledger_v1_workspace ON sessions.session_analysis_schedule_ledger_v1 (org_id, workspace_id, created_at);
-CREATE INDEX session_analysis_schedule_ledger_v1_session ON sessions.session_analysis_schedule_ledger_v1 (org_id, workspace_id, session_id, created_at);
 CREATE INDEX session_analysis_schedule_ledger_v1_day ON sessions.session_analysis_schedule_ledger_v1 (created_at);
 CREATE INDEX session_analysis_schedule_ledger_v1_job ON sessions.session_analysis_schedule_ledger_v1 (analysis_job_id);
 ALTER TABLE sessions.session_analysis_schedule_ledger_v1 ENABLE ROW LEVEL SECURITY;
@@ -187,6 +196,11 @@ DECLARE
   v_job_id uuid; v_reused boolean; v_spent bigint;
 BEGIN
   PERFORM sessions.session_analysis_require_caller(ARRAY['service_role', '<runtime>']);
+  -- The locks below make the counts atomic only if each later statement sees the commits made before the lock
+  -- was granted: READ COMMITTED. A REPEATABLE READ or SERIALIZABLE snapshot could count stale rows.
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION USING ERRCODE = '25000', MESSAGE = 'claims scheduler: READ COMMITTED required';
+  END IF;
   IF p_org_id IS NULL OR length(p_org_id) NOT BETWEEN 1 AND 512 OR btrim(p_org_id) = ''
     OR p_workspace_id IS NULL OR length(p_workspace_id) NOT BETWEEN 1 AND 512 OR btrim(p_workspace_id) = ''
     OR p_session_id IS NULL OR length(p_session_id) NOT BETWEEN 1 AND 512 OR btrim(p_session_id) = ''
@@ -199,6 +213,14 @@ BEGIN
   v_interval := least(greatest(p_min_interval_seconds, 60), 86400);
   v_ceiling := least(greatest(p_daily_token_ceiling, 1), 50000000);
   v_reserve := least(greatest(p_reserve_tokens, 1), 1000000);
+  -- The M3-1 kill switch (062160): on only with an enabled global and workspace 'claims' row.
+  IF NOT EXISTS (SELECT 1 FROM sessions.session_intel_controls AS w
+                  WHERE w.scope = 'workspace' AND w.feature = 'claims' AND w.enabled
+                    AND w.org_id = p_org_id AND w.workspace_id = p_workspace_id)
+     OR NOT EXISTS (SELECT 1 FROM sessions.session_intel_controls AS g
+                     WHERE g.scope = 'global' AND g.feature = 'claims' AND g.enabled) THEN
+    RETURN jsonb_build_object('outcome', 'control_off');
+  END IF;
   IF NOT sessions.session_analysis_admit_live_v1(p_org_id, p_workspace_id, p_session_id) THEN
     RETURN jsonb_build_object('outcome', 'not_found');
   END IF;
@@ -212,7 +234,8 @@ BEGIN
     RETURN jsonb_build_object('outcome', 'in_flight');
   END IF;
   IF EXISTS (SELECT 1 FROM sessions.session_analysis_schedule_ledger_v1 AS l
-              WHERE l.org_id = p_org_id AND l.workspace_id = p_workspace_id AND l.session_id = p_session_id
+               JOIN sessions.session_analysis_jobs_v2 AS j ON j.id = l.analysis_job_id
+              WHERE j.org_id = p_org_id AND j.workspace_id = p_workspace_id AND j.session_id = p_session_id
                 AND l.created_at > now() - make_interval(secs => v_interval)) THEN
     RETURN jsonb_build_object('outcome', 'over_budget', 'reason', 'session_interval');
   END IF;
@@ -232,18 +255,20 @@ BEGIN
   IF v_reused THEN
     RETURN jsonb_build_object('outcome', 'reused');
   END IF;
-  INSERT INTO sessions.session_analysis_schedule_ledger_v1 (org_id, workspace_id, session_id, analysis_job_id, reserved_tokens)
-  VALUES (p_org_id, p_workspace_id, p_session_id, v_job_id, v_reserve);
+  INSERT INTO sessions.session_analysis_schedule_ledger_v1 (org_id, workspace_id, analysis_job_id, reserved_tokens)
+  VALUES (p_org_id, p_workspace_id, v_job_id, v_reserve);
   RETURN jsonb_build_object('outcome', 'enqueued', 'reservedTokens', v_reserve);
 END
 $schedule$;
 
--- Live sessions to schedule, newest activity first, at most p_limit (1..200): sessions of workspaces whose
--- 'claims' control is on globally and for the workspace (062160), with last_activity_at within p_active_seconds
--- (60..86400) by their canonical id, no native job queued or running, activity newer than their last completed
--- native analysis, and neither a completed analysis nor a scheduled job within p_min_interval_seconds (60..86400).
--- User turns since the last analysis are not derivable from analysis data (the jobs carry no turn coverage), so
--- this is the documented fallback: newer activity, and the interval.
+-- Live sessions to schedule, at most p_limit (1..200), round-robin across workspaces: every workspace's newest
+-- session first, then every workspace's second, and so on (newest activity first within a round), so a busy
+-- workspace never starves the rest. Sessions of workspaces whose 'claims' control is on globally and for the
+-- workspace (062160), with last_activity_at within p_active_seconds (60..86400) by their canonical id, no native
+-- job queued or running, activity newer than their last completed or failed native analysis (a session that keeps
+-- failing waits for new activity), and neither a completed analysis nor a scheduled job within
+-- p_min_interval_seconds (60..86400). User turns since the last analysis are not derivable from analysis data (the
+-- jobs carry no turn coverage), so this is the documented fallback: newer activity, and the interval.
 CREATE FUNCTION sessions.session_analysis_schedule_candidates_v1(
   p_active_seconds integer, p_min_interval_seconds integer, p_limit integer
 ) RETURNS TABLE (org_id text, workspace_id text, session_id text, last_activity_at timestamptz)
@@ -273,28 +298,65 @@ BEGIN
              AND si.last_activity_at >= now() - make_interval(secs => v_active)
            ORDER BY si.last_activity_at DESC LIMIT 1000) AS s
        GROUP BY s.org_id, s.workspace_id, s.sid
+    ), due AS (
+      SELECT l.org_id AS d_org, l.workspace_id AS d_ws, l.session_id AS d_session, l.last_activity_at AS d_activity,
+             row_number() OVER (PARTITION BY l.org_id, l.workspace_id
+                                ORDER BY l.last_activity_at DESC, l.session_id) AS d_round
+        FROM live AS l
+       WHERE NOT EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j
+                          WHERE j.org_id = l.org_id AND j.workspace_id = l.workspace_id AND j.session_id = l.session_id
+                            AND j.origin = 'native'
+                            AND (j.status IN ('queued', 'running')
+                                 OR (j.status = 'completed' AND (j.completed_at >= l.last_activity_at
+                                                                OR j.completed_at > now() - make_interval(secs => v_interval)))
+                                 OR (j.status = 'failed' AND j.updated_at >= l.last_activity_at)))
+         AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_schedule_ledger_v1 AS x
+                           JOIN sessions.session_analysis_jobs_v2 AS xj ON xj.id = x.analysis_job_id
+                          WHERE xj.org_id = l.org_id AND xj.workspace_id = l.workspace_id AND xj.session_id = l.session_id
+                            AND x.created_at > now() - make_interval(secs => v_interval))
     )
-    SELECT l.org_id, l.workspace_id, l.session_id, l.last_activity_at FROM live AS l
-     WHERE NOT EXISTS (SELECT 1 FROM sessions.session_analysis_jobs_v2 AS j
-                        WHERE j.org_id = l.org_id AND j.workspace_id = l.workspace_id AND j.session_id = l.session_id
-                          AND j.origin = 'native'
-                          AND (j.status IN ('queued', 'running')
-                               OR (j.status = 'completed' AND (j.completed_at >= l.last_activity_at
-                                                              OR j.completed_at > now() - make_interval(secs => v_interval)))))
-       AND NOT EXISTS (SELECT 1 FROM sessions.session_analysis_schedule_ledger_v1 AS x
-                        WHERE x.org_id = l.org_id AND x.workspace_id = l.workspace_id AND x.session_id = l.session_id
-                          AND x.created_at > now() - make_interval(secs => v_interval))
-     ORDER BY l.last_activity_at DESC, l.org_id, l.workspace_id, l.session_id
+    SELECT d.d_org, d.d_ws, d.d_session, d.d_activity FROM due AS d
+     ORDER BY d.d_round, d.d_activity DESC, d.d_org, d.d_ws, d.d_session
      LIMIT v_limit;
 END
 $schedule_candidates$;
 
+-- For the worker, before it runs a claimed job: 'unscheduled' when no ledger row names the job (a user request,
+-- a backfill, or a scheduled row past retention), else 'on' when the 'claims' control (062160) is on globally and
+-- for the job's workspace, else 'off'. Read-only; null input or an unknown job is 'unscheduled'.
+CREATE FUNCTION sessions.session_analysis_schedule_job_v1(p_job_id uuid)
+RETURNS text LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, sessions, pg_temp AS $schedule_job$
+DECLARE v_org text; v_ws text;
+BEGIN
+  PERFORM sessions.session_analysis_require_caller(ARRAY['service_role', '<runtime>']);
+  SELECT j.org_id, j.workspace_id INTO v_org, v_ws
+    FROM sessions.session_analysis_schedule_ledger_v1 AS l
+    JOIN sessions.session_analysis_jobs_v2 AS j ON j.id = l.analysis_job_id
+   WHERE l.analysis_job_id = p_job_id
+   LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN 'unscheduled';
+  END IF;
+  IF EXISTS (SELECT 1 FROM sessions.session_intel_controls AS w
+              WHERE w.scope = 'workspace' AND w.feature = 'claims' AND w.enabled
+                AND w.org_id = v_org AND w.workspace_id = v_ws)
+     AND EXISTS (SELECT 1 FROM sessions.session_intel_controls AS g
+                  WHERE g.scope = 'global' AND g.feature = 'claims' AND g.enabled) THEN
+    RETURN 'on';
+  END IF;
+  RETURN 'off';
+END
+$schedule_job$;
+
 REVOKE ALL ON FUNCTION sessions.session_analysis_admit_live_v1(text,text,text),
   sessions.session_analysis_admit_job_v1(text,text,text),
   sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint),
-  sessions.session_analysis_schedule_candidates_v1(integer,integer,integer)
+  sessions.session_analysis_schedule_candidates_v1(integer,integer,integer),
+  sessions.session_analysis_schedule_job_v1(uuid)
   FROM PUBLIC, anon, authenticated, service_role, search_consumer_runtime, bulls96_read_api, bulls96_session_ingest,
        bulls96_session_ingest_seeder, bulls96_analysis_admit;
 GRANT EXECUTE ON FUNCTION sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint),
-  sessions.session_analysis_schedule_candidates_v1(integer,integer,integer)
+  sessions.session_analysis_schedule_candidates_v1(integer,integer,integer),
+  sessions.session_analysis_schedule_job_v1(uuid)
   TO service_role;

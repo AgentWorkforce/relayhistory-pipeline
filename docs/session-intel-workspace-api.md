@@ -186,7 +186,7 @@ does not turn this view off. Only `READ_API_SESSION_INTEL_ENABLED` does. Two rea
 than code: the controls function is `service_role`-only and takes any org and workspace (it has no read-API scope
 pin), so the read API's role cannot call it without a new grant or a new scoped reader; and none of the five
 features (`advisor`, `conflicts`, `dm`, `claims`, `regen`) names this view, so which one gates it (or whether it
-needs its own) is a product decision. The controls do stop the producers: `claims` off stops new claim writes, `advisor`
+needs its own) is a product decision. The controls do stop the producers: `claims` off stops new claim writes and scheduled analyses, `advisor`
 off stops new advisories, so the view then shows only what was written before.
 
 ### No transcript text

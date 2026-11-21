@@ -1,8 +1,9 @@
 -- Rolls back 20261105062180 claims scheduler: restores 20261105046000's sessions.analysis_request_v1 body exactly
 -- (CREATE OR REPLACE keeps its owner and its single grant to bulls96_analysis_admit), drops
--- session_analysis_schedule_v1, session_analysis_schedule_candidates_v1, the two admission helpers and the table
--- sessions.session_analysis_schedule_ledger_v1, and removes the ledger row.
--- Analysis jobs the scheduler enqueued are ordinary jobs and stay. The scheduler ledger is its durable budget:
+-- session_analysis_schedule_v1, session_analysis_schedule_candidates_v1, session_analysis_schedule_job_v1, the two
+-- admission helpers and the table sessions.session_analysis_schedule_ledger_v1, and removes the ledger row.
+-- Analysis jobs the scheduler enqueued are ordinary jobs and stay; without session_analysis_schedule_job_v1 the
+-- worker no longer tells them apart, so a queued one then runs even with the 'claims' control off. The scheduler ledger is its durable budget:
 -- while any ledger row exists this refuses (55000), because dropping it forgets today's spend and a re-applied
 -- scheduler would start from zero. To drop it anyway, set the override in the same session first (this file
 -- opens its own transaction), for example
@@ -21,7 +22,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062180_claims_scheduler.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claims scheduler: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062180_claims_scheduler.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'56cb14743be633925992aee3c88dd6cec1ca08eb334363cdb6ea38ecbd69a969'
+ IF NOT FOUND OR v_sha<>'c3dd8c94b3a7dfdb0f50636853ec531ebb58d8692c05ce960633bfbd30920785'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claims scheduler: own applied checksum required';END IF;
  LOCK TABLE sessions.session_analysis_schedule_ledger_v1 IN ACCESS EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.session_analysis_schedule_ledger_v1)
@@ -134,6 +135,7 @@ $request$;
 
 DROP FUNCTION sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint),
  sessions.session_analysis_schedule_candidates_v1(integer,integer,integer),
+ sessions.session_analysis_schedule_job_v1(uuid),
  sessions.session_analysis_admit_job_v1(text,text,text),
  sessions.session_analysis_admit_live_v1(text,text,text);
 DROP TABLE sessions.session_analysis_schedule_ledger_v1;

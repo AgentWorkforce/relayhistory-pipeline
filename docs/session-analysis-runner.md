@@ -219,14 +219,21 @@ runner and the Lambda schedule are on, the claim rate is the sum of both.
 
 A side tick of this runner (never the Lambda) that enqueues an analysis for live sessions, so their claims
 (`docs/relayfacts.md`, Claims) stay current. Code: `src/session-analysis/claims-scheduler.ts`, wired in
-`runner.ts` `runnerTick`. Store side: migration `20261105062180_claims_scheduler.sql` (PROVISIONAL slot; applying
-it to a real database needs Khaliq's OK).
+`runner.ts` `runnerTick`. Store side: migration `20261105062180_claims_scheduler.sql` (applying it to a real
+database needs Khaliq's OK).
+
+**Pre-apply check (owner).** The migration replaces `analysis_request_v1` (SECURITY DEFINER), which now calls two
+owner-only helpers (`session_analysis_admit_live_v1`, `session_analysis_admit_job_v1`) as its own owner. The
+helpers are owned by the role that applies the file. If `pg_get_userbyid(proowner)` of
+`sessions.analysis_request_v1(text,text,text,text)` is not that role, every user analysis request fails `42501`
+after the apply. Compare it with `current_user` before applying.
 
 Gates, all required, each exactly `"true"`: `SESSION_ANALYSIS_ENABLED`, `SUMMARY_DECISION_RECORDS_ENABLED`,
 `SESSION_INTEL_CLAIMS_ENABLED`, `SESSION_INTEL_CLAIMS_SCHEDULER_ENABLED` (default off), a configured model key, and
 per workspace the M3-1 `claims` control (global AND workspace row; read through `src/shared/session-intel-controls.ts`,
 fail-closed, counted as `skipped_control`). With any gate off the runner's tick is the analysis tick itself: no
-query, no log line.
+query, no log line. The `claims` control is checked again by the admission (`control_off`) and by the worker
+before it runs a scheduled job (see Kill switch below).
 
 | Env | Default | Bounds | Meaning |
 |---|---|---|---|
@@ -241,15 +248,21 @@ clamps the same values again.
 
 - **Selection.** `session_analysis_schedule_candidates_v1`: sessions of workspaces whose `claims` control is on,
   with directory activity in the last 2 hours (by canonical id), no native job queued or running, activity newer
-  than their last completed analysis, and neither a completed analysis nor a scheduled job within the minimum
-  interval; at most 50 per pass, newest first. Fallback, documented: the analysis jobs carry no turn coverage, so
+  than their last completed or failed analysis (a session whose analysis keeps failing waits for new activity
+  instead of being re-enqueued every interval), and neither a completed analysis nor a scheduled job within the
+  minimum interval; at most 50 per pass, **round-robin across workspaces**: every workspace's newest session
+  first, then every workspace's second, and so on, newest activity first within a round. One busy workspace
+  therefore cannot fill the 50 and starve the others. Fallback, documented: the analysis jobs carry no turn coverage, so
   "at least N new user turns since the last analysis" is not derivable from analysis data and is not enforced.
   Future work: the 3-new-turns rule, once the analysis records its turn coverage.
 - **Enqueue.** `session_analysis_schedule_v1`, per candidate, as `service_role` (or the runtime role): the same
   locks, evidence check, purge fence and 30-minute reuse as a user request (`analysis_request_v1`'s own blocks, now
   shared helpers), a job-level in-flight check, then the budgets under the per-org lock plus one global scheduler
-  lock. Answers `enqueued`, `reused`, `in_flight`, `not_found` or `over_budget` with a reason (`session_interval`,
-  `workspace_hourly`, `global_daily`, `daily_tokens`); over budget is skipped and counted, never deferred. It writes
+  lock. Answers `control_off` (the `claims` control is not on globally and for the workspace; checked first, no
+  lock), `enqueued`, `reused`, `in_flight`, `not_found` or `over_budget` with a reason (`session_interval`,
+  `workspace_hourly`, `global_daily`, `daily_tokens`); over budget is skipped and counted, never deferred. The
+  locks make the budget counts atomic only under READ COMMITTED, so the function refuses (`25000`) in a
+  REPEATABLE READ or SERIALIZABLE transaction; the tick's calls are single statements at the default level. It writes
   no request row, so it never spends the user request limits. Known limit: `analysis_request_v1` finds an
   in-flight analysis only through a request row (its 046000 check joins requests to jobs), so a user request while
   a scheduled job is queued or running may start a second job; once the scheduled job completes, a request within
@@ -258,12 +271,28 @@ clamps the same values again.
   pinned versions of `src/session-analysis/versions.ts`.
 - **Known limits.** Candidates are read by canonical session id; a job a user requested under a physical session
   id is not seen as covering that session, so the scheduler may enqueue one for it too. At most 50 candidates are
-  read per pass (newest activity first, across every organisation); the database budgets then decide how many are
-  enqueued, and the rest are read again on a later pass.
+  read per pass (round-robin across workspaces, across every organisation); the database budgets then decide how
+  many are enqueued, and the rest are read again on a later pass. With more than 50 eligible workspaces, the 50
+  with the newest activity are read first; the others surface as those are enqueued (in flight is excluded).
+- **Caps and the UTC day.** The global daily cap and the token ceiling reset at UTC midnight, not on a rolling 24
+  hours; the workspace cap is a rolling hour. One busy workspace at the default 5 per hour can fill the default
+  global 40 per day in 8 hours, after which no workspace is scheduled until UTC midnight. Size the global cap for
+  the number of workspaces enabled.
 - **Budget ledger.** `sessions.session_analysis_schedule_ledger_v1`, one row per enqueued job with its token
-  reservation; durable, so a restart keeps the counts. Rows reference their job `ON DELETE CASCADE`, so every erase
-  of a session's analysis jobs (per-session operator purge, per-user erase, C3 purge, the v2 forget trigger) erases
-  them too; rows older than 8 days are deleted by the admission function.
+  reservation; durable, so a restart keeps the counts. A row holds org, workspace, the job's id, the reservation
+  and the time, and no session id (the session is read through the job). It references its job `ON DELETE SET
+  NULL`: when an erase removes a session's analysis jobs (per-session operator purge, per-user erase, C3 purge, the
+  v2 forget trigger) the row stays without its job and keeps counting toward the workspace, daily and token
+  budgets, so an erase never refunds spend. Rows older than 8 days are deleted by the admission function.
+- **Kill switch.** Turning the `claims` control off stops new scheduling (candidates, the tick's own read, and the
+  admission's `control_off`) and also stops scheduled jobs already queued: before the worker runs a claimed job
+  (with `SESSION_INTEL_CLAIMS_ENABLED`, the same wiring as the claims writer), it asks
+  `session_analysis_schedule_job_v1` whether the scheduler enqueued it; a scheduled job whose workspace control is
+  off is failed as `claims_control_off` (not retried) with no evidence read and no provider call, counted
+  `cancelled` and `scheduled_control_off`. User-requested jobs are never stopped by it. If the gate's read fails
+  the job is failed retryable (`claims_scheduler_gate_failed`); without migration `062180` (`42883`) every job runs.
+  A worker with `SESSION_INTEL_CLAIMS_ENABLED` off has no gate, so use the control, not only that flag, to stop
+  queued scheduled jobs.
 - **Token reservation.** Each job reserves its worst case: `ceil(480 KiB / 4)` input tokens (the engine's
   `MAXIMUM_INPUT_BYTES`) plus 16,384 for the response (the full analysis call has no output cap of its own), that is
   139,264 tokens. It is a reservation, not actual spend; reconciling it against the job's recorded
@@ -274,6 +303,7 @@ clamps the same values again.
   user-requested analysis or the read API.
 - **Log.** One line per pass, `claims scheduler tick`, stage `claims-scheduler`, with `selected`, `enqueued`,
   `skipped_budget`, `skipped_control`, `skipped` (in flight, reused, not found), `failed` and `duration_ms`; no ids.
+  At `warn` when `failed` is above 0, otherwise `info`.
 
 ## Activation checklist (blocked)
 
