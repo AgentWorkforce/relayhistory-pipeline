@@ -21,6 +21,8 @@ import {
 } from "../versions.ts";
 import { claimsSchedulerSettings, claimsSchedulerTick, CLAIMS_SCHEDULER_RESERVE_TOKENS, scheduledJobGate } from "../claims-scheduler.ts";
 import { runAnalysisJob } from "../processor.ts";
+import { analysisTickDeps } from "../runtime-deps.ts";
+import { analysisTick } from "../worker.ts";
 import { PGlite as MigrationPGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
@@ -383,6 +385,44 @@ describe("062180: the worker's scheduled-job gate", () => {
     expect(await gate({ id: "00000000-0000-4000-8000-000000000000" })).toEqual({ run: true });
     // The gate reads as service_role only.
     expect(await code(asRole("bulls96_read_api", () => pg.query(`SELECT ${JOB.replace(/\(.*$/, "")}($1::uuid)`, [id])))).toBe("42501");
+  });
+
+  test("wired whenever analysis runs: with every claims flag off, the tick fails a queued scheduled job as claims_control_off, no provider call", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    await controls([["workspace", "org-a", "ws-a", false]]);
+    const db = { query: (t: string, p?: unknown[]) => asRole("service_role", () => pg.query(t, p as never)) } as never;
+    const deps = analysisTickDeps({
+      db, transact: async () => { throw new Error("no transaction"); }, store: createFsStore({ root: mkdtempSync(join(tmpdir(), "claims-off-")) }),
+      bucket: "bucket", region: "us-east-1", keyPrefix: "", modelKey: "k", credentials: () => ({ accessKeyId: "a", secretAccessKey: "s" }),
+      env: { SESSION_ANALYSIS_ENABLED: "true" },
+    });
+    expect(deps.claims).toBeUndefined();
+    expect(deps.decisionRecords).toBeUndefined();
+    expect(deps.scheduledJobGate).toBe(scheduledJobGate);
+    let touched = 0;
+    const untouchable = new Proxy({}, { get: () => { touched += 1; throw new Error("must not be called"); } }) as never;
+    const counts = await analysisTick({ config: { ...deps.config, batch: 1 }, db, store: deps.store, canonical: deps.canonical, transport: untouchable, scheduledJobGate: deps.scheduledJobGate })();
+    expect(counts).toMatchObject({ cancelled: 1, scheduled_control_off: 1 });
+    expect(touched).toBe(0);
+    expect((await pg.query("SELECT status, last_error FROM sessions.session_analysis_jobs_v2")).rows).toEqual([{ status: "failed", last_error: "claims_control_off" }]);
+  });
+
+  test("a failing gate read never stops a user-requested job; a scheduled job is held back (retryable)", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    await pointer(pg, { key: key("s-2") });
+    expect((await request("s-2")).outcome).toBe("accepted");
+    const idOf = async (s: string) => (await pg.query<{ id: string }>("SELECT id::text id FROM sessions.session_analysis_jobs_v2 WHERE session_id = $1", [s])).rows[0]!.id;
+    // The gate function fails (here: a statement timeout); the request-row read is real.
+    const db = { query: (t: string, p?: unknown[]) => t.includes("session_analysis_schedule_job_v1")
+      ? Promise.reject(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }))
+      : asRole("service_role", () => pg.query(t, p as never)) } as never;
+    const counts: Record<string, number> = {};
+    const gate = scheduledJobGate(db, counts);
+    expect(await gate({ id: await idOf("s-2") })).toEqual({ run: true });
+    expect(await gate({ id: await idOf("s-1") })).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
+    expect(counts).toEqual({ scheduled_gate_failed: 2 });
   });
 });
 

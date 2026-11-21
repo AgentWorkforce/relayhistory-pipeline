@@ -957,7 +957,7 @@ test("real tree: after the full tree including 062140, the staged output facts w
   }
 });
 
-test("real tree: after the full tree including 062180, the claims scheduler's admission and candidates are service_role and runtime functions, the helpers owner-only, and an extra grant is ACL drift", async () => {
+test("real tree: after the full tree including 062180, the claims scheduler's admission, candidates and scheduled-job gate are service_role and runtime functions, the helpers owner-only, and an extra grant is ACL drift", async () => {
   const s = await prefixDatabase();
   await runTarget(s.db, s);
   const CSC = "upstream:20261105062180_claims_scheduler.sql";
@@ -970,13 +970,14 @@ test("real tree: after the full tree including 062180, the claims scheduler's ad
   expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
   const schedule = "sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)";
   const candidates = "sessions.session_analysis_schedule_candidates_v1(integer,integer,integer)";
+  const job = "sessions.session_analysis_schedule_job_v1(uuid)";
   const live = "sessions.session_analysis_admit_live_v1(text,text,text)";
-  expect(RUNTIME_APPLICATION_FUNCTIONS).toEqual(expect.arrayContaining([schedule, candidates]));
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toEqual(expect.arrayContaining([schedule, candidates, job]));
   expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(live);
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   await s.db.exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN CREATE ROLE bulls96_read_api; END IF; END $$`);
-  for (const [fn, role] of [[schedule, "bulls96_read_api"], [candidates, "bulls96_read_api"], [live, "service_role"]] as const) {
+  for (const [fn, role] of [[schedule, "bulls96_read_api"], [candidates, "bulls96_read_api"], [job, "bulls96_read_api"], [live, "service_role"]] as const) {
     await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO ${role}`);
     expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
     await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${fn} FROM ${role}`);

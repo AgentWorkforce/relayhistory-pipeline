@@ -529,8 +529,8 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.session_intel_workspace_alerts_v1(text,text,integer)') IS NOT NULL AND to_regprocedure('sessions.session_intel_workspace_claims_v1(text,text,text[],integer)') IS NOT NULL AS applied",
   },
   "upstream:20261105062180_claims_scheduler.sql": {
-    evidence: "table sessions.session_analysis_schedule_ledger_v1 and function sessions.session_analysis_schedule_v1",
-    sql: "SELECT to_regclass('sessions.session_analysis_schedule_ledger_v1') IS NOT NULL AND to_regprocedure('sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)') IS NOT NULL AS applied",
+    evidence: "table sessions.session_analysis_schedule_ledger_v1 and functions sessions.session_analysis_schedule_v1 and sessions.session_analysis_schedule_job_v1",
+    sql: "SELECT to_regclass('sessions.session_analysis_schedule_ledger_v1') IS NOT NULL AND to_regprocedure('sessions.session_analysis_schedule_v1(text,text,text,integer,integer,integer,bigint,bigint)') IS NOT NULL AND to_regprocedure('sessions.session_analysis_schedule_job_v1(uuid)') IS NOT NULL AS applied",
   },
   "upstream:20261105062190_coordination_advisories_pending_priority.sql": {
     evidence: "function sessions.coordination_advisories_pending_for_v2",

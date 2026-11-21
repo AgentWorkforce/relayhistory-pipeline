@@ -94,6 +94,9 @@ export const CANDIDATES_SQL =
 export const SCHEDULE_SQL =
   "SELECT sessions.session_analysis_schedule_v1($1, $2, $3, $4, $5, $6, $7, $8) AS r";
 export const SCHEDULED_JOB_SQL = "SELECT sessions.session_analysis_schedule_job_v1($1::uuid) AS gate";
+/** A user request always writes a request row naming its job (analysis_request_v1); a scheduled job never does. */
+export const USER_REQUESTED_JOB_SQL =
+  "SELECT EXISTS (SELECT 1 FROM sessions.session_analysis_requests_v2 WHERE analysis_job_id = $1::uuid) AS requested";
 
 /** runAnalysisJob's admit hook: run the claimed job, or fail it with a controlled code before any provider call. */
 export type AnalysisJobAdmission = { run: true } | { run: false; code: string; retryable: boolean };
@@ -101,24 +104,37 @@ export type AnalysisJobAdmission = { run: true } | { run: false; code: string; r
 /**
  * The worker's gate for scheduled jobs. A job the scheduler did not enqueue always runs. A scheduled job runs only
  * while its workspace 'claims' control is on; off is `claims_control_off`, not retried. Without migration 062180
- * (42883) no job is scheduled, so every job runs. Any other error fails the job as retryable
- * (`claims_scheduler_gate_failed`): the control is default-deny, and the job is tried again after its backoff.
+ * (42883) no job is scheduled, so every job runs.
+ *
+ * When the gate's read fails otherwise (or answers something unknown), the job's request row decides: a
+ * user-requested job (analysis_request_v1 always writes one) runs; a job without one (a scheduled job, or a
+ * backfill) is held back as retryable `claims_scheduler_gate_failed` (the control is default-deny) and is tried
+ * again after its backoff. If that read fails too, nothing can tell the job apart, and it runs: a user's analysis is
+ * never stopped by the gate. Counts `scheduled_gate_failed` on every gate failure.
  */
 export function scheduledJobGate(db: SqlExecutor, counts?: Record<string, number>): (job: { id: string }) => Promise<AnalysisJobAdmission> {
   const count = (k: string) => { if (counts) counts[k] = (counts[k] ?? 0) + 1; };
+  const onFailure = async (job: { id: string }): Promise<AnalysisJobAdmission> => {
+    count("scheduled_gate_failed");
+    let requested: unknown;
+    try {
+      requested = (await db.query<{ requested: unknown }>(USER_REQUESTED_JOB_SQL, [job.id])).rows[0]?.requested;
+    } catch {
+      return { run: true };
+    }
+    return requested === false ? { run: false, code: "claims_scheduler_gate_failed", retryable: true } : { run: true };
+  };
   return async (job) => {
     let gate: unknown;
     try {
       gate = (await db.query<{ gate: unknown }>(SCHEDULED_JOB_SQL, [job.id])).rows[0]?.gate;
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code === "42883") return { run: true };
-      count("scheduled_gate_failed");
-      return { run: false, code: "claims_scheduler_gate_failed", retryable: true };
+      return onFailure(job);
     }
     if (gate === "unscheduled" || gate === "on") return { run: true };
     if (gate === "off") { count("scheduled_control_off"); return { run: false, code: "claims_control_off", retryable: false }; }
-    count("scheduled_gate_failed");
-    return { run: false, code: "claims_scheduler_gate_failed", retryable: true };
+    return onFailure(job);
   };
 }
 

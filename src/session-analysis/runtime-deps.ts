@@ -76,10 +76,14 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
       ? {
           decisionRecords: postgresDecisionRecordsSink(inputs.db),
           ...(sessionIntelClaimsEnabled(env)
-            ? { claims: postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db)), scheduledJobGate }
+            ? { claims: postgresClaimsPort(inputs.db, sessionIntelControls(inputs.db)) }
             : {}),
         }
       : {}),
+    // The claims kill switch's worker side, whenever analysis runs, whatever the claims flags say: a job the
+    // claims scheduler enqueued is failed as claims_control_off while its workspace control is off. Without
+    // migration 062180 (42883) every job runs; user-requested jobs always run (claims-scheduler.ts).
+    scheduledJobGate,
     transact: inputs.transact,
     // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
     // pages, every version of a ticketed result key that no published job owns.
