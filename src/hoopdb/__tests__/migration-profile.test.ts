@@ -2718,7 +2718,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     };
     // 20261105062210 is newest: 062200's down refuses (55000) while it is applied; its checksum-pinned down (installed
     // state: mode 'main', gate off) restores 043800's exact ACK (proconfig back to search_path only), drops the flip
-    // function, the mode table and its ledger row, and refuses on a rerun.
+    // and gate functions, the mode table and its ledger row, and refuses on a rerun.
     const T2 = "upstream:20261105062210_lazy_ack_t2.sql";
     expect(await names()).toContain(T2);
     expect((await failure(rollback("20261105062200_session_directory_list_readiness.down.sql")))?.code).toBe("55000");
