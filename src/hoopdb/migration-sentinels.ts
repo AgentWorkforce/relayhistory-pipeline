@@ -536,6 +536,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.coordination_advisories_pending_for_v2",
     sql: "SELECT to_regprocedure('sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062200_session_directory_list_readiness.sql": {
+    evidence: "functions sessions.list_session_directory_readiness_for and sessions.query_session_directory_readiness_for",
+    sql: "SELECT to_regprocedure('sessions.list_session_directory_readiness_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,boolean)') IS NOT NULL AND to_regprocedure('sessions.query_session_directory_readiness_for(text,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text,text,integer,boolean)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

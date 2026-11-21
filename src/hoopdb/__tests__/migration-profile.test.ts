@@ -2654,6 +2654,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SIW = "upstream:20261105062170_session_intel_workspace.sql";
     const CSC = "upstream:20261105062180_claims_scheduler.sql";
     const CAP = "upstream:20261105062190_coordination_advisories_pending_priority.sql";
+    const LRD = "upstream:20261105062200_session_directory_list_readiness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2664,7 +2665,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(operatorTurnsRollbackSql()); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR, SOF, RFC, SIC, SIW, CSC]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA, OCF, TG, LA, RG, RK, TSOG, AR, MD, MDE, MUE, SRS, OSC, OSR, SOF, RFC, SIC, SIW, CSC, CAP, LRD]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2715,6 +2716,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105062200 is newest: 062190's down refuses (55000) while it is applied; its checksum-pinned down drops only
+    // the two readiness list functions (034000's and 046010's list functions stay) and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(LRD);
+    expect((await failure(rollback("20261105062190_coordination_advisories_pending_priority.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(CAP);
+    await rollback("20261105062200_session_directory_list_readiness.down.sql");
+    expect(await names()).not.toContain(LRD);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.list_session_directory_readiness_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,boolean)'), to_regprocedure('sessions.query_session_directory_readiness_for(text,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text,text,integer,boolean)'))")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)'), to_regprocedure('sessions.query_session_directory_for(text,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text,text,integer)'))")).rows[0]!.n).toBe(2);
+    expect((await failure(rollback("20261105062200_session_directory_list_readiness.down.sql")))?.code).toBe("55000");
     // 20261105062190 is newest: 062180's down refuses (55000) while it is applied; its checksum-pinned down drops only
     // the priority-first reader (v1 stays) and its ledger row, and refuses on a rerun.
     expect(await names()).toContain(CAP);
