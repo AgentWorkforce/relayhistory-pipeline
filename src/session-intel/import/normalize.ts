@@ -215,7 +215,8 @@ export class Hasher {
   session(harness: string, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
   project(key: string) { return `p_${this.h("project", key, 24)}`; }
   repo(key: string) { return `r_${this.h("repo", key, 24)}`; }
-  location(value: string) { return `l_${this.h("action-location", value, 24)}`; }
+  location(domain: "record" | "directory" | "target" | "repository-target" | "basename-hint", value: string) { return `l_${this.h(`action-location/${domain}`, value, 24)}`; }
+  repositoryMap(digest: string) { return `m_${this.h("action-repository-map", digest, 64)}`; }
   branch(b: string | null) { return b ? `b_${this.h("branch", canonicalBranch(b), 16)}` : null; }
   org(id: string) { return `o_${this.h("org", id, 24)}`; }
   workspace(id: string) { return `w_${this.h("workspace", id, 24)}`; }

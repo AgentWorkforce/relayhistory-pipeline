@@ -193,6 +193,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
   const salt = fromStdin ? await readSaltStdin(io.stdin ?? process.stdin) : await readSaltFile(values["salt-file"]!, repoRoot);
 
   const captureProvenance = values["action-provenance"] === true || values["repository-map"] !== undefined;
+  if (values["repository-map"] !== undefined && !values["repository-map"].trim()) throw new ImportError("--repository-map must name a private file");
   let repositoryMap;
   if (values["repository-map"]) {
     if (isInside(repoRoot, realpathSync(resolve(values["repository-map"])))) throw new ImportError("repository map belongs outside the repository");
@@ -213,7 +214,7 @@ export async function main(argv: string[], io: CliIo = defaultIo): Promise<numbe
 
   const projects: Record<string, string> = {};
   for (const r of rows) if (r.mapped.sourceProject) projects[hasher.project(r.mapped.sourceProject)] = r.mapped.sourceProject;
-  const actions = captureProvenance ? actionArtifacts(rows.flatMap((r) => r.provenance ? [r.provenance] : []), deleteBy, repositoryMap?.sha256 ?? null, {
+  const actions = captureProvenance ? actionArtifacts(rows.flatMap((r) => r.provenance ? [r.provenance] : []), deleteBy, repositoryMap ? { sha256: repositoryMap.sha256, fingerprint: hasher.repositoryMap(repositoryMap.sha256) } : null, {
     sessionsSha256: sha256Hex(`${rows.map((r) => r.line).join("\n")}\n`),
     implementationSha256: sha256Hex(["./cli.ts", "./provenance.ts", "./normalize.ts", "./adapters.ts", "./code-mode.ts", "./git.ts", "./io.ts", "./writer.ts", "./action-provenance.md", "../replay/snapshot.ts", "../replay/util.ts", "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts"]
       .map((name) => sha256Hex(readFileSync(new URL(name, import.meta.url)))).join("\n")),

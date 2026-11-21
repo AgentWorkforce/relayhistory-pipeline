@@ -30,17 +30,37 @@ opens any directory named by a trace. A future `observedAt`, duplicate normalize
 root, malformed identity, credential-bearing URL or over-budget input is refused
 without echoing values. The most specific lexical root wins. Case and symlinks
 are not guessed: path identity preserves case and no filesystem canonicalization
-of trace paths occurs. Absolute POSIX and drive-letter paths are supported; UNC,
+of trace paths occurs. Absolute POSIX and drive-letter paths are supported; a
+drive path that normalizes above its drive root is refused, rather than becoming
+a relative path or losing its drive identity. UNC,
 home expansion and paths without a resolvable base remain unknown.
 
 The new `action-provenance.json` file is mode 0600 and SHA-pinned in the existing
 snapshot manifest. It additionally pins the exact `sessions.jsonl` bytes, the
-implementation sources, definition/bounds, repository-map bytes and retention
+implementation sources, definition/bounds and retention
 deadline. The private mapping beside the snapshot holds raw directory/target
 paths, canonical repository claims and original call references. Those values
 never appear in the hashed sidecar. Delete both exports and their reverse map
 with the study by its earliest deletion deadline. Never commit real exports or
 maps to this public repository.
+
+The sidecar's `repositoryMapFingerprint` is a domain-separated HMAC of the map's
+raw SHA-256, keyed with the private import salt. The unsalted map digest is kept
+only in the private reverse map, preventing holders of a sidecar from confirming
+a guessed map without the salt. Used claims' exact `observedAt` timestamps are
+intentionally present as claim availability times: they are needed to avoid
+future-evidence leakage and may disclose when an operator collected a map. The
+hashed sidecar is not anonymous; review it before sharing. Record, directory,
+target, repository-relative target and basename-hint identities use separate
+HMAC domains, even if their untrusted input strings are identical.
+
+`implementationSha256` pins the listed source files, not a complete executable
+or dependency closure. It omits transitive files outside that list, installed
+TypeScript/parser and other dependency versions, bundles, loaders, runtime and
+platform configuration. Reproducible execution additionally needs the source
+commit, lockfile, installed toolchain and those inputs. The default-off byte
+golden covers the generic format; native adapters also have behavior tests, not
+complete byte goldens for every native input shape.
 
 Each record names the legacy harness/session/event id and fact kind, with:
 

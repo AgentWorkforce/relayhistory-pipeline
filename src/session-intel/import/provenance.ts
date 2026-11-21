@@ -41,8 +41,22 @@ export function directoryPath(value: unknown, base: string | null = null): strin
   if (!windows && value.includes("\\")) return null;
   const path = windows ? value.replace(/\\/gu, "/") : value;
   if (path.startsWith("//") || path.startsWith("~")) return null;
-  if (path.startsWith("/") || /^[A-Za-z]:\//u.test(path)) return posix.normalize(path).replace(/\/$/u, "") || "/";
-  return base ? directoryPath(posix.join(base, path)) : null;
+  if (/^[A-Za-z]:/u.test(path) && !/^[A-Za-z]:\//u.test(path)) return null;
+  if (path.startsWith("/") || /^[A-Za-z]:\//u.test(path)) {
+    if (windows) {
+      if (!/^[A-Za-z]:\//u.test(path)) return null;
+      let depth = 0;
+      for (const part of path.slice(3).split("/")) {
+        if (part === "..") { if (depth === 0) return null; depth--; }
+        else if (part && part !== ".") depth++;
+      }
+    }
+    const normalized = posix.normalize(path);
+    if (windows && !/^[A-Za-z]:\//u.test(normalized)) return null;
+    if (!windows && !normalized.startsWith("/")) return null;
+    return /^[A-Za-z]:\/$/u.test(normalized) ? normalized : normalized.replace(/\/$/u, "") || "/";
+  }
+  return base ? directoryPath(`${base}/${path}`) : null;
 }
 const contains = (root: string, path: string) => path === root || path.startsWith(`${root}/`);
 
@@ -100,7 +114,7 @@ export function parseRepositoryMap(text: string, now: Date): RepositoryMap {
       if (!isRecord(r)) throw new Error();
       onlyKeys(r, ["directory", "repository", "observedAt"], "root");
       const directory = directoryPath(r.directory), repository = repositoryIdentity(r.repository), observedAt = isoTime(r.observedAt, "observedAt");
-      if (!directory || directory === "/" || /^[A-Za-z]:$/u.test(directory) || !repository || observedAt > now.toISOString() || seen.has(directory)) throw new Error();
+      if (!directory || directory === "/" || /^[A-Za-z]:\/?$/u.test(directory) || !repository || observedAt > now.toISOString() || seen.has(directory)) throw new Error();
       seen.add(directory); return { directory, repository, observedAt };
     }).sort((a, b) => b.directory.length - a.directory.length || textCompare(a.directory, b.directory));
     return { roots, sha256: sha256Hex(text) };
@@ -190,7 +204,7 @@ export function actionContext(directory: unknown, source: DirectorySource, at: L
 
 /** No status here means independently verified: these are explicit operator/trace claims only. */
 export function actionRecord(context: ActionContext | null, identity: Pick<ActionRecord, "harness" | "sessionId" | "eventId" | "kind" | "factAt">,
-  hasher: { location(value: string): string; repo(value: string): string }, roots: readonly RepositoryRoot[] | RepositoryResolver = []): { record: ActionRecord; location: PrivateActionLocation | null } {
+  hasher: { location(domain: "record" | "directory" | "target" | "repository-target" | "basename-hint", value: string): string; repo(value: string): string }, roots: readonly RepositoryRoot[] | RepositoryResolver = []): { record: ActionRecord; location: PrivateActionLocation | null } {
   const c = context ?? actionContext(null, "unknown", { file: 0, line: 0 }, identity.factAt);
   const path = c.target ?? c.directory;
   const resolveRoot = typeof roots === "function" ? roots : repositoryResolver(roots);
@@ -203,22 +217,22 @@ export function actionRecord(context: ActionContext | null, identity: Pick<Actio
   ];
   const conflict = mapped && declared && mapped.repository !== declared.repository;
   const repository = conflict ? null : mapped?.repository ?? declared?.repository ?? null;
-  const id = context ? hasher.location(JSON.stringify([identity.harness, identity.sessionId, identity.eventId, c.directory, c.startingDirectory, c.target, repository, claims, c.at, c.evidenceRef])) : null;
+  const id = context ? hasher.location("record", JSON.stringify([identity.harness, identity.sessionId, identity.eventId, c.directory, c.startingDirectory, c.target, repository, claims, c.at, c.evidenceRef])) : null;
   const hint = c.directory ? posix.basename(c.directory) : null;
   return {
-    record: { ...identity, sourceAt: c.observedAt, location: id, effectiveLocation: c.directory ? hasher.location(c.directory) : null, startingLocation: c.startingDirectory ? hasher.location(c.startingDirectory) : null, target: c.target ? hasher.location(c.target) : null, source: c.source, reason: c.reason,
+    record: { ...identity, sourceAt: c.observedAt, location: id, effectiveLocation: c.directory ? hasher.location("directory", c.directory) : null, startingLocation: c.startingDirectory ? hasher.location("directory", c.startingDirectory) : null, target: c.target ? hasher.location("target", c.target) : null, source: c.source, reason: c.reason,
       repository: repository ? hasher.repo(repository) : null,
-      repositoryTarget: repository && mapped && c.target && c.target !== mapped.directory ? hasher.location(JSON.stringify(["repository-target", mapped.repository, posix.relative(mapped.directory, c.target)])) : null,
+      repositoryTarget: repository && mapped && c.target && c.target !== mapped.directory ? hasher.location("repository-target", JSON.stringify([mapped.repository, posix.relative(mapped.directory, c.target)])) : null,
       repositoryBasis: conflict ? "conflicting_claims" : mapped ? "operator_declared" : declared ? "trace_declared" : "unattributed",
       repositoryClaims: claims.map((claim) => ({ repository: hasher.repo(claim.repository), basis: claim.basis, availableAt: claim.observedAt })),
       availableAt: [identity.factAt, c.observedAt, c.evidenceAt ?? c.observedAt, ...claims.map((claim) => claim.observedAt)].sort().at(-1)!,
-      repositoryHint: !repository && hint && hint !== "/" && !/^[A-Za-z]:$/u.test(hint) ? hasher.location(`basename-hint\u0000${hint}`) : null },
+      repositoryHint: !repository && hint && hint !== "/" && !/^[A-Za-z]:$/u.test(hint) ? hasher.location("basename-hint", hint) : null },
     location: id ? { directory: c.directory, startingDirectory: c.startingDirectory, target: c.target, repository, source: { ...c.at }, output: c.evidenceRef ? { ...c.evidenceRef } : null, claims } : null,
   };
 }
 
 /** Capture-only extension: existing /1 session records and replay consumers are deliberately untouched. */
-export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: string, repositoryMapSha256: string | null, pins: { sessionsSha256: string; implementationSha256: string }) {
+export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: string, repositoryMap: { sha256: string; fingerprint: string } | null, pins: { sessionsSha256: string; implementationSha256: string }) {
   const records: ActionRecord[] = [], locations: Record<string, PrivateActionLocation> = Object.create(null);
   let bytes = 0, privateBytes = 0;
   for (const data of exports) {
@@ -241,12 +255,14 @@ export function actionArtifacts(exports: Iterable<ActionExport>, deleteBy: strin
   const definition = { format: PROVENANCE_FORMAT, rules: "static-action-scope/1", bounds: PROVENANCE_BOUNDS, identity: "repository-origin-claim/1", status: "capture_only", legacySessionScopeUnchanged: true,
     consumedByReplay: false, trust: "operator-and-trace-claims-not-independent-verification" };
   if (![pins.sessionsSha256, pins.implementationSha256].every((pin) => /^[a-f0-9]{64}$/u.test(pin))) throw new ImportError("action provenance requires exact session and implementation digests");
+  if (repositoryMap && (!/^[a-f0-9]{64}$/u.test(repositoryMap.sha256) || !/^m_[a-f0-9]{64}$/u.test(repositoryMap.fingerprint)))
+    throw new ImportError("action provenance requires a private map digest and salted public fingerprint");
   const counts = { records: records.length, attributedRecords: records.filter((r) => r.repository !== null).length,
     operatorDeclared: records.filter((r) => r.repositoryBasis === "operator_declared").length, traceDeclared: records.filter((r) => r.repositoryBasis === "trace_declared").length,
     unattributed: records.filter((r) => r.repository === null).length, conflictingClaims: records.filter((r) => r.repositoryBasis === "conflicting_claims").length, availableAfterFact: records.filter((r) => r.availableAt > r.factAt).length };
-  const body = `${JSON.stringify({ ...definition, ...pins, counts, definitionSha256: sha256Hex(JSON.stringify(definition)), deleteBy, repositoryMapSha256, records })}\n`;
+  const body = `${JSON.stringify({ ...definition, ...pins, counts, definitionSha256: sha256Hex(JSON.stringify(definition)), deleteBy, repositoryMapFingerprint: repositoryMap?.fingerprint ?? null, records })}\n`;
   if (Buffer.byteLength(body) > PROVENANCE_BOUNDS.exportBytes) throw new ImportError("action provenance artifact exceeds its bound; use a smaller explicit input frame");
-  const privateMapping = { format: PROVENANCE_FORMAT, repositoryMapSha256, locations };
+  const privateMapping = { format: PROVENANCE_FORMAT, repositoryMapSha256: repositoryMap?.sha256 ?? null, locations };
   if (Buffer.byteLength(JSON.stringify(privateMapping)) > PROVENANCE_BOUNDS.exportBytes)
     throw new ImportError("private action provenance map exceeds its bound; use a smaller explicit input frame");
   return { body, privateMapping };
