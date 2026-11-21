@@ -36,7 +36,6 @@ const plan = JSON.parse(process.argv[2] ?? "{}") as { seconds?: number; c?: numb
 const SECONDS = plan.seconds ?? 30, C = plan.c ?? 8, GAP = plan.gapMs ?? 1000;
 const epoch = "3".repeat(64), identity = "c".repeat(64);
 const profile: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
-const ACK = "sessions.ingest_lazy_ack_batch(jsonb)";
 const pct = (xs: number[], p: number) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return Math.round(s[Math.min(s.length - 1, Math.floor(p * s.length))]! * 10) / 10; };
 
 const admin = new pg.Client({ connectionString: url }); await admin.connect();
@@ -78,7 +77,7 @@ try {
     return deliverBatch({ ledger, acceptanceMode: "buffered", target: { store: scratch.store, keyRoot: "96bulls" }, custody: await custody(t, raw) } as never, t, raw);
   };
   for (let w = 0; w < C; w++) await deliver(w, 1); // warm: first-seen adoption per user/origin
-  await pool.query(`ALTER FUNCTION ${ACK} SET bulls96.lazy_ack_t2='fenced'`);
+  await pool.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')"); // the supported gate change (mode is 'main')
   for (const cell of plan.cells) {
     const mode0 = (await pool.query("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows[0].mode as FlipMode;
     const end = Date.now() + SECONDS * 1000;

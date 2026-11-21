@@ -221,7 +221,7 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
  },15000);
  test("062210: the real publisher and an upload complete while try-lock T2 flips run back to back (no queued exclusive, no stall)",async()=>{
   const d=await fixture();
-  await d.pool.query("ALTER FUNCTION sessions.ingest_lazy_ack_batch(jsonb) SET bulls96.lazy_ack_t2='fenced'");
+  await d.pool.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')");
   let stop=false;const flips:FlipResult[]=[];let queued=0;
   const flipper=(async()=>{let to:"main"|"t2"="t2";
    while(!stop){const r=await lazyAckT2FlipOutcome((q,p)=>d.pool.query(q,p as never[])as never,to,{budgetMs:50});flips.push(r);if(r.result==="switched")to=to==="t2"?"main":"t2";

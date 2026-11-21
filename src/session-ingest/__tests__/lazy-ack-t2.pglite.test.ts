@@ -310,6 +310,23 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
     expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp"]);
     expect(p.prosrc).toBe(ackBody(readFileSync(MAIN_MIG, "utf8")));
   });
+  test("caller pin: the ACK reads its gate before its own 50000 S, so its only caller is the seat-ACK trigger on ingest_batches", async () => {
+    // The ACK selects its body from its function-local gate at entry and takes (961996,50000) shared in its own
+    // ingest_lock_fences; that is safe because every existing path into it (commit and claim) already holds 50000 S. A
+    // new caller (a function calling it, or another trigger using its trigger function) turns this red: check the rule.
+    const f = await fixture();
+    const callers = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+      WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql') AND p.oid<>'sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure
+       AND regexp_replace(p.prosrc,'--[^\n]*','','g') ~ 'ingest_lazy_ack_batch[(](?!jsonb[)])' ORDER BY 1`)).rows.map((r) => r.f);
+    // (A signature reference, 'ingest_lazy_ack_batch(jsonb)' as in set_mode/set_gate, is not a call.)
+    expect(callers).toEqual(["sessions.ingest_receipt_seat_ack()"]);
+    const sqlCallers = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p
+      WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='sql') AND p.prosrc ~ 'ingest_lazy_ack_batch'`)).rows;
+    expect(sqlCallers).toEqual([]);
+    const triggers = (await f.db.query<{ t: string }>(`SELECT tgrelid::regclass::text||'.'||tgname t FROM pg_trigger
+      WHERE tgfoid='sessions.ingest_receipt_seat_ack()'::regprocedure AND NOT tgisinternal ORDER BY 1`)).rows.map((r) => r.t);
+    expect(triggers).toEqual(["sessions.ingest_batches.ingest_receipt_seat_ack"]);
+  });
   test("lazy_ack_t2_set_gate: the supported gate change; requires mode main, returns the previous value, owner-only, read committed", async () => {
     const f = await fixture();
     const gate = async () => (await f.db.query<any>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].c as string[];
