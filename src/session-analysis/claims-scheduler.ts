@@ -104,13 +104,17 @@ export type AnalysisJobAdmission = { run: true } | { run: false; code: string; r
 /**
  * The worker's gate for scheduled jobs. A job the scheduler did not enqueue always runs. A scheduled job runs only
  * while its workspace 'claims' control is on; off is `claims_control_off`, not retried. Without migration 062180
- * (42883) no job is scheduled, so every job runs.
+ * (42883) no job is scheduled, so every job runs; the 42883 answer is remembered for the rest of the gate's life
+ * (one analysis tick: analysisTick builds one gate per tick), so the tick makes the failing call once, not once per
+ * job.
  *
  * When the gate's read fails otherwise (or answers something unknown), the job's request row decides: a
- * user-requested job (analysis_request_v1 always writes one) runs; a job without one (a scheduled job, or a
- * backfill) is held back as retryable `claims_scheduler_gate_failed` (the control is default-deny) and is tried
- * again after its backoff. If that read fails too, nothing can tell the job apart, and it runs: a user's analysis is
- * never stopped by the gate. Counts `scheduled_gate_failed` on every gate failure.
+ * user-requested job (analysis_request_v1 always writes one) runs; a job without one is a scheduled job (the worker
+ * claims only origin 'native' jobs, and a native job is either requested or scheduled), and it is held back as
+ * retryable `claims_scheduler_gate_failed` and tried again after its backoff. The worker's failure accounting
+ * applies: after the job's third attempt it is failed for good. If the request-row read fails too, nothing can
+ * tell the job apart, and it runs: a user's analysis is never stopped by the gate. So the control is default-deny
+ * except under a double read failure. Counts `scheduled_gate_failed` on every gate failure.
  */
 export function scheduledJobGate(db: SqlExecutor, counts?: Record<string, number>): (job: { id: string }) => Promise<AnalysisJobAdmission> {
   const count = (k: string) => { if (counts) counts[k] = (counts[k] ?? 0) + 1; };
@@ -124,12 +128,14 @@ export function scheduledJobGate(db: SqlExecutor, counts?: Record<string, number
     }
     return requested === false ? { run: false, code: "claims_scheduler_gate_failed", retryable: true } : { run: true };
   };
+  let notInstalled = false;
   return async (job) => {
+    if (notInstalled) return { run: true };
     let gate: unknown;
     try {
       gate = (await db.query<{ gate: unknown }>(SCHEDULED_JOB_SQL, [job.id])).rows[0]?.gate;
     } catch (error) {
-      if ((error as { code?: unknown } | null)?.code === "42883") return { run: true };
+      if ((error as { code?: unknown } | null)?.code === "42883") { notInstalled = true; return { run: true }; }
       return onFailure(job);
     }
     if (gate === "unscheduled" || gate === "on") return { run: true };

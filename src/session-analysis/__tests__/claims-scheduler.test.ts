@@ -153,13 +153,44 @@ describe("scheduledJobGate: the worker's check before it runs a claimed job", ()
     // User-requested (a request row names the job): runs.
     expect(await run(down, true)).toEqual({ run: true });
     expect(await run("surprise", true)).toEqual({ run: true });
-    // No request row (a scheduled job, or a backfill): held back, retryable.
+    // No request row (a scheduled job): held back, retryable.
     expect(await run(down, false)).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
     expect(await run("surprise", false)).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
     // Neither read can tell: it runs (a user's analysis is never stopped by the gate).
     expect(await run(down, down)).toEqual({ run: true });
     expect(await run(down, null)).toEqual({ run: true });
     expect(counts).toEqual({ scheduled_gate_failed: 6 });
+  });
+
+  test("a gate answer with no row (gate undefined) is a failure: the request row decides", async () => {
+    const counts: Record<string, number> = {};
+    const noRow = (requested: unknown) => {
+      const calls: Call[] = [];
+      return { calls, db: { query: async (text: string, params: unknown[]) => {
+        calls.push([text, params]);
+        return { rows: text === SCHEDULED_JOB_SQL ? [] : [{ requested }] };
+      } } as never };
+    };
+    const user = noRow(true);
+    expect(await scheduledJobGate(user.db, counts)({ id: ID })).toEqual({ run: true });
+    expect(user.calls).toEqual([[SCHEDULED_JOB_SQL, [ID]], [USER_REQUESTED_JOB_SQL, [ID]]]);
+    expect(await scheduledJobGate(noRow(false).db, counts)({ id: ID })).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
+    expect(counts).toEqual({ scheduled_gate_failed: 2 });
+  });
+
+  test("without 062180 (42883) the gate makes the failing call once per gate (one tick), then runs every job without a query", async () => {
+    const g = gateDb(Object.assign(new Error("no fn"), { code: "42883" }));
+    const gate = scheduledJobGate(g.db);
+    for (let i = 0; i < 3; i += 1) expect(await gate({ id: ID })).toEqual({ run: true });
+    expect(g.calls).toEqual([[SCHEDULED_JOB_SQL, [ID]]]);
+    // A new gate (the next tick) asks again, so applying 062180 takes effect on the next tick.
+    await scheduledJobGate(g.db)({ id: ID });
+    expect(g.calls.length).toBe(2);
+    // Any other error is not remembered: each job asks.
+    const down = gateDb(Object.assign(new Error("down"), { code: "57014" }), true);
+    const g2 = scheduledJobGate(down.db);
+    await g2({ id: ID }); await g2({ id: ID });
+    expect(down.calls.filter((c) => c[0] === SCHEDULED_JOB_SQL).length).toBe(2);
   });
 });
 

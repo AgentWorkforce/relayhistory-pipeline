@@ -293,10 +293,13 @@ clamps the same values again.
   scheduler flag say), it asks `session_analysis_schedule_job_v1` whether the scheduler enqueued it; a scheduled
   job whose workspace control is off is failed as `claims_control_off` (not retried) with no evidence read and no
   provider call, counted `cancelled` and `scheduled_control_off`. User-requested jobs are never stopped by it.
-  Without migration `062180` (`42883`) every job runs. If the gate's read fails otherwise, the job's request row
-  decides (counted `scheduled_gate_failed`): a user-requested job (it always has one) runs; a job without one (a
-  scheduled job, or a backfill) is failed retryable (`claims_scheduler_gate_failed`) and tried again after its
-  backoff; if that read fails too, the job runs. Known limit: the gate finds a scheduled job through its ledger
+  Without migration `062180` (`42883`) every job runs; the gate remembers that answer for the rest of the tick, so
+  such a database sees one failing call (one Postgres ERROR line) per tick, not one per job. If the gate's read
+  fails otherwise, the job's request row decides (counted `scheduled_gate_failed`): a user-requested job (it always
+  has one) runs; a job without one is a scheduled job (the worker claims only `native` jobs) and is failed retryable
+  (`claims_scheduler_gate_failed`) and tried again after its backoff (15 s, then 30 s). The third such hold fails it
+  for good (3 attempts), and the candidates query then skips that session until it has new activity. If the
+  request-row read fails too, the job runs. Known limit: the gate finds a scheduled job through its ledger
   row, so a scheduled job still queued after its ledger row was pruned (more than 8 days, and only once a later
   admission ran) reads as unscheduled and runs even with the control off.
 - **Token reservation.** Each job reserves its worst case: `ceil(480 KiB / 4)` input tokens (the engine's

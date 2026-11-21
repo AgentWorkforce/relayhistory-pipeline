@@ -19,7 +19,7 @@ import {
   SESSION_ANALYSIS_MODEL_VERSION, SESSION_ANALYSIS_RESULT_SCHEMA_VERSION, SESSION_ANALYSIS_SUMMARY_MODEL_VERSION,
   SESSION_ANALYSIS_SUMMARY_VERSION, SESSION_ANALYSIS_VERSION,
 } from "../versions.ts";
-import { claimsSchedulerSettings, claimsSchedulerTick, CLAIMS_SCHEDULER_RESERVE_TOKENS, scheduledJobGate } from "../claims-scheduler.ts";
+import { claimsSchedulerSettings, claimsSchedulerTick, CLAIMS_SCHEDULER_RESERVE_TOKENS, scheduledJobGate, USER_REQUESTED_JOB_SQL } from "../claims-scheduler.ts";
 import { runAnalysisJob } from "../processor.ts";
 import { analysisTickDeps } from "../runtime-deps.ts";
 import { analysisTick } from "../worker.ts";
@@ -29,6 +29,7 @@ import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/p
 import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../../hoopdb/migrate.ts";
 import { sessionIntelControls } from "../../shared/session-intel-controls.ts";
 import { MIGRATION_SENTINELS } from "../../hoopdb/migration-sentinels.ts";
+import { RUNTIME_APPLICATION_POLICY, runtimeApplicationAclCatalog } from "../../hoopdb/migrate-guards.ts";
 
 setDefaultTimeout(120_000);
 type Json = Record<string, any>;
@@ -423,6 +424,77 @@ describe("062180: the worker's scheduled-job gate", () => {
     expect(await gate({ id: await idOf("s-2") })).toEqual({ run: true });
     expect(await gate({ id: await idOf("s-1") })).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
     expect(counts).toEqual({ scheduled_gate_failed: 2 });
+  });
+});
+
+describe("062180: gate holds and the runtime role", () => {
+  test("tick level: a scheduled job held by gate errors is requeued with backoff twice, failed for good on its third hold, then its session waits for new activity", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    const db = { query: (t: string, p?: unknown[]) => t.includes("session_analysis_schedule_job_v1")
+      ? Promise.reject(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }))
+      : asRole("service_role", () => pg.query(t, p as never)) } as never;
+    const deps = analysisTickDeps({
+      db, transact: async () => { throw new Error("no transaction"); }, store: createFsStore({ root: mkdtempSync(join(tmpdir(), "claims-hold-")) }),
+      bucket: "bucket", region: "us-east-1", keyPrefix: "", modelKey: "k", credentials: () => ({ accessKeyId: "a", secretAccessKey: "s" }),
+      env: { SESSION_ANALYSIS_ENABLED: "true" },
+    });
+    let touched = 0;
+    const untouchable = new Proxy({}, { get: () => { touched += 1; throw new Error("must not be called"); } }) as never;
+    const tick = () => analysisTick({ config: { ...deps.config, batch: 1 }, db, store: deps.store, canonical: deps.canonical, transport: untouchable, scheduledJobGate: deps.scheduledJobGate })();
+    const row = async () => (await pg.query<{ status: string; attempts: number; last_error: string; due: boolean }>(
+      "SELECT status, attempts, last_error, available_at > now() AS due FROM sessions.session_analysis_jobs_v2")).rows;
+    for (const attempt of [1, 2]) {
+      expect(await tick()).toMatchObject({ cancelled: 1, scheduled_gate_failed: 1 });
+      // Requeued for its backoff (15 s, then 30 s): not claimable until then.
+      expect(await row()).toEqual([{ status: "queued", attempts: attempt, last_error: "claims_scheduler_gate_failed", due: true }]);
+      expect(await tick()).toMatchObject({ idle: 1 });
+      await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET available_at = now() - interval '1 second'");
+    }
+    expect(await tick()).toMatchObject({ cancelled: 1, scheduled_gate_failed: 1 });
+    expect((await row()).map(({ due: _, ...r }) => r)).toEqual([{ status: "failed", attempts: 3, last_error: "claims_scheduler_gate_failed" }]);
+    expect(touched).toBe(0);
+    // Failed after the last activity: the candidates skip the session until it is active again.
+    await pg.query("UPDATE sessions.session_analysis_schedule_ledger_v1 SET created_at = now() - interval '20 minutes'");
+    await pg.query("UPDATE sessions.session_index SET last_activity_at = now() - interval '30 minutes'");
+    expect(await candidates()).toEqual([]);
+    await pg.query("UPDATE sessions.session_index SET last_activity_at = now() + interval '1 second'");
+    expect(await candidates()).toEqual(["org-a/ws-a/s-1"]);
+  });
+
+  test("the request-row read and the gate work under RLS as a NOBYPASSRLS runtime role with the migrator's runtime ACL", async () => {
+    await controls([["global", null, null, true], ["workspace", "org-a", "ws-a", true]]);
+    expect(await schedule()).toMatchObject({ outcome: "enqueued" });
+    await pointer(pg, { key: key("s-2") });
+    expect((await request("s-2")).outcome).toBe("accepted");
+    // The runtime role exactly as the migrator installs it (installRuntimeApplicationAcl): table grants, the
+    // trusted-backend all-row policy on every RLS table, function EXECUTE. No BYPASSRLS, no ownership.
+    await pg.exec("CREATE ROLE history_rt NOLOGIN NOINHERIT NOBYPASSRLS; GRANT USAGE ON SCHEMA sessions TO history_rt");
+    const catalog = runtimeApplicationAclCatalog();
+    for (const [rel, privs] of Object.entries(catalog.tables))
+      if ((await pg.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [rel])).rows[0]!.r) await pg.exec(`GRANT ${privs.join(", ")} ON TABLE ${rel} TO history_rt`);
+    for (const rel of catalog.rlsTables)
+      if ((await pg.query<{ r: string | null }>("SELECT to_regclass($1)::text r", [rel])).rows[0]!.r)
+        await pg.exec(`CREATE POLICY ${RUNTIME_APPLICATION_POLICY} ON ${rel} AS PERMISSIVE FOR ALL TO history_rt USING (true) WITH CHECK (true)`);
+    for (const fn of catalog.functions)
+      if ((await pg.query<{ r: string | null }>("SELECT to_regprocedure($1)::text r", [fn])).rows[0]!.r) await pg.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO history_rt`);
+    expect((await pg.query<{ b: boolean }>("SELECT rolbypassrls b FROM pg_roles WHERE rolname = 'history_rt'")).rows[0]!.b).toBe(false);
+    expect((await pg.query<{ rls: boolean }>("SELECT relrowsecurity rls FROM pg_class WHERE oid = 'sessions.session_analysis_requests_v2'::regclass")).rows[0]!.rls).toBe(true);
+    const asRt = { query: (t: string, p?: unknown[]) => asRole("history_rt", () => pg.query(t, p as never)) } as never;
+    const idOf = async (sid: string) => (await pg.query<{ id: string }>("SELECT id::text id FROM sessions.session_analysis_jobs_v2 WHERE session_id = $1", [sid])).rows[0]!.id;
+    const requested = async (id: string) => ((await (asRt as { query: (t: string, p: unknown[]) => Promise<{ rows: { requested: boolean }[] }> }).query(USER_REQUESTED_JOB_SQL, [id])).rows[0]!.requested);
+    expect(await requested(await idOf("s-2"))).toBe(true);
+    expect(await requested(await idOf("s-1"))).toBe(false);
+    // The real gate as the runtime role: the user job is unscheduled, the scheduled one is on, then off.
+    expect(await scheduledJobGate(asRt)({ id: await idOf("s-2") })).toEqual({ run: true });
+    expect(await scheduledJobGate(asRt)({ id: await idOf("s-1") })).toEqual({ run: true });
+    await controls([["workspace", "org-a", "ws-a", false]]);
+    expect(await scheduledJobGate(asRt)({ id: await idOf("s-1") })).toEqual({ run: false, code: "claims_control_off", retryable: false });
+    // A gate failure as the runtime role still lets the user job through (the request row is visible under RLS).
+    const failing = { query: (t: string, p?: unknown[]) => t.includes("session_analysis_schedule_job_v1")
+      ? Promise.reject(Object.assign(new Error("down"), { code: "57014" })) : asRole("history_rt", () => pg.query(t, p as never)) } as never;
+    expect(await scheduledJobGate(failing)({ id: await idOf("s-2") })).toEqual({ run: true });
+    expect(await scheduledJobGate(failing)({ id: await idOf("s-1") })).toEqual({ run: false, code: "claims_scheduler_gate_failed", retryable: true });
   });
 });
 
