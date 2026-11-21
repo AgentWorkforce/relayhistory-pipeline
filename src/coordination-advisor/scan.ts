@@ -65,6 +65,8 @@ export const DIRECTORY_KEYS_SQL = `SELECT d.org_id, d.workspace_id, d.harness, d
  WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL`;
 
 export const UPSERT_SQL = "SELECT inserted, upgraded, skipped FROM sessions.coordination_advisories_upsert_v1($1, $2, $3::jsonb)";
+/** 20261105062220: the instance writer (COORDINATION_ADVISOR_INCARNATION_ENABLED). Same arguments and counts as v1. */
+export const UPSERT_V2_SQL = "SELECT inserted, upgraded, skipped FROM sessions.coordination_advisories_upsert_v2($1, $2, $3::jsonb)";
 export const MARK_DELIVERED_SQL = "SELECT sessions.coordination_advisories_mark_delivered_v1($1, $2, $3, $4, $5) AS matched";
 export const SWEEP_SQL = "SELECT expired, deleted FROM sessions.coordination_advisories_sweep_v1()";
 export const RECENT_SQL = `SELECT row_kind, harness, session_id, peer_harness, peer_session_id, urgency, latest_at, sent_last_hour
@@ -122,8 +124,10 @@ export interface AdvisorStore {
   claims?(orgId: string, workspaceId: string, since: Date, limit: number): Promise<ClaimRow[]>;
 }
 
-export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
+/** `incarnation` (COORDINATION_ADVISOR_INCARNATION_ENABLED): upsert through 062220's v2; otherwise 062000's v1, as before. */
+export function sqlAdvisorStore(db: SqlQuery, opts: { incarnation?: boolean } = {}): AdvisorStore {
   const controls = sessionIntelControls(db);
+  const upsertSql = opts.incarnation === true ? UPSERT_V2_SQL : UPSERT_SQL;
   return {
     controls: (orgId, workspaceId) => controls.read(orgId, workspaceId),
     async candidates(since, limit, workspaces) {
@@ -137,7 +141,7 @@ export function sqlAdvisorStore(db: SqlQuery): AdvisorStore {
     },
     directory: () => workerDirectory(db),
     async upsert(orgId, workspaceId, row) {
-      const { rows } = await db.query<{ inserted: number; upgraded: number; skipped: number }>(UPSERT_SQL,
+      const { rows } = await db.query<{ inserted: number; upgraded: number; skipped: number }>(upsertSql,
         [orgId, workspaceId, JSON.stringify([row])]);
       const r = rows[0];
       return { inserted: Number(r?.inserted ?? 0), upgraded: Number(r?.upgraded ?? 0), skipped: Number(r?.skipped ?? 0) };

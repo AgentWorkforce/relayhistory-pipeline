@@ -15,6 +15,15 @@ export const COORDINATION_ADVISOR_RELAY_TOKEN = "COORDINATION_ADVISOR_RELAY_TOKE
 export const COORDINATION_ADVISOR_RELAY_URL = "COORDINATION_ADVISOR_RELAY_URL";
 export const COORDINATION_ADVISOR_FACTS_BACKEND = "COORDINATION_ADVISOR_FACTS_BACKEND";
 /**
+ * The advisory instance (20261105062220, docs/coordination-live-advisories.md "Advisory instances"). Exactly "true"
+ * only, default off. On: the worker writes through coordination_advisories_upsert_v2 (each row gets an incarnation,
+ * rotated on a LOW -> HIGH promotion). Off: upsert_v1 exactly as before (incarnation NULL, a legacy row). Instance mode
+ * has no DM: on together with COORDINATION_ADVISOR_RELAY_DM_ENABLED the worker refuses to start, because
+ * mark_delivered_v1 is fenced to legacy rows and a generation-aware mark_delivered is a later slice. Turning it on is a
+ * coordinated step after ack-v2 Desktops ship (Khaliq's call).
+ */
+export const COORDINATION_ADVISOR_INCARNATION_ENABLED = "COORDINATION_ADVISOR_INCARNATION_ENABLED";
+/**
  * M2-4: the conflict rows (constraint_violation, intent_conflict, overlap from the claim detectors). Exactly
  * "true" only, default off; the M3-1 `conflicts` control must also be on for the workspace. Off: the scan reads no
  * claims and runs no conflict code.
@@ -40,6 +49,8 @@ export interface AdvisorConfig {
   relayDm: { enabled: false } | { enabled: true; token: string; url: string };
   /** SESSION_INTEL_CONFLICTS_ENABLED is exactly "true". */
   conflicts: boolean;
+  /** COORDINATION_ADVISOR_INCARNATION_ENABLED is exactly "true": write through upsert_v2. Never with relayDm on. */
+  incarnation: boolean;
 }
 
 /** Only the exact string "true" turns the worker's scan and writes on. */
@@ -73,7 +84,8 @@ function relayUrl(raw: string): string {
 
 /**
  * Parsed only when the worker is enabled. A malformed value, an unknown facts backend
- * selection, or the DM flag without its credential refuses to start rather than run degraded.
+ * selection, the DM flag without its credential, or the DM flag with the instance flag refuses to start rather
+ * than run degraded.
  */
 export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {
   const backendRaw = env[COORDINATION_ADVISOR_FACTS_BACKEND];
@@ -82,6 +94,10 @@ export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {
   else if (backendRaw === "postgres") factsBackend = "postgres";
   else throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_FACTS_BACKEND} must be unset, "", "clickhouse" or "postgres"`);
   const dmOn = exactTrueFlag(env[COORDINATION_ADVISOR_RELAY_DM_ENABLED]);
+  const incarnation = exactTrueFlag(env[COORDINATION_ADVISOR_INCARNATION_ENABLED]);
+  // DMs fail closed in instance mode: mark_delivered_v1 never marks a protected row, so a DM could repeat.
+  if (incarnation && dmOn)
+    throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_INCARNATION_ENABLED} and ${COORDINATION_ADVISOR_RELAY_DM_ENABLED} must not both be on (instance mode has no DM)`);
   let relayDm: AdvisorConfig["relayDm"] = { enabled: false };
   if (dmOn) {
     const token = env[COORDINATION_ADVISOR_RELAY_TOKEN];
@@ -100,5 +116,6 @@ export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {
     workspaces: parseDirectoryWorkspaces(typeof env[READ_API_DIRECTORY_WORKSPACES] === "string" ? env[READ_API_DIRECTORY_WORKSPACES] as string : undefined),
     relayDm,
     conflicts: exactTrueFlag(env[SESSION_INTEL_CONFLICTS_ENABLED]),
+    incarnation,
   };
 }
