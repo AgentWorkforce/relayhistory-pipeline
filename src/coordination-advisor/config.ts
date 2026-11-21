@@ -95,7 +95,10 @@ export function advisorConfig(env: Record<string, unknown>): AdvisorConfig {
   else throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_FACTS_BACKEND} must be unset, "", "clickhouse" or "postgres"`);
   const dmOn = exactTrueFlag(env[COORDINATION_ADVISOR_RELAY_DM_ENABLED]);
   const incarnation = exactTrueFlag(env[COORDINATION_ADVISOR_INCARNATION_ENABLED]);
-  // DMs fail closed in instance mode: mark_delivered_v1 never marks a protected row, so a DM could repeat.
+  // DMs fail closed in instance mode: mark_delivered_v1 is fenced to legacy rows, so an instance row would never be
+  // marked delivered (delivered_at, delivery.dm and the pending -> delivered step would be wrong for every DM sent).
+  // A DM itself is sent only when the upsert inserted or upgraded a row, so it would not repeat; the refusal stands
+  // until a generation-aware mark_delivered exists.
   if (incarnation && dmOn)
     throw new Error(`coordination advisor: ${COORDINATION_ADVISOR_INCARNATION_ENABLED} and ${COORDINATION_ADVISOR_RELAY_DM_ENABLED} must not both be on (instance mode has no DM)`);
   let relayDm: AdvisorConfig["relayDm"] = { enabled: false };

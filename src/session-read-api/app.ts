@@ -2290,6 +2290,12 @@ export function createReadApi(deps: ReadApiDeps) {
     if (typeof sessionId !== "string" || sessionId === "" || sessionId.length > 256) throw bad("sessionId must be given exactly once");
     return { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
   };
+  // Instance switch on without 062220 applied: the 503 (no fallback) is logged naming the missing function.
+  const missing = (c: Context, error: unknown, reason: string) => {
+    if ((error as { code?: string })?.code === "42883")
+      log({ route: c.req.routePath, reason, error_code: "42883", status: 503, correlation_id: c.get("correlationId") });
+    return error;
+  };
   const exactlyOnce = (c: Context, name: string) => {
     const all = c.req.queries(name);
     if (!all || all.length !== 1) throw bad(`${name} must be given exactly once`);
@@ -2309,7 +2315,9 @@ export function createReadApi(deps: ReadApiDeps) {
       if (status !== "pending") throw bad("status must be pending");
       const instance = deps.advisoryInstance === true;
       if (instance && !advisories.source.pendingInstances) throw new Error("coordination advisories: the instance reader is not wired");
-      const rows = instance ? await advisories.source.pendingInstances!(recipient) : await advisories.source.pending(recipient);
+      const rows = instance
+        ? await advisories.source.pendingInstances!(recipient).catch((error: unknown) => { throw missing(c, error, "coordination_advisories_pending_for_v3_missing"); })
+        : await advisories.source.pending(recipient);
       log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
       return c.json({
         contract: instance ? ADVISORIES_INSTANCE_CONTRACT : ADVISORIES_CONTRACT,
@@ -2352,7 +2360,8 @@ export function createReadApi(deps: ReadApiDeps) {
         if (incarnation !== undefined && incarnation !== null) {
           if (typeof incarnation !== "string" || !ADVISORY_INCARNATION.test(incarnation)) throw bad("incarnation must be a UUID");
           if (!advisories.source.ackInstance) throw new Error("coordination advisories: the instance ack is not wired");
-          const result = await advisories.source.ackInstance(recipient, advisoryId, incarnation.toLowerCase());
+          const result = await advisories.source.ackInstance(recipient, advisoryId, incarnation.toLowerCase())
+            .catch((error: unknown) => { throw missing(c, error, "coordination_advisories_ack_v2_missing"); });
           // 404 whether the id is unknown, another recipient's, a legacy row, or a stale instance: nothing is disclosed.
           if (result === "no_match") throw new HttpError(404, "not_found", "advisory not found");
           log({ route: c.req.routePath, reason: result === "acked" ? "coordination_advisory_acked" : "coordination_advisory_already_acked", correlation_id: c.get("correlationId") });
