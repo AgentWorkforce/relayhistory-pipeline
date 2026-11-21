@@ -243,6 +243,10 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/origin-claim-fence.postgres.test.ts
+      - name: Prove the 062210 T2 staged ACK fence, try-lock flip and seat upgrade schedules (held candidate, gate off)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: bun test --timeout 300000 src/session-ingest/__tests__/lazy-ack-t2.postgres.test.ts
       - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (044010)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
