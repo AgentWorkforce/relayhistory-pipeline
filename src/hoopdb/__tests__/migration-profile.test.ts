@@ -3770,7 +3770,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await failure(db.exec(down))).toBeNull();
       expect((await db.query<{ n: number }>(grantRow)).rows[0].n).toBe(0);
     }
-  });
+  }, 180_000); // Rolls back every later step one by one: about 52 s today, longer with each new slot.
 
   test("Cloud SQL trust root: only Google's fixed cloudsqladmin SUPERUSER is excluded in cloudsql mode", async () => {
     expect(Object.isFrozen(CLOUDSQL_PLATFORM_SUPERUSERS)).toBe(true);

@@ -11,6 +11,8 @@
  * A failed claims read never fails the view: status and handoffs are still served, with empty intents and
  * decisions, `hasClaims` null and the claims coverage null. No transcript text is read or returned: the directory
  * gives titles and the stored (scrubbed) short summary; advisories give ids, kinds, artifacts and timestamps.
+ * The short summary is served only where the directory list serves it (READ_API_LIST_SHORT_SUMMARY_ENABLED,
+ * deps.listShortSummary); otherwise `shortSummary` and `summaryAt` are null and the summary coverage is null.
  */
 import type { AdvisoryEvidence } from "./coordination-advisories.ts";
 import type { Directory, DirectoryListRow } from "./directory.ts";
@@ -42,6 +44,7 @@ export const SESSION_INTEL_NOTES = {
   handoffsCapped: "handoffs capped at 100",
   alertClassUnmapped: "alert kind without a class",
   searchNotServed: "handoff search is not served here; use GET /v1/sessions/summaries/search",
+  summariesNotServed: "short summaries not served",
 } as const;
 
 /**
@@ -178,6 +181,11 @@ export interface WorkspaceViewArgs {
   now: number;
   source: SessionIntelSource;
   directory: Directory | undefined;
+  /**
+   * READ_API_LIST_SHORT_SUMMARY_ENABLED (deps.listShortSummary === true): serve the directory's stored short summary.
+   * Anything else: `shortSummary` and `summaryAt` are null, the summary coverage is null, with a note.
+   */
+  shortSummary: boolean;
   /** READ_API_ADVISORY_NOTIFY_ROWS, parsed; absent = empty (no alert is notify-eligible). */
   notifyRows?: ReadonlySet<string>;
   /** Counts and reason codes only. */
@@ -243,7 +251,9 @@ export async function workspaceView(a: WorkspaceViewArgs) {
   const claimsOf = (r: DirectoryListRow) => bySession.get(keyOf(r.harness, r.session_id));
   const hasClaims = (r: DirectoryListRow) => (claims === null ? null : claimsOf(r) !== undefined);
   const summaryOf = (r: DirectoryListRow) => {
-    const s = typeof r.short_summary === "string" && r.short_summary !== "" ? cut(r.short_summary, SHORT_SUMMARY_MAX) : null;
+    // The list route's own gate (app.ts includeShortSummary): never served here unless it is served there.
+    const s = a.shortSummary === true && typeof r.short_summary === "string" && r.short_summary !== ""
+      ? cut(r.short_summary, SHORT_SUMMARY_MAX) : null;
     return { shortSummary: s, summaryAt: s === null ? null : isoOrNull(r.short_summary_generated_at) };
   };
   const titleOf = (r: DirectoryListRow) => (typeof r.title === "string" ? cut(r.title, SESSION_TITLE_MAX) : null);
@@ -288,14 +298,15 @@ export async function workspaceView(a: WorkspaceViewArgs) {
     };
   });
   if (alerts.some((x) => x.class === null)) notes.push(SESSION_INTEL_NOTES.alertClassUnmapped);
+  if (a.shortSummary !== true) notes.push(SESSION_INTEL_NOTES.summariesNotServed);
   notes.push(SESSION_INTEL_NOTES.searchNotServed);
 
   const coverage = {
     sessionsActive: status.length,
-    sessionsWithSummary: status.filter((s) => s.shortSummary !== null).length,
+    sessionsWithSummary: a.shortSummary === true ? status.filter((s) => s.shortSummary !== null).length : null,
     sessionsWithClaims: claims === null ? null : status.filter((s) => s.hasClaims === true).length,
     claimsNewestAt: claims === null ? null : newest(claims.map((c) => c.updatedAt)),
-    summariesNewestAt: newest([...status, ...handoffs].map((s) => s.summaryAt)),
+    summariesNewestAt: a.shortSummary === true ? newest([...status, ...handoffs].map((s) => s.summaryAt)) : null,
     // Whether the claims extractor runs is not visible to the read API: never "on".
     claimsExtraction: "unknown" as "off" | "unknown",
     notes,

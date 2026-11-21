@@ -109,7 +109,11 @@ Live status and progress: the directory's sessions whose `last_activity_at` is w
 - `title`, `projectId`, `state`, `lastActivityAt` come from the directory (`sessions.list_session_directory_for`, the
   existing read-API path; no new grant).
 - `shortSummary` is the directory's stored short summary, which is scrubbed at the producer; `summaryAt` is its
-  `short_summary_generated_at` (null when there is no summary).
+  `short_summary_generated_at` (null when there is no summary). Served only where the directory list serves it:
+  with `READ_API_LIST_SHORT_SUMMARY_ENABLED` exactly `true` (the gate the list route's `includeShortSummary`
+  checks). Otherwise both are `null` for every session, `sessionsWithSummary` and `summariesNewestAt` are `null`,
+  and the view carries the note `short summaries not served`, so the view never shows a summary the list route
+  would refuse.
 - `openIntents`: up to **3** current (not superseded) intent claims whose evidence names the session
   (`sessions.relayfacts_claims_v1`, migration `062150`), newest first, **titles only**, at most 120 characters.
 - `hasClaims`: whether the session has any current intent or decision; `null` when the claims read failed.
@@ -132,10 +136,10 @@ What the view could and could not see, so a dashboard never implies full coverag
 | Field | Meaning |
 |---|---|
 | `sessionsActive` | The number of `status` sessions |
-| `sessionsWithSummary` | Of those, how many have a short summary |
+| `sessionsWithSummary` | Of those, how many have a short summary. **`null` when short summaries are not served** (`READ_API_LIST_SHORT_SUMMARY_ENABLED` off) |
 | `sessionsWithClaims` | Of those, how many have a current intent or decision. **`null` when the claims reader is unavailable** (missing function, `42883`, or any error); that is not `0` |
 | `claimsNewestAt` | The newest `updated_at` of the claims read, or `null` (none, or unavailable) |
-| `summariesNewestAt` | The newest `summaryAt` of `status` and `handoffs`, or `null` |
+| `summariesNewestAt` | The newest `summaryAt` of `status` and `handoffs`, or `null` (none, or not served) |
 | `claimsExtraction` | `"unknown"`: the read API cannot see whether the claims extractor runs. It is never `"on"` |
 | `notes` | Fixed strings, never with an id or a value |
 
@@ -145,11 +149,45 @@ The notes:
 - `alerts capped at 100`, `status capped at 200`, `handoffs capped at 100`: a list reached its bound, so there may be
   more;
 - `alert kind without a class`;
+- `short summaries not served`: `READ_API_LIST_SHORT_SUMMARY_ENABLED` is off, so no summary is shown;
 - `handoff search is not served here; use GET /v1/sessions/summaries/search` (always).
 
 **A failed claims read never fails the route.** Status and handoffs are still served, with `openIntents` and
 `decisions` empty, `hasClaims` null, `sessionsWithClaims` and `claimsNewestAt` null, and the note. The failure is
 logged with its error code only. A failed alerts or directory read fails the route (`503`).
+
+### Claim and decision titles: what gated them before, and erase
+
+Migration `062170` is the first path that lets the read-API role read **intent** titles: before it,
+`sessions.relayfacts_claims_v1` (`062150`) had no read-API function and no grant to `bulls96_read_api`, so intent
+titles were never served by the read API. **Decision** titles were already served by `GET /v1/relayfacts` and
+`GET /v1/relayfacts/{topic}` (`sessions.relayfacts_list_v1`, `062080`), behind `READ_API_RELAYFACTS_ENABLED` and
+`requireCanary(identity, "relayfacts")`. This view serves both behind a different pair of gates,
+`READ_API_SESSION_INTEL_ENABLED` and `requireCanary(identity, "coordination")`; both canaries read the same
+`READ_API_DIRECTORY_WORKSPACES` allowlist. So turning `READ_API_RELAYFACTS_ENABLED` off does not hide decision
+titles from this view: turn `READ_API_SESSION_INTEL_ENABLED` off too.
+
+Erase, precisely ([relayfacts](relayfacts.md), Retention, and its claims section). Where an erase reaches the
+relayfacts tables (the self-host operator per-session erase, and the hosted per-user erase job, each only with
+`SUMMARY_DECISION_RECORDS_ENABLED=true`), it deletes every evidence row of the erased session from both the decision
+and the claim evidence tables, deletes a record or claim left with no evidence, and rewrites a kept one's statement
+from its oldest remaining evidence. It does **not** change a kept record's or claim's **title**: the title is the
+dedupe key shared by the sessions that still cite it. So a title first written from an erased session can still
+appear in this view, under another (live) session whose evidence cites the same record or claim. It never appears
+under the erased session itself: that session's evidence rows are gone, and the directory no longer lists it.
+Where no erase reaches these tables (`SUMMARY_DECISION_RECORDS_ENABLED` off on the erase path; on hosted, the
+operator per-session erase is self-host only) the evidence rows stay, but the session is no longer listed by the directory, so the view
+does not ask for it; its titles still show under any live session citing the same record or claim.
+
+### Not gated by the session-intelligence controls
+
+The route does not read the `062160` controls (`sessions.session_intel_controls_v1`): turning a feature off there
+does not turn this view off. Only `READ_API_SESSION_INTEL_ENABLED` does. Two reasons, both design questions rather
+than code: the controls function is `service_role`-only and takes any org and workspace (it has no read-API scope
+pin), so the read API's role cannot call it without a new grant or a new scoped reader; and none of the five
+features (`advisor`, `conflicts`, `dm`, `claims`, `regen`) names this view, so which one gates it (or whether it
+needs its own) is a product decision. The controls do stop the producers: `claims` off stops new claim writes, `advisor`
+off stops new advisories, so the view then shows only what was written before.
 
 ### No transcript text
 
@@ -157,7 +195,7 @@ Nothing in the response is transcript content. Alerts carry ids, kinds, artifact
 sha) and timestamps. Sessions carry the directory's title and its stored scrubbed short summary. Claims carry their
 title only: never the statement and never the evidence's claim text.
 
-## Storage: migration 20261105062170 (provisional slot)
+## Storage: migration 20261105062170
 
 Two read-only (`STABLE`) SECURITY DEFINER functions, `search_path` pinned, PUBLIC EXECUTE revoked, EXECUTE for
 `bulls96_read_api` alone. Each refuses (`42501`) unless the org is the read API's request scope
