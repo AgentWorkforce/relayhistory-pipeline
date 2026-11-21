@@ -1,8 +1,9 @@
 /** Synthetic action scope evidence; no shell, Git, model or network execution. */
 import { afterAll, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { readClaudeCode, readCodex, readGeneric, SessionSet } from "../adapters.ts";
 import { main } from "../cli.ts";
 import { codeModeShellCalls, codeModeShells } from "../code-mode.ts";
@@ -29,12 +30,24 @@ async function codex(rows: unknown[]) { const set = new SessionSet(emptyStats(),
 test("path and repository claim normalization rejects credentials and preserves case-sensitive paths", () => {
   expect(directoryPath("../other", "/work/home")).toBe("/work/other");
   expect(directoryPath("C:\\work\\repo")).toBe("C:/work/repo");
+  expect(directoryPath("C:/")).toBe("C:/");
+  for (const raw of ["C:/../work", "D:/../work", "C:/../../work", "C:/../D:/work", "C:/../C:/work", "C:relative"]) expect(directoryPath(raw)).toBeNull();
+  expect(directoryPath("../../work", "C:/repo")).toBeNull();
+  expect(directoryPath("../../C:/work", "C:/repo")).toBeNull();
+  expect(directoryPath("../other", "C:/repo")).toBe("C:/other");
   expect(directoryPath("/work/Case")).not.toBe(directoryPath("/work/case"));
   for (const raw of ["relative", "~/repo", "//server/share", "/work\\repo", "/work\nrepo"]) expect(directoryPath(raw)).toBeNull();
   expect(repositoryIdentity("git@GIT.EXAMPLE:acme/repo.git")).toBe("git.example/acme/repo");
   for (const raw of ["repo", "https://user:private@git.example/acme/repo", "https://token@git.example/acme/repo", "https://git.example/acme/repo?token=private", "git.example/../repo"])
     expect(repositoryIdentity(raw)).toBeNull();
-  expect(h.location("/work/Case")).not.toBe(h.location("/work/case"));
+  expect(h.location("directory", "/work/Case")).not.toBe(h.location("directory", "/work/case"));
+});
+
+test("location uses have distinct HMAC domains even for identical hostile preimages", () => {
+  const value = JSON.stringify(["git.example/acme/api", "src/A.ts"]);
+  const domains = ["record", "directory", "target", "repository-target", "basename-hint"] as const;
+  expect(new Set(domains.map((domain) => h.location(domain, value))).size).toBe(domains.length);
+  expect(h.location("directory", value)).not.toBe(h.location("repository-target", value));
 });
 
 for (const [command, base, expected] of [
@@ -100,7 +113,7 @@ test("Git directory changes bind each action; unsupported flow retains only star
     call("unsafe", "cd /work/other; git commit", "03"), output("unsafe", "04", "12345678")]);
   const data = toSnapshotSession(b, h, tenant, roots)!.provenance!;
   expect(data.records[0]!.repository).toBe(h.repo("git.example/acme/other"));
-  expect(data.records[1]).toMatchObject({ repository: null, reason: "unsupported_shell", startingLocation: h.location("/work/home") });
+  expect(data.records[1]).toMatchObject({ repository: null, reason: "unsupported_shell", startingLocation: h.location("directory", "/work/home") });
   expect(data.locations[data.records[1]!.location!]!.directory).toBeNull();
 });
 
@@ -157,17 +170,50 @@ test("opt-in CLI sidecar is manifest-pinned, private, capture-only and leaves le
   expect(parsed.sessionsSha256).toBe(loaded.manifest.files["sessions.jsonl"]);
   expect(parsed.implementationSha256).toMatch(/^[a-f0-9]{64}$/u);
   expect(parsed.counts).toMatchObject({ records: 2, operatorDeclared: 2, availableAfterFact: 2 });
+  const mapSha256 = sha256Hex(readFileSync(map));
+  expect(parsed.repositoryMapFingerprint).toBe(h.repositoryMap(mapSha256));
+  expect(h.repositoryMap(mapSha256)).not.toBe(new Hasher("another-synthetic-salt").repositoryMap(mapSha256));
+  expect(body).not.toContain(mapSha256);
+  expect(parsed).not.toHaveProperty("repositoryMapSha256");
   for (const secret of ["/work/other", "private-name", "synthetic-action-salt"]) expect(body).not.toContain(secret);
   expect(statSync(join(out, "action-provenance.json")).mode & 0o077).toBe(0);
   const privateMap = JSON.parse(readFileSync(`${out}.mapping.json`, "utf8"));
   expect(JSON.stringify(privateMap.actionProvenance)).toContain("/work/other");
   expect(privateMap.deleteBy).toBe(deleteBy);
+  expect(privateMap.actionProvenance.repositoryMapSha256).toBe(mapSha256);
+});
+
+test("an empty repository-map option is refused instead of silently enabling capture", async () => {
+  const input = writeRows([{ sessionId: "g", ts: at("01"), kind: "commit", commit: "abcdef12" }]);
+  const out = join(temp(), "out");
+  for (const value of ["", " "]) await expect(main(["--format", "generic", "--in", input, "--out", out,
+    "--salt-stdin", "--delete-by", deleteBy, "--repository-map", value], {
+    now, out: () => {}, err: () => {}, stdin: (async function* () { yield "synthetic-action-salt-keep-private"; })(),
+  })).rejects.toThrow("--repository-map must name a private file");
+  expect(() => statSync(out)).toThrow();
 });
 
 test("sidecar and capture budgets fail before writing an apparently complete artifact", () => {
   const b = new SessionBuilder("generic", "b", emptyStats(), true, { sizes: new WeakMap(), count: PROVENANCE_BOUNDS.actions, bytes: 0 });
   expect(() => b.commit("abcdef12", at("01"), { file: 0, line: 1 }, actionContext("/work/other", "generic_event", { file: 0, line: 1 }, at("01")))).toThrow("capture exceeds");
   expect(() => actionArtifacts([{ records: [], locations: { fixture: { directory: "x".repeat(PROVENANCE_BOUNDS.exportBytes), startingDirectory: null, target: null, repository: null, source: { file: 0, line: 1 }, output: null, claims: [] } } }], deleteBy, null, { sessionsSha256: sha256Hex("fixture"), implementationSha256: sha256Hex("code") })).toThrow("private action provenance map exceeds");
+});
+
+test("captured context bytes overflow before the action-count bound", () => {
+  const budget = { sizes: new WeakMap(), count: 0, bytes: 0 };
+  const b = new SessionBuilder("generic", "byte-bound", emptyStats(), true, budget);
+  const context = actionContext(`/${"x".repeat(1000)}`, "generic_event", { file: 0, line: 1 }, at("01"));
+  expect(() => { for (let i = 0; i < 10_000; i++) b.commit("abcdef12", at("01"), { file: 0, line: i + 1 }, context); }).toThrow("capture exceeds");
+  expect(budget.count).toBeLessThan(PROVENANCE_BOUNDS.actions);
+  expect(budget.bytes).toBeLessThanOrEqual(PROVENANCE_BOUNDS.captureBytes);
+});
+
+test("per-session export bytes overflow while captured context still fits", () => {
+  const b = new SessionBuilder("generic", "export-byte-bound", emptyStats(), true);
+  const context = actionContext(`/${"x".repeat(600)}`, "generic_event", { file: 0, line: 1 }, at("01"));
+  for (let i = 0; i < 10_000; i++) b.commit("abcdef12", at("01"), { file: 0, line: i + 1 }, context);
+  expect(b.commits).toHaveLength(10_000);
+  expect(() => toSnapshotSession(b, h, tenant)).toThrow("export exceeds");
 });
 
 test("rest object defaults are hidden while an ordinary RHS object spread remains visible", () => {
@@ -183,12 +229,32 @@ test("default-off CLI matches the pre-provenance landed golden byte digests", as
     now, out: (s) => stdout.push(s), err: (s) => stderr.push(s), stdin: (async function* () { yield "synthetic-action-salt-keep-private"; })(),
   })).toBe(0);
   expect({ sessions: sha256Hex(readFileSync(join(out, "sessions.jsonl"))), manifest: sha256Hex(readFileSync(join(out, "manifest.json"))),
-    mapping: sha256Hex(readFileSync(`${out}.mapping.json`)), stdout: sha256Hex(stdout.join("\n").split(`${out}.mapping.json`).join("<mapping>").split(out).join("<out>")), stderr }).toEqual({
+    mapping: sha256Hex(readFileSync(`${out}.mapping.json`)), stdout: sha256Hex(stdout.join("\n").split(realpathSync(`${out}.mapping.json`)).join("<mapping>").split(realpathSync(out)).join("<out>")), stderr }).toEqual({
     sessions: "68a524d7f35caa018c5a36ac387507fd55c3f261419476b4fe5bde555c9bec1a",
     manifest: "4a302a2f2e2e54cd724a9cfd3f055d569c50501bd5a5419a76dec464e78b820d",
     mapping: "474635fc9ee3ec223e6c23a9183b970d1ae94c23ac93751e01ccbacd10a258c5",
-    stdout: "725f07d5933d0f329f4ed8a682864644b09378f54c4682859306eceee7d53d1f", stderr: [],
+    stdout: "e576cd517ceda27952ba0caeb04d727bb9bed33facd74a1428af5b7905eae8de", stderr: [],
   });
+});
+
+test("provenance production modules have no process or Bun shell imports", () => {
+  const forbiddenImports = (source: string) => {
+    const file = ts.createSourceFile("fixture.ts", source, ts.ScriptTarget.Latest, true);
+    const found: string[] = [];
+    const check = (value: ts.Expression | undefined) => {
+      if (value && ts.isStringLiteralLike(value) && ["bun", "child_process", "node:child_process"].includes(value.text)) found.push(value.text);
+    };
+    const visit = (node: ts.Node) => {
+      if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) check(node.moduleSpecifier);
+      if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) check(node.moduleReference.expression);
+      if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(node.expression) && node.expression.text === "require"))) check(node.arguments[0]);
+      ts.forEachChild(node, visit);
+    };
+    visit(file); return found;
+  };
+  expect(forbiddenImports('import {exec} from "child_process"; require("node:child_process"); import {$} from "bun";')).toHaveLength(3);
+  for (const file of ["provenance.ts", "adapters.ts", "normalize.ts"])
+    expect(forbiddenImports(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"))).toEqual([]);
 });
 
 test("capture never executes Git or probes a directory controlled by a trace", () => {
@@ -213,9 +279,11 @@ const trace=${JSON.stringify(trace)}, forbidden=[];
 function isTrace(v){const s=v instanceof URL?v.pathname:typeof v==="string"?v:null;return s!==null&&(s===trace||s.startsWith(trace+"/"));}
 function guarded(original,kind,keys){const result={...original};for(const key of keys){const fn=original[key];if(typeof fn!=="function")continue;result[key]=(...args)=>{if(kind==="process"||isTrace(args[0])){forbidden.push(kind+":"+key);throw new Error("forbidden synthetic probe");}return Reflect.apply(fn,original,args);};}return {...result,default:result};}
 const nativeFs={...fs}, nativePromises={...fsp}, nativeProcesses={...cp};
-mock.module("node:fs",()=>guarded(nativeFs,"fs",["stat","statSync","lstat","lstatSync","access","accessSync","existsSync","realpath","realpathSync","readlink","readlinkSync","readdir","readdirSync","opendir","opendirSync","open","openSync","readFile","readFileSync"]));
-mock.module("node:fs/promises",()=>guarded(nativePromises,"fs",["stat","lstat","access","realpath","readlink","readdir","opendir","open","readFile"]));
+const promiseGuards=guarded(nativePromises,"fs",["stat","lstat","access","realpath","readlink","readdir","opendir","open","readFile","watch"]);
+mock.module("node:fs",()=>{const g=guarded(nativeFs,"fs",["stat","statSync","lstat","lstatSync","access","accessSync","exists","existsSync","realpath","realpathSync","readlink","readlinkSync","readdir","readdirSync","opendir","opendirSync","open","openSync","readFile","readFileSync","createReadStream","watch","watchFile"]);g.promises=promiseGuards;g.default.promises=promiseGuards;return g;});
+mock.module("node:fs/promises",()=>promiseGuards);
 mock.module("node:child_process",()=>guarded(nativeProcesses,"process",["exec","execFile","execSync","execFileSync","spawn","spawnSync","fork"]));
+Bun.$=()=>{forbidden.push("process:Bun.$");throw new Error("forbidden synthetic probe");};
 for(const key of ["spawn","spawnSync"]){Bun[key]=()=>{forbidden.push("process:Bun."+key);throw new Error("forbidden synthetic probe");};}
 for(const key of ["file","write"]){const fn=Bun[key];Bun[key]=(...args)=>{if(isTrace(args[0])){forbidden.push("fs:Bun."+key);throw new Error("forbidden synthetic probe");}return Reflect.apply(fn,Bun,args);};}
 test("only explicitly selected input/map files are read",async()=>{
@@ -230,7 +298,13 @@ test("only explicitly selected input/map files are read",async()=>{
  await expect(Promise.resolve().then(()=>guardedFs.stat(trace))).rejects.toThrow("forbidden synthetic probe");
  expect(()=>guardedCp.execFileSync("git",["-C",trace,"remote","get-url","origin"])).toThrow("forbidden synthetic probe");
  expect(()=>Bun.spawn(["git","status"])).toThrow("forbidden synthetic probe");
- expect(forbidden.length).toBe(3);
+ const guardedFsModule=await import("node:fs");
+ await expect(Promise.resolve().then(()=>guardedFsModule.promises.stat(trace))).rejects.toThrow("forbidden synthetic probe");
+ expect(()=>guardedFsModule.createReadStream(trace)).toThrow("forbidden synthetic probe");
+ expect(()=>guardedFsModule.exists(trace,()=>{})).toThrow("forbidden synthetic probe");
+ expect(()=>guardedFsModule.watch(trace,()=>{})).toThrow("forbidden synthetic probe");
+ expect(()=>Bun.$(["git status"])).toThrow("forbidden synthetic probe");
+ expect(forbidden.length).toBe(8);
 });`);
   const result = Bun.spawnSync({ cmd: [process.execPath, "test", child], env: { PATH: process.env.PATH ?? "" }, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(`synthetic probe guard failed: ${result.stderr.toString()}`);
@@ -318,7 +392,7 @@ test("invalid turn context and metadata missing cwd cannot reuse an earlier repo
   const records = toSnapshotSession(b, h, tenant)!.provenance!.records;
   expect(records.every((r) => r.repository === null)).toBe(true);
   expect(records[0]!.effectiveLocation).toBeNull();
-  expect(records[1]!.effectiveLocation).toBe(h.location("/work/home"));
+  expect(records[1]!.effectiveLocation).toBe(h.location("directory", "/work/home"));
 });
 
 
@@ -340,5 +414,5 @@ test("flat code-mode and shell-patch writes retain starting evidence without inv
   ]);
   const data = toSnapshotSession(b, h, tenant, [{ directory: "/work/home", repository: "git.example/acme/home", observedAt: at("00") }])!.provenance!;
   expect(data.records).toHaveLength(2);
-  for (const r of data.records) expect(r).toMatchObject({ repository: null, repositoryTarget: null, effectiveLocation: null, target: null, startingLocation: h.location("/work/home") });
+  for (const r of data.records) expect(r).toMatchObject({ repository: null, repositoryTarget: null, effectiveLocation: null, target: null, startingLocation: h.location("directory", "/work/home") });
 });
