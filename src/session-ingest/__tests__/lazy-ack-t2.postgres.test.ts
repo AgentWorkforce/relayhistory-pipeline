@@ -165,7 +165,14 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
     if (admin) { if (name) await admin.query("DROP DATABASE IF EXISTS " + name + " WITH(FORCE)"); await admin.end(); }
   }, 60000);
   // The supported order back: mode main first, then the gate off through lazy_ack_t2_set_gate.
-  const reset = async () => { await setMode("main"); await pool.query("SELECT sessions.lazy_ack_t2_set_gate('off')"); };
+  // Bounded retries on the try-lock's 55P03 only, so a busy barrier at cleanup does not replace the test's own failure.
+  const reset = async () => {
+    await setMode("main");
+    for (let i = 0; ; i++) {
+      try { await pool.query("SELECT sessions.lazy_ack_t2_set_gate('off')"); return; }
+      catch (e: any) { if (e?.code !== "55P03" || i >= 100) throw e; await sleep(50); }
+    }
+  };
 
   test("S1: a busy flip queues nothing: a same-origin ACK of another user still passes 50000 while a fenced main ACK is paused", async () => {
     const pa = await prepared("s1-u1", "s1-o"), pb = await prepared("s1-u2", "s1-o"), pc = await prepared("s1-u3", "s1-o");

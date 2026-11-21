@@ -235,7 +235,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Session list readiness: two read-API list functions beside 034000's and 046010's; no G4 function names
       // them, no ingest path calls them.
       "20261105062200_session_directory_list_readiness.sql",
-      // T2 staged ACK: replaced 043800 ACK (gate off), one owner-only mode table and one owner-only flip function; no G4
+      // T2 staged ACK: replaced 043800 ACK (gate off), one owner-only mode table and two owner-only functions (flip, gate); no G4
       // function names them.
       "20261105062210_lazy_ack_t2.sql",
     ]);
