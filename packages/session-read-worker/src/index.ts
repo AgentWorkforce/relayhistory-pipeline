@@ -205,6 +205,8 @@ export interface Env extends CanonicalEnv {
   READ_API_ADVISORY_NOTIFY_ROWS?: string;
   /** Exactly "true": M3-7 advisory priority (062190's v2 ordering and the priority fields); anything else = off. */
   READ_API_ADVISORY_PRIORITY_ENABLED?: string;
+  /** Exactly "true": the 062220 advisory instance on the GET (pending_for_v3, contract advisories/v3); anything else = off. */
+  READ_API_ADVISORY_INSTANCE_ENABLED?: string;
   /**
    * Exactly "true": serve GET and POST /v1/sessions/:sessionId/analysis (analysisDeps); anything
    * else = GET 501 analysis_not_configured and POST 405, as before the flag.
@@ -500,20 +502,23 @@ const ADVISORIES_V2_CACHE = pendingV2Cache();
 /**
  * The advisory deps from the Worker's env: the advisories GET (READ_API_COORDINATION_ADVISORIES_ENABLED; the ack's
  * writer refuses, and the GET-only gate answers a POST with 405 before it), the notify rows, and the M3-7 priority
- * switch (READ_API_ADVISORY_PRIORITY_ENABLED, exactly "true"), with the v1-fallback warning logged at warn.
+ * switch (READ_API_ADVISORY_PRIORITY_ENABLED, exactly "true"), with the v1-fallback warning logged at warn, and the
+ * 062220 instance switch (READ_API_ADVISORY_INSTANCE_ENABLED, exactly "true"; the GET only, the ack stays refused).
  */
 export function workerAdvisoryDeps(
-  env: Pick<Env, "READ_API_COORDINATION_ADVISORIES_ENABLED" | "READ_API_ADVISORY_PRIORITY_ENABLED">,
+  env: Pick<Env, "READ_API_COORDINATION_ADVISORIES_ENABLED" | "READ_API_ADVISORY_PRIORITY_ENABLED" | "READ_API_ADVISORY_INSTANCE_ENABLED">,
   run: TenantRunner, advisoryNotifyRows: ReadonlySet<string>,
   warnLog: (fields: Record<string, unknown>) => void = (fields) => log("warn", "coordination advisories pull fell back to v1", fields),
 ) {
   const priority = exactTrueFlag(env.READ_API_ADVISORY_PRIORITY_ENABLED);
+  const instance = exactTrueFlag(env.READ_API_ADVISORY_INSTANCE_ENABLED);
   return {
     ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
       ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(run, workerAckRefused, { priority, cache: ADVISORIES_V2_CACHE, warn: warnLog }) } }
       : {}),
     ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
     ...(priority ? { advisoryPriority: true } : {}),
+    ...(instance ? { advisoryInstance: true } : {}),
   };
 }
 

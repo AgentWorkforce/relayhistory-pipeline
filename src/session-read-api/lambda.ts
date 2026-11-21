@@ -95,7 +95,7 @@ import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
-  READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED,
+  READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED, READ_API_ADVISORY_INSTANCE_ENABLED,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
@@ -625,6 +625,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const advisoryNotifyRows = parseAdvisoryNotifyRows(env[READ_API_ADVISORY_NOTIFY_ROWS]);
   // M3-7 priority (v2 ordering and the added item fields): off unless exactly "true".
   const advisoryPriority = exactTrueFlag(env[READ_API_ADVISORY_PRIORITY_ENABLED]);
+  // 062220 advisory instance (pending_for_v3, contract advisories/v3, ack_v2 with an incarnation): off unless exactly "true".
+  const advisoryInstance = exactTrueFlag(env[READ_API_ADVISORY_INSTANCE_ENABLED]);
   // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
   const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
@@ -760,6 +762,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...advisoriesDeps,
     ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
     ...(advisoryPriority ? { advisoryPriority: true } : {}),
+    ...(advisoryInstance ? { advisoryInstance: true } : {}),
     // The Session Intelligence workspace view: the 062170 readers and the directory, READ ONLY on the read-role pool.
     ...(exactTrueFlag(env[READ_API_SESSION_INTEL_ENABLED]) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(poolTenantRunner(pool as never)) } } : {}),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
