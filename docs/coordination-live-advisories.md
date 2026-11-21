@@ -71,6 +71,7 @@ Table `sessions.coordination_advisories`, one row per finding per recipient:
 | `evidence` | `jsonb` | Bounded: at most 10 `{sessionId, eventId, ts, kind}` entries |
 | `created_at`, `delivered_at`, `acked_at` | `timestamptz` | `delivered_at` and `acked_at` nullable |
 | `status` | `text` | `check (status in ('pending','delivered','acked','expired'))` |
+| `incarnation` | `uuid` | Nullable, no default (migration `062220`): the advisory instance; NULL is a legacy row. See "Advisory instances" |
 
 - **Key.** Both agents in a pair receive the same finding, so the primary key is `(advisory_id, harness, session_id)`: `advisory_id` stays the finding id, and the recipient makes the row unique. The ack route names the recipient for the same reason.
 - **Content is scrub-bounded like `short_summary`:** no transcript content. `artifact` and `evidence` hold only paths, migration names, commit shas, session and event ids, and timestamps, with a hard `char_length` bound on `artifact`.
@@ -156,6 +157,8 @@ names, meaning and order.
   on.
 - **Dedup.** Desktop dedupes system notifications by `advisoryId` per human per device, recorded across restarts
   (M3-9); until it ships, the pull path is at-least-once and the same advisory can show again on a later turn.
+  An `advisoryId` alone is not unique over time (see "Advisory instances"): under contract `advisories/v3` the key is
+  the instance, `(advisoryId, incarnation)`.
 
 The GET is read-only, like every read-API route on the read pool. `status=pending` means not yet acked: it returns rows whose status is `pending` or `delivered`, so a row the desktop has not acked stays visible until it expires, and a crashed turn sees it again.
 
@@ -170,6 +173,65 @@ POST /v1/coordination/advisories/:advisoryId/ack
 - **Not the recipient:** `404` if no row matches `advisoryId` for that source, session and the token's workspace. The route never discloses whether the id exists for someone else.
 - **Trust boundary.** The token is workspace-scoped, not session-scoped. `source` and `sessionId` select the recipient's rows but do not prove the caller is that session, so any member of the workspace can read or ack them. That matches the overlaps route, which already shows workspace-wide findings. Nothing crosses a workspace, and an ack can hide an advisory but never disclose one.
 - **Same gates as the GET.** The read API's CORS preflight allows `GET` only today, so this PR also adds `POST` for this route.
+
+### Advisory instances (062220)
+
+**The id is reused.** `advisoryId` is the finding id (`packages/coordination-detect` `findingId`: a stable hash of
+the workspace, kind, sorted lanes and artifact) and has no epoch. The sweep deletes a row 7 days after `created_at`,
+and the next scan that sees the same finding re-inserts the same id; a LOW -> HIGH promotion keeps it too. A client
+or the relay core that keys delivery by `advisoryId` alone can therefore mistake a re-created (or promoted) advisory
+for the one it already showed or acked.
+
+**The instance.** Migration `20261105062220` adds `incarnation uuid NULL` (no default, no backfill: every existing
+row, and every row the v1 writer writes, is a **legacy** row with NULL). An advisory instance is
+`(advisoryId, recipient, incarnation)`:
+
+- `coordination_advisories_upsert_v2` (same grants as v1) gives a new row a random incarnation, and on a LOW -> HIGH
+  promotion (v1's condition: same tenant, `pending` or `delivered`) **rotates** it in the same statement: a new
+  incarnation, `status = 'pending'`, `delivered_at = NULL`. An acked or expired row is never resurrected; any other
+  conflict leaves the incarnation alone. A re-created row (after the sweep) is a fresh insert, so a new incarnation.
+- `coordination_advisories_ack_v2(org, workspace, advisoryId, harness, sessionId, incarnation)` acks exactly that
+  instance and answers `acked`, `already_acked` or `no_match` (unknown id, another recipient or tenant, a stale or
+  legacy instance, an expired row). The state change is one UPDATE on id + recipient + incarnation + tenant +
+  `pending`/`delivered`; when it matches nothing a second statement checks for that exact instance already acked
+  (acked is terminal, so that answer cannot go stale).
+- `coordination_advisories_pending_for_v3` is `062190`'s `pending_for_v2` (same order, filters, scope and bound) plus
+  `incarnation`.
+- **v1 fences.** `062220` replaces `062000`'s `upsert_v1`, `ack_v1` and `mark_delivered_v1` with the one added
+  predicate `incarnation IS NULL` (same signatures and grants): an old v1 writer, a delayed old-client ack or a stale
+  DM receipt skips a protected row (`upsert_v1` counts it as skipped; `ack_v1` and `mark_delivered_v1` answer false)
+  and never promotes or marks it. Its checksum-pinned rollback restores the exact `062000` bodies and drops the three
+  new functions and the column (every row is legacy again).
+
+**Read API, behind `READ_API_ADVISORY_INSTANCE_ENABLED`** (exactly `true`, default off; self-host service, hosted
+Lambda and read Worker). Off: the GET and the ack are byte-identical to before (contract
+`coordination-advisories/1`, no `incarnation`, v1 ack; a body with `incarnation` is the old `400`). On:
+
+- the GET reads `pending_for_v3` and answers `"contract": "advisories/v3"`; each item ends with `incarnation` (a UUID,
+  or `null` on a legacy row). The contract value means both: incarnation present AND ack_v2 enforced. A client
+  matches it exactly; any other value (including `coordination-advisories/1`) is legacy. With the switch on the
+  order is priority-first (v3 is v2's order) whatever `READ_API_ADVISORY_PRIORITY_ENABLED` says; that switch still
+  decides the `priority`, `notifyEligible` and `delivery` fields. There is no fallback: with the switch on and
+  `062220` absent the GET fails (503), so turn the switch off before rolling `062220` back.
+- the ack body accepts `{"source", "sessionId", "incarnation"}`. With a UUID `incarnation` (either case), ack_v2:
+  `200 {"contract":"advisories/v3","result":"acked"}`, `200 {...,"result":"already_acked"}`, or `404 not_found` on
+  no match (the same 404 as v1: nothing is disclosed about which case it was). A malformed one is `400`. Without
+  `incarnation`, or with `null` (what a legacy item carries), it is the v1 ack (`204` / `404`), which matches legacy
+  rows only. The read Worker still refuses acks (GET only).
+- `notifyEligible` stays the class policy (`READ_API_ADVISORY_NOTIFY_ROWS`), evaluated per row on each GET: a
+  re-created or promoted instance of an allowlisted class is eligible afresh, and nothing is carried from an earlier
+  instance.
+
+**Writer, behind `COORDINATION_ADVISOR_INCARNATION_ENABLED`** (exactly `true`, default off): the advisor writes through
+`upsert_v2`; off, through `upsert_v1` exactly as before. **Instance mode has no DM** until a later
+generation-aware slice (a fenced `mark_delivered_v2`): the advisor refuses to start with this flag and
+`COORDINATION_ADVISOR_RELAY_DM_ENABLED` both on.
+
+**Rollout order (each step is Khaliq's call).** Apply `062220` (changes nothing: both flags off, v1 writes NULL and
+old clients keep acking). Turn `READ_API_ADVISORY_INSTANCE_ENABLED` on (legacy rows show `incarnation: null`; old
+clients ignore the contract value). Ship ack-v2 Desktops. Only then turn `COORDINATION_ADVISOR_INCARNATION_ENABLED`
+on, with the DM flag off: from then on new rows are protected and an old client's v1 ack on them is a `404`. Back
+out in the reverse order.
 
 ### Push: HIGH by Relay DM
 
@@ -204,6 +266,8 @@ SQL and the next-tick stop contract.
 | `READ_API_COORDINATION_ADVISORIES_ENABLED` | off | The GET and ack routes |
 | `COORDINATION_ADVISOR_RELAY_DM_ENABLED` | off | HIGH Relay DMs (also needs the sender credential) |
 | `READ_API_ADVISORY_PRIORITY_ENABLED` | off | Exactly `true`: priority-first order through `062190`'s `pending_for_v2` (v1 fallback while it is absent) and the `priority`, `notifyEligible` and `delivery` item fields; also `priority` and `notifyEligible` on the workspace view's alerts. Off: v1 only and the pre-M3-7 responses |
+| `READ_API_ADVISORY_INSTANCE_ENABLED` | off | Exactly `true`: the advisory instance on the advisories routes (`062220`): contract `advisories/v3`, each item's `incarnation`, and an ack with an `incarnation` through `ack_v2`. Off: byte-identical responses and the v1 ack (see "Advisory instances") |
+| `COORDINATION_ADVISOR_INCARNATION_ENABLED` | off | Exactly `true`: the advisor writes through `upsert_v2` (an incarnation per row, rotated on promotion). Refused together with `COORDINATION_ADVISOR_RELAY_DM_ENABLED` (instance mode has no DM). On only after ack-v2 Desktops ship |
 | `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible: true` for the listed `<kind>:<urgency>` rows (see "Priority and delivery"); each row needs its eval result and Khaliq's OK |
 | `SESSION_INTEL_CONFLICTS_ENABLED` | off | The conflict rows (see "Conflict rows"); also needs the workspace's `conflicts` control |
 
