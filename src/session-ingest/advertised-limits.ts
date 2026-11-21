@@ -4,9 +4,10 @@
  *
  * Why: every staged buffered commit holds the global receipt seat clock for a time roughly linear in its record
  * count, and a waiting commit fails 55P03 once the queue ahead of it outlasts the 2 s lock_timeout in one lock stage.
- * Smaller batches shorten each hold. Uploaders that follow the published limit (desktop-core's
- * DeliveryLimits::with_published for default jobs, relayhistory sdk-ts exportLimitsFromPublished) prepare their NEXT
- * batches at min(advertised, 500); batches they already persisted keep their body and are retried unchanged.
+ * Smaller batches shorten each hold. Uploaders that follow the published limit prepare their NEXT batches at
+ * min(advertised, 500); batches they already persisted keep their body and are retried unchanged. Which clients follow
+ * it is a source reading (desktop-core DeliveryLimits::with_published, relayhistory sdk-ts exportLimitsFromPublished),
+ * not a verified release.
  *
  * What it never changes: the accepted limit. MAX_DELIVERY_RECORDS (500, vendor/delivery) still gates prepare,
  * async admission, recovery and turns, so a lower advertised value never refuses or strands a batch.
@@ -14,7 +15,8 @@
  * receipts in app.ts, and deliver.ts's receipt.
  *
  * Parsing: a strict decimal integer 1..MAX_DELIVERY_RECORDS (no sign, no leading zero, no spaces). Anything else is
- * treated as unset and reported once (`invalid`), never a refusal: a bad advertisement must not take uploads down.
+ * treated as unset and flagged (`invalid`); the Worker warns once per isolate (worker.ts), never a refusal: a bad
+ * advertisement must not take uploads down.
  */
 import { DELIVERY_LIMITS, MAX_DELIVERY_RECORDS, type DeliveryLimits } from "./vendor/delivery/delivery-contracts.ts";
 
@@ -27,8 +29,13 @@ export function parseAdvertisedMaxRecords(raw: string | undefined): AdvertisedMa
   return value >= 1 && value <= MAX_DELIVERY_RECORDS ? { value } : { invalid: true };
 }
 
-/** The limits object to publish. Unset (or equal to the accepted limit) returns DELIVERY_LIMITS itself. */
+/**
+ * The limits object to publish. Unset, equal to the accepted limit, or anything that is not an integer in
+ * 1..MAX_DELIVERY_RECORDS (NaN, fractions, 0, negatives, above 500: only the Worker path parses, other callers may not)
+ * returns DELIVERY_LIMITS itself.
+ */
 export function advertisedDeliveryLimits(maxRecords: number | undefined): Readonly<DeliveryLimits> {
-  if (maxRecords === undefined || maxRecords === DELIVERY_LIMITS.maxRecords) return DELIVERY_LIMITS;
+  if (maxRecords === undefined || !Number.isInteger(maxRecords) || maxRecords < 1 || maxRecords >= MAX_DELIVERY_RECORDS ||
+    maxRecords === DELIVERY_LIMITS.maxRecords) return DELIVERY_LIMITS;
   return Object.freeze({ ...DELIVERY_LIMITS, maxRecords });
 }
