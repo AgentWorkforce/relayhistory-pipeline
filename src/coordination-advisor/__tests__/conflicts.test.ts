@@ -101,18 +101,36 @@ describe("a claim shared by both sessions (live)", () => {
 
 describe("a claim's time is per session (H1)", () => {
   const ev = (session: string, min: number, id = 1) => ({ id, source: "claude", session_id: session, created_at: at(min) });
-  test("the founder keeps observed_at; a session that joined an older record gets its own evidence time", () => {
+  test("a sole holder keeps observed_at; on a record with several holders each session gets its own evidence time", () => {
+    const [solo] = parseClaimRows([row("s1", "intent", "x in supabase/migrations", "fnd", { observed_at: at(-50), evidence: [ev("fnd", -45), ev("fnd", -30, 2)] })]);
+    expect(claimTimeFor(solo!, "claude", "fnd")).toBe(at(-50));
     const [r] = parseClaimRows([row("i1", "intent", "x in supabase/migrations", "fnd", { observed_at: at(-50), evidence: [ev("fnd", -45), ev("join", -10, 2), ev("join", -5, 3)] })]);
-    expect(claimTimeFor(r!, "claude", "fnd")).toBe(at(-50));
-    expect(claimTimeFor(r!, "claude", "join")).toBe(at(-10));
+    expect([claimTimeFor(r!, "claude", "fnd"), claimTimeFor(r!, "claude", "join")]).toEqual([at(-45), at(-10)]);
     const s = liveSessions([cand("fnd"), cand("join")], [], [r!], NOW);
-    expect(s.map((x) => [x.session.sessionId, x.claims.map((c) => c.at)])).toEqual([["fnd", [at(-50)]], ["join", [at(-10)]]]);
-    // No observed_at (a decision): created_at for the founder; a joiner still its own evidence.
-    const [d] = parseClaimRows([row("d1", "decision", "y", "fnd", { created_at: at(-40), evidence: [ev("fnd", -40), ev("join", -12, 2)] })]);
+    expect(s.map((x) => [x.session.sessionId, x.claims.map((c) => c.at)])).toEqual([["fnd", [at(-45)]], ["join", [at(-10)]]]);
+    // No observed_at (a decision, or an erased holder): each session's own earliest evidence.
+    const [d] = parseClaimRows([row("d1", "decision", "y", "fnd", { created_at: at(-60), evidence: [ev("fnd", -40), ev("join", -12, 2)] })]);
     expect([claimTimeFor(d!, "claude", "fnd"), claimTimeFor(d!, "claude", "join")]).toEqual([at(-40), at(-12)]);
-    // A founder whose own evidence is earlier than the row's time (a replay row built from a joiner first) keeps its own.
-    const [e] = parseClaimRows([row("e1", "intent", "z", "join", { observed_at: at(-10), evidence: [ev("join", -10), ev("fnd", -50, 2)] })]);
-    expect([claimTimeFor(e!, "claude", "fnd"), claimTimeFor(e!, "claude", "join")]).toEqual([at(-50), at(-10)]);
+  });
+
+  // The three ways a record-level time could predate a session's own statement: each must stay LOW.
+  const decision = () => row("d1", "decision", "Advisories return 501 when the flag is off in src/advisories.", "own", { topic: "src-advisories",
+    created_at: at(-70), evidence: [ev("own", -70)] });
+  const INTENT = "Return 404 when the flag is off in src/advisories routes.";
+  const pairs = (intent: Record<string, unknown>, lanes: ReturnType<typeof lane>[], cands = ["own", "fnd", "join"]) =>
+    Object.fromEntries(liveConflictAdvisories("ws", liveSessions(cands.map((c) => cand(c)), lanes, parseClaimRows([decision(), intent]), NOW), NOW).advisories
+      .map((a) => [a.lanes.map((l) => l.sessionId).sort().join("+"), `${a.kind}/${a.urgency}`]));
+  test("a tie: one insert gives two holders the same evidence time; neither gets the record's observed_at", () => {
+    const intent = row("i1", "intent", INTENT, "fnd", { topic: "src-advisories", observed_at: at(-60), evidence: [ev("fnd", -10), ev("join", -10, 2)] });
+    expect(pairs(intent, [lane("join", [["src/advisories/route.ts", -30]])])).toEqual({ "fnd+own": "intent_conflict/low", "join+own": "intent_conflict/low" });
+  });
+  test("the founder moved: a joiner's earlier observed time moved observed_at; the founder's earlier write stays before its claim", () => {
+    const intent = row("i1", "intent", INTENT, "fnd", { topic: "src-advisories", observed_at: at(-60), evidence: [ev("fnd", -20), ev("join", -10, 2)] });
+    expect(pairs(intent, [lane("fnd", [["src/advisories/route.ts", -40]])])).toEqual({ "fnd+own": "intent_conflict/low", "join+own": "intent_conflict/low" });
+  });
+  test("an erased founder: observed_at NULL, created_at kept; the remaining holder is timed by its own evidence", () => {
+    const intent = row("i1", "intent", INTENT, "join", { topic: "src-advisories", observed_at: null, created_at: at(-60), evidence: [ev("join", -10)] });
+    expect(pairs(intent, [lane("join", [["src/advisories/route.ts", -30]])], ["own", "join"])).toEqual({ "join+own": "intent_conflict/low" });
   });
 
   test("a write made before the joining session stated the intent is not after its claim: LOW, not HIGH", () => {

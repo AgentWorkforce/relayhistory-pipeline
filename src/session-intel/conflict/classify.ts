@@ -105,11 +105,21 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
   const knownA = known(c.a), knownB = known(c.b);
   // A stored claim whose evidence spans both sessions appears on both sides with one recordId. An intent or a
   // decision is left out of both, so it can never be cited (it would be a self-conflict in disguise, or an
-  // "overlap" with itself). A propagating constraint stays on both sides, marked shared: it may be cited only as
-  // the constraint of a violation (validateCitations), never in an intent_conflict or an overlap.
-  const records = (v: ConflictCandidate["a"]) => new Set(v.claims.filter((cl) => cl.recordId !== undefined && isLiveClaim(cl, nowIso)).map((cl) => cl.recordId!));
+  // "overlap" with itself). A propagating constraint is kept, marked shared, on the side of its earliest holder only
+  // (the side whose copy is strictly earlier; a tie keeps neither): it may be cited only as the constraint of a
+  // violation (validateCitations), never in an intent_conflict or an overlap. So the session that restated it can
+  // still violate it, and its author is never flagged against its own constraint through the restater's copy.
+  const records = (v: ConflictCandidate["a"]) => {
+    const m = new Map<string, string>();
+    for (const cl of v.claims) if (cl.recordId !== undefined && isLiveClaim(cl, nowIso)) {
+      const cur = m.get(cl.recordId);
+      if (cur === undefined || cl.at < cur) m.set(cl.recordId, cl.at);
+    }
+    return m;
+  };
   const recA = records(c.a), recB = records(c.b);
-  const shared = new Set([...recA].filter((r) => recB.has(r)));
+  const shared = new Set([...recA.keys()].filter((r) => recB.has(r)));
+  const firstHolder = (name: SideName, recordId: string) => name === "a" ? recA.get(recordId)! < recB.get(recordId)! : recB.get(recordId)! < recA.get(recordId)!;
   const side = (name: SideName): JudgeSide => {
     const v = name === "a" ? c.a : c.b;
     const ref = refString(v.session);
@@ -119,7 +129,7 @@ export function buildJudgeInput(c: ConflictCandidate, now: Date): BuiltInput {
       const id = claimRef(ref, cl.id);
       if (!isLiveClaim(cl, nowIso)) { if (cl.at < nowIso) excluded.set(id, "superseded"); continue; }
       const isShared = cl.recordId !== undefined && shared.has(cl.recordId);
-      if (isShared && (cl.kind !== "constraint" || cl.scope === "session")) { excluded.set(id, "shared"); continue; }
+      if (isShared && (cl.kind !== "constraint" || cl.scope === "session" || !firstHolder(name, cl.recordId!))) { excluded.set(id, "shared"); continue; }
       if (cl.kind === "constraint" && cl.scope === "session") { excluded.set(id, "session_scope"); continue; }
       const mine = topicsOfClaim(cl, otherKnown).filter((t) => topics.has(t)).sort(textCompare);
       if (!mine.length) { excluded.set(id, isShared ? "shared" : "off_topic"); continue; }

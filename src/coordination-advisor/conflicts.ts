@@ -90,19 +90,22 @@ export function parseClaimRows(rows: ReadonlyArray<Record<string, unknown>>): Cl
 }
 
 /**
- * A claim's time for one session that holds it, from that session's own evidence. relayfacts keeps one row per
- * stored claim, with one `observed_at` (the earliest any holder reported) and evidence rows per holder. The session
- * holding the record's earliest evidence row founded it (or tied): its time is `observed_at` (else `created_at`), or
- * its own earliest evidence if that is earlier. Any other session joined an older record: its time is its own
- * earliest evidence row, never the record's, so a write it made before it stated the claim is not counted as after.
+ * A claim's time for one session that holds it, from that session's own evidence (conservative). relayfacts keeps
+ * one row per stored claim, with one `observed_at` and evidence rows per holder, and no observed time per evidence
+ * row. A merge moves `observed_at` to the earliest any holder reported, and an erase clears it, so on a record held
+ * by more than one session `observed_at` cannot be attributed to any one of them. So:
+ *  - a record whose evidence names this session only, with an `observed_at`: that `observed_at` (only this session's
+ *    own reports can have set or moved it; an erase of another holder would have cleared it);
+ *  - otherwise (several holders, a tie, a NULL `observed_at`, a decision): this session's own earliest evidence
+ *    `created_at`, which is when the claim was recorded for it, never earlier than its statement.
+ * An evidence time is the ingest time, so a session's claim may be timed later than it was made: that can only turn
+ * a HIGH into a LOW, never the reverse.
  */
 export function claimTimeFor(row: ClaimRow, source: string, sessionId: string): string {
   const own = row.evidence.filter((e) => e.source === source && e.sessionId === sessionId).map((e) => e.createdAt).sort(textCompare)[0];
-  const record = row.observedAt ?? row.createdAt;
-  if (own === undefined) return record;
-  const first = row.evidence.map((e) => e.createdAt).sort(textCompare)[0]!;
-  if (own > first) return own;
-  return textCompare(record, own) <= 0 ? record : own;
+  if (own === undefined) return row.observedAt ?? row.createdAt;
+  const alone = row.evidence.every((e) => e.source === source && e.sessionId === sessionId);
+  return alone && row.observedAt !== null ? row.observedAt : own;
 }
 
 /**
@@ -262,7 +265,8 @@ export function liveConflictAdvisories(workspaceId: string, sessions: readonly A
 /**
  * One tick's advisories for a workspace. A conflict never suppresses a collision: the advisor's HIGH rows (T1, T2,
  * the 60-minute T3) are always kept, and a pair with both gets both rows (the pair cooldown is per source class,
- * so neither holds back the other, in this tick or a later one). A pair with a constraint_violation or
+ * so neither holds back the other, in this tick or a later one; after a restart, durable rows of either class hold
+ * back both for up to one pair cooldown, 6 hours by default). A pair with a constraint_violation or
  * intent_conflict loses its LOW overlap rows (nearby_work, similar_summary). A conflict-detector `overlap` is
  * dropped when the advisor already has a row for the pair.
  */
