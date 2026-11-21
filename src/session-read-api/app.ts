@@ -322,6 +322,12 @@ export interface ReadApiDeps {
    * whose advisories carry `notifyEligible: true` on both advisory routes. Absent = empty: none.
    */
   advisoryNotifyRows?: ReadonlySet<string>;
+  /**
+   * READ_API_ADVISORY_PRIORITY_ENABLED (exactly "true"): advisory items and workspace alerts carry `priority`,
+   * `notifyEligible` (and on the advisories GET `delivery`). The advisories source gets the same switch for its v2
+   * ordering. Absent or false: both routes answer exactly as before M3-7.
+   */
+  advisoryPriority?: boolean;
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -2110,8 +2116,8 @@ export function createReadApi(deps: ReadApiDeps) {
   /**
    * Live coordination advisories, pull side (docs/coordination-live-advisories.md). The workspace
    * comes from the verified identity; `source` and `sessionId` select the recipient's rows. The GET
-   * serves pending or delivered rows (priority first, then oldest, at most 10; 062190, with the oldest-first v1 as the
-   * fallback); the ack is the only write.
+   * serves pending or delivered rows (oldest first, at most 10; with READ_API_ADVISORY_PRIORITY_ENABLED, priority
+   * first through 062190, with the oldest-first v1 as the fallback); the ack is the only write.
    */
   const advisoriesDisabled = (c: Context) => fail(c, unsupported("advisories_disabled"));
   const recipientOf = (identity: VerifiedIdentity, source: unknown, sessionId: unknown) => {
@@ -2138,7 +2144,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (status !== "pending") throw bad("status must be pending");
       const rows = await advisories.source.pending(recipient);
       log({ route: c.req.routePath, reason: "coordination_advisories_served", findings: rows.length, correlation_id: c.get("correlationId") });
-      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map((row) => advisoryItem(row, deps.advisoryNotifyRows)), nextCursor: null });
+      return c.json({ contract: ADVISORIES_CONTRACT, advisories: rows.slice(0, 10).map((row) => advisoryItem(row, deps.advisoryNotifyRows, deps.advisoryPriority === true)), nextCursor: null });
     } catch (error) {
       return fail(c, error);
     }
@@ -2195,6 +2201,7 @@ export function createReadApi(deps: ReadApiDeps) {
         orgId: identity.orgId, workspaceId: identity.workspaceId, now: Date.now(), source: intel.source, directory: deps.directory,
         shortSummary: deps.listShortSummary === true,
         ...(deps.advisoryNotifyRows ? { notifyRows: deps.advisoryNotifyRows } : {}),
+        ...(deps.advisoryPriority === true ? { priority: true } : {}),
         log: (fields) => log({ route: c.req.routePath, ...fields, correlation_id: correlationId }),
       });
       // Counts only, never an id or a title.

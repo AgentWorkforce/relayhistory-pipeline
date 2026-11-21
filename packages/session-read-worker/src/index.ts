@@ -137,7 +137,7 @@ import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince } from "../../../src/session-read-api/config.ts";
-import { sqlCoordinationAdvisories } from "../../../src/session-read-api/coordination-advisories.ts";
+import { pendingV2Cache, sqlCoordinationAdvisories } from "../../../src/session-read-api/coordination-advisories.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
@@ -194,8 +194,14 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_ADVISORIES_ENABLED?: string;
   /** Exactly "true": serve GET /v1/session-intel/workspace (sqlSessionIntel and the directory). */
   READ_API_SESSION_INTEL_ENABLED?: string;
-  /** `<kind>:<urgency>` rows whose advisories are notifyEligible (advisory-priority.ts); default empty; malformed = 503. */
+  /**
+   * `<kind>:<urgency>` rows whose advisories are notifyEligible (advisory-priority.ts); default empty. Malformed: the
+   * two advisory routes (GET /v1/coordination/advisories and GET /v1/session-intel/workspace) answer 503; every other
+   * route is served.
+   */
   READ_API_ADVISORY_NOTIFY_ROWS?: string;
+  /** Exactly "true": M3-7 advisory priority (062190's v2 ordering and the priority fields); anything else = off. */
+  READ_API_ADVISORY_PRIORITY_ENABLED?: string;
   /**
    * Exactly "true": serve GET and POST /v1/sessions/:sessionId/analysis (analysisDeps); anything
    * else = GET 501 analysis_not_configured and POST 405, as before the flag.
@@ -478,6 +484,34 @@ export interface Overrides {
   fetcher?: typeof fetch;
 }
 
+/** The routes that read READ_API_ADVISORY_NOTIFY_ROWS (a malformed list fails only these). */
+const ADVISORY_ROUTE = /^\/v1\/(coordination\/advisories(\/|$)|session-intel\/workspace$)/u;
+/**
+ * The source is built per request; "pending_for_v2 not installed" (and the warning's spacing) is remembered per
+ * isolate here, so a database without 062190 costs one probe per minute, not a failed statement per GET.
+ */
+const ADVISORIES_V2_CACHE = pendingV2Cache();
+
+/**
+ * The advisory deps from the Worker's env: the advisories GET (READ_API_COORDINATION_ADVISORIES_ENABLED; the ack's
+ * writer refuses, and the GET-only gate answers a POST with 405 before it), the notify rows, and the M3-7 priority
+ * switch (READ_API_ADVISORY_PRIORITY_ENABLED, exactly "true"), with the v1-fallback warning logged at warn.
+ */
+export function workerAdvisoryDeps(
+  env: Pick<Env, "READ_API_COORDINATION_ADVISORIES_ENABLED" | "READ_API_ADVISORY_PRIORITY_ENABLED">,
+  run: TenantRunner, advisoryNotifyRows: ReadonlySet<string>,
+  warnLog: (fields: Record<string, unknown>) => void = (fields) => log("warn", "coordination advisories pull fell back to v1", fields),
+) {
+  const priority = exactTrueFlag(env.READ_API_ADVISORY_PRIORITY_ENABLED);
+  return {
+    ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
+      ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(run, workerAckRefused, { priority, cache: ADVISORIES_V2_CACHE, warn: warnLog }) } }
+      : {}),
+    ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
+    ...(priority ? { advisoryPriority: true } : {}),
+  };
+}
+
 export async function handle(request: Request, env: Env, ctx: ExecutionContext, overrides: Overrides = {}): Promise<Response> {
   const pathname = new URL(request.url).pathname;
   if (pathname.startsWith("/v1/canonical/analyses/")) return canonicalAnalysisHandle(request, env, overrides.fetcher);
@@ -489,7 +523,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   let completeSinceMs: number;
   let authConfig: AuthConfig;
   let analyticsSelection: AnalyticsConfig;
-  let advisoryNotifyRows: ReadonlySet<string>;
+  let advisoryNotifyRows: ReadonlySet<string> = new Set();
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
     try {
@@ -521,12 +555,6 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS");
     }
-    // The notify allowlist is parsed strictly; a malformed list is a misconfigured deploy.
-    try {
-      advisoryNotifyRows = parseAdvisoryNotifyRows(env.READ_API_ADVISORY_NOTIFY_ROWS);
-    } catch {
-      throw new ConfigError("READ_API_ADVISORY_NOTIFY_ROWS");
-    }
     // The index verify flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
     try {
       ownerBufferedIndexVerifyEnabled(env.READ_API_OWNER_BUFFERED_INDEX_VERIFY);
@@ -537,6 +565,16 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
     return json(503, "backend_unavailable", "read backend unavailable");
+  }
+  // The notify allowlist is parsed strictly. A malformed list fails only the routes that read it (the advisories
+  // and the workspace view), with the same 503 as a misconfigured deploy; every other route is still served.
+  try {
+    advisoryNotifyRows = parseAdvisoryNotifyRows(env.READ_API_ADVISORY_NOTIFY_ROWS);
+  } catch {
+    if (ADVISORY_ROUTE.test(pathname)) {
+      log("error", "read worker not configured", { error_code: "missing_READ_API_ADVISORY_NOTIFY_ROWS" });
+      return json(503, "backend_unavailable", "read backend unavailable");
+    }
   }
   const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
     repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
@@ -568,11 +606,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
       ? { digest: { cache: sqlNarrativeCache(tenant.run), ...(env.DIGEST_NARRATIVE ? { generator: serviceNarrativeGenerator(env.DIGEST_NARRATIVE) } : {}) } }
       : {}),
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
-    // The GET only; the ack's writer refuses, and the GET-only gate above answers a POST with 405 before it.
-    ...(exactTrueFlag(env.READ_API_COORDINATION_ADVISORIES_ENABLED)
-      ? { coordinationAdvisories: { enabled: true as const, source: sqlCoordinationAdvisories(tenant.run, workerAckRefused, { warn: (fields) => log("warn", "coordination advisories pull fell back to v1", fields) }) } }
-      : {}),
-    ...(advisoryNotifyRows.size > 0 ? { advisoryNotifyRows } : {}),
+    ...workerAdvisoryDeps(env, tenant.run, advisoryNotifyRows),
     ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),

@@ -84,6 +84,8 @@ id**, newest first (the earliest `created_at` of its rows), at most **100**.
 - `sessions`: the distinct recipient and peer sessions of its rows, byte-ordered. Two for a pair; at most 4 when the
   recipients name different peers (a planned-fleet conflict sent to two orchestrators).
 - `acked`: one entry per recipient row, with whether that recipient acked.
+- `priority` and `notifyEligible` are present only with `READ_API_ADVISORY_PRIORITY_ENABLED` exactly `true` (default
+  off); with it off an alert has neither field, exactly as before M3-7.
 - `priority`: 1, 2 or 3, from the same shared function as `GET /v1/coordination/advisories`
   (`src/session-read-api/advisory-priority.ts`; see [the advisories doc](coordination-live-advisories.md), "Priority
   and delivery"), applied to the advisory's urgency and kind. Desktop dedupes system notifications by `advisoryId`
@@ -215,7 +217,8 @@ The `bulls96_read_api` role's transactions are read-only by default; these reade
 
 | Flag | Default | Turns on |
 |---|---|---|
-| `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible` rows, shared with the advisories GET |
+| `READ_API_ADVISORY_PRIORITY_ENABLED` | off | `priority` and `notifyEligible` on alerts (and the advisories GET's priority order), shared with the advisories GET |
+| `READ_API_ADVISORY_NOTIFY_ROWS` | empty | `notifyEligible` rows, shared with the advisories GET; malformed: this route and the advisories GET answer 503 on the read Worker, and the self-host service and the Lambda fail to start |
 | `READ_API_SESSION_INTEL_ENABLED` | off | `GET /v1/session-intel/workspace` on the self-host service, the hosted Lambda and the read Worker |
 
 Applying migration `062170` to any real database, and enabling the flag in production, each need Khaliq's own

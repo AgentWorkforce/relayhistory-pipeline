@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import {
+  PENDING_SQL, PENDING_V1_DELIVERY_SQL, PENDING_V2_ABSENT_TTL_MS, PENDING_V2_SIGNATURE, PENDING_V2_SQL, pendingV2Cache,
   poolTenantWriter, sqlCoordinationAdvisories,
   type AdvisoriesSource, type AdvisoryRecipient, type AdvisoryRow,
 } from "../coordination-advisories.ts";
@@ -56,9 +57,10 @@ function memorySource(rows: AdvisoryRow[] = [row(0)]) {
   return { source, calls, acked };
 }
 
-const api = (enabled: boolean | undefined, source = memorySource().source, cors?: ReadonlySet<string>, canary: ReadonlySet<string> = new Set([ID.workspaceId]), notifyRows?: ReadonlySet<string>) => createReadApi({
+const api = (enabled: boolean | undefined, source = memorySource().source, cors?: ReadonlySet<string>, canary: ReadonlySet<string> = new Set([ID.workspaceId]), notifyRows?: ReadonlySet<string>, priority?: boolean) => createReadApi({
   verify, adapter: {} as never, liveness: memoryLiveness().liveness, completeSinceMs: 0, directoryWorkspaces: canary,
   ...(notifyRows ? { advisoryNotifyRows: notifyRows } : {}),
+  ...(priority === undefined ? {} : { advisoryPriority: priority }),
   ...(enabled === undefined ? {} : { coordinationAdvisories: { enabled, source } }),
   ...(cors ? { corsAllowedOrigins: cors } : {}),
 });
@@ -133,17 +135,26 @@ describe("GET /v1/coordination/advisories", () => {
     expect(body.advisories).toHaveLength(10);
     expect(body.advisories.map((a: any) => a.advisoryId)).toEqual(rows.slice(0, 10).map((a) => a.advisoryId));
     const first = body.advisories[0];
-    // M3-7 appends priority and delivery; the eight original keys keep their order (additive, same contract).
-    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence", "priority", "notifyEligible", "delivery"]);
-    expect(first.priority).toBe(2);
-    expect(first.notifyEligible).toBe(false);
-    expect(first.delivery).toEqual({ dm: false, deliveredAt: null });
+    // The priority switch is off by default: exactly the eight pre-M3-7 keys.
+    expect(Object.keys(first)).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence"]);
     expect(first.peer).toEqual({ source: "claude", sessionId: "p-0" });
     expect(first.evidence).toEqual([{ sessionId: "s-1", eventId: "e-0", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }]);
     expect(first.message.length).toBeLessThanOrEqual(ADVISORY_MESSAGE_MAX);
     expect(first.message).toContain("codex:s-1 and claude:p-0 both wrote src/shared.ts");
     expect(first.message).toContain("first seen 2026-11-12T09:58:12.000Z");
     expect(mem.calls).toEqual([{ op: "pending", recipient: { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" } }]);
+  });
+
+  test("switch off (absent or false): the response bytes are exactly the pre-M3-7 ones, whatever the notify rows say", async () => {
+    const one = [row(0, { deliveredAt: "2026-11-12T10:05:00.000Z" })];
+    const expected = '{"contract":"coordination-advisories/1","advisories":[{"advisoryId":"9f3c2a71d04be6e0","urgency":"high","kind":"concurrent_edit","artifact":"src/shared.ts","peer":{"source":"claude","sessionId":"p-0"},"createdAt":"2026-11-12T10:00:00.000Z","message":"relayhistory-coordination: possible duplicate work.\\nYour session codex:s-1 and claude:p-0 both wrote src/shared.ts\\n(concurrent_edit, first seen 2026-11-12T09:58:12.000Z). Please check with the other agent before continuing.\\nAdvisory 9f3c2a71d04be6e0; ack it at the end of your turn.","evidence":[{"sessionId":"s-1","eventId":"e-0","ts":"2026-11-12T09:58:12.000Z","kind":"tool"}]}],"nextCursor":null}';
+    for (const priority of [undefined, false]) {
+      const r = await api(true, memorySource(one).source, undefined, undefined, parseAdvisoryNotifyRows("concurrent_edit:high"), priority).request(base, { headers: auth });
+      expect(await r.text()).toBe(expected);
+    }
+    const on = await (await api(true, memorySource(one).source, undefined, undefined, undefined, true).request(base, { headers: auth })).json() as any;
+    expect(Object.keys(on.advisories[0])).toEqual(["advisoryId", "urgency", "kind", "artifact", "peer", "createdAt", "message", "evidence", "priority", "notifyEligible", "delivery"]);
+    expect(on.advisories[0]).toMatchObject({ priority: 2, notifyEligible: false, delivery: { dm: true, deliveredAt: "2026-11-12T10:05:00.000Z" } });
   });
 
   test("M3-7: priority by urgency and kind, and delivery from delivered_at (dm true only once the DM set it)", async () => {
@@ -158,7 +169,7 @@ describe("GET /v1/coordination/advisories", () => {
       [{ urgency: "low", kind: "nearby_work" }, 3, { dm: false, deliveredAt: null }],
     ];
     const rows = cases.map(([over], i) => row(i, over));
-    const body = await (await api(true, memorySource(rows).source).request(base, { headers: auth })).json() as any;
+    const body = await (await api(true, memorySource(rows).source, undefined, undefined, undefined, true).request(base, { headers: auth })).json() as any;
     expect(body.contract).toBe("coordination-advisories/1");
     expect(body.advisories.map((a: any) => [a.kind, a.urgency, a.priority, a.delivery])).toEqual(
       cases.map(([over, p, d]) => [over.kind, over.urgency, p, d]));
@@ -170,7 +181,7 @@ describe("GET /v1/coordination/advisories", () => {
       row(2, { urgency: "high", kind: "superseded_work" }), row(3, { urgency: "high", kind: "concurrent_edit" }),
     ];
     const read = async (notifyRows?: ReadonlySet<string>) =>
-      ((await (await api(true, memorySource(rows).source, undefined, undefined, notifyRows).request(base, { headers: auth })).json()) as any).advisories.map((a: any) => a.notifyEligible);
+      ((await (await api(true, memorySource(rows).source, undefined, undefined, notifyRows, true).request(base, { headers: auth })).json()) as any).advisories.map((a: any) => a.notifyEligible);
     expect(await read()).toEqual([false, false, false, false]);
     expect(await read(parseAdvisoryNotifyRows(""))).toEqual([false, false, false, false]);
     expect(await read(parseAdvisoryNotifyRows("duplicate_work:high"))).toEqual([true, false, false, false]);
@@ -269,7 +280,22 @@ describe("sqlCoordinationAdvisories", () => {
     return { log, released: () => released, pool: { connect: async () => client } };
   }
 
-  test("pending reads the 062190 priority-first function in the given READ ONLY runner with the recipient and the page bound", async () => {
+  test("switch off (the default): only 062000's v1, the exact pre-M3-7 statement; no v2 statement is ever issued", async () => {
+    const texts: string[] = [];
+    const read = async <T,>(_o: string, _w: string, work: (q: any) => Promise<T>) =>
+      work({ query: async (text: string, params?: unknown[]) => { texts.push(`${text} ${JSON.stringify(params)}`); return { rows: [] }; } });
+    for (const opts of [{}, { priority: false }]) {
+      await sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, opts)
+        .pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
+    }
+    expect(PENDING_SQL).toBe(`SELECT advisory_id, harness, session_id, peer_harness, peer_session_id, urgency, kind, artifact,
+       evidence, created_at
+  FROM sessions.coordination_advisories_pending_for_v1($1, $2, $3, $4)`);
+    expect(texts).toEqual([`${PENDING_SQL} ["org","ws","codex","s-1"]`, `${PENDING_SQL} ["org","ws","codex","s-1"]`]);
+    expect(texts.join("\n")).not.toMatch(/pending_for_v2|to_regprocedure/);
+  });
+
+  test("switch on: pending reads the 062190 priority-first function in the given READ ONLY runner with the recipient and the page bound", async () => {
     const p = pool((t) => t.includes("pending_for_v2") ? [{
       advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "low",
       kind: "concurrent_edit", artifact: "src", evidence: [{ sessionId: "s-1", eventId: "e", ts: "2026-11-12T09:58:12.000Z", kind: "tool" }],
@@ -281,7 +307,7 @@ describe("sqlCoordinationAdvisories", () => {
       const c = await p.pool.connect();
       return work({ query: async (text: string, params?: unknown[]) => c.query(text, params) });
     };
-    const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never);
+    const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { priority: true });
     const rows = await src.pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
     expect(seen).toEqual(["org/ws"]);
     expect(p.log).toEqual([expect.stringContaining('sessions.coordination_advisories_pending_for_v2 ["org","ws","codex","s-1",10]')]);
@@ -297,45 +323,76 @@ describe("sqlCoordinationAdvisories", () => {
       const c = await p.pool.connect();
       return work({ query: async (text: string, params?: unknown[]) => c.query(text, params) });
     };
-    const rows = await sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never)
+    const rows = await sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { priority: true })
       .pending({ orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" });
     expect(p.log[0]).toMatch(/created_at, delivered_at\s+FROM sessions\.coordination_advisories_pending_for_v2/);
     expect(rows[0]!.deliveredAt).toBe("2026-11-12T10:05:00.000Z");
   });
 
-  test("062190 not applied (42883): v1 in a fresh transaction, oldest first, with a counted warning; any other error is not a fallback", async () => {
+  test("switch on, 062190 not installed: one probe, then v1 for the TTL with no failed statement; the warning at most once per TTL", async () => {
     const calls: string[] = [];
     const warns: Record<string, unknown>[] = [];
-    let missing = true;
+    let t = 1_000;
     const read = async <T,>(_org: string, _ws: string, work: (q: any) => Promise<T>) => {
       calls.push("BEGIN");
-      return work({ query: async (text: string) => {
-        if (text.includes("pending_for_v2")) {
+      return work({ query: async (text: string, params?: unknown[]) => {
+        if (text === PENDING_V2_SQL) {
           calls.push("v2");
-          if (missing) throw Object.assign(new Error("function sessions.coordination_advisories_pending_for_v2 does not exist"), { code: "42883" });
-          throw Object.assign(new Error("boom"), { code: "57014" });
+          throw Object.assign(new Error("function sessions.coordination_advisories_pending_for_v2 does not exist"), { code: "42883" });
         }
+        if (text.includes("to_regprocedure")) { calls.push(`probe ${JSON.stringify(params)}`); return { rows: [{ installed: false }] }; }
+        expect(text).toBe(PENDING_V1_DELIVERY_SQL);
         calls.push("v1");
         return { rows: [{ advisory_id: ADV, harness: "codex", session_id: "s-1", peer_harness: "claude", peer_session_id: "p", urgency: "high",
           kind: "duplicate_work", artifact: "m.sql", evidence: [], created_at: new Date(0), delivered_at: null }] };
       } });
     };
-    const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { warn: (f) => { warns.push(f); } });
+    // A shared cache: the Worker builds a source per request.
+    const cache = pendingV2Cache();
+    const make = () => sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { priority: true, cache, now: () => t, warn: (f) => { warns.push(f); } });
     const r = { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" };
-    expect((await src.pending(r)).map((a) => a.advisoryId)).toEqual([ADV]);
-    expect((await src.pending(r)).length).toBe(1);
-    expect(calls).toEqual(["BEGIN", "v2", "BEGIN", "v1", "BEGIN", "v2", "BEGIN", "v1"]);
+    expect((await make().pending(r)).map((a) => a.advisoryId)).toEqual([ADV]);
+    expect(calls).toEqual(["BEGIN", "v2", "BEGIN", `probe ${JSON.stringify([PENDING_V2_SIGNATURE])}`, "BEGIN", "v1"]);
+    calls.length = 0;
+    t += 10_000;
+    expect((await make().pending(r)).length).toBe(1);
+    t += 10_000;
+    expect((await make().pending(r)).length).toBe(1);
+    expect(calls).toEqual(["BEGIN", "v1", "BEGIN", "v1"]);
+    expect(warns).toEqual([{ reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 1 }]);
+    // After the TTL it probes v2 again, and warns again (with the running count).
+    calls.length = 0;
+    t += PENDING_V2_ABSENT_TTL_MS;
+    await make().pending(r);
+    expect(calls).toEqual(["BEGIN", "v2", "BEGIN", `probe ${JSON.stringify([PENDING_V2_SIGNATURE])}`, "BEGIN", "v1"]);
     expect(warns).toEqual([
       { reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 1 },
-      { reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 2 },
+      { reason: "coordination_advisories_v1_fallback", error_code: "42883", fallbacks: 4 },
     ]);
-    missing = false;
-    await expect(src.pending(r)).rejects.toThrow("boom");
-    expect(warns.length).toBe(2);
-    // Through the route: the fallback still answers 200 with the same item shape.
-    missing = true;
-    const body = await (await api(true, src).request(base, { headers: auth })).json() as any;
+    // Through the route with the switch on: the fallback still answers 200 with the M3-7 item shape.
+    t += PENDING_V2_ABSENT_TTL_MS;
+    const body = await (await api(true, make(), undefined, undefined, undefined, true).request(base, { headers: auth })).json() as any;
     expect(body.advisories.map((a: any) => [a.advisoryId, a.priority])).toEqual([[ADV, 1]]);
+  });
+
+  test("switch on: a 42883 while pending_for_v2 IS installed (signature drift) is rethrown, never a fallback; other errors too", async () => {
+    const calls: string[] = [];
+    const warns: unknown[] = [];
+    let code = "42883";
+    const read = async <T,>(_org: string, _ws: string, work: (q: any) => Promise<T>) => work({ query: async (text: string) => {
+      if (text === PENDING_V2_SQL) { calls.push("v2"); throw Object.assign(new Error("drift"), { code }); }
+      if (text.includes("to_regprocedure")) { calls.push("probe"); return { rows: [{ installed: true }] }; }
+      calls.push("v1"); return { rows: [] };
+    } });
+    const src = sqlCoordinationAdvisories(read as never, (() => { throw new Error("no write"); }) as never, { priority: true, warn: (f) => { warns.push(f); } });
+    const r = { orgId: "org", workspaceId: "ws", source: "codex", sessionId: "s-1" };
+    await expect(src.pending(r)).rejects.toThrow("drift");
+    expect(calls).toEqual(["v2", "probe"]);
+    // Not cached as absent: the next GET tries v2 again.
+    code = "57014";
+    await expect(src.pending(r)).rejects.toThrow("drift");
+    expect(calls).toEqual(["v2", "probe", "v2"]);
+    expect(warns).toEqual([]);
   });
 
   test("ack runs in one READ WRITE transaction with the tenant bound, and rolls back on error", async () => {

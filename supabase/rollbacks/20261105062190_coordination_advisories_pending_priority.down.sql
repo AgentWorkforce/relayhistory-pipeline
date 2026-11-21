@@ -14,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062190_coordination_advisories_pending_priority.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='coordination advisories priority reader: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062190_coordination_advisories_pending_priority.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'a716ba376766022ad3503ffe76609ff469ed165a79a6bbd7d2b4a54631ea6845'
+ IF NOT FOUND OR v_sha<>'896cde6541634d5c081b1c2ae75ab264a1812a28b872b6f88852414992f35577'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='coordination advisories priority reader: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.coordination_advisories_pending_for_v2(text,text,text,text,integer);
