@@ -299,9 +299,11 @@ export const STEPS: readonly Step[] = [
           revision: String(r.revision), operation: r.operation, received_at: received, payload: servicePayload(r) })),
         meta: records.map((r) => [r.revision_id, sha(JSON.stringify(r)), SOURCE, f.sessionId]),
       };
-      await io.editFence(keys.fence, (fence) => ({ next: fence, result: undefined }));
+      const previousFence = await io.readFence(keys.fence);
+      await io.editFence(keys.fence, (fence) => ({ next: previousFence.state === "present" || fence.version > 0 ? null : fence, result: undefined }));
       const read = await io.readFence(keys.fence);
       must(read.state === "present", "buffered fixture has no current S3 fence");
+      if (previousFence.state === "present") must(read.version === previousFence.version, "buffered fixture changed an existing fence");
       const fence = read.fence, sessionHash = sessionKeyHash(SOURCE, f.sessionId);
       const putJson = (key: string, value: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(value)));
       await putJson(orgFenceAuthorityKey(KEY_ROOT, TENANT_B.org), { ...FENCE_AUTHORITY, orgId: TENANT_B.org });
@@ -339,8 +341,12 @@ export const STEPS: readonly Step[] = [
       must(c.manifest && c.manifest.raw.chunks.length > 0, "buffered drain wrote no canonical manifest/chunks");
       const prefix = c.manifestKey!.slice(0, c.manifestKey!.indexOf("/v1/"));
       const named = chunkKeys(c.manifest as never, { prefix }).map((k) => String(k.key));
-      for (const key of named) must(c.keys.includes(key) && (await store.head(objectKey(key))) !== undefined, "a buffered canonical chunk is missing");
-      await until(60_000, 1000, async () => {
+      for (const key of named) {
+        must(c.keys.includes(key) && (await store.head(objectKey(key))) !== undefined, "a buffered canonical chunk is missing");
+        const raw = await readAll(await store.get(objectKey(key)));
+        must(raw.length > 0 && !Buffer.from(raw).toString("latin1").includes(f.marker), "a buffered canonical chunk is empty or not sealed");
+      }
+      await until(240_000, 1000, async () => {
         const r = await call(stack.readUrl, `/v1/sessions/${f.sessionId}/events?source=${SOURCE}&${ws(TENANT_B)}`, { token: stack.tokens.b });
         return r.status === 200 && hasEvent(r, f.marker) ? { done: true } : { last: `buffered events: ${r.status}, fixture marker present=${hasEvent(r, f.marker)}` };
       });
