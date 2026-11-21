@@ -56,6 +56,6 @@ production success.
 - C=2: 12 of 12 at n=100 (median 0.55 s, max 2.2 s) and 4 of 6 at n=500.
 - Run 1 at C=8, n=100: 0 of 59 tries over 30 s per budget (250 ms, 1 s, 5 s, and a 1 s budget with fast backoff).
 
-**Uploads:** no failures in any valid cell. Each flip cell's latency and throughput fall between its two controls, so no stall can be attributed to failed tries.
+**Uploads:** no failures in any valid cell. Each flip cell's throughput falls between its two controls or above both (C=4, n=500), so no stall can be attributed to failed tries.
 
 **Reading:** under sustained back-to-back load from 4 or more uploaders, a 50000 try-lock rarely finds an instant with no shared holder. Production transactions are longer, so that instant is rarer there.
