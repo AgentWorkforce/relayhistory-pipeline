@@ -17,6 +17,7 @@ import {batch,record,TENANT} from "./support.ts";
 import {orderedFixtureLedger,initializeFixtureSeatClock}from "./ordered-support.ts";
 import {publicationRpc} from "../publication-rpc.ts";
 import {canonicalPublicationTick,publishBufferedStage} from "../publication-job.ts";
+import {lazyAckT2FlipOutcome,type FlipResult} from "../lazy-ack-t2-flip.ts";
 import {layoutComponent} from "../../shared/layout-component.ts";
 import type {ObjectStore} from "../../shared/vendor.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
@@ -218,6 +219,29 @@ describe.skipIf(!url)("background publisher actual PostgreSQL admission",()=>{
   expect((await d.pool.query("SELECT cleanup_state FROM sessions.ingest_stage_intents")).rows[0].cleanup_state).toBe("retired");
   expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows[0].state).toBe("published");
  },15000);
+ test("062210: the real publisher and an upload complete while try-lock T2 flips run back to back (no queued exclusive, no stall)",async()=>{
+  const d=await fixture();
+  await d.pool.query("ALTER FUNCTION sessions.ingest_lazy_ack_batch(jsonb) SET bulls96.lazy_ack_t2='fenced'");
+  let stop=false;const flips:FlipResult[]=[];let queued=0;
+  const flipper=(async()=>{let to:"main"|"t2"="t2";
+   while(!stop){const r=await lazyAckT2FlipOutcome((q,p)=>d.pool.query(q,p as never[])as never,to,{budgetMs:50});flips.push(r);if(r.result==="switched")to=to==="t2"?"main":"t2";
+    queued=Math.max(queued,Number((await d.pool.query("SELECT count(*) n FROM pg_locks WHERE locktype='advisory' AND NOT granted AND objid=50000")).rows[0].n));}})();
+  const t0=performance.now();
+  let published:any,uploaded:any;
+  try{[published,uploaded]=await Promise.all([
+   publishBufferedStage({rpc:d.rpc,target:d.target,store:()=>d.store},d.stage,{enabled:true,maxJobMs:10000,heartbeatMs:100}).then((r)=>({r,ms:performance.now()-t0})),
+   deliverBatch({ledger:d.ledger,target:{store:d.store,keyRoot:"96bulls"},acceptanceMode:"buffered"},TENANT,await batch([record({record_id:"t2-flip-r2"})],{batch_id:"t2-flip-b2"})).then((r)=>({r,ms:performance.now()-t0})),
+  ]);}finally{stop=true;await flipper;}
+  console.log(JSON.stringify({case:"062210 publisher under flips",publishMs:Math.round(published.ms),uploadMs:Math.round(uploaded.ms),
+   flips:{tries:flips.length,switched:flips.filter((f)=>f.result==="switched").length,noSwitch:flips.filter((f)=>f.result==="no_switch").length},maxQueuedOn50000:queued}));
+  expect(published.r.enabled).toBe(true);
+  expect((await d.pool.query("SELECT state FROM sessions.ingest_publication_attempts")).rows[0].state).toBe("published");
+  expect(uploaded.r.outcome).toBe("accepted_buffered");
+  expect(flips.every((f)=>f.result!=="indeterminate")).toBe(true);
+  expect(flips.length).toBeGreaterThan(0);
+  // A successful try holds 50000 exclusive for one autocommit statement; nothing ever queues behind a FAILED try.
+  expect(published.ms).toBeLessThan(10000);
+ },30000);
  test("layout SQL exactly matches shared JS including astral and long identities",async()=>{
   const d=await fixture();
   for(const id of["plain",".leading","sess:1","emoji😀mix","é"+"x".repeat(200),"x".repeat(127)+"😀z"]){
