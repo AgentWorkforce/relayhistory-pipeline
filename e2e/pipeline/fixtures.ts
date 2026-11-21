@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { deliveryAccount } from "../../src/session-ingest/vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION } from "../../src/session-ingest/vendor/delivery/delivery-contracts.ts";
+import type { DeliveryKind } from "../../src/session-ingest/vendor/delivery/delivery-contracts.ts";
 import type { Tenant } from "../selfhost/stack.ts";
 
 export const SOURCE = "claude";
@@ -22,6 +23,7 @@ export const FIXTURES = {
   s3Second: { sessionId: "0195f000-0000-7000-8000-00000000b002", originId: "origin-e2e-s3", marker: "pipesthreesecond" },
   s3AfterReset: { sessionId: "0195f000-0000-7000-8000-00000000b003", originId: "origin-e2e-s3", marker: "pipesthreeafter" },
   s3Rearm: { sessionId: "0195f000-0000-7000-8000-00000000b004", originId: "origin-e2e-s3", marker: "pipesthreerearm" },
+  buffered: { sessionId: "0195f000-0000-7000-8000-00000000b005", originId: "origin-e2e-buffered", marker: "pipebufferedmarker" },
 } as const satisfies Record<string, Fixture>;
 
 /**
@@ -41,7 +43,7 @@ export async function deliveryBatch(tenant: Tenant, f: Fixture, opts: { batch: s
     result_status: "completed", role, stop_reason: null, subagent_session_id: null, text,
     token_json: null, tool_use_id: null, ts_ms: ts, turn_id: `turn-${id}`,
   });
-  const payloads: [string, Record<string, unknown>][] = [
+  const payloads: [DeliveryKind, Record<string, unknown>][] = [
     ["session", {
       agent_version: null, cwd: project, discovery_state: "full", first_activity_ms: STARTED_MS,
       first_prompt: `${f.marker} first prompt`, git_branch: null, initial_commit: null,
@@ -57,8 +59,8 @@ export async function deliveryBatch(tenant: Tenant, f: Fixture, opts: { batch: s
   const records = payloads.map(([kind, payload], index) => {
     const recordId = sha(`${f.originId}:${kind}:${f.sessionId}:${index}`);
     return {
-      kind, operation: "upsert", origin_id: f.originId, payload, record_id: recordId,
-      revision: opts.revision, revision_id: sha(`${recordId}:${opts.revision}:${JSON.stringify(payload)}`), schema_version: 1,
+      kind, operation: "upsert" as const, origin_id: f.originId, payload, record_id: recordId,
+      revision: opts.revision, revision_id: sha(`${recordId}:${opts.revision}:${JSON.stringify(payload)}`), schema_version: 1 as const,
       session_id: f.sessionId, source: SOURCE,
     };
   });
