@@ -4,22 +4,23 @@
  * and Postgres where the piece's output is storage. Bounded waits only; no model calls; no network beyond the
  * stack. The step ids are the contract with flows/lib/classify.mjs (which steps a "targeted" run selects).
  */
-import { existsSync } from "node:fs";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { zstdDecompressSync } from "node:zlib";
 import { mintToken } from "../../src/alleyoop/auth.ts";
 import { runCourierOnce } from "../../src/alleyoop/courier.ts";
 import { fixedBearerToken } from "../../src/alleyoop/relay-auth-token.ts";
 import { readSummaryObject } from "../../src/bob-costas/summary-objects.ts";
 import { createHash } from "node:crypto";
 import { createS3Eraser } from "../../src/migration/neon-s3-erasure/eraser.ts";
-import { s3Ledger, s3LedgerKeys, fenceAuthorityKey } from "../../src/session-ingest/ledger-s3.ts";
+import { s3Ledger, s3LedgerKeys, s3LedgerObjects, fenceAuthorityKey, orgFenceAuthorityKey, sessionKeyHash, fenceEpoch } from "../../src/session-ingest/ledger-s3.ts";
+import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "../../src/session-ingest/staging.ts";
+import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, acceptedCompleteKey, drainBufferedBatches } from "../../src/session-ingest/buffered-drain.ts";
 import { sweepRearmMarkers } from "../../src/session-ingest/rearm-sweeper.ts";
-import { liveMachineId } from "../../src/session-ingest/writer.ts";
+import { liveMachineId, type Group } from "../../src/session-ingest/writer.ts";
 import type { LedgerTenant } from "../../src/session-ingest/ledger.ts";
-import { deliveryAccount } from "../../src/session-ingest/vendor/delivery/prepare.ts";
+import { deliveryAccount, servicePayload } from "../../src/session-ingest/vendor/delivery/prepare.ts";
 import { masterKeyring, parseMasterKeys } from "../../src/shared/keyring.ts";
 import { chunkKeys, manifestKey, objectKey, readAll, type ObjectStore } from "../../src/shared/vendor.ts";
 import { TENANT_A, TENANT_B, type Tenant } from "../selfhost/stack.ts";
@@ -27,7 +28,6 @@ import { COURIER_SESSION, FENCE_AUTHORITY, FIXTURES, SOURCE, STARTED_MS, courier
 import { CANONICAL_BUCKET, HOOP_BUCKET, HOOP_SERVICES, HOOP_TENANT, KEY_ROOT, SELFHOST_SERVICES, type PipelineStack } from "./stack.ts";
 import { proveCoordinationAdvisories } from "./coordination.ts";
 
-const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 export type Result = "PASS" | "FAIL" | "SKIP";
 export interface StepResult { id: string; title: string; result: Result; detail: string; ms: number }
 class Failed extends Error {}
@@ -285,6 +285,73 @@ export const STEPS: readonly Step[] = [
     },
   },
   {
+    id: "backlog.drain", title: "i. the backlog drain over a buffered stage", leg: "selfhost",
+    async run({ stack }) {
+      // Self-contained on a fresh stack. In the full run this precedes controls.s3, whose user-wide reset
+      // deliberately makes older buffered stages ineligible; do not replace that fence with a test override.
+      const f = FIXTURES.buffered, store = stack.store(CANONICAL_BUCKET), tenant = ledgerTenant(TENANT_B);
+      const io = s3LedgerObjects(store, KEY_ROOT), keys = s3LedgerKeys(KEY_ROOT, tenant);
+      const received = new Date(STARTED_MS).toISOString();
+      const { batch: { records } } = await deliveryBatch(TENANT_B, f, { batch: "drain-1", revision: 1 });
+      const group: Group = {
+        source: SOURCE, sessionId: f.sessionId,
+        lines: records.map((r) => JSON.stringify({ kind: r.kind, origin_id: r.origin_id, record_id: r.record_id,
+          revision: String(r.revision), operation: r.operation, received_at: received, payload: servicePayload(r) })),
+        meta: records.map((r) => [r.revision_id, sha(JSON.stringify(r)), SOURCE, f.sessionId]),
+      };
+      await io.editFence(keys.fence, (fence) => ({ next: fence, result: undefined }));
+      const read = await io.readFence(keys.fence);
+      must(read.state === "present", "buffered fixture has no current S3 fence");
+      const fence = read.fence, sessionHash = sessionKeyHash(SOURCE, f.sessionId);
+      const putJson = (key: string, value: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(value)));
+      await putJson(orgFenceAuthorityKey(KEY_ROOT, TENANT_B.org), { ...FENCE_AUTHORITY, orgId: TENANT_B.org });
+      const prepared = prepareBufferedStage(KEY_ROOT, {
+        claim_token: "00000000-0000-4000-8000-000000000001", batch_digest: sha("e2e-buffered-drain-batch"),
+        received_at: received, org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: f.originId, user_id: tenant.userId,
+      }, [group], [records.map((_, i) => i)]);
+      await putBufferedStage(store, prepared);
+      // Synthetic accepted-export boundary; this does not prove SQL's acceptance/export job.
+      await putJson(prepared.spec.key + ACCEPTED_SUFFIX, {
+        v: 2, kind: "buffered-accepted", stage_sha256: prepared.spec.sha256, live: true, kept: [records.map((_, i) => i)],
+        fence: { instance: fence.instance, resets: fence.resets, resetsCompleted: fence.resetsCompleted,
+          epochs: { [sessionHash]: fenceEpoch(fence, f.originId, sessionHash) } },
+      });
+      await putJson(acceptedCompleteKey(KEY_ROOT, TENANT_B.org), {
+        v: 1, kind: "buffered-accepted-complete", stages: 1, completedAtMs: STARTED_MS,
+      });
+      const options = { store, keyRoot: KEY_ROOT, orgs: [TENANT_B.org], dryRun: false,
+        decompress: (b: Uint8Array) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })), sleep: async () => {} };
+      const drained = await drainBufferedBatches(options);
+      must(drained.stopped === "complete" && drained.objects.drained === 1 && drained.sessions_written === 1
+        && drained.lines.candidate === records.length && drained.lines.written === records.length
+        && drained.orgs_without_authority === 0 && Object.keys(drained.write_failures).length === 0,
+      `buffered drain: ${JSON.stringify(drained)}`);
+      const marker = JSON.parse(Buffer.from(await readAll(await store.get(objectKey(prepared.spec.key + DRAINED_SUFFIX)))).toString("utf8"));
+      must(marker.kind === "buffered-drained" && marker.outcome === "drained" && marker.staged_sha256 === prepared.spec.sha256,
+        "drained marker does not attest this staged object's digest");
+      const owner = JSON.parse(Buffer.from(await readAll(await store.get(objectKey(keys.owner(f.originId, SOURCE, f.sessionId))))).toString("utf8"));
+      must(owner.originId === f.originId && owner.source === SOURCE && owner.sessionId === f.sessionId, "wrong buffered ownership stub");
+      for (const r of records) {
+        const entry = (await io.readIndex(keys.revisions(f.originId, r.record_id)))?.doc.records[r.record_id];
+        must(entry && entry[0] === r.revision && entry[1] === r.revision_id && entry[2] === sha(JSON.stringify(r)), "missing or incorrect buffered revision index entry");
+      }
+      const c = await canonical(stack, TENANT_B, f);
+      must(c.manifest && c.manifest.raw.chunks.length > 0, "buffered drain wrote no canonical manifest/chunks");
+      const prefix = c.manifestKey!.slice(0, c.manifestKey!.indexOf("/v1/"));
+      const named = chunkKeys(c.manifest as never, { prefix }).map((k) => String(k.key));
+      for (const key of named) must(c.keys.includes(key) && (await store.head(objectKey(key))) !== undefined, "a buffered canonical chunk is missing");
+      await until(60_000, 1000, async () => {
+        const r = await call(stack.readUrl, `/v1/sessions/${f.sessionId}/events?source=${SOURCE}&${ws(TENANT_B)}`, { token: stack.tokens.b });
+        return r.status === 200 && hasEvent(r, f.marker) ? { done: true } : { last: `buffered events: ${r.status}, fixture marker present=${hasEvent(r, f.marker)}` };
+      });
+      const again = await drainBufferedBatches(options);
+      const after = await canonical(stack, TENANT_B, f);
+      must(again.objects.already_drained === 1 && again.objects.drained === 0 && again.lines.written === 0
+        && after.manifest?.revision === c.manifest.revision, `buffered rerun was not a no-op: ${JSON.stringify(again)}`);
+      return `buffered stage -> ${records.length} canonical records; digest-bound drained marker, ownership and revision indexes; all ${named.length} manifest chunk(s) stored; consumer/read API marker visible; rerun already_drained=1 with unchanged manifest`;
+    },
+  },
+  {
     id: "controls.s3", title: "g. controls on the S3 ledger: equal revision stale, disable, reset, re-uploads not admitted", leg: "selfhost",
     async run({ stack }) {
       // Self-host under INGEST_LEDGER=s3 serves no selection or reset route (selfhost-config.ts refuses session
@@ -355,13 +422,6 @@ export const STEPS: readonly Step[] = [
       const again = await sweepRearmMarkers({ store, eraser }, { keyRoot: KEY_ROOT, bucket: CANONICAL_BUCKET, orgs: [TENANT_B.org], now: later });
       must(again.counts.alreadyDone >= 1 && again.counts.erased === 0, `second sweep: ${JSON.stringify(again.counts)}`);
       return `admitted, then claim/disable/commit rearmed=1; sweep erased 1 session (${pass.counts.versions} versions), ${before.keys.length} -> 0 objects, other sessions intact; second sweep alreadyDone=${again.counts.alreadyDone}`;
-    },
-  },
-  {
-    id: "backlog.drain", title: "i. the backlog drain over a buffered stage", leg: "selfhost",
-    async run() {
-      if (!existsSync(join(ROOT, "src/session-ingest/buffered-drain.ts"))) throw new Skipped("pending #578 (the S3-only buffered backlog drain is not on this branch)");
-      throw new Failed("src/session-ingest/buffered-drain.ts is on this branch but this lane does not drive it yet: add the step (docs/pipeline-e2e.md)");
     },
   },
   {
