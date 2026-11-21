@@ -266,7 +266,7 @@ const isMigrationDir = (parts: string[], i: number) => {
  * most 14 digits (`0042_`, `20261105062150_`). The depth is kept. Everything else, a sentence, a key-shaped name, a name with `@` or
  * whitespace, is hashed.
  */
-export function scrubPath(path: string, hasher: Hasher): string {
+export function scrubPath(path: string, hasher: Pick<Hasher, "segment">): string {
   const parts = path.split("/");
   const lastLower = parts[parts.length - 1]!.toLowerCase();
   return parts.map((seg, i) => {

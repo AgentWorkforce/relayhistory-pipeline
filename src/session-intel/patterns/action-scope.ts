@@ -1,5 +1,6 @@
 /** Offline, opt-in action scope. Consumes only manifest-pinned public sidecar bytes, never reverse maps. */
-import { PROVENANCE_BOUNDS, PROVENANCE_FORMAT, type ActionRecord } from "../import/provenance.ts";
+import { PROVENANCE_BOUNDS, PROVENANCE_FORMAT, PROVENANCE_PATH_FORMAT, REPOSITORY_PATH_ENCODING, type ActionRecord } from "../import/provenance.ts";
+import { IMPORT_BOUNDS, repoRelativePath, scrubPath } from "../import/normalize.ts";
 import type { Snapshot, SnapshotSession } from "../replay/snapshot.ts";
 import { canonicalJson, isoTime, isRecord, onlyKeys, sha256Hex } from "../replay/util.ts";
 
@@ -15,22 +16,35 @@ const hash = (v: unknown, prefix = "") => typeof v === "string" && new RegExp(`^
 const stamp = (v: unknown) => { const t = isoTime(v, "time"); if (t !== v) fail(); return t; };
 const id = (v: unknown, max = 512) => { if (typeof v !== "string" || !v || v.length > max || /[\u0000-\u001f\u007f]/u.test(v)) fail(); };
 
+/** Recognize the existing M4 vocabulary without learning the salt or inventing a second scrub policy. */
+function encodedPath(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > IMPORT_BOUNDS.path || repoRelativePath(value, null) !== value) return false;
+  const segment = (s: string) => {
+    // generated/<hash>.manifest.json is the import's special hot-path spelling.
+    const token = /^([a-f0-9]{12})(?:\.manifest)?$/u.exec(s)?.[1];
+    return token ?? "!";
+  };
+  return scrubPath(value, { segment }) === value;
+}
+
 /** Exact per-fact join, including kind and timestamp: an event id alone is not an action identity. */
-export function readActionScope(snapshot: Snapshot, now: Date): Map<string, ActionRecord> {
+export function readActionScope(snapshot: Snapshot, now: Date, options: { repositoryPaths?: boolean } = {}): Map<string, ActionRecord> {
   try {
+    const expected = options.repositoryPaths ? { ...definition, format: PROVENANCE_PATH_FORMAT, repositoryPathEncoding: REPOSITORY_PATH_ENCODING } : definition;
+    const recordFields = options.repositoryPaths ? [...fields, "repositoryPath"] : fields;
     const text = snapshot.extraFiles?.[ACTION_FILE];
     if (text === undefined || Buffer.byteLength(text) > PROVENANCE_BOUNDS.exportBytes || sha256Hex(text) !== snapshot.manifest.files[ACTION_FILE]) fail();
     const raw: unknown = JSON.parse(text);
     if (!isRecord(raw)) fail();
-    onlyKeys(raw, [...Object.keys(definition), "sessionsSha256", "implementationSha256", "counts", "definitionSha256", "deleteBy", "repositoryMapFingerprint", "records"], "sidecar");
-    for (const [k, v] of Object.entries(definition)) {
+    onlyKeys(raw, [...Object.keys(expected), "sessionsSha256", "implementationSha256", "counts", "definitionSha256", "deleteBy", "repositoryMapFingerprint", "records"], "sidecar");
+    for (const [k, v] of Object.entries(expected)) {
       if (k === "bounds") {
         if (!isRecord(raw.bounds)) fail();
         onlyKeys(raw.bounds, Object.keys(PROVENANCE_BOUNDS), "bounds");
         for (const [key, n] of Object.entries(PROVENANCE_BOUNDS)) if (raw.bounds[key] !== n) fail();
       } else if (raw[k] !== v) fail();
     }
-    if (raw.definitionSha256 !== sha256Hex(JSON.stringify(definition)) || !hash(raw.implementationSha256)
+    if (raw.definitionSha256 !== sha256Hex(JSON.stringify(expected)) || !hash(raw.implementationSha256)
       || !hash(raw.sessionsSha256) || raw.sessionsSha256 !== snapshot.manifest.files["sessions.jsonl"]
       || (raw.repositoryMapFingerprint !== null && !(typeof raw.repositoryMapFingerprint === "string" && /^m_[a-f0-9]{64}$/u.test(raw.repositoryMapFingerprint)))) fail();
     const deleteBy = stamp(raw.deleteBy);
@@ -45,8 +59,8 @@ export function readActionScope(snapshot: Snapshot, now: Date): Map<string, Acti
     const records = new Map<string, ActionRecord>();
     for (const r of raw.records) {
       if (!isRecord(r)) fail();
-      onlyKeys(r, fields, "record");
-      if (Object.keys(r).length !== fields.length) fail();
+      onlyKeys(r, recordFields, "record");
+      if (Object.keys(r).length !== recordFields.length) fail();
       id(r.harness, 64); id(r.sessionId); id(r.eventId);
       if (!["write", "commit", "outcome"].includes(r.kind as string)) fail();
       const factAt = stamp(r.factAt), sourceAt = stamp(r.sourceAt), availableAt = stamp(r.availableAt);
@@ -69,6 +83,8 @@ export function readActionScope(snapshot: Snapshot, now: Date): Map<string, Acti
       if (r.repository === null && r.repositoryTarget !== null) fail();
       // Projection facts cannot recover an individual nested call's working directory.
       if ((r.source === "code_mode_projection" || r.reason === "projection_scope_unavailable") && (r.repository !== null || r.repositoryTarget !== null)) fail();
+      if (options.repositoryPaths && r.repositoryPath !== null && (!encodedPath(r.repositoryPath) || r.kind !== "write"
+        || r.repository === null || r.repositoryTarget === null || r.repositoryBasis !== "operator_declared" || r.reason !== "literal")) fail();
       const record = r as unknown as ActionRecord;
       const key = actionKey(record, record.kind, { ts: factAt, eventId: record.eventId });
       if (!facts.has(key) || records.has(key)) fail();
