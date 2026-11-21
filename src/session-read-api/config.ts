@@ -36,7 +36,9 @@ export const READ_API_ADVISORY_PRIORITY_ENABLED = "READ_API_ADVISORY_PRIORITY_EN
  * Exactly "true" (exactTrueFlag): the advisory instance (20261105062220). The advisories GET reads pending_for_v3,
  * answers contract "advisories/v3" and gives each item its `incarnation` (null on a legacy row); an ack POST with an
  * `incarnation` acks that instance through ack_v2. Anything else: the response bytes and the v1 ack exactly as before.
- * Needs 062220 applied (no fallback: turn it off before rolling 062220 back).
+ * Instance mode is priority-first whatever READ_API_ADVISORY_PRIORITY_ENABLED says (v3 is v2's order; that switch
+ * still decides the priority fields). Needs 062220 applied (no fallback: the GET answers 503 and logs
+ * coordination_advisories_pending_for_v3_missing; turn it off before rolling 062220 back).
  */
 export const READ_API_ADVISORY_INSTANCE_ENABLED = "READ_API_ADVISORY_INSTANCE_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/session-intel/workspace; anything else = 501 `unsupported_by_backend`, reason `session_intel_disabled`. */

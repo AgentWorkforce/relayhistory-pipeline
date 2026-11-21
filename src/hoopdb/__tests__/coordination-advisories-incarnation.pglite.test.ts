@@ -162,6 +162,8 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     expect(await ackV1(1)).toBe(true);
     expect(await ackV1(1)).toBe(true);
     expect(await row(1)).toMatchObject({ status: "acked", incarnation: null });
+    // A legacy row acked through v1 is no instance: ack_v2 with any UUID is no_match, not already_acked.
+    expect(await ackV2(1, crypto.randomUUID())).toBe("no_match");
     // ack_v2 never matches a legacy row, whatever incarnation it is given.
     expect(await ackV2(2, crypto.randomUUID())).toBe("no_match");
     expect(await row(2)).toMatchObject({ status: "pending", incarnation: null });
@@ -258,6 +260,9 @@ describe("20261105062220 coordination advisories: the advisory instance", () => 
     // The Desktop that holds the LOW instance sees a new instance on the next pull.
     expect((await pending(3)).map((r) => [r.advisory_id, r.urgency, r.incarnation])).toEqual([[hex(1), "high", inc2]]);
     expect(await ackV2(1, inc2)).toBe("acked");
+    // The old instance stays no_match after the new one is acked (not already_acked).
+    expect(await ackV2(1, inc1)).toBe("no_match");
+    expect(await ackV2(1, inc2)).toBe("already_acked");
     // Retention: the acked row ages out and the sweep deletes it; the next scan re-inserts the SAME id.
     await db.query("UPDATE sessions.coordination_advisories SET created_at = now() - interval '8 days' WHERE advisory_id = $1", [hex(1)]);
     expect(await h.as("service_role", async (tx) => (await tx.query("SELECT * FROM sessions.coordination_advisories_sweep_v1()")).rows[0])).toEqual({ expired: 0, deleted: 1 });
