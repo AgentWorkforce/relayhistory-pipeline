@@ -520,6 +520,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "tables sessions.relayfacts_claims_v1 and sessions.relayfacts_claim_evidence_v1 and function sessions.relayfacts_claims_insert_v1",
     sql: "SELECT to_regclass('sessions.relayfacts_claims_v1') IS NOT NULL AND to_regclass('sessions.relayfacts_claim_evidence_v1') IS NOT NULL AND to_regprocedure('sessions.relayfacts_claims_insert_v1(text,text,jsonb)') IS NOT NULL AS applied",
   },
+  "upstream:20261105062210_lazy_ack_t2.sql": {
+    evidence: "table sessions.lazy_ack_t2_mode and the gated T2 staged ACK (bulls96.lazy_ack_t2)",
+    sql: "SELECT to_regclass('sessions.lazy_ack_t2_mode') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%current_setting(''bulls96.lazy_ack_t2'',true)%' AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
