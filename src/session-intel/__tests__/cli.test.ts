@@ -18,8 +18,9 @@ const at = (m: string) => `2026-11-01T09:${m}:00.000Z`;
 test("default replay CLI outputs match the pre-adapter 74914c24 golden byte for byte", async () => {
   const out = join(temp(), "out"), fixture = new URL("./fixtures/snapshot", import.meta.url).pathname;
   expect(await main(["replay", "--snapshot", fixture, "--out", out, "--allow-repo-out"], io())).toBe(0);
-  // Produced by running the baseline CLI against this same synthetic fixture and fixed clock.
-  const expected = { "alerts.json": "2c1ca63e1d3700cf2245692567501c77fcc86abebf5f021c16ffcdeb5157bd33", "report.json": "cd31005136d3ef97d6fde0042701c7b76554e9768b3144ffa34418070aa4428f", "report.md": "8e7caf841a643e1e95c92f77e7c3564e3f79a33d246410a93cc750864a8d21b0" };
+  // Produced by running the baseline CLI against this same synthetic fixture and fixed clock. Re-pinned for 062220's
+  // writer flag: it edits coordination-advisor sources, so only the detector's sourceSha256 (and the hash over it) moved.
+  const expected = { "alerts.json": "c8af973122cd4313e064f97835631bf157abacd18bb9451d46db25dd86927c55", "report.json": "bba12068a02546fc6aad39fa6df0a040b6c41762ad66eb414aef3a8cfbdff9fe", "report.md": "c8a34a83deee57598bc1d84dbee4eb884b5e2badd8f0c6e77395f9e0da5ae356" };
   for (const [file, digest] of Object.entries(expected)) expect(sha256Hex(readFileSync(join(out, file)))).toBe(digest);
   expect(replayDetectors(undefined).map((d) => d.name)).toEqual(["coordination-advisor"]);
 });

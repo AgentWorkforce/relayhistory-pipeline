@@ -40,19 +40,20 @@ export async function advisorMain(env: Record<string, string | undefined>, io: A
     await io.idle();
     return "disabled";
   }
-  // Every refusal (malformed value, DM on without its token or URL, an unavailable backend) happens here, before HoopDb opens.
+  // Every refusal (malformed value, DM on without its token or URL, DM with the instance writer, an unavailable backend)
+  // happens here, before HoopDb opens.
   const cfg = advisorConfig(env);
   const sender = io.sender(cfg);
   const backendFor = io.backend(cfg, env);
   const limits = new AdvisorLimits(cfg);
   // The allowlist size only, never its ids. Empty: the worker runs and scans nothing.
-  log.info(`coordination advisor enabled; workspaces=${cfg.workspaces === "*" ? "all" : cfg.workspaces.size}`,
+  log.info(`coordination advisor enabled; workspaces=${cfg.workspaces === "*" ? "all" : cfg.workspaces.size}${cfg.incarnation ? "; writer=upsert_v2" : ""}`,
     { service: ADVISOR_SERVICE, state: cfg.relayDm.enabled ? "dm_on" : "dm_off", kind: cfg.factsBackend });
   await io.runWorker({
     service: ADVISOR_SERVICE,
     stages: [],
     handlers: () => ({}),
-    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces,
+    tick: advisorTick((db) => ({ store: sqlAdvisorStore(db, cfg.incarnation ? { incarnation: true } : {}), backend: backendFor(db), limits, sender, workspaces: cfg.workspaces,
       ...(cfg.conflicts ? { conflicts: true } : {}) }), { intervalMs: cfg.intervalMs }),
   });
   return "ran";
