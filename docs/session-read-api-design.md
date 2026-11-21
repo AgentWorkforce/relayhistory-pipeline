@@ -493,9 +493,15 @@ service and the Worker read it alike):
   or `null`, the last completed projection as stored, so it can be set while `eventsReady` is false). Rows, order
   and cursor are unchanged.
 - `readyOnly=true`: only the ready sessions. The predicate is in the SQL, before `ORDER BY`, the keyset and
-  `LIMIT p_limit + 1`, so a page is full whenever it has a `nextCursor`, and nothing repeats or is skipped. It
-  applies to `q` reads too. Each 200 carries `X-Relayhistory-Ready-Only: applied`. **A client must check this
+  `LIMIT p_limit + 1`, so a page is full whenever it has a `nextCursor`. Across a walk, no row repeats and none
+  is skipped as long as its readiness and activity time do not change during the walk; a row that becomes ready,
+  becomes not ready again, or moves in activity time while a client pages can appear, vanish or move, as with any
+  keyset list. It applies to `q` reads too; with owner-buffered reads configured, `q` + `readyOnly` answers 501
+  `q_with_buffered`, as `q` alone does on main. Each 200 carries `X-Relayhistory-Ready-Only: applied`. **A client must check this
   header: readers older than this change ignore the param and answer 200 unfiltered, without it.**
+
+Order of checks: the workspace checks and the `includeAgentName` / `includeShortSummary` checks answer before
+the readiness parameter check, so a request that fails one of those gets that answer, not a readiness one.
 
 Grammar: only the exact `true` turns either on. With the flag on, any other value (`false`, `1`, empty, `TRUE`)
 or a repeated param is 400 (`<name> must be true`), as `includeShortSummary` answers 400 for anything but

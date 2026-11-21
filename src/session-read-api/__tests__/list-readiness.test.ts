@@ -234,6 +234,32 @@ describe("flag on: what each param does", () => {
   });
 });
 
+describe("CORS exposes X-Relayhistory-Ready-Only only with the flag on", () => {
+  test("flag on: the expose-headers value ends with the readiness header; flag off (absent or false): the pre-readiness value", async () => {
+    const origins = new Set(["https://app.example.test"]);
+    const expose = async (deps: Record<string, unknown>) => {
+      const app = createReadApi({
+        verify: async () => ({ userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] }),
+        ch: {} as never,
+        liveness: memoryLiveness().liveness,
+        completeSinceMs: 0,
+        directory: sqlDirectory((async (_o, _w, work) => work({ async query<R>() { return { rows: [] as R[] }; } })) as TenantRunner),
+        directoryWorkspaces: new Set(["ws-a"]),
+        corsAllowedOrigins: origins,
+        ...deps,
+      } as never);
+      const r = await app.request("/v1/sessions?workspace=ws-a", { headers: { authorization: "Bearer t", origin: "https://app.example.test" } });
+      return r.headers.get("access-control-expose-headers");
+    };
+    const base = "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation";
+    expect(await expose({})).toBe(base);
+    expect(await expose({ listReadiness: false })).toBe(base);
+    const on = await expose(ON);
+    expect(on).toBe(`${base}, ${READY_ONLY_HEADER}`);
+    expect(on!.endsWith(", X-Relayhistory-Ready-Only")).toBe(true);
+  });
+});
+
 describe("the cursor binds readyOnly", () => {
   const position = { lastActivityAt: "2026-10-04T12:00:00.000001Z", sessionId: "s-2", harness: "codex" };
   const marked = encodeReadyListCursor(position);
