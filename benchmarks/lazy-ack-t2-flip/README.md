@@ -42,3 +42,20 @@ SESSION_INGEST_TEST_PG_URL=postgresql://postgres@127.0.0.1:<port>/postgres RCF_O
 
 The barrier-free fraction falls as concurrency and hold time grow, so treat the numbers as an upper bound on
 production success.
+
+## Results (`results/`): local loopback PostgreSQL 16.15, one laptop
+
+| File | Cells | Status |
+|---|---|---|
+| `run1-partial.jsonl` (plan `run1-plan.json`) | C=8, 30 s cells, budgets 250 ms / 1 s / 5 s and one fast backoff | **The n=100 cells stand.** Throughput fell across cells, flip and no-flip alike (cells ran in sequence on a growing database). **The n=500 cells are withdrawn:** the host disk filled (`No space left on device`), hence the `delivery_unavailable` and `57P03` failures. |
+| `run2-c8.json`, `run2-c4.json`, `run2-c2.json` | C=8/4/2, 20 s cells: a no-flip control, then a flip cell (budget 5 s), then another control, for n=100 and for n=500 | Primary evidence. Compare each flip cell with the controls on either side of it. |
+
+**Run 2, flips with a 5 s budget and 1 s between tries:**
+- C=8: 1 of 4 tries switched at n=100 and 1 of 4 at n=500. Each success took about 20 attempts and 1.3-2.4 s.
+- C=4: 1 of 4 at both sizes.
+- C=2: 12 of 12 at n=100 (median 0.55 s, max 2.2 s) and 4 of 6 at n=500.
+- Run 1 at C=8, n=100: 0 of 59 tries over 30 s per budget (250 ms, 1 s, 5 s, and a 1 s budget with fast backoff).
+
+**Uploads:** no failures in any valid cell. Each flip cell's latency and throughput fall between its two controls, so no stall can be attributed to failed tries.
+
+**Reading:** under sustained back-to-back load from 4 or more uploaders, a 50000 try-lock rarely finds an instant with no shared holder. Production transactions are longer, so that instant is rarer there.

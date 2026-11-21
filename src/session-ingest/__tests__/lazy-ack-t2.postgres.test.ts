@@ -314,7 +314,7 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
         await lockWaiting(A.pid); // A holds 50000 shared and waits on X's clock lock
         expect((await operatorFlip("t2", { budgetMs: 300 })).result).toBe("no_switch");
         await busyFlip("t2");
-        const dt = Number.parseInt((await pool.query("SHOW deadlock_timeout")).rows[0].deadlock_timeout);
+        const dt = Number((await pool.query("SELECT setting FROM pg_settings WHERE name='deadlock_timeout'")).rows[0].setting); // ms, whatever SHOW's unit
         const lt = Math.max(1, Math.floor(dt / 5));
         await X.c.query(`SET LOCAL lock_timeout='${lt}ms'`);
         const t0 = performance.now();
