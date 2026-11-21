@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_|session_intel_controls_v1)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_|coordination_advisor_|ingest_origin_|ingest_turn_|ingest_set_session_uploads_internal|buffered_turn_sources_for|aa_session_directory_hide_turn_only|ingest_legacy_export_scope_authority_register|legacy_export_privacy_|summary_regeneration_audit_|read_api_token_issue_v2|relayfacts_|relayfacts_evidence_|search_reconcile_|session_analysis_cutover_free|session_analysis_first_seen_v1|org_s3_cutover_|staged_facts_|session_intel_controls_v1|lazy_ack_t2_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -1007,6 +1007,33 @@ test("real tree: after the full tree including 062120, the cutover proof is a ru
   await s.db.exec(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_read_api') THEN CREATE ROLE bulls96_read_api; END IF; END $$`);
   await s.db.exec(`GRANT EXECUTE ON FUNCTION ${fn} TO bulls96_read_api`);
   expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${fn}: `))).toBe(true);
+});
+
+test("real tree: after the full tree including 062210, the T2 flip function is owner-only, the gate is off, the mode is 'main', the replaced ACK keeps its ACL, and an extra grant is ACL drift", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const T2 = "upstream:20261105062210_lazy_ack_t2.sql";
+  expect(s.split.held).toContain(T2);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(T2);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  const flip = "sessions.lazy_ack_t2_set_mode(text)";
+  expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(flip);
+  expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(flip);
+  expect((await s.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.c)
+    .toContain("bulls96.lazy_ack_t2=off");
+  expect((await s.db.query<{ mode: string }>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+  const c = client(s.db);
+  expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  for (const role of ["bulls96_session_ingest", "service_role"]) {
+    await s.db.exec(`GRANT EXECUTE ON FUNCTION ${flip} TO ${role}`);
+    expect((await sessionsFunctionAclDrift(c, "history_rt")).some((d) => d.startsWith(`${flip}: `))).toBe(true);
+    await s.db.exec(`REVOKE EXECUTE ON FUNCTION ${flip} FROM ${role}`);
+    expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
+  }
 });
 
 test("real tree: controls getter is runtime-only and an extra grant is ACL drift", async () => {
