@@ -200,13 +200,23 @@ export type RecentAdvisory =
   | { kind: "pair"; recipient: SessionRef; peer: SessionRef; urgency: Urgency; latestAt: number }
   | { kind: "recipient"; recipient: SessionRef; latestAt: number; sentLastHour: number };
 
-const levelKey = (pair: string, urgency: Urgency) => `${urgency}\u0002${pair}`;
+/**
+ * The source class of a pair cooldown: the advisor's own rows (collision and overlap), or the conflict detector's
+ * (M2-4). Each class cools down only itself. `any` is internal: durable state (062070) does not say which class
+ * wrote a row, so a seeded row that this process cannot attribute holds back both classes.
+ */
+export type CooldownSource = "advisor" | "conflict";
+type CooldownBucket = CooldownSource | "any";
+const levelKey = (pair: string, urgency: Urgency, bucket: CooldownBucket) => `${bucket}\u0003${urgency}\u0002${pair}`;
 
 /**
- * Per-pair cooldown, per urgency, and per-recipient hourly cap. A HIGH write starts the HIGH cooldown and
- * a LOW write the LOW one; a HIGH advisory waits only on the HIGH cooldown, so a LOW never holds back a
- * HIGH, while a LOW waits on either. In memory, merged with durable state by `seed` when a reader for it
- * exists; the upsert (never re-inserts an existing row, never touches an acked one) keeps a DM from repeating.
+ * Per-pair cooldown, per urgency and per source class, and per-recipient hourly cap. A HIGH write starts the HIGH
+ * cooldown and a LOW write the LOW one; a HIGH advisory waits only on the HIGH cooldown, so a LOW never holds back a
+ * HIGH, while a LOW waits on either. A source class waits only on its own writes (and on durable state it cannot
+ * attribute), so a conflict row never holds back a collision row for the pair, nor the reverse. The source defaults
+ * to `advisor`: with conflicts off, every write and check is the advisor's and the cooldown is exactly as before.
+ * In memory, merged with durable state by `seed` when a reader for it exists; the upsert (never re-inserts an
+ * existing row, never touches an acked one) keeps a DM from repeating.
  */
 export class AdvisorLimits {
   private readonly pairs = new Map<string, number>();
@@ -214,29 +224,21 @@ export class AdvisorLimits {
   constructor(private readonly cfg: { pairCooldownMs: number; sessionHourlyCap: number }) {}
   get pairCooldownMs(): number { return this.cfg.pairCooldownMs; }
 
-  inCooldown(pair: string, urgency: Urgency, now: number): boolean {
-    const cooling = (u: Urgency) => {
-      const at = this.pairs.get(levelKey(pair, u));
+  inCooldown(pair: string, urgency: Urgency, now: number, source: CooldownSource = "advisor"): boolean {
+    const cooling = (u: Urgency) => ([source, "any"] as const).some((b) => {
+      const at = this.pairs.get(levelKey(pair, u, b));
       return at !== undefined && now - at < this.cfg.pairCooldownMs;
-    };
+    });
     return cooling("high") || (urgency === "low" && cooling("low"));
   }
   underCap(recipient: SessionRef, now: number): boolean {
     return this.recent(refKey(recipient), now).length < this.cfg.sessionHourlyCap;
   }
-  /**
-   * The pair cooldown state as it is now, frozen: a later touchPair does not change it. scan.ts's deliver uses it
-   * when conflict rows are on, so one tick's advisories from two sources (the advisor's and the conflict
-   * detector's) for one pair are each checked against the state the tick started with.
-   */
-  cooldownSnapshot(): { inCooldown(pair: string, urgency: Urgency, now: number): boolean } {
-    const frozen = new AdvisorLimits(this.cfg);
-    for (const [k, at] of this.pairs) frozen.pairs.set(k, at);
-    return { inCooldown: (pair, urgency, now) => frozen.inCooldown(pair, urgency, now) };
+  /** Any write attempt for the pair (inserted, upgraded or skipped) starts or re-seeds its cooldown for its source. */
+  touchPair(pair: string, urgency: Urgency, at: number, source: CooldownSource = "advisor"): void {
+    this.touch(levelKey(pair, urgency, source), at);
   }
-  /** Any write attempt for the pair (inserted, upgraded or skipped) starts or re-seeds its cooldown. */
-  touchPair(pair: string, urgency: Urgency, at: number): void {
-    const k = levelKey(pair, urgency);
+  private touch(k: string, at: number): void {
     this.pairs.set(k, Math.max(at, this.pairs.get(k) ?? at));
   }
   /** One advisory written for the recipient (inserted or upgraded). */
@@ -251,7 +253,15 @@ export class AdvisorLimits {
    */
   seed(rows: RecentAdvisory[], now: number): void {
     for (const r of rows) {
-      if (r.kind === "pair") { this.touchPair(pairKey(r.recipient, r.peer), r.urgency, r.latestAt); continue; }
+      if (r.kind === "pair") {
+        // A durable pair row carries no source class. When this process holds the pair's cooldown for a class at
+        // that urgency, the row is its own write: it keeps that class's later time (the advisor's only, with
+        // conflicts off: exactly as before). Otherwise (a restart) it holds back both classes.
+        const pair = pairKey(r.recipient, r.peer);
+        const own = (["advisor", "conflict"] as const).map((b) => levelKey(pair, r.urgency, b)).filter((k) => this.pairs.has(k));
+        for (const k of own.length ? own : [levelKey(pair, r.urgency, "any")]) this.touch(k, r.latestAt);
+        continue;
+      }
       const k = refKey(r.recipient);
       const have = this.recent(k, now);
       if (have.length < r.sentLastHour) this.sent.set(k, [...have, ...Array<number>(r.sentLastHour - have.length).fill(r.latestAt)]);

@@ -11,7 +11,7 @@ import type { LaneFacts } from "../../packages/coordination-detect/src/index.ts"
 import { COORDINATION_EVIDENCE_LOOKBACK_MS } from "../session-read-api/coordination-backend.ts";
 import { conflictCandidates } from "../session-intel/conflict/candidates.ts";
 import {
-  alertArtifact, buildJudgeInput, citable, decide, validateCitations, type Classification, type Decision, type JudgeAction, type JudgeClaim, type SideName,
+  alertArtifact, buildJudgeInput, citable, decide, validateCitations, type Classification, type Decision, type JudgeAction, type JudgeClaim, type JudgeSide, type SideName,
 } from "../session-intel/conflict/classify.ts";
 import { ruleClassify } from "../session-intel/conflict/judges.ts";
 import type { ClaimKind, ClaimScope, SnapshotClaim, SnapshotSession } from "../session-intel/replay/snapshot.ts";
@@ -90,9 +90,25 @@ export function parseClaimRows(rows: ReadonlyArray<Record<string, unknown>>): Cl
 }
 
 /**
+ * A claim's time for one session that holds it, from that session's own evidence. relayfacts keeps one row per
+ * stored claim, with one `observed_at` (the earliest any holder reported) and evidence rows per holder. The session
+ * holding the record's earliest evidence row founded it (or tied): its time is `observed_at` (else `created_at`), or
+ * its own earliest evidence if that is earlier. Any other session joined an older record: its time is its own
+ * earliest evidence row, never the record's, so a write it made before it stated the claim is not counted as after.
+ */
+export function claimTimeFor(row: ClaimRow, source: string, sessionId: string): string {
+  const own = row.evidence.filter((e) => e.source === source && e.sessionId === sessionId).map((e) => e.createdAt).sort(textCompare)[0];
+  const record = row.observedAt ?? row.createdAt;
+  if (own === undefined) return record;
+  const first = row.evidence.map((e) => e.createdAt).sort(textCompare)[0]!;
+  if (own > first) return own;
+  return textCompare(record, own) <= 0 ? record : own;
+}
+
+/**
  * The live inputs as the replay's as-of sessions: one per candidate lane, with its facts when the facts read
  * returned any (a session with claims and no writes yet is still a candidate). A claim is attached to
- * every session its evidence names; its time is `observed_at`, else `created_at`; a decision has no scope
+ * every session its evidence names, at that session's own time (claimTimeFor); a decision has no scope
  * (`session`, which only matters for constraints). Facts at or after `now` are left out (ts < now, as in replay).
  */
 export function liveSessions(candidates: readonly CandidateLane[], facts: readonly LaneFacts[], claims: readonly ClaimRow[], now: Date): AsOfSession[] {
@@ -107,7 +123,7 @@ export function liveSessions(candidates: readonly CandidateLane[], facts: readon
       seen.add(k);
       const mine = row.evidence.filter((x) => x.source === e.source && x.sessionId === e.sessionId).map((x) => x.id).filter(Boolean);
       claimsOf.set(k, [...(claimsOf.get(k) ?? []), {
-        id: row.id, at: row.observedAt ?? row.createdAt, kind: row.kind, scope: row.scope ?? "session", text: row.statement,
+        id: row.id, at: claimTimeFor(row, e.source, e.sessionId), kind: row.kind, scope: row.scope ?? "session", text: row.statement,
         confidence: 1, evidenceIds: mine.slice(0, 64), topic: row.topic, recordId: row.id,
       }]);
     }
@@ -187,15 +203,43 @@ function evidenceOf(claims: JudgeClaim[], action: JudgeAction | null, sessionOf:
   return out.sort((x, y) => textCompare(x.ts, y.ts) || textCompare(x.eventId, y.eventId));
 }
 
-export interface LiveConflictStats { pairs: number; truncatedPairs: number; vetoed: number; silenced: number }
+export interface LiveConflictStats { pairs: number; truncatedPairs: number; vetoed: number; silenced: number; steps: number }
+
+/**
+ * The live path's CPU bounds per workspace per tick. The input cap: at most this many visible facts (writes,
+ * commits and outcomes) and claims over the workspace's sessions, checked before any pair is formed. The step
+ * budget: each candidate pair costs its two sides' facts and claims (the judge input is built from them) plus its
+ * constraints times the other side's actions (the rule judge's matching loop); once the running total would pass
+ * the budget, the workspace's conflicts are skipped. Never partial: a workspace over either bound gets no conflict
+ * rows this tick (scan.ts counts it in conflictsSkipped), and its collision and overlap rows go on.
+ */
+export const CONFLICT_MAX_INPUTS = 10_000;
+export const CONFLICT_STEP_BUDGET = 200_000;
+export interface LiveConflictBounds { maxInputs?: number; stepBudget?: number }
+export type LiveConflictResult =
+  | { advisories: ConflictAdvisory[]; stats: LiveConflictStats; overBudget?: undefined }
+  | { advisories: []; stats: LiveConflictStats; overBudget: "inputs" | "steps" };
+
+const sizeOf = (v: AsOfSession) => v.writes.length + v.commits.length + v.outcomes.length + v.claims.length;
 
 /** The conflict advisories of one workspace as of `now`: the rule judge only, through the shared code. */
-export function liveConflictAdvisories(workspaceId: string, sessions: readonly AsOfSession[], now: Date): { advisories: ConflictAdvisory[]; stats: LiveConflictStats } {
+export function liveConflictAdvisories(workspaceId: string, sessions: readonly AsOfSession[], now: Date, bounds: LiveConflictBounds = {}): LiveConflictResult {
+  const maxInputs = bounds.maxInputs ?? CONFLICT_MAX_INPUTS, stepBudget = bounds.stepBudget ?? CONFLICT_STEP_BUDGET;
+  const stats: LiveConflictStats = { pairs: 0, truncatedPairs: 0, vetoed: 0, silenced: 0, steps: 0 };
+  let inputs = 0;
+  for (const v of sessions) inputs += sizeOf(v);
+  if (inputs > maxInputs) return { advisories: [], stats, overBudget: "inputs" };
   const { candidates, truncated } = conflictCandidates(sessions, now);
-  const stats: LiveConflictStats = { pairs: candidates.length, truncatedPairs: truncated, vetoed: 0, silenced: 0 };
+  stats.pairs = candidates.length;
+  stats.truncatedPairs = truncated;
   const out: ConflictAdvisory[] = [];
   for (const cand of candidates) {
+    stats.steps += sizeOf(cand.a) + sizeOf(cand.b);
+    if (stats.steps > stepBudget) return { advisories: [], stats, overBudget: "steps" };
     const built = buildJudgeInput(cand, now);
+    const constraints = (s: JudgeSide) => s.claims.filter((c) => c.kind === "constraint").length;
+    stats.steps += constraints(built.input.a) * built.input.b.actions.length + constraints(built.input.b) * built.input.a.actions.length;
+    if (stats.steps > stepBudget) return { advisories: [], stats, overBudget: "steps" };
     if (!citable(built.input)) continue;
     const v = validateCitations(built, ruleClassify(built.input));
     if (!v.ok) { stats.vetoed++; continue; }
@@ -217,10 +261,10 @@ export function liveConflictAdvisories(workspaceId: string, sessions: readonly A
 
 /**
  * One tick's advisories for a workspace. A conflict never suppresses a collision: the advisor's HIGH rows (T1, T2,
- * the 60-minute T3) are always kept, and a pair with both gets both rows (deliver's start-of-tick cooldown lets two
- * sources through for one pair in one tick). A pair with a constraint_violation or intent_conflict loses its LOW
- * overlap rows (nearby_work, similar_summary). A conflict-detector `overlap` is dropped when the advisor already has
- * a row for the pair.
+ * the 60-minute T3) are always kept, and a pair with both gets both rows (the pair cooldown is per source class,
+ * so neither holds back the other, in this tick or a later one). A pair with a constraint_violation or
+ * intent_conflict loses its LOW overlap rows (nearby_work, similar_summary). A conflict-detector `overlap` is
+ * dropped when the advisor already has a row for the pair.
  */
 export function mergeConflicts(high: Advisory[], low: Advisory[], conflicts: ConflictAdvisory[]): Array<Advisory | ConflictAdvisory> {
   const conflictPairs = new Set(conflicts.filter((c) => CONFLICT_CLASSES.has(c.kind)).map((c) => pairKey(c.lanes[0], c.lanes[1])));

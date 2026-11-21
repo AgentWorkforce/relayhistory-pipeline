@@ -234,16 +234,39 @@ describe("which actions may make an alert HIGH", () => {
 });
 
 describe("a claim shared by both sessions (replay)", () => {
-  test("the same recordId on both sides is excluded from both as shared; another claim is unaffected", () => {
-    const b = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
-      actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
-    expect([...b.excluded]).toEqual([["claude:s-a#k1", "shared"], ["claude:s-b#k9", "shared"]]);
-    expect(ruleClassify(b.input).verdict).toBe("none");
-    const other = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
-      actor("09:40", { claims: [claim("k9", "09:12", "intent", "Write in supabase/migrations.", { recordId: "rec-2" })] }));
-    expect(ruleClassify(other.input).verdict).toBe("constraint_violation");
+  test("a shared intent or decision is excluded from both sides as shared: agreement, never an overlap or a conflict", () => {
+    const intent = (id: string, hm: string, recordId: string) => claim(id, hm, "intent", "Add pagination to the list route in src/catalog.", { recordId });
+    const pair = (recB: string) => built({ claims: [intent("i1", "09:10", "rec-1")], writes: [write("src/catalog/list.ts", "09:20", "w0")] },
+      { claims: [intent("i9", "09:12", recB)], writes: [write("src/catalog/page.ts", "09:30", "w1")] });
+    const b = pair("rec-1");
+    expect([...b.excluded]).toEqual([["claude:s-a#i1", "shared"], ["claude:s-b#i9", "shared"]]);
+    expect(citable(b.input)).toBe(false);
+    // Control: the same claims as two records are an overlap.
+    expect(ruleClassify(pair("rec-2").input).verdict).toBe("overlap");
     // A recordId must look like a claim id.
     expect(() => snap("s1", { claims: [claim("x", "09:10", "intent", "a", { recordId: "a#b" })] })).toThrow("recordId must match");
+  });
+
+  test("B restates A's constraint (one recordId) and then writes against it: still a constraint_violation", () => {
+    const b = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
+      actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
+    expect([...b.excluded]).toEqual([]);
+    expect([...b.input.a.claims, ...b.input.b.claims].map((c) => [c.id, c.shared])).toEqual([["claude:s-a#k1", true], ["claude:s-b#k9", true]]);
+    const out = ruleClassify(b.input);
+    expect(out).toEqual({ verdict: "constraint_violation", claimIds: ["claude:s-a#k1"], actionId: "claude:s-b@w1" });
+    const v = validateCitations(b, out);
+    if (!v.ok || v.verdict === "none") throw new Error("vetoed");
+    expect(decide(b.input, v.c, { fleet: false, orchestratorSessionIds: [] })).toMatchObject({ urgency: "high", delivery: { violator: "claude:s-b", owner: "claude:s-a" } });
+    // The shared constraint is never citable as an overlap (that would be agreement with itself).
+    expect(validateCitations(b, { verdict: "overlap", claimIds: ["claude:s-a#k1", "claude:s-b#k9"], actionId: null })).toEqual({ ok: false, reason: "shared" });
+    // A write before the constraint still did not break it.
+    const early = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] },
+      actor("09:05", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "project", recordId: "rec-1" })] }));
+    expect(ruleClassify(early.input).verdict).not.toBe("constraint_violation");
+    // A shared session-scope constraint stays out, as before.
+    const ss = built({ claims: [claim("k1", "09:10", "constraint", CONSTRAINT, { scope: "session", recordId: "rec-1" })] },
+      actor("09:40", { claims: [claim("k9", "09:12", "constraint", CONSTRAINT, { scope: "session", recordId: "rec-1" })] }));
+    expect([...ss.excluded.values()]).toEqual(["shared", "shared"]);
   });
 });
 
