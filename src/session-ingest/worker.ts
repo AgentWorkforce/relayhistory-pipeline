@@ -54,7 +54,7 @@
  *   INGEST_ADVERTISED_MAX_RECORDS unset (default: 500) | 1..500 strict integer: the maxRecords published on
  *                              GET /v1/delivery/limits and in receipts (advertised-limits.ts). Advertising only:
  *                              acceptance stays MAX_DELIVERY_RECORDS (500). Anything else is ignored (500 published)
- *                              and warned once at app start, never a refusal. Rendered only from
+ *                              and warned once per isolate, never a refusal. Rendered only from
  *                              sessionIngest.advertisedMaxRecords
  *   INGEST_CLAIM_LOCK_WAIT_MS  unset (default) | 25..2000: each claim runs in its own short transaction with
  *                              SET LOCAL lock_timeout of this many ms (ledger-sql.ts inClaimLockWait), so a
@@ -291,7 +291,7 @@ export interface IngestSettings {
   bufferLockRetry?: true;
   /** INGEST_ADVERTISED_MAX_RECORDS (1..500): the advertised maxRecords; acceptance stays 500. Absent (the default): 500 published. */
   advertisedMaxRecords?: number;
-  /** INGEST_ADVERTISED_MAX_RECORDS was set but not a strict integer in 1..500: ignored (500 published), warned once at app start. */
+  /** INGEST_ADVERTISED_MAX_RECORDS was set but not a strict integer in 1..500: ignored (500 published), warned once per isolate (warnAdvertisedLimitInvalidOnce). */
   advertisedMaxRecordsInvalid?: true;
   /** INGEST_CLAIM_LOCK_WAIT_MS (25..2000): each claim waits at most this long for a lock (ledger-sql.ts). Absent (the default): the role's lock_timeout. */
   claimLockWaitMs?: number;
@@ -533,6 +533,17 @@ export function reserveAnalyticsSubrequests(settings: IngestSettings, selection:
   return { ...settings, subrequestCap: Math.max(0, reserved) };
 }
 
+// ingestApp runs per request (fetch below), so the invalid-advertised-limit warn is memoized per isolate: once per
+// isolate lifetime, not once per request.
+let advertisedLimitInvalidWarned = false;
+export function warnAdvertisedLimitInvalidOnce(settings: Pick<IngestSettings, "advertisedMaxRecordsInvalid">): void {
+  if (!settings.advertisedMaxRecordsInvalid || advertisedLimitInvalidWarned) return;
+  advertisedLimitInvalidWarned = true;
+  log.warn("session ingest advertised limit ignored", { error_code: "advertised_max_records_invalid" });
+}
+/** Tests only: forget that this isolate already warned. */
+export function resetAdvertisedLimitWarningForTests(): void { advertisedLimitInvalidWarned = false; }
+
 export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort) {
   const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
     ? {
@@ -548,7 +559,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     : undefined;
   const { custodySource, privacyAuthority } = custodyConfig(env);
   // Babysitter retention (additive): on but inactive with a Neon replica; loud, never a 503.
-  if (settings.advertisedMaxRecordsInvalid) log.warn("session ingest advertised limit ignored", { error_code: "advertised_max_records_invalid" });
+  warnAdvertisedLimitInvalidOnce(settings);
   if (settings.babysitterRetention && replica) log.warn("babysitter retention routing inactive", { error_code: "replica_on" });
   if (settings.babysitterRetention && settings.subrequestCap === undefined) log.warn("babysitter retention routing inactive", { error_code: "subrequest_cap_unset" });
   if (settings.babysitterRetention && settings.retentionGeneration === undefined) log.warn("babysitter retention routing inactive", { error_code: "generation_unset" });

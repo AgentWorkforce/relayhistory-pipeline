@@ -2,12 +2,13 @@
  * INGEST_ADVERTISED_MAX_RECORDS (advertised-limits.ts): the advertised records-per-batch limit, independent of the
  * accepted limit. Default off: unset publishes exactly what main publishes.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createIngestApp, SYNC_SCOPE } from "../app.ts";
 import { deliverBatch } from "../deliver.ts";
 import { advertisedDeliveryLimits, parseAdvertisedMaxRecords } from "../advertised-limits.ts";
 import { DELIVERY_LIMITS, MAX_DELIVERY_RECORDS } from "../vendor/delivery/delivery-contracts.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
+import { log } from "../../shared/log.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
@@ -48,6 +49,12 @@ describe("advertisedDeliveryLimits", () => {
   test("unset and 500 return the very same DELIVERY_LIMITS object (byte-identical publication)", () => {
     expect(advertisedDeliveryLimits(undefined)).toBe(DELIVERY_LIMITS);
     expect(advertisedDeliveryLimits(MAX_DELIVERY_RECORDS)).toBe(DELIVERY_LIMITS);
+  });
+  test("range guard: anything but an integer in 1..499 returns DELIVERY_LIMITS itself (only the Worker path parses)", () => {
+    for (const v of [NaN, 0, -1, 1.5, 499.9, 500, 501, 1000, Infinity, -Infinity, Number.MAX_SAFE_INTEGER])
+      expect({ v, same: advertisedDeliveryLimits(v) === DELIVERY_LIMITS }).toEqual({ v, same: true });
+    expect(advertisedDeliveryLimits(1).maxRecords).toBe(1);
+    expect(advertisedDeliveryLimits(499).maxRecords).toBe(499);
   });
   test("a lower value changes maxRecords only, frozen", () => {
     const l = advertisedDeliveryLimits(100);
@@ -121,6 +128,29 @@ describe("acceptance is unchanged: advertised 100 never refuses or strands a 500
 });
 
 describe("Worker settings", () => {
+  test("the invalid-value warn is once per isolate, not once per request (ingestApp runs per request)", async () => {
+    const { ingestSettings, ingestApp, resetAdvertisedLimitWarningForTests } = await import("../worker.ts");
+    const st = scratchStore(); cleanups.push(st.done);
+    const warn = spyOn(log, "warn");
+    cleanups.push(() => warn.mockRestore());
+    const advertisedWarns = () => warn.mock.calls.filter((c) => (c[1] as any)?.error_code === "advertised_max_records_invalid").length;
+    const run = (async () => { throw Error("db_unused"); }) as never;
+    const build = async (raw: string | undefined) => {
+      const env = { ...full, ...(raw === undefined ? {} : { INGEST_ADVERTISED_MAX_RECORDS: raw }) };
+      const settings = (await ingestSettings(env))!;
+      return ingestApp(env as never, settings, run, { store: st.store, keyRoot: settings.keyRoot } as never);
+    };
+    resetAdvertisedLimitWarningForTests();
+    for (let i = 0; i < 3; i++) await build(undefined);
+    for (let i = 0; i < 3; i++) await build("100");
+    expect(advertisedWarns()).toBe(0);
+    for (let i = 0; i < 5; i++) await build("abc");
+    expect(advertisedWarns()).toBe(1);
+    resetAdvertisedLimitWarningForTests();
+    await build("0");
+    expect(advertisedWarns()).toBe(2);
+  });
+
   const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
   const target = { store: {} as never, keyRoot: "96bulls" };
   test("unset: settings and deliver deps exactly as before", async () => {

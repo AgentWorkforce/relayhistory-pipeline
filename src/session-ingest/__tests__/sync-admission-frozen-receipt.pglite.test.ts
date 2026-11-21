@@ -65,8 +65,8 @@ function journalBroken(store: ObjectStore): ObjectStore {
 }
 
 type Mode = "off" | "on" | "on-witness-failed" | "drain";
-interface Setup { mode?: Mode; flag?: "off" | "on"; admission?: boolean; drop?: keyof Ledger }
-async function setup({ mode = "off", flag = "on", admission = true, drop }: Setup) {
+interface Setup { mode?: Mode; flag?: "off" | "on"; admission?: boolean; drop?: keyof Ledger; advertised?: number }
+async function setup({ mode = "off", flag = "on", admission = true, drop, advertised }: Setup) {
   const f = await fixture();
   const s = spied(f.ledger, drop);
   const logs: Record<string, unknown>[] = [];
@@ -76,7 +76,8 @@ async function setup({ mode = "off", flag = "on", admission = true, drop }: Setu
     identify: (req) => bindingIdentity(req),
     log: (x) => logs.push(x),
     custodySource: "frozen-supabase",
-    deliver: { ledger: s.ledger, acceptanceMode: "buffered", target: { store: mode === "on-witness-failed" ? journalBroken(f.store) : f.store, keyRoot: "96bulls" } },
+    deliver: { ledger: s.ledger, acceptanceMode: "buffered", target: { store: mode === "on-witness-failed" ? journalBroken(f.store) : f.store, keyRoot: "96bulls" },
+      ...(advertised === undefined ? {} : { advertisedMaxRecords: advertised }) },
     ...(asyncMode !== "off" ? { asyncAdmission: { mode: asyncMode, enqueue: async (m: AdmissionMessage) => { sent.push(m); } } } : {}),
     ...(flag === "on" ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
   });
@@ -202,6 +203,24 @@ describe.each([["every migration", undefined], ["G4-only schema", G4_LAST_MIGRAT
     expect(t.calls[0]).toBe("frozenWitness");
     expect(res.headers.get(CURRENT_CUSTODY_ACK_HEADER)).not.toBeNull();
     expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
+  });
+
+  test("INGEST_ADVERTISED_MAX_RECORDS=100: the queued receipt and the legacy-replay receipt both publish 100 (the limits route's value)", async () => {
+    const q = await setup({ mode: "on", advertised: 100 });
+    const qb = await batch([record({ record_id: "adv-q" })], { batch_id: "adv-queued" });
+    const qres = await q.post(qb);
+    expect(qres.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_QUEUED);
+    const qbody = (await qres.json()) as { limits: Record<string, unknown> };
+    expect(qbody.limits).toEqual(await q.limits());
+    expect(qbody.limits).toMatchObject({ ...DELIVERY_LIMITS, maxRecords: 100 });
+    const l = await setup({ mode: "off", advertised: 100 });
+    const lb = await batch([record({ record_id: "adv-l" })], { batch_id: "adv-legacy" });
+    await l.legacy(lb, await digestOf(lb));
+    const lres = await l.post(lb);
+    expect(lres.headers.get(ADMISSION_HEADER)).toBe(ADMISSION_LEGACY_REPLAY);
+    const lbody = (await lres.json()) as { limits: Record<string, unknown> };
+    expect(lbody.limits).toEqual(await l.limits());
+    expect(lbody.limits).toMatchObject({ ...DELIVERY_LIMITS, maxRecords: 100 });
   });
 
   test("flag on, ledger without frozenReceipt, queued-v1 identity: 503 custody_source_unavailable, no witness or claim", async () => {
