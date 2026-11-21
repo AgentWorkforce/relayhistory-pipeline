@@ -4,6 +4,7 @@
  * hashes every customer id with the import salt and validates the result with the M0 loader's own
  * `parseSession`, so an import the replay harness would refuse is never written.
  */
+import { actionContext, actionRecord, directoryPath, PROVENANCE_BOUNDS, repositoryResolver, type RepositoryResolver, type ActionContext, type ActionExport, type CaptureBudget, type RepositoryRoot } from "./provenance.ts";
 import { createHmac } from "node:crypto";
 import { parseSession, SNAPSHOT_BOUNDS, type SnapshotSession } from "../replay/snapshot.ts";
 import { isoTime, textCompare } from "../replay/util.ts";
@@ -214,6 +215,7 @@ export class Hasher {
   session(harness: string, id: string) { return `s_${this.h(`session\u0000${harness}`, id, 32)}`; }
   project(key: string) { return `p_${this.h("project", key, 24)}`; }
   repo(key: string) { return `r_${this.h("repo", key, 24)}`; }
+  location(value: string) { return `l_${this.h("action-location", value, 24)}`; }
   branch(b: string | null) { return b ? `b_${this.h("branch", canonicalBranch(b), 16)}` : null; }
   org(id: string) { return `o_${this.h("org", id, 24)}`; }
   workspace(id: string) { return `w_${this.h("workspace", id, 24)}`; }
@@ -312,7 +314,19 @@ export class SessionBuilder {
   readonly outcomes: Outcome[] = [];
   readonly usage: Usage[] = [];
 
-  constructor(readonly harness: string, public sourceId: string, private readonly stats: ImportStats) {}
+  private readonly contexts = new WeakMap<object, ActionContext>();
+  constructor(readonly harness: string, public sourceId: string, private readonly stats: ImportStats, readonly captureProvenance = false, private readonly provenanceBudget: CaptureBudget = { sizes: new WeakMap(), count: 0, bytes: 0 }) {}
+  contextFor(fact: object): ActionContext | null { return this.contexts.get(fact) ?? null; }
+  capture(fact: object, context: ActionContext | null) {
+    if (!this.captureProvenance || !context) return;
+    const previous = this.provenanceBudget.sizes.get(fact), size = Buffer.byteLength(JSON.stringify(context));
+    const bytes = this.provenanceBudget.bytes - (previous ?? 0) + size;
+    if ((previous === undefined && this.provenanceBudget.count >= PROVENANCE_BOUNDS.actions) || bytes > PROVENANCE_BOUNDS.captureBytes)
+      throw new ImportError("action provenance capture exceeds its bound; use a smaller explicit input frame");
+    if (previous === undefined) this.provenanceBudget.count++;
+    this.provenanceBudget.bytes = bytes; this.provenanceBudget.sizes.set(fact, size);
+    this.contexts.set(fact, { ...context, at: { ...context.at }, evidenceRef: context.evidenceRef ? { ...context.evidenceRef } : null, declaration: context.declaration ? { ...context.declaration } : null });
+  }
 
   touch(ts: string, at: LineRef) {
     if (!this.first || ts < this.first) this.first = ts;
@@ -325,21 +339,30 @@ export class SessionBuilder {
     list.push(v);
   }
   /** `raw` is normalized here; a path that cannot be made repo-relative safely is dropped and counted. */
-  write(raw: unknown, ts: string, at: LineRef, cwd: string | null = this.cwd, branch: string | null = this.branch, kind = "tool_use") {
+  write(raw: unknown, ts: string, at: LineRef, cwd: string | null = this.cwd, branch: string | null = this.branch, kind = "tool_use", context: ActionContext | null = null) {
     this.touch(ts, at);
     const path = typeof raw === "string" ? repoRelativePath(raw, cwd) : null;
     if (!path) { this.stats.droppedPaths++; return; }
-    this.push(this.writes, { path, ts, branch, kind, at });
+    const fact = { path, ts, branch, kind, at };
+    this.push(this.writes, fact);
+    if (this.captureProvenance) {
+      const scope = context ?? actionContext(null, "unknown", at, ts);
+      const target = typeof raw === "string" ? directoryPath(raw, scope.directory) : null;
+      this.capture(fact, { ...scope, target, reason: target && scope.reason === "missing_directory" && context ? "literal" : scope.reason });
+    }
   }
-  commit(sha: string | null, ts: string, at: LineRef): Commit {
+  commit(sha: string | null, ts: string, at: LineRef, context: ActionContext | null = null): Commit {
     this.touch(ts, at);
     const c = { sha, ts, at };
     this.push(this.commits, c);
+    this.capture(c, context);
     return c;
   }
-  outcome(key: string | null, reverted: boolean, ts: string, at: LineRef) {
+  outcome(key: string | null, reverted: boolean, ts: string, at: LineRef, context: ActionContext | null = null) {
     this.touch(ts, at);
-    this.push(this.outcomes, { key, reverted, ts, at });
+    const fact = { key, reverted, ts, at };
+    this.push(this.outcomes, fact);
+    this.capture(fact, context);
   }
   tokens(n: unknown, ts: string, at: LineRef) {
     this.touch(ts, at);
@@ -372,6 +395,7 @@ export class SessionBuilder {
     for (const f of o.files) this.files.add(f);
     this.cwd ??= o.cwd; this.remote ??= o.remote; this.project ??= o.project; this.branch ??= o.branch;
     for (const p of o.parents) this.parent(p);
+    for (const fact of [...o.writes, ...o.commits, ...o.outcomes]) this.capture(fact, o.contextFor(fact));
     for (const w of o.writes) this.push(this.writes, w);
     for (const c of o.commits) this.push(this.commits, c);
     for (const x of o.outcomes) this.push(this.outcomes, x);
@@ -404,8 +428,8 @@ const byTs = <T extends { ts: string }>(xs: T[]) => xs.map((x, i) => [x, i] as c
  * timestamp at all. `createdAt` and `lastActivityAt` are the earliest and latest timestamped record, which
  * bound every fact (the M0 loader's createdAt..lastActivityAt rule). The summary and claims stay empty.
  */
-export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Tenant):
-  { line: Record<string, unknown>; session: SnapshotSession; mapped: MappedSession } | null {
+export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Tenant, repositoryRoots: readonly RepositoryRoot[] | RepositoryResolver = []):
+  { line: Record<string, unknown>; session: SnapshotSession; mapped: MappedSession; provenance?: ActionExport } | null {
   if (!b.first || !b.last) return null;
   const key = b.project ?? projectKey(b.remote, b.cwd);
   const repoKey = projectKey(b.remote, null) ?? key;
@@ -414,23 +438,37 @@ export function toSnapshotSession(b: SessionBuilder, hasher: Hasher, tenant: Ten
   const parents = [...b.parents].sort(textCompare);
   const events: [string, number, number][] = [];
   const paths: Record<string, string> = {};
+  const provenance: ActionExport = { records: [], locations: {} };
+  const resolveRoot = typeof repositoryRoots === "function" ? repositoryRoots : repositoryResolver(repositoryRoots);
+  let provenanceBytes = 0;
   const scrub = (raw: string) => { const h = scrubPath(raw, hasher); paths[h] = raw; return h; };
-  const ev = (prefix: string, i: number, at: LineRef) => { const id = `${prefix}${i + 1}`; events.push([id, at.file, at.line]); return id; };
+  const ev = (prefix: string, i: number, at: LineRef, fact?: { ts: string }, kind?: "write" | "commit" | "outcome") => {
+    const id = `${prefix}${i + 1}`; events.push([id, at.file, at.line]);
+    if (b.captureProvenance && fact && kind) {
+      const action = actionRecord(b.contextFor(fact), { harness: b.harness, sessionId, eventId: id, kind, factAt: fact.ts }, hasher, resolveRoot);
+      provenanceBytes += Buffer.byteLength(JSON.stringify(action.record)) + (action.location ? Buffer.byteLength(JSON.stringify(action.location)) : 0);
+      if (provenanceBytes > PROVENANCE_BOUNDS.exportBytes || provenance.records.length >= PROVENANCE_BOUNDS.actions)
+        throw new ImportError("action provenance export exceeds its bound; use a smaller explicit input frame");
+      provenance.records.push(action.record);
+      if (action.record.location && action.location) provenance.locations[action.record.location] = action.location;
+    }
+    return id;
+  };
   const line = {
     orgId: hasher.org(tenant.orgId), workspaceId: hasher.workspace(tenant.workspaceId), harness: b.harness, sessionId,
     projectId: key ? hasher.project(key) : null, repo: repoKey ? hasher.repo(repoKey) : null, branch: hasher.branch(b.branch),
     title: null, userId: null, taskRef: null,
     parentSessionIds: parents.map((p) => hasher.session(b.harness, p)),
     createdAt: b.first, lastActivityAt: b.last, shortSummary: null,
-    writes: byTs(b.writes).map((w, i) => ({ path: scrub(w.path), ts: w.ts, eventId: ev("w", i, w.at), kind: w.kind, branch: hasher.branch(w.branch) })),
-    commits: byTs(b.commits).map((c, i) => ({ sha: c.sha && SHA.test(c.sha) ? c.sha.toLowerCase() : UNKNOWN, ts: c.ts, eventId: ev("c", i, c.at) })),
+    writes: byTs(b.writes).map((w, i) => ({ path: scrub(w.path), ts: w.ts, eventId: ev("w", i, w.at, w, "write"), kind: w.kind, branch: hasher.branch(w.branch) })),
+    commits: byTs(b.commits).map((c, i) => ({ sha: c.sha && SHA.test(c.sha) ? c.sha.toLowerCase() : UNKNOWN, ts: c.ts, eventId: ev("c", i, c.at, c, "commit") })),
     outcomes: byTs(b.outcomes).map((o, i) => ({
-      key: o.key && SHA.test(o.key) ? o.key.toLowerCase() : UNKNOWN, ts: o.ts, eventId: ev("o", i, o.at), reverted: o.reverted,
+      key: o.key && SHA.test(o.key) ? o.key.toLowerCase() : UNKNOWN, ts: o.ts, eventId: ev("o", i, o.at, o, "outcome"), reverted: o.reverted,
     })),
     usage: byTs(b.usage).map((u, i) => ({ ts: u.ts, eventId: ev("u", i, u.at), tokens: u.tokens, costUsdMicros: null })),
     claims: [],
   };
   // The M0 loader's own validation: an import it would refuse is never written.
   const session = parseSession(line, `session ${sessionId}`);
-  return { line, session, mapped: { harness: b.harness, sessionId, sourceSessionId: b.sourceId, sourceParentIds: parents, sourceProject: key, events, paths } };
+  return { line, session, ...(b.captureProvenance ? { provenance } : {}), mapped: { harness: b.harness, sessionId, sourceSessionId: b.sourceId, sourceParentIds: parents, sourceProject: key, events, paths } };
 }

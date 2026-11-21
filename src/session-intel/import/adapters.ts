@@ -6,10 +6,22 @@
 import { basename } from "node:path";
 import { relayhistoryActivityEvent } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { commitShaFromOutput, gitOps } from "./git.ts";
-import { codeModeShells, codexCommitSha } from "./code-mode.ts";
+import { actionContext, directoryPath, gitDirectory, repositoryIdentity, type ActionContext, type CaptureBudget, type DirectorySource } from "./provenance.ts";
+import { codeModeShellCalls, codexCommitSha } from "./code-mode.ts";
 import { readJsonl } from "./io.ts";
 import { cleanId, IMPORT_BOUNDS, ImportError, SessionBuilder, strictTs, type ImportHarness, type ImportStats, type LineRef } from "./normalize.ts";
 import { isRecord } from "../replay/util.ts";
+
+function scope(b: SessionBuilder, directory: string | null, source: DirectorySource, at: LineRef, ts: string,
+  declaration: ActionContext["declaration"] = null, script?: string, action: "commit" | "revert" = "commit"): ActionContext | null {
+  if (!b.captureProvenance) return null;
+  const context = actionContext(directory, source, at, ts, declaration);
+  if (script !== undefined) {
+    context.directory = gitDirectory(script, context.directory, action);
+    context.reason = context.directory ? "literal" : "unsupported_shell";
+  }
+  return context;
+}
 
 export type ImportFormat = "claude-code" | "codex" | "generic";
 export const FORMATS: readonly ImportFormat[] = ["claude-code", "codex", "generic"];
@@ -17,8 +29,9 @@ export const FORMATS: readonly ImportFormat[] = ["claude-code", "codex", "generi
 /** Every session of one import, keyed by harness and the source session id. */
 export class SessionSet {
   readonly byKey = new Map<string, SessionBuilder>();
+  readonly provenanceBudget: CaptureBudget = { sizes: new WeakMap(), count: 0, bytes: 0 };
   /** `notAfter`: a record stamped after it (the import's clock plus a day of skew) is an outlier, dropped and counted. */
-  constructor(readonly stats: ImportStats, readonly notAfter: string | null = null) {}
+  constructor(readonly stats: ImportStats, readonly notAfter: string | null = null, readonly captureProvenance = false) {}
   /** The record's timestamp if it is usable: null (counted) when it is missing, not strict ISO, or in the future. */
   accept(ts: string | null): string | null {
     if (!ts) { this.stats.untimedRecords++; return null; }
@@ -30,7 +43,7 @@ export class SessionSet {
     let b = this.byKey.get(k);
     if (!b) {
       if (this.byKey.size >= IMPORT_BOUNDS.sessions) throw new ImportError(`more than ${IMPORT_BOUNDS.sessions} sessions`);
-      b = new SessionBuilder(harness, id, this.stats);
+      b = new SessionBuilder(harness, id, this.stats, this.captureProvenance, this.provenanceBudget);
       this.byKey.set(k, b);
     }
     return b;
@@ -119,11 +132,11 @@ export async function readClaudeCode(file: string, fileIndex: number, set: Sessi
         if ((keys || name === "Bash") && !once(seenTools, b, toolId)) continue;
         if (keys) {
           const key = keys.find((k) => typeof input[k] === "string");
-          b.write(key ? input[key] : null, ts, at, cwd ?? b.cwd, branch ?? b.branch);
+          b.write(key ? input[key] : null, ts, at, cwd ?? b.cwd, branch ?? b.branch, "tool_use", scope(b, cwd, "record_cwd", at, ts));
         } else if (name === "Bash" && typeof input.command === "string") {
           const ops = gitOps(input.command);
-          if (ops.commit) pending.set(toolId, { b, commit: b.commit(null, ts, at) });
-          for (const sha of ops.reverts) b.outcome(sha, true, ts, at);
+          if (ops.commit) pending.set(toolId, { b, commit: b.commit(null, ts, at, scope(b, cwd, "record_cwd", at, ts, null, input.command)) });
+          for (const sha of ops.reverts) b.outcome(sha, true, ts, at, scope(b, cwd, "record_cwd", at, ts, null, input.command, "revert"));
         }
       } else if (block.type === "tool_result") {
         const p = pending.get(str(block.tool_use_id) ?? "");
@@ -131,6 +144,8 @@ export async function readClaudeCode(file: string, fileIndex: number, set: Sessi
         pending.delete(str(block.tool_use_id)!);
         const tur = isRecord(r.toolUseResult) ? r.toolUseResult : null;
         p.commit.sha = commitShaFromOutput(resultText(block.content)) ?? (tur ? commitShaFromOutput(str(tur.stdout) ?? "") : null);
+        const context = p.b.contextFor(p.commit);
+        if (p.commit.sha && context) p.b.capture(p.commit, { ...context, evidenceAt: ts, evidenceRef: at });
       }
     }
   });
@@ -168,9 +183,12 @@ function shellScript(command: unknown): { script: string; patch: string | null }
  * payload at the top level without a timestamp; those lines take the last timestamp seen.
  */
 export async function readCodex(file: string, fileIndex: number, set: SessionSet): Promise<void> {
-  const b = new SessionBuilder("codex", "", set.stats);
+  const b = new SessionBuilder("codex", "", set.stats, set.captureProvenance, set.provenanceBudget);
   let id: string | null = null;
   let cwd: string | null = null;
+  let cwdAt: string | null = null;
+  let scopeCwd: string | null = null;
+  let declaration: ActionContext["declaration"] = null;
   let lastTs: string | null = null;
   let lastTotal: number | null = null;
   let childPath: string | null = null;
@@ -204,10 +222,14 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     b.touch(ts, at);
     if (type === "session_meta" || (!enveloped && typeof r.id === "string" && r.type === undefined)) {
       id ??= cleanId(p.id);
-      cwd = cleanId(p.cwd, IMPORT_BOUNDS.path) ?? cwd;
+      const nextCwd = cleanId(p.cwd, IMPORT_BOUNDS.path);
+      if (nextCwd) cwd = nextCwd;
+      scopeCwd = directoryPath(nextCwd); cwdAt = ts;
       b.cwd ??= cwd;
       const git = isRecord(p.git) ? p.git : {};
       b.remote ??= cleanId(git.repository_url, IMPORT_BOUNDS.path);
+      const repository = repositoryIdentity(git.repository_url), root = scopeCwd;
+      declaration = repository && root ? { repository, root, observedAt: ts } : null;
       b.branch = cleanId(git.branch) ?? b.branch;
       // A spawned subagent thread names its parent (confirmed in the audited format; see the doc).
       const src = isRecord(p.source) && isRecord(p.source.subagent) && isRecord(p.source.subagent.thread_spawn) ? p.source.subagent.thread_spawn : null;
@@ -223,7 +245,7 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
       metadataSeen = true;
       return;
     }
-    if (type === "turn_context") { cwd = cleanId(p.cwd, IMPORT_BOUNDS.path) ?? cwd; b.cwd ??= cwd; return; }
+    if (type === "turn_context") { const next = cleanId(p.cwd, IMPORT_BOUNDS.path); if (next) cwd = next; scopeCwd = directoryPath(next); cwdAt = ts; b.cwd ??= cwd; return; }
     if (type === "event_msg") {
       if (p.type !== "token_count" || !isRecord(p.info)) return;
       const last = isRecord(p.info.last_token_usage) ? p.info.last_token_usage : null;
@@ -239,14 +261,20 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
     if (type !== "response_item") return;
     const kind = str(p.type);
     const callId = str(p.call_id) ?? str(p.id) ?? `line-${line}`;
-    const write = (paths: string[], workdir: string | null) => { for (const path of paths) b.write(path, ts, at, workdir ?? cwd); };
-    const shell = (script: string, patch: string | null, workdir: string | null) => {
-      write(patchPaths(patch ?? ""), workdir);
+    const available = cwdAt && cwdAt > ts ? cwdAt : ts;
+    const write = (paths: string[], workdir: string | null, context = scope(b, workdir ?? scopeCwd, workdir ? "tool_workdir" : "session_cwd", at, available, declaration)) => {
+      for (const path of paths) b.write(path, ts, at, workdir ?? cwd, undefined, "tool_use", context);
+    };
+    const shell = (script: string, patch: string | null, workdir: string | null, specified = false) => {
+      const directory = specified ? directoryPath(workdir, scopeCwd) : scopeCwd;
+      const source = specified ? "tool_workdir" : "session_cwd";
+      const context = scope(b, directory, source, at, available, declaration);
+      write(patchPaths(patch ?? ""), workdir, context);
       // A patch applied through a heredoc in the script (`apply_patch <<'EOF' ...`).
-      write(patchPaths(script), workdir);
+      write(patchPaths(script), workdir, context ? { ...context, directory: null, reason: "unsupported_shell" } : null);
       const ops = gitOps(script);
-      if (ops.commit) { const c = b.commit(null, ts, at); pending.set(callId, c); }
-      for (const sha of ops.reverts) b.outcome(sha, true, ts, at);
+      if (ops.commit) { const c = b.commit(null, ts, at, scope(b, directory, source, at, available, declaration, script)); pending.set(callId, c); }
+      for (const sha of ops.reverts) b.outcome(sha, true, ts, at, scope(b, directory, source, at, available, declaration, script, "revert"));
     };
     if (kind === "function_call" || kind === "custom_tool_call") {
       const name = str(p.name) ?? "";
@@ -267,14 +295,18 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
             payload: { name: "exec", args_json: JSON.stringify({ input }), is_error: isError },
           }, { workspaceId: "import", source: "codex", sessionId: "import", machineId: "import", userId: "import" });
           if (Array.isArray(event?.files_touched))
-            write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd);
+            write(event.files_touched.filter((path): path is string => typeof path === "string"), cwd,
+              b.captureProvenance ? { ...actionContext(scopeCwd, "code_mode_projection", at, available), directory: null, reason: "projection_scope_unavailable" } : null);
           const failed = Array.isArray(event?.tool_calls) && event.tool_calls.some((call) => isRecord(call) && call.isError === true);
           if (!failed) {
-            const nested = codeModeShells(input);
+            const nested = codeModeShellCalls(input);
             if (nested.incomplete) set.stats.codexCodeModeShellUnparsed++;
-            const commits = nested.commands.filter((command) => gitOps(shellScript(command).script).commit);
-            for (const _ of commits) {
-              const c = b.commit(null, ts, at);
+            const commits = nested.calls.filter((call) => gitOps(shellScript(call.command).script).commit);
+            for (const call of commits) {
+              const directory = call.workdir.kind === "inherit" ? scopeCwd : call.workdir.kind === "literal" ? directoryPath(call.workdir.value, scopeCwd) : null;
+              const context = scope(b, directory, call.workdir.kind === "inherit" ? "session_cwd" : "tool_workdir", at, available, declaration, shellScript(call.command).script);
+              if (context && !context.directory && call.workdir.kind === "unknown") context.reason = "dynamic_workdir";
+              const c = b.commit(null, ts, at, context);
               // One outer output cannot safely name several nested commit attempts.
               if (commits.length === 1 && !nested.incomplete) pending.set(callId, c);
             }
@@ -282,22 +314,26 @@ export async function readCodex(file: string, fileIndex: number, set: SessionSet
         }
       } else if (name === "apply_patch") {
         const input = kind === "custom_tool_call" ? str(p.input) : (str(parseArgs(p.arguments).input) ?? str(p.arguments));
-        write(patchPaths(input ?? ""), cwd);
+        write(patchPaths(input ?? ""), cwd, scope(b, scopeCwd, "session_cwd", at, available, declaration));
       } else if (SHELL_TOOLS.has(name)) {
         const args = parseArgs(kind === "custom_tool_call" ? p.input : p.arguments);
         const { script, patch } = shellScript(args.command ?? args.cmd);
-        shell(script, patch, cleanId(args.workdir, IMPORT_BOUNDS.path));
+        shell(script, patch, cleanId(args.workdir, IMPORT_BOUNDS.path), Object.hasOwn(args, "workdir") || Object.hasOwn(args, "cwd") || Object.hasOwn(args, "working_directory"));
       }
     } else if (kind === "local_shell_call" && isRecord(p.action)) {
       const { script, patch } = shellScript(p.action.command);
-      shell(script, patch, cleanId(p.action.working_directory, IMPORT_BOUNDS.path));
+      shell(script, patch, cleanId(p.action.working_directory, IMPORT_BOUNDS.path), Object.hasOwn(p.action, "working_directory"));
     } else if (kind === "function_call_output" || kind === "custom_tool_call_output" || kind === "local_shell_call_output") {
       const c = pending.get(callId);
       if (!c) return;
       pending.delete(callId);
       c.sha = codexCommitSha(p.output);
       // The SHA is not available at call time: do not leak later output into an earlier replay view.
-      if (c.sha) { if (ts > c.ts) c.ts = ts; c.at = at; }
+      if (c.sha) {
+        if (ts > c.ts) c.ts = ts; c.at = at;
+        const context = b.contextFor(c);
+        if (context) b.capture(c, { ...context, evidenceAt: ts, evidenceRef: at });
+      }
     }
   });
   if (!b.first) return;
@@ -347,9 +383,11 @@ export async function readGeneric(file: string, fileIndex: number, set: SessionS
     if (branch) b.branch = branch;
     if (parent) b.parent(parent);
     // The customer's `kind` label is free text: it is validated but never copied.
-    for (const f of (r.files as string[] | undefined) ?? []) b.write(f, ts, at, cwd ?? b.cwd, branch ?? b.branch, "write");
-    if (commit) b.commit(commit, ts, at);
-    if (outcome) b.outcome(outcome.key, outcome.reverted, ts, at);
+    const repository = repositoryIdentity(repo);
+    const context = scope(b, cwd ?? null, "generic_event", at, ts, repository ? { repository, root: directoryPath(cwd), observedAt: ts } : null);
+    for (const f of (r.files as string[] | undefined) ?? []) b.write(f, ts, at, cwd ?? b.cwd, branch ?? b.branch, "write", context);
+    if (commit) b.commit(commit, ts, at, context);
+    if (outcome) b.outcome(outcome.key, outcome.reverted, ts, at, context);
     if (r.tokens !== undefined) b.tokens(r.tokens, ts, at);
   });
 }
