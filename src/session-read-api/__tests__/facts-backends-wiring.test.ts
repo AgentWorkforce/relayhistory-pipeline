@@ -3,12 +3,14 @@
  * readApiDepsFromSecret): READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND=postgres with the
  * route's ENABLED flag ("1") wires the Postgres facts backends on the read pool, with no
  * ClickHouse; anything else wires nothing new; an unknown value refuses startup without echoing
- * it, and the hosted Lambda refuses postgres. No database is touched: pg.Pool is a recorder.
+ * it, and the hosted Lambda refuses postgres. The same for READ_API_SUMMARY_SEARCH_BACKEND (the
+ * summary search store). No database is touched: pg.Pool is a recorder.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import pg from "pg";
 import { TENANT_SETTINGS_SQL } from "../liveness.ts";
-import { factsBackends, READER_LOGIN_SQL, READER_PG16_SQL, readApiDepsFromSecret } from "../lambda.ts";
+import { factsBackends, READER_LOGIN_SQL, READER_PG16_SQL, readApiDepsFromSecret, summarySearchBackend } from "../lambda.ts";
+import { parseSummarySearchBackend } from "../config.ts";
 import { READER_LOGIN_ROW, readerLoginAnswer } from "./reader-login-support.ts";
 import { selfhostSearchComposition } from "../server.ts";
 
@@ -309,6 +311,74 @@ describe("session intelligence workspace wiring (READ_API_SESSION_INTEL_ENABLED)
         expect(built.deps.sessionIntel?.enabled).toBe(true);
         expect(typeof built.deps.sessionIntel?.source.alerts).toBe("function");
         expect(typeof built.deps.sessionIntel?.source.claims).toBe("function");
+      } finally {
+        await built.close();
+      }
+    }
+  });
+});
+
+describe("summary search backend selector (READ_API_SUMMARY_SEARCH_BACKEND)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("unset, empty or clickhouse = clickhouse; postgres = postgres; anything else throws without echoing the value", () => {
+    expect(parseSummarySearchBackend({})).toBe("clickhouse");
+    expect(parseSummarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: "" })).toBe("clickhouse");
+    expect(parseSummarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: "clickhouse" })).toBe("clickhouse");
+    expect(parseSummarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: "postgres" })).toBe("postgres");
+    for (const value of ["Postgres", " postgres", "postgres ", "pg", "clickhouse ", "neon", "1", "synthetic-value-x"]) {
+      let error: Error | null = null;
+      try { parseSummarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: value }); } catch (e) { error = e as Error; }
+      expect(error?.message).toBe('session read api: READ_API_SUMMARY_SEARCH_BACKEND must be unset, "", "clickhouse" or "postgres"');
+    }
+  });
+
+  test("the service wires the Postgres backend only for postgres; the default wires nothing new", async () => {
+    for (const value of [undefined, "", "clickhouse"]) {
+      const built = await build({ ...ENV, READ_API_SUMMARY_SEARCH_ENABLED: "true", ...(value === undefined ? {} : { READ_API_SUMMARY_SEARCH_BACKEND: value }) });
+      try {
+        expect([value, built.deps.summarySearch, built.deps.summarySearchBackend]).toEqual([value, true, undefined]);
+      } finally {
+        await built.close();
+      }
+    }
+    const pg = await build({ ...ENV, READ_API_SUMMARY_SEARCH_ENABLED: "true", READ_API_SUMMARY_SEARCH_BACKEND: "postgres" });
+    try {
+      expect([pg.deps.summarySearch, pg.deps.summarySearchBackend, pg.deps.ch]).toEqual([true, "postgres", undefined]);
+    } finally {
+      await pg.close();
+    }
+    // The selector does not turn the route on: READ_API_SUMMARY_SEARCH_ENABLED stays required.
+    const off = await build({ ...ENV, READ_API_SUMMARY_SEARCH_BACKEND: "postgres" });
+    try {
+      expect(off.deps.summarySearch).toBeUndefined();
+    } finally {
+      await off.close();
+    }
+  });
+
+  test("an unknown value refuses service startup, naming the flag and never echoing the value", async () => {
+    for (const value of ["Postgres", "pg", "clickhouse ", "neon"]) {
+      const error = await build({ ...ENV, READ_API_SUMMARY_SEARCH_BACKEND: value }).then(() => null, (e: Error) => e);
+      expect(error?.message).toContain("READ_API_SUMMARY_SEARCH_BACKEND");
+      expect(error?.message).not.toContain(value);
+    }
+  });
+
+  test("the hosted Lambda entry refuses postgres; clickhouse and unset pass unchanged", async () => {
+    expect(() => summarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: "postgres" }, "lambda")).toThrow("served only by the self-host service");
+    expect(summarySearchBackend({ READ_API_SUMMARY_SEARCH_BACKEND: "postgres" }, "service")).toBe("postgres");
+    expect(summarySearchBackend({}, "lambda")).toBe("clickhouse");
+    const error = await buildLambda({ READ_API_SUMMARY_SEARCH_ENABLED: "true", READ_API_SUMMARY_SEARCH_BACKEND: "postgres" }).then(() => null, (e: Error) => e);
+    expect(error?.message).toBe("session read api: READ_API_SUMMARY_SEARCH_BACKEND=postgres is served only by the self-host service");
+    for (const value of [undefined, "", "clickhouse"]) {
+      const built = await buildLambda({ READ_API_SUMMARY_SEARCH_ENABLED: "true", ...(value === undefined ? {} : { READ_API_SUMMARY_SEARCH_BACKEND: value }) });
+      try {
+        expect([value, built.deps.summarySearch, built.deps.summarySearchBackend, Boolean(built.deps.ch)]).toEqual([value, true, undefined, true]);
       } finally {
         await built.close();
       }

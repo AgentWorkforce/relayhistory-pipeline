@@ -54,7 +54,9 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * either param is 501 `param_includeReadiness` / `param_readyOnly` and the list is unchanged.
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true", ClickHouse backend only) serves GET
  * /v1/sessions/summaries/search over the owner-applied session_brief_documents table; otherwise 501
- * `summary_search_not_configured`.
+ * `summary_search_not_configured`. READ_API_SUMMARY_SEARCH_BACKEND=postgres (self-host service only;
+ * the Lambda refuses to start with it) serves the same route from the session directory instead
+ * (postgres/summary-search.ts), with or without ClickHouse.
  * READ_API_RELAYFACTS_ENABLED (exactly "true", either entry) serves GET /v1/relayfacts
  * and /v1/relayfacts/:topic (migration 20261105062080); otherwise both are 501
  * `relayfacts_disabled`.
@@ -94,7 +96,8 @@ import {
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import {
-  coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
+  coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, parseSummarySearchBackend, readApiRouteEnabled,
+  type SummarySearchBackendKind,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED,
@@ -594,6 +597,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   parseSelfhostReadApi(env);
   parseSelfhostLoginSync(env);
   factsBackends(env, "lambda");
+  summarySearchBackend(env, "lambda");
   searchSkipsPartialSessions(env, "lambda");
   sessionPartialRetryable(env, "lambda");
   postgresTlsOptions(env);
@@ -625,6 +629,19 @@ export function factsBackends(env: NodeJS.ProcessEnv, entry: ReadAppEntry) {
   return { output, digest, coordination };
 }
 
+/**
+ * READ_API_SUMMARY_SEARCH_BACKEND (config.ts parseSummarySearchBackend): which store serves GET
+ * /v1/sessions/summaries/search. Unset = "clickhouse", today's behaviour. "postgres" (the session
+ * directory) is served only by the self-host service: the hosted Lambda refuses it rather than
+ * ignore it. Any other value refuses to start.
+ */
+export function summarySearchBackend(env: NodeJS.ProcessEnv, entry: ReadAppEntry): SummarySearchBackendKind {
+  const kind = parseSummarySearchBackend(env);
+  if (entry !== "service" && kind === "postgres")
+    throw new Error("session read api: READ_API_SUMMARY_SEARCH_BACKEND=postgres is served only by the self-host service");
+  return kind;
+}
+
 /** The read API's dependencies except its verifier: the read-role pool, the
  * selected search binding (the ClickHouse client or the composition's adapter,
  * never both), directory/liveness SQL and the self-host login. `close` releases
@@ -650,6 +667,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
   const listReadiness = exactTrueFlag(env[READ_API_LIST_READINESS_ENABLED]);
   const summarySearch = exactTrueFlag(env[READ_API_SUMMARY_SEARCH_ENABLED]);
+  const summarySearchPg = summarySearchBackend(env, entry) === "postgres";
   const messageOrigin = messageOriginLabelsEnabled(env[MESSAGE_ORIGIN_LABELS_VAR]);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
@@ -765,6 +783,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(listShortSummary ? { listShortSummary: true } : {}),
     ...(listReadiness ? { listReadiness: true } : {}),
     ...(summarySearch ? { summarySearch: true } : {}),
+    ...(summarySearchPg ? { summarySearchBackend: "postgres" as const } : {}),
     ...(exactTrueFlag(env[READ_API_SESSION_SOURCES_ENABLED]) ? { sessionSources: sqlSessionSources(poolTenantRunner(pool as never)) } : {}),
     ...(messageOrigin ? { messageOrigin: true } : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),

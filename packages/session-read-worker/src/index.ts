@@ -58,6 +58,9 @@
  * READ_API_SUMMARY_SEARCH_ENABLED (exactly "true": GET /v1/sessions/summaries/search over the
  * owner-applied ClickHouse session_brief_documents; every other value = 501
  * summary_search_not_configured; unset in wrangler.jsonc),
+ * READ_API_SUMMARY_SEARCH_BACKEND (unset, "" or "clickhouse" only: the Postgres summary search
+ * backend is served only by the self-host service, so "postgres" or any other value is a
+ * misconfigured deploy and every request answers 503; unset in wrangler.jsonc),
  * READ_API_RELAYFACTS_ENABLED (exactly "true": GET /v1/relayfacts and
  * /v1/relayfacts/:topic, migration 20261105062080; every other value = 501
  * relayfacts_disabled),
@@ -141,7 +144,7 @@ import type { AnalysisDeps } from "../../../src/session-read-api/app.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, sessionPartialRetryableFlag } from "../../../src/session-read-api/config.ts";
+import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseSummarySearchBackend, sessionPartialRetryableFlag } from "../../../src/session-read-api/config.ts";
 import { pendingV2Cache, sqlCoordinationAdvisories } from "../../../src/session-read-api/coordination-advisories.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
@@ -238,6 +241,8 @@ export interface Env extends CanonicalEnv {
   /** Exactly "true": serve the GET /v1/sessions includeReadiness=true / readyOnly=true opt-ins; anything else = 501 param_includeReadiness / param_readyOnly. */
   READ_API_LIST_READINESS_ENABLED?: string;
   READ_API_SUMMARY_SEARCH_ENABLED?: string;
+  /** Unset, "" or "clickhouse" only (parseSummarySearchBackend); "postgres" is self-host service only and, like any other value, refuses every request. */
+  READ_API_SUMMARY_SEARCH_BACKEND?: string;
   /** Exactly "true": serve GET /v1/sessions/:sessionId/sources (sqlSessionSources); anything else = 501 sources_not_configured. */
   READ_API_SESSION_SOURCES_ENABLED?: string;
   /** Self-host service only (config.ts READ_API_SESSION_PARTIAL_RETRYABLE): unset, "" or "false"; anything else refuses every request. */
@@ -541,6 +546,15 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
       throw new ConfigError(error instanceof AnalyticsConfigError ? error.variable : "ANALYTICS_SINK");
     }
     authConfig = workerAuthConfig(env);
+    // The Postgres summary search backend is self-host service only (src/session-read-api/lambda.ts
+    // summarySearchBackend); the Worker serves the ClickHouse one and refuses anything else.
+    let summarySearchBackend: string;
+    try {
+      summarySearchBackend = parseSummarySearchBackend(env as unknown as Record<string, unknown>);
+    } catch {
+      throw new ConfigError("READ_API_SUMMARY_SEARCH_BACKEND");
+    }
+    if (summarySearchBackend !== "clickhouse") throw new ConfigError("READ_API_SUMMARY_SEARCH_BACKEND");
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
     // Owner-buffered on needs its privacy authority bound; refuse every request rather than run

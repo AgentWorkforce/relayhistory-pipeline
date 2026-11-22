@@ -69,6 +69,23 @@ export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_
 export const READ_API_LIST_READINESS_ENABLED = "READ_API_LIST_READINESS_ENABLED";
 /** GET /v1/sessions/summaries/search: ClickHouse summary search (clickhouse/summary-search-query.ts). Default off. */
 export const READ_API_SUMMARY_SEARCH_ENABLED = "READ_API_SUMMARY_SEARCH_ENABLED";
+/**
+ * The store GET /v1/sessions/summaries/search reads once READ_API_SUMMARY_SEARCH_ENABLED is on: today's
+ * ClickHouse documents, or the Postgres session directory (postgres/summary-search.ts). Service entry only.
+ */
+export type SummarySearchBackendKind = "clickhouse" | "postgres";
+export const READ_API_SUMMARY_SEARCH_BACKEND = "READ_API_SUMMARY_SEARCH_BACKEND";
+
+/**
+ * READ_API_SUMMARY_SEARCH_BACKEND: unset or "" = "clickhouse" (the default, today's behaviour); exactly
+ * "clickhouse" or "postgres"; anything else refuses to start. Never echoes the value.
+ */
+export function parseSummarySearchBackend(env: Record<string, unknown>): SummarySearchBackendKind {
+  const raw = env[READ_API_SUMMARY_SEARCH_BACKEND];
+  if (raw === undefined || raw === "" || raw === "clickhouse") return "clickhouse";
+  if (raw === "postgres") return "postgres";
+  throw new Error(`session read api: ${READ_API_SUMMARY_SEARCH_BACKEND} must be unset, "", "clickhouse" or "postgres"`);
+}
 /** GET /v1/sessions/:sessionId/sources: the live sources of one session id (session-sources.ts). Default off. */
 export const READ_API_SESSION_SOURCES_ENABLED = "READ_API_SESSION_SOURCES_ENABLED";
 /**

@@ -28,7 +28,8 @@ route does not check currentness and its results are best-effort (below).
 
 Reader candidate discovery is exclusively CH; Supabase only hydrates exact paired
 source/session tuples under the existing signed workspace claim policy. No title/summary query
-or broad directory candidate scan runs in Supabase. Existing rank fusion, deterministic recency ties, brief snippet priority and frozen-rank cursor semantics remain; a source-version fingerprint invalidates pre-index cursors.
+or broad directory candidate scan runs in Supabase. (The opt-in self-host Postgres backend below is
+the one exception, and only when its selector is set.) Existing rank fusion, deterministic recency ties, brief snippet priority and frozen-rank cursor semantics remain; a source-version fingerprint invalidates pre-index cursors.
 
 Only the existing keyword pools are claimed. No embedding/vector pool is implemented or enabled here. Existing typed unsupported organization/project/event-window/kind/task/tag/agent filters remain unsupported until their semantics have separate proof.
 
@@ -72,3 +73,30 @@ schedule `{"briefDocuments": true}` with `SESSION_BRIEF_DOCUMENTS_PUBLISH=1` unt
 backfill and outbox are drained; then deploy the reader flag. While capture is live, the
 operator erase runtime (`20261105050020`) refuses with "independent artifact writer requires
 a drain protocol"; that drain protocol is not implemented.
+
+## Opt-in Postgres backend (self-host service only)
+
+`READ_API_SUMMARY_SEARCH_BACKEND=postgres`, together with `READ_API_SUMMARY_SEARCH_ENABLED=true`,
+serves the same route on the self-host service without ClickHouse or this lane's documents
+(`src/session-read-api/postgres/summary-search.ts`). Unset, `""` or `clickhouse` keep the
+ClickHouse path above byte for byte; any other value fails startup; the hosted Lambda refuses
+`postgres` at startup and the read Worker answers 503 to every request with it. There is no
+automatic fallback between the backends. No migration, index or grant is added.
+
+- Candidates come from the existing directory query function (migration `20261105046010`) as
+  the read role: `q` is normalised like a directory search word (3 visible characters to 200
+  code points, else 400) and sent as one phrase term, a substring match on the tenant's live
+  rows' `search_text`. Erased or tombstoned sessions are never returned.
+- `search_text` also holds task title, agent, project, repo, branch and model, and can be stale,
+  so every row is re-checked with the same `summaryMatches` as the ClickHouse path. Only rows
+  whose current title or short summary contains `q` are served; the re-check can drop rows,
+  never add them.
+- Bounded and best-effort: keyset pages of 200 rows, newest activity first, at most 3 pages
+  (600 rows) per request, stopping once `limit + 1` matches are found. When many recent rows
+  match `q` only through another field, the page can hold fewer than `limit` sessions, even
+  none, with `truncated: true`; older matches past the scan are missed.
+- Same response shape, attestation, canary, buffered 501 and tenant check as the ClickHouse
+  path; the page is ordered last activity DESC, source DESC, session_id DESC. Which rows fill
+  the page at the truncation edge can differ from ClickHouse on identical activity timestamps.
+  No cursor; no ranking or snippets.
+- Fresher than the ClickHouse path: the read is the directory itself, with no outbox lag.
