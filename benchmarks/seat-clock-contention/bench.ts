@@ -1,36 +1,45 @@
 /**
  * Receipt seat clock contention benchmark, on a THROWAWAY loopback PostgreSQL that the operator owns. Synthetic data only.
- * The script creates its own databases (one migrated template, then one copy per run) and drops all of them at the end.
- * It refuses any URL that is not a loopback IP literal, or that carries a password.
+ * The script creates its own databases (one migrated template, then one copy per cell) and drops all of them at the end.
+ * It refuses a URL that is not postgres(ql):// to a loopback IP literal, or that has a password, query parameters or a
+ * fragment. It also refuses to start when PGHOST, PGHOSTADDR, PGPASSWORD, PGPASSFILE, PGSERVICE or PGSERVICEFILE is set.
  *
  * What runs: the repository's migrator (local profile, as the *.postgres.test.ts files) and the CURRENT functions and lock
- * order, unchanged. Load goes through the real upload path (deliverBatch -> sqlLedger: claim, prepare, commit + staged ACK),
- * every ledger call its own transaction as bulls96_session_ingest with SET LOCAL lock_timeout 2s / statement_timeout 5s
- * (the role's settings in supabase/bootstrap/session_ingest_role.sql; SET ROLE does not apply role settings, so they are
- * set explicitly), READ COMMITTED.
+ * order, unchanged. Load goes through the real upload path (deliverBatch -> sqlLedger: claim, prepare, commit + staged ACK)
+ * in Bun worker threads (load-worker.ts). Every ledger call is its own transaction as bulls96_session_ingest with
+ * SET LOCAL lock_timeout 2s / statement_timeout 5s (the role's settings in supabase/bootstrap/session_ingest_role.sql;
+ * SET ROLE does not apply role settings, so they are set explicitly), READ COMMITTED.
  *
- * Workloads (same total records per run):
- *   W1 distinct origins: C workers, each its own user and origin (orgs rotate over 4), all competing on the clock.
+ * Workloads (same total records per cell; no warm-up delivery, first-seen adoption happens in the timed phase):
+ *   W1 distinct origins: C workers, each its own user and origin (orgs rotate over 4).
  *   W2 hot origin: half the batches belong to ONE user/origin served by C/2 concurrent workers; the other half to C/2
  *      tail workers with one distinct user/origin each.
- * A failed delivery is re-queued (the client re-uploads the same batch after a 100-300 ms pause), as a real client would.
+ * A failed delivery is re-queued (the client re-uploads the same batch after a 100-300 ms pause).
+ * Per cell, bufferLockBusy: true turns on DeliverDeps.bufferLockBusy (a configuration variant).
  *
- * Control: every controlEveryMs an owner connection runs sessions.ingest_lazy_clear(reset) for a dedicated control user,
- * with the same 2 s / 5 s limits. That is the step of the lazy ordered control (ingest_apply_ordered_control ->
- * ingest_lazy_clear) that takes the clock row FOR UPDATE, which conflicts with every other clock lock mode.
+ * Controls, one kind per cell (cell.controls, else plan.controls, default "c1"), at a fixed rate (controlEveryMs), one
+ * at a time, 2 s / 5 s:
+ *   c1: sessions.ingest_lazy_clear(reset) for a dedicated user, as the owner: the clock FOR UPDATE step alone.
+ *   c2: ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control as the runtime role,
+ *       a selection disable of a fresh session of a dedicated user, with a relayhistory-cloud control witness.
+ *   none: no control.
  *
- * Measurement: a dedicated superuser connection samples back to back (period reported) pgrowlocks() on the clock row and
- * the not-granted rows of pg_locks with pg_blocking_pids. Every ledger transaction is timed on the client and tagged with
- * SET LOCAL application_name (stage), so the samples map to stages and transactions:
- *   HOLD (per transaction holding the clock in an exclusive mode) = client-observed end of COMMIT - first sample showing it
- *        as the clock locker. Resolution: one sample period at the start; the end is exact.
- *   WAIT (per transaction, per lock class) = samples showing it waiting on that class x sample period.
- * Output: results/<runId>/summary.json (+ txns.jsonl.gz, waits.jsonl.gz raw receipts) and a line per cell on stdout.
+ * Measurement:
+ *   Per call (client clock): whole-call age, statement time and COMMIT response time.
+ *   Sampled: a sampler thread (sampler-worker.ts) on one superuser connection polls pgrowlocks() on the clock row, the
+ *   not-granted pg_locks rows with pg_blocking_pids, granted tuple and advisory locks, and the stage tags
+ *   (SET LOCAL application_name). Samples are matched to transactions by pid and client time window.
+ *   HOLD = first exclusive-mode locker sample -> min(client COMMIT completion, last locker sample + period p50).
+ *   CLOCK WAIT = first clock-wait sample -> first holder sample, or -> client end for a transaction that failed while
+ *   waiting; 0 if never seen waiting. WAIT BY CLASS = samples x period p50.
+ * Output: results/<runId>/summary.json, txns-<cell>.jsonl.gz (every transaction with its hold samples and wait counts),
+ * graph-<cell>.json (wait-graph counts), and one JSON line per cell on stdout. report.ts renders the tables.
  *
  * Usage: SESSION_INGEST_TEST_PG_URL=postgresql://postgres@127.0.0.1:<port>/postgres \
  *   bun benchmarks/seat-clock-contention/bench.ts '<plan json>'
- *   plan = { runId?, totalRecords?, maxSeconds?, controlEveryMs?, originClaimFence?, historyLive?,
- *            cells: [{ workload: "W1"|"W2", n: number, c: number }] }
+ *   plan = { runId?, totalRecords?, maxSeconds?, controlEveryMs?, controls?, originClaimFence?, historyLive?, threads?,
+ *            cells: [{ workload: "W1"|"W2", n: number, c: number, controls?, bufferLockBusy?, label? }] }
+ *   runId and label: letters, digits, dot, dash and underscore only.
  */
 import pg from "pg";
 import { isIP } from "node:net";
@@ -46,13 +55,22 @@ import { sqlLedger } from "../../src/session-ingest/ledger-sql.ts";
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 if (!url) throw Error("SESSION_INGEST_TEST_PG_URL (an owned loopback fixture) is required");
 const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return isIP(x) === 4 ? x.split(".")[0] === "127" : isIP(x) === 6 && x === "::1"; };
-{ const u = new URL(url); if (!loopback(u.hostname) || u.password) throw Error("loopback throwaway fixture only"); }
+{
+  const u = new URL(url);
+  // Query parameters (host=, hostaddr=, password=, service=) and libpq environment variables can redirect or authenticate
+  // the connection outside the URL's host: refuse them.
+  if (!["postgres:", "postgresql:"].includes(u.protocol) || !loopback(u.hostname) || u.password || u.search || u.hash) throw Error("loopback throwaway fixture only");
+  for (const v of ["PGHOST", "PGHOSTADDR", "PGPASSWORD", "PGPASSFILE", "PGSERVICE", "PGSERVICEFILE"]) if (process.env[v] !== undefined) throw Error(`refusing to start with ${v} set`);
+}
+const SAFE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 
 type Workload = "W1" | "W2";
 type Cell = { workload: Workload; n: number; c: number; controls?: "c1" | "c2" | "none"; bufferLockBusy?: boolean; label?: string };
 type Plan = { runId?: string; threads?: number; controls?: "c1" | "c2" | "none"; totalRecords?: number; maxSeconds?: number; controlEveryMs?: number; originClaimFence?: boolean; historyLive?: boolean; cells: Cell[] };
 const plan = JSON.parse(process.argv[2] ?? "{}") as Plan;
 const RUN_ID = plan.runId ?? new Date().toISOString().replace(/[:.]/g, "-");
+if (!SAFE_ID.test(RUN_ID) || RUN_ID.startsWith(".")) throw Error("runId: letters, digits, dot, dash, underscore only");
+for (const c of plan.cells ?? []) if (c.label !== undefined && (!SAFE_ID.test(c.label) || c.label.startsWith("."))) throw Error("cell label: letters, digits, dot, dash, underscore only");
 const TOTAL = plan.totalRecords ?? 64000, MAX_S = plan.maxSeconds ?? 300, CONTROL_MS = plan.controlEveryMs ?? 1000;
 const FENCE = plan.originClaimFence ?? true;
 const OUT = join(import.meta.dir, "results", RUN_ID);

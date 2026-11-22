@@ -23,22 +23,22 @@ Tables only. Definitions, the qualified records/s reading (250 vs 500 is about e
 
 ### Clock hold vs wait, commit transactions (ms, p50 / p95 / p99 / max)
 
-Sampled: hold start and wait come from the lock sampler (period p50 per cell in the last table, about 0.6-2.8 ms); hold end is the COMMIT completion. Coverage = observed holds (commit transactions of any outcome, incl. ones that later failed 57014) / committed commits.
+Sampled: hold start and wait come from the lock sampler (period p50 per cell in the last table). Hold end = min(client COMMIT completion, last holder sample + period). Hold n includes commits that failed after taking the clock. Clock wait includes commits that failed while waiting (about 2 s or 5 s, the timeouts) and never-waited commits (0), so percentiles near 5 s are censored. Observed holds / committed is not a coverage measure (its numerator includes failed commits); unobserved = successful commit or control transactions with no hold sample.
 
-| workload | batch | C | hold | wait for clock | commit stage latency (ok) | observed holds / committed | sample period p50 |
-|---|---|---|---|---|---|---|---|
-| W1 | 250 | 4 | 68 / 82 / 86 / 103 | 43 / 258 / 483 / 539 | 115 / 324 / 555 / 598 | 256/256 | 0.72 ms |
-| W1 | 250 | 16 | 71 / 86 / 403 / 518 | 914 / 2067 / 2471 / 2744 | 983 / 2202 / 2533 / 2823 | 256/256 | 1.18 ms |
-| W1 | 250 | 64 | 71 / 109 / 547 / 1344 | 3481 / 4996 / 5014 / 5035 | 2262 / 4947 / 4994 / 5014 | 271/256 | 2.12 ms |
-| W1 | 500 | 4 | 130 / 159 / 196 / 211 | 63 / 551 / 1056 / 1335 | 207 / 705 / 1205 / 1451 | 128/128 | 0.62 ms |
-| W1 | 500 | 16 | 136 / 188 / 766 / 810 | 1298 / 3493 / 3645 / 3680 | 1444 / 3641 / 3790 / 3804 | 128/128 | 1.12 ms |
-| W1 | 500 | 64 | 134 / 413 / 1341 / 1460 | 4207 / 5000 / 5043 / 5074 | 2324 / 4857 / 4956 / 5002 | 131/128 | 1.42 ms |
-| W2 | 250 | 4 | 65 / 82 / 129 / 2092 | 6 / 79 / 122 / 206 | 101 / 225 / 322 / 2117 | 256/256 | 0.57 ms |
-| W2 | 250 | 16 | 62 / 80 / 88 / 91 | 9 / 763 / 925 / 995 | 447 / 1272 / 2157 / 2432 | 256/256 | 0.64 ms |
-| W2 | 250 | 64 | 64 / 95 / 266 / 467 | 0 / 3601 / 3929 / 3991 | 1445 / 3704 / 4031 / 4724 | 256/256 | 0.73 ms |
-| W2 | 500 | 4 | 127 / 157 / 165 / 175 | 12 / 146 / 231 / 240 | 168 / 425 / 485 / 1372 | 128/128 | 0.54 ms |
-| W2 | 500 | 16 | 126 / 158 / 169 / 171 | 0 / 1861 / 2331 / 2440 | 821 / 2259 / 2576 / 3122 | 128/128 | 0.53 ms |
-| W2 | 500 | 64 | 129 / 217 / 510 / 1110 | 0 / 4384 / 4992 / 4994 | 1725 / 4094 / 4705 / 4937 | 130/128 | 0.67 ms |
+| workload | batch | C | hold | wait for clock | commit stage latency (ok) | observed holds / committed | unobserved | sample period p50 |
+|---|---|---|---|---|---|---|---|---|
+| W1 | 250 | 4 | 68 / 82 / 86 / 103 | 43 / 258 / 483 / 539 | 115 / 324 / 555 / 598 | 256/256 | 0 | 0.72 ms |
+| W1 | 250 | 16 | 71 / 86 / 403 / 518 | 914 / 2067 / 2471 / 2744 | 983 / 2202 / 2533 / 2823 | 256/256 | 0 | 1.18 ms |
+| W1 | 250 | 64 | 71 / 109 / 547 / 1344 | 3481 / 4996 / 5014 / 5035 | 2262 / 4947 / 4994 / 5014 | 271/256 | 0 | 2.12 ms |
+| W1 | 500 | 4 | 130 / 159 / 196 / 211 | 63 / 551 / 1056 / 1335 | 207 / 705 / 1205 / 1451 | 128/128 | 0 | 0.62 ms |
+| W1 | 500 | 16 | 136 / 188 / 766 / 810 | 1298 / 3493 / 3645 / 3680 | 1444 / 3641 / 3790 / 3804 | 128/128 | 0 | 1.12 ms |
+| W1 | 500 | 64 | 134 / 413 / 1341 / 1460 | 4207 / 5000 / 5043 / 5074 | 2324 / 4857 / 4956 / 5002 | 131/128 | 0 | 1.42 ms |
+| W2 | 250 | 4 | 65 / 82 / 129 / 2092 | 6 / 79 / 122 / 206 | 101 / 225 / 322 / 2117 | 256/256 | 0 | 0.57 ms |
+| W2 | 250 | 16 | 62 / 80 / 88 / 91 | 9 / 763 / 925 / 995 | 447 / 1272 / 2157 / 2432 | 256/256 | 0 | 0.64 ms |
+| W2 | 250 | 64 | 64 / 95 / 266 / 467 | 0 / 3601 / 3929 / 3991 | 1445 / 3704 / 4031 / 4724 | 256/256 | 0 | 0.73 ms |
+| W2 | 500 | 4 | 127 / 157 / 165 / 175 | 12 / 146 / 231 / 240 | 168 / 425 / 485 / 1372 | 128/128 | 0 | 0.54 ms |
+| W2 | 500 | 16 | 126 / 158 / 169 / 171 | 0 / 1861 / 2331 / 2440 | 821 / 2259 / 2576 / 3122 | 128/128 | 0 | 0.53 ms |
+| W2 | 500 | 64 | 129 / 217 / 510 / 1110 | 0 / 4384 / 4992 / 4994 | 1725 / 4094 / 4705 / 4937 | 130/128 | 0 | 0.67 ms |
 
 ### Controls during load (fixed rate, one at a time; latency and hold in ms)
 

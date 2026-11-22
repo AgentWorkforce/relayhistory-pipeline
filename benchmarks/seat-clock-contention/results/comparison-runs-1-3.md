@@ -5,8 +5,13 @@ Run 4 adds isolated distinct-origin cells, matched none-vs-C2 rotations at W1/50
 
 - Source: `baseline-471d291a/` (run 1, C1), `baseline-471d291a-c2/` (run 2, C2), `baseline-471d291a-none/` (run 3, no
   control) and `unit4-471d291a/` (run 4).
-- Harness and settings are identical across runs.
-- The host is shared, so spread between runs is real and is reported, not removed.
+- Server settings, image, host and load generator are the same in every run. The harness was not identical across runs:
+  - run 1 predates the `controls` plan field and the `controlKind`, `sampledCoverage`, `callTimingMs`, `tuples`,
+    `advisoryHeldByStage` and `commitsQueuedOnClock` result fields;
+  - run 4 adds sampling of granted advisory locks, which lengthens each sample;
+  - the sampler period differs by run and cell (p50 0.53-2.84 ms).
+- The host is shared. Spread between runs is reported, not removed, and includes these harness changes as well as host
+  load.
 
 ## Definitions
 
@@ -35,18 +40,29 @@ Run 4 adds isolated distinct-origin cells, matched none-vs-C2 rotations at W1/50
   - Also: stage latency, drain time, commits/s, durable records/s, failures by SQLSTATE.
 - **Sampled** (one superuser connection polling back to back; period p50 0.5-2.8 ms per cell, reported as
   `sampler.periodMs`):
-  - **clock hold start**: the first sample showing the transaction as the clock-row locker (pgrowlocks), in an exclusive
-    mode. **Hold end** is the measured COMMIT completion.
-  - **clock wait**: first wait sample -> first holder sample.
-  - **lock wait by class**: number of samples x period p50.
-  - **granted advisory locks and the wait graph**.
-  - **Coverage**: every committed commit had an observed hold in every cell, which is shown as "observed holds /
-    committed". The observed count can exceed committed because commits that held the clock and then failed are included.
-    Holds shorter than one period could be missed.
+  - **Clock hold**: from the first sample showing the transaction as the clock-row locker (pgrowlocks) in an exclusive
+    mode, to min(client-observed COMMIT completion, last such sample + period p50).
+    - Hold n counts every commit transaction with an observed hold, including ones that failed after taking the clock.
+    - The start uses the server clock (sampler) and the end uses the client clock (same host).
+  - **Clock wait**: first sample waiting on the clock row -> first sample holding it.
+    - A transaction that failed while waiting has no holder sample; its wait runs to its client end, which is about 5 s
+      (the statement timeout) or 2 s (lock_timeout).
+    - A commit never seen waiting counts as 0.
+    - Both are included in the percentiles. So a p95 near 5.0 s at C64 is the timeout, censored, and says nothing about the
+      tail beyond it.
+  - **Lock wait by class**: number of samples x period p50.
+  - **Granted advisory locks (run 4) and the wait graph**.
+  - **Coverage**: the reported ratio "observed holds / committed" counts failed commits that held the clock in its
+    numerator, so it can exceed 1. It is not a coverage measure. Use `unobservedHolds` instead: transactions of the
+    commit or control stage that succeeded with no hold sample.
+    - It is 0 in every cell of runs 2-4.
+    - In run 1 it is 1, 1, 4, 2, 15, 1, 1, 2 in eight cells, all of them C1 controls, whose holds (about 1-3 ms) are near
+      or below the sample period. Every committed commit in runs 1-4 had an observed hold.
+    - Holds shorter than one period can be missed.
 - **Retries**: a failed delivery is re-uploaded after 100-300 ms. Retries/batch = extra attempts per batch.
-- **Smoke run (scope)**: the 16-worker smoke I quoted in an early progress note is not in these results. It was a
-  single-threaded client, one cell (W1, n=250, C=16), 8,000 records, with the sampler on the client thread. Treat it only
-  as an early sanity check.
+- **Smoke run (scope)**: an earlier 16-worker smoke figure was produced by a prior single-threaded version of the
+  harness: one cell (W1, n=250, C=16), 8,000 records, with the sampler on the client thread. It is not part of these
+  results and is not comparable to them.
 
 ## Which stages take which lock (evidence, run 4)
 
@@ -62,8 +78,13 @@ per-origin claim fence on:
     native-origin. The 13 that failed were stopped at the clock, which is consistent with the lock order origin-claim ->
     erase gate -> fence -> clock -> native-origin -> slots.
 - **Why W1 commits queue on the clock together.** The W1 tuples are distinct, so their origin-claim keys are distinct, and
-  two W1 commits never exclude each other on the wrapper lock. The only shared lock is the clock row (staged ACK NO KEY
-  UPDATE vs NO KEY UPDATE).
+  two W1 commits never exclude each other on the wrapper lock. The dominant shared lock is the clock row (staged ACK NO
+  KEY UPDATE vs NO KEY UPDATE). In the W1 cells of run 4 the clock accounts for more than 99% of wait samples. The rest:
+  - claim waiting on another claim's transaction id (row lock or unique-index insert conflict): up to 865 samples at
+    500/C16;
+  - commit waiting on a transaction id: 8-39 samples per cell;
+  - relation-extension waits on `ingest_lazy_native_slots` between claims and commits: up to 180 samples in rotA1-c2;
+  - single samples of commit-on-commit transaction waits.
   - In every sample with two or more commits queued on the clock, the queued commits held distinct origin-claim keys
     (W1 500/C16: up to 13 queued, p50 12 distinct keys). No sample in any run-4 cell had two queued commits holding the
     same key.
@@ -87,8 +108,9 @@ In the retry-heavy C64 cells, 250 delivers more than 500 (records/s 250 vs 500, 
 | W1 C64 | 2,578 vs 2,263 (0.31 vs 0.87) | 2,711 vs 2,478 (0.28 vs 0.70) | 2,855 vs 2,160 (0.33 vs 1.02) |
 | W2 C64 (mixed) | 1,352 vs 1,274 (0.95 vs 2.88) | **2,273 vs 1,147** (0.41 vs 3.21) | 1,822 vs 1,051 (0.73 vs 3.81) |
 
-At 500 each failed attempt throws away twice the work and waits about twice as long in the clock queue, so retries per
-batch are 3-4x higher. The mixed C64 cell is also the noisiest between runs (250: 1,352 / 2,273 / 1,822).
+Retries per batch at 500 are 2.5-7.8x those at 250 (W1 C64: 2.8, 2.5, 3.1; W2 C64: 3.0, 7.8, 5.2 in runs 1, 2, 3). A
+possible mechanism, untested: at 500 each failed attempt discards twice the work and waits about twice as long in the
+clock queue. The mixed C64 cell is also the noisiest between runs (250: 1,352 / 2,273 / 1,822).
 
 ## No control vs C1 vs C2, one run per cell (runs 1-3)
 
@@ -139,15 +161,23 @@ scheduled = started + missed.
 
 Reading:
 
-- At W1/500/C4, C2 lowers commits/s from 6.73 to 5.50 on average (-18%). The ranges do not overlap (none 6.24-7.31, C2
-  4.88-5.97), and the effect appears in both orders (order A, none first: 6.24-7.31 vs 5.47-5.97; order B, C2 first:
-  6.56-7.12 vs 4.88-5.71).
-- Clock wait p95 rises from 105-169 ms to 485-1,441 ms.
-- The measured COMMIT response p95 overlaps between the arms (none 4-27 ms, C2 7-24 ms), while the commit statement p95
-  rises from 238-327 ms to 613-1,314 ms. The added time is lock wait inside the statement, not COMMIT.
-- Mechanism, from the wait graph: C2's lazy_clear step queues FOR UPDATE on the clock. That conflicts with the KEY SHARE
-  that in-flight claims keep re-taking, so C2 waits on a moving set of claims while it holds the row's tuple lock, and
-  every staged ACK that arrives queues behind it.
+- At W1/500/C4, running C2 is associated with lower commit throughput: commits/s 6.73 -> 5.50 on average (-18%).
+  - The ranges do not overlap (none 6.24-7.31, C2 4.88-5.97).
+  - The association holds in both orders (order A, none first: 6.24-7.31 vs 5.47-5.97; order B, C2 first: 6.56-7.12 vs
+    4.88-5.71).
+- Clock wait p95 is 105-169 ms without C2 and 485-1,441 ms with it.
+- Commit statement p95 is 238-327 ms without C2 and 613-1,314 ms with it.
+- Commit COMMIT-response p95 is higher with C2 in 5 of 6 pairs (none / C2: A1 4.3 / 14.9, A2 5.5 / 7.0, A3 26.6 / 14.8,
+  B1 5.8 / 16.8, B2 6.9 / 21.4, B3 10.3 / 23.7 ms). So COMMIT time is not excluded as a contributor, although it is small
+  next to the statement increase.
+- **C2 dose differs per cell**, because the control runs at a fixed rate for as long as the cell runs. A cell with C2
+  drains more slowly, so it gets more control attempts.
+  - Started / missed per C2 cell: A1 22 / 3, A2 21 / 1, A3 17 / 5, B1 22 / 1, B2 25 / 5, B3 26 / 2.
+  - Drain time in those cells is 21.4-26.2 s.
+  - The arms differ in the number of controls as well as in their presence.
+- **Mechanism, inferred from the wait graph and not directly observed**: C2's lazy_clear step queues FOR UPDATE on the
+  clock. The graph shows it waiting on claim transactions (FOR UPDATE conflicts with their KEY SHARE) and shows staged
+  ACKs queued behind it. That new claims keep re-taking KEY SHARE while C2 waits is not observed directly.
 - Earlier single-run differences at C16/C64 (runs 1-3) are within the spread between runs and are not attributed to
   controls.
 
@@ -161,20 +191,40 @@ for the busy answer's Retry-After.
   failures, so 57014 still surfaces as `delivery_unavailable`.
 - **W2**: busy-off drained in 29.8 s at 2,144 records/s. Busy-on drained in 40.1 s at 1,596 records/s, with 17
   `delivery_busy` and 5 `delivery_unavailable`.
-- One cell each on a shared host. The slower busy-on drains are not separated from run-to-run spread; for comparison, W1
-  500/C16 drained in 18.5-21.3 s across runs 1-4.
+- One cell each on a shared host. The slower busy-on drains are not separated from run-to-run spread. The same
+  configuration as W1 busy-off (W1, 500, C16, no control) drained in 18.5-22.8 s across runs 3 and 4: 20.4 s in run 3;
+  18.5 s (isolated) and 22.8 s (busy-off) in run 4. Including runs 1-2, which had controls, the W1 500/C16 range is
+  18.5-22.8 s.
 
 ## Evidence gaps
 
-1. **Hold tails at C64** (p99 0.6-1.4 s, max 2.7 s) come with the 8-CPU container saturated (docker stats up to ~790%). The
-   cause is not isolated (CPU vs a wait inside the hold); the harness does not time phases inside `ingest_lazy_ack_batch`.
+1. **Hold tails at C64** (p99 0.6-1.4 s, max 2.7 s): the cause is not isolated (CPU vs a wait inside the hold).
+   - The harness does not time phases inside `ingest_lazy_ack_batch`.
+   - Container CPU was not recorded in any committed run.
 2. **Configuration assumptions**: originClaimFence is on; bufferLockRetry is off; bufferLockBusy is off except in the
    variant cells. The client retry pause is fixed. No production setting is modeled.
 3. **Not run**: the set-based ACK body A/B (gate off vs on); P0W01 vs 55P03 on a held second slot; the FOR KEY SHARE ->
    FOR UPDATE -> FOR NO KEY UPDATE ordering experiment.
 4. **C16/C64 control effects**: one run per cell in runs 1-3. Attributing them would need matched rotations as at W1/500/C4.
-5. **Environment**: loopback round trip (about 0.03 ms) instead of a network and connection proxy; local storage and fsync;
+5. **C2 dose**: the number of control attempts per cell grows with drain time and is not held constant between arms.
+6. **Environment**: loopback round trip (about 0.03 ms) instead of a network and connection proxy; local storage and fsync;
    synthetic records. Production COMMIT round trips sit inside the hold and are not represented.
-6. **Sampling limits**: lock-wait-by-class figures are sample count x period p50, so they are approximate when the period
-   varies (C64 p99 period up to about 16 ms). Waits shorter than one period can be missed.
-7. **Busy-path variant**: a single cell per workload; no rotations.
+7. **Sampler limits**:
+   - The observer has a cost: one extra backend querying pg_locks, pg_blocking_pids and pgrowlocks back to back.
+   - Its period varies (C64 p99 up to about 16 ms).
+   - Each sample's subqueries are not one atomic snapshot of the lock table.
+   - Lock-wait-by-class figures are sample count x period p50, so they are approximate.
+   - Waits and holds shorter than one period can be missed.
+8. **Clock mixing**: hold start (server clock) and hold end or transaction window (client clock) come from different
+   clocks on the same host. Transactions are matched to samples by pid and client-side window with a 1 ms tolerance.
+9. **Timeout censoring**: waits of failed transactions stop at the 2 s or 5 s limit. Percentiles near those limits are
+   censored.
+10. **Run-1 coverage holes**: 28 C1 control holds with no sample (`unobservedHolds`). Commits are fully covered.
+11. **Harness changes between runs**: see the top of this file. Cross-run spread includes them.
+12. **No warm-up**: no warm-up delivery runs before timing. Each cell starts on a fresh copy of the template database,
+    and first-seen user and org adoption happens inside the timed phase, in each stream's first delivery.
+13. **No checkpoint or vacuum control** between cells or runs. Autovacuum and checkpoints run on their defaults during
+    cells.
+14. **Non-clock waits in W1**: small but present (claim-on-claim transaction waits, relation extension). Not analyzed
+    further.
+15. **Busy-path variant**: a single cell per workload; no rotations.

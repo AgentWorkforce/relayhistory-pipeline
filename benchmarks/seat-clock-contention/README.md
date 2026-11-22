@@ -20,13 +20,14 @@ against a disposable loopback PostgreSQL that you create and destroy. CI does no
   - Every transaction is tagged `SET LOCAL application_name='scb:<stage>'`.
 - **Workloads.** Each run has the same total number of records (`totalRecords`, default 64,000), built as a backlog before
   timing starts.
-  - `W1`, distinct origins: C workers, each with its own user and origin (orgs rotate over 4). All of them compete only
-    on the seat clock.
+  - `W1`, distinct origins: C workers, each with its own user and origin (orgs rotate over 4). Their dominant shared
+    lock is the seat clock; minor claim-on-claim and relation-extension waits also occur.
   - `W2`, hot origin: half the batches go to one user and origin, served by C/2 concurrent workers. The other half go
     to C/2 tail workers with one user and origin each. Hot-origin claims, prepares and commits queue on the per-origin
     advisory key, and commits also queue behind commits on the clock.
   - A failed delivery goes back on its worker's queue and is re-uploaded after a 100-300 ms pause, as a client would.
-  - Warm-up deliveries (first-seen user and org adoption) run before timing and are excluded.
+  - There is no warm-up delivery. First-seen user and org adoption happens inside the timed phase, in each stream's first
+    delivery.
 - **Controls**, one kind per run (matched runs; never both in one cell), at a fixed rate (`controlEveryMs`, default
   1000 ms, one at a time), with the 2 s / 5 s limits:
   - `controls: "c1"` (diagnostic): `sessions.ingest_lazy_clear(<reset for a dedicated control user>, 'reset')` as the
@@ -34,8 +35,8 @@ against a disposable loopback PostgreSQL that you create and destroy. CI does no
     every other clock lock mode.
   - `controls: "c2"` (acceptance): the Worker's entrypoint `ledger.applyOrderedControl` -> `ingest_set_session_uploads`
     -> `ingest_apply_ordered_control`, as `bulls96_session_ingest`. Each attempt is a selection disable of a fresh session
-    of a dedicated control user, with a relayhistory-cloud control witness (the witness shape used by the
-    review/receipt-clock-fix-t2-r2-bench fixture).
+    of a dedicated control user, with a relayhistory-cloud control witness (pending control, sourceControlVersion v,
+    privacyVersion v-1).
   - For each control the harness reports: started, completed during load, completed only after load ended (drain-only),
     failures by SQLSTATE, latency, and missed slots.
 - **Client.** Load runs in up to 8 Bun worker threads (`load-worker.ts`). The lock sampler runs in its own thread
@@ -50,17 +51,22 @@ the functions. So one superuser connection samples back to back (period reported
 - `pgrowlocks('sessions.ingest_receipt_seat_clock')`: which transaction holds the clock row, and in which mode;
 - the not-granted rows of `pg_locks` with `pg_blocking_pids`, plus the granted tuple locks: who waits, on what, and
   behind whom;
+- the granted advisory locks, which show which stage holds which key and in which mode;
 - the `application_name` of every active backend, which gives the stage.
+
+The subqueries of one sample are not one atomic snapshot, and the sampler is an extra backend with its own cost.
 
 Samples are matched to client-side transactions by backend pid and time window.
 
 - **HOLD** applies to a transaction holding the clock in an exclusive mode (staged ACK: NO KEY UPDATE; control: FOR
-  UPDATE). It runs from the first sample that shows the transaction as the clock locker to the end of its COMMIT. That
-  end is the client's COMMIT completion, or one sample period after the last locker sample if the client saw it later.
-  The start has one sample period of resolution.
+  UPDATE). It runs from the first sample that shows the transaction as the clock locker (server clock) to min(client-observed
+  COMMIT completion, last locker sample + period p50). The start has one sample period of resolution. Hold n includes
+  transactions that failed after taking the clock.
 - **WAIT for the clock** runs from the first sample that shows the transaction waiting on the clock row to the first
   sample that shows it holding the row. A waiter on the row waits either on the clock's tuple lock or on the holder's
-  transaction id while holding that tuple lock. A transaction never seen waiting counts as 0.
+  transaction id while holding that tuple lock. A transaction never seen waiting counts as 0. A transaction that fails while waiting has no holder sample, so its
+  wait runs to its client end (about 2 s or 5 s, the timeouts). Both are included in the percentiles, so percentiles near
+  5 s are censored at the statement timeout.
 - **Lock waits by class** is the number of samples showing a transaction waiting on a class, times the sample period.
   The classes are clock, row:<table>, advisory:native-origin, advisory:origin-claim, the erase gate (961996,50000),
   and xid (a row lock or unique-index insert conflict on another transaction).
