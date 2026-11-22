@@ -157,12 +157,6 @@ function boundedCount(v: unknown, max: number): number | undefined {
 }
 
 /**
- * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts
- * spanAttrs): the value to emit for `key`, or undefined to drop it. A key off the allowlist is
- * dropped; a BOUNDED_COUNT_FIELDS key survives only as a clamped non-negative integer; a string
- * is scrubbed and truncated. Other values pass through (callers narrow further by type).
- */
-/**
  * Enumerated fields: emitted only when the value is one of a closed set (else dropped), so they can never
  * carry free text. `store_cause` mirrors object-store STORE_TRANSPORT_CAUSES (log.test.ts pins the two equal).
  */
@@ -205,6 +199,13 @@ export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za
 export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin"]);
 const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
 
+/**
+ * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts
+ * spanAttrs): the value to emit for `key`, or undefined to drop it. A key off the allowlist is
+ * dropped; a BOOLEAN_FIELDS key survives only as true or false; a BOUNDED_COUNT_FIELDS key
+ * survives only as a clamped non-negative integer; a string is scrubbed and truncated. Other
+ * values pass through (callers narrow further by type).
+ */
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;
   if (BOOLEAN_FIELDS.has(key)) return typeof value === "boolean" ? value : undefined;

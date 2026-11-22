@@ -801,9 +801,10 @@ export function createIngestApp(deps: IngestAppDeps) {
    * keeps ageing towards the expiry; a real overlap is young). On would_refuse / refused, `same_origin` is an
    * overlap label: true = at least one live holder of the key in this isolate was taken with this request's
    * origin (the parsed batch's origin_id; never logged). The limit is one holder per key, so with a key that also
-   * held the origin a same-origin overlap would still refuse and a different-origin-only overlap would not; in
-   * observe every request becomes a holder (also those `on` would have refused), so like `count` the share is an
-   * upper bound, per isolate.
+   * held the origin a same-origin overlap would still refuse and a different-origin-only overlap would not. Read
+   * it as a count per isolate (delivery.batches would_refuse lines with same_origin false, out of all of them):
+   * it describes the overlaps observed, not how many requests `on` would refuse. Turns batches share one fixed
+   * origin, so on turns lines it only tells another turns batch (true) from a delivery (false).
    * The turns route is observed, never refused: its forwarder answers its own caller only after every batch
    * receipt, so a refusal there waits until that caller's 429 handling is confirmed.
    */

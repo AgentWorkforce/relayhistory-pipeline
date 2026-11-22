@@ -217,8 +217,14 @@ request's origin (the batch's `origin_id`), `false` = only other origins of the 
 The key itself stays per user; the label is there to decide from observe data whether a key that also held
 the origin would refuse less without missing same-origin overlaps. The limit is fixed at one holder per key,
 so with such a key a same-origin overlap would still refuse and a different-origin-only overlap would not.
-As with `count`, in `observe` every request becomes a holder (also those `on` would have refused), so the
-share is an upper bound, and it is per isolate. `on` answers an overlapping
+Report it as a count, per isolate: the `would_refuse` lines with `kind` = `delivery.batches` and
+`same_origin` = `false`, out of all `would_refuse` lines with `kind` = `delivery.batches`, both counts shown.
+That describes the overlaps observed; it makes no claim about how many requests `on` would refuse (that would
+need a fixed denominator and assumptions about arrivals, retries and holder lifetimes). Every turns batch
+carries one fixed synthetic origin, so on `kind` = `turns.batches` lines `same_origin` only tells another
+turns batch (`true`) from a delivery (`false`); turns are never refused, so those lines are left out of that
+count. A delivery behind a turns holder (`kind` = `delivery.batches`, `same_origin` = `false`) stays in it.
+`on` answers an overlapping
 `/v1/delivery/batches` 429 `delivery_busy` (`Retry-After` 2-10 s, jittered) before any ledger call and writes
 the same line with `outcome` = `refused` (with `age_ms` and `same_origin`); its request line shows `delivery_busy`. In `on`,
 `/v1/turns/batches` is never refused: it is tracked as in `observe` (it still counts as a holder, so a
@@ -239,8 +245,9 @@ flags: `PRIVATE_INGEST_INFLIGHT_LEASE` accepts `observe` or `on`; unset or empty
 any other value refuses (`private_ingest_profile_inflight_lease`). Setting it, planning and deploying is a
 production flag change that needs its own approval. Before moving `observe` to `on`: when
 `INGEST_ORIGIN_CLAIM_FENCE` is on, the claim serializes per origin, so a per-user lease in `on` refuses
-different-origin overlaps that the claim would let through; read the share of `would_refuse` lines with
-`same_origin` = `false` and decide whether the key should include the origin first. `on` to `observe` is an
+different-origin overlaps that the claim would let through; read the count of `would_refuse` lines with
+`kind` = `delivery.batches` and `same_origin` = `false` out of all `would_refuse` lines with `kind` =
+`delivery.batches` (both counts), then decide whether the key should include the origin first. `on` to `observe` is an
 ordinary update. Rollback is
 unset (or empty), then plan and deploy, no code change: the plan shows one `unbind` of
 `INGEST_INFLIGHT_LEASE`, which the operator's delete allowlist (`inflightLeaseDeletionAllowed`) admits only

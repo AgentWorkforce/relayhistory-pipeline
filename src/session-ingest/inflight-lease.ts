@@ -42,8 +42,9 @@ export const INFLIGHT_LEASE_TTL_MS = 90_000;
 
 /**
  * Most holders one isolate tracks. One holder is one delivery in flight in this isolate, so a full map of live
- * holders is far above any real concurrency; the cap only bounds memory (a few hundred bytes per entry, plus the
- * holder's origin id: a parsed batch identifier, at most 512 bytes) if releases were lost faster than they expire.
+ * holders is far above any real concurrency; the cap only bounds memory if releases were lost faster than they
+ * expire. Worst case per holder: a few hundred bytes plus its origin id (a parsed batch identifier, at most 512
+ * bytes), so a full map is a few MB per isolate.
  */
 export const INFLIGHT_LEASE_MAX_ENTRIES = 10_000;
 

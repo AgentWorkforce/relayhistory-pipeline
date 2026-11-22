@@ -502,6 +502,30 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(JSON.stringify(same.leaseLines())).not.toContain("origin-x1");
   });
 
+  test("same_origin on turns lines (observe): another turns batch is true, a delivery holder is false", async () => {
+    // Every turns batch carries the one fixed turns origin, so two overlapping turns batches always match.
+    const turns = harness("observe");
+    const g = turns.ledger.gate();
+    const first = turns.post({ path: "/v1/turns/batches", batch: await turnBatch() });
+    await g.entered;
+    await turns.post({ path: "/v1/turns/batches", batch: { ...(await turnBatch()), batch_id: "turns-2" } });
+    g.open();
+    expect((await first).status).toBe(200);
+    expect(turns.leaseLines()).toEqual([expect.objectContaining({ kind: "turns.batches", outcome: "would_refuse", state: "observe", count: 1, same_origin: true })]);
+    expect(JSON.stringify(turns.leaseLines())).not.toContain(TURN_ORIGIN_ID);
+
+    // A turns batch behind a live delivery holder (origin-1) does not match it.
+    const mixed = harness("observe");
+    const h = mixed.ledger.gate();
+    const delivery = mixed.post();
+    await h.entered;
+    const t = await mixed.post({ path: "/v1/turns/batches", batch: await turnBatch() });
+    h.open();
+    expect((await delivery).status).toBe(200);
+    expect(t.status).toBe(200);
+    expect(mixed.leaseLines()).toEqual([expect.objectContaining({ kind: "turns.batches", outcome: "would_refuse", state: "observe", count: 1, same_origin: false })]);
+  });
+
   test("same_origin, age_ms and count survive the production log filter on would_refuse and refused lines", async () => {
     const observe = harness("observe");
     await overlap(observe, undefined, { a: "origin-x1", b: "origin-x1" });
