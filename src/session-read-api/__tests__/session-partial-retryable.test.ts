@@ -14,7 +14,7 @@ import type { SearchIndexAdapter } from "@rhc/search-index/contracts.ts";
 import { AuthError, createReadApi, type ReadApiDeps, type VerifiedIdentity } from "../app.ts";
 import { CANONICAL_CURSOR_PREFIX } from "../canonical-events.ts";
 import { READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag } from "../config.ts";
-import { READER_LOGIN_SQL, readApiDepsFromSecret, sessionPartialRetryable } from "../lambda.ts";
+import { createReadApiLambdaHandler, type FunctionUrlEvent, READER_LOGIN_SQL, readApiDepsFromSecret, sessionPartialRetryable } from "../lambda.ts";
 import type { Liveness } from "../page.ts";
 import { PARTIAL_SESSIONS_CAP } from "../queries.ts";
 import { selfhostSearchComposition } from "../server.ts";
@@ -52,7 +52,10 @@ function stubCh(partial: string[], partialInWorkspace: string[] = []) {
   return ch;
 }
 
-function api(partial: string[], on: boolean, partialInWorkspace: string[] = [], cors?: ReadonlySet<string>) {
+function api(
+  partial: string[], on: boolean, partialInWorkspace: string[] = [], cors?: ReadonlySet<string>,
+  history: { completeSinceMs: number; createdAt: Record<string, number> } = { completeSinceMs: 0, createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } },
+) {
   const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: async (t) => {
@@ -60,8 +63,8 @@ function api(partial: string[], on: boolean, partialInWorkspace: string[] = [], 
       return ID;
     },
     ch: stubCh(partial, partialInWorkspace),
-    liveness: memoryLiveness({ createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } }).liveness,
-    completeSinceMs: 0,
+    liveness: memoryLiveness({ createdAt: history.createdAt }).liveness,
+    completeSinceMs: history.completeSinceMs,
     ...(on ? { sessionPartialRetryable: true } : {}),
     ...(cors ? { corsAllowedOrigins: cors } : {}),
     log: (f) => logs.push(f),
@@ -90,11 +93,11 @@ function canonical(on: boolean) {
 
 const COVERED = ["/v1/sessions/s-1/events?workspace=ws-a", "/v1/events?workspace=ws-a&session=s-1"];
 
-const expect501 = async (r: Response) => {
+const expect501 = async (r: Response, reason = "session_partial") => {
   expect(r.status).toBe(501);
   expect(r.headers.get("Retry-After")).toBeNull();
   const b = await body(r);
-  expect(b.error).toEqual({ code: "unsupported_by_backend", message: "not served by this backend: session_partial", reason: "session_partial" });
+  expect(b.error).toEqual({ code: "unsupported_by_backend", message: `not served by this backend: ${reason}`, reason });
 };
 const expect503 = async (r: Response) => {
   expect(r.status).toBe(503);
@@ -186,6 +189,46 @@ describe("startup wiring", () => {
   });
 });
 
+describe("the hosted Lambda handler refuses true before the secret lookup", () => {
+  // buildApp (reached through the exported handler factory) checks the flag before it asks Secrets Manager.
+  // fetch is stubbed for the whole test, so nothing leaves the process; the unset run proves the stub sees the
+  // lookup, so zero calls with "true" means the refusal came first. Synthetic values only.
+  const VARS: Record<string, string> = {
+    AWS_REGION: "us-east-1", SESSION_READ_API_SECRET_ARN: "arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic",
+    AWS_ACCESS_KEY_ID: "synthetic-access-key", AWS_SECRET_ACCESS_KEY: "synthetic-secret-key", READ_API_COMPLETE_SINCE: "epoch",
+  };
+  const touched = [...Object.keys(VARS), "AWS_SESSION_TOKEN", READ_API_SESSION_PARTIAL_RETRYABLE];
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = Object.fromEntries(touched.map((k) => [k, process.env[k]]));
+    for (const k of touched) delete process.env[k];
+    Object.assign(process.env, VARS);
+  });
+  afterEach(() => {
+    for (const k of touched) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    (globalThis.fetch as { mockRestore?: () => void }).mockRestore?.();
+  });
+
+  test("true: 503 init failure with no secret lookup; unset: the lookup is attempted", async () => {
+    const urls: string[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+      urls.push(String(input instanceof Request ? input.url : input));
+      throw new Error("no network in this test");
+    }) as typeof fetch);
+    const event = {} as FunctionUrlEvent;
+    process.env[READ_API_SESSION_PARTIAL_RETRYABLE] = "true";
+    expect((await createReadApiLambdaHandler()(event)).statusCode).toBe(503);
+    expect(urls).toEqual([]);
+    delete process.env[READ_API_SESSION_PARTIAL_RETRYABLE];
+    expect((await createReadApiLambdaHandler()(event)).statusCode).toBe(503);
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("secretsmanager");
+  });
+});
+
 describe("the read Worker refuses READ_API_SESSION_PARTIAL_RETRYABLE", () => {
   afterEach(() => { (console.error as { mockRestore?: () => void }).mockRestore?.(); });
   const base = {
@@ -264,6 +307,22 @@ describe("excluded routes keep the 501 with the flag on", () => {
     expect(unbounded.status).toBe(501);
     expect(unbounded.headers.get("Retry-After")).toBeNull();
     expect((await body(unbounded)).error.reason).toBe("session_partial_unbounded");
+  });
+
+  test("another 501 on a covered first page (history_floor, history_floor_unknown_session) keeps its own reason, no Retry-After", async () => {
+    // Floor after the session's start: history_floor. No live pointer, so no start time: history_floor_unknown_session.
+    // Both are thrown on the same first-page path as session_partial and never clear by retrying, so the flag must
+    // leave them alone. The session is also partial, so only the reason tells them apart.
+    const floorMs = Date.parse("2026-11-01T00:00:00Z");
+    const cases = [
+      { reason: "history_floor", createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } },
+      { reason: "history_floor_unknown_session", createdAt: {} },
+    ];
+    for (const { reason, createdAt } of cases) {
+      const { get, logs } = api(["s-1"], true, [], undefined, { completeSinceMs: floorMs, createdAt });
+      for (const path of COVERED) await expect501(await get(path), reason);
+      expect(logs.filter((l) => l.status === 503)).toEqual([]);
+    }
   });
 
   test("canonical cursor page: the recheck stays 501", async () => {

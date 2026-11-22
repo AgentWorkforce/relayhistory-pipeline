@@ -600,14 +600,20 @@ components:
         `backend_unavailable` with `reason: session_partial` and
         `Retry-After: 60` instead of 501 `session_partial`. There is no
         staleness bound: a session can stay partial indefinitely, so a client
-        MUST cap its retries and then treat the read as the 501. Workspace
-        search, `session_partial_unbounded`, cursor pages and the hosted
-        deployments keep the 501. Other 503s on these routes are unchanged:
-        `backend_unavailable` or `search_timeout` with no `reason`, and an
-        owner-buffered read's `buffered_fenced` with `Retry-After: 1`.
+        MUST cap its retries and then treat the read as the 501; every such
+        answer counts as a 5xx. Workspace search, `session_partial_unbounded`,
+        the canonical cursor page's recheck and the hosted deployments keep the
+        501; an ordinary cursor page runs no partial check. This response also
+        describes the other 503s on these routes, which are unchanged and keep
+        their own `code` and `Retry-After`, for example `backend_unavailable`
+        or `search_timeout` with no `reason` and no `Retry-After`, an
+        owner-buffered read's `buffered_fenced` and the token check's 503s
+        (such as `token_store_unavailable` and `relaycontrol_unavailable`) with
+        `Retry-After: 1`, and a service that is not enabled (`not_configured`)
+        with `Retry-After: 60`. That list is not complete.
       headers:
         Retry-After:
-          description: Seconds to wait before retrying. 60 with `reason` `session_partial`, 1 with `buffered_fenced`; absent otherwise.
+          description: Seconds to wait before retrying, when present. 60 with `reason` `session_partial`; other 503s set their own value or none (see the description).
           schema: {type: integer}
       content:
         application/json:
