@@ -243,16 +243,18 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/origin-claim-fence.postgres.test.ts
-      - name: Prove the 062210 T2 staged ACK fence, try-lock flip, seat upgrade and rollback quiescence schedules (held candidate, gate off)
+      - name: Prove the 062210 T2 staged ACK gate row under a non-superuser owner (fence, try-lock setters, RR/SERIALIZABLE races, seat upgrade, lifecycle and rollback quiescence; held candidate, gate off)
         env:
+          # The fixture superuser only provisions the owner role and its database (owner-role-harness.ts); everything
+          # under test runs as that NOSUPERUSER NOBYPASSRLS owner or as the runtime role.
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
           SESSION_INGEST_TEST_PG_REQUIRED: "1"
         run: |
           set -o pipefail
           bun test --timeout 300000 src/session-ingest/__tests__/lazy-ack-t2.postgres.test.ts src/session-ingest/__tests__/lazy-ack-t2-rollback.postgres.test.ts 2>&1 | tee lazy-ack-t2-pg.log
-          # The proof must have RUN: at least 16 passing tests (13 + 3 today) and no skipped one.
+          # The proof must have RUN: at least 39 passing tests (32 + 7 today) and no skipped one.
           if grep -Eq '^ *[1-9][0-9]* skip' lazy-ack-t2-pg.log; then echo "::error title=pg-proof::062210 T2 tests skipped"; exit 1; fi
-          grep -Eq '^ *(1[6-9]|[2-9][0-9]|[1-9][0-9]{2,}) pass' lazy-ack-t2-pg.log || { echo "::error title=pg-proof::062210 T2 pass count below 16"; exit 1; }
+          grep -Eq '^ *(39|[4-9][0-9]|[1-9][0-9]{2,}) pass' lazy-ack-t2-pg.log || { echo "::error title=pg-proof::062210 T2 pass count below 39"; exit 1; }
       - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (044010)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres

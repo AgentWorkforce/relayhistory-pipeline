@@ -16,8 +16,9 @@
  *   There is no queued fallback, no admission stop and no automatic repeat-until-success. Flipping back to main uses
  *   the same try-lock and can starve under load too: a rollback of the mode is not immediate.
  * Change the gate only with sessions.lazy_ack_t2_set_gate('fenced'|'off'): owner-only, the same barrier try-lock, and
- * the mode must be 'main'. A bare ALTER FUNCTION ... SET bulls96.lazy_ack_t2 is out of protocol (not barriered). Never
- * RESET the gate (set 'off'). lazy_ack_t2_set_mode refuses 't2' (55000, not retried here) unless the gate is 'fenced'.
+ * the mode must be 'main'. Gate and mode live in one owner-only row (sessions.lazy_ack_t2_mode); a direct UPDATE of it
+ * is refused unless its transaction holds the barrier exclusively. lazy_ack_t2_set_mode refuses 't2' (55000, not retried
+ * here) unless the row's gate is 'fenced'.
  * Busy is recognised by SQLSTATE 55P03 AND the server's English message text (the function's own message, or the row
  * NOWAIT message); a server with translated messages (lc_messages other than English) makes every busy a thrown error,
  * never a retry or a false "switched".

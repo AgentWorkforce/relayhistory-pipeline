@@ -9,40 +9,63 @@
 -- under KEY SHARE, which every other ACK and claim also takes compatibly. Only the seat numbering and the writes (seat
 -- INSERT, slot UPDATE, decision INSERT, last_seat) remain inside it.
 --
--- Gate (two levels):
---   proconfig bulls96.lazy_ack_t2 ('off' installed): off = main's body, byte for byte in behaviour, no extra read.
---     fenced = the body comes from sessions.lazy_ack_t2_mode ('main' installed | 't2').
---     on:   SELECT sessions.lazy_ack_t2_set_gate('fenced');  (off: set_gate('off'); owner-only, barriered, mode must be
---           'main'. A bare ALTER FUNCTION ... SET bulls96.lazy_ack_t2 is an out-of-protocol override.)
---     read: SELECT proconfig FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure;
---   mode row: changed ONLY by sessions.lazy_ack_t2_set_mode(text) (owner-only), in its own transaction; 't2' only while
---     the gate is 'fenced'. Change the gate only via lazy_ack_t2_set_gate (mode must be 'main'); never RESET it.
--- The flip barrier is (961996,50000), the existing operator-erase gate. Every ingest_lock_fences call takes it SHARED
--- (050010's statement trigger on ingest_fence_owners, including ON CONFLICT), and this ACK calls ingest_lock_fences as
--- its second statement, BEFORE it selects its body, so every invocation holds 50000 shared from before selection to the
--- end of its outer transaction. lazy_ack_t2_set_mode only TRY-locks 50000 EXCLUSIVE (then the mode row FOR UPDATE
--- NOWAIT, in that order; nothing else can lock the row: it is owner-only), so it succeeds only at an instant when no
--- transaction that entered ingest_lock_fences (and no erase) is open, including:
+-- Gate and mode: one owner-only singleton row, sessions.lazy_ack_t2_mode(gate, mode). No function-level SET, no custom
+-- parameter, no grant: a non-superuser owner installs and changes it (PostgreSQL 15+ refuses a function-level SET of a
+-- custom parameter to a non-superuser owner, 42501).
+--   gate 'off' (installed): main's 043800 body (outputs, first errors, rows, sequence effects), plus one singleton read.
+--   gate 'fenced': the body comes from mode ('main' installed | 't2'). CHECK (mode='main' OR gate='fenced'): the row can
+--     never say off/t2.
+--   on:   SELECT sessions.lazy_ack_t2_set_gate('fenced');  off: set_gate('off'). Owner-only, barriered, mode must be 'main'.
+--   mode: SELECT sessions.lazy_ack_t2_set_mode('t2'|'main'); owner-only, barriered; 't2' only while the gate is 'fenced'.
+--   read: SELECT gate,mode FROM sessions.lazy_ack_t2_mode;
+--   Exactly one row: PK singleton CHECK(singleton) (at most one), installed with the table, and DELETE/TRUNCATE refused
+--   by triggers. A missing row fails closed (55000) in the ACK and in both setters; it never means 'main'. An UPDATE is
+--   refused (trigger) unless its transaction holds (961996,50000) EXCLUSIVE, as both setters do.
+-- Where the ACK reads it: once, after ingest_lock_fences and after the suppressed early return, just before the clock
+-- lock is chosen. ingest_lock_fences took (961996,50000) SHARED (050010's statement trigger on ingest_fence_owners),
+-- held to the end of the outer transaction, and both setters TRY-lock 50000 EXCLUSIVE, so no gate or mode change can
+-- commit between the read and this transaction's end.
+--   READ COMMITTED: a plain read. Its statement snapshot is taken after 50000 shared was granted, so it sees every
+--     change committed before, and none can commit after. T2 only if gate='fenced' AND mode='t2'.
+--   REPEATABLE READ / SERIALIZABLE (treated as reachable; the shipped callers run READ COMMITTED, so this branch is
+--     defensive): the transaction snapshot may predate a committed change, and a plain read then returns the stale
+--     version without error. So the read is FOR SHARE, which conflicts with any UPDATE of the row: a version replaced
+--     after the snapshot gives 40001 (retry the whole transaction). FOR KEY SHARE is not enough: gate and mode are
+--     non-key columns, and after a barrier-held UPDATE with no prior row lock a FOR KEY SHARE read returned the stale
+--     row without error (PostgreSQL 15/16/17; after the setters, whose FOR UPDATE NOWAIT precedes their UPDATE, it
+--     happened to give 40001; the design does not rely on that). On a current row: gate 'off' -> main; gate
+--     'fenced' -> 55000 for a staged ACK in either mode (T2 needs READ COMMITTED statement snapshots).
+--   Scope: the read, the missing-row check (55000 at every isolation level, nothing written) and the fenced-isolation
+--     refusal apply to the staged ACKs that need the mode decision (every non-suppressed ACK; a kind other than staged
+--     is then refused as on main). Suppressed receipts
+--     return before the read at every isolation level and in every gate/mode state: no read, no refusal, exactly
+--     043800's suppressed path (the same text in both bodies, pinned by the PGlite suite; it selects no seat-allocation
+--     body). Through the runtime entry points a suppressed receipt is ACKed inside its claim, which 043500 already
+--     refuses outside READ COMMITTED (40001) in every state, as on main. r3 refused non-READ COMMITTED suppressed
+--     receipts while fenced; restoring that is one hunk (move the read above the suppressed return).
+--   A 40001 here means: retry the WHOLE transaction (a new snapshot). The shipped caller runs each commit as one
+--     autocommit statement (src/session-ingest/ledger-sql.ts, the commit call), maps any SQLSTATE other than its lock
+--     codes to IngestUnavailable (503, src/session-ingest/deliver.ts), and the client re-sends the delivery.
+-- The flip barrier is (961996,50000), the existing operator-erase gate. Both setters only TRY-lock 50000 EXCLUSIVE
+-- (then the row FOR UPDATE NOWAIT, in that order), so a change succeeds only at an instant when no transaction that
+-- entered ingest_lock_fences (and no erase) is open, including:
 --   - an invocation that selected main and is paused before the clock;
 --   - a transaction paused after its ACK, before COMMIT;
 --   - a claim holding the clock KEY SHARE that later enters an ACK;
 --   - a multi-call transaction.
 -- When busy it raises 55P03 at once with nothing changed, and it never QUEUES an exclusive request: no ingest pause
--- while it retries and no queue-order edge in any lock cycle. A successful flip holds 50000 exclusive until its own
--- COMMIT (run it as one autocommit statement), so writers arriving in that window wait for that commit only. Same in
--- both directions. The mode row is read UNLOCKED by the ACK: no flip can commit while the reader holds 50000 shared,
--- and fenced mode refuses anything but READ COMMITTED BEFORE reading it (a REPEATABLE READ snapshot taken before a flip
--- could still see the old mode). Compatibility consequence: with proconfig 'fenced', a non-READ COMMITTED commit fails
--- 55000 in either mode; the Worker and self-host run read committed. Initial transition: off -> fenced changes nothing
--- while the row says 'main'. Operator: src/session-ingest/lazy-ack-t2-flip.ts, ONE bounded attempt sequence per
--- operator action in a naturally quiet window, one autocommit statement per attempt. Exhausted: no switch (mode
--- unchanged). Reply lost: indeterminate; reconcile before any further attempt. No queued fallback, no admission stop,
--- no automatic repeat. Under sustained concurrent uploads the try-lock rarely finds a free instant (local bench), and
--- that applies equally to flipping BACK to main: rolling the mode back is not immediate. The down migration refuses
--- unless the mode is 'main' and the gate is not 'fenced'. Busy (any ingest or erase transaction open): fail-fast via a
--- try-lock on 50000, never queued, so it can starve too. A successful rollback holds 50000 exclusive through its DDL
--- and COMMIT; uploads arriving in that interval wait for it. Never flip during an operator erase (same key). The ALTER,
--- the flip, the rollback and the apply are real-database operations and Khaliq's own decisions.
+-- while it retries and no queue-order edge in any lock cycle. A successful change holds 50000 exclusive until its own
+-- COMMIT (run it as one autocommit statement), so writers arriving in that window wait for that commit only. Both
+-- setters require READ COMMITTED. Initial transition: off -> fenced changes nothing while the mode is 'main'. Operator:
+-- src/session-ingest/lazy-ack-t2-flip.ts, ONE bounded attempt sequence per operator action in a naturally quiet window,
+-- one autocommit statement per attempt. Exhausted: no switch (mode unchanged). Reply lost: indeterminate; reconcile
+-- before any further attempt. No queued fallback, no admission stop, no automatic repeat. Under sustained concurrent
+-- uploads the try-lock rarely finds a free instant (local bench), and that applies equally to flipping BACK to main:
+-- rolling the mode back is not immediate. The down migration refuses unless gate 'off' and mode 'main'. Busy (any
+-- ingest or erase transaction open): fail-fast via a try-lock on 50000, never queued, so it can starve too. A
+-- successful rollback holds 50000 exclusive through its DDL and COMMIT; uploads arriving in that interval wait for it.
+-- Never flip during an operator erase (same key). The gate and mode changes, the rollback and the apply are
+-- real-database operations and the owner's own decisions. This does not resolve ordered-control starvation.
 --
 -- Mode 't2', exactly:
 --   prefix as main up to the clock; the clock FOR KEY SHARE (not NO KEY UPDATE); origin lock, stage row, attempt
@@ -68,16 +91,12 @@
 --     KEY SHARE planning phase, as they already do behind claims.
 -- Lock order (t2): fence row -> 50000 shared -> clock KEY SHARE -> origin -> stage -> slots -> clock NO KEY UPDATE.
 -- No KEY SHARE -> NO KEY UPDATE deadlock between ACKs: the second upgrader waits for the first one's commit, and a queued
--- FOR UPDATE waiter does not block an upgrade (PostgreSQL 16, tested). Mixed main/t2 ACKs cannot run concurrently while
--- the gate stays 'fenced': the MODE ROW changes only under 50000 exclusive (lazy_ack_t2_set_mode), and the supported
--- GATE change (lazy_ack_t2_set_gate) takes the same exclusive try-lock and requires the mode 'main'; set_mode refuses
--- 't2' unless the gate is 'fenced'. So no supported sequence leaves the gate 'off' with the mode 't2'. A bare
--- ALTER FUNCTION ... SET is NOT barriered (an out-of-protocol override): a gate changed that way while the row says
--- 't2' would mix main and T2 ACKs, and a same-origin pair can then deadlock (40P01, detected; nothing corrupted).
--- Never RESET the gate: set it 'off'. Without a proconfig entry, current_setting falls back to the session value.
--- No grant changes: the mode table and lazy_ack_t2_set_mode are owner-only; the ACK stays SECURITY INVOKER.
+-- FOR UPDATE waiter does not block an upgrade (PostgreSQL 16, tested). Mixed main/t2 ACKs cannot run concurrently: the
+-- row changes only under 50000 exclusive (both setters), and every staged ACK reads it under 50000 shared, current
+-- (READ COMMITTED) or proven current (FOR SHARE) or refused. Owner-only; the ACK stays SECURITY INVOKER (the runtime
+-- role reaches it through the SECURITY DEFINER commit entry point, as before).
 -- Rollback (generated by scripts/sessions-function-boundary/lanes/lazy-ack-t2.ts):
--- supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql restores the exact 043800 body and drops the table and function.
+-- supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql restores the exact 043800 body and drops the table and functions.
 DO $lazy_ack_tx_creator$
 DECLARE me oid;
 BEGIN
@@ -88,18 +107,33 @@ END $lazy_ack_tx_creator$;
 
 CREATE TABLE sessions.lazy_ack_t2_mode(
  singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
- mode text NOT NULL CHECK(mode IN('main','t2'))
+ mode text NOT NULL CHECK(mode IN('main','t2')),
+ gate text NOT NULL DEFAULT 'off' CHECK(gate IN('off','fenced')),
+ CONSTRAINT lazy_ack_t2_mode_t2_needs_fenced CHECK(mode='main' OR gate='fenced')
 );
-INSERT INTO sessions.lazy_ack_t2_mode(singleton,mode) VALUES(true,'main');
+INSERT INTO sessions.lazy_ack_t2_mode(singleton,mode,gate) VALUES(true,'main','off');
 ALTER TABLE sessions.lazy_ack_t2_mode ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON sessions.lazy_ack_t2_mode FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+-- Exactly one row, changed only under the barrier. The PK allows at most one row; the triggers refuse its removal (a
+-- missing row would fail every staged ACK closed) and refuse any UPDATE by a transaction that does not hold
+-- (961996,50000) EXCLUSIVE, so even a direct owner UPDATE cannot change the row while an ACK holds 50000 shared.
+CREATE FUNCTION sessions.lazy_ack_t2_mode_keep()RETURNS trigger
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_tx_keep$
+BEGIN
+ IF TG_OP='UPDATE' AND EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
+   AND classid=961996 AND objid=50000 AND objsubid=2 AND mode='ExclusiveLock' AND granted AND pid=pg_backend_pid()) THEN RETURN NEW;END IF;
+ RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: the gate row is a singleton; it is changed only by lazy_ack_t2_set_gate and lazy_ack_t2_set_mode';
+END $lazy_ack_tx_keep$;
+REVOKE ALL ON FUNCTION sessions.lazy_ack_t2_mode_keep() FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+CREATE TRIGGER lazy_ack_t2_mode_keep_row BEFORE UPDATE OR DELETE ON sessions.lazy_ack_t2_mode FOR EACH ROW EXECUTE FUNCTION sessions.lazy_ack_t2_mode_keep();
+CREATE TRIGGER lazy_ack_t2_mode_no_truncate BEFORE TRUNCATE ON sessions.lazy_ack_t2_mode FOR EACH STATEMENT EXECUTE FUNCTION sessions.lazy_ack_t2_mode_keep();
 
 -- The only writer of the mode row. TRY-locks the flip barrier (961996,50000) EXCLUSIVE: it succeeds only when no
 -- transaction that entered ingest_lock_fences (or an erase) is open, and it never waits. Run it alone in its own
 -- transaction; retry with bounded backoff outside the transaction; if the budget runs out, report no switch.
 CREATE FUNCTION sessions.lazy_ack_t2_set_mode(p_mode text)RETURNS text
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_tx_set_mode$
-DECLARE v_old text;
+DECLARE v_old text;v_gate text;
 BEGIN
  IF p_mode IS NULL OR p_mode NOT IN('main','t2') THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='T2 staged ACK: mode must be main or t2';END IF;
  -- READ COMMITTED only: the reads below must see what was committed before the try-lock (a REPEATABLE READ snapshot
@@ -110,22 +144,20 @@ BEGIN
  -- queue-order edge to any cycle). Busy -> 55P03 at once, nothing changed; the caller retries in a NEW transaction.
  IF NOT pg_try_advisory_xact_lock(961996,50000) THEN
   RAISE EXCEPTION USING ERRCODE='55P03',MESSAGE='T2 staged ACK: flip barrier busy (an ingest or erase transaction is open); mode unchanged, retry';END IF;
- SELECT mode INTO STRICT v_old FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;
- -- 't2' only under the fenced gate: off -> fenced with the row already 't2' would switch bodies without the barrier.
- IF p_mode='t2' AND NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure
-   AND 'bulls96.lazy_ack_t2=fenced'=ANY(coalesce(proconfig,'{}'::text[]))) THEN
+ SELECT mode,gate INTO v_old,v_gate FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: the gate row is missing; mode unchanged';END IF;
+ -- 't2' only under the fenced gate, read from the row this call holds locked (the table CHECK enforces it too).
+ IF p_mode='t2' AND v_gate<>'fenced' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: mode t2 requires the gate fenced first (sessions.lazy_ack_t2_set_gate(''fenced'')); mode unchanged';END IF;
  UPDATE sessions.lazy_ack_t2_mode SET mode=p_mode WHERE singleton;
  RETURN v_old;
 END $lazy_ack_tx_set_mode$;
 REVOKE ALL ON FUNCTION sessions.lazy_ack_t2_set_mode(text) FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
--- The supported way to change the gate, serialized with lazy_ack_t2_set_mode on the same barrier: TRY-lock
--- (961996,50000) EXCLUSIVE (busy -> 55P03, nothing changed), lock the mode row NOWAIT, require mode 'main' (55000
--- otherwise), then ALTER the ACK's proconfig in this same short owner transaction. So a gate change and a mode flip can
--- never both pass their checks: no supported sequence ends with the gate 'off' and the mode 't2'. A bare
--- ALTER FUNCTION ... SET bulls96.lazy_ack_t2 by the owner is an out-of-protocol override. Returns the previous gate
--- value ('off', 'fenced', another value as set, or 'absent' when there is no entry).
+-- The only way to change the gate, serialized with lazy_ack_t2_set_mode on the same barrier: TRY-lock (961996,50000)
+-- EXCLUSIVE (busy -> 55P03, nothing changed), lock the row NOWAIT, require mode 'main' (55000 otherwise), then UPDATE
+-- the gate column in this same short owner transaction. So a gate change and a mode flip can never both pass their
+-- checks, and the table CHECK refuses off/t2 in any case. Returns the previous gate ('off' or 'fenced').
 CREATE FUNCTION sessions.lazy_ack_t2_set_gate(p_gate text)RETURNS text
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_tx_set_gate$
 DECLARE v_mode text;v_old text;
@@ -135,36 +167,24 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: the gate change requires read committed';END IF;
  IF NOT pg_try_advisory_xact_lock(961996,50000) THEN
   RAISE EXCEPTION USING ERRCODE='55P03',MESSAGE='T2 staged ACK: flip barrier busy (an ingest or erase transaction is open); gate unchanged, retry';END IF;
- SELECT mode INTO STRICT v_mode FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;
+ SELECT mode,gate INTO v_mode,v_old FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: the gate row is missing; gate unchanged';END IF;
  IF v_mode<>'main' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='T2 staged ACK: change the gate only while the mode is main (sessions.lazy_ack_t2_set_mode(''main'') first); gate unchanged';END IF;
- SELECT coalesce((SELECT substr(c,length('bulls96.lazy_ack_t2=')+1) FROM pg_proc p,unnest(p.proconfig) c
-   WHERE p.oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure AND c LIKE 'bulls96.lazy\_ack\_t2=%'),'absent') INTO v_old;
- IF p_gate='fenced' THEN ALTER FUNCTION sessions.ingest_lazy_ack_batch(jsonb) SET bulls96.lazy_ack_t2='fenced';
- ELSE ALTER FUNCTION sessions.ingest_lazy_ack_batch(jsonb) SET bulls96.lazy_ack_t2='off';END IF;
+ UPDATE sessions.lazy_ack_t2_mode SET gate=p_gate WHERE singleton;
  RETURN v_old;
 END $lazy_ack_tx_set_gate$;
 REVOKE ALL ON FUNCTION sessions.lazy_ack_t2_set_gate(text) FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
 
 CREATE OR REPLACE FUNCTION sessions.ingest_lazy_ack_batch(p jsonb) RETURNS void
-LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp SET bulls96.lazy_ack_t2='off' AS $lazy_ack_batch$
+LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lazy_ack_batch$
 DECLARE c sessions.ingest_receipt_seat_clock%ROWTYPE;a sessions.ingest_claim_attempts%ROWTYPE;
  t sessions.ingest_stage_intents%ROWTYPE;slot sessions.ingest_lazy_native_slots%ROWTYPE;s sessions.ingest_receipt_seats%ROWTYPE;
  d sessions.ingest_lazy_ack_decisions%ROWTYPE;r record;v_last bigint;v_key text;v_material jsonb;v_accept boolean;v_first text;v_new_lineage bigint;
- v_t2 boolean;v_recs jsonb;v_plan jsonb;v_epos integer;v_ephase integer;v_lim integer;v_rounds integer;v_allocs integer;e record;
+ v_t2 boolean;v_gate text;v_mode text;v_recs jsonb;v_plan jsonb;v_epos integer;v_ephase integer;v_lim integer;v_rounds integer;v_allocs integer;e record;
 BEGIN
  PERFORM sessions.ingest_lazy_guard(p->>'org_id');
  PERFORM sessions.ingest_lock_fences(p->>'org_id',p->>'workspace_id',p->>'user_id');
- -- 062210 gate, read once, right AFTER ingest_lock_fences: that call took (961996,50000) SHARED (050010's statement
- -- trigger on ingest_fence_owners), held to transaction end, so every invocation joins the flip barrier BEFORE it selects
- -- its body. proconfig 'off' (installed): main, no table read. 'fenced': READ COMMITTED required first (a REPEATABLE READ
- -- snapshot taken before a flip could still see the old mode), then the mode row, read unlocked: no flip can commit
- -- while this transaction holds 50000 shared.
- IF current_setting('bulls96.lazy_ack_t2',true) IS NOT DISTINCT FROM 'fenced' THEN
-  IF current_setting('transaction_isolation')<>'read committed' THEN
-   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: the fenced staged ACK requires read committed';END IF;
-  SELECT m.mode='t2' INTO STRICT v_t2 FROM sessions.lazy_ack_t2_mode m WHERE m.singleton;
- ELSE v_t2:=false;END IF;
  PERFORM 1 FROM sessions.ingest_lazy_user_seals u JOIN sessions.ingest_seed_fence_baselines b USING(org_id,workspace_id,user_id)
   WHERE u.org_id=p->>'org_id' AND u.workspace_id=p->>'workspace_id' AND u.user_id=p->>'user_id' AND u.privacy_fingerprint=b.fingerprint;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: real user seal required before any receipt';END IF;
@@ -174,6 +194,20 @@ BEGIN
  -- claim's ingest_lazy_records already holds KEY SHARE; two claims upgrading would deadlock).
  IF p->>'buffer_receipt_kind'='suppressed' THEN
   PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR KEY SHARE;RETURN;END IF;
+ -- 062210 gate row, read once: after ingest_lock_fences (which took (961996,50000) SHARED, held to transaction end, so
+ -- no gate or mode change can commit from here on) and after the suppressed return, before the clock lock is chosen.
+ -- READ COMMITTED: a plain read; its snapshot is taken now, after 50000, so it is current. Otherwise the transaction
+ -- snapshot may predate a committed change: FOR SHARE conflicts with the setters' UPDATE, so a replaced version gives
+ -- 40001 (FOR KEY SHARE would not: non-key update); a current 'fenced' row is refused, a current 'off' row runs main.
+ IF current_setting('transaction_isolation')='read committed' THEN
+  SELECT m.gate,m.mode INTO v_gate,v_mode FROM sessions.lazy_ack_t2_mode m WHERE m.singleton;
+ ELSE
+  SELECT m.gate,m.mode INTO v_gate,v_mode FROM sessions.lazy_ack_t2_mode m WHERE m.singleton FOR SHARE;
+ END IF;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: the T2 gate row is missing';END IF;
+ IF v_gate<>'off' AND current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: the fenced staged ACK requires read committed';END IF;
+ v_t2:=v_gate='fenced' AND v_mode='t2';
  -- 043800: NO KEY UPDATE, not FOR UPDATE. This ACK writes last_seat only (a non-key column), so NO KEY UPDATE
  -- is exactly what its own UPDATE below takes. It still serializes staged ACKs (NO KEY UPDATE vs NO KEY UPDATE)
  -- and is still excluded by set_live/control_changed/lazy_clear (FOR UPDATE) and the FOR SHARE holders, but it
