@@ -1,0 +1,19 @@
+{
+ "claim -> advisory:origin-claim [ExclusiveLock] <- claim": 2976,
+ "prepare -> advisory:origin-claim [ExclusiveLock] <- claim": 1898,
+ "commit -> clock [ShareLock] <- commit": 6148,
+ "prepare -> advisory:origin-claim [ExclusiveLock] <- commit": 7988,
+ "prepare -> advisory:origin-claim [ExclusiveLock] <- untagged": 15,
+ "commit -> advisory:origin-claim [ExclusiveLock] <- claim": 10067,
+ "commit -> advisory:origin-claim [ExclusiveLock] <- none": 14,
+ "commit -> clock [ShareLock] <- untagged": 11,
+ "commit -> advisory:origin-claim [ExclusiveLock] <- untagged": 8,
+ "prepare -> advisory:origin-claim [ExclusiveLock] <- none": 20,
+ "commit -> clock [ShareLock] <- none": 8,
+ "claim -> advisory:origin-claim [ExclusiveLock] <- commit": 3116,
+ "claim -> advisory:origin-claim [ExclusiveLock] <- untagged": 6,
+ "claim -> advisory:origin-claim [ExclusiveLock] <- none": 7,
+ "commit -> xid(row or unique-insert) [ShareLock] <- none": 9,
+ "commit -> clock [ExclusiveLock] <- commit": 55,
+ "claim -> advisory:origin-claim [ExclusiveLock] <- prepare": 34
+}

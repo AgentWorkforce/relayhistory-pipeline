@@ -1,0 +1,12 @@
+{
+ "claim -> xid(row or unique-insert) [ShareLock] <- claim": 549,
+ "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 3,
+ "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 5,
+ "commit -> clock [ShareLock] <- commit": 18169,
+ "commit -> clock [ExclusiveLock] <- commit": 116332,
+ "commit -> clock [ShareLock] <- untagged": 104,
+ "commit -> clock [ExclusiveLock] <- none": 54,
+ "commit -> xid(row or unique-insert) [ShareLock] <- none": 53,
+ "commit -> clock [ShareLock] <- none": 10,
+ "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 3
+}

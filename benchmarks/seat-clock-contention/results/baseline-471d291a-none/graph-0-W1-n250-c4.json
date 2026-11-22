@@ -1,0 +1,8 @@
+{
+ "commit -> clock [ShareLock] <- commit": 13110,
+ "commit -> clock [ExclusiveLock] <- commit": 509,
+ "commit -> xid(row or unique-insert) [ShareLock] <- none": 16,
+ "commit -> clock [ExclusiveLock] <- none": 1,
+ "commit -> clock [ShareLock] <- untagged": 36,
+ "commit -> clock [ShareLock] <- none": 7
+}
