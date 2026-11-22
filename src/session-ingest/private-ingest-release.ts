@@ -206,7 +206,7 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             stage before it answers (deliver.ts bufferLedgerStage). Independent of bufferLockBusy.
  *   claimLockWaitMs           an integer 25..2000 (omit for the role default): INGEST_CLAIM_LOCK_WAIT_MS, the claim's
  *                             transaction-local lock wait (ledger-sql.ts inClaimLockWait). 2026-11-16 customer
- *                             incident: a deploy may add, change or remove both, like the other cutover controls, so
+ *                             incident: a deploy may add or change both, like the other cutover controls, so
  *                             they live here and not in COMMON_PROFILE (a COMMON_PROFILE change can never match the
  *                             live version it replaces, private_ingest_live_phase).
  *   originClaimFence          "on" only (omit for off): INGEST_ORIGIN_CLAIM_FENCE, buffered claim/stage/commit through
@@ -220,6 +220,10 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             on the HTTP sync path (inflight-lease.ts). observe refuses nothing; on answers an
  *                             overlapping same-tenant delivery batch 429 delivery_busy before any ledger call
  *                             (turns batches are tracked, never refused).
+ * Removing a rendered cutover var is a binding deletion in the plan, which the operator admits only through its
+ * reviewed delete allowlist (scripts/private-ingest-operator.ts). Of these controls that covers bufferLockBusy,
+ * advertisedMaxRecords and inflightLease, each under its own conditions; every other one (bufferLockRetry,
+ * claimTimeoutBusy and claimLockWaitMs included) refuses native_binding_target when removed.
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */

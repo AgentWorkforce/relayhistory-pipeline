@@ -148,6 +148,15 @@ stack input `sessionIngest.claimLockBusy: "on"` (canonical or buffered acceptanc
 which renders no var). Operator note: if the deploy actor previously set `INGEST_CLAIM_LOCK_BUSY`
 out of band as a Worker version secret of the same name, it must remove that secret before the
 stack-rendered var applies, or the apply conflicts.
+Rollback on the private-ingest release: there is no variable-only rollback. The release profile pins
+`claimLockBusy: "on"` in source (`COMMON_PROFILE` in `src/session-ingest/private-ingest-release.ts`), no
+environment variable feeds it, the release guard refuses a profile without it
+(`private_ingest_profile_common`), the live-phase match refuses a source profile without it while the live
+Worker still carries `INGEST_CLAIM_LOCK_BUSY` (the evidence check refuses `private_ingest_live_unknown_flag`,
+so no candidate matches and the release refuses `private_ingest_live_phase`), and the operator has no unbind
+for `INGEST_CLAIM_LOCK_BUSY` (a plan that deletes it refuses `native_binding_target`). Turning it off requires
+a separately reviewed change to the pinned profile, its guard and the live-phase match (and to the operator's
+delete allowlist), then a deploy.
 
 Claim statement-timeout busy (default off, independent of `INGEST_CLAIM_LOCK_BUSY`): with
 `INGEST_CLAIM_TIMEOUT_BUSY=on` (parsed like `INGEST_CLAIM_LOCK_BUSY`: only `on`, any case, trimmed)
@@ -198,8 +207,27 @@ in the public profile): the `private-ingest-production` environment variables
 `PRIVATE_INGEST_BUFFER_LOCK_BUSY` / `PRIVATE_INGEST_BUFFER_LOCK_RETRY` accept only `on`; unset or empty is
 off and renders no var; any other value refuses (`private_ingest_profile_buffer_lock_busy` /
 `private_ingest_profile_buffer_lock_retry`). Setting one and then planning and deploying the private-ingest
-Worker is a production flag change that needs its own approval. A deploy may add or remove them at the live
-phase; rollback is unset (or empty), then plan and deploy, no code change.
+Worker is a production flag change that needs its own approval. A deploy may add them at the live phase.
+Removing a rendered var is a binding deletion (`unbind`) in the plan, and the operator admits an unbind
+only for the variables in its reviewed delete allowlist (`scripts/private-ingest-operator.ts`); any other
+unbind refuses `native_binding_target`.
+- `INGEST_BUFFER_LOCK_BUSY` rollback: unset (or empty) `PRIVATE_INGEST_BUFFER_LOCK_BUSY`, then plan and
+  deploy, no code change. The plan shows one `unbind` of `INGEST_BUFFER_LOCK_BUSY`, which the operator
+  (`bufferLockBusyDeletionAllowed`) admits only when the candidate profile omits `bufferLockBusy`, the
+  proposed Worker environment has no `INGEST_BUFFER_LOCK_BUSY`, the live value is exactly `on` (no trim, no
+  case folding), the deleted native binding is the `plain_text` binding of that name with that exact text,
+  and the plan updates the Worker. A candidate that still sets `bufferLockBusy: "on"`, or a second delete
+  in the same plan, refuses `native_binding_inventory`; any other mismatch refuses `native_binding_target`.
+- `INGEST_BUFFER_LOCK_RETRY` has no operator unbind. Unsetting `PRIVATE_INGEST_BUFFER_LOCK_RETRY` while the
+  var is rendered produces a plan with an `unbind` of `INGEST_BUFFER_LOCK_RETRY`, which the operator refuses
+  (`native_binding_target`); the environment variable accepts only `on` or unset/empty, so there is no
+  variable-only way to turn it off. Turning it off needs a separately reviewed operator change first. It is
+  independent of `INGEST_BUFFER_LOCK_BUSY`: removing the BUSY var leaves a rendered RETRY var as it is, and a
+  second failure then answers 503 again.
+
+The operator admits at most one unbind per plan (`native_binding_inventory`). Each supported unbind is its
+own plan, deploy and readback of the live Worker; a following unbind is planned only from the live state
+that deploy produced, never two in one plan.
 
 In-flight lease before the claim (default off; stack input `sessionIngest.inflightLease: "observe"` or
 `"on"`, omit for off): `INGEST_INFLIGHT_LEASE` keeps a per-isolate, in-memory lease per signed (org,
@@ -292,17 +320,22 @@ sets 250 ms with `claimTimeoutBusy` and `claimLockBusy` on (2026-11-16, customer
 `claimTimeoutBusy` and `claimLockWaitMs` are cutover controls of the private-ingest release contract
 (like the fence mirror and the stop list), never tracked in the public profile: set the
 `private-ingest-production` environment variables `PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY=on` and
-`PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS=250`, then plan and deploy the private-ingest Worker. A deploy may
-add, change or remove them at the live phase.
+`PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS=250`, then plan and deploy the private-ingest Worker. The release guard
+lets a deploy add them or change them at the live phase (`PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS` within
+25..2000). Removing a rendered var has no operator unbind today: the operator refuses the delete row with
+`native_binding_target`, so removal needs a separately reviewed operator change.
 Watch `outcome=delivery_busy` with `error_code=ledger_lock_timeout` per tenant: a rise is expected
 and means fast back-off, not failure. Residual risk: the claim is now a multi-statement transaction,
 so a Worker that dies between the claim and its COMMIT/ROLLBACK leaves the transaction open, holding
 the user's fence row until the server ends it; the local `idle_in_transaction_session_timeout` of
 1000 ms (instead of the role's 10 s) bounds that window, and a dropped connection ends it at once. During
-it that user's claims answer 429 and retry. Rollback: unset (or empty) `PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS`
-and/or `PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY` in the `private-ingest-production` environment, then plan and
-deploy the private-ingest Worker, the same steps as a stop-list change (no var rendered: the claim
-returns to the single autocommit statement and 57014 to the 503). No code change is needed. Only `stage=claim`
+it that user's claims answer 429 and retry. Rollback: neither variable has a value that turns its behaviour
+off while keeping the binding (`PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY` accepts only `on` or unset/empty,
+`PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS` only 25..2000 or unset/empty). The lock wait can be changed within
+25..2000 by setting the variable, then planning and deploying the private-ingest Worker. Unsetting either
+variable while its var is rendered produces a plan with an `unbind`, which the operator refuses
+(`native_binding_target`); returning to no rendered var (the claim back to the single autocommit statement,
+57014 back to the 503) needs a separately reviewed operator change that admits that unbind first. Only `stage=claim`
 is affected: `buffer_intent` and `buffer_receipt` run after the claim has committed its attempt, so
 a short lock wait there would throw away a successful claim and force a resume; they keep the role
 `lock_timeout` and stay 503 on a lock or statement timeout.

@@ -124,8 +124,10 @@ test("the retained sanitized inputs artifact reduces the stop list to a count", 
   expect(redactStoppedOrgs({ asyncAdmission: "drain" })).toEqual({ asyncAdmission: "drain" });
 });
 
-// 2026-11-16 customer incident: the claim lock controls are cutover controls, so a deploy may add, change or remove
-// them at the live phase. (As COMMON_PROFILE keys they could never match the live version they replace.)
+// 2026-11-16 customer incident: the claim lock controls are cutover controls, so the release guard (the only thing
+// this test covers) lets a deploy add, change or remove them at the live phase. (As COMMON_PROFILE keys they could
+// never match the live version they replace.) The operator is a separate gate: it has no unbind for these vars and
+// refuses a plan that removes one with native_binding_target (scripts/private-ingest-operator.ts).
 test("claim lock controls: env shapes, and add / change / remove at a held phase", () => {
   expect(privateIngestCutoverFromEnv({ PRIVATE_INGEST_CLAIM_TIMEOUT_BUSY: "on", PRIVATE_INGEST_CLAIM_LOCK_WAIT_MS: "250" }))
     .toEqual({ claimTimeoutBusy: "on", claimLockWaitMs: 250 });
