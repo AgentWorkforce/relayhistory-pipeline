@@ -798,26 +798,32 @@ export function createIngestApp(deps: IngestAppDeps) {
    * would_refuse (observe; and the turns route in on), refused (on) or fail_open (the map was full of live
    * holders: proceeded untracked); `state` the mode, `kind` the route, `count` the live holders the key already
    * had, and on would_refuse / refused `age_ms` the age of the oldest of them (a holder whose release never ran
-   * keeps ageing towards the expiry; a real overlap is young).
+   * keeps ageing towards the expiry; a real overlap is young). On would_refuse / refused, `same_origin` is an
+   * overlap label: true = at least one live holder of the key in this isolate was taken with this request's
+   * origin (the parsed batch's origin_id; never logged). The limit is one holder per key, so with a key that also
+   * held the origin a same-origin overlap would still refuse and a different-origin-only overlap would not; in
+   * observe every request becomes a holder (also those `on` would have refused), so like `count` the share is an
+   * upper bound, per isolate.
    * The turns route is observed, never refused: its forwarder answers its own caller only after every batch
    * receipt, so a refusal there waits until that caller's 429 handling is confirmed.
    */
-  const takeInflightLease = (cfg: NonNullable<IngestAppDeps["inflightLease"]>, tenant: { orgId: string; workspaceId: string; userId: string }, route: string, fields: Record<string, unknown>): InflightGrant => {
+  const takeInflightLease = (cfg: NonNullable<IngestAppDeps["inflightLease"]>, tenant: { orgId: string; workspaceId: string; userId: string }, originId: string, route: string, fields: Record<string, unknown>): InflightGrant => {
     const at = (cfg.now ?? Date.now)();
-    const line = (outcome: "would_refuse" | "refused" | "fail_open", count: number, ageMs?: number) =>
-      emit({ ...fields, route: "ingest.inflight_lease", kind: route, outcome, state: cfg.mode, reason: INFLIGHT_LEASE_LOCK, count, ...(ageMs === undefined ? {} : { age_ms: ageMs }) });
+    const line = (outcome: "would_refuse" | "refused" | "fail_open", count: number, ageMs?: number, sameOriginHolders?: number) =>
+      emit({ ...fields, route: "ingest.inflight_lease", kind: route, outcome, state: cfg.mode, reason: INFLIGHT_LEASE_LOCK, count,
+        ...(ageMs === undefined ? {} : { age_ms: ageMs }), ...(sameOriginHolders === undefined ? {} : { same_origin: sameOriginHolders > 0 }) });
     if (cfg.mode === "on" && route === "delivery.batches") {
-      const r = cfg.lease.acquire(tenant, at);
+      const r = cfg.lease.acquire(tenant, at, originId);
       if (!r.ok) {
-        line("refused", r.holdersBefore, r.oldestHolderAgeMs);
+        line("refused", r.holdersBefore, r.oldestHolderAgeMs, r.sameOriginHolders);
         throw new DeliveryBusyError(INFLIGHT_LEASE_LOCK, inflightRetryAfter(cfg.random ?? deps.deliver.random ?? Math.random));
       }
       if (r.failOpen) line("fail_open", r.holdersBefore);
       return r;
     }
-    const r = cfg.lease.track(tenant, at);
+    const r = cfg.lease.track(tenant, at, originId);
     if (r.failOpen) line("fail_open", r.holdersBefore);
-    else if (r.holdersBefore > 0) line("would_refuse", r.holdersBefore, r.oldestHolderAgeMs);
+    else if (r.holdersBefore > 0) line("would_refuse", r.holdersBefore, r.oldestHolderAgeMs, r.sameOriginHolders);
     return r;
   };
 
@@ -859,7 +865,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       const queued = asyncMode === "on" && !!witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody");
       // INGEST_INFLIGHT_LEASE: the synchronous path only, before its first lock-capable call (the consent
       // snapshot write, the turn register, the claim). The queued ACK neither takes nor is refused by it.
-      if (inflight && !queued) lease = takeInflightLease(inflight, tenant, route, fields);
+      if (inflight && !queued) lease = takeInflightLease(inflight, tenant, batch.origin_id, route, fields);
       await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { deferDenied: true, phase: "precheck", route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f }));
       // The turns origin participates in every logical-session erasure. The independently
       // default-off registration gate is checked only after the pre-write consent check, and

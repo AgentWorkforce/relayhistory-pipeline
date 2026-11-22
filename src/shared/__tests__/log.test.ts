@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, FRAME_NAME_SHAPE, STORE_CAUSE_VALUES, errorFields, log, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, BOOLEAN_FIELDS, BOUNDED_COUNT_FIELDS, FRAME_NAME_SHAPE, STORE_CAUSE_VALUES, errorFields, log, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
 import { STORE_TRANSPORT_CAUSES } from "../vendor.ts";
 import { send } from "../../../packages/object-store/src/core.ts";
 import { ObjectStoreError, storeTransportCause } from "../../../packages/object-store/src/errors.ts";
@@ -128,6 +128,19 @@ describe("telemetry allowlist", () => {
     expect(sanitizeLogField("age_ms", Number.MAX_SAFE_INTEGER)).toBe(3_600_000);
     for (const bad of ["3489", "org_123", -1, 1.5, Number.NaN, null, true]) expect(sanitizeLogField("age_ms", bad)).toBeUndefined();
     expect(JSON.parse(logLine("info", "request", { route: "ingest.inflight_lease", age_ms: 1_234 })).age_ms).toBe(1_234);
+  });
+
+  test("same_origin (the in-flight lease line's overlap label) is a boolean only, never an id", () => {
+    expect(ALLOWED_LOG_FIELDS.has("same_origin")).toBe(true);
+    expect(BOOLEAN_FIELDS.has("same_origin")).toBe(true);
+    expect(sanitizeLogField("same_origin", true)).toBe(true);
+    expect(sanitizeLogField("same_origin", false)).toBe(false);
+    for (const bad of ["true", "false", "origin-1", "", 0, 1, Number.NaN, null, {}, [true]]) expect(sanitizeLogField("same_origin", bad)).toBeUndefined();
+    for (const v of [true, false]) {
+      const line = JSON.parse(logLine("info", "request", { route: "ingest.inflight_lease", outcome: "would_refuse", count: 1, age_ms: 7, same_origin: v }));
+      expect(line).toMatchObject({ route: "ingest.inflight_lease", outcome: "would_refuse", count: 1, age_ms: 7, same_origin: v });
+    }
+    expect(Object.hasOwn(JSON.parse(logLine("info", "request", { same_origin: "origin-1" })), "same_origin")).toBe(false);
   });
   test("error fields are code-only", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));

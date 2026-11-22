@@ -3,10 +3,12 @@
  * lock-capable call. Module: one holder per (org, workspace, user), token-guarded idempotent release, expiry,
  * collision-free keys, capped entries that fail open. App: off unchanged, observe logs one would-refuse line,
  * on refuses an overlapping delivery with a 429 before any ledger, consent or turn-register call, the turns
- * route is tracked (never refused) in on, the oldest holder's age rides on would_refuse / refused lines, the
- * lease is released on every exit, and the queued ACK is never leased.
+ * route is tracked (never refused) in on, the oldest holder's age and the same-origin overlap label ride on
+ * would_refuse / refused lines (and survive the production log filter, with no origin id), the lease is released
+ * on every exit, and the queued ACK is never leased.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { logLine } from "../../shared/log.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER } from "../async-admission.ts";
 import {
@@ -35,7 +37,7 @@ describe("inflight lease module", () => {
     expect(a.ok).toBe(true);
     expect(lease.holders(TENANT, T0)).toBe(1);
     const b = lease.acquire(TENANT, T0 + 1);
-    expect(b).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1 });
+    expect(b).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1, sameOriginHolders: 0 });
     if (!a.ok) throw new Error("unreachable");
     a.release();
     expect(lease.holders(TENANT, T0 + 2)).toBe(0);
@@ -122,8 +124,8 @@ describe("inflight lease module", () => {
     const first = lease.acquire(TENANT, T0);
     expect(first.ok).toBe(true);
     expect(Object.hasOwn(first, "oldestHolderAgeMs")).toBe(false);
-    expect(lease.acquire(TENANT, T0 + 1_234)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1_234 });
-    expect(lease.acquire(TENANT, T0 + 9_999)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 9_999 });
+    expect(lease.acquire(TENANT, T0 + 1_234)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1_234, sameOriginHolders: 0 });
+    expect(lease.acquire(TENANT, T0 + 9_999)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 9_999, sameOriginHolders: 0 });
     // track: the oldest of several holders, not the newest.
     const t1 = lease.track(TENANT, T0 + 500);
     expect(t1).toMatchObject({ holdersBefore: 1, oldestHolderAgeMs: 500 });
@@ -141,7 +143,69 @@ describe("inflight lease module", () => {
     const lease = createInflightLease({ ttlMs: 10_000 });
     expect(lease.acquire(TENANT, T0).ok).toBe(true);
     expect(lease.track(TENANT, T0 - 5)).toMatchObject({ holdersBefore: 1, oldestHolderAgeMs: 0 });
-    expect(lease.acquire(TENANT, T0 - 5)).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 0 });
+    expect(lease.acquire(TENANT, T0 - 5)).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 0, sameOriginHolders: 0 });
+  });
+
+  test("same origin: an overlap with a holder of the same origin counts it; a different origin is still refused by acquire", () => {
+    const same = createInflightLease();
+    expect(same.acquire(TENANT, T0, "origin-a").ok).toBe(true);
+    expect(same.track(TENANT, T0 + 1, "origin-a")).toMatchObject({ ok: true, holdersBefore: 1, sameOriginHolders: 1 });
+    expect(same.acquire(TENANT, T0 + 2, "origin-a")).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 2, sameOriginHolders: 2 });
+
+    const other = createInflightLease();
+    expect(other.acquire(TENANT, T0, "origin-a").ok).toBe(true);
+    // The key is per user: a different origin of the same user is refused exactly as before, with no same-origin holder.
+    expect(other.acquire(TENANT, T0 + 1, "origin-b")).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1, sameOriginHolders: 0 });
+    expect(other.track(TENANT, T0 + 1, "origin-b")).toMatchObject({ ok: true, holdersBefore: 1, sameOriginHolders: 0 });
+    expect(other.counters).toEqual({ granted: 2, refused: 1, failOpen: 0 });
+  });
+
+  test("same origin: mixed holders count only the matching ones; strict equality", () => {
+    const lease = createInflightLease();
+    lease.track(TENANT, T0, "origin-a");
+    lease.track(TENANT, T0, "origin-b");
+    // A third origin: two live holders, none of them its own.
+    expect(lease.acquire(TENANT, T0 + 1, "origin-c")).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 1, sameOriginHolders: 0 });
+    expect(lease.acquire(TENANT, T0 + 1, "origin-a")).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 1, sameOriginHolders: 1 });
+    expect(lease.acquire(TENANT, T0 + 1, "ORIGIN-A")).toMatchObject({ ok: false, holdersBefore: 2, sameOriginHolders: 0 });
+    expect(lease.track(TENANT, T0 + 1, "origin-a")).toMatchObject({ ok: true, holdersBefore: 2, sameOriginHolders: 1 });
+  });
+
+  test("same origin: an arrival without an origin matches nothing, and a holder taken without one never matches", () => {
+    const lease = createInflightLease();
+    lease.track(TENANT, T0);
+    expect(lease.track(TENANT, T0 + 1)).toMatchObject({ holdersBefore: 1, sameOriginHolders: 0 });
+    expect(lease.track(TENANT, T0 + 2, "origin-a")).toMatchObject({ holdersBefore: 2, sameOriginHolders: 0 });
+    expect(lease.acquire(TENANT, T0 + 3)).toMatchObject({ ok: false, holdersBefore: 3, sameOriginHolders: 0 });
+    expect(lease.acquire(TENANT, T0 + 3, "origin-a")).toMatchObject({ ok: false, holdersBefore: 3, sameOriginHolders: 1 });
+  });
+
+  test("same origin: an expired or released same-origin holder no longer counts while a different-origin holder stays", () => {
+    const expiring = createInflightLease({ ttlMs: 1_000 });
+    expiring.track(TENANT, T0, "origin-a");
+    expiring.track(TENANT, T0 + 500, "origin-b");
+    // acquire refuses without adding a holder: just before expiry both count, one of them the same origin.
+    expect(expiring.acquire(TENANT, T0 + 999, "origin-a")).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 999, sameOriginHolders: 1 });
+    // At T0+1000 the origin-a holder has expired; only the origin-b holder (taken at T0+500) is live.
+    expect(expiring.acquire(TENANT, T0 + 1_000, "origin-a")).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 500, sameOriginHolders: 0 });
+
+    const releasing = createInflightLease();
+    const a = releasing.track(TENANT, T0, "origin-a");
+    releasing.track(TENANT, T0, "origin-b");
+    a.release();
+    expect(releasing.acquire(TENANT, T0 + 1, "origin-a")).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1, sameOriginHolders: 0 });
+    expect(releasing.track(TENANT, T0 + 1, "origin-a")).toMatchObject({ holdersBefore: 1, sameOriginHolders: 0 });
+  });
+
+  test("same origin: a grant with no prior holder (or failing open with none) has no sameOriginHolders", () => {
+    const lease = createInflightLease({ maxEntries: 1 });
+    const first = lease.acquire(TENANT, T0, "origin-a");
+    expect(first).toMatchObject({ ok: true, holdersBefore: 0 });
+    expect(Object.hasOwn(first, "sameOriginHolders")).toBe(false);
+    const tracked = lease.track({ ...TENANT, userId: "user-2" }, T0, "origin-a");
+    expect(tracked).toMatchObject({ ok: true, holdersBefore: 0, failOpen: true });
+    expect(Object.hasOwn(tracked, "sameOriginHolders")).toBe(false);
+    expect(Object.hasOwn(lease.track({ ...TENANT, userId: "user-3" }, T0), "sameOriginHolders")).toBe(false);
   });
 
   test("options must be positive integers", () => {
@@ -220,9 +284,10 @@ function harness(mode: InflightLeaseMode | undefined, opts: { slots?: true; leas
     ...opts.deps,
   });
   let n = 0;
-  const post = async (over: { userId?: string; path?: string; batch?: unknown } = {}) => {
+  const post = async (over: { userId?: string; path?: string; batch?: unknown; origin?: string } = {}) => {
     const id = `r${++n}`;
-    const body = JSON.stringify({ protocolVersion: 1, batch: over.batch ?? await batch([record({ record_id: id })], { batch_id: `batch-${id}` }) });
+    const origin = over.origin ? { origin_id: over.origin } : {};
+    const body = JSON.stringify({ protocolVersion: 1, batch: over.batch ?? await batch([record({ record_id: id, ...origin })], { batch_id: `batch-${id}`, ...origin }) });
     const res = await app.fetch(new Request(`https://x${over.path ?? "/v1/delivery/batches"}`, {
       method: "POST", body,
       headers: { [IDENTITY_HEADER]: encodeIdentity({ ...TENANT, ...(over.userId ? { userId: over.userId } : {}), scopes: [SYNC_SCOPE] }), "x-correlation-id": `corr-${id}` },
@@ -234,11 +299,11 @@ function harness(mode: InflightLeaseMode | undefined, opts: { slots?: true; leas
 }
 
 /** Delivery A held at its claim, then B; returns both answers after A is let through. */
-async function overlap(h: ReturnType<typeof harness>, bUser?: string) {
+async function overlap(h: ReturnType<typeof harness>, bUser?: string, origins: { a?: string; b?: string } = {}) {
   const g = h.ledger.gate();
-  const a = h.post();
+  const a = h.post(origins.a ? { origin: origins.a } : {});
   await g.entered;
-  const b = await h.post(bUser ? { userId: bUser } : {});
+  const b = await h.post({ ...(bUser ? { userId: bUser } : {}), ...(origins.b ? { origin: origins.b } : {}) });
   g.open();
   return { a: await a, b };
 }
@@ -264,7 +329,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     const lines = h.leaseLines();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toEqual({
-      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "would_refuse", state: "observe", reason: "tenant_inflight", count: 1, age_ms: 0,
+      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "would_refuse", state: "observe", reason: "tenant_inflight", count: 1, age_ms: 0, same_origin: true,
       org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
     });
     expect(h.lease.entries()).toBe(0);
@@ -284,7 +349,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(h.ledger.claims).toHaveLength(1);
     const lines = h.leaseLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ outcome: "refused", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0, kind: "delivery.batches" });
+    expect(lines[0]).toMatchObject({ outcome: "refused", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0, same_origin: true, kind: "delivery.batches" });
     // The refused request's route line is a plain delivery_busy: no lock alert, no database lock fields.
     const route = h.logged.find((f) => f.route === "delivery.batches" && f.outcome === "delivery_busy")!;
     expect(route).toBeDefined();
@@ -301,7 +366,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     const res = await h.post({ path: "/v1/turns/batches", batch: await turnBatch() });
     expect(res.status).toBe(200);
     expect(h.ledger.entered).toBe(1);
-    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 3_000 })]);
+    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 3_000, same_origin: false })]);
     // The turns batch held the key while it ran (granted, not refused) and released it.
     expect(h.lease.counters).toEqual({ granted: 2, refused: 0, failOpen: 0 });
     expect(h.lease.holders(TENANT, T0)).toBe(1);
@@ -320,7 +385,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(t.status).toBe(200);
     expect(h.ledger.entered).toBe(2);
     expect(h.leaseLines()).toEqual([{
-      route: "ingest.inflight_lease", kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0,
+      route: "ingest.inflight_lease", kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0, same_origin: false,
       org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
     }]);
     expect(h.lease.counters).toEqual({ granted: 2, refused: 0, failOpen: 0 });
@@ -338,7 +403,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(d.status).toBe(429);
     expect(d.json.error?.code).toBe("delivery_busy");
     expect(h.ledger.entered).toBe(1);
-    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "delivery.batches", outcome: "refused", state: "on", count: 1, age_ms: 0 })]);
+    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "delivery.batches", outcome: "refused", state: "on", count: 1, age_ms: 0, same_origin: false })]);
     expect(h.lease.entries()).toBe(0);
   });
 
@@ -377,14 +442,14 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     const observe = harness("observe");
     const stuck = observe.lease.acquire(TENANT, T0 - 4_321);
     expect((await observe.post()).status).toBe(200);
-    expect(observe.leaseLines()).toEqual([expect.objectContaining({ outcome: "would_refuse", state: "observe", count: 1, age_ms: 4_321 })]);
+    expect(observe.leaseLines()).toEqual([expect.objectContaining({ outcome: "would_refuse", state: "observe", count: 1, age_ms: 4_321, same_origin: false })]);
     if (stuck.ok) stuck.release();
 
     const on = harness("on");
     on.lease.acquire(TENANT, T0 - 60_000);
     const refused = await on.post();
     expect(refused.status).toBe(429);
-    expect(on.leaseLines()).toEqual([expect.objectContaining({ outcome: "refused", state: "on", count: 1, age_ms: 60_000 })]);
+    expect(on.leaseLines()).toEqual([expect.objectContaining({ outcome: "refused", state: "on", count: 1, age_ms: 60_000, same_origin: false })]);
 
     // A full map with a live holder of the same key: the grant carries an age, the fail_open line does not.
     const full = createInflightLease({ maxEntries: 1 });
@@ -394,6 +459,62 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     const lines = open.leaseLines();
     expect(lines).toEqual([expect.objectContaining({ outcome: "fail_open", state: "observe", count: 1 })]);
     expect(Object.hasOwn(lines[0]!, "age_ms")).toBe(false);
+    expect(Object.hasOwn(lines[0]!, "same_origin")).toBe(false);
+  });
+
+  test("same_origin: observe labels a same-origin overlap true and a different-origin overlap false, with no origin id", async () => {
+    const same = harness("observe");
+    const s = await overlap(same, undefined, { a: "origin-x1", b: "origin-x1" });
+    expect([s.a.status, s.b.status]).toEqual([200, 200]);
+    expect(same.leaseLines()).toEqual([expect.objectContaining({ kind: "delivery.batches", outcome: "would_refuse", state: "observe", count: 1, age_ms: 0, same_origin: true })]);
+    expect(JSON.stringify(same.leaseLines())).not.toContain("origin-x1");
+
+    const diff = harness("observe");
+    const d = await overlap(diff, undefined, { a: "origin-x1", b: "origin-y2" });
+    expect([d.a.status, d.b.status]).toEqual([200, 200]);
+    expect(diff.ledger.claims).toHaveLength(2);
+    expect(diff.leaseLines()).toEqual([{
+      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "would_refuse", state: "observe", reason: "tenant_inflight", count: 1, age_ms: 0, same_origin: false,
+      org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
+    }]);
+    const text = JSON.stringify(diff.leaseLines());
+    for (const o of ["origin-x1", "origin-y2"]) expect(text).not.toContain(o);
+  });
+
+  test("same_origin: on still refuses a different-origin overlap (the key is per user) and labels it false; same origin true", async () => {
+    const diff = harness("on");
+    const d = await overlap(diff, undefined, { a: "origin-x1", b: "origin-y2" });
+    expect(d.a.status).toBe(200);
+    expect(d.b.status).toBe(429);
+    expect(d.b.json.error?.code).toBe("delivery_busy");
+    expect(diff.ledger.entered).toBe(1);
+    expect(diff.leaseLines()).toEqual([{
+      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "refused", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0, same_origin: false,
+      org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
+    }]);
+    const text = JSON.stringify(diff.leaseLines());
+    for (const o of ["origin-x1", "origin-y2"]) expect(text).not.toContain(o);
+
+    const same = harness("on");
+    const s = await overlap(same, undefined, { a: "origin-x1", b: "origin-x1" });
+    expect([s.a.status, s.b.status]).toEqual([200, 429]);
+    expect(same.leaseLines()).toEqual([expect.objectContaining({ outcome: "refused", state: "on", count: 1, age_ms: 0, same_origin: true })]);
+    expect(JSON.stringify(same.leaseLines())).not.toContain("origin-x1");
+  });
+
+  test("same_origin, age_ms and count survive the production log filter on would_refuse and refused lines", async () => {
+    const observe = harness("observe");
+    await overlap(observe, undefined, { a: "origin-x1", b: "origin-x1" });
+    const on = harness("on");
+    await overlap(on, undefined, { a: "origin-x1", b: "origin-y2" });
+    const lines = [...observe.leaseLines(), ...on.leaseLines()];
+    expect(lines.map((l) => l.outcome)).toEqual(["would_refuse", "refused"]);
+    for (const [i, l] of lines.entries()) {
+      // The default emit (no deps.log) writes through log.ts: the same filter as logLine.
+      const written = JSON.parse(logLine("info", "session ingest", l));
+      expect(written).toMatchObject({ route: "ingest.inflight_lease", outcome: l.outcome, count: 1, age_ms: 0, same_origin: i === 0 });
+      for (const key of Object.keys(l)) expect(Object.hasOwn(written, key)).toBe(true);
+    }
   });
 
   test("on: a different user in the same workspace is not refused", async () => {

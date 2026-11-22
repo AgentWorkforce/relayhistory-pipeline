@@ -116,8 +116,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // The claims scheduler tick line (src/session-analysis/claims-scheduler.ts): bounded counts only.
   "selected", "skipped_budget", "skipped_control",
   // The ingest in-flight lease line (src/session-ingest/app.ts takeInflightLease): the age in ms of the oldest
-  // live holder the key already had; a bounded integer.
-  "age_ms",
+  // live holder the key already had; a bounded integer. `same_origin`: whether at least one of those live holders
+  // was taken with this request's origin; a boolean only (BOOLEAN_FIELDS), never the origin id.
+  "age_ms", "same_origin",
 ]);
 
 /**
@@ -200,10 +201,13 @@ export const CLIENT_VERSION_SHAPE = /^[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}(?:-[0-9A-Z
 export const LOG_TAG_SHAPE = /^[0-9a-f]{8}$/;
 /** `error_frame`: a function name only (db-error-class.ts FRAME_NAME, pinned equal); never a path, line or text. */
 export const FRAME_NAME_SHAPE = /^(?=.{1,64}$)[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*){0,3}$/;
+/** Boolean fields: emitted only when the value is `true` or `false` (else dropped), so they can never carry text or an id. */
+export const BOOLEAN_FIELDS: ReadonlySet<string> = new Set(["same_origin"]);
 const SHAPED_FIELDS: ReadonlyMap<string, RegExp> = new Map([["client_version", CLIENT_VERSION_SHAPE], ["receipt_tag", LOG_TAG_SHAPE], ["attempt_tag", LOG_TAG_SHAPE], ["error_frame", FRAME_NAME_SHAPE]]);
 
 export function sanitizeLogField(key: string, value: unknown): unknown {
   if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;
+  if (BOOLEAN_FIELDS.has(key)) return typeof value === "boolean" ? value : undefined;
   const allowed = ENUM_FIELDS.get(key);
   if (allowed !== undefined) return typeof value === "string" && allowed.has(value) ? value : undefined;
   const shape = SHAPED_FIELDS.get(key);

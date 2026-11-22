@@ -211,9 +211,16 @@ that `on` would refuse proceeds and writes one line, `route` = `ingest.inflight_
 `would_refuse`, `state` = `observe`, `kind` = the request route, `reason` = `tenant_inflight`, `count` = the
 live holders the key already had, `age_ms` = the age of the oldest of them, plus the request line's own
 `org_id`, `workspace_id`, `correlation_id` and client fields. A young `age_ms` is a real overlap; one that
-keeps growing towards 90 000 is a holder whose release never ran. `on` answers an overlapping
+keeps growing towards 90 000 is a holder whose release never ran. `same_origin` (a boolean; never an origin
+id) is an overlap label: `true` = at least one live holder of the key in this isolate was taken with this
+request's origin (the batch's `origin_id`), `false` = only other origins of the same user were in flight.
+The key itself stays per user; the label is there to decide from observe data whether a key that also held
+the origin would refuse less without missing same-origin overlaps. The limit is fixed at one holder per key,
+so with such a key a same-origin overlap would still refuse and a different-origin-only overlap would not.
+As with `count`, in `observe` every request becomes a holder (also those `on` would have refused), so the
+share is an upper bound, and it is per isolate. `on` answers an overlapping
 `/v1/delivery/batches` 429 `delivery_busy` (`Retry-After` 2-10 s, jittered) before any ledger call and writes
-the same line with `outcome` = `refused` (with `age_ms`); its request line shows `delivery_busy`. In `on`,
+the same line with `outcome` = `refused` (with `age_ms` and `same_origin`); its request line shows `delivery_busy`. In `on`,
 `/v1/turns/batches` is never refused: it is tracked as in `observe` (it still counts as a holder, so a
 delivery overlapping it is refused) and an overlapping turns batch writes the `would_refuse` line with
 `state` = `on`. Because the lease comes before the upload-consent precheck, in `on` a delivery that would
@@ -230,7 +237,11 @@ path are never leased. Clients that ignore `Retry-After` keep their own backoff;
 because it costs no ledger call. On the private-ingest release it is a cutover control like the buffer-lock
 flags: `PRIVATE_INGEST_INFLIGHT_LEASE` accepts `observe` or `on`; unset or empty is off and renders no var;
 any other value refuses (`private_ingest_profile_inflight_lease`). Setting it, planning and deploying is a
-production flag change that needs its own approval. `on` to `observe` is an ordinary update. Rollback is
+production flag change that needs its own approval. Before moving `observe` to `on`: when
+`INGEST_ORIGIN_CLAIM_FENCE` is on, the claim serializes per origin, so a per-user lease in `on` refuses
+different-origin overlaps that the claim would let through; read the share of `would_refuse` lines with
+`same_origin` = `false` and decide whether the key should include the origin first. `on` to `observe` is an
+ordinary update. Rollback is
 unset (or empty), then plan and deploy, no code change: the plan shows one `unbind` of
 `INGEST_INFLIGHT_LEASE`, which the operator's delete allowlist (`inflightLeaseDeletionAllowed`) admits only
 when the live value is exactly `observe` or `on`; any other live value is refused, at preflight with
