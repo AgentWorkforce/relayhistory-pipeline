@@ -140,6 +140,13 @@ export function bump(c: Counts, key: string, by = 1): void {
   c[key] = (Object.hasOwn(c, key) ? c[key]! : 0) + by;
 }
 const RETRYABLE = new Set([429, 502, 503, 504]);
+/**
+ * A 503 whose `error.reason` is `session_partial` (the read API's READ_API_SESSION_PARTIAL_RETRYABLE, on a
+ * session's first events page): retried this many times, honouring Retry-After, then answered like the 501
+ * (`unsupported`, reason `session_partial`), so one stuck session is recorded and the harvest carries on. Any
+ * other 503 keeps the full retry budget and then stops the harvest.
+ */
+export const PARTIAL_RETRIES = 2;
 
 export class ReadApiClient {
   readonly stats: ClientStats;
@@ -197,11 +204,15 @@ export class ReadApiClient {
     return url;
   }
 
-  /** GET one route; retries 429/502/503/504 and transport errors, honouring Retry-After. Every attempt counts. */
+  /**
+   * GET one route; retries 429/502/503/504 and transport errors, honouring Retry-After. Every attempt counts.
+   * A 503 session_partial answers `unsupported` after PARTIAL_RETRIES retries.
+   */
   async get(route: HarvestRoute, params: [string, string][], sessionId?: string): Promise<Answer> {
     const url = this.url(route, sessionId, params);
     const maxRetries = this.o.maxRetries ?? 5;
     const maxWait = this.o.maxRetryAfterMs ?? 120_000;
+    let partials = 0;
     for (let attempt = 0; ; attempt++) {
       if (this.stats.requests >= this.o.maxRequests) throw new RequestCapReached(this.o.maxRequests);
       this.stats.requests++;
@@ -226,7 +237,9 @@ export class ReadApiClient {
       }
       if (RETRYABLE.has(res.status)) {
         const after = retryAfterMs(res.headers.get("retry-after"), this.clock());
-        await res.body?.cancel().catch(() => {});
+        if (res.status === 503 && await this.partial(res, route)) {
+          if (++partials > PARTIAL_RETRIES) return { kind: "unsupported", reason: "session_partial" };
+        } else await res.body?.cancel().catch(() => {});
         if (attempt >= maxRetries) throw new HarvestError(`${route}: the read API stayed unavailable (${res.status}) after ${attempt + 1} attempts`);
         if (after !== null && after > maxWait) throw new HarvestError(`${route}: the read API asked to wait ${Math.ceil(after / 1_000)}s (Retry-After), longer than ${maxWait / 1_000}s; rerun later to resume`);
         await this.wait(after ?? Math.min(maxWait, 1_000 * 2 ** attempt), after !== null);
@@ -263,6 +276,13 @@ export class ReadApiClient {
     if (honoured) this.stats.retryAfterHonoured++;
     this.stats.waitedMs += ms;
     await this.sleep(ms);
+  }
+
+  /** Whether a 503 is the retryable session_partial: its body's `error.reason`, read within maxResponseBytes. */
+  private async partial(res: Response, route: string): Promise<boolean> {
+    const body = await this.body(res, route);
+    const err = body && typeof body === "object" ? (body as { error?: unknown }).error : undefined;
+    return !!err && typeof err === "object" && (err as { reason?: unknown }).reason === "session_partial";
   }
 
   /** The JSON body, read up to maxResponseBytes (default 32 MiB) without trusting Content-Length. */

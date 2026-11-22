@@ -8,7 +8,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
-import { carriesTokenFragment, HARVEST_ROUTES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
+import { carriesTokenFragment, HARVEST_ROUTES, PARTIAL_RETRIES, parseReadApi, ReadApiClient, redact, retryAfterMs, TOKEN_ENV } from "../harvest/client.ts";
 import { EXIT_CAPPED, failureMessage, main, type HarvestIo } from "../harvest/cli.ts";
 import { RECEIPT_FILE, repoKey, sessionFacts, STATE_FILE, type FrameRow } from "../harvest/harvest.ts";
 import { Hasher, IMPORT_BOUNDS } from "../import/normalize.ts";
@@ -844,5 +844,51 @@ describe("server-supplied keys never hit inherited properties", () => {
     expect(own(r.frame.byDay["2026-11-02"])).toEqual([["claude", 1], ["constructor", 1]]);
     expect(own(r.facts.sessionsWithoutEvents)).toEqual([[value, 1]]);
     expect(r.incompleteReasons).toEqual(["events_not_served"]);
+  });
+});
+
+describe("a retryable session_partial 503", () => {
+  /** A client whose fetch answers `answers` in turn (the last repeats) and records every sleep. */
+  function client503(answers: Response[]) {
+    let i = 0;
+    const sleeps: number[] = [];
+    const f = (async () => answers[Math.min(i++, answers.length - 1)]!.clone()) as unknown as typeof fetch;
+    const c = new ReadApiClient({ base: parseReadApi("https://read.example.test"), token: TOKEN, workspace: WS, maxRequests: 100, concurrency: 1, fetch: f, sleep: async (ms) => { sleeps.push(ms); } });
+    return { c, sleeps, calls: () => i };
+  }
+  const partial = () => Response.json(
+    { error: { code: "backend_unavailable", message: "session is not fully readable yet; retry later", reason: "session_partial" }, correlationId: "c" },
+    { status: 503, headers: { "retry-after": "60" } },
+  );
+
+  test("is retried PARTIAL_RETRIES times honouring Retry-After, then answered like the 501", async () => {
+    const { c, sleeps, calls } = client503([partial()]);
+    const a = await c.get("/v1/sessions/:sessionId/events", [], "fx-h-a");
+    expect(a).toEqual({ kind: "unsupported", reason: "session_partial" });
+    expect(PARTIAL_RETRIES).toBe(2);
+    expect(calls()).toBe(PARTIAL_RETRIES + 1);
+    expect(sleeps).toEqual([60_000, 60_000]);
+    expect(c.stats).toMatchObject({ requests: 3, retries: 2, retryAfterHonoured: 2 });
+  });
+
+  test("that clears is read normally", async () => {
+    const ok = Response.json({ events: [], nextCursor: null }, { headers: { "x-relayhistory-workspace-id": WS } });
+    const { c, calls } = client503([partial(), ok]);
+    expect((await c.get("/v1/sessions/:sessionId/events", [], "fx-h-a")).kind).toBe("ok");
+    expect(calls()).toBe(2);
+  });
+
+  test("any other 503 keeps the full retry budget and then stops the harvest", async () => {
+    for (const body of [
+      { error: { code: "backend_unavailable", reason: "other" } },
+      { error: { code: "backend_unavailable" } },
+      { reason: "session_partial" },
+      null,
+    ]) {
+      const r = body === null ? new Response("down", { status: 503 }) : Response.json(body, { status: 503 });
+      const { c, calls } = client503([r]);
+      await expect(c.get("/v1/sessions/:sessionId/events", [], "fx-h-a")).rejects.toThrow("stayed unavailable (503) after 6 attempts");
+      expect(calls()).toBe(6);
+    }
   });
 });
