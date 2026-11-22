@@ -684,6 +684,45 @@ describe("session ingest: INGEST_BUFFER_LOCK_BUSY / INGEST_BUFFER_LOCK_RETRY (de
   });
 });
 
+describe("session ingest: INGEST_INFLIGHT_LEASE (inflightLease, default off)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("omitted: no var at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }, { ...buffered, bufferLockBusy: "on" as const, claimLockBusy: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      const env = (sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env;
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_INFLIGHT_LEASE")).toBe(false);
+      expect(Object.hasOwn(env, "INGEST_INFLIGHT_LEASE")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, inflightLease: undefined }, b)));
+    }
+  });
+
+  it('"observe" / "on": exactly one more var, no new binding or resource', () => {
+    for (const base of [inputs, canonical, buffered]) {
+      for (const mode of ["observe", "on"] as const) {
+        const on = { ...base, inflightLease: mode };
+        expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+        expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_INFLIGHT_LEASE: mode });
+        const p = props(on);
+        expect(p.env.INGEST_INFLIGHT_LEASE).toBe(mode);
+        expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_INFLIGHT_LEASE"].sort());
+        expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+        expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+      }
+    }
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it('is refused for any value but "observe" or "on"', () => {
+    const why = 'sessionIngest.inflightLease must be "observe" or "on" (omit for off)';
+    for (const value of ["off", "ON", "Observe", "enforce", true, 1, "", null, "yes"])
+      expect(() => assertSessionIngestInputs({ ...inputs, inflightLease: value } as never, refuse)).toThrow(why);
+    expect(() => assertSessionIngestInputs({ ...inputs, INGEST_INFLIGHT_LEASE: "on" }, refuse)).toThrow("sessionIngest.INGEST_INFLIGHT_LEASE is not a known setting");
+  });
+});
+
 describe("session ingest: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
   // The only shape the Neon-exit Worker serves (worker.ts ingestSettings): buffered, frozen-supabase, replica off.
   const exit: SessionIngestInputs = {

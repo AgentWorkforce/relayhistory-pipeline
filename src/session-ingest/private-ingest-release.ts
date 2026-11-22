@@ -216,14 +216,19 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *   advertisedMaxRecords      an integer 1..500 (omit for the default 500): INGEST_ADVERTISED_MAX_RECORDS, the
  *                             maxRecords the Worker publishes (advertised-limits.ts). Advertising only; acceptance
  *                             stays 500, so no persisted batch is refused when it is lowered.
+ *   inflightLease             "observe" or "on" (omit for off): INGEST_INFLIGHT_LEASE, the per-isolate in-flight lease
+ *                             on the HTTP sync path (inflight-lease.ts). observe refuses nothing; on answers an
+ *                             overlapping same-tenant delivery 429 delivery_busy before any ledger call.
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */
-export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords"] as const;
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "originClaimFence", "turnFenceRegister", "advertisedMaxRecords", "inflightLease"] as const;
 export type PrivateIngestCutover = {
   s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[]; claimTimeoutBusy?: "on"; bufferLockBusy?: "on"; bufferLockRetry?: "on";
   claimLockWaitMs?: number; originClaimFence?: "on"; turnFenceRegister?: "on"; advertisedMaxRecords?: number;
+  inflightLease?: "observe" | "on";
 };
+const inflightLeaseOk = (v: unknown): v is "observe" | "on" => v === "observe" || v === "on";
 const ADVERTISED_DIGITS = /^[1-9][0-9]{0,2}$/u;
 const advertisedOk = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 1 && n <= 500;
 const CLAIM_LOCK_WAIT_DIGITS = /^[0-9]{2,4}$/u;
@@ -237,6 +242,9 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
   const turnFenceRegister = profile.turnFenceRegister;
   const bufferBusy = profile.bufferLockBusy, bufferRetry = profile.bufferLockRetry;
   const advertised = profile.advertisedMaxRecords;
+  const inflight = profile.inflightLease;
+  if (inflight !== undefined && !inflightLeaseOk(inflight))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_inflight_lease");
   if (advertised !== undefined && !advertisedOk(advertised))
     privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_advertised_max_records");
   if (mirror !== undefined && mirror !== "on")
@@ -266,6 +274,7 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
     ...(originFence === "on" ? { originClaimFence: "on" as const } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" as const } : {}),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: advertised as number }),
+    ...(inflight === undefined ? {} : { inflightLease: inflight }),
   };
 }
 
@@ -283,6 +292,8 @@ function checkedCutover(profile: Record<string, unknown>, live = false): Private
  *   PRIVATE_INGEST_TURN_FENCE_REGISTER         "on" or unset/empty; anything else refuses.
  *   PRIVATE_INGEST_ADVERTISED_MAX_RECORDS      decimal digits 1..500 (no sign, leading zero, space or fraction), or
  *                                              unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_INFLIGHT_LEASE              "observe", "on" or unset/empty; anything else (any other case or
+ *                                              spacing included) refuses.
  */
 export function privateIngestCutoverFromEnv(env: Record<string, string | undefined>): PrivateIngestCutover {
   const mirror = env.PRIVATE_INGEST_S3_FENCE_MIRROR ?? "", orgs = env.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS ?? "";
@@ -299,6 +310,8 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
   if (turnFenceRegister !== "" && turnFenceRegister !== "on") privateIngestRefuse("private_ingest_profile_turn_fence_register");
   const advertised = env.PRIVATE_INGEST_ADVERTISED_MAX_RECORDS ?? "";
   if (advertised !== "" && !ADVERTISED_DIGITS.test(advertised)) privateIngestRefuse("private_ingest_profile_advertised_max_records");
+  const inflight = env.PRIVATE_INGEST_INFLIGHT_LEASE ?? "";
+  if (inflight !== "" && !inflightLeaseOk(inflight)) privateIngestRefuse("private_ingest_profile_inflight_lease");
   return checkedCutover({
     ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
     ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
@@ -309,6 +322,7 @@ export function privateIngestCutoverFromEnv(env: Record<string, string | undefin
     ...(originFence === "on" ? { originClaimFence: "on" } : {}),
     ...(turnFenceRegister === "on" ? { turnFenceRegister: "on" } : {}),
     ...(advertised === "" ? {} : { advertisedMaxRecords: Number(advertised) }),
+    ...(inflight === "" ? {} : { inflightLease: inflight }),
   });
 }
 
@@ -328,6 +342,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
   const originFence = text("INGEST_ORIGIN_CLAIM_FENCE");
   const turnFenceRegister = text("INGEST_TURN_FENCE_REGISTER");
   const advertised = text("INGEST_ADVERTISED_MAX_RECORDS");
+  const inflight = text("INGEST_INFLIGHT_LEASE");
   if (lockWait !== undefined && !CLAIM_LOCK_WAIT_DIGITS.test(lockWait)) privateIngestRefuse("private_ingest_live_cutover");
   if (advertised !== undefined && !ADVERTISED_DIGITS.test(advertised)) privateIngestRefuse("private_ingest_live_cutover");
   return checkedCutover({
@@ -340,6 +355,7 @@ function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
     ...(originFence === undefined ? {} : { originClaimFence: originFence }),
     ...(turnFenceRegister === undefined ? {} : { turnFenceRegister }),
     ...(advertised === undefined ? {} : { advertisedMaxRecords: Number(advertised) }),
+    ...(inflight === undefined ? {} : { inflightLease: inflight }),
   }, true);
 }
 

@@ -221,6 +221,52 @@ test("buffer lock controls: absent renders nothing, on renders, anything else re
   expect(privateIngestVersionReadback(both, fromBoth.active, fromBoth.version)).toMatchObject({ phase: "baseline-drain" });
 });
 
+// Per-isolate in-flight lease (inflight-lease.ts): a cutover control like the buffer lock controls, two values.
+test("inflight lease control: absent renders nothing, observe / on render, anything else refuses, add / remove at a held phase", () => {
+  const name = "INGEST_INFLIGHT_LEASE", envName = "PRIVATE_INGEST_INFLIGHT_LEASE", refusal = "private_ingest_profile_inflight_lease";
+  expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain("inflightLease");
+  expect(privateIngestCutoverFromEnv({ [envName]: "" })).toEqual({});
+  expect(privateIngestCutoverFromEnv({})).toEqual({});
+  for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
+    const absent = at(phase);
+    expect(privateIngestReleasePhase(absent)).toBe(phase);
+    expect(Object.hasOwn(sessionIngestVars(absent.sessionIngest), name)).toBe(false);
+  }
+  for (const mode of ["observe", "on"] as const) {
+    expect(privateIngestCutoverFromEnv({ [envName]: mode })).toEqual({ inflightLease: mode });
+    for (const phase of ["baseline-drain", "step-4-async-on"] as const) {
+      const on = at(phase, { inflightLease: mode });
+      expect(privateIngestReleasePhase(on)).toBe(phase);
+      expect(sessionIngestVars(on.sessionIngest)).toEqual({ ...sessionIngestVars(at(phase).sessionIngest), [name]: mode });
+    }
+    const plain = at("baseline-drain"), on = at("baseline-drain", { inflightLease: mode });
+    const pass = { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "baseline-drain", to: "baseline-drain" };
+    const fromPlain = live(plain), fromOn = live(on);
+    expect(privateIngestTransitionReadback(on, fromPlain.active, fromPlain.version)).toMatchObject(pass);  // add
+    expect(privateIngestTransitionReadback(plain, fromOn.active, fromOn.version)).toMatchObject(pass);     // remove (rollback)
+    expect(privateIngestVersionReadback(on, fromOn.active, fromOn.version)).toMatchObject({ phase: "baseline-drain" });
+    expect(code(() => privateIngestVersionReadback(plain, fromOn.active, fromOn.version))).not.toBeNull();
+  }
+  const observe = at("baseline-drain", { inflightLease: "observe" }), fromOn = live(at("baseline-drain", { inflightLease: "on" }));
+  expect(code(() => privateIngestVersionReadback(observe, fromOn.active, fromOn.version))).not.toBeNull();
+  for (const v of ["off", "ON", "Observe", "true", "1", " on", "enforce"])
+    expect(code(() => privateIngestCutoverFromEnv({ [envName]: v }))).toBe(refusal);
+  for (const v of ["off", "ON", true, 1, "", "enforce"])
+    expect(code(() => privateIngestReleasePhase(at("baseline-drain", { inflightLease: v })))).toBe(refusal);
+  const plain = at("baseline-drain");
+  for (const bad of [[{ name, type: "plain_text", text: "off" }], [{ name, type: "plain_text", text: "enforce" }], [{ name, type: "secret_text" }]]) {
+    const fixture = live(plain, bad);
+    expect(code(() => privateIngestTransitionReadback(plain, fixture.active, fixture.version))).toBe("private_ingest_live_cutover");
+  }
+  const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+  const production = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...privateIngestCutoverFromEnv({}) } };
+  expect(privateIngestReleasePhase(production)).toBe("baseline-drain");
+  expect(Object.hasOwn(sessionIngestVars(production.sessionIngest), name)).toBe(false);
+  const workflow = readFileSync(".github/workflows/deploy-private-ingest-worker.yml", "utf8");
+  expect(workflow).toContain(`${envName}: \${{ vars.${envName} }}`);
+  expect(workflow.split("\npermissions:")[0]).not.toContain(envName);
+});
+
 // Advertised records-per-batch limit (advertised-limits.ts): a cutover control; acceptance stays 500 either way.
 test("advertised max records control: env shape, profile check, and add / change / remove at a held phase", () => {
   expect(PRIVATE_INGEST_CUTOVER_KEYS).toContain("advertisedMaxRecords");

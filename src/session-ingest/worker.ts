@@ -51,6 +51,13 @@
  *                              re-issues the same ledger call once after a 50-250 ms jittered pause; a second
  *                              failure propagates as before (429 with INGEST_BUFFER_LOCK_BUSY, else 503).
  *                              Rendered only from sessionIngest.bufferLockRetry: "on"
+ *   INGEST_INFLIGHT_LEASE      unset/empty/anything else = off (default) | observe | on (any case, trimmed): a
+ *                              per-isolate in-flight lease per signed (org, workspace, user), taken on the HTTP
+ *                              sync path before its first ledger call (inflight-lease.ts). observe: nothing is
+ *                              refused, a delivery `on` would refuse logs one ingest.inflight_lease line. on: that
+ *                              delivery is a 429 delivery_busy (lock tenant_inflight, Retry-After 2-10 s) before
+ *                              any ledger call; never a lock alert. Per isolate, so partial. Not the queued ACK,
+ *                              the admission consumer or self-host. Rendered only from sessionIngest.inflightLease
  *   INGEST_ADVERTISED_MAX_RECORDS unset (default: 500) | 1..500 strict integer: the maxRecords published on
  *                              GET /v1/delivery/limits and in receipts (advertised-limits.ts). Advertising only:
  *                              acceptance stays MAX_DELIVERY_RECORDS (500). Anything else is ignored (500 published)
@@ -119,6 +126,7 @@ import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
+import { createInflightLease, inflightLeaseMode, type InflightLease, type InflightLeaseMode } from "./inflight-lease.ts";
 import { parseAdvertisedMaxRecords } from "./advertised-limits.ts";
 import { UPLOAD_DIRECT_ALLOWLIST_VAR, UPLOAD_DIRECT_FLAG, UPLOAD_DIRECT_OFF, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
@@ -195,6 +203,8 @@ export interface IngestWorkerEnv {
   INGEST_CLAIM_TIMEOUT_BUSY?: string;
   INGEST_BUFFER_LOCK_BUSY?: string;
   INGEST_BUFFER_LOCK_RETRY?: string;
+  /** observe | on (any case): the per-isolate in-flight lease (inflight-lease.ts). Anything else: off. */
+  INGEST_INFLIGHT_LEASE?: string;
   /** 1..500 (strict integer): the maxRecords this Worker ADVERTISES (advertised-limits.ts). Unset or invalid: 500. */
   INGEST_ADVERTISED_MAX_RECORDS?: string;
   /** 25..2000 ms: a claim's own lock wait (ledger-sql.ts inClaimLockWait). Unset (default): the role's lock_timeout. */
@@ -289,6 +299,8 @@ export interface IngestSettings {
   bufferLockBusy?: true;
   /** INGEST_BUFFER_LOCK_RETRY=on: that failure re-issues the same ledger call once after 50-250 ms. Absent (the default): one call. */
   bufferLockRetry?: true;
+  /** INGEST_INFLIGHT_LEASE=observe|on: the per-isolate in-flight lease on the HTTP sync path. Absent (the default): off. */
+  inflightLease?: InflightLeaseMode;
   /** INGEST_ADVERTISED_MAX_RECORDS (1..500): the advertised maxRecords; acceptance stays 500. Absent (the default): 500 published. */
   advertisedMaxRecords?: number;
   /** INGEST_ADVERTISED_MAX_RECORDS was set but not a strict integer in 1..500: ignored (500 published), warned once per isolate (warnAdvertisedLimitInvalidOnce). */
@@ -416,6 +428,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_BUSY) ? { bufferLockBusy: true as const } : {}),
     ...(routingFlag(env.INGEST_BUFFER_LOCK_RETRY) ? { bufferLockRetry: true as const } : {}),
+    ...(inflightLeaseMode(env.INGEST_INFLIGHT_LEASE) ? { inflightLease: inflightLeaseMode(env.INGEST_INFLIGHT_LEASE)! } : {}),
     ...advertisedSetting(env.INGEST_ADVERTISED_MAX_RECORDS),
     ...(env.INGEST_CLAIM_LOCK_WAIT_MS ? { claimLockWaitMs: claimLockWaitMs(env.INGEST_CLAIM_LOCK_WAIT_MS) } : {}),
     ...(originClaimFence ? { originClaimFence: true as const } : {}),
@@ -544,6 +557,14 @@ export function warnAdvertisedLimitInvalidOnce(settings: Pick<IngestSettings, "a
 /** Tests only: forget that this isolate already warned. */
 export function resetAdvertisedLimitWarningForTests(): void { advertisedLimitInvalidWarned = false; }
 
+/** INGEST_INFLIGHT_LEASE: one lease map per isolate, created on first use (ingestApp runs per request). */
+let isolateInflightLease: InflightLease | undefined;
+function inflightLeaseForIsolate(): InflightLease {
+  return (isolateInflightLease ??= createInflightLease());
+}
+/** Tests only: forget this isolate's lease map. */
+export function resetInflightLeaseForTests(): void { isolateInflightLease = undefined; }
+
 export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort) {
   const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
     ? {
@@ -582,6 +603,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.httpAdmissionStoppedOrgs ? { httpAdmissionStoppedOrgs: settings.httpAdmissionStoppedOrgs } : {}),
     ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
     ...(settings.turnFenceRegister ? { turnFenceRegister: true as const } : {}),
+    ...(settings.inflightLease ? { inflightLease: { mode: settings.inflightLease, lease: inflightLeaseForIsolate() } } : {}),
     // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
     // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;
     // the next S3-ledger claim for the user (or the reset's own retry elsewhere) finishes it (ledger-s3.ts finishResets).

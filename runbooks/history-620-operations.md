@@ -201,6 +201,29 @@ off and renders no var; any other value refuses (`private_ingest_profile_buffer_
 Worker is a production flag change that needs its own approval. A deploy may add or remove them at the live
 phase; rollback is unset (or empty), then plan and deploy, no code change.
 
+In-flight lease before the claim (default off; stack input `sessionIngest.inflightLease: "observe"` or
+`"on"`, omit for off): `INGEST_INFLIGHT_LEASE` keeps a per-isolate, in-memory lease per signed (org,
+workspace, user) on the HTTP sync delivery path (`inflight-lease.ts`; an empty workspace id is its own key).
+Unset, empty or any other value is off: the request path never enters it. The lease is taken in
+`acceptBatch` after the per-org HTTP stop and the body parse, before the first call that can take a ledger
+or fence lock, and released when the delivery ends (success or error). `observe` refuses nothing; a delivery
+that `on` would refuse proceeds and writes one line, `route` = `ingest.inflight_lease`, `outcome` =
+`would_refuse`, `state` = `observe`, `kind` = the request route, `reason` = `tenant_inflight`, `count` = the
+live holders the key already had, plus the request line's own `org_id`, `workspace_id`, `correlation_id` and
+client fields. `on` answers that delivery 429 `delivery_busy` (`Retry-After` 2-10 s, jittered) before any
+ledger call and writes the same line with `outcome` = `refused`; its request line shows `delivery_busy`. It
+is not a database-lock 429: there is no `ingest.lock_alert` line for it, and the DB-error rate alert counts
+it in the denominator only, like the slot limit's 429. A holder whose release never ran expires after 90 s
+(the slot TTL); if one isolate's map is full of live holders the lease fails open and writes `outcome` =
+`fail_open`. Limits: per isolate, so it only sees overlaps that land in the same isolate (observe first to
+measure that share); HTTP sync path only: the queued ACK, the admission consumer and the self-host inbox
+path are never leased. Clients that ignore `Retry-After` keep their own backoff; each refused retry is cheap
+because it costs no ledger call. On the private-ingest release it is a cutover control like the buffer-lock
+flags: `PRIVATE_INGEST_INFLIGHT_LEASE` accepts `observe` or `on`; unset or empty is off and renders no var;
+any other value refuses (`private_ingest_profile_inflight_lease`). Setting it, planning and deploying is a
+production flag change that needs its own approval; rollback is unset (or empty), then plan and deploy, no
+code change.
+
 Advertised records per batch (default off; stack input `sessionIngest.advertisedMaxRecords`, an integer
 1..500, omit for off): `INGEST_ADVERTISED_MAX_RECORDS` changes only the `maxRecords` the Worker publishes on
 `GET /v1/delivery/limits` and in every receipt (`advertised-limits.ts`). Acceptance stays

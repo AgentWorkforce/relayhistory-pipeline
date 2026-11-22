@@ -59,6 +59,7 @@ import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from ".
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch, TURN_ORIGIN_ID } from "./turns.ts";
 import { HttpAdmissionStopped } from "./http-admission-stop.ts";
+import { INFLIGHT_LEASE_LOCK, inflightRetryAfter, type InflightGrant, type InflightLease, type InflightLeaseMode } from "./inflight-lease.ts";
 import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 /**
@@ -155,6 +156,16 @@ export interface IngestAppDeps {
    * the verified org/workspace). Absent = none. A sink can never change or fail the answer.
    */
   analytics?: AnalyticsPort;
+  /**
+   * INGEST_INFLIGHT_LEASE (inflight-lease.ts): observe | on. Absent (the default): acceptBatch never enters the
+   * lease path and its answers and log lines are unchanged. Present: an HTTP sync delivery (POST /v1/delivery/batches
+   * and /v1/turns/batches, never the queued ACK) takes the per-isolate lease for its signed (org, workspace, user)
+   * after the body is parsed and before the first lock-capable ledger call, and releases it in `finally`.
+   * observe: nothing is refused; a delivery that `on` would refuse logs one `ingest.inflight_lease` line.
+   * on: that delivery is a 429 delivery_busy (lock `tenant_inflight`, Retry-After 2-10 s) before any ledger call.
+   * `now` / `random`: test seams (default Date.now / deps.deliver.random or Math.random).
+   */
+  inflightLease?: { mode: InflightLeaseMode; lease: InflightLease; now?: () => number; random?: () => number };
   /**
    * INGEST_TURN_FENCE_REGISTER=on (buffered hosted ingest only). Absent (the default): the turns
    * route is byte-for-byte the pre-gate path, the capability route is not installed, no writer is
@@ -778,6 +789,32 @@ export function createIngestApp(deps: IngestAppDeps) {
     });
   }
 
+  const inflight = deps.inflightLease;
+  /**
+   * INGEST_INFLIGHT_LEASE: take the per-isolate lease (inflight-lease.ts), or throw its 429 (on). At most one
+   * `ingest.inflight_lease` line per delivery, no ids beyond the route line's own: outcome would_refuse
+   * (observe), refused (on) or fail_open (the map was full of live holders: proceeded untracked); `state` the
+   * mode, `kind` the route, `count` the live holders the key already had.
+   */
+  const takeInflightLease = (cfg: NonNullable<IngestAppDeps["inflightLease"]>, tenant: { orgId: string; workspaceId: string; userId: string }, route: string, fields: Record<string, unknown>): InflightGrant => {
+    const at = (cfg.now ?? Date.now)();
+    const line = (outcome: "would_refuse" | "refused" | "fail_open", count: number) =>
+      emit({ ...fields, route: "ingest.inflight_lease", kind: route, outcome, state: cfg.mode, reason: INFLIGHT_LEASE_LOCK, count });
+    if (cfg.mode === "on") {
+      const r = cfg.lease.acquire(tenant, at);
+      if (!r.ok) {
+        line("refused", r.holdersBefore);
+        throw new DeliveryBusyError(INFLIGHT_LEASE_LOCK, inflightRetryAfter(cfg.random ?? deps.deliver.random ?? Math.random));
+      }
+      if (r.failOpen) line("fail_open", r.holdersBefore);
+      return r;
+    }
+    const r = cfg.lease.track(tenant, at);
+    if (r.failOpen) line("fail_open", r.holdersBefore);
+    else if (r.holdersBefore > 0) line("would_refuse", r.holdersBefore);
+    return r;
+  };
+
   // One acceptance path for the public delivery shape and the private turns shape: the
   // same custody (relayhistory witness, shadow, or frozen-supabase), claim, buffer and receipt.
   const acceptBatch = async (c: Context<Env>, route: string, parse: (value: unknown, identity: IngestIdentity) => HistoryExportBatch) => {
@@ -793,6 +830,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       kind: "session_ingest.batch_completed", traceId: c.get("correlationId"), orgId: identity.orgId, workspaceId: identity.workspaceId,
       route: route === "turns.batches" ? "turns" : "delivery", outcome: ingestOutcome(native), records, durationMs: Date.now() - started,
     });
+    let lease: InflightGrant | undefined;
     try {
       assertHttpAdmissionOpen(identity.orgId);
       const batch = parse(await jsonOf(c, read), identity);
@@ -808,6 +846,14 @@ export function createIngestApp(deps: IngestAppDeps) {
       // The operator's enforced sharing mode caps the person's choice (capture-policy.ts operatorSharingCap).
       // Only with INGEST_UPLOAD_CONSENT on: with it off (the default) capture enforce behaves exactly as on main.
       const operator = deps.uploadConsent && deps.uploadConsent.enforcement !== "off" ? operatorSharingCap(identity, capturePolicyUploads) : undefined;
+      // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
+      // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
+      // header must come from the claim).
+      const witness = c.get("journalWitness");
+      const queued = asyncMode === "on" && !!witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody");
+      // INGEST_INFLIGHT_LEASE: the synchronous path only, before its first lock-capable call (the consent
+      // snapshot write, the turn register, the claim). The queued ACK neither takes nor is refused by it.
+      if (inflight && !queued) lease = takeInflightLease(inflight, tenant, route, fields);
       await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { deferDenied: true, phase: "precheck", route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f }));
       // The turns origin participates in every logical-session erasure. The independently
       // default-off registration gate is checked only after the pre-write consent check, and
@@ -822,11 +868,7 @@ export function createIngestApp(deps: IngestAppDeps) {
         // an older or flag-off ingest can still return a durable receipt, but can never set it.
         c.header(TURN_FENCE_HEADER, TURN_FENCE_REGISTERED);
       }
-      // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
-      // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
-      // header must come from the claim).
-      const witness = c.get("journalWitness");
-      if (asyncMode === "on" && witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody")) {
+      if (queued) {
         const prepared = await prepareForAdmission(deps.deliver, tenant, batch, receivedAtMs);
         try {
           await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs, witness.seq, operator);
@@ -884,6 +926,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       const lockAlert = lockAlertFields(error, deps.deliver.acceptanceMode);
       if (lockAlert) emit(lockAlert);
       return failure(c, error);
+    } finally {
+      lease?.release();
     }
   };
 

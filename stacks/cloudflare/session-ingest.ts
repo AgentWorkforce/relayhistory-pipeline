@@ -189,6 +189,15 @@ export interface SessionIngestInputs {
    */
   bufferLockRetry?: "on";
   /**
+   * INGEST_INFLIGHT_LEASE: a per-isolate in-flight lease per signed (org, workspace, user) on the HTTP sync
+   * delivery path, taken before the first ledger call (src/session-ingest/inflight-lease.ts). "observe" refuses
+   * nothing and logs a delivery that "on" would refuse; "on" answers it 429 delivery_busy with Retry-After 2-10 s
+   * before any ledger call (never a database lock alert). Per isolate, so it sees only overlaps within one isolate;
+   * the queued ACK and the admission consumer are never leased. Allowed in canonical and buffered acceptance alike.
+   * Present: the var only (no queue, no binding). Omit for off (no var rendered, vars byte-identical to before).
+   */
+  inflightLease?: "observe" | "on";
+  /**
    * INGEST_CLAIM_LOCK_WAIT_MS: each claim runs in its own short transaction with SET LOCAL lock_timeout of this
    * many ms (25..2000), so a claim queued behind the same user's in-flight claim gives up quickly with 55P03
    * (and, with claimLockBusy, the 429 delivery_busy) instead of waiting the role's 2 s lock_timeout and
@@ -275,7 +284,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "claimLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "bufferLockBusy", "bufferLockRetry", "inflightLease", "claimLockWaitMs", "advertisedMaxRecords", "originClaimFence", "turnFenceRegister", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -393,6 +402,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.bufferLockBusy must be "on", in buffered mode only (omit for off)');
   if (v.bufferLockRetry !== undefined && (v.bufferLockRetry !== "on" || v.acceptanceMode !== "buffered"))
     refuse('sessionIngest.bufferLockRetry must be "on", in buffered mode only (omit for off)');
+  if (v.inflightLease !== undefined && v.inflightLease !== "observe" && v.inflightLease !== "on")
+    refuse('sessionIngest.inflightLease must be "observe" or "on" (omit for off)');
   if (v.claimLockWaitMs !== undefined && (typeof v.claimLockWaitMs !== "number" || !Number.isSafeInteger(v.claimLockWaitMs) || v.claimLockWaitMs < 25 || v.claimLockWaitMs > 2000))
     refuse("sessionIngest.claimLockWaitMs must be an integer from 25 to 2000 (omit for the role default)");
   if (v.advertisedMaxRecords !== undefined && (typeof v.advertisedMaxRecords !== "number" || !Number.isSafeInteger(v.advertisedMaxRecords) || v.advertisedMaxRecords < 1 || v.advertisedMaxRecords > 500))
@@ -447,6 +458,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
     ...(p.bufferLockBusy === "on" ? { INGEST_BUFFER_LOCK_BUSY: "on" } : {}),
     ...(p.bufferLockRetry === "on" ? { INGEST_BUFFER_LOCK_RETRY: "on" } : {}),
+    ...(p.inflightLease === "observe" || p.inflightLease === "on" ? { INGEST_INFLIGHT_LEASE: p.inflightLease } : {}),
     ...(p.claimLockWaitMs !== undefined ? { INGEST_CLAIM_LOCK_WAIT_MS: String(p.claimLockWaitMs) } : {}),
     ...(p.advertisedMaxRecords !== undefined ? { INGEST_ADVERTISED_MAX_RECORDS: String(p.advertisedMaxRecords) } : {}),
     ...(p.originClaimFence === "on" ? { INGEST_ORIGIN_CLAIM_FENCE: "on" } : {}),
