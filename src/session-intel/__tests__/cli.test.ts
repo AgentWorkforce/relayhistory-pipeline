@@ -15,7 +15,7 @@ afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true 
 const io = () => ({ now, out: () => {}, err: () => {} });
 const at = (m: string) => `2026-11-01T09:${m}:00.000Z`;
 
-test("default replay CLI outputs match the pre-adapter 74914c24 golden byte for byte", async () => {
+test("default replay CLI outputs match the pinned golden byte for byte (findings as at 74914c24; source hashes re-pinned)", async () => {
   const out = join(temp(), "out"), fixture = new URL("./fixtures/snapshot", import.meta.url).pathname;
   expect(await main(["replay", "--snapshot", fixture, "--out", out, "--allow-repo-out"], io())).toBe(0);
   // Produced by running the baseline CLI against this same synthetic fixture and fixed clock. Re-pinned for 062220's

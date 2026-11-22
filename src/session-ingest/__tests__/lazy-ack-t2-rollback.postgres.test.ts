@@ -22,7 +22,7 @@
  *           while holding 50000 exclusive; nothing changed.
  *   MARKER  a reader holding the validation marker FOR SHARE (before its own 50000, as the publisher does): the down
  *           fails fast instead of holding 50000 exclusive while it waits on that reader.
- *   LATER   after the full migrate the down refuses (55000, verbatim) while a later slot (062220) is applied, nothing
+ *   LATER   after the full migrate the down refuses (55000, verbatim) while a later slot (062220 today) is applied, nothing
  *           changed; every other case first rolls back each later slot (discovered: reverse filename order, real down
  *           files, as the owner; a later slot without a down fails the suite) and a reapply restores the full ledger.
  *   Not exercised: an ACK admitted while the marker is not 'pass' (044030 apply-window admission, off by default). Its
@@ -195,7 +195,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     return { pool, fx, down, downReceipts, state, pausedAck, conn, lockWaiting, migrate, asRuntime, deliverOne, preparedPayload: prepared, log, ledgerNames, fullLedger, later, ownerUrl: db.ownerUrl };
   }
 
-  test("LATER: with a later slot (062220) still applied the down refuses verbatim and changes nothing; after the later downs it succeeds", async () => {
+  test("LATER: with a later slot still applied the down refuses verbatim and changes nothing; after the later downs it succeeds", async () => {
     const d = await scratchDb({ keepLater: true });
     expect(d.later).toContain("upstream:20261105062220_coordination_advisories_incarnation.sql");
     const before = await d.state(), ledgerBefore = await d.ledgerNames();
@@ -358,7 +358,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     const re = await d.migrate();
     log.reapply = re;
     expect(await d.state()).toEqual(intact);
-    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots (062220) included
+    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots included
     expect(await d.deliverOne("life-u1", "life-o1")).toBe("accepted_buffered");
     log.downUsers = [...new Set(d.downReceipts)];
     log.server = (await d.fx.query("SHOW server_version")).rows[0].server_version;
@@ -448,7 +448,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     // to the rollback target with 062210 absent, is lazy-ack-t2-rollback-target.postgres.test.ts.
     await d.migrate();
     expect(await d.state()).toMatchObject({ table: "sessions.lazy_ack_t2_mode", row: [{ singleton: true, gate: "off", mode: "main" }], ledger: 1, marker: "pass", t2Body: true });
-    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots (062220) included
+    expect(await d.ledgerNames()).toEqual(d.fullLedger); // the full ledger is back, the later slots included
     expect((await d.state()).marker).toBe("pass");
     const R = await d.conn("t2-first-entry-retry");
     try {
