@@ -78,6 +78,7 @@ import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts"
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 // Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
 import { routingFlag } from "./babysitter-retention.ts";
+import { eraseRuntimeSettings } from "../session-erase/flags.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -123,6 +124,8 @@ export interface SelfhostIngestSettings {
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
+  eraseFenceEnforced?: true;
+  eraseBytesEnabled?: true;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
@@ -265,6 +268,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   return {
@@ -281,6 +285,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     heartbeatAccept,
     introspectPositiveTtlMs,
     sessionErase,
+    ...eraseRuntime,
     ...(admission ? { admission } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
