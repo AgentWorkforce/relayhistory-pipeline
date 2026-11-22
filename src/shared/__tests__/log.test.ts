@@ -119,6 +119,16 @@ describe("telemetry allowlist", () => {
     expect(sanitizeLogField("store_status", 9999)).toBe(599);
     expect(sanitizeLogField("store_status", "503 SlowDown on 96bulls/key")).toBeUndefined();
   });
+
+  test("age_ms (the in-flight lease line's oldest holder age) is a bounded integer only", () => {
+    expect(ALLOWED_LOG_FIELDS.has("age_ms")).toBe(true);
+    expect(BOUNDED_COUNT_FIELDS.get("age_ms")).toBe(3_600_000);
+    expect(sanitizeLogField("age_ms", 0)).toBe(0);
+    expect(sanitizeLogField("age_ms", 89_999)).toBe(89_999);
+    expect(sanitizeLogField("age_ms", Number.MAX_SAFE_INTEGER)).toBe(3_600_000);
+    for (const bad of ["3489", "org_123", -1, 1.5, Number.NaN, null, true]) expect(sanitizeLogField("age_ms", bad)).toBeUndefined();
+    expect(JSON.parse(logLine("info", "request", { route: "ingest.inflight_lease", age_ms: 1_234 })).age_ms).toBe(1_234);
+  });
   test("error fields are code-only", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));
     expect(f).toEqual({ error_code: "chunk_empty", retryable: false });

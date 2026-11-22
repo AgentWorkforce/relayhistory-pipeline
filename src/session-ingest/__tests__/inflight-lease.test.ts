@@ -2,8 +2,9 @@
  * INGEST_INFLIGHT_LEASE (default off): the per-isolate in-flight lease taken in acceptBatch before the first
  * lock-capable call. Module: one holder per (org, workspace, user), token-guarded idempotent release, expiry,
  * collision-free keys, capped entries that fail open. App: off unchanged, observe logs one would-refuse line,
- * on refuses an overlapping delivery with a 429 before any ledger call, the lease is released on every exit,
- * and the queued ACK is never leased.
+ * on refuses an overlapping delivery with a 429 before any ledger, consent or turn-register call, the turns
+ * route is tracked (never refused) in on, the oldest holder's age rides on would_refuse / refused lines, the
+ * lease is released on every exit, and the queued ACK is never leased.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
@@ -34,7 +35,7 @@ describe("inflight lease module", () => {
     expect(a.ok).toBe(true);
     expect(lease.holders(TENANT, T0)).toBe(1);
     const b = lease.acquire(TENANT, T0 + 1);
-    expect(b).toEqual({ ok: false, holdersBefore: 1 });
+    expect(b).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1 });
     if (!a.ok) throw new Error("unreachable");
     a.release();
     expect(lease.holders(TENANT, T0 + 2)).toBe(0);
@@ -116,6 +117,26 @@ describe("inflight lease module", () => {
     expect(lease.counters).toEqual({ granted: 2, refused: 0, failOpen: 0 });
   });
 
+  test("oldest holder age: on refusals and on grants with holders, from the clock; absent with no holder", () => {
+    const lease = createInflightLease({ ttlMs: 10_000 });
+    const first = lease.acquire(TENANT, T0);
+    expect(first.ok).toBe(true);
+    expect(Object.hasOwn(first, "oldestHolderAgeMs")).toBe(false);
+    expect(lease.acquire(TENANT, T0 + 1_234)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 1_234 });
+    expect(lease.acquire(TENANT, T0 + 9_999)).toEqual({ ok: false, holdersBefore: 1, oldestHolderAgeMs: 9_999 });
+    // track: the oldest of several holders, not the newest.
+    const t1 = lease.track(TENANT, T0 + 500);
+    expect(t1).toMatchObject({ holdersBefore: 1, oldestHolderAgeMs: 500 });
+    const t2 = lease.track(TENANT, T0 + 2_000);
+    expect(t2).toMatchObject({ holdersBefore: 2, oldestHolderAgeMs: 2_000 });
+    // The first holder expires at T0+10000: the oldest live one is then t1 (taken at T0+500).
+    expect(lease.track(TENANT, T0 + 10_000)).toMatchObject({ holdersBefore: 2, oldestHolderAgeMs: 9_500 });
+    // A key with no holder reports no age.
+    const other = lease.track({ ...TENANT, userId: "user-2" }, T0 + 3_000);
+    expect(other.holdersBefore).toBe(0);
+    expect(Object.hasOwn(other, "oldestHolderAgeMs")).toBe(false);
+  });
+
   test("options must be positive integers", () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => createInflightLease({ ttlMs: bad })).toThrow(/ttlMs/);
@@ -175,7 +196,7 @@ class GatedLedger extends MemoryLedger {
   }
 }
 
-function harness(mode: InflightLeaseMode | undefined, opts: { slots?: true; lease?: InflightLease } = {}) {
+function harness(mode: InflightLeaseMode | undefined, opts: { slots?: true; lease?: InflightLease; deps?: Record<string, unknown> } = {}) {
   const s = scratchStore();
   cleanups.push(s.done);
   const ledger = new GatedLedger();
@@ -189,6 +210,7 @@ function harness(mode: InflightLeaseMode | undefined, opts: { slots?: true; leas
     log: (fields) => logged.push(fields),
     identify: (r) => bindingIdentity(r),
     ...(mode ? { inflightLease: { mode, lease, now: () => T0, random: () => 0.5 } } : {}),
+    ...opts.deps,
   });
   let n = 0;
   const post = async (over: { userId?: string; path?: string; batch?: unknown } = {}) => {
@@ -235,7 +257,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     const lines = h.leaseLines();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toEqual({
-      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "would_refuse", state: "observe", reason: "tenant_inflight", count: 1,
+      route: "ingest.inflight_lease", kind: "delivery.batches", outcome: "would_refuse", state: "observe", reason: "tenant_inflight", count: 1, age_ms: 0,
       org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
     });
     expect(h.lease.entries()).toBe(0);
@@ -255,7 +277,7 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(h.ledger.claims).toHaveLength(1);
     const lines = h.leaseLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ outcome: "refused", state: "on", reason: "tenant_inflight", count: 1, kind: "delivery.batches" });
+    expect(lines[0]).toMatchObject({ outcome: "refused", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0, kind: "delivery.batches" });
     // The refused request's route line is a plain delivery_busy: no lock alert, no database lock fields.
     const route = h.logged.find((f) => f.route === "delivery.batches" && f.outcome === "delivery_busy")!;
     expect(route).toBeDefined();
@@ -266,14 +288,104 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect((await h.post()).status).toBe(200);
   });
 
-  test("on: the turns route is leased the same way (shared key with delivery)", async () => {
+  test("on: the turns route shares the key with delivery but is tracked, never refused", async () => {
     const h = harness("on");
-    const held = h.lease.acquire(TENANT, T0);
+    const held = h.lease.acquire(TENANT, T0 - 3_000);
     const res = await h.post({ path: "/v1/turns/batches", batch: await turnBatch() });
-    expect(res.status).toBe(429);
-    expect(h.ledger.entered).toBe(0);
-    expect(h.leaseLines()[0]).toMatchObject({ kind: "turns.batches", outcome: "refused" });
+    expect(res.status).toBe(200);
+    expect(h.ledger.entered).toBe(1);
+    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 3_000 })]);
+    // The turns batch held the key while it ran (granted, not refused) and released it.
+    expect(h.lease.counters).toEqual({ granted: 2, refused: 0, failOpen: 0 });
+    expect(h.lease.holders(TENANT, T0)).toBe(1);
     if (held.ok) held.release();
+    expect(h.lease.entries()).toBe(0);
+  });
+
+  test("on: a turns batch overlapping an in-flight delivery proceeds and logs would_refuse with state on", async () => {
+    const h = harness("on");
+    const g = h.ledger.gate();
+    const a = h.post();
+    await g.entered;
+    const t = await h.post({ path: "/v1/turns/batches", batch: await turnBatch() });
+    g.open();
+    expect((await a).status).toBe(200);
+    expect(t.status).toBe(200);
+    expect(h.ledger.entered).toBe(2);
+    expect(h.leaseLines()).toEqual([{
+      route: "ingest.inflight_lease", kind: "turns.batches", outcome: "would_refuse", state: "on", reason: "tenant_inflight", count: 1, age_ms: 0,
+      org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, correlation_id: "corr-r2", client_kind: "other",
+    }]);
+    expect(h.lease.counters).toEqual({ granted: 2, refused: 0, failOpen: 0 });
+    expect(h.lease.entries()).toBe(0);
+  });
+
+  test("on: a delivery overlapping an in-flight turns batch is refused", async () => {
+    const h = harness("on");
+    const g = h.ledger.gate();
+    const t = h.post({ path: "/v1/turns/batches", batch: await turnBatch() });
+    await g.entered;
+    const d = await h.post();
+    g.open();
+    expect((await t).status).toBe(200);
+    expect(d.status).toBe(429);
+    expect(d.json.error?.code).toBe("delivery_busy");
+    expect(h.ledger.entered).toBe(1);
+    expect(h.leaseLines()).toEqual([expect.objectContaining({ kind: "delivery.batches", outcome: "refused", state: "on", count: 1, age_ms: 0 })]);
+    expect(h.lease.entries()).toBe(0);
+  });
+
+  test("on: a refused delivery never reaches the consent check, the turn register or the ledger", async () => {
+    let consentCalls = 0;
+    const consentStore = {
+      snapshot: async () => { consentCalls++; throw Object.assign(new Error("unread"), { code: "probe" }); },
+      apply: async () => { throw new Error("unused"); },
+    };
+    const h = harness("on", { deps: { uploadConsent: { enforcement: "report", store: consentStore, nowMs: () => T0 }, turnFenceRegister: true } });
+    let turnRegisters = 0;
+    (h.ledger as unknown as { registerTurnSessions: (i: unknown) => Promise<[string, string][]> }).registerTurnSessions = async () => { turnRegisters++; return []; };
+    // A is held at its claim, past its own consent precheck; B overlaps it and is refused.
+    const g = h.ledger.gate();
+    const a = h.post();
+    await g.entered;
+    expect(consentCalls).toBe(1);
+    const b = await h.post();
+    expect(b.status).toBe(429);
+    // The refused delivery reached neither the consent check, the turn register nor the ledger.
+    expect(consentCalls).toBe(1);
+    expect(turnRegisters).toBe(0);
+    expect(h.ledger.entered).toBe(1);
+    expect(h.leaseLines()).toEqual([expect.objectContaining({ outcome: "refused" })]);
+    g.open();
+    expect((await a).status).toBe(200);
+    // The counters are live: an admitted turns batch reaches both.
+    const before = consentCalls;
+    expect((await h.post({ path: "/v1/turns/batches", batch: await turnBatch() })).status).toBe(200);
+    expect(consentCalls).toBeGreaterThan(before);
+    expect(turnRegisters).toBe(1);
+  });
+
+  test("age_ms: the oldest holder's age on would_refuse (observe) and refused (on), never on fail_open", async () => {
+    const observe = harness("observe");
+    const stuck = observe.lease.acquire(TENANT, T0 - 4_321);
+    expect((await observe.post()).status).toBe(200);
+    expect(observe.leaseLines()).toEqual([expect.objectContaining({ outcome: "would_refuse", state: "observe", count: 1, age_ms: 4_321 })]);
+    if (stuck.ok) stuck.release();
+
+    const on = harness("on");
+    on.lease.acquire(TENANT, T0 - 60_000);
+    const refused = await on.post();
+    expect(refused.status).toBe(429);
+    expect(on.leaseLines()).toEqual([expect.objectContaining({ outcome: "refused", state: "on", count: 1, age_ms: 60_000 })]);
+
+    // A full map with a live holder of the same key: the grant carries an age, the fail_open line does not.
+    const full = createInflightLease({ maxEntries: 1 });
+    full.acquire(TENANT, T0 - 1_000);
+    const open = harness("observe", { lease: full });
+    expect((await open.post()).status).toBe(200);
+    const lines = open.leaseLines();
+    expect(lines).toEqual([expect.objectContaining({ outcome: "fail_open", state: "observe", count: 1 })]);
+    expect(Object.hasOwn(lines[0]!, "age_ms")).toBe(false);
   });
 
   test("on: a different user in the same workspace is not refused", async () => {

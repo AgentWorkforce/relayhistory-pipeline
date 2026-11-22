@@ -191,8 +191,9 @@ export interface SessionIngestInputs {
   /**
    * INGEST_INFLIGHT_LEASE: a per-isolate in-flight lease per signed (org, workspace, user) on the HTTP sync
    * delivery path, taken before the first ledger call (src/session-ingest/inflight-lease.ts). "observe" refuses
-   * nothing and logs a delivery that "on" would refuse; "on" answers it 429 delivery_busy with Retry-After 2-10 s
-   * before any ledger call (never a database lock alert). Per isolate, so it sees only overlaps within one isolate;
+   * nothing and logs a delivery that "on" would refuse; "on" answers an overlapping delivery batch 429 delivery_busy
+   * with Retry-After 2-10 s before any ledger call (never a database lock alert); turns batches are tracked as in
+   * "observe", never refused. Per isolate, so it sees only overlaps within one isolate;
    * the queued ACK and the admission consumer are never leased. Allowed in canonical and buffered acceptance alike.
    * Present: the var only (no queue, no binding). Omit for off (no var rendered, vars byte-identical to before).
    */

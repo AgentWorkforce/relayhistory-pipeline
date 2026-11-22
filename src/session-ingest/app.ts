@@ -162,7 +162,9 @@ export interface IngestAppDeps {
    * and /v1/turns/batches, never the queued ACK) takes the per-isolate lease for its signed (org, workspace, user)
    * after the body is parsed and before the first lock-capable ledger call, and releases it in `finally`.
    * observe: nothing is refused; a delivery that `on` would refuse logs one `ingest.inflight_lease` line.
-   * on: that delivery is a 429 delivery_busy (lock `tenant_inflight`, Retry-After 2-10 s) before any ledger call.
+   * on: an overlapping POST /v1/delivery/batches is a 429 delivery_busy (lock `tenant_inflight`, Retry-After 2-10 s)
+   * before any ledger call. POST /v1/turns/batches is never refused: in `on` it is tracked as in observe (it still
+   * counts as a holder) and logs the would-refuse line with state `on`.
    * `now` / `random`: test seams (default Date.now / deps.deliver.random or Math.random).
    */
   inflightLease?: { mode: InflightLeaseMode; lease: InflightLease; now?: () => number; random?: () => number };
@@ -791,19 +793,23 @@ export function createIngestApp(deps: IngestAppDeps) {
 
   const inflight = deps.inflightLease;
   /**
-   * INGEST_INFLIGHT_LEASE: take the per-isolate lease (inflight-lease.ts), or throw its 429 (on). At most one
-   * `ingest.inflight_lease` line per delivery, no ids beyond the route line's own: outcome would_refuse
-   * (observe), refused (on) or fail_open (the map was full of live holders: proceeded untracked); `state` the
-   * mode, `kind` the route, `count` the live holders the key already had.
+   * INGEST_INFLIGHT_LEASE: take the per-isolate lease (inflight-lease.ts), or throw its 429 (on, delivery batches
+   * only). At most one `ingest.inflight_lease` line per delivery, no ids beyond the route line's own: outcome
+   * would_refuse (observe; and the turns route in on), refused (on) or fail_open (the map was full of live
+   * holders: proceeded untracked); `state` the mode, `kind` the route, `count` the live holders the key already
+   * had, and on would_refuse / refused `age_ms` the age of the oldest of them (a holder whose release never ran
+   * keeps ageing towards the expiry; a real overlap is young).
+   * The turns route is observed, never refused: its forwarder answers its own caller only after every batch
+   * receipt, so a refusal there waits until that caller's 429 handling is confirmed.
    */
   const takeInflightLease = (cfg: NonNullable<IngestAppDeps["inflightLease"]>, tenant: { orgId: string; workspaceId: string; userId: string }, route: string, fields: Record<string, unknown>): InflightGrant => {
     const at = (cfg.now ?? Date.now)();
-    const line = (outcome: "would_refuse" | "refused" | "fail_open", count: number) =>
-      emit({ ...fields, route: "ingest.inflight_lease", kind: route, outcome, state: cfg.mode, reason: INFLIGHT_LEASE_LOCK, count });
-    if (cfg.mode === "on") {
+    const line = (outcome: "would_refuse" | "refused" | "fail_open", count: number, ageMs?: number) =>
+      emit({ ...fields, route: "ingest.inflight_lease", kind: route, outcome, state: cfg.mode, reason: INFLIGHT_LEASE_LOCK, count, ...(ageMs === undefined ? {} : { age_ms: ageMs }) });
+    if (cfg.mode === "on" && route === "delivery.batches") {
       const r = cfg.lease.acquire(tenant, at);
       if (!r.ok) {
-        line("refused", r.holdersBefore);
+        line("refused", r.holdersBefore, r.oldestHolderAgeMs);
         throw new DeliveryBusyError(INFLIGHT_LEASE_LOCK, inflightRetryAfter(cfg.random ?? deps.deliver.random ?? Math.random));
       }
       if (r.failOpen) line("fail_open", r.holdersBefore);
@@ -811,7 +817,7 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
     const r = cfg.lease.track(tenant, at);
     if (r.failOpen) line("fail_open", r.holdersBefore);
-    else if (r.holdersBefore > 0) line("would_refuse", r.holdersBefore);
+    else if (r.holdersBefore > 0) line("would_refuse", r.holdersBefore, r.oldestHolderAgeMs);
     return r;
   };
 

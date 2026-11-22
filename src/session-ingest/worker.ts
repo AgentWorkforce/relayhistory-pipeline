@@ -54,9 +54,10 @@
  *   INGEST_INFLIGHT_LEASE      unset/empty/anything else = off (default) | observe | on (any case, trimmed): a
  *                              per-isolate in-flight lease per signed (org, workspace, user), taken on the HTTP
  *                              sync path before its first ledger call (inflight-lease.ts). observe: nothing is
- *                              refused, a delivery `on` would refuse logs one ingest.inflight_lease line. on: that
- *                              delivery is a 429 delivery_busy (lock tenant_inflight, Retry-After 2-10 s) before
- *                              any ledger call; never a lock alert. Per isolate, so partial. Not the queued ACK,
+ *                              refused, a delivery `on` would refuse logs one ingest.inflight_lease line. on: an
+ *                              overlapping delivery batch is a 429 delivery_busy (lock tenant_inflight, Retry-After
+ *                              2-10 s) before any ledger call; never a lock alert; a turns batch is tracked as in
+ *                              observe, never refused. Per isolate, so partial. Not the queued ACK,
  *                              the admission consumer or self-host. Rendered only from sessionIngest.inflightLease
  *   INGEST_ADVERTISED_MAX_RECORDS unset (default: 500) | 1..500 strict integer: the maxRecords published on
  *                              GET /v1/delivery/limits and in receipts (advertised-limits.ts). Advertising only:

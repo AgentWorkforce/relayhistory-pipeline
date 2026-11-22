@@ -115,6 +115,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "session_hash", "system", "request_id", "prior_status", "prior_failure_code", "regeneration_reason", "failure_code",
   // The claims scheduler tick line (src/session-analysis/claims-scheduler.ts): bounded counts only.
   "selected", "skipped_budget", "skipped_control",
+  // The ingest in-flight lease line (src/session-ingest/app.ts takeInflightLease): the age in ms of the oldest
+  // live holder the key already had; a bounded integer.
+  "age_ms",
 ]);
 
 /**
@@ -138,6 +141,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["selected", 100_000],
   ["skipped_budget", 100_000],
   ["skipped_control", 100_000],
+  ["age_ms", 3_600_000],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
   ...SEAL_POOL_LOG_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),

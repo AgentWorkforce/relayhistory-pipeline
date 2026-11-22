@@ -865,6 +865,21 @@ export function advertisedMaxRecordsDeletionAllowed(
     proposedEnv?.INGEST_ADVERTISED_MAX_RECORDS === undefined &&
     typeof live === "string" && parseAdvertisedMaxRecords(live).value !== undefined;
 }
+/**
+ * The only plan that may unbind INGEST_INFLIGHT_LEASE (rollback to off): the candidate profile omits
+ * inflightLease, no value is proposed, and the live value is exactly "observe" or "on" (strict, no trim
+ * or case folding, as the private-ingest release guard reads it in private-ingest-release.ts).
+ */
+export function inflightLeaseDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_INFLIGHT_LEASE;
+  return sessionIngest.inflightLease === undefined &&
+    proposedEnv?.INGEST_INFLIGHT_LEASE === undefined &&
+    (live === "observe" || live === "on");
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -1020,6 +1035,11 @@ export function assertOperatorSnapshot(
             if (!advertisedMaxRecordsDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = currentEnv.INGEST_ADVERTISED_MAX_RECORDS;
+          } else if (b.sid === "INGEST_INFLIGHT_LEASE") {
+            // Rolling the in-flight lease back to off: only a strict live "observe" or "on".
+            if (!inflightLeaseDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_INFLIGHT_LEASE;
           } else {
             refuse("native_binding_target");
           }

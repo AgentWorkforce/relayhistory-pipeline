@@ -218,7 +218,8 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
  *                             stays 500, so no persisted batch is refused when it is lowered.
  *   inflightLease             "observe" or "on" (omit for off): INGEST_INFLIGHT_LEASE, the per-isolate in-flight lease
  *                             on the HTTP sync path (inflight-lease.ts). observe refuses nothing; on answers an
- *                             overlapping same-tenant delivery 429 delivery_busy before any ledger call.
+ *                             overlapping same-tenant delivery batch 429 delivery_busy before any ledger call
+ *                             (turns batches are tracked, never refused).
  * These controls are never tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
  * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
  */

@@ -14,6 +14,9 @@
  *   - No timers, no IO: the clock is passed in, and acquire / release never wait on anything.
  *   - A holder expires after INFLIGHT_LEASE_TTL_MS, so a release lost to a promise that never settles frees
  *     itself. Release is token-guarded: a late release after expiry and re-acquire never frees the newer holder.
+ *   - When the key already has live holders, acquire / track also report the age of the oldest one
+ *     (oldestHolderAgeMs, from its expiry and the TTL), so a holder whose release never ran (its age keeps
+ *     growing towards the TTL) can be told apart from a real overlap (a young holder).
  *   - Entries are capped (INFLIGHT_LEASE_MAX_ENTRIES). Expired holders of the acquired key are swept on every
  *     acquire, and all expired holders are swept when the map is full. A map still full of live holders FAILS
  *     OPEN (the delivery proceeds untracked) and is counted, so the lease can never refuse for its own memory.
@@ -27,8 +30,10 @@ export const INFLIGHT_LEASE_LOCK = "tenant_inflight";
 
 /**
  * Holder expiry: 90 s, the SQL slot lease TTL (worker.ts deliverDepsFor, "past the Worker's wall-clock
- * budget") and the self-host tenant limiter's. A live delivery holds well under it (the role's
- * statement_timeout is 5 s per statement), so expiry only frees a holder whose release never ran.
+ * budget") and the self-host tenant limiter's. It is a backstop for a release that never ran (for example a
+ * request cancelled by its caller before `finally`), not a claim about how long a delivery takes: a delivery
+ * runs several statements (the role's statement_timeout is 5 s each) plus retries and lock waits, so its own
+ * bound is a multiple of that timeout.
  */
 export const INFLIGHT_LEASE_TTL_MS = 90_000;
 
@@ -45,19 +50,27 @@ export interface InflightGrant {
   ok: true;
   /** Live holders of the same key when this one was taken (observe: > 0 means on would have refused). */
   holdersBefore: number;
+  /** Present only when holdersBefore > 0: age in ms of the oldest live holder the key already had. */
+  oldestHolderAgeMs?: number;
   /** The map was full of live holders: proceeded untracked. */
   failOpen: boolean;
   /** Idempotent; frees only this grant's own holder. */
   release(): void;
 }
-export interface InflightRefusal { ok: false; holdersBefore: number }
+export interface InflightRefusal {
+  ok: false;
+  holdersBefore: number;
+  /** Age in ms of the oldest live holder of the key (holdersBefore is always > 0 here). */
+  oldestHolderAgeMs: number;
+}
 
 export interface InflightLeaseCounters { granted: number; refused: number; failOpen: number }
 
 export interface InflightLease {
-  /** `on`: at most one holder per key; a second live holder is refused. */
+  /** At most one holder per key; a second live holder is refused (the app's `on` for delivery batches). */
   acquire(key: InflightLeaseKey, nowMs: number): InflightGrant | InflightRefusal;
-  /** `observe`: always granted (counted), reporting how many live holders the key already had. */
+  /** Always granted (counted), reporting how many live holders the key already had (the app's `observe`, and
+   *  the turns route in `on`). */
   track(key: InflightLeaseKey, nowMs: number): InflightGrant;
   /** Live holders of `key` at `nowMs`. Tests and diagnostics. */
   holders(key: InflightLeaseKey, nowMs: number): number;
@@ -108,11 +121,22 @@ export function createInflightLease(opts: InflightLeaseOptions = {}): InflightLe
   };
   const sweepAll = (at: number) => { for (const k of [...keys.keys()]) prune(k, at); };
 
-  const grant = (k: string, at: number, holdersBefore: number): InflightGrant => {
+  /** Live holders of `k` at `at` and, when there are any, the age of the oldest (expiresAt = taken + ttlMs). */
+  const live = (k: string, at: number): { count: number; oldestHolderAgeMs?: number } => {
+    const holders = prune(k, at);
+    if (!holders) return { count: 0 };
+    let oldest = Infinity;
+    for (const expiresAt of holders.values()) if (expiresAt < oldest) oldest = expiresAt;
+    return { count: holders.size, oldestHolderAgeMs: Math.max(0, at - (oldest - ttlMs)) };
+  };
+
+  const grant = (k: string, at: number, before: { count: number; oldestHolderAgeMs?: number }): InflightGrant => {
+    const holdersBefore = before.count;
+    const age = before.oldestHolderAgeMs === undefined ? {} : { oldestHolderAgeMs: before.oldestHolderAgeMs };
     if (size >= maxEntries) sweepAll(at);
     if (size >= maxEntries) {
       counters.failOpen++;
-      return { ok: true, holdersBefore, failOpen: true, release: NOOP };
+      return { ok: true, holdersBefore, ...age, failOpen: true, release: NOOP };
     }
     const token = nextToken++;
     let holders = keys.get(k);
@@ -124,6 +148,7 @@ export function createInflightLease(opts: InflightLeaseOptions = {}): InflightLe
     return {
       ok: true,
       holdersBefore,
+      ...age,
       failOpen: false,
       release() {
         if (released) return;
@@ -141,16 +166,16 @@ export function createInflightLease(opts: InflightLeaseOptions = {}): InflightLe
   return {
     acquire(key, nowMs) {
       const k = inflightLeaseKey(key);
-      const live = prune(k, nowMs)?.size ?? 0;
-      if (live > 0) {
+      const before = live(k, nowMs);
+      if (before.count > 0) {
         counters.refused++;
-        return { ok: false, holdersBefore: live };
+        return { ok: false, holdersBefore: before.count, oldestHolderAgeMs: before.oldestHolderAgeMs! };
       }
-      return grant(k, nowMs, 0);
+      return grant(k, nowMs, before);
     },
     track(key, nowMs) {
       const k = inflightLeaseKey(key);
-      return grant(k, nowMs, prune(k, nowMs)?.size ?? 0);
+      return grant(k, nowMs, live(k, nowMs));
     },
     holders(key, nowMs) {
       return prune(inflightLeaseKey(key), nowMs)?.size ?? 0;

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   assertOperatorSnapshot,
   advertisedMaxRecordsDeletionAllowed,
+  inflightLeaseDeletionAllowed,
   retainedOperatorPlan,
   requireStateAuthority,
   operatorStateUrl,
@@ -73,7 +74,7 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised" | "inflight") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
@@ -82,25 +83,28 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
   // "custody-shadow" / "custody-shadow-drain": shadow custody, no receipt bridge; the latter retains admission resources.
   // "neon-exit": frozen custody plus SESSIONS_NEON_EXIT, with no NEON_REPLICA binding.
   // "advertised": buffered + explicit asyncAdmission "off" + advertisedMaxRecords 120 (one more plain-text binding).
+  // "inflight": buffered + explicit asyncAdmission "off" + inflightLease "on" (one more plain-text binding).
   const mode = declared === "canonical" ? "canonical" : "buffered";
   const neonExit = declared === "neon-exit";
   const shadowDrain = declared === "custody-shadow-drain", shadow = declared === "custody-shadow" || shadowDrain;
   const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain" || shadowDrain;
   const admissionVar = declared === "admission-drain" || shadowDrain ? "drain" : "on";
   const advertised = declared === "advertised";
+  const inflight = declared === "inflight";
   const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt || neonExit;
-  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0);
+  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0) + (inflight ? 1 : 0);
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || advertised || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
+      ...(declared === "buffered" || advertised || inflight || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
       ...(custody ? { custodySource: shadow ? "shadow" as const : "frozen-supabase" as const } : {}),
       ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(neonExit ? { neonExit: "on" as const } : {}),
       ...(advertised ? { advertisedMaxRecords: 120 } : {}),
+      ...(inflight ? { inflightLease: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -607,6 +611,87 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       expect(to500.some((e) => e.action === "delete")).toBe(false);
       expect(() => assertOperatorSnapshot(at(update500), input)).toThrow("native_binding_target");
     }
+    if (inflight) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const leaseBinding = worker.bindings.find((b: any) => b.sid === "INGEST_INFLIGHT_LEASE");
+      expect(leaseBinding.data.bindings[0]).toEqual({ type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "on" });
+      expect(worker.props.env.INGEST_INFLIGHT_LEASE).toBe("on");
+      const { INGEST_INFLIGHT_LEASE: _lease, ...unbindEnv } = worker.props.env;
+      const { inflightLease: _mode, ...withoutLease } = input.sessionIngest as any;
+      const omitted = { ...input, sessionIngest: withoutLease };
+      // Rollback to off: live (state) has the value, the candidate omits it, so the plan deletes the binding.
+      const unbindWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: unbindEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === leaseBinding ? { ...b, action: "delete" } : b),
+      };
+      const at = (w: any) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": w } } });
+      const withLive = (live: unknown) => ({ ...unbindWorker, state: { ...unbindWorker.state, props: {
+        ...unbindWorker.state.props, env: { ...unbindWorker.state.props.env, INGEST_INFLIGHT_LEASE: live } } } });
+      const withDeleted = (w: any, value: unknown) => ({ ...w, bindings: w.bindings.map((b: any) =>
+        b.sid !== "INGEST_INFLIGHT_LEASE" ? b : { ...b, data: { bindings: [value] } }) });
+      // Admitted for live "on" and live "observe"; the delete entry is pinned to the live text.
+      for (const live of ["on", "observe"]) {
+        const target = { type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: live };
+        const each = assertOperatorSnapshot(at(withDeleted(withLive(live), target)), omitted);
+        expect(each).toHaveLength(bindingCount);
+        expect(each.find((e) => e.sid === "INGEST_INFLIGHT_LEASE")).toEqual({ sid: "INGEST_INFLIGHT_LEASE", action: "delete", target });
+      }
+      // The candidate profile still sets the value: the inventory no longer matches, or (with a retained row for
+      // it as well) the delete names an expected binding.
+      for (const mode of ["observe", "on"] as const) {
+        const keeps = { ...input, sessionIngest: { ...withoutLease, inflightLease: mode } };
+        expect(() => assertOperatorSnapshot(at(unbindWorker), keeps)).toThrow("native_binding_inventory");
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: [...unbindWorker.bindings, {
+          sid: "INGEST_INFLIGHT_LEASE", action: "update",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: mode }] },
+        }] }), keeps)).toThrow("native_binding_target");
+      }
+      // The proposed env still carries the variable.
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: worker.props }), omitted)).toThrow("native_binding_target");
+      // Live text other than exactly "observe" / "on"; the deleted binding is forged to match so only the
+      // live-value check can refuse.
+      for (const live of ["On", "ON", " on", "on ", "Observe", "off", "1", "", 1, undefined]) {
+        expect(() => assertOperatorSnapshot(at(withDeleted(withLive(live), {
+          type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: live })), omitted)).toThrow("native_binding_target");
+      }
+      // The native binding text differs from the live text, or the binding is not plain text.
+      for (const value of [
+        { type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "observe" },
+        { type: "plain_text", name: "FOREIGN", text: "on" },
+        { type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "on", extra: "x" },
+        { type: "secret_text", name: "INGEST_INFLIGHT_LEASE", text: "on" },
+      ])
+        expect(() => assertOperatorSnapshot(at(withDeleted(unbindWorker, value)), omitted)).toThrow("native_binding_target");
+      // The Worker resource row must be an update.
+      for (const action of ["create", "noop"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, action }), omitted)).toThrow("native_binding_target");
+      // The same delete row under another sid stays refused, with every lease condition satisfied: the candidate
+      // omits the value, the live lease value is valid, and the foreign var's live text equals the deleted text.
+      const foreign = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+          ...unbindWorker.state.props.env, INGEST_BUFFER_LOCK_BUSY: "on" } } },
+        bindings: [...worker.bindings.filter((b: any) => b !== leaseBinding), { sid: "INGEST_BUFFER_LOCK_BUSY", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_BUFFER_LOCK_BUSY", text: "on" }] } }],
+      };
+      expect(foreign.state.props.env.INGEST_INFLIGHT_LEASE).toBe("on");
+      expect(() => assertOperatorSnapshot(at(foreign), omitted)).toThrow("native_binding_target");
+      // on -> observe stays an update row checked against the candidate profile alone, with no delete.
+      const toObserve = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: { ...worker.props.env, INGEST_INFLIGHT_LEASE: "observe" } },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b !== leaseBinding ? b : { ...b, action: "update",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "observe" }] } }),
+      };
+      const observed = assertOperatorSnapshot(at(toObserve), { ...input, sessionIngest: { ...withoutLease, inflightLease: "observe" } });
+      expect(observed.some((e) => e.action === "delete")).toBe(false);
+      expect(() => assertOperatorSnapshot(at(toObserve), input)).toThrow("native_binding_target");
+    }
     if (custody && !frozenReceipt && !neonExit) {
       const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
       const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
@@ -812,7 +897,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised", "inflight"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -1159,6 +1244,19 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
       .toThrow("binding_render_summary");
   });
 
+  test("in-flight lease removal renders one reviewed binding deletion", () => {
+    const unbind = {
+      sid: "INGEST_INFLIGHT_LEASE",
+      action: "delete",
+      target: { type: "plain_text", name: "INGEST_INFLIGHT_LEASE", text: "on" },
+    };
+    const removal = [queue("noop"), flag("noop", "drain"), unbind];
+    expect(() => run(SEVEN, {}, removal)).not.toThrow();
+    const rendered = plans(SEVEN, {}, removal);
+    expect(rendered.planText).toContain("[session-ingest/INGEST_INFLIGHT_LEASE] unbind");
+    expect(rendered.planText).toContain(", 1 binding changes");
+  });
+
   test("a refused contract exposes actions only, never binding values", () => {
     let refusal: unknown;
     try {
@@ -1247,4 +1345,21 @@ test("the retained plan unbinds INGEST_ADVERTISED_MAX_RECORDS only for an omitte
   expect(advertisedMaxRecordsDeletionAllowed(profile({ advertisedMaxRecords: 500 }), live("120"), {})).toBe(false);
   expect(advertisedMaxRecordsDeletionAllowed(profile(), live("120"), live("120"))).toBe(false);
   expect(advertisedMaxRecordsDeletionAllowed(profile(), live("120"), live(""))).toBe(false);
+});
+test("the retained plan unbinds INGEST_INFLIGHT_LEASE only for an omitted candidate value and a strict live observe or on", () => {
+  const profile = (extra: Record<string, unknown> = {}) =>
+    ({ ...baseInput.sessionIngest, ...extra }) as any;
+  const live = (value: unknown) => ({ INGEST_INFLIGHT_LEASE: value });
+  for (const value of ["observe", "on"]) {
+    expect(inflightLeaseDeletionAllowed(profile(), live(value), {})).toBe(true);
+    expect(inflightLeaseDeletionAllowed(profile(), live(value), undefined)).toBe(true);
+    // The candidate profile still sets it, or a value is proposed.
+    for (const mode of ["observe", "on"])
+      expect(inflightLeaseDeletionAllowed(profile({ inflightLease: mode }), live(value), {})).toBe(false);
+    for (const proposed of ["observe", "on", ""])
+      expect(inflightLeaseDeletionAllowed(profile(), live(value), live(proposed))).toBe(false);
+  }
+  for (const value of ["On", "ON", "Observe", "OBSERVE", " on", "on ", "observe\t", "off", "true", "1", "", 0, 1, null, undefined])
+    expect(inflightLeaseDeletionAllowed(profile(), live(value), {})).toBe(false);
+  expect(inflightLeaseDeletionAllowed(profile(), undefined, {})).toBe(false);
 });
