@@ -1,0 +1,21 @@
+{
+ "claim -> xid(row or unique-insert) [ShareLock] <- claim": 469,
+ "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 6,
+ "claim -> xid(row or unique-insert) [ShareLock] <- none": 3,
+ "commit -> clock [ShareLock] <- commit": 15135,
+ "commit -> clock [ExclusiveLock] <- commit": 57517,
+ "commit -> clock [ShareLock] <- untagged": 87,
+ "commit -> xid(row or unique-insert) [ShareLock] <- none": 59,
+ "commit -> clock [ExclusiveLock] <- none": 65,
+ "control -> clock [AccessExclusiveLock] <- commit": 10337,
+ "control -> clock [AccessExclusiveLock] <- claim": 4,
+ "control -> clock [ShareLock] <- claim": 668,
+ "commit -> clock [ExclusiveLock] <- commit+control": 78811,
+ "commit -> clock [ShareLock] <- none": 2,
+ "control -> clock [ShareLock] <- commit": 1619,
+ "commit -> clock [ExclusiveLock] <- control": 2188,
+ "control -> clock [ShareLock] <- untagged": 17,
+ "commit -> clock [ShareLock] <- control": 14,
+ "control -> clock [AccessExclusiveLock] <- none": 1,
+ "commit -> xid(row or unique-insert) [ShareLock] <- control": 1
+}

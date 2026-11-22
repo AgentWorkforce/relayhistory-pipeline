@@ -1,0 +1,68 @@
+{
+    "runId": "baseline-471d291a",
+    "totalRecords": 64000,
+    "maxSeconds": 300,
+    "controlEveryMs": 1000,
+    "cells": [
+        {
+            "workload": "W1",
+            "n": 250,
+            "c": 4
+        },
+        {
+            "workload": "W1",
+            "n": 250,
+            "c": 16
+        },
+        {
+            "workload": "W1",
+            "n": 250,
+            "c": 64
+        },
+        {
+            "workload": "W1",
+            "n": 500,
+            "c": 4
+        },
+        {
+            "workload": "W1",
+            "n": 500,
+            "c": 16
+        },
+        {
+            "workload": "W1",
+            "n": 500,
+            "c": 64
+        },
+        {
+            "workload": "W2",
+            "n": 250,
+            "c": 4
+        },
+        {
+            "workload": "W2",
+            "n": 250,
+            "c": 16
+        },
+        {
+            "workload": "W2",
+            "n": 250,
+            "c": 64
+        },
+        {
+            "workload": "W2",
+            "n": 500,
+            "c": 4
+        },
+        {
+            "workload": "W2",
+            "n": 500,
+            "c": 16
+        },
+        {
+            "workload": "W2",
+            "n": 500,
+            "c": 64
+        }
+    ]
+}
