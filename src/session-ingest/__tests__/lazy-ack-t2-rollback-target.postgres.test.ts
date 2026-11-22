@@ -5,8 +5,9 @@
  * `git worktree add --detach <dir> <target sha>` with its own `bun install --frozen-lockfile`). Skipped otherwise.
  *
  * Schedule: apply this tree as the owner; roll back every slot later than 062210 (discovered in reverse filename
- * order, each from its real down file as the owner; a later slot without a down fails the test); stage a delivery (claim and stage committed, the commit not yet run); the
- * down as the owner; the commit is refused while readiness is pending (55000 'generation not ready'); then the
+ * order, each from its real down file as the owner; a later slot without a down fails the test); stage a delivery
+ * (claim and stage committed, the commit not yet run); the down as the owner; the commit is refused while readiness
+ * is pending (55000 'generation not ready'); then the
  * operator's readiness restoration, all as the owner, with the TARGET tree's own code: (1) its migrator (nothing
  * applied: 062210 is not in that tree; phase 2 marks PASS at its generation), (2) its generation rebind of the lazy
  * policy and admission rows (src/hoopdb/ingest-generation-rebind.ts), (3) the client re-sends the same batch to the
