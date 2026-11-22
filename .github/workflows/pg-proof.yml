@@ -246,7 +246,9 @@ jobs:
       - name: Prove the 062210 T2 staged ACK gate row under a non-superuser owner (fence, try-lock setters, RR/SERIALIZABLE races, seat upgrade, lifecycle and rollback quiescence; held candidate, gate off)
         env:
           # The fixture superuser only provisions the owner role and its database (owner-role-harness.ts); everything
-          # under test runs as that NOSUPERUSER NOBYPASSRLS owner or as the runtime role.
+          # under test runs as that NOSUPERUSER NOBYPASSRLS owner or as the runtime role. Not in this step:
+          # lazy-ack-t2-rollback-target.postgres.test.ts (opt-in; it needs a checkout of the rollback target tree), so
+          # the no-skip check below does not cover it.
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
           SESSION_INGEST_TEST_PG_REQUIRED: "1"
         run: |
