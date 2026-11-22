@@ -64,6 +64,8 @@
  * READ_API_SESSION_SOURCES_ENABLED (exactly "true": GET /v1/sessions/:sessionId/sources, the
  * live harnesses of one session id from session_index through the read role; every other value =
  * 501 sources_not_configured; unset in wrangler.jsonc),
+ * READ_API_SESSION_PARTIAL_RETRYABLE (self-host service only: unset, "" or "false" here; any other
+ * value refuses every request as missing_READ_API_SESSION_PARTIAL_RETRYABLE; unset in wrangler.jsonc),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -140,7 +142,7 @@ import type { AnalysisDeps } from "../../../src/session-read-api/app.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, sessionPartialRetryableFlag } from "../../../src/session-read-api/config.ts";
 import { pendingV2Cache, sqlCoordinationAdvisories } from "../../../src/session-read-api/coordination-advisories.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
@@ -241,6 +243,8 @@ export interface Env extends CanonicalEnv {
   READ_API_SUMMARY_SEARCH_ENABLED?: string;
   /** Exactly "true": serve GET /v1/sessions/:sessionId/sources (sqlSessionSources); anything else = 501 sources_not_configured. */
   READ_API_SESSION_SOURCES_ENABLED?: string;
+  /** Self-host service only (config.ts READ_API_SESSION_PARTIAL_RETRYABLE): unset, "" or "false"; anything else refuses every request. */
+  READ_API_SESSION_PARTIAL_RETRYABLE?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
   MESSAGE_ORIGIN_LABELS_ENABLED?: string;
   /**
@@ -584,6 +588,13 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     }
     // The hosted canonical events flag accepts only unset/empty or exactly "true"; anything else is a misconfigured deploy.
     canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED);
+    // The retryable session_partial 503 is served by the self-host service only: "true" here (or a
+    // value that does not parse) is a misconfigured deploy, refused rather than silently ignored.
+    try {
+      if (sessionPartialRetryableFlag(env.READ_API_SESSION_PARTIAL_RETRYABLE)) throw new Error("service only");
+    } catch {
+      throw new ConfigError("READ_API_SESSION_PARTIAL_RETRYABLE");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Session Read API
-  version: 1.2.1
+  version: 1.3.0
   license:
     name: FSL-1.1-ALv2
     url: https://fsl.software/FSL-1.1-ALv2.template.md
@@ -251,6 +251,7 @@ paths:
                   events: {type: array, items: {$ref: "#/components/schemas/Event"}}
                   nextCursor: {type: [string, "null"]}
                   correlationId: {type: string}
+        "503": {$ref: "#/components/responses/Unavailable"}
         default: {$ref: "#/components/responses/Error"}
   /v1/events:
     get:
@@ -274,7 +275,11 @@ paths:
         scan. Default refuse mode returns on the first attributed session; an
         empty, malformed or non-advancing id, the 32-page bound or the 3 s
         deadline returns `session_partial_unbounded` so the caller falls back.
-        Skip mode returns 503 when that scan cannot complete safely.
+        Skip mode returns 503 when that scan cannot complete safely. With
+        `session`, a partial session's first page is 501 `session_partial`;
+        on the self-host service with `READ_API_SESSION_PARTIAL_RETRYABLE=true`
+        it is 503 `backend_unavailable`, reason `session_partial`, with
+        `Retry-After` (see the 503 response). A workspace search keeps its 501.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}
@@ -328,6 +333,7 @@ paths:
                       reason: {type: string, enum: [session_partial, session_partial_unbounded]}
                       sessions: {type: array, maxItems: 1000, items: {type: string}}
                   correlationId: {type: string}
+        "503": {$ref: "#/components/responses/Unavailable"}
         default: {$ref: "#/components/responses/Error"}
   /v1/cli/login:
     post:
@@ -584,6 +590,39 @@ components:
               refreshToken: {type: string}
               refreshTokenExpiresAt: {type: string, format: date-time}
               tokenType: {type: string, enum: [Bearer]}
+    Unavailable:
+      description: >-
+        Retryable 503. New in 1.3.0, self-host service with
+        `READ_API_SESSION_PARTIAL_RETRYABLE=true` only (default off): the
+        first page (no `cursor`) of a session-scoped read
+        (`/v1/sessions/{sessionId}/events`, `/v1/events?session=`) of a
+        session that is partial in the search index answers 503
+        `backend_unavailable` with `reason: session_partial` and
+        `Retry-After: 60` instead of 501 `session_partial`. There is no
+        staleness bound: a session can stay partial indefinitely, so a client
+        MUST cap its retries and then treat the read as the 501. Workspace
+        search, `session_partial_unbounded`, cursor pages and the hosted
+        deployments keep the 501. Other 503s on these routes are unchanged:
+        `backend_unavailable` or `search_timeout` with no `reason`, and an
+        owner-buffered read's `buffered_fenced` with `Retry-After: 1`.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying. 60 with `reason` `session_partial`, 1 with `buffered_fenced`; absent otherwise.
+          schema: {type: integer}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+                  reason: {type: string}
+              correlationId: {type: string}
     Error:
       description: >-
         401 missing_authorization or invalid_token; 403 forbidden (wrong

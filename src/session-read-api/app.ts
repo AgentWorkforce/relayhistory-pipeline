@@ -406,6 +406,16 @@ export interface ReadApiDeps {
    * affected. Wired by the self-host service only (lambda.ts searchSkipsPartialSessions).
    */
   searchSkipsPartialSessions?: boolean;
+  /**
+   * READ_API_SESSION_PARTIAL_RETRYABLE=true: the FIRST page of a session-scoped read of a partial
+   * session (GET /v1/sessions/:sessionId/events, canonical first page included, and GET
+   * /v1/events?session=) answers 503 `backend_unavailable`, reason `session_partial`,
+   * `Retry-After: 60`, instead of the 501. There is no staleness bound: the session may stay partial,
+   * so clients must cap their retries. Workspace search, `session_partial_unbounded` and the
+   * canonical cursor-page recheck keep the 501. Absent/false: the 501, unchanged. Wired by the
+   * self-host service only (lambda.ts sessionPartialRetryable).
+   */
+  sessionPartialRetryable?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
   corsAllowedOrigins?: ReadonlySet<string>;
 }
@@ -747,7 +757,7 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}${deps.listReadiness === true ? `, ${READY_ONLY_HEADER}` : ""}`);
+        c.header("Access-Control-Expose-Headers", `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.searchSkipsPartialSessions === true ? ", X-Sessions-Read-Incomplete" : ""}${deps.messageOrigin === true ? ", X-Sessions-Read-Origin" : ""}${deps.listReadiness === true ? `, ${READY_ONLY_HEADER}` : ""}${deps.sessionPartialRetryable === true ? ", Retry-After" : ""}`);
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -785,10 +795,17 @@ export function createReadApi(deps: ReadApiDeps) {
     c.header("X-Relayhistory-Workspace-Id", identity.workspaceId);
   });
 
-  const fail = (c: Context, error: unknown) => {
+  // partialRetryable: the route says this request is a session-scoped FIRST page, the only place
+  // ReadApiDeps.sessionPartialRetryable turns the 501 session_partial into a retryable 503.
+  const fail = (c: Context, error: unknown, partialRetryable = false) => {
     const correlationId = c.get("correlationId") as string;
     const identity = c.get("identity") as VerifiedIdentity | undefined;
     if (error instanceof HttpError) {
+      if (partialRetryable && deps.sessionPartialRetryable === true && error.status === 501 && error.reason === "session_partial") {
+        c.header("Retry-After", "60");
+        log({ route: c.req.routePath, reason: "session_partial", status: 503, correlation_id: correlationId });
+        return c.json({ error: { code: "backend_unavailable", message: "session is not fully readable yet; retry later", reason: "session_partial" }, correlationId }, 503);
+      }
       if (error.code === "buffered_fenced") {
         c.header("Retry-After", "1");
         log({ route: c.req.routePath, reason: "buffered_fenced", status: 503, correlation_id: correlationId });
@@ -1062,6 +1079,7 @@ export function createReadApi(deps: ReadApiDeps) {
 
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     let stopAbortLog: (() => void) | undefined;
+    let partialRetryable = false;
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
@@ -1109,6 +1127,7 @@ export function createReadApi(deps: ReadApiDeps) {
       }
       const objectCursor = rawCursor?.startsWith(CANONICAL_CURSOR_PREFIX) === true;
       const cursor = objectCursor ? undefined : decodeCursor(rawCursor);
+      partialRetryable = !objectCursor && cursor === undefined;
       // Search retention is not canonical object retention. Only the Node
       // service with a verified Locker source can answer this exact old scope;
       // workspace search and the hosted/Worker paths retain their floor.
@@ -1196,13 +1215,14 @@ export function createReadApi(deps: ReadApiDeps) {
       return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`, error.details));
-      return fail(c, error);
+      return fail(c, error, partialRetryable);
     } finally {
       stopAbortLog?.();
     }
   });
 
   app.get("/v1/events", async (c) => {
+    let partialRetryable = false;
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
@@ -1227,6 +1247,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const untilMs = parseTime(single(c, "until"), "until");
       const maxContent = positiveInt(single(c, "maxContent"));
       const cursor = decodeCursor(single(c, "cursor"));
+      partialRetryable = sessionId !== undefined && cursor === undefined;
       const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, ...(origin === undefined ? {} : { actorName: origin }), q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
 
       if (sessionId !== undefined) {
@@ -1299,7 +1320,7 @@ export function createReadApi(deps: ReadApiDeps) {
     } catch (error) {
       // The origin header only marks an answered, filtered page.
       c.header("X-Sessions-Read-Origin", undefined);
-      return fail(c, error);
+      return fail(c, error, partialRetryable);
     }
   });
 

@@ -515,7 +515,9 @@ OpenSearch search path a session is partial while its index state is not complet
 has not run yet, it is too large for the limits (`scope_too_large`), or a new upload moved its directory epoch and the
 re-index has not run yet. So with `skip` a session that is being written to drops out of search results until its
 next index pass. A session-scoped read of a partial session still answers 501
-`session_partial`. The hosted pipeline Lambda never reads the limits, and the hosted read Lambda refuses `skip`.
+`session_partial`, unless `READ_API_SESSION_PARTIAL_RETRYABLE=true` (default off, `session-read-api` only) turns its
+first page into a retryable 503 `backend_unavailable` with `Retry-After: 60`; that 503 has no staleness bound, so
+clients must cap their retries (docs/local-stack.md). The hosted pipeline Lambda never reads the limits, and the hosted read Lambda refuses `skip`.
 `SEARCH_INDEX_STREAMING_ENABLED` (default on, except with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` unless the staged
 reconcile is on) indexes such a
 session instead (see "Streaming reconcile (Phase 2)" below). `SEARCH_INDEX_STAGED_RECONCILE_ENABLED` (default
