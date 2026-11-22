@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import ts from "typescript";
 import { apiRoot, checkPreservedVersion, parseCommittedProfile, preservedProfile, profileInputs, resolveProfile, workflowEnvironment } from "./resolve-deploy-profile.ts";
-import { renderDeployConfig } from "./render-deploy-config.ts";
+import { CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, renderDeployConfig } from "./render-deploy-config.ts";
 
 const template = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
 const env = { HYPERDRIVE_ID: "1234567890abcdef1234567890abcdef", OWNER_BUFFERED: "preserve" };
@@ -61,6 +61,14 @@ describe("preserve the deployed Reader profile", () => {
   test("explicit off disables without preserving live settings (live is read only for the analysis guard, no pin)", async () => {
     const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, get());
     expect(resolved).toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
+  });
+  test("a template that predeclares a hosted canonical events var is refused by preserve and explicit dispatches", async () => {
+    for (const name of [CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR]) {
+      const flagged = template.replace(/"vars"\s*:\s*\{/, `"vars": { "${name}": "true",`);
+      expect(flagged).not.toBe(template);
+      for (const mode of [{}, { OWNER_BUFFERED: "off" }, { OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }])
+        await expect(resolveProfile({ ...env, ...mode }, flagged, get())).rejects.toThrow(new RegExp(`must leave ${name} unset`));
+    }
   });
   test("explicit buffered on/off cannot erase the directory just because its environment variable is unset", async () => {
     const off = await resolveProfile({ ...env, OWNER_BUFFERED: "off" }, template, get());

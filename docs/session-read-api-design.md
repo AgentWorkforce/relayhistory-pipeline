@@ -157,6 +157,30 @@ A self-host's relaycontrol proxies History reads with a user's `sh_at_` token. T
    - `asc` with `q` gets 501.
    - Filters `taskRef`, `tag`, `agent`, `projectContains` and `noProject` get 501 in phase A (no caller in phase A sends them).
 
+### Hosted canonical events beyond the floor (`READ_API_CANONICAL_EVENTS_HOSTED`, default off)
+
+Code only, default off, read Worker only (`ReadApiDeps.canonicalEventsHosted` in `src/session-read-api/app.ts`, wired in `packages/session-read-worker/src/index.ts`). The Lambda never builds the dependency, and the self-host service keeps its own canonical events path, which ignores this one.
+
+- **Flags.** `READ_API_CANONICAL_EVENTS_HOSTED` is on only when exactly `true`. Unset or empty is off. Any other value, including `TRUE` or `false`, is a configuration error: every request that reaches the Worker's configuration step answers 503, and the log names `missing_READ_API_CANONICAL_EVENTS_HOSTED`. The `/v1/canonical/*` routes and the 405 method check answer before that step and are not affected. The flag also needs the raw-store secrets (`PIPELINE_RAW_S3_*`); without them the path stays off, and no log line says so. `READ_API_CANONICAL_EVENTS_WORKSPACES` is the workspace allowlist (`*` or a list). Unset or empty allows no workspace. Neither variable may be declared in `wrangler.jsonc` or any deploy template; the deploy-config render and the profile resolver refuse a template that declares either.
+- **When it serves.** `GET /v1/sessions/:sessionId/events` is answered from the session's canonical objects only when all of these hold: the token's workspace is on the allowlist; the session has a live pointer; and its `created_at` is older than `READ_API_COMPLETE_SINCE`. Without `source`, the one live source of the session id is found through the `/sources` reader (`session-sources.ts`). Where an operator erase fence is bound, a source is dropped first when any form of its key is fenced, as `/sources` drops it. If there is no live source, the route answers as without the flag; if every source was dropped as fenced, it answers 404. If more than one is left, it answers 501 `events_canonical_source_ambiguous`; sources are never merged. The resolved source must itself be older than the floor.
+- **Checks on every page.** These are the self-host path's checks:
+  - The partial-session check runs before and after the object read (501 `session_partial`).
+  - A tombstone found after the object read answers an empty page.
+  - Where an operator erase fence is bound, a fenced source is dropped before the source is resolved, and the fence is rechecked after the object read (404, no content). The read Worker binds no operator fence today, so there an erase shows through the tombstone and partial checks.
+  - A row of another tenant, session or source is 501 `events_canonical_tenant_mismatch`, and is never served.
+  - A source row of another tenant is a 500. A source row that names the requested id in neither its physical nor its source ids is outside the reader's contract and answers 503. Neither is served.
+  - A scope too large to read stays a 501.
+- **Contract changes, with the dependency present only:**
+  - 409 `cursor_backend_transition` for a `b96e1:` cursor on a session served from objects.
+  - The same 409 for a `b96c1:` object cursor on a session not served from objects, for allowlisted workspaces only. Off the allowlist, and after a workspace is removed from the allowlist or the flag is turned off, a `b96c1:` cursor answers 501 `canonical_cursor_scope` as today.
+  - The same 409 for a `b96c1:` cursor whose canonical source generation changed.
+  - The 501 `events_canonical_source_ambiguous` above.
+  - Object pages carry `b96c1:` cursors.
+  - Known limit: an id that is also an alias of another source's session counts as two sources (501 `events_canonical_source_ambiguous`), as `/sources` lists both. The caller can pass `source`.
+  - Every other answer, including sessions inside the floor and workspaces off the allowlist, is byte-identical to the flag-off route: 501 `history_floor`, the ClickHouse page, and 501 `canonical_cursor_scope`.
+- **Origin labels.** Object pages carry message origin labels only when `MESSAGE_ORIGIN_LABELS_ENABLED` is exactly `true` on the Worker, as on the other paths.
+- **Enabling.** Enabling is an operator decision: setting both variables on the deployed Worker. The deploy workflow passes its variables explicitly and carries neither of these, so a plain variable set by hand is dropped by the next workflow deploy. A durable enable needs a later reviewed change to the deploy workflow. With the flag on but the raw-store secrets missing, the path stays off without a log line. The caller's pagination stickiness must keep a `b96c1:` cursor on 96Bulls, as it does a `b96e1:` cursor, and must treat the 409 as "restart without a cursor".
+
 ## 5. Rollout
 
 - **Cloud flags** are one Worker var per route group, `SESSIONS_READ_96BULLS_<GROUP>` = `off|shadow|on`. Phase A groups: `EVENTS_SEARCH`, `SESSION_EVENTS` and `EVENTS_IN_SESSION`. `SESSIONS_READ_96BULLS_URL` holds the origin.

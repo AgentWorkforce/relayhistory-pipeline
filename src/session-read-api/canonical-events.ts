@@ -14,6 +14,11 @@ export const CANONICAL_CURSOR_PREFIX = "b96c1:";
 export interface CanonicalEventsDeps {
   source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }>;
   deadlineMs?: number;
+  /**
+   * Label who wrote each event (message-origin.ts), as the index writer does with
+   * MESSAGE_ORIGIN_LABELS_ENABLED. Absent or false: unchanged (no labels).
+   */
+  originLabels?: boolean;
 }
 export async function canonicalEventPage(deps: CanonicalEventsDeps, liveness: Liveness,
   input: EventQuery & { sessionId: string; source: string }, rawCursor?: string): Promise<EventPage> {
@@ -51,7 +56,7 @@ export async function canonicalEventPage(deps: CanonicalEventsDeps, liveness: Li
           (row.workspace_id !== undefined && row.workspace_id !== identity.workspaceId))
         throw new CanonicalReadError("tenant_mismatch");
       const converted = eventRowFromIndex(toIndexRow(projectedToNeonRow(row,
-        { ...identity, harness: identity.source }, ""), 0));
+        { ...identity, harness: identity.source }, "", deps.originLabels === true), 0));
       if (!converted.event_id || !converted.machine_id || !Number.isSafeInteger(converted.ts_ms))
         throw new CanonicalReadError("event_invalid");
       return converted;

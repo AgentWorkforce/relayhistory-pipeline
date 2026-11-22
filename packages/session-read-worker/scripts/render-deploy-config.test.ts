@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -267,6 +267,32 @@ describe("deploy config render, owner_buffered_events", () => {
     const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${OWNER_BUFFERED_EVENTS_VAR}": "on",`);
     expect(flagged).not.toBe(TEMPLATE);
     expect(() => renderDeployConfig(flagged, { ...ON, ownerBufferedEvents: "on" })).toThrow(/leave READ_API_OWNER_BUFFERED_EVENTS unset/);
+  });
+
+  test("a template that predeclares a hosted canonical events var is refused in every mode; no render ever sets one", () => {
+    const dispatches: RenderInputs[] = [
+      { hyperdriveId: HD },
+      { hyperdriveId: HD, ownerBuffered: "off" },
+      { hyperdriveId: HD, ownerBuffered: "off", bufferedSearchGate: "on" },
+      ON,
+      { ...ON, ownerBufferedEvents: "on" },
+    ];
+    for (const name of [CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR]) {
+      for (const value of ["true", "", "false"]) {
+        const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${name}": ${JSON.stringify(value)},`);
+        expect(flagged).not.toBe(TEMPLATE);
+        for (const inputs of dispatches) {
+          expect(() => renderDeployConfig(flagged, inputs)).toThrow(RenderError);
+          expect(() => renderDeployConfig(flagged, inputs)).toThrow(new RegExp(`must leave ${name} unset`));
+        }
+      }
+    }
+    for (const inputs of dispatches) {
+      const rendered = renderDeployConfig(TEMPLATE, inputs);
+      expect(rendered).not.toContain(CANONICAL_EVENTS_HOSTED_VAR);
+      expect(rendered).not.toContain(CANONICAL_EVENTS_WORKSPACES_VAR);
+    }
+    expect(TEMPLATE).not.toContain("READ_API_CANONICAL_EVENTS_");
   });
 
   test("a template that predeclares READ_API_OWNER_BUFFERED_EVENTS is refused in every mode and for every events value", () => {

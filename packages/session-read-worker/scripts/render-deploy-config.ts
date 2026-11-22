@@ -117,6 +117,15 @@ export const OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR = "READ_API_OWNER_BUFFERED_STA
 export const OWNER_BUFFERED_PHASE_LOG_VAR = "READ_API_OWNER_BUFFERED_PHASE_LOG";
 /** The owner-buffered out-of-band index check (index.ts Env; ownerBufferedIndexVerifyEnabled accepts only "on"). */
 export const OWNER_BUFFERED_INDEX_VERIFY_VAR = "READ_API_OWNER_BUFFERED_INDEX_VERIFY";
+/** The hosted canonical events flag (index.ts Env; canonicalEventsHostedEnabled accepts only "true"). */
+export const CANONICAL_EVENTS_HOSTED_VAR = "READ_API_CANONICAL_EVENTS_HOSTED";
+/** Its workspace allowlist (index.ts Env; parseDirectoryWorkspaces syntax). */
+export const CANONICAL_EVENTS_WORKSPACES_VAR = "READ_API_CANONICAL_EVENTS_WORKSPACES";
+/**
+ * Vars no template and no render may declare: enabling them is an operator decision made on the
+ * deployed Worker, never a default. A template declaring any of them is refused in every mode.
+ */
+export const NEVER_DECLARED_VARS = [CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR] as const;
 /** Vars only this render adds; a template declaring any of them is refused in every mode. */
 const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
 
@@ -197,13 +206,16 @@ function leaveUnset(vars: Record<string, string>, keys: readonly string[]): void
   }
 }
 
-/** Refuses a template whose vars already declare a render-only flag, in every mode; an unparsable template is left to the paths that parse it. */
+/**
+ * Refuses a template whose vars already declare a render-only flag or a never-declared one, in
+ * every mode; an unparsable template is left to the paths that parse it.
+ */
 function refusePredeclaredEvents(template: string, hyperdriveId: string): void {
   const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, hyperdriveId));
   if (parsed.error) return;
   const vars = (parsed.config as JsoncConfig | undefined)?.vars;
   if (vars === null || typeof vars !== "object") return;
-  for (const k of RENDER_ONLY_VARS) if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
+  for (const k of [...RENDER_ONLY_VARS, ...NEVER_DECLARED_VARS]) if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
 }
 
 const HYPERDRIVE_ID = /^[0-9a-f]{32}$/;

@@ -115,6 +115,7 @@ import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
 import { rawStoreFromEnv, type RawStore } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { AnalysisResultError } from "../../../src/session-analysis/results.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
+import type { CanonicalEventsDeps } from "../../../src/session-read-api/canonical-events.ts";
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
 import { sqlSessionHarnesses } from "../../../src/session-read-api/session-turns-source.ts";
 import { sqlSessionSources } from "../../../src/session-read-api/session-sources.ts";
@@ -123,7 +124,7 @@ import { sqlEvidenceDeps, type EvidenceDeps } from "../../../src/session-read-ap
 import { objectKey, readAll } from "../../../src/shared/vendor.ts";
 import { logLine, type Level } from "../../../src/shared/log.ts";
 import { createClickHouseClient, type ClickHouseClient, type RequestOptions } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
-import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-read-api/app.ts";
+import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "../../../src/session-read-api/app.ts";
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { serviceNarrativeGenerator, sqlNarrativeCache } from "../../../src/session-read-api/digest-narrative.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
@@ -240,6 +241,16 @@ export interface Env extends CanonicalEnv {
   READ_API_SESSION_SOURCES_ENABLED?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
   MESSAGE_ORIGIN_LABELS_ENABLED?: string;
+  /**
+   * Hosted canonical events (src/session-read-api/app.ts canonicalEventsHosted): exactly "true"
+   * serves GET /v1/sessions/:sessionId/events for sessions older than READ_API_COMPLETE_SINCE from
+   * the canonical objects (needs the raw-store secrets; without them it stays off). Unset or empty
+   * = off (default); any other value refuses every request (503, logged
+   * missing_READ_API_CANONICAL_EVENTS_HOSTED). Never predeclared in wrangler.jsonc.
+   */
+  READ_API_CANONICAL_EVENTS_HOSTED?: string;
+  /** Its workspace allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. Never predeclared in wrangler.jsonc. */
+  READ_API_CANONICAL_EVENTS_WORKSPACES?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
   DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
@@ -566,6 +577,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_INDEX_VERIFY");
     }
+    // The hosted canonical events flag accepts only unset/empty or exactly "true"; anything else is a misconfigured deploy.
+    canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED);
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -625,6 +638,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(exactTrueFlag(env.READ_API_SUMMARY_SEARCH_ENABLED) ? { summarySearch: true } : {}),
     ...(exactTrueFlag(env.READ_API_SESSION_SOURCES_ENABLED) ? { sessionSources: sqlSessionSources(tenant.run) } : {}),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { messageOrigin: true } : {}),
+    ...workerCanonicalEventsHosted(env, tenant.run, overrides.fetcher),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
@@ -786,38 +800,90 @@ export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | und
 }
 
 /**
+ * One session's full canonical snapshot (rows, legacy coverage, generation, exists): pointers
+ * through the read role (tenant-bound), objects with the raw-store secrets the /v1/canonical
+ * route uses (PIPELINE_RAW_S3_*), every fetch bounded by the caller's signal. Shared by timing,
+ * turns and the hosted canonical events read.
+ */
+function workerCanonicalSource(env: Env, pointers: ReturnType<typeof sqlCanonicalPointers>, fetcher: typeof fetch) {
+  const maximum = readerMaxRuleset(env);
+  return async (identity: Parameters<typeof canonicalSnapshot>[1], signal: AbortSignal) => {
+    const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
+    const raw = rawStoreFromEnv(env, bounded);
+    if (!raw) throw new CanonicalReadError("not_configured");
+    return canonicalSnapshot(
+      {
+        ...raw,
+        readerMaxRuleset: maximum,
+        prefix: env,
+        pointers: pointers.pointers,
+        decompress: (bytes, max) => {
+          const output = decompress(bytes, new Uint8Array(max));
+          if (output.byteLength > max) throw new CanonicalReadError("chunk_bound");
+          return output;
+        },
+      },
+      identity,
+    );
+  };
+}
+
+/**
  * Session timing from canonical S3: pointers through the read role (tenant-bound), objects
  * with the raw-store secrets the /v1/canonical route uses (PIPELINE_RAW_S3_*). Without
  * those secrets the route answers 501 `timing_not_configured`.
  */
 export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TimingDeps | undefined {
   if (!rawStoreFromEnv(env, fetcher)) return undefined;
-  const maximum = readerMaxRuleset(env);
   const pointers = sqlCanonicalPointers(run);
+  const snapshot = workerCanonicalSource(env, pointers, fetcher);
   return {
     state: pointers.state,
     assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true",
     async source(identity, signal) {
-      const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
-      const raw = rawStoreFromEnv(env, bounded);
-      if (!raw) throw new CanonicalReadError("not_configured");
-      const snapshot = await canonicalSnapshot(
-        {
-          ...raw,
-          readerMaxRuleset: maximum,
-          prefix: env,
-          pointers: pointers.pointers,
-          decompress: (bytes, max) => {
-            const output = decompress(bytes, new Uint8Array(max));
-            if (output.byteLength > max) throw new CanonicalReadError("chunk_bound");
-            return output;
-          },
-        },
-        identity,
-      );
-      return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
+      const { rows, legacyCoverage } = await snapshot(identity, signal);
+      return { rows, legacyCoverage };
     },
   };
+}
+
+/**
+ * READ_API_CANONICAL_EVENTS_HOSTED: unset or empty = off, exactly "true" = on, anything else
+ * (including "TRUE" or "false") a ConfigError: every request that reaches the configuration step
+ * answers 503, logged missing_READ_API_CANONICAL_EVENTS_HOSTED (the /v1/canonical/* routes and the
+ * 405 method check answer before it). The value itself is never logged.
+ */
+export function canonicalEventsHostedEnabled(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return false;
+  if (raw === "true") return true;
+  throw new ConfigError("READ_API_CANONICAL_EVENTS_HOSTED");
+}
+
+/**
+ * Hosted canonical events (app.ts canonicalEventsHosted): the full snapshot on the timing
+ * pointers and raw-store secrets, with the writer's origin labels when
+ * MESSAGE_ORIGIN_LABELS_ENABLED is exactly "true". Built only when READ_API_CANONICAL_EVENTS_HOSTED
+ * is exactly "true" and the raw store is configured; otherwise undefined and the events route
+ * answers as without the flag (with the flag on but the raw store missing, without a log line).
+ * The Worker binds no operator erase fence; an erase shows through the tombstone and partial checks.
+ */
+export function canonicalEventsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): CanonicalEventsDeps | undefined {
+  if (!canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED) || !rawStoreFromEnv(env, fetcher)) return undefined;
+  return {
+    source: workerCanonicalSource(env, sqlCanonicalPointers(run), fetcher),
+    ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { originLabels: true } : {}),
+  };
+}
+
+/**
+ * The read API deps for hosted canonical events: `canonicalEvents` (above) plus
+ * `canonicalEventsHosted` with READ_API_CANONICAL_EVENTS_WORKSPACES (unset/empty = no workspace)
+ * and the session-sources reader. Off: {} (the deps carry neither key).
+ */
+export function workerCanonicalEventsHosted(env: Env, run: TenantRunner, fetcher?: typeof fetch): Pick<ReadApiDeps, "canonicalEvents" | "canonicalEventsHosted"> {
+  const canonicalEvents = canonicalEventsDeps(env, run, fetcher);
+  if (!canonicalEvents) return {};
+  return { canonicalEvents, canonicalEventsHosted: { workspaces: parseDirectoryWorkspaces(env.READ_API_CANONICAL_EVENTS_WORKSPACES), sources: sqlSessionSources(run) } };
 }
 
 /**

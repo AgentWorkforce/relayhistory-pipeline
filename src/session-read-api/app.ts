@@ -344,6 +344,19 @@ export interface ReadApiDeps {
   advisoryPriority?: boolean;
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
+  /**
+   * READ_API_CANONICAL_EVENTS_HOSTED=true (exactly "true", the hosted Worker only): GET
+   * /v1/sessions/:sessionId/events serves a session older than `completeSinceMs` from the
+   * `canonicalEvents` objects for a workspace on `workspaces` (READ_API_CANONICAL_EVENTS_WORKSPACES,
+   * parseDirectoryWorkspaces syntax; empty = none). Without `source` the one live source is resolved
+   * through `sources` (fenced sources dropped first where an operator fence is bound); more than one
+   * = 501 `events_canonical_source_ambiguous`, none = the route as without the flag (404 when every
+   * source was fenced). Under this dep, for an allowlisted workspace, a cursor from the other
+   * backend, or a canonical generation that moved under an object cursor, is a 409
+   * `cursor_backend_transition`. Ignored with `selfhost`.
+   * Absent: the route answers exactly as before (docs/session-read-api-design.md).
+   */
+  canonicalEventsHosted?: { workspaces: ReadonlySet<string> | "*"; sources: SessionSources };
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
   /**
@@ -990,6 +1003,54 @@ export function createReadApi(deps: ReadApiDeps) {
     return events.map((event) => ({ ...event, messageId: ids.get(key(event.eventId, event.machineId, event.kind)) ?? null }));
   }
 
+  /** True when an operator erase fence (where one is bound) holds any id form of this source; checked one at a time. */
+  async function hostedFenced(identity: VerifiedIdentity, source: string, forms: Iterable<string>): Promise<boolean> {
+    const erased = deps.operatorErased;
+    if (!erased) return false;
+    for (const id of forms)
+      if (await erased({ orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId: id })) return true;
+    return false;
+  }
+
+  /**
+   * The hosted canonical events read without `source`: the live sources of the session id
+   * (session-sources.ts), their rows rechecked as the /sources route does (tenant, harness name,
+   * and the requested id among the row's physical or source ids, which the statement guarantees).
+   * Where an operator erase fence is bound, a source is dropped when any form of its key is fenced
+   * (the requested id and each physical and source id its live rows hold), before the count, as
+   * /sources drops it. Then: more than one left = 501 `events_canonical_source_ambiguous` (no
+   * merge); one left = that source and its id forms (the route rechecks them after the object
+   * read); none left but one was fenced = 404; no rows = undefined (the route as without the flag).
+   * An id that is also an alias of another source's session counts as two sources.
+   */
+  async function hostedSource(identity: VerifiedIdentity, sessionId: string, reader: SessionSources): Promise<{ source: string; forms: string[] } | undefined> {
+    const rows = await reader(identity.orgId, identity.workspaceId, sessionId);
+    if (rows.length > SESSION_SOURCES_MAX) throw new Error("session sources out of contract");
+    const ids = new Map<string, Set<string>>();
+    for (const row of rows) {
+      if (row.org_id !== identity.orgId || row.workspace_id !== identity.workspaceId) throw new TenantMismatchError();
+      if (typeof row.harness !== "string" || !HARNESS_NAME.test(row.harness)) throw new Error("session sources out of contract");
+      if (!Array.isArray(row.session_ids) || !Array.isArray(row.canonical_ids) ||
+          (!row.session_ids.includes(sessionId) && !row.canonical_ids.includes(sessionId))) throw new Error("session sources out of contract");
+      const forms = ids.get(row.harness) ?? new Set([sessionId]);
+      for (const id of [...row.session_ids, ...row.canonical_ids]) if (typeof id === "string" && id !== "") forms.add(id);
+      ids.set(row.harness, forms);
+    }
+    const kept: string[] = [];
+    let fenced = false;
+    for (const source of [...ids.keys()].sort()) {
+      if (await hostedFenced(identity, source, ids.get(source)!)) { fenced = true; continue; }
+      kept.push(source);
+    }
+    if (kept.length > 1) throw unsupported("events_canonical_source_ambiguous");
+    const [source] = kept;
+    if (source === undefined) {
+      if (fenced) throw new HttpError(404, "not_found", "Session not found");
+      return undefined;
+    }
+    return { source, forms: [...ids.get(source)!] };
+  }
+
   app.get("/v1/sessions/:sessionId/events", async (c) => {
     let stopAbortLog: (() => void) | undefined;
     try {
@@ -1066,6 +1127,54 @@ export function createReadApi(deps: ReadApiDeps) {
           await check();
           return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
         }
+      }
+      // The hosted equivalent (READ_API_CANONICAL_EVENTS_HOSTED): its own allowlist, sessions older
+      // than the floor only, one resolved source, and 409 on a cursor from the other backend.
+      const hosted = deps.canonicalEventsHosted;
+      if (hosted && !deps.selfhost && deps.canonicalEvents &&
+          (hosted.workspaces === "*" || hosted.workspaces.has(identity.workspaceId))) {
+        // The same sessionStart sessionGate asks below (one call per request).
+        start ??= await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        const old = (s: Awaited<ReturnType<Liveness["sessionStart"]>>) => s.live > 0 && s.createdAtMs !== null && s.createdAtMs < deps.completeSinceMs;
+        let served = source;
+        // The id forms of a source this block resolved itself (no `source` given), for the post-read
+        // fence recheck; with `source` given the fence middleware rechecks instead.
+        let resolvedForms: string[] | undefined;
+        let eligible = old(start);
+        if (eligible && served === undefined) {
+          const resolved = await hostedSource(identity, sessionId, hosted.sources);
+          if (resolved === undefined) eligible = false;
+          else {
+            served = resolved.source;
+            resolvedForms = resolved.forms;
+            eligible = old(await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, served));
+          }
+        }
+        if (eligible && served !== undefined) {
+          if (cursor) throw cursorTransition();
+          const check = async () => {
+            if ((await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0)
+              throw unsupported("session_partial");
+          };
+          await check();
+          let page;
+          try {
+            page = await canonicalEventPage(deps.canonicalEvents, deps.liveness,
+              { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source: served, order, limit, maxContent, cursor }, objectCursor ? rawCursor : undefined);
+          } catch (error) {
+            if (error instanceof CanonicalReadError) {
+              if (objectCursor && error.reason === "source_generation_changed") throw cursorTransition();
+              throw error.status === 400 ? bad("canonical cursor is not valid") : unsupported(`events_canonical_${error.reason}`, error.details);
+            }
+            throw error;
+          }
+          const events = includeMessageId ? await withMessageIds(identity, sessionId, served, page.events) : page.events;
+          await check();
+          // A fence that committed during the object read wins before any content leaves.
+          if (resolvedForms && await hostedFenced(identity, served, resolvedForms)) throw new HttpError(404, "not_found", "Session not found");
+          return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+        }
+        if (objectCursor) throw cursorTransition();
       }
       if (objectCursor) throw unsupported("canonical_cursor_scope");
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined, start)) === "empty")
