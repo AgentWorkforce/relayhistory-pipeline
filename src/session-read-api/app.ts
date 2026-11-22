@@ -41,7 +41,8 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *                                   brief-summary.ts, migration 20261105056000)
  *   GET /v1/sessions/summaries/search  sessions whose title or scrubbed short summary contains q:
  *                                   ClickHouse session_brief_documents candidates, hydrated from the
- *                                   directory (READ_API_SUMMARY_SEARCH_ENABLED=true; otherwise 501)
+ *                                   directory (READ_API_SUMMARY_SEARCH_ENABLED=true; otherwise 501), or
+ *                                   the directory query alone (READ_API_SUMMARY_SEARCH_BACKEND=postgres)
  *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
@@ -119,6 +120,7 @@ import {
   summaryMatches,
   type SummaryCandidateRow,
 } from "./clickhouse/summary-search-query.ts";
+import { normalizeSummarySearchQ, searchSummariesPostgres } from "./postgres/summary-search.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
 import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
@@ -281,6 +283,12 @@ export interface ReadApiDeps {
    * true = 501 `summary_search_not_configured`; nothing else changes.
    */
   summarySearch?: boolean;
+  /**
+   * READ_API_SUMMARY_SEARCH_BACKEND=postgres (self-host service only): with summarySearch, the route
+   * reads the directory query instead of ClickHouse (postgres/summary-search.ts) and needs no
+   * ClickHouse binding. Absent: the ClickHouse path, byte for byte.
+   */
+  summarySearchBackend?: "postgres";
   /**
    * READ_API_SESSION_SOURCES_ENABLED=true (exactly "true"): GET /v1/sessions/:sessionId/sources
    * lists the harnesses holding a live pointer row for the session id (session-sources.ts).
@@ -1669,7 +1677,11 @@ export function createReadApi(deps: ReadApiDeps) {
    * published yet is missing from a normal 200. Same workspace attestation and canary as the
    * directory routes (after the flag check). No cursor: `truncated` says more candidates existed. Answers
    * `{ sessions: [<the /v1/sessions shape with shortSummary, shortSummaryGeneratedAt>], truncated }`.
-   * 501 `summary_search_not_configured` (flag off, or no ClickHouse binding),
+   * With summarySearchBackend "postgres" the candidates come from the directory query instead
+   * (postgres/summary-search.ts: one normalised phrase term, 3 meaningful characters to 200 code
+   * points or 400, at most SUMMARY_SEARCH_PG_MAX_PAGES directory pages, the same re-check and
+   * order); no ClickHouse binding is needed and no automatic fallback exists between the two.
+   * 501 `summary_search_not_configured` (flag off, or no ClickHouse binding on the ClickHouse backend),
    * `summary_search_schema_missing` (the owner-applied DDL is absent), `q_with_buffered` (an
    * owner-buffered workspace: buffered sessions have no search document).
    */
@@ -1677,7 +1689,7 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity = c.get("identity");
       // Flag first: flag off answers exactly the not-configured 501, whatever the query says.
-      if (deps.summarySearch !== true || !deps.ch) throw unsupported("summary_search_not_configured");
+      if (deps.summarySearch !== true || (deps.summarySearchBackend !== "postgres" && !deps.ch)) throw unsupported("summary_search_not_configured");
       attestWorkspace(c, identity);
       const directory = directoryFor(identity);
       for (const name of Object.keys(c.req.query())) if (!["workspace", "q", "limit"].includes(name)) throw unsupported(`param_${name}`);
@@ -1688,6 +1700,17 @@ export function createReadApi(deps: ReadApiDeps) {
       // Buffered rows have no search document: a q read never drops them silently (as GET /v1/sessions?q=).
       if (ownerBufferedFor(identity) !== undefined) throw unsupported("q_with_buffered");
       const limit = clampLimit(single(c, "limit"), SUMMARY_SEARCH_DEFAULT_LIMIT, SUMMARY_SEARCH_MAX_LIMIT);
+      if (deps.summarySearchBackend === "postgres") {
+        const phrase = normalizeSummarySearchQ(q);
+        if (!phrase.ok) throw bad(phrase.message);
+        const found = await searchSummariesPostgres(directory, identity, phrase.text, limit);
+        if (found === null) throw unsupported("directory_not_migrated");
+        const sessions = found.rows.map((row) => sessionFromDirectoryRow(row, { includeShortSummary: "recorded" }));
+        // Counts only: never the query, a session id or summary text. listed = directory rows scanned.
+        log({ route: c.req.routePath, reason: "summary_search_served", kind: "postgres", listed: found.scanned, count: sessions.length, status: 200, correlation_id: c.get("correlationId") });
+        return c.json({ sessions, truncated: found.truncated, correlationId: c.get("correlationId") });
+      }
+      if (!deps.ch) throw unsupported("summary_search_not_configured");
       const built = buildSummarySearchQuery(deps.ch.database, { orgId: identity.orgId, workspaceId: identity.workspaceId, q, limit });
       let candidates: SummaryCandidateRow[];
       try {
