@@ -880,6 +880,22 @@ export function inflightLeaseDeletionAllowed(
     proposedEnv?.INGEST_INFLIGHT_LEASE === undefined &&
     (live === "observe" || live === "on");
 }
+/**
+ * The only plan that may unbind INGEST_BUFFER_LOCK_BUSY (rollback to off): the candidate profile omits
+ * bufferLockBusy, no value is proposed, and the live value is exactly "on" (strict, no trim or case
+ * folding, as the private-ingest release guard reads it in private-ingest-release.ts). No other buffer or
+ * claim flag has an unbind: INGEST_BUFFER_LOCK_RETRY and INGEST_CLAIM_LOCK_BUSY stay refused.
+ */
+export function bufferLockBusyDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_BUFFER_LOCK_BUSY;
+  return sessionIngest.bufferLockBusy === undefined &&
+    proposedEnv?.INGEST_BUFFER_LOCK_BUSY === undefined &&
+    live === "on";
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -1040,6 +1056,11 @@ export function assertOperatorSnapshot(
             if (!inflightLeaseDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = currentEnv.INGEST_INFLIGHT_LEASE;
+          } else if (b.sid === "INGEST_BUFFER_LOCK_BUSY") {
+            // Rolling the buffer-stage lock-wait 429 back to off: only a strict live "on".
+            if (!bufferLockBusyDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_BUFFER_LOCK_BUSY;
           } else {
             refuse("native_binding_target");
           }

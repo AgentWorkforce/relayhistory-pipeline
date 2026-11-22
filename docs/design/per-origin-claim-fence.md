@@ -121,7 +121,10 @@ closed (`55000`), like any other caller. **Keep the flag off during any schema a
   missing-function bug is not masked. Every other error passes through unchanged.
 - Stack: `sessionIngest.originClaimFence: "on"` renders the var (buffered only). Production CI: a cutover control like
   the claim lock controls (`PRIVATE_INGEST_ORIGIN_CLAIM_FENCE` protected-environment variable →
-  `privateIngestCutoverFromEnv`), so a deploy may add or remove it at the live phase.
+  `privateIngestCutoverFromEnv`), so the release guard lets a deploy add it at the live phase. The variable accepts
+  only `on` or unset/empty, so no value keeps the binding with the flag off, and removing the rendered var has no
+  operator unbind today (the operator refuses the delete row with `native_binding_target`); removal needs a
+  separately reviewed operator change.
 
 ## 5. Release: generation overlap, then the flag
 
@@ -149,8 +152,10 @@ the 2026-11-13/16 outage. G is the live PASS generation, and H is the generation
 
 Rollback:
 
-- **Flag:** unset the variable and deploy. This restores the per-user path immediately, and the schema stays
-  compatible both ways.
+- **Flag:** removing the var restores the per-user path immediately, and the schema stays compatible both ways.
+  On the private-ingest release there is no operator unbind for `INGEST_ORIGIN_CLAIM_FENCE` today: unsetting the
+  variable produces a plan whose delete row the operator refuses (`native_binding_target`), so this rollback
+  needs a separately reviewed operator change that admits that unbind first, then unset the variable and deploy.
 - **Schema:** `supabase/rollbacks/20261105062010_ingest_origin_claim_fence.down.sql` (checksum-pinned, migrator
   lock, refuses while a later step is applied) restores `058010`'s exact `ingest_lock_fences` and drops the new
   objects. A flag-on Worker then falls back on `42883`.
