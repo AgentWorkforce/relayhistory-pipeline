@@ -3,14 +3,17 @@
  * over a recording Directory fake: the directory query alone finds the candidates (one normalised
  * phrase term, keyset pages of DIRECTORY_LIST_MAX_LIMIT rows, at most SUMMARY_SEARCH_PG_MAX_PAGES),
  * summaryMatches re-checks every row, every row is tenant-checked, and the page keeps the
- * ClickHouse path's shape and order. With the selector unset nothing changes. No database.
+ * ClickHouse path's shape and order. The fake returns rows in the directory query's own order
+ * (migration 20261105046010: last_activity_at DESC, session_id DESC, harness DESC), which differs
+ * from the ClickHouse order on ties. With the selector unset nothing changes. No database.
  */
 import { describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type ReadApiDeps, type VerifiedIdentity } from "../app.ts";
 import { DIRECTORY_LIST_MAX_LIMIT, type Directory, type DirectoryListRow, type DirectoryQueryArgs } from "../directory.ts";
 import type { ClickHouseClient } from "../../session-pipeline/vendor/search-index/clickhouse.ts";
 import {
-  compareSummaryRows, normalizeSummarySearchQ, SUMMARY_SEARCH_PG_MAX_PAGES, type SummarySearchPgRow,
+  normalizeSummarySearchQ, searchSummariesPostgres, SUMMARY_SEARCH_PG_BUDGET_MS, SUMMARY_SEARCH_PG_MAX_PAGES,
+  type SummarySearchPgRow,
 } from "../postgres/summary-search.ts";
 import { memoryLiveness } from "./support.ts";
 
@@ -34,7 +37,18 @@ function row(n: number, over: Partial<SummarySearchPgRow> = {}): SummarySearchPg
   };
 }
 
-/** Rows newest first, served as keyset pages of args.limit + 1 after args.cursor. */
+/**
+ * The directory query's ORDER BY (20261105046010 query_session_directory_for): last_activity_at DESC,
+ * session_id DESC, harness DESC, with the keyset (last_activity_at, session_id, harness) < cursor.
+ */
+function compareDirectoryRows(a: SummarySearchPgRow, b: SummarySearchPgRow): number {
+  if (a.cursor_ts !== b.cursor_ts) return a.cursor_ts < b.cursor_ts ? 1 : -1;
+  if (a.session_id !== b.session_id) return a.session_id < b.session_id ? 1 : -1;
+  if (a.harness !== b.harness) return a.harness < b.harness ? 1 : -1;
+  return 0;
+}
+
+/** Rows in the directory query's order, served as keyset pages of args.limit + 1 after args.cursor. */
 function fakeDirectory(all: SummarySearchPgRow[] | null) {
   const queries: Array<{ orgId: string; workspaceId: string; args: DirectoryQueryArgs }> = [];
   const lists: unknown[] = [];
@@ -44,8 +58,8 @@ function fakeDirectory(all: SummarySearchPgRow[] | null) {
     async query(orgId, workspaceId, args) {
       queries.push({ orgId, workspaceId, args });
       if (all === null) return null;
-      const sorted = [...all].sort(compareSummaryRows);
-      const from = args.cursor ? sorted.findIndex((r) => compareSummaryRows(r, {
+      const sorted = [...all].sort(compareDirectoryRows);
+      const from = args.cursor ? sorted.findIndex((r) => compareDirectoryRows(r, {
         ...r, cursor_ts: args.cursor!.lastActivityAt, harness: args.cursor!.harness, session_id: args.cursor!.sessionId,
       }) > 0) : 0;
       return from < 0 ? [] : sorted.slice(from, from + args.limit + 1);
@@ -205,7 +219,7 @@ describe("postgres backend", () => {
     expect(b).toMatchObject({ sessions: [], truncated: true });
     expect(queries).toHaveLength(SUMMARY_SEARCH_PG_MAX_PAGES);
     // Keyset: each page continues after the previous page's last visible row.
-    const sorted = [...all].sort(compareSummaryRows);
+    const sorted = [...all].sort(compareDirectoryRows);
     expect(queries.map((q) => q.args.cursor)).toEqual([undefined, 1, 2].map((p) => p === undefined ? undefined : {
       lastActivityAt: sorted[p * DIRECTORY_LIST_MAX_LIMIT - 1]!.cursor_ts, sessionId: sorted[p * DIRECTORY_LIST_MAX_LIMIT - 1]!.session_id, harness: "codex",
     }));
@@ -275,6 +289,109 @@ describe("postgres backend", () => {
     expect((await json(await api({ summarySearch: true, backend: "postgres", directory })(path("erasure")))).error.reason).toBe("directory_not_migrated");
     const failing: Directory = { ...fakeDirectory([]).directory, async query() { throw new Error("connection reset"); } };
     expect((await api({ summarySearch: true, backend: "postgres", directory: failing })(path("erasure"))).status).toBe(503);
+  });
+});
+
+/** Answers the i-th directory query with pages[i] (nothing after the last), whatever the cursor. */
+function pagedDirectory(pages: SummarySearchPgRow[][]) {
+  const queries: DirectoryQueryArgs[] = [];
+  const directory: Directory = {
+    ...fakeDirectory([]).directory,
+    async query(_orgId, _workspaceId, args) { queries.push(args); return pages[queries.length - 1] ?? []; },
+  };
+  return { directory, queries };
+}
+/** `count` rows, newest first from `from`, that match no title or summary. */
+const filler = (count: number, from: number) => Array.from({ length: count }, (_, i) => row(from - i, { title: "x", short_summary: "y" }));
+
+describe("postgres backend: pages, order, tenant and logs", () => {
+  test("the served page is in the ClickHouse order, not the directory query's order", async () => {
+    // One activity time: the directory orders session_id DESC first, ClickHouse source DESC first.
+    const { directory } = fakeDirectory([
+      row(7, { harness: "claude", session_id: "s9" }),
+      row(7, { harness: "codex", session_id: "s1" }),
+      row(8, { harness: "claude", session_id: "s0" }),
+      row(7, { harness: "claude", session_id: "s5" }),
+    ]);
+    const answered = await directory.query("org-s", "ws-s", { limit: DIRECTORY_LIST_MAX_LIMIT } as DirectoryQueryArgs);
+    expect(answered!.map((r) => `${r.harness}:${r.session_id}`)).toEqual(["claude:s0", "claude:s9", "claude:s5", "codex:s1"]);
+    const b = await json(await api({ summarySearch: true, backend: "postgres", directory })(path("erasure", "&limit=10")));
+    expect(keys(b)).toEqual(["claude:s0", "codex:s1", "claude:s9", "claude:s5"]);
+  });
+
+  test("a session returned again on a later page is served and counted once", async () => {
+    const dup = row(9000, { harness: "claude", session_id: "s-dup" });
+    // Page 1: the match, 199 non-matching rows and the extra row; page 2 (short): the same session again and one more match.
+    const { directory, queries } = pagedDirectory([[dup, ...filler(DIRECTORY_LIST_MAX_LIMIT, 8999)], [{ ...dup }, row(10)]]);
+    const logs: Array<Record<string, unknown>> = [];
+    const b = await json(await api({ summarySearch: true, backend: "postgres", directory, logs })(path("erasure", "&limit=10")));
+    expect(keys(b)).toEqual(["claude:s-dup", "codex:s10"]);
+    expect(b.truncated).toBe(false);
+    expect(queries).toHaveLength(2);
+    expect(logs.find((l) => l.reason === "summary_search_served")).toMatchObject({ listed: DIRECTORY_LIST_MAX_LIMIT + 1, count: 2 });
+  });
+
+  // A foreign row anywhere in a page is a 500, never served: the route checks every row a page returns.
+  async function expectRefused(pages: SummarySearchPgRow[][], limit: number, calls: number) {
+    const logs: Array<Record<string, unknown>> = [];
+    const { directory, queries } = pagedDirectory(pages);
+    const r = await api({ summarySearch: true, backend: "postgres", directory, logs })(path("erasure", `&limit=${limit}`));
+    expect(r.status).toBe(500);
+    expect(JSON.stringify(await json(r))).not.toContain("erasure race");
+    expect(logs.filter((l) => l.reason === "cross_tenant_rows")).toHaveLength(1);
+    expect(logs.some((l) => l.reason === "summary_search_served")).toBe(false);
+    expect(queries).toHaveLength(calls);
+  }
+
+  test("a foreign row in a page's extra (limit + 1) position is refused, never served", async () => {
+    for (const over of [{ org_id: "org-other" }, { workspace_id: "ws-other" }]) {
+      // 200 visible matches (limit 1 also stops the scan early), then the foreign row.
+      await expectRefused([[...Array.from({ length: DIRECTORY_LIST_MAX_LIMIT }, (_, i) => row(9000 - i)), row(1, over)]], 1, 1);
+    }
+  });
+
+  test("a foreign row on a later page is refused, never served", async () => {
+    for (const over of [{ org_id: "org-other" }, { workspace_id: "ws-other" }]) {
+      // A full first page of non-matching rows, then the foreign row on page 2.
+      await expectRefused([filler(DIRECTORY_LIST_MAX_LIMIT + 1, 9000), [row(5), row(4, over)]], 20, 2);
+    }
+  });
+
+  test("no log line carries the query in any letter case, a session id, a title or summary text", async () => {
+    const rows = [
+      row(30, { session_id: "probe-sid-alpha", title: "Quartz Erasure ledger", short_summary: "Probe summary text one" }),
+      row(20, { session_id: "probe-sid-bravo", title: "x", short_summary: "Second probe summary, quartz erasure" }),
+      row(10, { session_id: "probe-sid-charlie", title: "other", short_summary: "Unrelated probe summary", git_branch: "quartz-erasure" }),
+    ];
+    const rawQ = "  qUaRtZ   ERASURE ";
+    const logs: Array<Record<string, unknown>> = [];
+    const served = await api({ summarySearch: true, backend: "postgres", directory: fakeDirectory(rows).directory, logs })(path(rawQ));
+    expect(keys(await json(served))).toEqual(["codex:probe-sid-alpha", "codex:probe-sid-bravo"]);
+    const foreign = fakeDirectory([...rows, row(5, { session_id: "probe-sid-delta", workspace_id: "ws-other", short_summary: "Foreign probe summary" })]).directory;
+    expect((await api({ summarySearch: true, backend: "postgres", directory: foreign, logs })(path(rawQ))).status).toBe(500);
+    const failing: Directory = { ...fakeDirectory([]).directory, async query() { throw new Error("connection reset"); } };
+    expect((await api({ summarySearch: true, backend: "postgres", directory: failing, logs })(path(rawQ))).status).toBe(503);
+    expect(logs.map((l) => l.reason)).toEqual(expect.arrayContaining(["summary_search_served", "cross_tenant_rows"]));
+    const text = JSON.stringify(logs).toLowerCase();
+    const needles = [rawQ, rawQ.trim(), "quartz erasure", "quartz", "erasure", "probe-sid", "probe summary", "foreign probe", "ledger",
+      ...rows.flatMap((r) => [r.session_id, r.title!, r.short_summary!])];
+    for (const needle of needles) expect(text).not.toContain(needle.toLowerCase());
+  });
+});
+
+describe("postgres backend: time budget", () => {
+  test(`no further directory page starts once ${SUMMARY_SEARCH_PG_BUDGET_MS} ms have passed since the first query started; truncated`, async () => {
+    expect(SUMMARY_SEARCH_PG_BUDGET_MS).toBe(2000);
+    const all = filler(DIRECTORY_LIST_MAX_LIMIT * 4, 9000);
+    // Clock readings: when the first query starts, then before each later page.
+    for (const [ticks, pages] of [[[0, 1999, 2000], 2], [[0, 2000], 1], [[0, 0, 0], SUMMARY_SEARCH_PG_MAX_PAGES]] as const) {
+      const { directory, queries } = fakeDirectory(all);
+      const clock = [...ticks];
+      let last = 0;
+      const now = () => (last = clock.length > 0 ? clock.shift()! : last);
+      const found = await searchSummariesPostgres(directory, { orgId: "org-s", workspaceId: "ws-s" }, "erasure", 20, now);
+      expect([ticks, queries.length, found!.truncated, found!.scanned, found!.rows.length]).toEqual([ticks, pages, true, pages * DIRECTORY_LIST_MAX_LIMIT, 0]);
+    }
   });
 });
 

@@ -90,11 +90,28 @@ automatic fallback between the backends. No migration, index or grant is added.
 - `search_text` also holds task title, agent, project, repo, branch and model, and can be stale,
   so every row is re-checked with the same `summaryMatches` as the ClickHouse path. Only rows
   whose current title or short summary contains `q` are served; the re-check can drop rows,
-  never add them.
+  never add them. A session returned again on a later page is served and counted once.
+- The re-check compares the normalised `q` with the raw title and short summary. `search_text`
+  is not normalised either: `sessions.session_directory_search_text` (migration
+  `20261030020000`) joins the trimmed raw fields with single spaces. So a title holding a
+  no-break space, a tab or a run of spaces where `q` has one space is not found through either
+  step; normalising only the re-check would serve such a title only when some other field
+  happened to match the SQL term, so it is not done.
+- Inputs that behave differently from the ClickHouse path, which matches `q` as given after
+  trimming its ends and lower-casing: inside `q`, a tab, a no-break space or a run of spaces
+  becomes one space, and a zero-width space or other format character is removed, before
+  matching; `q` needs 3 visible characters, so `a b` answers 400 here while the ClickHouse path
+  accepts it.
 - Bounded and best-effort: keyset pages of 200 rows, newest activity first, at most 3 pages
-  (600 rows) per request, stopping once `limit + 1` matches are found. When many recent rows
-  match `q` only through another field, the page can hold fewer than `limit` sessions, even
-  none, with `truncated: true`; older matches past the scan are missed.
+  per request, stopping once `limit + 1` matches are found, and no further page starts once
+  `SUMMARY_SEARCH_PG_BUDGET_MS` (2000 ms) have passed since the first query started. The page
+  bound is on rows returned per page; the database may read more rows to find them. Each
+  statement is bounded by the read pool's statement timeout (`statement_timeout` 2000 ms on the
+  pool in `src/session-read-api/lambda.ts` `readApiDepsFromSecret`, matching the read role's
+  pinned `READER_SETTINGS`), so the page budget and the time budget together bound the
+  request. Past either budget the page can hold fewer than `limit` sessions, even none, with
+  `truncated: true`; older matches past the scan are missed, as they are when many recent rows
+  match `q` only through another field.
 - Same response shape, attestation, canary, buffered 501 and tenant check as the ClickHouse
   path; the page is ordered last activity DESC, source DESC, session_id DESC. Which rows fill
   the page at the truncation edge can differ from ClickHouse on identical activity timestamps.
