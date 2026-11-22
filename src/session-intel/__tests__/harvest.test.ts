@@ -849,11 +849,14 @@ describe("server-supplied keys never hit inherited properties", () => {
 
 describe("a retryable session_partial 503", () => {
   /** A client whose fetch answers `answers` in turn (the last repeats) and records every sleep. */
-  function client503(answers: Response[]) {
+  function client503(answers: (Response | (() => Response))[], maxResponseBytes?: number) {
     let i = 0;
     const sleeps: number[] = [];
-    const f = (async () => answers[Math.min(i++, answers.length - 1)]!.clone()) as unknown as typeof fetch;
-    const c = new ReadApiClient({ base: parseReadApi("https://read.example.test"), token: TOKEN, workspace: WS, maxRequests: 100, concurrency: 1, fetch: f, sleep: async (ms) => { sleeps.push(ms); } });
+    const f = (async () => {
+      const a = answers[Math.min(i++, answers.length - 1)]!;
+      return typeof a === "function" ? a() : a.clone();
+    }) as unknown as typeof fetch;
+    const c = new ReadApiClient({ base: parseReadApi("https://read.example.test"), token: TOKEN, workspace: WS, maxRequests: 100, concurrency: 1, fetch: f, sleep: async (ms) => { sleeps.push(ms); }, maxResponseBytes });
     return { c, sleeps, calls: () => i };
   }
   const partial = () => Response.json(
@@ -890,5 +893,27 @@ describe("a retryable session_partial 503", () => {
       await expect(c.get("/v1/sessions/:sessionId/events", [], "fx-h-a")).rejects.toThrow("stayed unavailable (503) after 6 attempts");
       expect(calls()).toBe(6);
     }
+  });
+
+  test("a 503 whose body cannot be read keeps the full retry budget too", async () => {
+    // The body stream errors mid-read.
+    const broken = () => new Response(new ReadableStream({
+      start(ctl) { ctl.enqueue(new TextEncoder().encode('{"error":')); ctl.error(new Error("reset")); },
+    }), { status: 503 });
+    // A declared Content-Length over maxResponseBytes.
+    const big = () => new Response(JSON.stringify({ error: { reason: "session_partial", pad: "x".repeat(64) } }),
+      { status: 503, headers: { "content-length": "4096" } });
+    for (const [answer, max] of [[broken, undefined], [big, 128]] as const) {
+      const { c, calls } = client503([answer], max);
+      await expect(c.get("/v1/sessions/:sessionId/events", [], "fx-h-a")).rejects.toThrow("stayed unavailable (503) after 6 attempts");
+      expect(calls()).toBe(6);
+    }
+  });
+
+  test("with a Retry-After over the bound fails on the first answer", async () => {
+    const slow = Response.json({ error: { code: "backend_unavailable", reason: "session_partial" } }, { status: 503, headers: { "retry-after": "3600" } });
+    const { c, calls } = client503([slow]);
+    await expect(c.get("/v1/sessions/:sessionId/events", [], "fx-h-a")).rejects.toThrow("asked to wait 3600s");
+    expect(calls()).toBe(1);
   });
 });
