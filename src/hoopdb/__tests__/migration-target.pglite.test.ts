@@ -1114,8 +1114,8 @@ test("real tree: after the full tree including 062210, the T2 flip and gate func
   const flip = "sessions.lazy_ack_t2_set_mode(text)", gateFn = "sessions.lazy_ack_t2_set_gate(text)";
   for (const fn of [flip, gateFn]) { expect(RUNTIME_APPLICATION_FUNCTIONS).not.toContain(fn); expect(CONSUMER_RUNTIME_FUNCTIONS).not.toContain(fn); }
   expect((await s.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid='sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure")).rows[0]!.c)
-    .toContain("bulls96.lazy_ack_t2=off");
-  expect((await s.db.query<{ mode: string }>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+    .toEqual(["search_path=pg_catalog, pg_temp"]);
+  expect((await s.db.query<{ gate: string; mode: string }>("SELECT gate,mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ gate: "off", mode: "main" }]);
   const c = client(s.db);
   expect(await sessionsFunctionAclDrift(c, "history_rt")).toEqual([]);
   for (const fn of [flip, gateFn]) for (const role of ["bulls96_session_ingest", "service_role"]) {

@@ -1,9 +1,8 @@
 /**
  * 20261105062210_lazy_ack_t2, differential equality (PGlite; every migration incl. 062210).
  *
- * sessions.ingest_lazy_ack_batch selects its body from the function-local gate bulls96.lazy_ack_t2 (installed 'off':
- * main's 043800 body, no table read) and, when the gate is 'fenced', from the owner-only row sessions.lazy_ack_t2_mode
- * ('main' installed | 't2'). T2 takes the clock FOR KEY SHARE, plans under the slot locks, then upgrades to FOR NO KEY
+ * sessions.ingest_lazy_ack_batch selects its body from the owner-only singleton row sessions.lazy_ack_t2_mode(gate, mode)
+ * (installed off/main: main's 043800 body plus one singleton read); T2 runs only for fenced/t2. T2 takes the clock FOR KEY SHARE, plans under the slot locks, then upgrades to FOR NO KEY
  * UPDATE for the seat numbers and writes (062155's set body). Each case builds one state with a real staged delivery
  * (claim and stage committed, the commit payload captured), then runs the SAME commit from the SAME state three times:
  * gate off (main), fenced + mode 'main', fenced + mode 't2', each in its own transaction that is rolled back
@@ -95,14 +94,40 @@ type Outcome = { ok: true; result: unknown } | { ok: false; code: string; messag
 type Run = { out: Outcome; snap: Record<string, unknown>; triggerCalls: number; gate: string[] };
 
 type Mode = "off" | "fenced-main" | "t2";
-const GATE = "bulls96.lazy_ack_t2";
+/** The exact gate read 062210 inserts after the suppressed return (pinned by the byte-identity test). */
+const GATE_READ = ` -- 062210 gate row, read once: after ingest_lock_fences (which took (961996,50000) SHARED, held to transaction end, so
+ -- no gate or mode change can commit from here on) and after the suppressed return, before the clock lock is chosen.
+ -- READ COMMITTED: a plain read; its snapshot is taken now, after 50000, so it is current. Otherwise the transaction
+ -- snapshot may predate a committed change: FOR SHARE conflicts with the setters' UPDATE, so a replaced version gives
+ -- 40001 (FOR KEY SHARE would not: non-key update); a current 'fenced' row is refused, a current 'off' row runs main.
+ IF current_setting('transaction_isolation')='read committed' THEN
+  SELECT m.gate,m.mode INTO v_gate,v_mode FROM sessions.lazy_ack_t2_mode m WHERE m.singleton;
+ ELSE
+  SELECT m.gate,m.mode INTO v_gate,v_mode FROM sessions.lazy_ack_t2_mode m WHERE m.singleton FOR SHARE;
+ END IF;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: the T2 gate row is missing';END IF;
+ IF v_gate<>'off' AND current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest: the fenced staged ACK requires read committed';END IF;
+ v_t2:=v_gate='fenced' AND v_mode='t2';
+`;
+const gateRow = async (f: Fixture) => (await f.db.query<{ gate: string; mode: string }>("SELECT gate,mode FROM sessions.lazy_ack_t2_mode")).rows;
+/** The supported path to a row state (owner, READ COMMITTED, one statement each): mode main first, then the gate, then the mode. */
+async function setRow(f: Fixture, gate: "off" | "fenced", mode: "main" | "t2") {
+  await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
+  await f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [gate]);
+  await f.db.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [mode]);
+}
 async function runMode(f: Fixture, mode: Mode, payload: string, setup: (f: Fixture) => Promise<unknown>, seqs: Array<{ s: string; v: string | null; start: string }>, sql = COMMIT): Promise<Run> {
   for (const q of seqs) await f.db.query("SELECT setval($1::regclass,$2::bigint,$3)", [q.s, q.v ?? q.start, q.v !== null]);
   await f.db.exec("BEGIN");
   try {
-    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${mode === "off" ? "off" : "fenced"}';SET LOCAL track_functions='pl'`);
-    if (mode !== "off") expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode($1) old", [mode === "t2" ? "t2" : "main"])).rows[0].old).toBe("main");
-    const gate = (await f.db.query<{ c: string[] }>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0]!.c;
+    await f.db.exec("SET LOCAL track_functions='pl'");
+    if (mode !== "off") {
+      expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') old")).rows[0].old).toBe("off");
+      expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode($1) old", [mode === "t2" ? "t2" : "main"])).rows[0].old).toBe("main");
+    }
+    const g = (await gateRow(f))[0]!;
+    const gate = [g.gate, g.mode];
     await setup(f);
     const calls = async () => Number((await f.db.query<{ n: string }>("SELECT coalesce((SELECT calls FROM pg_stat_xact_user_functions WHERE schemaname='sessions' AND funcname='ingest_history_native_changed'),0)::text n")).rows[0]!.n);
     const before = await calls();
@@ -137,9 +162,9 @@ async function both(f: Fixture, payload: string, setup: (f: Fixture) => Promise<
     const off = await runMode(f, "off", payload, withSwitch, seqs, sql);
     const fmain = await runMode(f, "fenced-main", payload, withSwitch, seqs, sql);
     const on = await runMode(f, "t2", payload, withSwitch, seqs, sql);
-    expect(off.gate).toContain(GATE + "=off");
-    expect(fmain.gate).toContain(GATE + "=fenced");
-    expect(on.gate).toContain(GATE + "=fenced");
+    expect(off.gate).toEqual(["off", "main"]);
+    expect(fmain.gate).toEqual(["fenced", "main"]);
+    expect(on.gate).toEqual(["fenced", "t2"]);
     for (const [name, r] of [["fenced-main", fmain], ["t2", on]] as const) {
       expect({ live, name, out: r.out }).toEqual({ live, name, out: off.out });
       for (const t of Object.keys(off.snap)) expect({ live, name, t, rows: r.snap[t] }).toEqual({ live, name, t, rows: off.snap[t] });
@@ -172,148 +197,224 @@ async function bodyCalls(f: Fixture, tag: string, prelude: string, form?: string
     const before = await n();
     expect(((await f.db.query<any>(COMMIT, [c.payload])).rows[0].r).kind).toBe("committed");
     return (await n()) - before;
-  } finally { await f.db.exec("ROLLBACK"); if (form) await f.db.exec(`RESET ${GATE}`); }
+  } finally { await f.db.exec("ROLLBACK"); }
 }
 
-describe("062210 installs the gate off, the mode 'main', and keeps the 043800 contract", () => {
-  test("proconfig pins the gate 'off'; mode row 'main'; owner-only table and flip function; SECURITY INVOKER", async () => {
+describe("062210 installs the gate row off/main, and keeps the 043800 contract", () => {
+  test("no function-level gate: proconfig is search_path only; row off/main; owner-only table, setters and keep trigger; SECURITY INVOKER", async () => {
     const f = await fixture();
     const p = (await f.db.query<any>("SELECT proconfig,prosecdef FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0];
-    expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp", GATE + "=off"]);
+    expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp"]);
     expect(p.prosecdef).toBe(false);
-    expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
+    // Logical key and cardinality: the boolean singleton PK with CHECK(singleton); the two-column CHECK; DELETE/TRUNCATE refused.
+    const cons = (await f.db.query<any>("SELECT conname,contype,pg_get_constraintdef(oid) d FROM pg_constraint WHERE conrelid='sessions.lazy_ack_t2_mode'::regclass AND contype IN('p','c','u','f','x') ORDER BY conname")).rows;
+    expect(cons.map((c: any) => [c.contype, c.d])).toEqual(expect.arrayContaining([["p", "PRIMARY KEY (singleton)"], ["c", "CHECK (singleton)"],
+      ["c", "CHECK ((mode = ANY (ARRAY['main'::text, 't2'::text])))"], ["c", "CHECK ((gate = ANY (ARRAY['off'::text, 'fenced'::text])))"],
+      ["c", "CHECK (((mode = 'main'::text) OR (gate = 'fenced'::text)))"]]));
+    expect(cons.length).toBe(5);
+    expect((await f.db.query<any>("SELECT tgname,tgtype FROM pg_trigger WHERE tgrelid='sessions.lazy_ack_t2_mode'::regclass AND NOT tgisinternal ORDER BY 1")).rows.map((r: any) => r.tgname))
+      .toEqual(["lazy_ack_t2_mode_keep_row", "lazy_ack_t2_mode_no_truncate"]);
     const priv = (await f.db.query<any>(`SELECT r.rolname,
         has_table_privilege(r.oid,'sessions.lazy_ack_t2_mode','SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') t,
-        has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_mode(text)','EXECUTE') OR has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_gate(text)','EXECUTE') x
+        has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_mode(text)','EXECUTE') OR has_function_privilege(r.oid,'sessions.lazy_ack_t2_set_gate(text)','EXECUTE')
+         OR has_function_privilege(r.oid,'sessions.lazy_ack_t2_mode_keep()','EXECUTE') x
       FROM pg_roles r WHERE r.rolname IN('bulls96_session_ingest','bulls96_session_ingest_seeder','anon','authenticated','service_role') ORDER BY 1`)).rows;
     expect(priv.length).toBeGreaterThan(0);
     for (const r of priv) expect(r).toEqual({ rolname: r.rolname, t: false, x: false });
-    const sm = (await f.db.query<any>("SELECT prosecdef,proconfig FROM pg_proc WHERE oid='sessions.lazy_ack_t2_set_mode(text)'::regprocedure")).rows[0];
-    expect(sm).toEqual({ prosecdef: false, proconfig: ["search_path=pg_catalog, pg_temp"] });
-    expect((await f.db.query<any>("SELECT relrowsecurity FROM pg_class WHERE oid='sessions.lazy_ack_t2_mode'::regclass")).rows[0].relrowsecurity).toBe(true);
+    for (const fn of ["sessions.lazy_ack_t2_set_mode(text)", "sessions.lazy_ack_t2_set_gate(text)", "sessions.lazy_ack_t2_mode_keep()"])
+      expect((await f.db.query<any>("SELECT prosecdef,proconfig FROM pg_proc WHERE oid=$1::regprocedure", [fn])).rows[0]).toEqual({ prosecdef: false, proconfig: ["search_path=pg_catalog, pg_temp"] });
+    expect((await f.db.query<any>("SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='sessions.lazy_ack_t2_mode'::regclass")).rows[0]).toEqual({ relrowsecurity: true, relforcerowsecurity: false });
+    // No function in the sessions schema carries any bulls96.* setting.
+    expect((await f.db.query<any>("SELECT count(*)::int n FROM pg_proc p,unnest(p.proconfig) c WHERE c LIKE 'bulls96.%'")).rows[0].n).toBe(0);
   });
-  test("with every T2 addition removed, the installed body is 043800's body byte for byte", async () => {
+  test("with every T2 addition removed, the installed body is 043800's body byte for byte; the one gate read is pinned exactly", async () => {
+    // What this pins (it replaced r3's "gate off = same bytes, no read"): the installed body is 043800's body plus exactly
+    // (1) the extended DECLARE line, (2) GATE_READ below, inserted right after the suppressed return and before the clock,
+    // and (3) the two IF NOT v_t2 ... ELSE <T2> END IF branches. So with gate 'off' the statements that run are 043800's
+    // plus GATE_READ: one singleton read (READ COMMITTED: plain, AccessShareLock on the table only; otherwise FOR SHARE on
+    // the row) and the isolation checks. Outputs, first errors, rows and sequences are the differential suites' claim.
     const f = await fixture();
     const { readFileSync } = await import("node:fs");
     const installed = (await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].prosrc as string;
     expect(installed).toBe(ackBody(readFileSync(MIG, "utf8")));
+    expect(installed.split(GATE_READ).length - 1).toBe(1);
     let x = installed.replace(/\n v_t2 boolean;[^\n]*/, "");
-    x = x.replace(/ -- 062210 gate[\s\S]*?ELSE v_t2:=false;END IF;\n/, "");
+    x = x.replace(GATE_READ, "");
     x = x.replace(/ IF NOT v_t2 THEN\n( SELECT \* INTO STRICT c FROM sessions\.ingest_receipt_seat_clock WHERE singleton FOR NO KEY UPDATE;v_last:=c\.last_seat;\n) ELSE\n[\s\S]*?\n END IF;\n/, "$1");
     x = x.replace(" IF NOT v_t2 THEN\n FOR r IN", " FOR r IN");
     x = x.replace(/( END LOOP;\n) ELSE\n[\s\S]*\n END IF;\n( UPDATE sessions\.ingest_receipt_seat_clock SET last_seat=v_last)/, "$1$2");
     expect(x).toBe(ackBody(readFileSync(MAIN_MIG, "utf8")));
   });
-  test("statement order: fences (barrier) -> gate -> RC check -> mode read -> clock; T2: KEY SHARE, then the upgrade reads last_seat", async () => {
+  test("the suppressed path is 043800's text: everything from BEGIN through the suppressed RETURN is identical in both bodies (guard, fences, seal, clock KEY SHARE, return), and no gate read precedes it", async () => {
+    const { readFileSync } = await import("node:fs");
+    const upToSuppressed = (body: string) => {
+      const b = body.indexOf("\nBEGIN\n"), r = body.indexOf("FOR KEY SHARE;RETURN;END IF;\n");
+      expect(b > -1 && r > b).toBe(true);
+      return body.slice(b, r + "FOR KEY SHARE;RETURN;END IF;\n".length);
+    };
+    const t2 = upToSuppressed(ackBody(readFileSync(MIG, "utf8"))), main = upToSuppressed(ackBody(readFileSync(MAIN_MIG, "utf8")));
+    expect(t2).toBe(main);
+    expect(t2).toContain("IF p->>'buffer_receipt_kind'='suppressed' THEN\n  PERFORM 1 FROM sessions.ingest_receipt_seat_clock WHERE singleton FOR KEY SHARE;RETURN;END IF;");
+    expect(t2).not.toContain("lazy_ack_t2_mode");
+    expect(t2).not.toContain("transaction_isolation");
+  });
+  test("statement order: fences (barrier) -> suppressed return -> gate row read -> isolation check -> clock; T2: KEY SHARE, then the upgrade reads last_seat", async () => {
     const f = await fixture();
     const src = (await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].prosrc as string;
     const at = (s: string, from = 0) => { const i = src.indexOf(s, from); expect({ s, i: i > -1 }).toEqual({ s, i: true }); return i; };
-    const fences = at("PERFORM sessions.ingest_lock_fences("), gate = at("current_setting('bulls96.lazy_ack_t2',true) IS NOT DISTINCT FROM 'fenced'");
-    const rc = at("current_setting('transaction_isolation')<>'read committed'"), mode = at("FROM sessions.lazy_ack_t2_mode m WHERE m.singleton;");
+    const fences = at("PERFORM sessions.ingest_lock_fences("), supp = at("IF p->>'buffer_receipt_kind'='suppressed' THEN");
+    const rcRead = at("FROM sessions.lazy_ack_t2_mode m WHERE m.singleton;"), rrRead = at("FROM sessions.lazy_ack_t2_mode m WHERE m.singleton FOR SHARE;");
+    const missing = at("the T2 gate row is missing"), iso = at("the fenced staged ACK requires read committed");
     const ks = at("WHERE singleton FOR KEY SHARE;\n END IF;"), up = at("SELECT ck.last_seat INTO STRICT v_last FROM sessions.ingest_receipt_seat_clock ck WHERE ck.singleton FOR NO KEY UPDATE;");
-    expect(fences < gate && gate < rc && rc < mode && mode < ks && ks < up).toBe(true);
-    expect(src.split("current_setting(").length - 1).toBe(2);
-    expect(src.split("lazy_ack_t2_mode").length - 1).toBe(1);
-    // The T2 branch never reads last_seat before its upgrade (the KEY SHARE row variable is used only for identity columns).
+    expect(fences < supp && supp < rcRead && rcRead < rrRead && rrRead < missing && missing < iso && iso < ks && ks < up).toBe(true);
+    expect(src.split("lazy_ack_t2_mode").length - 1).toBe(2); // the two read forms, one executed per call
+    expect(src).not.toMatch(/FOR KEY SHARE[^;]*lazy_ack_t2_mode|lazy_ack_t2_mode[^;]*FOR KEY SHARE/);
+    expect(src).not.toContain("bulls96.");
     const t2 = src.slice(src.indexOf(" ELSE\n  -- (A)")).replace(/--[^\n]*/g, "");
     expect(t2.indexOf("last_seat")).toBe(t2.indexOf("ck.last_seat") + 3);
     expect(t2.slice(0, t2.indexOf("ck.last_seat"))).not.toContain("c.last_seat");
   });
-  test("the runtime role cannot select T2: ALTER FUNCTION, the flip function and the mode table are refused; session values are overridden", async () => {
+  test("the runtime role takes the normal ACK path; direct table access and the setters are refused (42501); a session value of the old parameter selects nothing", async () => {
     const f = await fixture();
-    for (const stmt of [`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`, "SELECT sessions.lazy_ack_t2_set_mode('t2')", "SELECT sessions.lazy_ack_t2_set_gate('fenced')", "UPDATE sessions.lazy_ack_t2_mode SET mode='t2'",
-      "SELECT mode FROM sessions.lazy_ack_t2_mode", "INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'t2')",
-      // No runtime lock on the mode row in any mode: only the flip (after its 50000 try-lock) can lock it.
+    for (const stmt of ["SELECT sessions.lazy_ack_t2_set_mode('t2')", "SELECT sessions.lazy_ack_t2_set_gate('fenced')", "SELECT sessions.lazy_ack_t2_mode_keep()",
+      "UPDATE sessions.lazy_ack_t2_mode SET mode='t2'", "UPDATE sessions.lazy_ack_t2_mode SET gate='fenced'",
+      "SELECT mode FROM sessions.lazy_ack_t2_mode", "INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'t2','fenced')",
       "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR UPDATE", "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR NO KEY UPDATE",
       "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR SHARE", "SELECT 1 FROM sessions.lazy_ack_t2_mode FOR KEY SHARE",
-      "LOCK TABLE sessions.lazy_ack_t2_mode IN ACCESS SHARE MODE", "DELETE FROM sessions.lazy_ack_t2_mode", "TRUNCATE sessions.lazy_ack_t2_mode"]) {
+      "LOCK TABLE sessions.lazy_ack_t2_mode IN ACCESS SHARE MODE", "DELETE FROM sessions.lazy_ack_t2_mode", "TRUNCATE sessions.lazy_ack_t2_mode",
+      `ALTER FUNCTION ${ACK} SET search_path=public`]) {
       await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
       try { await expect(f.db.exec(stmt)).rejects.toMatchObject({ code: "42501" }); } finally { await f.db.exec("ROLLBACK"); }
     }
-    // Mode 't2' committed by the owner (under the fenced gate), then the gate set 'off' (the operator never does that while
-    // the row says 't2'; here it isolates the override): session/local values cannot select the fenced body.
-    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`);
-    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main");
-    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='off'`);
-    try {
-      for (const form of [`SET LOCAL ${GATE}='fenced'`, `SELECT set_config('${GATE}','fenced',true)`, `SELECT set_config('${GATE}','fenced',false)`])
-        expect({ form, calls: await bodyCalls(f, "s" + form.length, "SELECT 1", form) }).toEqual({ form, calls: 2 });
-    } finally { await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')"); }
+    // The normal path (runtime role, SECURITY DEFINER commit entry point) commits with the row off/main and fenced/t2.
+    expect(await bodyCalls(f, "rt0", "SELECT 1")).toBe(2);
+    expect(await bodyCalls(f, "rt1", "SELECT sessions.lazy_ack_t2_set_gate('fenced');SELECT sessions.lazy_ack_t2_set_mode('t2')")).toBe(1);
+    for (const form of [`SET LOCAL bulls96.lazy_ack_t2='fenced'`, `SELECT set_config('bulls96.lazy_ack_t2','fenced',true)`])
+      expect({ form, calls: await bodyCalls(f, "s" + form.length, "SELECT 1", form) }).toEqual({ form, calls: 2 });
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
   });
-  test("body selection: only gate exactly 'fenced' AND mode 't2' runs T2", async () => {
+  test("body selection: only the row fenced/t2 runs T2; the row can never say off/t2", async () => {
     const f = await fixture();
-    const alter = (v: string) => `ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`;
-    expect(await bodyCalls(f, "m0", alter("off"))).toBe(2);
-    expect(await bodyCalls(f, "m1", alter("fenced"))).toBe(2); // mode 'main'
-    expect(await bodyCalls(f, "m2", `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2');${alter("off")}`)).toBe(2); // gate off ignores the row
-    expect(await bodyCalls(f, "m3", `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2')`)).toBe(1);
-    for (const v of ["FENCED", "on", "t2", " fenced", "fenced ", ""])
-      expect({ v, calls: await bodyCalls(f, "m4" + v.trim().length + v.length, `${alter("fenced")};SELECT sessions.lazy_ack_t2_set_mode('t2');${alter(v)}`) }).toEqual({ v, calls: 2 });
-    // The flips above were rolled back with their transactions.
-    expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+    expect(await bodyCalls(f, "m0", "SELECT 1")).toBe(2); // off/main
+    expect(await bodyCalls(f, "m1", "SELECT sessions.lazy_ack_t2_set_gate('fenced')")).toBe(2); // fenced/main
+    expect(await bodyCalls(f, "m3", "SELECT sessions.lazy_ack_t2_set_gate('fenced');SELECT sessions.lazy_ack_t2_set_mode('t2')")).toBe(1);
+    for (const [sql, code] of [["UPDATE sessions.lazy_ack_t2_mode SET mode='t2'", "23514"], ["UPDATE sessions.lazy_ack_t2_mode SET gate='on'", "23514"],
+      ["UPDATE sessions.lazy_ack_t2_mode SET gate=NULL", "23502"], ["UPDATE sessions.lazy_ack_t2_mode SET mode='x'", "23514"],
+      ["INSERT INTO sessions.lazy_ack_t2_mode VALUES(false,'main','off')", "23514"], ["INSERT INTO sessions.lazy_ack_t2_mode VALUES(true,'main','off')", "23505"]] as const) {
+      await f.db.exec("BEGIN;SELECT pg_advisory_xact_lock(961996,50000)"); // past the keep trigger: the constraints themselves
+      try { await expect(f.db.exec(sql)).rejects.toMatchObject({ code }); } finally { await f.db.exec("ROLLBACK"); }
+    }
+    // Without 50000 EXCLUSIVE even a valid direct UPDATE by the owner is refused (the trigger), and with 50000 SHARED too.
+    for (const pre of ["SELECT 1", "SELECT pg_advisory_xact_lock_shared(961996,50000)", "SELECT pg_advisory_xact_lock(961996,50001)"]) {
+      await f.db.exec(`BEGIN;${pre}`);
+      try { await expect(f.db.exec("UPDATE sessions.lazy_ack_t2_mode SET gate='fenced'")).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("changed only by") }); }
+      finally { await f.db.exec("ROLLBACK"); }
+    }
+    await f.db.exec("BEGIN");
+    try { await f.db.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')"); await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
+      await expect(f.db.exec("UPDATE sessions.lazy_ack_t2_mode SET gate='off'")).rejects.toMatchObject({ code: "23514" }); } finally { await f.db.exec("ROLLBACK"); }
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
   });
-  test("fenced refuses REPEATABLE READ and SERIALIZABLE (either mode) before reading the mode; gate off does not", async () => {
+  test("exactly one row: DELETE and TRUNCATE are refused (55000); a missing row fails the staged ACK and both setters closed (55000), never main", async () => {
     const f = await fixture();
+    for (const sql of ["DELETE FROM sessions.lazy_ack_t2_mode", "TRUNCATE sessions.lazy_ack_t2_mode"]) {
+      await f.db.exec("BEGIN");
+      try { await expect(f.db.exec(sql)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the gate row is a singleton") }); } finally { await f.db.exec("ROLLBACK"); }
+    }
+    const c = await capture(f, [rec("miss-1", 2)]);
+    const gone = "ALTER TABLE sessions.lazy_ack_t2_mode DISABLE TRIGGER lazy_ack_t2_mode_keep_row;DELETE FROM sessions.lazy_ack_t2_mode";
+    for (const iso of ["READ COMMITTED", "REPEATABLE READ"]) {
+      await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};${gone};SET LOCAL ROLE bulls96_session_ingest`);
+      try { await expect(f.db.query(COMMIT, [c.payload])).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the T2 gate row is missing") }); }
+      finally { await f.db.exec("ROLLBACK"); }
+    }
+    for (const [sql, msg] of [["SELECT sessions.lazy_ack_t2_set_gate('fenced')", "gate unchanged"], ["SELECT sessions.lazy_ack_t2_set_mode('main')", "mode unchanged"]] as const) {
+      await f.db.exec(`BEGIN;${gone}`);
+      try { await expect(f.db.exec(sql)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the gate row is missing; " + msg) }); }
+      finally { await f.db.exec("ROLLBACK"); }
+    }
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
+    expect(((await f.run(COMMIT, [c.payload])) as any).rows[0].r.kind).toBe("committed");
+  });
+  test("REPEATABLE READ / SERIALIZABLE: off/main runs main; fenced refuses a staged ACK (either mode); suppressed receipts are never refused by the gate", async () => {
+    // Serial (one connection): the row is current here. The stale-snapshot schedules (FOR SHARE -> 40001) are the
+    // real-PostgreSQL suite's. Suppressed receipts: the claim that ACKs them refuses non-READ COMMITTED itself (043500,
+    // 40001 'lazy records require read committed') in every state, as on main; the ACK's own suppressed path, called
+    // directly at RR/SER on a real suppressed batch row, returns before the gate read in every state: no refusal, no
+    // lock on the gate table.
+    const f = await fixture();
+    await deliver(f, [rec("iso-supp-warm", 1)]);
+    const sid = "s-isosupp";
+    await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,$4,'claude',$5)", [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN, sid]);
+    const s0 = await capture(f, [rec("isosupp-0", 2, { session_id: sid })], "ingest_claim_buffered_batch");
+    await f.db.exec("SET ROLE bulls96_session_ingest");
+    try { await f.db.query("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [s0.payload]); } finally { await f.db.exec("RESET ROLE"); }
+    const suppRow = "SELECT sessions.ingest_lazy_ack_batch(to_jsonb(b)) FROM sessions.ingest_batches b WHERE b.buffer_receipt_kind='suppressed' AND b.state='committed' ORDER BY b.batch_id LIMIT 1";
+    expect((await f.db.query<any>("SELECT count(*)::int n FROM sessions.ingest_batches WHERE buffer_receipt_kind='suppressed' AND state='committed'")).rows[0].n).toBe(1);
     for (const iso of ["REPEATABLE READ", "SERIALIZABLE"]) {
-      // Gate and mode are set by the owner at READ COMMITTED (the operator functions require it), before the RR transaction.
-      for (const [setup, refused] of [[["off", "main"], false], [["fenced", "main"], true], [["fenced", "t2"], true]] as const) {
+      for (const [state, refused] of [[["off", "main"], false], [["fenced", "main"], true], [["fenced", "t2"], true]] as const) {
         const c = await capture(f, [rec("iso-" + ++serial, 2)]);
-        await f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [setup[0]]);
-        await f.db.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [setup[1]]);
-        await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
+        const s = await capture(f, [rec("isosupp-" + serial, 2, { session_id: sid })], "ingest_claim_buffered_batch");
+        await setRow(f, state[0], state[1]);
         try {
-          const q = f.db.query<any>(COMMIT, [c.payload]);
-          if (refused) await expect(q).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the fenced staged ACK requires read committed") });
-          else expect((await q).rows[0].r.kind).toBe("committed");
-        } finally {
-          await f.db.exec("ROLLBACK");
-          await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
-          await f.db.query("SELECT sessions.lazy_ack_t2_set_gate('off')");
-        }
+          await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
+          try {
+            const q = f.db.query<any>(COMMIT, [c.payload]);
+            if (refused) await expect(q).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the fenced staged ACK requires read committed") });
+            else expect((await q).rows[0].r.kind).toBe("committed");
+          } finally { await f.db.exec("ROLLBACK"); }
+          await f.db.exec(`BEGIN ISOLATION LEVEL ${iso};SET LOCAL ROLE bulls96_session_ingest`);
+          try { await expect(f.db.query("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [s.payload])).rejects.toMatchObject({ code: "40001", message: expect.stringContaining("lazy records require read committed") }); }
+          finally { await f.db.exec("ROLLBACK"); }
+          await f.db.exec(`BEGIN ISOLATION LEVEL ${iso}`);
+          try {
+            expect((await f.db.query(suppRow)).rows.length).toBe(1);
+            expect({ iso, state, gateLocks: Number((await f.db.query<any>("SELECT count(*)::int n FROM pg_locks WHERE locktype='relation' AND relation='sessions.lazy_ack_t2_mode'::regclass AND pid=pg_backend_pid()")).rows[0].n) })
+              .toEqual({ iso, state, gateLocks: 0 });
+          } finally { await f.db.exec("ROLLBACK"); }
+        } finally { await setRow(f, "off", "main"); }
       }
     }
   });
-  test("lazy_ack_t2_set_mode only TRY-locks 50000 (never queues), then the mode row NOWAIT, in that order", async () => {
+  test("lazy_ack_t2_set_mode and lazy_ack_t2_set_gate only TRY-lock 50000 (never queue), then the row NOWAIT, in that order; no ALTER, no SET", async () => {
     const f = await fixture();
-    const src = ((await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid='sessions.lazy_ack_t2_set_mode(text)'::regprocedure")).rows[0].prosrc as string).replace(/--[^\n]*/g, "");
-    const tryLock = src.indexOf("IF NOT pg_try_advisory_xact_lock(961996,50000) THEN"), row = src.indexOf("FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;");
-    expect(tryLock).toBeGreaterThan(-1);
-    expect(row).toBeGreaterThan(tryLock);
-    expect(src.split("lazy_ack_t2_mode").length - 1).toBe(2); // the locking read and the UPDATE, both after the try-lock
-    expect(src).not.toMatch(/pg_advisory_xact_lock\(|pg_advisory_lock\(|lock_timeout/);
+    for (const fn of ["sessions.lazy_ack_t2_set_mode(text)", "sessions.lazy_ack_t2_set_gate(text)"]) {
+      const src = ((await f.db.query<any>("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [fn])).rows[0].prosrc as string).replace(/--[^\n]*/g, "");
+      const iso = src.indexOf("current_setting('transaction_isolation')<>'read committed'");
+      const tryLock = src.indexOf("IF NOT pg_try_advisory_xact_lock(961996,50000) THEN"), row = src.indexOf("FROM sessions.lazy_ack_t2_mode WHERE singleton FOR UPDATE NOWAIT;");
+      expect({ fn, ok: iso > -1 && tryLock > iso && row > tryLock }).toEqual({ fn, ok: true });
+      expect(src.split("lazy_ack_t2_mode").length - 1).toBe(2); // the locking read and the UPDATE, both after the try-lock
+      expect(src).not.toMatch(/pg_advisory_xact_lock\(|pg_advisory_lock\(|lock_timeout|ALTER\s|set_config|\bSET\s+(LOCAL\s+)?[a-z_]+\./i);
+    }
   });
-  test("the down refuses unless the mode is main and the gate is not fenced; then restores 043800 exactly", async () => {
+  test("the down refuses unless the row says off/main; then restores 043800 exactly", async () => {
     const f = await fixture();
     const { readFileSync } = await import("node:fs");
     const DOWN = readFileSync("supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql", "utf8");
-    // The PGlite fixture has no migrator ledger: a minimal one with this file's own checksum, as the real migrator records it.
     const sha = (await import("node:crypto")).createHash("sha256").update(readFileSync(MIG, "utf8")).digest("hex");
-    // (the fixture's marker table, privacy-authority-support.ts, lacks the updated_at the real one has)
     await f.db.exec(`CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL);
       ALTER TABLE sessions.__96bulls_role_validation ADD COLUMN IF NOT EXISTS updated_at timestamptz`);
     await f.db.query("INSERT INTO sessions.__96bulls_migrations VALUES('upstream:20261105062210_lazy_ack_t2.sql',$1)", [sha]);
     const attempt = async () => { const e = await f.db.exec(DOWN).then(() => null, (x: any) => x); if (e) await f.db.exec("ROLLBACK"); return e; };
-    const alter = (v: string) => f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`);
-    await alter("fenced");
-    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
+    await setRow(f, "fenced", "t2");
     expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
-    await alter("off"); // (never done by the operator while the row says 't2'; the down still refuses)
-    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the mode is not main") });
-    await alter("fenced");
-    await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
-    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the gate is fenced") });
-    expect(await f.db.query<any>("SELECT to_regclass('sessions.lazy_ack_t2_mode') r").then((r) => r.rows[0].r)).toBe("sessions.lazy_ack_t2_mode");
-    await alter("off");
+    expect(await gateRow(f)).toEqual([{ gate: "fenced", mode: "t2" }]);
+    await setRow(f, "fenced", "main");
+    expect(await attempt()).toMatchObject({ code: "55000", message: expect.stringContaining("the gate is not off") });
+    expect(await gateRow(f)).toEqual([{ gate: "fenced", mode: "main" }]);
+    await setRow(f, "off", "main");
     expect(await attempt()).toBeNull();
     expect((await f.db.query<any>("SELECT to_regclass('sessions.lazy_ack_t2_mode') r")).rows[0].r).toBeNull();
+    expect((await f.db.query<any>("SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'lazy\\_ack\\_t2\\_%'")).rows[0].n).toBe(0);
     const p = (await f.db.query<any>("SELECT proconfig,prosrc FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0];
     expect(p.proconfig).toEqual(["search_path=pg_catalog, pg_temp"]);
     expect(p.prosrc).toBe(ackBody(readFileSync(MAIN_MIG, "utf8")));
   });
-  test("caller pin: the ACK reads its gate before its own 50000 S, so its only caller is the seat-ACK trigger on ingest_batches", async () => {
-    // The ACK selects its body from its function-local gate at entry and takes (961996,50000) shared in its own
-    // ingest_lock_fences; that is safe because every existing path into it (commit and claim) already holds 50000 S. A
-    // new caller (a function calling it, or another trigger using its trigger function) turns this red: check the rule.
+  test("caller pin: the ACK reads its gate row only after its own 50000 S; its only caller is the seat-ACK trigger on ingest_batches", async () => {
+    // The ACK takes (961996,50000) shared in its own ingest_lock_fences before it reads the gate row, and every existing
+    // path into it (commit and claim) already holds 50000 S before it (the down's quiescence relies on that). A new
+    // caller (a function calling it, or another trigger using its trigger function) turns this red: check the rule.
     const f = await fixture();
     const callers = (await f.db.query<{ f: string }>(`SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
       WHERE p.prolang=(SELECT oid FROM pg_language WHERE lanname='plpgsql') AND p.oid<>'sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure
@@ -342,61 +443,44 @@ describe("062210 installs the gate off, the mode 'main', and keeps the 043800 co
       WHERE tgfoid='sessions.ingest_receipt_seat_ack()'::regprocedure AND NOT tgisinternal ORDER BY 1`)).rows.map((r) => r.t);
     expect(triggers).toEqual(["sessions.ingest_batches.ingest_receipt_seat_ack"]);
   });
-  test("lazy_ack_t2_set_gate: the supported gate change; requires mode main, returns the previous value, owner-only, read committed", async () => {
+  test("lazy_ack_t2_set_gate: requires mode main, returns the previous gate, UPDATEs the row only, read committed", async () => {
     const f = await fixture();
-    const gate = async () => (await f.db.query<any>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].c as string[];
-    const sm = (await f.db.query<any>("SELECT prosecdef,proconfig FROM pg_proc WHERE oid='sessions.lazy_ack_t2_set_gate(text)'::regprocedure")).rows[0];
-    expect(sm).toEqual({ prosecdef: false, proconfig: ["search_path=pg_catalog, pg_temp"] });
     for (const bad of ["on", "FENCED", "", "t2", "main"])
       await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [bad])).rejects.toMatchObject({ code: "22023" });
     await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate(NULL)")).rejects.toMatchObject({ code: "22023" });
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).rows[0].o).toBe("off");
-    expect(await gate()).toContain(GATE + "=fenced");
+    expect(await gateRow(f)).toEqual([{ gate: "fenced", mode: "main" }]);
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('fenced') o")).rows[0].o).toBe("fenced");
-    // mode 't2' (set under the fenced gate): no gate change either way, gate unchanged.
     await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')");
     for (const g of ["off", "fenced"]) {
       await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_gate($1)", [g])).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("only while the mode is main") });
-      expect(await gate()).toContain(GATE + "=fenced");
+      expect(await gateRow(f)).toEqual([{ gate: "fenced", mode: "t2" }]);
     }
     await f.db.query("SELECT sessions.lazy_ack_t2_set_mode('main')");
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('off') o")).rows[0].o).toBe("fenced");
-    expect(await gate()).toEqual(["search_path=pg_catalog, pg_temp", GATE + "=off"]);
-    // An out-of-protocol RESET leaves no entry: reported as 'absent', and set_gate restores an explicit value.
-    await f.db.exec(`ALTER FUNCTION ${ACK} RESET ${GATE}`);
-    expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_gate('off') o")).rows[0].o).toBe("absent");
-    expect(await gate()).toContain(GATE + "=off");
-    // Both operator functions refuse anything but READ COMMITTED (their reads must follow the try-lock).
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
+    expect((await f.db.query<any>("SELECT proconfig c FROM pg_proc WHERE oid=$1::regprocedure", [ACK])).rows[0].c).toEqual(["search_path=pg_catalog, pg_temp"]);
     for (const [iso, stmt] of [["REPEATABLE READ", "SELECT sessions.lazy_ack_t2_set_gate('fenced')"], ["SERIALIZABLE", "SELECT sessions.lazy_ack_t2_set_gate('fenced')"],
       ["REPEATABLE READ", "SELECT sessions.lazy_ack_t2_set_mode('main')"], ["SERIALIZABLE", "SELECT sessions.lazy_ack_t2_set_mode('main')"]] as const) {
       await f.db.exec(`BEGIN ISOLATION LEVEL ${iso}`);
       try { await expect(f.db.exec(stmt)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("requires read committed") }); }
       finally { await f.db.exec("ROLLBACK"); }
     }
-    expect(await gate()).toContain(GATE + "=off");
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
   });
-  test("lazy_ack_t2_set_mode: returns the old mode, refuses anything but main/t2 (22023) and leaves the row unchanged", async () => {
+  test("lazy_ack_t2_set_mode: returns the old mode, refuses anything but main/t2 (22023); 't2' only with the row's gate fenced", async () => {
     const f = await fixture();
     for (const bad of ["T2", "off", "fenced", "", " t2"])
       await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode($1)", [bad])).rejects.toMatchObject({ code: "22023" });
     await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode(NULL)")).rejects.toMatchObject({ code: "22023" });
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('main') o")).rows[0].o).toBe("main");
-    // 't2' only under the fenced gate (review M1): refused (55000) with the gate off or any non-'fenced' value, row unchanged.
-    for (const v of ["off", "FENCED", "on", ""]) {
-      await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='${v}'`);
-      await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')")).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("requires the gate fenced first") });
-      expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
-    }
-    await f.db.exec(`ALTER FUNCTION ${ACK} RESET ${GATE}`); // no gate entry at all: refused too
-    await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')")).rejects.toMatchObject({ code: "55000" });
-    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='fenced'`);
+    await expect(f.db.query("SELECT sessions.lazy_ack_t2_set_mode('t2')")).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("requires the gate fenced first") });
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')");
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('t2') o")).rows[0].o).toBe("main");
-    await f.db.exec(`ALTER FUNCTION ${ACK} SET ${GATE}='off'`);
-    // 'main' is always allowed (the way back), whatever the gate says.
     expect((await f.db.query<any>("SELECT sessions.lazy_ack_t2_set_mode('main') o")).rows[0].o).toBe("t2");
-    await expect(f.db.query("UPDATE sessions.lazy_ack_t2_mode SET mode='x'")).rejects.toMatchObject({ code: "23514" });
-    await expect(f.db.query("INSERT INTO sessions.lazy_ack_t2_mode VALUES(false,'main')")).rejects.toMatchObject({ code: "23514" });
-    expect((await f.db.query<any>("SELECT mode FROM sessions.lazy_ack_t2_mode")).rows).toEqual([{ mode: "main" }]);
+    await f.db.query("SELECT sessions.lazy_ack_t2_set_gate('off')");
+    expect(await gateRow(f)).toEqual([{ gate: "off", mode: "main" }]);
   });
 });
 
