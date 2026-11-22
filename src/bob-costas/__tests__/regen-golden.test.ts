@@ -39,6 +39,7 @@ const open: PGlite[] = [];
 afterEach(async () => {
   setSystemTime();
   for (const f of FLAGS) delete process.env[f];
+  delete process.env.SUMMARY_SWEEP_BOUNDED;
   while (open.length) await open.pop()!.close();
 });
 
@@ -126,5 +127,11 @@ describe("Bob Costas flags-off golden (summaries regeneration push A)", () => {
   test("flags set to anything but exactly \"true\" are off: identical to main", async () => {
     if (process.env.GOLDEN_WRITE === "1") return;
     expectGolden(FIXTURE, await run(Object.fromEntries(FLAGS.map((f, i) => [f, ["TRUE", "1", "yes", " true"][i]!]))));
+  });
+
+  test("SUMMARY_SWEEP_BOUNDED empty or off (its tuning ignored): identical to main", async () => {
+    if (process.env.GOLDEN_WRITE === "1") return;
+    for (const v of ["", "off"])
+      expectGolden(FIXTURE, await run({ SUMMARY_SWEEP_BOUNDED: v, SUMMARY_SWEEP_PAGE_ROWS: "nope", SUMMARY_SWEEP_WINDOW_SECONDS: "1" }));
   });
 });

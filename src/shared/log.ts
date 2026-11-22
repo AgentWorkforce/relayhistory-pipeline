@@ -32,6 +32,8 @@ export const SEAL_POOL_LOG_FIELDS = [
 const SUMMARY_INPUT_FIELDS = [
   "chunks_read", "chunks_total", "bytes_read", "names_dropped", "turns_dropped",
   "max_chunks", "max_input_bytes", "max_chunk_bytes",
+  // ...and the bounded summary sweep's startup settings (src/bob-costas/sweep-bounded.ts).
+  "window_seconds", "page_rows", "catchup_seconds",
 ];
 
 /** The streaming reconcile read budgets serve() logs at startup (searchIndexStreamBudgetWarning). */

@@ -17,6 +17,7 @@ import { logRegenQueued, purgeRegenAudit, writeRegenAudit, type RegenAuditEntry 
 import { maxDueAttempts } from "../summary-regen/backoff.ts";
 import { regenActive, type RegenReason } from "../summary-regen/settings.ts";
 import { bobCostasRegenFromEnv, REGEN_WORK_SUFFIX, type BobCostasRegen } from "./regen.ts";
+import { boundedSweepFromEnv, boundedWalks, findMissingPage, findRegenPage, type BoundedSweepSettings } from "./sweep-bounded.ts";
 
 export const SWEEP_STAGES = ["summary-short", "summary-long"] as const;
 const KIND = { "summary-short": "short", "summary-long": "long" } as const;
@@ -186,12 +187,16 @@ export function summarySweep(opts: {
   limit?: number;
   /** Regeneration flags; undefined reads them from the environment, null forces them off. */
   regen?: BobCostasRegen | null;
+  /** SUMMARY_SWEEP_BOUNDED (sweep-bounded.ts); undefined reads it from the environment, null forces it off. */
+  bounded?: BoundedSweepSettings | null;
 }) {
   const everyMs = opts.everyMs ?? 300_000;
   const limit = opts.limit ?? 100;
   const regenConfig = opts.regen === undefined ? bobCostasRegenFromEnv() : opts.regen;
   const coverage = regenConfig && regenActive(regenConfig.settings) ? regenConfig : null;
   const auditOn = regenConfig?.settings.audit.enabled === true;
+  const boundedConfig = opts.bounded === undefined ? boundedSweepFromEnv() : opts.bounded;
+  const walks = boundedConfig ? boundedWalks(boundedConfig) : null;
   let last = 0;
   let lastPurge = 0;
   return async (db: HoopDb, now: Date) => {
@@ -200,10 +205,21 @@ export function summarySweep(opts: {
     const queue = postgresPipelineQueue(db);
     // The master key id is the same for every workspace (hkdf1:<current master>).
     const currentKeyId = (await opts.keyring.currentKey({ orgId: "-", workspaceId: "-" })).keyId;
-    for (const stage of SWEEP_STAGES) {
-      const rows = await findMissingSummaries(db, stage, limit, currentKeyId);
-      for (const row of rows) await queue.send(await enrichMessage(sweepMessage(stage, row)));
-      if (rows.length) log.info("summary sweep queued", { stage, count: rows.length });
+    if (walks) {
+      // Bounded: one keyset page per pass, the same checks on that page only (sweep-bounded.ts).
+      for (const stage of SWEEP_STAGES)
+        await walks.run(`missing:${stage}`, now, limit,
+          (bound) => findMissingPage(db, stage, KIND[stage], boundedConfig!.pageRows, currentKeyId, bound),
+          async (rows, pass) => {
+            for (const row of rows) await queue.send(await enrichMessage(sweepMessage(stage, row)));
+            if (rows.length) log.info("summary sweep queued", { stage, count: rows.length, reason: `bounded_${pass}` });
+          });
+    } else {
+      for (const stage of SWEEP_STAGES) {
+        const rows = await findMissingSummaries(db, stage, limit, currentKeyId);
+        for (const row of rows) await queue.send(await enrichMessage(sweepMessage(stage, row)));
+        if (rows.length) log.info("summary sweep queued", { stage, count: rows.length });
+      }
     }
     // Audit retention (4): at most hourly, bounded per call by the SQL function; self-host may run
     // Bob Costas without the brief worker, whose prune tick purges the same table.
@@ -218,8 +234,7 @@ export function summarySweep(opts: {
     }
     if (!coverage || !(await hasColumns(db, "sessions.session_summaries", SUMMARY_COVERAGE_COLUMNS))) return;
     const audit = coverage.settings.audit.enabled && (await hasRelation(db, AUDIT_RELATION));
-    for (const stage of SWEEP_STAGES) {
-      const rows = await findRegenDue(db, stage, limit, coverage, now);
+    const queueRegen = async (stage: (typeof SWEEP_STAGES)[number], rows: RegenDueRow[]) => {
       const entries: RegenAuditEntry[] = [];
       let stamps = 0;
       for (const row of rows) {
@@ -249,6 +264,13 @@ export function summarySweep(opts: {
         await writeRegenAudit(db, entries).catch((error: unknown) =>
           log.warn("summary regeneration audit write failed", { stage, count: entries.length, error_code: error instanceof Error ? error.name : "unknown" }));
       }
+    };
+    for (const stage of SWEEP_STAGES) {
+      if (walks)
+        await walks.run(`regen:${stage}`, now, limit,
+          (bound) => findRegenPage(db, stage, KIND[stage], boundedConfig!.pageRows, coverage, now, bound),
+          (rows) => queueRegen(stage, rows));
+      else await queueRegen(stage, await findRegenDue(db, stage, limit, coverage, now));
     }
   };
 }

@@ -1,0 +1,34 @@
+-- Post-apply OPERATOR job for the bounded Bob Costas summary sweep (src/bob-costas/sweep-bounded.ts,
+-- SUMMARY_SWEEP_BOUNDED=on). Not a migration: it is CREATE INDEX CONCURRENTLY on session_index, which
+-- cannot run inside migrate.ts's BEGIN/COMMIT, so it has no slot (registry rule) and no parent slot
+-- (it needs only the base session_index table). Run once, outside a transaction, as the table owner,
+-- before SUMMARY_SWEEP_BOUNDED is turned on:
+--   psql -v ON_ERROR_STOP=1 -X -d <HoopDb> -f supabase/pending/summary_sweep_indexed_at.sql
+-- Building it on a real database needs the owner's explicit approval, like any production change.
+--
+-- Write cost: this index is not free. sessions.upsert_session_index sets indexed_at to the write
+-- time on every applied upsert (supabase/migrations/20261025000000_sessions_index.sql, `indexed_at =
+-- excluded.indexed_at`), so every session_index upsert changes an indexed column: it can never be a
+-- HOT update, and it writes one more index entry (plus its WAL) each time. Measure the database's
+-- write IO and the session_index upsert rate before building it, and weigh that against the read IO
+-- the bounded sweep saves.
+--
+-- It serves the sweep's keyset page: live rows, newest indexed_at first, tie-broken by the primary key
+-- ((indexed_at, org_id, workspace_id, harness, session_id, machine_id) < cursor ORDER BY ... DESC LIMIT n;
+-- a backward scan of this index). Results never depend on it: without the index each page is one
+-- scan of session_index with a top-n sort, slower, never different. The worker refuses to start with
+-- SUMMARY_SWEEP_BOUNDED=on unless this index is present and valid.
+--
+-- Validity: IF NOT EXISTS skips an existing INVALID index (a failed or interrupted CONCURRENTLY
+-- build), so after running this file check it, and expect exactly one row with valid = true:
+--   SELECT (i.indisvalid AND i.indisready AND i.indislive) AS valid
+--     FROM pg_catalog.pg_index i
+--     JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+--     JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+--     JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+--    WHERE n.nspname = 'sessions' AND t.relname = 'session_index' AND c.relname = 'session_index_summary_sweep_idx';
+-- If valid is false: DROP INDEX CONCURRENTLY sessions.session_index_summary_sweep_idx; then rerun this
+-- file (CONCURRENTLY again) and check again. Idempotent once valid.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS session_index_summary_sweep_idx
+  ON sessions.session_index (indexed_at, org_id, workspace_id, harness, session_id, machine_id)
+  WHERE deleted_at IS NULL;

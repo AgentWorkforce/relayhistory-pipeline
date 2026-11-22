@@ -66,6 +66,8 @@ export interface WorkerOptions {
   attests?: ManifestReaderName[];
   /** Runs once per loop tick, for side loops such as reconcile. */
   tick?: (db: HoopDb, now: Date) => Promise<void>;
+  /** Runs once after the schema check, before the worker reports ready; a throw refuses startup. */
+  startup?: (db: HoopDb) => Promise<void>;
   /** Bounded best-effort flushes (product analytics) run with the telemetry shutdown, before the exit. */
   onShutdown?: () => Promise<void>;
   /**
@@ -395,6 +397,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   await waitForHoopDb(db);
   const expected = await expectedSchema();
   await waitForSchema(db, expected);
+  await opts.startup?.(db);
   // Live on every /readyz probe and before every claim: ledger, marker AND phase 2 now.
   health.schemaReady = async () =>
     (await schemaVerdict(expected, (work) => inTransaction(db, work))).ok;

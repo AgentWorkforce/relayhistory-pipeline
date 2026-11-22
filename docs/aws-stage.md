@@ -262,6 +262,46 @@ plaintext. They are derived: Bob Costas's summary sweep (at startup, then every
 `SUMMARY_SWEEP_SECONDS`, default 300) re-queues every indexed session without a
 summary and rebuilds each as an encrypted object.
 
+That sweep reads most of `session_index` and three anti-join tables on every run.
+`SUMMARY_SWEEP_BOUNDED=on` (default `off`; anything but `on`, `off` or empty refuses
+startup) bounds it: each run checks one keyset page of at most
+`SUMMARY_SWEEP_PAGE_ROWS` (default 1000) rows indexed in the last
+`SUMMARY_SWEEP_WINDOW_SECONDS` (default 3600), plus one page of a newest-first
+catch-up walk over the whole table that starts at most every
+`SUMMARY_SWEEP_CATCHUP_SECONDS` (default 86400). Build
+`supabase/pending/summary_sweep_indexed_at.sql` (CONCURRENTLY, outside a
+transaction) before turning it on; see `src/bob-costas/sweep-bounded.ts`.
+
+With the flag on, Bob Costas refuses to start when:
+
+- a tuning value is not an integer in its range (window 300 to 604800, page rows
+  10 to 10000, catch-up 3600 to 2592000);
+- `SUMMARY_SWEEP_WINDOW_SECONDS` is below the effective
+  `SUMMARY_REGEN_IDLE_SECONDS` (default 600), so a session that goes idle is
+  still inside the window when it becomes due for idle-turn regeneration;
+- the startup index probe does not find a valid
+  `sessions.session_index_summary_sweep_idx` (`pg_index` `indisvalid`,
+  `indisready` and `indislive` all true): it refuses with `index_missing`,
+  `index_invalid` or `index_unverified` (probe error), as
+  `READ_API_OWNER_BUFFERED_INDEX_VERIFY` fences buffered reads. `IF NOT EXISTS`
+  skips an invalid index: drop it `CONCURRENTLY` and rebuild. The index adds a
+  write to every `session_index` upsert (never a HOT update); measure write IO
+  first. Building it needs the owner's explicit approval.
+
+On start it logs one `bob costas summary sweep` line with `state=bounded_on`,
+`window_seconds`, `page_rows` and `catchup_seconds`.
+
+Walk latency trade-off: work that becomes due without `indexed_at` moving waits
+for the catch-up walk, which takes ceil(live rows / `SUMMARY_SWEEP_PAGE_ROWS`)
+ticks and restarts from the top whenever the worker restarts (its cursor is in
+memory). That covers a retry whose backoff rung (`SUMMARY_RETRY_BACKOFF_SECONDS`)
+runs past the window, a summariser config change, a dead letter resolved on an
+old session, a lost or deleted summary, a master-key rotation, and rows pushed
+out of the window page when more than `SUMMARY_SWEEP_PAGE_ROWS` sessions were
+indexed inside one window. Follow-up: bounded sweep walk latency (a persisted
+cursor, a budgeted multi-page walk or a `next_retry_at` window) must land before
+anyone recommends turning the flag on.
+
 ## HoopDb migrator profile (external Supabase)
 
 The migrate Job's profile comes from `eks.*` inputs (`stacks/aws/eks.ts` `hoopdbModeEnv`,
