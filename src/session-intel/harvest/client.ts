@@ -278,9 +278,17 @@ export class ReadApiClient {
     await this.sleep(ms);
   }
 
-  /** Whether a 503 is the retryable session_partial: its body's `error.reason`, read within maxResponseBytes. */
+  /**
+   * Whether a 503 is the retryable session_partial: its body's `error.reason`, read within maxResponseBytes. A body
+   * that cannot be read (too large, a stream error, a stall cut by the request timeout) is not one: what is left is
+   * cancelled and the 503 takes the ordinary retry path, as it did before its body was read.
+   */
   private async partial(res: Response, route: string): Promise<boolean> {
-    const body = await this.body(res, route);
+    let body: unknown;
+    try { body = await this.body(res, route); } catch {
+      await res.body?.cancel().catch(() => {});
+      return false;
+    }
     const err = body && typeof body === "object" ? (body as { error?: unknown }).error : undefined;
     return !!err && typeof err === "object" && (err as { reason?: unknown }).reason === "session_partial";
   }
