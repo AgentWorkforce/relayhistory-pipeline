@@ -7,6 +7,7 @@ import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
 import { perChunkCap, summaryInputCapsFromEnv } from "./session-input.ts";
 import { bobCostasRegenFromEnv } from "./regen.ts";
+import { boundedSweepFromEnv, boundedSweepStartup } from "./sweep-bounded.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const raw = lockerStore();
@@ -29,14 +30,19 @@ log.info("bob costas input caps", {
 });
 // Summaries regeneration flags (all default off: null keeps today's code path); read once, shared.
 const regen = bobCostasRegenFromEnv();
+// SUMMARY_SWEEP_BOUNDED (default off: null keeps the legacy sweep); a malformed value refuses startup.
+const bounded = boundedSweepFromEnv();
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
   attests: ["summaries"],
+  // With the bounded sweep on, refuse to start unless its operator index is present and valid.
+  ...(bounded ? { startup: boundedSweepStartup(bounded) } : {}),
   // Queues summaries for indexed sessions that have none (e.g. after migration 0004).
   tick: summarySweep({
     keyring,
     regen,
+    bounded,
     everyMs: Number(process.env.SUMMARY_SWEEP_SECONDS ?? 300) * 1000,
   }),
   handlers: (db) => {
