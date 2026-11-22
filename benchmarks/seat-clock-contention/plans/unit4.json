@@ -1,0 +1,28 @@
+{
+ "runId": "unit4-471d291a",
+ "totalRecords": 64000,
+ "maxSeconds": 300,
+ "controlEveryMs": 1000,
+ "cells": [
+  {"workload": "W1", "n": 250, "c": 4, "controls": "none", "label": "isolated"},
+  {"workload": "W1", "n": 250, "c": 16, "controls": "none", "label": "isolated"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "isolated"},
+  {"workload": "W1", "n": 500, "c": 16, "controls": "none", "label": "isolated"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotA1-none"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotA1-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotB1-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotB1-none"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotA2-none"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotA2-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotB2-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotB2-none"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotA3-none"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotA3-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "c2", "label": "rotB3-c2"},
+  {"workload": "W1", "n": 500, "c": 4, "controls": "none", "label": "rotB3-none"},
+  {"workload": "W1", "n": 500, "c": 16, "controls": "none", "label": "busy-off"},
+  {"workload": "W1", "n": 500, "c": 16, "controls": "none", "bufferLockBusy": true, "label": "busy-on"},
+  {"workload": "W2", "n": 500, "c": 16, "controls": "none", "label": "busy-off"},
+  {"workload": "W2", "n": 500, "c": 16, "controls": "none", "bufferLockBusy": true, "label": "busy-on"}
+ ]
+}

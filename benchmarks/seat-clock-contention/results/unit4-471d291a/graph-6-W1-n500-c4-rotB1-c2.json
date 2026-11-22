@@ -1,0 +1,19 @@
+{
+ "commit -> clock [ShareLock] <- commit": 8181,
+ "commit -> clock [ExclusiveLock] <- commit": 1735,
+ "commit -> clock [ShareLock] <- untagged": 19,
+ "control2 -> clock [AccessExclusiveLock] <- commit": 1052,
+ "control2 -> clock [ShareLock] <- claim": 10726,
+ "control2 -> clock [ShareLock] <- untagged": 41,
+ "control2 -> clock [ShareLock] <- commit": 5870,
+ "commit -> clock [ExclusiveLock] <- control2": 12522,
+ "commit -> clock [ShareLock] <- control2": 65,
+ "commit -> xid(row or unique-insert) [ShareLock] <- none": 6,
+ "commit -> clock [ExclusiveLock] <- commit+control2": 2542,
+ "control2 -> clock [ShareLock] <- none": 4,
+ "commit -> clock [ShareLock] <- none": 3,
+ "commit -> clock [ExclusiveLock] <- none": 1,
+ "control2 -> clock [AccessExclusiveLock] <- claim": 2,
+ "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 34,
+ "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 41
+}

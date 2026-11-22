@@ -1,0 +1,7362 @@
+{
+ "meta": {
+  "runId": "unit4-471d291a",
+  "serverVersion": "PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "settings": [
+   {
+    "name": "checkpoint_timeout",
+    "setting": "300",
+    "unit": "s"
+   },
+   {
+    "name": "deadlock_timeout",
+    "setting": "1000",
+    "unit": "ms"
+   },
+   {
+    "name": "default_transaction_isolation",
+    "setting": "read committed",
+    "unit": null
+   },
+   {
+    "name": "fsync",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "lock_timeout",
+    "setting": "0",
+    "unit": "ms"
+   },
+   {
+    "name": "max_connections",
+    "setting": "300",
+    "unit": null
+   },
+   {
+    "name": "max_wal_size",
+    "setting": "1024",
+    "unit": "MB"
+   },
+   {
+    "name": "shared_buffers",
+    "setting": "131072",
+    "unit": "8kB"
+   },
+   {
+    "name": "statement_timeout",
+    "setting": "0",
+    "unit": "ms"
+   },
+   {
+    "name": "synchronous_commit",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "track_functions",
+    "setting": "all",
+    "unit": null
+   },
+   {
+    "name": "wal_level",
+    "setting": "replica",
+    "unit": null
+   }
+  ],
+  "template": {
+   "migrateMs": 1565,
+   "historyLive": true,
+   "lazyPolicyRow": 1
+  },
+  "plan": {
+   "runId": "unit4-471d291a",
+   "totalRecords": 64000,
+   "maxSeconds": 300,
+   "controlEveryMs": 1000,
+   "cells": [
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 4,
+     "controls": "none",
+     "label": "isolated"
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 16,
+     "controls": "none",
+     "label": "isolated"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "isolated"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16,
+     "controls": "none",
+     "label": "isolated"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotA1-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotA1-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotB1-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotB1-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotA2-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotA2-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotB2-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotB2-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotA3-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotA3-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "c2",
+     "label": "rotB3-c2"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4,
+     "controls": "none",
+     "label": "rotB3-none"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16,
+     "controls": "none",
+     "label": "busy-off"
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16,
+     "controls": "none",
+     "bufferLockBusy": true,
+     "label": "busy-on"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 16,
+     "controls": "none",
+     "label": "busy-off"
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 16,
+     "controls": "none",
+     "bufferLockBusy": true,
+     "label": "busy-on"
+    }
+   ],
+   "originClaimFence": true
+  },
+  "client": {
+   "bun": "1.4.2",
+   "cpus": 24
+  },
+  "rtt": {
+   "n": 200,
+   "p50": 0.04,
+   "p95": 0.1,
+   "p99": 0.26,
+   "max": 0.52
+  }
+ },
+ "rows": [
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 4,
+    "controls": "none",
+    "label": "isolated"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 256,
+    "records": 64000,
+    "generatedMs": 2033
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 18.51,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3458,
+   "commitsPerSec": 13.83,
+   "deliveries": {
+    "accepted_buffered": 256
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 256,
+     "p50": 112.97,
+     "p95": 148.32,
+     "p99": 254.72,
+     "max": 311.57
+    },
+    "prepare": {
+     "n": 256,
+     "p50": 6.77,
+     "p95": 9.99,
+     "p99": 12.48,
+     "max": 19.67
+    },
+    "commit": {
+     "n": 256,
+     "p50": 112.04,
+     "p95": 165.65,
+     "p99": 246.28,
+     "max": 347.41
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 112.97,
+      "p95": 148.32,
+      "p99": 254.72,
+      "max": 311.57
+     },
+     "statement": {
+      "n": 256,
+      "p50": 110.41,
+      "p95": 145.33,
+      "p99": 161.73,
+      "max": 276.8
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 1.92,
+      "p95": 3.63,
+      "p99": 10.67,
+      "max": 219.83
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 6.77,
+      "p95": 9.99,
+      "p99": 12.48,
+      "max": 19.67
+     },
+     "statement": {
+      "n": 256,
+      "p50": 3.79,
+      "p95": 6.34,
+      "p99": 8.13,
+      "max": 11.14
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 1.77,
+      "p95": 3.3,
+      "p99": 4.3,
+      "max": 13.3
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 112.04,
+      "p95": 165.65,
+      "p99": 246.28,
+      "max": 347.41
+     },
+     "statement": {
+      "n": 256,
+      "p50": 110.17,
+      "p95": 162.19,
+      "p99": 223.28,
+      "max": 344.61
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 1.94,
+      "p95": 3.39,
+      "p99": 7.32,
+      "max": 189.4
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 64
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 64
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 64
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 64
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 256,
+     "prepare": 256,
+     "commit": 256
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 256,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256,
+      "advisory:native-origin [ExclusiveLock]": 256
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 256,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 256,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256,
+      "advisory:native-origin [ExclusiveLock]": 256
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 277,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 277,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 256,
+     "p50": 71.23,
+     "p95": 84.63,
+     "p99": 90.8,
+     "max": 262.43
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.99,
+    "commitHoldsObserved": 256,
+    "commitsOk": 256,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 256,
+     "p50": 41.46,
+     "p95": 83.23,
+     "p99": 146.55,
+     "max": 264.99
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 238,
+     "p50": 41.58,
+     "p95": 87.12,
+     "p99": 135.63,
+     "max": 187.11
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 0.99,
+     "p95": 0.99,
+     "p99": 0.99,
+     "max": 0.99
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 9897,
+    "commit -> clock [ExclusiveLock] <- commit": 303,
+    "commit -> clock [ShareLock] <- untagged": 55,
+    "commit -> clock [ShareLock] <- none": 13,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 12,
+    "commit -> clock [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 18061,
+    "periodMs": {
+     "n": 18060,
+     "p50": 0.99,
+     "p95": 1.58,
+     "p99": 1.98,
+     "max": 3.51
+    }
+   },
+   "client": {
+    "processCpuS": 18.8,
+    "eventLoopLagMs": {
+     "n": 6404,
+     "p50": 0.06,
+     "p95": 2.86,
+     "p99": 38.01,
+     "max": 51.04
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 16,
+    "controls": "none",
+    "label": "isolated"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 16,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 256,
+    "records": 64000,
+    "generatedMs": 2293
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 18.33,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3491,
+   "commitsPerSec": 13.96,
+   "deliveries": {
+    "accepted_buffered": 256
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 256,
+     "p50": 87.21,
+     "p95": 247.67,
+     "p99": 357.53,
+     "max": 387.56
+    },
+    "prepare": {
+     "n": 256,
+     "p50": 6.95,
+     "p95": 17.8,
+     "p99": 58.48,
+     "max": 129.47
+    },
+    "commit": {
+     "n": 256,
+     "p50": 753.52,
+     "p95": 1941.43,
+     "p99": 2016.23,
+     "max": 2142.84
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 87.21,
+      "p95": 247.67,
+      "p99": 357.53,
+      "max": 387.56
+     },
+     "statement": {
+      "n": 256,
+      "p50": 84.33,
+      "p95": 215.81,
+      "p99": 354.56,
+      "max": 385.24
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 1.9,
+      "p95": 5.29,
+      "p99": 86.63,
+      "max": 138.41
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 6.95,
+      "p95": 17.8,
+      "p99": 58.48,
+      "max": 129.47
+     },
+     "statement": {
+      "n": 256,
+      "p50": 4.09,
+      "p95": 9.58,
+      "p99": 49.67,
+      "max": 68.4
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 2.22,
+      "p95": 5.09,
+      "p99": 11.42,
+      "max": 124.91
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 256,
+      "p50": 753.52,
+      "p95": 1941.43,
+      "p99": 2016.23,
+      "max": 2142.84
+     },
+     "statement": {
+      "n": 256,
+      "p50": 751.46,
+      "p95": 1939.89,
+      "p99": 2013.4,
+      "max": 2139.74
+     },
+     "commitResponse": {
+      "n": 256,
+      "p50": 2.16,
+      "p95": 4.58,
+      "p99": 62.31,
+      "max": 124.68
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u9/scb-o9",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u10/scb-o10",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u11/scb-o11",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u12/scb-o12",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u13/scb-o13",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u14/scb-o14",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 16
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u15/scb-o15",
+      "workers": 1,
+      "batches": 16
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 256,
+     "prepare": 256,
+     "commit": 256
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 256,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256,
+      "advisory:native-origin [ExclusiveLock]": 256
+     },
+     "prepare": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256,
+      "advisory:origin-claim [ExclusiveLock]": 256
+     },
+     "commit": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 256,
+      "advisory:origin-claim [ExclusiveLock]": 256,
+      "advisory:native-origin [ExclusiveLock]": 256
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 9340,
+    "waitersMax": 14,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 9340,
+     "p50": 12,
+     "p95": 13,
+     "p99": 14,
+     "max": 14
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 256,
+     "p50": 67.87,
+     "p95": 84.79,
+     "p99": 144.4,
+     "max": 187.66
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 1.7,
+    "commitHoldsObserved": 256,
+    "commitsOk": 256,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 256,
+     "p50": 672.28,
+     "p95": 1863.98,
+     "p99": 1953.51,
+     "max": 2054.1
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 66.3,
+     "p95": 69.7,
+     "p99": 69.7,
+     "max": 69.7
+    },
+    "commit: clock": {
+     "n": 249,
+     "p50": 763.3,
+     "p95": 1533.4,
+     "p99": 1655.8,
+     "max": 1710.2
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 40,
+     "p50": 1.7,
+     "p95": 1.7,
+     "p99": 3.4,
+     "max": 3.4
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- commit": 91890,
+    "commit -> clock [ShareLock] <- commit": 13827,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 447,
+    "commit -> clock [ShareLock] <- untagged": 165,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 39,
+    "commit -> clock [ExclusiveLock] <- none": 35,
+    "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 9,
+    "commit -> clock [ShareLock] <- none": 6,
+    "claim -> xid(row or unique-insert) [ShareLock] <- none": 3,
+    "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 1,
+    "commit -> xid(row or unique-insert) [ShareLock] <- commit": 1
+   },
+   "sampler": {
+    "samples": 10101,
+    "periodMs": {
+     "n": 10100,
+     "p50": 1.7,
+     "p95": 2.96,
+     "p99": 3.57,
+     "max": 34.95
+    }
+   },
+   "client": {
+    "processCpuS": 19.71,
+    "eventLoopLagMs": {
+     "n": 13234,
+     "p50": 0.06,
+     "p95": 0.54,
+     "p99": 31.95,
+     "max": 86.23
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "isolated"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1949
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 18.8,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3405,
+   "commitsPerSec": 6.81,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 245.18,
+     "p95": 321.21,
+     "p99": 344.55,
+     "max": 394.46
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.18,
+     "p95": 12.95,
+     "p99": 17.15,
+     "max": 228.92
+    },
+    "commit": {
+     "n": 128,
+     "p50": 228.09,
+     "p95": 305.53,
+     "p99": 383.22,
+     "max": 503.32
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 245.18,
+      "p95": 321.21,
+      "p99": 344.55,
+      "max": 394.46
+     },
+     "statement": {
+      "n": 128,
+      "p50": 239.53,
+      "p95": 317.33,
+      "p99": 333.05,
+      "max": 340.19
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.04,
+      "p95": 5.74,
+      "p99": 14.17,
+      "max": 164.49
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.18,
+      "p95": 12.95,
+      "p99": 17.15,
+      "max": 228.92
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.64,
+      "p95": 8.4,
+      "p99": 10.18,
+      "max": 11.39
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.53,
+      "p95": 4.84,
+      "p99": 10.14,
+      "max": 223.31
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 228.09,
+      "p95": 305.53,
+      "p99": 383.22,
+      "max": 503.32
+     },
+     "statement": {
+      "n": 128,
+      "p50": 224.31,
+      "p95": 296.73,
+      "p99": 376.72,
+      "max": 501.25
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.89,
+      "p95": 5.06,
+      "p99": 16.76,
+      "max": 106.51
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 323,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 323,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 143.5,
+     "p95": 170.38,
+     "p99": 191.6,
+     "max": 269.56
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.95,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 81.77,
+     "p95": 152.68,
+     "p99": 246.19,
+     "max": 348.38
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 119,
+     "p50": 81.7,
+     "p95": 152,
+     "p99": 209,
+     "max": 302.1
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 10,
+     "p50": 0.95,
+     "p95": 0.95,
+     "p99": 0.95,
+     "max": 0.95
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 9978,
+    "commit -> clock [ExclusiveLock] <- commit": 390,
+    "commit -> clock [ShareLock] <- untagged": 23,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 10,
+    "commit -> clock [ShareLock] <- none": 2
+   },
+   "sampler": {
+    "samples": 18598,
+    "periodMs": {
+     "n": 18597,
+     "p50": 0.95,
+     "p95": 1.59,
+     "p99": 2.02,
+     "max": 4.25
+    }
+   },
+   "client": {
+    "processCpuS": 18.32,
+    "eventLoopLagMs": {
+     "n": 6420,
+     "p50": 0.07,
+     "p95": 1.46,
+     "p99": 67.46,
+     "max": 96.47
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 16,
+    "controls": "none",
+    "label": "isolated"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 16,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 2111
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 18.52,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3457,
+   "commitsPerSec": 6.91,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 224.67,
+     "p95": 755.96,
+     "p99": 872.14,
+     "max": 896.25
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.88,
+     "p95": 23.45,
+     "p99": 104.63,
+     "max": 106.61
+    },
+    "commit": {
+     "n": 128,
+     "p50": 1389.23,
+     "p95": 3357.57,
+     "p99": 3539.01,
+     "max": 3606.72
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 224.67,
+      "p95": 755.96,
+      "p99": 872.14,
+      "max": 896.25
+     },
+     "statement": {
+      "n": 128,
+      "p50": 220.18,
+      "p95": 750.92,
+      "p99": 869.27,
+      "max": 893.46
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.97,
+      "p95": 5.35,
+      "p99": 7.65,
+      "max": 152.94
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.88,
+      "p95": 23.45,
+      "p99": 104.63,
+      "max": 106.61
+     },
+     "statement": {
+      "n": 128,
+      "p50": 6.46,
+      "p95": 16.93,
+      "p99": 99.1,
+      "max": 104.54
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.3,
+      "p95": 5.18,
+      "p99": 10.38,
+      "max": 10.4
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 1389.23,
+      "p95": 3357.57,
+      "p99": 3539.01,
+      "max": 3606.72
+     },
+     "statement": {
+      "n": 128,
+      "p50": 1387.55,
+      "p95": 3353.57,
+      "p99": 3535.8,
+      "max": 3602.23
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.55,
+      "p95": 4.91,
+      "p99": 72.4,
+      "max": 76.65
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u9/scb-o9",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u10/scb-o10",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u11/scb-o11",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u12/scb-o12",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u13/scb-o13",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u14/scb-o14",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u15/scb-o15",
+      "workers": 1,
+      "batches": 8
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 9555,
+    "waitersMax": 13,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 9555,
+     "p50": 12,
+     "p95": 13,
+     "p99": 13,
+     "max": 13
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 139.86,
+     "p95": 163.65,
+     "p99": 224.15,
+     "max": 376.12
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 1.6,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 1259.3,
+     "p95": 3224.5,
+     "p99": 3392.67,
+     "max": 3476.03
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 2,
+     "p50": 1.6,
+     "p95": 1.6,
+     "p99": 1.6,
+     "max": 1.6
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 113.6,
+     "p95": 124.8,
+     "p99": 124.8,
+     "max": 124.8
+    },
+    "commit: clock": {
+     "n": 125,
+     "p50": 1428.8,
+     "p95": 2614.4,
+     "p99": 2739.2,
+     "max": 2763.2
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 1.6,
+     "p95": 1.6,
+     "p99": 1.6,
+     "max": 1.6
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 22,
+     "p50": 1.6,
+     "p95": 1.6,
+     "p99": 1.6,
+     "max": 1.6
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- commit": 86068,
+    "commit -> clock [ShareLock] <- commit": 13479,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 807,
+    "commit -> clock [ShareLock] <- untagged": 72,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 22,
+    "commit -> clock [ExclusiveLock] <- none": 13,
+    "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 4,
+    "claim -> xid(row or unique-insert) [ShareLock] <- none": 2,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 2,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1,
+    "commit -> clock [ShareLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 10513,
+    "periodMs": {
+     "n": 10512,
+     "p50": 1.6,
+     "p95": 2.86,
+     "p99": 3.58,
+     "max": 56.04
+    }
+   },
+   "client": {
+    "processCpuS": 19.88,
+    "eventLoopLagMs": {
+     "n": 12813,
+     "p50": 0.06,
+     "p95": 0.12,
+     "p99": 27.09,
+     "max": 138.1
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotA1-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1678
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 17.52,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3653,
+   "commitsPerSec": 7.31,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 208.3,
+     "p95": 251.35,
+     "p99": 382.52,
+     "max": 404.36
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 8.37,
+     "p95": 12.26,
+     "p99": 17.74,
+     "max": 19.65
+    },
+    "commit": {
+     "n": 128,
+     "p50": 230.8,
+     "p95": 296.62,
+     "p99": 428.95,
+     "max": 545.55
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 208.3,
+      "p95": 251.35,
+      "p99": 382.52,
+      "max": 404.36
+     },
+     "statement": {
+      "n": 128,
+      "p50": 204.6,
+      "p95": 244.21,
+      "p99": 288.13,
+      "max": 399.01
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.73,
+      "p95": 4.94,
+      "p99": 54.77,
+      "max": 167.42
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 8.37,
+      "p95": 12.26,
+      "p99": 17.74,
+      "max": 19.65
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.18,
+      "p95": 7.76,
+      "p99": 13.2,
+      "max": 15.7
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.33,
+      "p95": 4.12,
+      "p99": 5.75,
+      "max": 10.43
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 230.8,
+      "p95": 296.62,
+      "p99": 428.95,
+      "max": 545.55
+     },
+     "statement": {
+      "n": 128,
+      "p50": 228.19,
+      "p95": 293.19,
+      "p99": 409.78,
+      "max": 427.52
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.66,
+      "p95": 4.29,
+      "p99": 9.02,
+      "max": 135.45
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 310,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 310,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 133.19,
+     "p95": 159.1,
+     "p99": 169.47,
+     "max": 258.15
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.9,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 97.51,
+     "p95": 157.77,
+     "p99": 284.48,
+     "max": 285.94
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 126,
+     "p50": 89.1,
+     "p95": 151.2,
+     "p99": 248.4,
+     "max": 279.9
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 8,
+     "p50": 0.9,
+     "p95": 0.9,
+     "p99": 0.9,
+     "max": 0.9
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 12514,
+    "commit -> clock [ExclusiveLock] <- commit": 326,
+    "commit -> clock [ShareLock] <- untagged": 23,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 8,
+    "commit -> clock [ShareLock] <- none": 4,
+    "commit -> clock [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 18513,
+    "periodMs": {
+     "n": 18512,
+     "p50": 0.9,
+     "p95": 1.48,
+     "p99": 1.9,
+     "max": 6.25
+    }
+   },
+   "client": {
+    "processCpuS": 17.44,
+    "eventLoopLagMs": {
+     "n": 5958,
+     "p50": 0.06,
+     "p95": 1.43,
+     "p99": 66.32,
+     "max": 98.98
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotA1-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1777
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 23.4,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2735,
+   "commitsPerSec": 5.47,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 220.32,
+     "p95": 306.92,
+     "p99": 1125.15,
+     "max": 1458.78
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 8.44,
+     "p95": 16.95,
+     "p99": 714.78,
+     "max": 796.71
+    },
+    "commit": {
+     "n": 128,
+     "p50": 234.2,
+     "p95": 969.94,
+     "p99": 2310.04,
+     "max": 2354.52
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 220.32,
+      "p95": 306.92,
+      "p99": 1125.15,
+      "max": 1458.78
+     },
+     "statement": {
+      "n": 128,
+      "p50": 212.98,
+      "p95": 292.66,
+      "p99": 640.84,
+      "max": 882.27
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.89,
+      "p95": 28.3,
+      "p99": 701.7,
+      "max": 817.69
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 8.44,
+      "p95": 16.95,
+      "p99": 714.78,
+      "max": 796.71
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.15,
+      "p95": 8.4,
+      "p99": 9.84,
+      "max": 20.18
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.49,
+      "p95": 10.58,
+      "p99": 694.21,
+      "max": 792.74
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 234.2,
+      "p95": 969.94,
+      "p99": 2310.04,
+      "max": 2354.52
+     },
+     "statement": {
+      "n": 128,
+      "p50": 223.9,
+      "p95": 804.76,
+      "p99": 2307.61,
+      "max": 2338.89
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.64,
+      "p95": 14.9,
+      "p99": 742.59,
+      "max": 955.39
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 22,
+      "p50": 652.48,
+      "p95": 1930.59,
+      "p99": 2522.73,
+      "max": 2522.73
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 22,
+      "p50": 1.19,
+      "p95": 3.39,
+      "p99": 11.67,
+      "max": 11.67
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128,
+     "control2": 22
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 22,
+      "advisory:other(int8) [ExclusiveLock]": 22
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 3954,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 3954,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 130.55,
+     "p95": 163.49,
+     "p99": 1062.67,
+     "max": 1142.34
+    },
+    "control2": {
+     "n": 22,
+     "p50": 1.71,
+     "p95": 4.19,
+     "p99": 13.02,
+     "max": 13.02
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.82,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 97.78,
+     "p95": 674.08,
+     "p99": 1209.78,
+     "max": 2207.3
+    },
+    "control2": {
+     "n": 22,
+     "p50": 649.36,
+     "p95": 1923.48,
+     "p99": 2516.08,
+     "max": 2516.08
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 116.44,
+     "p95": 116.44,
+     "p99": 116.44,
+     "max": 116.44
+    },
+    "commit: clock": {
+     "n": 88,
+     "p50": 122.18,
+     "p95": 795.4,
+     "p99": 2121.34,
+     "max": 2121.34
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 34.44,
+     "p95": 34.44,
+     "p99": 34.44,
+     "max": 34.44
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 11,
+     "p50": 0.82,
+     "p95": 0.82,
+     "p99": 0.82,
+     "max": 0.82
+    },
+    "control2: clock": {
+     "n": 22,
+     "p50": 505.12,
+     "p95": 1599.82,
+     "p99": 2328.8,
+     "max": 2328.8
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 7,
+     "p50": 0.82,
+     "p95": 0.82,
+     "p99": 0.82,
+     "max": 0.82
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 3,
+     "scheduledSlots": 25,
+     "attempted": 22,
+     "completed": 22,
+     "completedDuringLoad": 22,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 22,
+      "p50": 652.48,
+      "p95": 1930.59,
+      "p99": 2522.73,
+      "max": 2522.73
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- control2": 10801,
+    "commit -> clock [ShareLock] <- commit": 9233,
+    "control2 -> clock [ShareLock] <- claim": 6948,
+    "control2 -> clock [ShareLock] <- commit": 5875,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 3616,
+    "commit -> clock [ExclusiveLock] <- commit": 2010,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 1944,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 141,
+    "commit -> clock [ShareLock] <- control2": 44,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 39,
+    "control2 -> clock [ShareLock] <- untagged": 36,
+    "commit -> clock [ShareLock] <- untagged": 19,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 10,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 7,
+    "control2 -> clock [ShareLock] <- none": 5,
+    "commit -> clock [ExclusiveLock] <- none": 4,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 3,
+    "commit -> clock [ShareLock] <- none": 2,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1,
+    "control2 -> clock [AccessExclusiveLock] <- none": 1,
+    "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 1
+   },
+   "sampler": {
+    "samples": 26602,
+    "periodMs": {
+     "n": 26601,
+     "p50": 0.82,
+     "p95": 1.47,
+     "p99": 1.81,
+     "max": 4.53
+    }
+   },
+   "client": {
+    "processCpuS": 17.53,
+    "eventLoopLagMs": {
+     "n": 7905,
+     "p50": 0.06,
+     "p95": 0.9,
+     "p99": 60.5,
+     "max": 86.21
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotB1-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1702
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 23.73,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2697,
+   "commitsPerSec": 5.39,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 1
+   },
+   "retriesPerBatch": 0.01,
+   "stageFailures": {
+    "commit:55P03": 1
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 129,
+     "p50": 253.23,
+     "p95": 329.19,
+     "p99": 535.21,
+     "max": 949.49
+    },
+    "prepare": {
+     "n": 129,
+     "p50": 9.1,
+     "p95": 15.67,
+     "p99": 26.86,
+     "max": 246.37
+    },
+    "commit": {
+     "n": 128,
+     "p50": 233.1,
+     "p95": 873.12,
+     "p99": 1716.46,
+     "max": 2251.43
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 129,
+      "p50": 253.23,
+      "p95": 329.19,
+      "p99": 535.21,
+      "max": 949.49
+     },
+     "statement": {
+      "n": 129,
+      "p50": 249.02,
+      "p95": 301.68,
+      "p99": 521.1,
+      "max": 689.14
+     },
+     "commitResponse": {
+      "n": 129,
+      "p50": 2.91,
+      "p95": 33.49,
+      "p99": 222.02,
+      "max": 259.99
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 129,
+      "p50": 9.1,
+      "p95": 15.67,
+      "p99": 26.86,
+      "max": 246.37
+     },
+     "statement": {
+      "n": 129,
+      "p50": 4.98,
+      "p95": 8.14,
+      "p99": 12.3,
+      "max": 12.41
+     },
+     "commitResponse": {
+      "n": 129,
+      "p50": 2.47,
+      "p95": 10.41,
+      "p99": 22.69,
+      "max": 233.49
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 233.1,
+      "p95": 873.12,
+      "p99": 1716.46,
+      "max": 2251.43
+     },
+     "statement": {
+      "n": 128,
+      "p50": 226.18,
+      "p95": 868.58,
+      "p99": 1708.29,
+      "max": 1745.62
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.66,
+      "p95": 16.76,
+      "p99": 291.34,
+      "max": 505.59
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 22,
+      "p50": 715.57,
+      "p95": 1878.14,
+      "p99": 2201.23,
+      "max": 2201.23
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 22,
+      "p50": 1.18,
+      "p95": 11.34,
+      "p99": 15.13,
+      "max": 15.13
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 129,
+     "prepare": 129,
+     "commit": 129,
+     "control2": 22
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129,
+      "advisory:native-origin [ExclusiveLock]": 129
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 22,
+      "advisory:other(int8) [ExclusiveLock]": 22
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 4935,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 4935,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 131.42,
+     "p95": 163.12,
+     "p99": 449.44,
+     "max": 2053.83
+    },
+    "control2": {
+     "n": 22,
+     "p50": 1.71,
+     "p95": 11.99,
+     "p99": 14.39,
+     "max": 14.39
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.83,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 129,
+     "p50": 94.52,
+     "p95": 741.18,
+     "p99": 1574.37,
+     "max": 1999.9
+    },
+    "control2": {
+     "n": 22,
+     "p50": 708.96,
+     "p95": 1860.92,
+     "p99": 2196.27,
+     "max": 2196.27
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 34.03,
+     "p95": 34.03,
+     "p99": 34.03,
+     "max": 34.03
+    },
+    "commit: clock": {
+     "n": 95,
+     "p50": 109.56,
+     "p95": 650.72,
+     "p99": 1841.77,
+     "max": 1841.77
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 28.22,
+     "p95": 28.22,
+     "p99": 28.22,
+     "max": 28.22
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 6,
+     "p50": 0.83,
+     "p95": 0.83,
+     "p99": 0.83,
+     "max": 0.83
+    },
+    "control2: clock": {
+     "n": 22,
+     "p50": 605.07,
+     "p95": 1582.81,
+     "p99": 2065.87,
+     "max": 2065.87
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 1,
+     "scheduledSlots": 23,
+     "attempted": 22,
+     "completed": 22,
+     "completedDuringLoad": 22,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 22,
+      "p50": 715.57,
+      "p95": 1878.14,
+      "p99": 2201.23,
+      "max": 2201.23
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- control2": 12522,
+    "control2 -> clock [ShareLock] <- claim": 10726,
+    "commit -> clock [ShareLock] <- commit": 8181,
+    "control2 -> clock [ShareLock] <- commit": 5870,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 2542,
+    "commit -> clock [ExclusiveLock] <- commit": 1735,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 1052,
+    "commit -> clock [ShareLock] <- control2": 65,
+    "control2 -> clock [ShareLock] <- untagged": 41,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 41,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 34,
+    "commit -> clock [ShareLock] <- untagged": 19,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 6,
+    "control2 -> clock [ShareLock] <- none": 4,
+    "commit -> clock [ShareLock] <- none": 3,
+    "control2 -> clock [AccessExclusiveLock] <- claim": 2,
+    "commit -> clock [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 26321,
+    "periodMs": {
+     "n": 26320,
+     "p50": 0.83,
+     "p95": 1.45,
+     "p99": 1.78,
+     "max": 4.52
+    }
+   },
+   "client": {
+    "processCpuS": 17.86,
+    "eventLoopLagMs": {
+     "n": 8101,
+     "p50": 0.06,
+     "p95": 0.88,
+     "p99": 61.76,
+     "max": 93.5
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotB1-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1752
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 19.52,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3278,
+   "commitsPerSec": 6.56,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 209.79,
+     "p95": 254.06,
+     "p99": 637.5,
+     "max": 1432.37
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 8.48,
+     "p95": 13.18,
+     "p99": 91.95,
+     "max": 582.28
+    },
+    "commit": {
+     "n": 128,
+     "p50": 235.34,
+     "p95": 325.57,
+     "p99": 1609.08,
+     "max": 2159.8
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 209.79,
+      "p95": 254.06,
+      "p99": 637.5,
+      "max": 1432.37
+     },
+     "statement": {
+      "n": 128,
+      "p50": 205.3,
+      "p95": 250.35,
+      "p99": 634.34,
+      "max": 1175.7
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.01,
+      "p95": 5.44,
+      "p99": 49.22,
+      "max": 256.4
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 8.48,
+      "p95": 13.18,
+      "p99": 91.95,
+      "max": 582.28
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.26,
+      "p95": 7.98,
+      "p99": 9.91,
+      "max": 18.34
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.38,
+      "p95": 4.98,
+      "p99": 86.8,
+      "max": 576.63
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 235.34,
+      "p95": 325.57,
+      "p99": 1609.08,
+      "max": 2159.8
+     },
+     "statement": {
+      "n": 128,
+      "p50": 232.26,
+      "p95": 322.59,
+      "p99": 1606.07,
+      "max": 2156.98
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.69,
+      "p95": 5.76,
+      "p99": 46.78,
+      "max": 76.8
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 2267,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 2267,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 133.96,
+     "p95": 158.82,
+     "p99": 681.33,
+     "max": 1522.26
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.83,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 96.94,
+     "p95": 161.22,
+     "p99": 1474.46,
+     "max": 1490.23
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 2,
+     "p50": 272.24,
+     "p95": 272.24,
+     "p99": 272.24,
+     "max": 272.24
+    },
+    "commit: clock": {
+     "n": 126,
+     "p50": 90.47,
+     "p95": 175.13,
+     "p99": 1530.52,
+     "max": 1538.82
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 2,
+     "p50": 53.95,
+     "p95": 53.95,
+     "p99": 53.95,
+     "max": 53.95
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 0.83,
+     "p95": 0.83,
+     "p99": 0.83,
+     "max": 0.83
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 15449,
+    "commit -> clock [ExclusiveLock] <- commit": 2336,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 436,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 119,
+    "commit -> clock [ShareLock] <- untagged": 32,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 12,
+    "commit -> clock [ShareLock] <- none": 8,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 4,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 21498,
+    "periodMs": {
+     "n": 21497,
+     "p50": 0.83,
+     "p95": 1.45,
+     "p99": 1.82,
+     "max": 3.45
+    }
+   },
+   "client": {
+    "processCpuS": 17.62,
+    "eventLoopLagMs": {
+     "n": 6763,
+     "p50": 0.06,
+     "p95": 1.29,
+     "p99": 63.19,
+     "max": 99.16
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotA2-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1849
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 20.51,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3121,
+   "commitsPerSec": 6.24,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 229.14,
+     "p95": 288.27,
+     "p99": 2221.15,
+     "max": 2361.19
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.09,
+     "p95": 15.18,
+     "p99": 832.25,
+     "max": 900.54
+    },
+    "commit": {
+     "n": 128,
+     "p50": 216.35,
+     "p95": 334.95,
+     "p99": 1394.26,
+     "max": 2317.42
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 229.14,
+      "p95": 288.27,
+      "p99": 2221.15,
+      "max": 2361.19
+     },
+     "statement": {
+      "n": 128,
+      "p50": 225.49,
+      "p95": 281.07,
+      "p99": 304.36,
+      "max": 383.33
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.44,
+      "p95": 8.12,
+      "p99": 1837.41,
+      "max": 2070.39
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.09,
+      "p95": 15.18,
+      "p99": 832.25,
+      "max": 900.54
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.29,
+      "p95": 8.48,
+      "p99": 11.16,
+      "max": 11.57
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.06,
+      "p95": 9.1,
+      "p99": 823.6,
+      "max": 888.66
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 216.35,
+      "p95": 334.95,
+      "p99": 1394.26,
+      "max": 2317.42
+     },
+     "statement": {
+      "n": 128,
+      "p50": 212.67,
+      "p95": 327.15,
+      "p99": 1328.39,
+      "max": 1390.43
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.86,
+      "p95": 5.5,
+      "p99": 762.43,
+      "max": 988.8
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 511,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 511,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 133.46,
+     "p95": 162.92,
+     "p99": 918.45,
+     "max": 2230.49
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.84,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 80.32,
+     "p95": 166.62,
+     "p99": 308.86,
+     "max": 1255.49
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 123,
+     "p50": 74.76,
+     "p95": 152.04,
+     "p99": 291.48,
+     "max": 1323
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 10,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 12169,
+    "commit -> clock [ExclusiveLock] <- commit": 553,
+    "commit -> clock [ShareLock] <- untagged": 22,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 10,
+    "commit -> clock [ShareLock] <- none": 5
+   },
+   "sampler": {
+    "samples": 22379,
+    "periodMs": {
+     "n": 22378,
+     "p50": 0.84,
+     "p95": 1.44,
+     "p99": 1.77,
+     "max": 3.15
+    }
+   },
+   "client": {
+    "processCpuS": 17.47,
+    "eventLoopLagMs": {
+     "n": 7143,
+     "p50": 0.06,
+     "p95": 1.35,
+     "p99": 63.85,
+     "max": 97.59
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotA2-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1880
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 21.45,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2984,
+   "commitsPerSec": 5.97,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 227.89,
+     "p95": 290.59,
+     "p99": 306.28,
+     "max": 319.62
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 8.58,
+     "p95": 11.16,
+     "p99": 13.24,
+     "max": 72.8
+    },
+    "commit": {
+     "n": 128,
+     "p50": 189.55,
+     "p95": 837.03,
+     "p99": 1300.99,
+     "max": 1524.52
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 227.89,
+      "p95": 290.59,
+      "p99": 306.28,
+      "max": 319.62
+     },
+     "statement": {
+      "n": 128,
+      "p50": 225.4,
+      "p95": 286.32,
+      "p99": 304.37,
+      "max": 315.6
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.52,
+      "p95": 4.83,
+      "p99": 10.72,
+      "max": 24.37
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 8.58,
+      "p95": 11.16,
+      "p99": 13.24,
+      "max": 72.8
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.11,
+      "p95": 7.46,
+      "p99": 10.16,
+      "max": 10.85
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.52,
+      "p95": 4.34,
+      "p99": 5.08,
+      "max": 67.91
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 189.55,
+      "p95": 837.03,
+      "p99": 1300.99,
+      "max": 1524.52
+     },
+     "statement": {
+      "n": 128,
+      "p50": 188.34,
+      "p95": 833.11,
+      "p99": 1298.16,
+      "max": 1521.23
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.79,
+      "p95": 6.99,
+      "p99": 29.85,
+      "max": 50.84
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 21,
+      "p50": 633.34,
+      "p95": 1648.27,
+      "p99": 2046.88,
+      "max": 2046.88
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 21,
+      "p50": 1.16,
+      "p95": 1.45,
+      "p99": 2.08,
+      "max": 2.08
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128,
+     "control2": 21
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 21,
+      "advisory:other(int8) [ExclusiveLock]": 21
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 4514,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 4514,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 128.99,
+     "p95": 158.64,
+     "p99": 171.85,
+     "max": 175.97
+    },
+    "control2": {
+     "n": 21,
+     "p50": 1.69,
+     "p95": 2.42,
+     "p99": 2.56,
+     "max": 2.56
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.8,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 55.07,
+     "p95": 702.68,
+     "p99": 1173.86,
+     "max": 1392.54
+    },
+    "control2": {
+     "n": 21,
+     "p50": 628.29,
+     "p95": 1642.49,
+     "p99": 2041.87,
+     "max": 2041.87
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 81,
+     "p50": 157.6,
+     "p95": 640.8,
+     "p99": 1269.6,
+     "max": 1269.6
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 0.8,
+     "p95": 0.8,
+     "p99": 0.8,
+     "max": 0.8
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 3,
+     "p50": 0.8,
+     "p95": 0.8,
+     "p99": 0.8,
+     "max": 0.8
+    },
+    "control2: clock": {
+     "n": 21,
+     "p50": 563.2,
+     "p95": 1480,
+     "p99": 1504,
+     "max": 1504
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 6,
+     "p50": 0.8,
+     "p95": 0.8,
+     "p99": 0.8,
+     "max": 0.8
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 1,
+     "scheduledSlots": 22,
+     "attempted": 21,
+     "completed": 21,
+     "completedDuringLoad": 21,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 21,
+      "p50": 633.34,
+      "p95": 1648.27,
+      "p99": 2046.88,
+      "max": 2046.88
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- control2": 12313,
+    "control2 -> clock [ShareLock] <- claim": 8520,
+    "control2 -> clock [ShareLock] <- commit": 5792,
+    "commit -> clock [ShareLock] <- commit": 4986,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 3779,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 1642,
+    "commit -> clock [ExclusiveLock] <- commit": 511,
+    "control2 -> clock [ShareLock] <- untagged": 32,
+    "commit -> clock [ShareLock] <- control2": 31,
+    "commit -> clock [ShareLock] <- untagged": 16,
+    "commit -> clock [ExclusiveLock] <- none": 8,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 6,
+    "control2 -> clock [ShareLock] <- none": 5,
+    "control2 -> clock [AccessExclusiveLock] <- claim": 3,
+    "commit -> clock [ShareLock] <- none": 3,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 3,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1,
+    "control2 -> clock [AccessExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 24843,
+    "periodMs": {
+     "n": 24842,
+     "p50": 0.8,
+     "p95": 1.47,
+     "p99": 1.81,
+     "max": 3.93
+    }
+   },
+   "client": {
+    "processCpuS": 17.62,
+    "eventLoopLagMs": {
+     "n": 6935,
+     "p50": 0.06,
+     "p95": 1.34,
+     "p99": 63.21,
+     "max": 93.09
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotB2-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1862
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 26.2,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2442,
+   "commitsPerSec": 4.88,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 2
+   },
+   "retriesPerBatch": 0.02,
+   "stageFailures": {
+    "commit:55P03": 2
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 130,
+     "p50": 256.39,
+     "p95": 339.82,
+     "p99": 1121.46,
+     "max": 1980.4
+    },
+    "prepare": {
+     "n": 130,
+     "p50": 8.7,
+     "p95": 15.44,
+     "p99": 54.46,
+     "max": 134.65
+    },
+    "commit": {
+     "n": 128,
+     "p50": 192.31,
+     "p95": 1316.98,
+     "p99": 2539.82,
+     "max": 2752.06
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 130,
+      "p50": 256.39,
+      "p95": 339.82,
+      "p99": 1121.46,
+      "max": 1980.4
+     },
+     "statement": {
+      "n": 130,
+      "p50": 248.73,
+      "p95": 321.62,
+      "p99": 556.76,
+      "max": 1586.27
+     },
+     "commitResponse": {
+      "n": 130,
+      "p50": 2.58,
+      "p95": 33.46,
+      "p99": 472.33,
+      "max": 909.13
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 130,
+      "p50": 8.7,
+      "p95": 15.44,
+      "p99": 54.46,
+      "max": 134.65
+     },
+     "statement": {
+      "n": 130,
+      "p50": 5.09,
+      "p95": 7.59,
+      "p99": 10.99,
+      "max": 17.63
+     },
+     "commitResponse": {
+      "n": 130,
+      "p50": 2.7,
+      "p95": 8.98,
+      "p99": 50.19,
+      "max": 130.82
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 192.31,
+      "p95": 1316.98,
+      "p99": 2539.82,
+      "max": 2752.06
+     },
+     "statement": {
+      "n": 128,
+      "p50": 188.1,
+      "p95": 1313.91,
+      "p99": 2487.02,
+      "max": 2535.52
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.21,
+      "p95": 21.41,
+      "p99": 586.46,
+      "max": 998.59
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 25,
+      "p50": 664.73,
+      "p95": 2282.31,
+      "p99": 2392.57,
+      "max": 2392.57
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 25,
+      "p50": 1.26,
+      "p95": 6.88,
+      "p99": 7.18,
+      "max": 7.18
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 130,
+     "prepare": 130,
+     "commit": 130,
+     "control2": 25
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 130,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 130,
+      "advisory:native-origin [ExclusiveLock]": 130
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 130,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 130
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 130,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 130,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 25,
+      "advisory:other(int8) [ExclusiveLock]": 25
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 11585,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 11585,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 130.81,
+     "p95": 168.3,
+     "p99": 1130.92,
+     "max": 1474.24
+    },
+    "control2": {
+     "n": 25,
+     "p50": 1.72,
+     "p95": 7.33,
+     "p99": 7.43,
+     "max": 7.43
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.78,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 130,
+     "p50": 51.4,
+     "p95": 1441.27,
+     "p99": 2350.56,
+     "max": 2405.16
+    },
+    "control2": {
+     "n": 25,
+     "p50": 660.71,
+     "p95": 2276.58,
+     "p99": 2386.47,
+     "max": 2386.47
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: clock": {
+     "n": 2,
+     "p50": 7.02,
+     "p95": 7.02,
+     "p99": 7.02,
+     "max": 7.02
+    },
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 95.16,
+     "p95": 95.16,
+     "p99": 95.16,
+     "max": 95.16
+    },
+    "commit: clock": {
+     "n": 85,
+     "p50": 139.62,
+     "p95": 1950,
+     "p99": 2179.32,
+     "max": 2179.32
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 60.06,
+     "p95": 60.06,
+     "p99": 60.06,
+     "max": 60.06
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 8,
+     "p50": 0.78,
+     "p95": 0.78,
+     "p99": 0.78,
+     "max": 0.78
+    },
+    "control2: clock": {
+     "n": 24,
+     "p50": 540.54,
+     "p95": 2083.38,
+     "p99": 2266.68,
+     "max": 2266.68
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 4,
+     "p50": 0.78,
+     "p95": 0.78,
+     "p99": 0.78,
+     "max": 0.78
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 5,
+     "scheduledSlots": 30,
+     "attempted": 25,
+     "completed": 25,
+     "completedDuringLoad": 25,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 25,
+      "p50": 664.73,
+      "p95": 2282.31,
+      "p99": 2392.57,
+      "max": 2392.57
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- control2": 16682,
+    "control2 -> clock [ShareLock] <- claim": 13133,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 10344,
+    "control2 -> clock [ShareLock] <- commit": 7425,
+    "commit -> clock [ShareLock] <- commit": 6388,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 3348,
+    "commit -> clock [ExclusiveLock] <- commit": 927,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 120,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 76,
+    "commit -> clock [ShareLock] <- control2": 67,
+    "control2 -> clock [ShareLock] <- untagged": 40,
+    "commit -> clock [ShareLock] <- untagged": 16,
+    "claim -> clock [ShareLock] <- control2": 15,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 8,
+    "control2 -> clock [ShareLock] <- none": 8,
+    "commit -> clock [ExclusiveLock] <- none": 6,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 4,
+    "commit -> clock [ShareLock] <- none": 3,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 2,
+    "control2 -> clock [AccessExclusiveLock] <- claim": 2,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 30740,
+    "periodMs": {
+     "n": 30739,
+     "p50": 0.78,
+     "p95": 1.45,
+     "p99": 1.79,
+     "max": 5.31
+    }
+   },
+   "client": {
+    "processCpuS": 18.3,
+    "eventLoopLagMs": {
+     "n": 9144,
+     "p50": 0.06,
+     "p95": 0.71,
+     "p99": 57.43,
+     "max": 92.54
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotB2-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1734
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 18.8,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3405,
+   "commitsPerSec": 6.81,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 261.33,
+     "p95": 332.28,
+     "p99": 972.95,
+     "max": 1111.92
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.34,
+     "p95": 12.93,
+     "p99": 20.7,
+     "max": 882.77
+    },
+    "commit": {
+     "n": 128,
+     "p50": 194.22,
+     "p95": 245.43,
+     "p99": 448.44,
+     "max": 1065.45
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 261.33,
+      "p95": 332.28,
+      "p99": 972.95,
+      "max": 1111.92
+     },
+     "statement": {
+      "n": 128,
+      "p50": 256.8,
+      "p95": 320.21,
+      "p99": 335.3,
+      "max": 503.82
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3,
+      "p95": 10.07,
+      "p99": 722.04,
+      "max": 847.01
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.34,
+      "p95": 12.93,
+      "p99": 20.7,
+      "max": 882.77
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.22,
+      "p95": 8.03,
+      "p99": 8.94,
+      "max": 10.52
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.18,
+      "p95": 6.34,
+      "p99": 11.43,
+      "max": 876.48
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 194.22,
+      "p95": 245.43,
+      "p99": 448.44,
+      "max": 1065.45
+     },
+     "statement": {
+      "n": 128,
+      "p50": 191.72,
+      "p95": 238.4,
+      "p99": 324.81,
+      "max": 445.4
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.99,
+      "p95": 6.88,
+      "p99": 27.12,
+      "max": 838.81
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 273,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 273,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 134.12,
+     "p95": 159.69,
+     "p99": 197.86,
+     "max": 986.29
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.84,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 51.2,
+     "p95": 105.3,
+     "p99": 205.55,
+     "max": 305.8
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    },
+    "commit: clock": {
+     "n": 114,
+     "p50": 49.56,
+     "p95": 105.84,
+     "p99": 170.52,
+     "max": 260.4
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 3,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 7015,
+    "commit -> clock [ExclusiveLock] <- commit": 346,
+    "commit -> clock [ShareLock] <- untagged": 25,
+    "commit -> clock [ShareLock] <- none": 3,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 3,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 20666,
+    "periodMs": {
+     "n": 20665,
+     "p50": 0.84,
+     "p95": 1.42,
+     "p99": 1.78,
+     "max": 53.4
+    }
+   },
+   "client": {
+    "processCpuS": 17.47,
+    "eventLoopLagMs": {
+     "n": 6455,
+     "p50": 0.06,
+     "p95": 1.42,
+     "p99": 65.32,
+     "max": 99.2
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotA3-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1808
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 20.22,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3165,
+   "commitsPerSec": 6.33,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 224.87,
+     "p95": 297.99,
+     "p99": 1569.37,
+     "max": 1706.38
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.26,
+     "p95": 16.14,
+     "p99": 742.12,
+     "max": 1491.51
+    },
+    "commit": {
+     "n": 128,
+     "p50": 227.37,
+     "p95": 374.84,
+     "p99": 929.7,
+     "max": 1660.85
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 224.87,
+      "p95": 297.99,
+      "p99": 1569.37,
+      "max": 1706.38
+     },
+     "statement": {
+      "n": 128,
+      "p50": 219.94,
+      "p95": 279.69,
+      "p99": 303.18,
+      "max": 305.94
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.01,
+      "p95": 26.56,
+      "p99": 1347.04,
+      "max": 1433.83
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.26,
+      "p95": 16.14,
+      "p99": 742.12,
+      "max": 1491.51
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.25,
+      "p95": 8.38,
+      "p99": 10.85,
+      "max": 10.93
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.89,
+      "p95": 11.04,
+      "p99": 736.33,
+      "max": 1484.79
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 227.37,
+      "p95": 374.84,
+      "p99": 929.7,
+      "max": 1660.85
+     },
+     "statement": {
+      "n": 128,
+      "p50": 219.14,
+      "p95": 304.58,
+      "p99": 459.33,
+      "max": 868.11
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.2,
+      "p95": 26.57,
+      "p99": 762.17,
+      "max": 1439.88
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 402,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 402,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 136.68,
+     "p95": 178.46,
+     "p99": 899.24,
+     "max": 1581.34
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.83,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 88.52,
+     "p95": 168.51,
+     "p99": 315.89,
+     "max": 749.32
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 122,
+     "p50": 80.51,
+     "p95": 149.4,
+     "p99": 247.34,
+     "max": 855.73
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 11,
+     "p50": 0.83,
+     "p95": 0.83,
+     "p99": 0.83,
+     "max": 0.83
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 12523,
+    "commit -> clock [ExclusiveLock] <- commit": 441,
+    "commit -> clock [ShareLock] <- untagged": 23,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 11,
+    "commit -> clock [ShareLock] <- none": 5
+   },
+   "sampler": {
+    "samples": 22334,
+    "periodMs": {
+     "n": 22333,
+     "p50": 0.83,
+     "p95": 1.45,
+     "p99": 1.8,
+     "max": 3.02
+    }
+   },
+   "client": {
+    "processCpuS": 17.82,
+    "eventLoopLagMs": {
+     "n": 6997,
+     "p50": 0.06,
+     "p95": 1.27,
+     "p99": 64.26,
+     "max": 94.09
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotA3-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1736
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 22.96,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2788,
+   "commitsPerSec": 5.58,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 248.34,
+     "p95": 329.22,
+     "p99": 1692.23,
+     "max": 1845.69
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 8.58,
+     "p95": 12.2,
+     "p99": 20.42,
+     "max": 24.22
+    },
+    "commit": {
+     "n": 128,
+     "p50": 176.71,
+     "p95": 904.93,
+     "p99": 1715.31,
+     "max": 1985.98
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 248.34,
+      "p95": 329.22,
+      "p99": 1692.23,
+      "max": 1845.69
+     },
+     "statement": {
+      "n": 128,
+      "p50": 245.24,
+      "p95": 314.41,
+      "p99": 362.94,
+      "max": 469.99
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.01,
+      "p95": 9.25,
+      "p99": 1382.4,
+      "max": 1550.5
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 8.58,
+      "p95": 12.2,
+      "p99": 20.42,
+      "max": 24.22
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.18,
+      "p95": 7.22,
+      "p99": 9.93,
+      "max": 11.54
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.53,
+      "p95": 4.91,
+      "p99": 12.37,
+      "max": 19.8
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 176.71,
+      "p95": 904.93,
+      "p99": 1715.31,
+      "max": 1985.98
+     },
+     "statement": {
+      "n": 128,
+      "p50": 171.21,
+      "p95": 882.24,
+      "p99": 1383.86,
+      "max": 1702.94
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.93,
+      "p95": 14.78,
+      "p99": 78.38,
+      "max": 1550.74
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 17,
+      "p50": 708.74,
+      "p95": 2648.3,
+      "p99": 2648.3,
+      "max": 2648.3
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 17,
+      "p50": 2.66,
+      "p95": 7.9,
+      "p99": 7.9,
+      "max": 7.9
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128,
+     "control2": 17
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:origin-claim [ExclusiveLock]": 128
+     },
+     "commit": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 17,
+      "advisory:other(int8) [ExclusiveLock]": 17
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 4288,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 4288,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 129.16,
+     "p95": 161.64,
+     "p99": 197.9,
+     "max": 1697.39
+    },
+    "control2": {
+     "n": 17,
+     "p50": 3.22,
+     "p95": 8.3,
+     "p99": 8.3,
+     "max": 8.3
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.84,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 40.07,
+     "p95": 740.07,
+     "p99": 1240.05,
+     "max": 1573.23
+    },
+    "control2": {
+     "n": 17,
+     "p50": 703,
+     "p95": 2640.29,
+     "p99": 2640.29,
+     "max": 2640.29
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: clock": {
+     "n": 2,
+     "p50": 5.04,
+     "p95": 5.04,
+     "p99": 5.04,
+     "max": 5.04
+    },
+    "commit: clock": {
+     "n": 77,
+     "p50": 109.2,
+     "p95": 943.32,
+     "p99": 1559.04,
+     "max": 1559.04
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 7,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    },
+    "control2: clock": {
+     "n": 17,
+     "p50": 580.44,
+     "p95": 2252.04,
+     "p99": 2252.04,
+     "max": 2252.04
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 3,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 5,
+     "scheduledSlots": 22,
+     "attempted": 17,
+     "completed": 17,
+     "completedDuringLoad": 17,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 17,
+      "p50": 708.74,
+      "p95": 2648.3,
+      "p99": 2648.3,
+      "max": 2648.3
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "control2 -> clock [ShareLock] <- claim": 12938,
+    "commit -> clock [ExclusiveLock] <- control2": 12031,
+    "commit -> clock [ShareLock] <- commit": 6256,
+    "control2 -> clock [ShareLock] <- commit": 3856,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 3696,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 1120,
+    "commit -> clock [ExclusiveLock] <- commit": 636,
+    "commit -> clock [ShareLock] <- control2": 66,
+    "control2 -> clock [ShareLock] <- untagged": 38,
+    "commit -> clock [ShareLock] <- untagged": 15,
+    "claim -> clock [ShareLock] <- control2": 8,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 7,
+    "control2 -> clock [ShareLock] <- none": 5,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 3,
+    "control2 -> clock [AccessExclusiveLock] <- claim": 3,
+    "commit -> clock [ExclusiveLock] <- none": 3,
+    "commit -> clock [ShareLock] <- none": 1,
+    "control2 -> clock [AccessExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 24501,
+    "periodMs": {
+     "n": 24500,
+     "p50": 0.84,
+     "p95": 1.51,
+     "p99": 1.83,
+     "max": 3.76
+    }
+   },
+   "client": {
+    "processCpuS": 17.9,
+    "eventLoopLagMs": {
+     "n": 7850,
+     "p50": 0.06,
+     "p95": 1.07,
+     "p99": 62.42,
+     "max": 86.17
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "c2",
+    "label": "rotB3-c2"
+   },
+   "controlKind": "c2",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1829
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 22.41,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2856,
+   "commitsPerSec": 5.71,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 1
+   },
+   "retriesPerBatch": 0.01,
+   "stageFailures": {
+    "commit:55P03": 1,
+    "control2:55P03": 1
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 129,
+     "p50": 209.43,
+     "p95": 263.48,
+     "p99": 1320.59,
+     "max": 2111.8
+    },
+    "prepare": {
+     "n": 129,
+     "p50": 8.61,
+     "p95": 14.03,
+     "p99": 31.44,
+     "max": 2015.25
+    },
+    "commit": {
+     "n": 128,
+     "p50": 252.75,
+     "p95": 686.37,
+     "p99": 1330.94,
+     "max": 2373.63
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 129,
+      "p50": 209.43,
+      "p95": 263.48,
+      "p99": 1320.59,
+      "max": 2111.8
+     },
+     "statement": {
+      "n": 129,
+      "p50": 207.31,
+      "p95": 256.15,
+      "p99": 1124.42,
+      "max": 1313.38
+     },
+     "commitResponse": {
+      "n": 129,
+      "p50": 2.81,
+      "p95": 9.72,
+      "p99": 28.62,
+      "max": 1367.03
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 129,
+      "p50": 8.61,
+      "p95": 14.03,
+      "p99": 31.44,
+      "max": 2015.25
+     },
+     "statement": {
+      "n": 129,
+      "p50": 5.21,
+      "p95": 7.49,
+      "p99": 9.96,
+      "max": 10.41
+     },
+     "commitResponse": {
+      "n": 129,
+      "p50": 2.65,
+      "p95": 6.26,
+      "p99": 23.73,
+      "max": 2007.12
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 252.75,
+      "p95": 686.37,
+      "p99": 1330.94,
+      "max": 2373.63
+     },
+     "statement": {
+      "n": 128,
+      "p50": 248.71,
+      "p95": 612.8,
+      "p99": 1284.86,
+      "max": 1323.13
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.76,
+      "p95": 23.68,
+      "p99": 994.43,
+      "max": 1088.52
+     }
+    },
+    "control2": {
+     "wholeCall": {
+      "n": 25,
+      "p50": 325.56,
+      "p95": 800.62,
+      "p99": 1281.36,
+      "max": 1281.36
+     },
+     "statement": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "commitResponse": {
+      "n": 25,
+      "p50": 1.29,
+      "p95": 13.89,
+      "p99": 22.89,
+      "max": 22.89
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [
+     "org-a/ws-a/scb-control2/scb-control2-o"
+    ],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 129,
+     "prepare": 129,
+     "commit": 129,
+     "control2": 26
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129,
+      "advisory:native-origin [ExclusiveLock]": 129
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 129,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 129,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "control2": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 26,
+      "advisory:other(int8) [ExclusiveLock]": 26
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 2477,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 2477,
+     "p50": 2,
+     "p95": 2,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 135.16,
+     "p95": 168.99,
+     "p99": 1133.46,
+     "max": 2121.83
+    },
+    "control2": {
+     "n": 25,
+     "p50": 1.96,
+     "p95": 13.99,
+     "p99": 23.27,
+     "max": 23.27
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.84,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 129,
+     "p50": 110.57,
+     "p95": 484.52,
+     "p99": 1192.35,
+     "max": 2000.9
+    },
+    "control2": {
+     "n": 26,
+     "p50": 321.51,
+     "p95": 1270.72,
+     "p99": 2158.99,
+     "max": 2158.99
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: clock": {
+     "n": 2,
+     "p50": 19.32,
+     "p95": 19.32,
+     "p99": 19.32,
+     "max": 19.32
+    },
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 57.96,
+     "p95": 57.96,
+     "p99": 57.96,
+     "max": 57.96
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 1,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    },
+    "commit: clock": {
+     "n": 117,
+     "p50": 100.8,
+     "p95": 446.04,
+     "p99": 1116.36,
+     "max": 2163
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 20.16,
+     "p95": 20.16,
+     "p99": 20.16,
+     "max": 20.16
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 9,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    },
+    "control2: clock": {
+     "n": 26,
+     "p50": 292.32,
+     "p95": 1178.52,
+     "p99": 2350.32,
+     "max": 2350.32
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 3,
+     "p50": 0.84,
+     "p95": 0.84,
+     "p99": 0.84,
+     "max": 0.84
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 2,
+     "scheduledSlots": 28,
+     "attempted": 26,
+     "completed": 25,
+     "completedDuringLoad": 25,
+     "completedAfterLoadEnd": 0,
+     "failed": {
+      "55P03": 1
+     },
+     "latencyMs": {
+      "n": 25,
+      "p50": 325.56,
+      "p95": 800.62,
+      "p99": 1281.36,
+      "max": 1281.36
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- control2": 9659,
+    "commit -> clock [ShareLock] <- commit": 9186,
+    "control2 -> clock [ShareLock] <- commit": 6378,
+    "control2 -> clock [ShareLock] <- claim": 4862,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 1451,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 1214,
+    "commit -> clock [ExclusiveLock] <- commit": 990,
+    "commit -> clock [ShareLock] <- control2": 105,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- commit": 67,
+    "commit -> clock [ShareLock] <- untagged": 27,
+    "claim -> clock [ShareLock] <- control2": 25,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 23,
+    "control2 -> clock [ShareLock] <- untagged": 21,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 8,
+    "control2 -> clock [ShareLock] <- none": 6,
+    "commit -> clock [ShareLock] <- none": 3,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 3,
+    "commit -> clock [ExclusiveLock] <- none": 3,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 2,
+    "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 1,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1,
+    "claim -> xid(row or unique-insert) [ShareLock] <- none": 1,
+    "claim -> clock [ShareLock] <- untagged": 1
+   },
+   "sampler": {
+    "samples": 24507,
+    "periodMs": {
+     "n": 24506,
+     "p50": 0.84,
+     "p95": 1.53,
+     "p99": 1.85,
+     "max": 3.77
+    }
+   },
+   "client": {
+    "processCpuS": 18.18,
+    "eventLoopLagMs": {
+     "n": 7796,
+     "p50": 0.06,
+     "p95": 1.21,
+     "p99": 59.91,
+     "max": 97.71
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 4,
+    "controls": "none",
+    "label": "rotB3-none"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 1801
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 17.98,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3560,
+   "commitsPerSec": 7.12,
+   "deliveries": {
+    "accepted_buffered": 128
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 128,
+     "p50": 211.91,
+     "p95": 248.4,
+     "p99": 412.21,
+     "max": 448.11
+    },
+    "prepare": {
+     "n": 128,
+     "p50": 9.24,
+     "p95": 21.52,
+     "p99": 36.29,
+     "max": 72.9
+    },
+    "commit": {
+     "n": 128,
+     "p50": 229.75,
+     "p95": 325.76,
+     "p99": 518.5,
+     "max": 568.84
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 211.91,
+      "p95": 248.4,
+      "p99": 412.21,
+      "max": 448.11
+     },
+     "statement": {
+      "n": 128,
+      "p50": 206.08,
+      "p95": 233.77,
+      "p99": 247.26,
+      "max": 418
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.7,
+      "p95": 26.01,
+      "p99": 172.58,
+      "max": 222.57
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 9.24,
+      "p95": 21.52,
+      "p99": 36.29,
+      "max": 72.9
+     },
+     "statement": {
+      "n": 128,
+      "p50": 5.25,
+      "p95": 9.06,
+      "p99": 10.49,
+      "max": 10.79
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.27,
+      "p95": 13.3,
+      "p99": 30.13,
+      "max": 66.77
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 229.75,
+      "p95": 325.76,
+      "p99": 518.5,
+      "max": 568.84
+     },
+     "statement": {
+      "n": 128,
+      "p50": 225.79,
+      "p95": 294.78,
+      "p99": 462.45,
+      "max": 558.84
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.3,
+      "p95": 10.3,
+      "p99": 43.63,
+      "max": 262.61
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 32
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 32
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 128,
+     "prepare": 128,
+     "commit": 128
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 417,
+    "waitersMax": 3,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 417,
+     "p50": 2,
+     "p95": 3,
+     "p99": 3,
+     "max": 3
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 135.29,
+     "p95": 158.58,
+     "p99": 175.21,
+     "max": 388.4
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.89,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 128,
+     "p50": 93.61,
+     "p95": 158.02,
+     "p99": 337.07,
+     "max": 415.44
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 125,
+     "p50": 89.89,
+     "p95": 145.07,
+     "p99": 337.31,
+     "max": 407.62
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 6,
+     "p50": 0.89,
+     "p95": 0.89,
+     "p99": 0.89,
+     "max": 0.89
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 12571,
+    "commit -> clock [ExclusiveLock] <- commit": 485,
+    "commit -> clock [ShareLock] <- untagged": 30,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 6,
+    "commit -> clock [ShareLock] <- none": 4
+   },
+   "sampler": {
+    "samples": 19258,
+    "periodMs": {
+     "n": 19257,
+     "p50": 0.89,
+     "p95": 1.45,
+     "p99": 1.75,
+     "max": 3.19
+    }
+   },
+   "client": {
+    "processCpuS": 17.56,
+    "eventLoopLagMs": {
+     "n": 6136,
+     "p50": 0.06,
+     "p95": 1.46,
+     "p99": 66.13,
+     "max": 89.47
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 16,
+    "controls": "none",
+    "label": "busy-off"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 16,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 2125
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 22.81,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2806,
+   "commitsPerSec": 5.61,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 13
+   },
+   "retriesPerBatch": 0.1,
+   "stageFailures": {
+    "commit:55P03": 9,
+    "commit:57014": 4
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 141,
+     "p50": 228.42,
+     "p95": 854.75,
+     "p99": 2971.35,
+     "max": 3046.64
+    },
+    "prepare": {
+     "n": 141,
+     "p50": 11.1,
+     "p95": 92.66,
+     "p99": 109.95,
+     "max": 123.82
+    },
+    "commit": {
+     "n": 128,
+     "p50": 1224.96,
+     "p95": 3594.48,
+     "p99": 4002.4,
+     "max": 4021.62
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 141,
+      "p50": 228.42,
+      "p95": 854.75,
+      "p99": 2971.35,
+      "max": 3046.64
+     },
+     "statement": {
+      "n": 141,
+      "p50": 220.22,
+      "p95": 697.3,
+      "p99": 803.67,
+      "max": 820.69
+     },
+     "commitResponse": {
+      "n": 141,
+      "p50": 3.18,
+      "p95": 620.66,
+      "p99": 2699.4,
+      "max": 2820.86
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 141,
+      "p50": 11.1,
+      "p95": 92.66,
+      "p99": 109.95,
+      "max": 123.82
+     },
+     "statement": {
+      "n": 141,
+      "p50": 7.17,
+      "p95": 17.25,
+      "p99": 99.75,
+      "max": 107.9
+     },
+     "commitResponse": {
+      "n": 141,
+      "p50": 2.62,
+      "p95": 10.23,
+      "p99": 81.15,
+      "max": 102.62
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 1224.96,
+      "p95": 3594.48,
+      "p99": 4002.4,
+      "max": 4021.62
+     },
+     "statement": {
+      "n": 128,
+      "p50": 1216.15,
+      "p95": 3592.3,
+      "p99": 4000.23,
+      "max": 4019
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 2.99,
+      "p95": 11.62,
+      "p99": 152.37,
+      "max": 2939.51
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u9/scb-o9",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u10/scb-o10",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u11/scb-o11",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u12/scb-o12",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u13/scb-o13",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u14/scb-o14",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u15/scb-o15",
+      "workers": 1,
+      "batches": 8
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 141,
+     "prepare": 141,
+     "commit": 141
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 141,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 141,
+      "advisory:native-origin [ExclusiveLock]": 141
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 141,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 141
+     },
+     "commit": {
+      "advisory:origin-claim [ExclusiveLock]": 141,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 141,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 10445,
+    "waitersMax": 14,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 10445,
+     "p50": 12,
+     "p95": 13,
+     "p99": 14,
+     "max": 14
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 144.29,
+     "p95": 195.92,
+     "p99": 295.35,
+     "max": 2985.31
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 1.69,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 141,
+     "p50": 1189.09,
+     "p95": 3781.03,
+     "p99": 4995.96,
+     "max": 4997.1
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 5,
+     "p50": 1.69,
+     "p95": 1.69,
+     "p99": 1.69,
+     "max": 1.69
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 123.37,
+     "p95": 135.2,
+     "p99": 135.2,
+     "max": 135.2
+    },
+    "commit: clock": {
+     "n": 137,
+     "p50": 1287.78,
+     "p95": 3089.32,
+     "p99": 4062.76,
+     "max": 4196.27
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 2,
+     "p50": 1.69,
+     "p95": 1.69,
+     "p99": 1.69,
+     "max": 1.69
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 17,
+     "p50": 1.69,
+     "p95": 3.38,
+     "p99": 3.38,
+     "max": 3.38
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- commit": 94504,
+    "commit -> clock [ShareLock] <- commit": 15233,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 865,
+    "commit -> clock [ShareLock] <- untagged": 57,
+    "commit -> clock [ExclusiveLock] <- commit+untagged": 20,
+    "commit -> clock [ExclusiveLock] <- none": 18,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 17,
+    "untagged -> clock [ExclusiveLock] <- commit+untagged": 6,
+    "claim -> xid(row or unique-insert) [ShareLock] <- none": 5,
+    "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 4,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim+commit": 4,
+    "untagged -> clock [ExclusiveLock] <- commit": 2,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 1,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 1,
+    "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 1,
+    "commit -> clock [ShareLock] <- none": 1,
+    "untagged -> clock [ShareLock] <- none": 1,
+    "commit -> clock [ExclusiveLock] <- untagged": 1,
+    "untagged -> clock [ShareLock] <- commit": 1,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 12430,
+    "periodMs": {
+     "n": 12429,
+     "p50": 1.69,
+     "p95": 3.07,
+     "p99": 3.71,
+     "max": 54.18
+    }
+   },
+   "client": {
+    "processCpuS": 22.57,
+    "eventLoopLagMs": {
+     "n": 15376,
+     "p50": 0.06,
+     "p95": 0.11,
+     "p99": 9.1,
+     "max": 183.97
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 500,
+    "c": 16,
+    "controls": "none",
+    "bufferLockBusy": true,
+    "label": "busy-on"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": true,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 16,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 2318
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 27.97,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2289,
+   "commitsPerSec": 4.58,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 15
+   },
+   "retriesPerBatch": 0.12,
+   "stageFailures": {
+    "commit:57014": 15
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 143,
+     "p50": 257.21,
+     "p95": 1049.62,
+     "p99": 1659.45,
+     "max": 1752.96
+    },
+    "prepare": {
+     "n": 143,
+     "p50": 11.75,
+     "p95": 147.95,
+     "p99": 827.31,
+     "max": 919.19
+    },
+    "commit": {
+     "n": 128,
+     "p50": 1322.41,
+     "p95": 4446.05,
+     "p99": 5078.65,
+     "max": 5638.14
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 143,
+      "p50": 257.21,
+      "p95": 1049.62,
+      "p99": 1659.45,
+      "max": 1752.96
+     },
+     "statement": {
+      "n": 143,
+      "p50": 245.55,
+      "p95": 907.45,
+      "p99": 1064.66,
+      "max": 1097.15
+     },
+     "commitResponse": {
+      "n": 143,
+      "p50": 3.51,
+      "p95": 192.98,
+      "p99": 1390.1,
+      "max": 1454.9
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 143,
+      "p50": 11.75,
+      "p95": 147.95,
+      "p99": 827.31,
+      "max": 919.19
+     },
+     "statement": {
+      "n": 143,
+      "p50": 7.08,
+      "p95": 54.08,
+      "p99": 116.47,
+      "max": 116.62
+     },
+     "commitResponse": {
+      "n": 143,
+      "p50": 3.06,
+      "p95": 142.39,
+      "p99": 822.13,
+      "max": 913.16
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 1322.41,
+      "p95": 4446.05,
+      "p99": 5078.65,
+      "max": 5638.14
+     },
+     "statement": {
+      "n": 128,
+      "p50": 1319.27,
+      "p95": 4290.74,
+      "p99": 4897.86,
+      "max": 4936.94
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.27,
+      "p95": 177.81,
+      "p99": 915.18,
+      "max": 1482.31
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-o0",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u9/scb-o9",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u10/scb-o10",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u11/scb-o11",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u12/scb-o12",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u13/scb-o13",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u14/scb-o14",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u15/scb-o15",
+      "workers": 1,
+      "batches": 8
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 143,
+     "prepare": 143,
+     "commit": 143
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 143,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 143,
+      "advisory:native-origin [ExclusiveLock]": 143
+     },
+     "prepare": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 143,
+      "advisory:origin-claim [ExclusiveLock]": 143
+     },
+     "commit": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 143,
+      "advisory:origin-claim [ExclusiveLock]": 143,
+      "advisory:native-origin [ExclusiveLock]": 130
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 12572,
+    "waitersMax": 14,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 12572,
+     "p50": 11,
+     "p95": 13,
+     "p99": 13,
+     "max": 14
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 130,
+     "p50": 155.26,
+     "p95": 456.69,
+     "p99": 1219.17,
+     "max": 1673.71
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 1.74,
+    "commitHoldsObserved": 130,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 143,
+     "p50": 1460.06,
+     "p95": 4996.57,
+     "p99": 5005.47,
+     "max": 5039.72
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: extend:ingest_lazy_native_slots": {
+     "n": 4,
+     "p50": 1.74,
+     "p95": 1.74,
+     "p99": 1.74,
+     "max": 1.74
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 133.98,
+     "p95": 144.42,
+     "p99": 144.42,
+     "max": 144.42
+    },
+    "commit: clock": {
+     "n": 140,
+     "p50": 1224.96,
+     "p95": 4252.56,
+     "p99": 4570.98,
+     "max": 4765.86
+    },
+    "commit: extend:ingest_lazy_native_slots": {
+     "n": 1,
+     "p50": 3.48,
+     "p95": 3.48,
+     "p99": 3.48,
+     "max": 3.48
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 46,
+     "p50": 1.74,
+     "p95": 753.42,
+     "p99": 791.7,
+     "max": 791.7
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ExclusiveLock] <- commit": 106312,
+    "commit -> clock [ShareLock] <- commit": 17458,
+    "commit -> xid(row or unique-insert) [ShareLock] <- commit": 2990,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 893,
+    "commit -> clock [ShareLock] <- untagged": 75,
+    "commit -> clock [ExclusiveLock] <- commit+untagged": 26,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 25,
+    "commit -> clock [ExclusiveLock] <- none": 12,
+    "claim -> xid(row or unique-insert) [ShareLock] <- untagged": 9,
+    "commit -> xid(row or unique-insert) [ShareLock] <- untagged": 6,
+    "claim -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 4,
+    "untagged -> clock [ShareLock] <- commit": 2,
+    "commit -> clock [ExclusiveLock] <- untagged": 2,
+    "untagged -> clock [ExclusiveLock] <- commit": 2,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- none": 1,
+    "commit -> extend:ingest_lazy_native_slots [ExclusiveLock] <- claim": 1,
+    "commit -> clock [ShareLock] <- none": 1
+   },
+   "sampler": {
+    "samples": 14750,
+    "periodMs": {
+     "n": 14749,
+     "p50": 1.74,
+     "p95": 3.33,
+     "p99": 4.38,
+     "max": 57.76
+    }
+   },
+   "client": {
+    "processCpuS": 25.27,
+    "eventLoopLagMs": {
+     "n": 19103,
+     "p50": 0.07,
+     "p95": 0.16,
+     "p99": 7.71,
+     "max": 150.75
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 16,
+    "controls": "none",
+    "label": "busy-off"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": false,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-hot",
+     "workers": 8,
+     "share": 0.5
+    },
+    {
+     "origin": "scb-o<k> (tail)",
+     "workers": 8,
+     "share": 0.5
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 2152
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 29.84,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 2144,
+   "commitsPerSec": 4.29,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_unavailable": 13
+   },
+   "retriesPerBatch": 0.1,
+   "stageFailures": {
+    "commit:55P03": 9,
+    "prepare:55P03": 2,
+    "claim:55P03": 2
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 139,
+     "p50": 579.31,
+     "p95": 1706.16,
+     "p99": 2239.58,
+     "max": 2246.65
+    },
+    "prepare": {
+     "n": 137,
+     "p50": 295.36,
+     "p95": 1362.85,
+     "p99": 1649.28,
+     "max": 1813.74
+    },
+    "commit": {
+     "n": 128,
+     "p50": 858.99,
+     "p95": 1971.15,
+     "p99": 2294.38,
+     "max": 2474.15
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 139,
+      "p50": 579.31,
+      "p95": 1706.16,
+      "p99": 2239.58,
+      "max": 2246.65
+     },
+     "statement": {
+      "n": 139,
+      "p50": 540.38,
+      "p95": 1701.26,
+      "p99": 2235.78,
+      "max": 2240.49
+     },
+     "commitResponse": {
+      "n": 139,
+      "p50": 3.46,
+      "p95": 60.2,
+      "p99": 393.62,
+      "max": 446.57
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 137,
+      "p50": 295.36,
+      "p95": 1362.85,
+      "p99": 1649.28,
+      "max": 1813.74
+     },
+     "statement": {
+      "n": 137,
+      "p50": 285.99,
+      "p95": 1339.81,
+      "p99": 1647.11,
+      "max": 1811.8
+     },
+     "commitResponse": {
+      "n": 137,
+      "p50": 1.97,
+      "p95": 40.51,
+      "p99": 80.88,
+      "max": 459.79
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 858.99,
+      "p95": 1971.15,
+      "p99": 2294.38,
+      "max": 2474.15
+     },
+     "statement": {
+      "n": 128,
+      "p50": 845.04,
+      "p95": 1908.02,
+      "p99": 2246.43,
+      "max": 2471.5
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.79,
+      "p95": 83.92,
+      "p99": 421.03,
+      "max": 485.41
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-hot",
+      "workers": 8,
+      "batches": 64
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 8
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 141,
+     "prepare": 139,
+     "commit": 137
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 139,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 139,
+      "advisory:native-origin [ExclusiveLock]": 139
+     },
+     "prepare": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 137,
+      "advisory:origin-claim [ExclusiveLock]": 137
+     },
+     "commit": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 6886,
+    "waitersMax": 7,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 6886,
+     "p50": 5,
+     "p95": 6,
+     "p99": 7,
+     "max": 7
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 132.29,
+     "p95": 210.66,
+     "p99": 573.54,
+     "max": 652.39
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.79,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 137,
+     "p50": 25.84,
+     "p95": 1749.59,
+     "p99": 1956.96,
+     "max": 1965.04
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: advisory:origin-claim": {
+     "n": 76,
+     "p50": 702.31,
+     "p95": 1315.35,
+     "p99": 1447.28,
+     "max": 1447.28
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 5,
+     "p50": 54.51,
+     "p95": 83.74,
+     "p99": 83.74,
+     "max": 83.74
+    },
+    "commit: advisory:origin-claim": {
+     "n": 72,
+     "p50": 778.15,
+     "p95": 1175.52,
+     "p99": 1331.94,
+     "max": 1331.94
+    },
+    "commit: clock": {
+     "n": 70,
+     "p50": 314.42,
+     "p95": 916.4,
+     "p99": 1015.94,
+     "max": 1015.94
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 12,
+     "p50": 0.79,
+     "p95": 0.79,
+     "p99": 0.79,
+     "max": 0.79
+    },
+    "prepare: advisory:origin-claim": {
+     "n": 75,
+     "p50": 661.23,
+     "p95": 1198.43,
+     "p99": 1416.47,
+     "max": 1416.47
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim": 31874,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- commit": 24966,
+    "commit -> clock [ExclusiveLock] <- commit": 22868,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 19171,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 15248,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 14450,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 11081,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 10913,
+    "commit -> clock [ShareLock] <- commit": 10441,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- commit": 9235,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 9146,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim": 9103,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim": 7129,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 7040,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 7031,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 5577,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 3537,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- commit": 3491,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 3467,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 1869,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- prepare": 1209,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 376,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- prepare": 295,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- prepare": 247,
+    "commit -> clock [ShareLock] <- untagged": 33
+   },
+   "sampler": {
+    "samples": 31147,
+    "periodMs": {
+     "n": 31146,
+     "p50": 0.79,
+     "p95": 2.02,
+     "p99": 2.57,
+     "max": 4.09
+    }
+   },
+   "client": {
+    "processCpuS": 23.59,
+    "eventLoopLagMs": {
+     "n": 21825,
+     "p50": 0.06,
+     "p95": 0.09,
+     "p99": 4.04,
+     "max": 135.73
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  },
+  {
+   "cell": {
+    "workload": "W2",
+    "n": 500,
+    "c": 16,
+    "controls": "none",
+    "bufferLockBusy": true,
+    "label": "busy-on"
+   },
+   "controlKind": "none",
+   "bufferLockBusy": true,
+   "originClaimFence": true,
+   "threads": 8,
+   "streams": [
+    {
+     "origin": "scb-hot",
+     "workers": 8,
+     "share": 0.5
+    },
+    {
+     "origin": "scb-o<k> (tail)",
+     "workers": 8,
+     "share": 0.5
+    }
+   ],
+   "backlog": {
+    "batches": 128,
+    "records": 64000,
+    "generatedMs": 2064
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 40.11,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 1596,
+   "commitsPerSec": 3.19,
+   "deliveries": {
+    "accepted_buffered": 128,
+    "error:delivery_busy": 17,
+    "error:delivery_unavailable": 5
+   },
+   "retriesPerBatch": 0.17,
+   "stageFailures": {
+    "commit:55P03": 12,
+    "prepare:55P03": 5,
+    "claim:55P03": 5
+   },
+   "stageLatencyMs": {
+    "claim": {
+     "n": 145,
+     "p50": 680.21,
+     "p95": 1909.69,
+     "p99": 2232.06,
+     "max": 2595.49
+    },
+    "prepare": {
+     "n": 140,
+     "p50": 367.4,
+     "p95": 1684.79,
+     "p99": 1957.45,
+     "max": 1983.12
+    },
+    "commit": {
+     "n": 128,
+     "p50": 1039.33,
+     "p95": 1801.53,
+     "p99": 2960.11,
+     "max": 2998.96
+    }
+   },
+   "callTimingMs": {
+    "claim": {
+     "wholeCall": {
+      "n": 145,
+      "p50": 680.21,
+      "p95": 1909.69,
+      "p99": 2232.06,
+      "max": 2595.49
+     },
+     "statement": {
+      "n": 145,
+      "p50": 677.09,
+      "p95": 1899.9,
+      "p99": 2157.09,
+      "max": 2228.7
+     },
+     "commitResponse": {
+      "n": 145,
+      "p50": 3.07,
+      "p95": 16.56,
+      "p99": 237.49,
+      "max": 1150.8
+     }
+    },
+    "prepare": {
+     "wholeCall": {
+      "n": 140,
+      "p50": 367.4,
+      "p95": 1684.79,
+      "p99": 1957.45,
+      "max": 1983.12
+     },
+     "statement": {
+      "n": 140,
+      "p50": 323.12,
+      "p95": 1641.85,
+      "p99": 1933.52,
+      "max": 1980.9
+     },
+     "commitResponse": {
+      "n": 140,
+      "p50": 1.44,
+      "p95": 12.39,
+      "p99": 1272.7,
+      "max": 1315.87
+     }
+    },
+    "commit": {
+     "wholeCall": {
+      "n": 128,
+      "p50": 1039.33,
+      "p95": 1801.53,
+      "p99": 2960.11,
+      "max": 2998.96
+     },
+     "statement": {
+      "n": 128,
+      "p50": 1032.91,
+      "p95": 1759.42,
+      "p99": 2565.89,
+      "max": 2992.35
+     },
+     "commitResponse": {
+      "n": 128,
+      "p50": 3.47,
+      "p95": 12.89,
+      "p99": 346.21,
+      "max": 1309.47
+     }
+    }
+   },
+   "tuples": {
+    "distinct": [
+     {
+      "tuple": "org-a/ws-a/scb-u0/scb-hot",
+      "workers": 8,
+      "batches": 64
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u1/scb-o1",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u2/scb-o2",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u3/scb-o3",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u4/scb-o4",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-b/ws-a/scb-u5/scb-o5",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-c/ws-a/scb-u6/scb-o6",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-d/ws-a/scb-u7/scb-o7",
+      "workers": 1,
+      "batches": 8
+     },
+     {
+      "tuple": "org-a/ws-a/scb-u8/scb-o8",
+      "workers": 1,
+      "batches": 8
+     }
+    ],
+    "controlUsers": [],
+    "sharedOriginIdAcrossUsers": []
+   },
+   "advisoryHeldByStage": {
+    "note": "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage",
+    "transactions": {
+     "claim": 150,
+     "prepare": 145,
+     "commit": 140
+    },
+    "held": {
+     "claim": {
+      "advisory:origin-claim [ExclusiveLock]": 145,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 145,
+      "advisory:native-origin [ExclusiveLock]": 145
+     },
+     "prepare": {
+      "advisory:origin-claim [ExclusiveLock]": 140,
+      "advisory:erase-gate(961996,50000) [ShareLock]": 140
+     },
+     "commit": {
+      "advisory:erase-gate(961996,50000) [ShareLock]": 128,
+      "advisory:origin-claim [ExclusiveLock]": 128,
+      "advisory:native-origin [ExclusiveLock]": 128
+     }
+    }
+   },
+   "commitsQueuedOnClock": {
+    "samplesWithTwoOrMore": 6346,
+    "waitersMax": 7,
+    "samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey": 0,
+    "distinctOriginClaimKeysAmongQueued": {
+     "n": 6346,
+     "p50": 5,
+     "p95": 6,
+     "p99": 7,
+     "max": 7
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 128,
+     "p50": 137.79,
+     "p95": 182.66,
+     "p99": 498.14,
+     "max": 1454.91
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.77,
+    "commitHoldsObserved": 128,
+    "commitsOk": 128,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 140,
+     "p50": 0,
+     "p95": 1503.67,
+     "p99": 1604.49,
+     "max": 1685.39
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "claim: advisory:origin-claim": {
+     "n": 85,
+     "p50": 693.77,
+     "p95": 1807.19,
+     "p99": 2005.85,
+     "max": 2005.85
+    },
+    "claim: xid(row or unique-insert)": {
+     "n": 5,
+     "p50": 75.46,
+     "p95": 99.33,
+     "p99": 99.33,
+     "max": 99.33
+    },
+    "commit: advisory:origin-claim": {
+     "n": 73,
+     "p50": 926.31,
+     "p95": 1896.51,
+     "p99": 2006.62,
+     "max": 2006.62
+    },
+    "commit: clock": {
+     "n": 67,
+     "p50": 472.78,
+     "p95": 719.95,
+     "p99": 809.27,
+     "max": 809.27
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 9,
+     "p50": 0.77,
+     "p95": 0.77,
+     "p99": 0.77,
+     "max": 0.77
+    },
+    "prepare: advisory:origin-claim": {
+     "n": 81,
+     "p50": 746.9,
+     "p95": 1912.68,
+     "p99": 2118.27,
+     "max": 2118.27
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "scheduledSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 30713,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim": 29885,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 28087,
+    "commit -> clock [ExclusiveLock] <- commit": 24193,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- commit": 20890,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 17387,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 16113,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim": 15961,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+commit": 15799,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 13674,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 13244,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 13094,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- commit": 11077,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- claim": 9418,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 9044,
+    "commit -> clock [ShareLock] <- commit": 8593,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+commit+prepare": 8460,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- claim+prepare": 5767,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- commit+prepare": 4031,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- commit": 3825,
+    "claim -> advisory:origin-claim [ExclusiveLock] <- prepare": 2149,
+    "prepare -> advisory:origin-claim [ExclusiveLock] <- prepare": 639,
+    "claim -> xid(row or unique-insert) [ShareLock] <- claim": 476,
+    "commit -> advisory:origin-claim [ExclusiveLock] <- prepare": 83,
+    "commit -> clock [ShareLock] <- untagged": 31
+   },
+   "sampler": {
+    "samples": 44577,
+    "periodMs": {
+     "n": 44576,
+     "p50": 0.77,
+     "p95": 1.77,
+     "p99": 2.33,
+     "max": 17.76
+    }
+   },
+   "client": {
+    "processCpuS": 26.23,
+    "eventLoopLagMs": {
+     "n": 28560,
+     "p50": 0.06,
+     "p95": 0.08,
+     "p99": 2.45,
+     "max": 109.38
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  }
+ ]
+}

@@ -49,7 +49,7 @@ const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return is
 { const u = new URL(url); if (!loopback(u.hostname) || u.password) throw Error("loopback throwaway fixture only"); }
 
 type Workload = "W1" | "W2";
-type Cell = { workload: Workload; n: number; c: number };
+type Cell = { workload: Workload; n: number; c: number; controls?: "c1" | "c2" | "none"; bufferLockBusy?: boolean; label?: string };
 type Plan = { runId?: string; threads?: number; controls?: "c1" | "c2" | "none"; totalRecords?: number; maxSeconds?: number; controlEveryMs?: number; originClaimFence?: boolean; historyLive?: boolean; cells: Cell[] };
 const plan = JSON.parse(process.argv[2] ?? "{}") as Plan;
 const RUN_ID = plan.runId ?? new Date().toISOString().replace(/[:.]/g, "-");
@@ -140,7 +140,7 @@ async function runCell(cell: Cell, index: number) {
     const tg = now();
     for (let i = 0; i < T; i++) {
       const w = new Worker(new URL("./load-worker.ts", import.meta.url).href); threads.push(w);
-      w.postMessage({ kind: "init", init: { dbUrl: dbUrl(db), generation, originClaimFence: FENCE, n: cell.n, streams: per[i]!, prefix: `scb-${index}-t${i}`, maxSeconds: MAX_S, epoch, identity } satisfies LoadInit });
+      w.postMessage({ kind: "init", init: { bufferLockBusy: cell.bufferLockBusy === true, dbUrl: dbUrl(db), generation, originClaimFence: FENCE, n: cell.n, streams: per[i]!, prefix: `scb-${index}-t${i}`, maxSeconds: MAX_S, epoch, identity } satisfies LoadInit });
       await onMsg(w, "ready");
     }
     const genMs = Math.round(now() - tg);
@@ -155,7 +155,8 @@ async function runCell(cell: Cell, index: number) {
     //   C2 "control2": sessions.ingest_reset_uploaded_sessions as bulls96_session_ingest (the Worker's front door), which runs
     //                  the full sessions.ingest_apply_ordered_control (lazy_begin, fence, receipt, apply_reset, lazy_clear, lazy_ack).
     // Missed slots (a control overrunning its slot) are counted. Both use the 2 s / 5 s limits.
-    type Ctl = { stage: string; t0: number; t1: number; ok: boolean; code?: string; pid: number };
+    type Ctl = { stage: string; t0: number; t1: number; ts?: number; ok: boolean; code?: string; pid: number };
+    let ctlTs: number | undefined;
     const controls: Ctl[] = [];
     const missed: Record<string, number> = { control: 0, control2: 0 };
     let running = true;
@@ -168,18 +169,18 @@ async function runCell(cell: Cell, index: number) {
       const c2Ledger = sqlLedger(async (sql, params) => {
         try {
           await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control2';SET LOCAL ROLE bulls96_session_ingest");
-          const r = await cc.query(sql, params as never); await cc.query("COMMIT"); return r as never;
+          const r = await cc.query(sql, params as never); ctlTs = now(); await cc.query("COMMIT"); return r as never;
         } catch (e: any) { c2Code = String(e?.code ?? "client"); await cc.query("ROLLBACK").catch(() => {}); throw e; }
       }, { acceptanceMode: "buffered", expectedGeneration: generation, originClaimFence: FENCE });
       let next = now() + CONTROL_MS + offset;
       while (running) {
         await Bun.sleep(Math.max(0, next - now())); if (!running) break;
-        let t0 = now();
+        let t0 = now(); ctlTs = undefined;
         while (next <= t0) { next += CONTROL_MS; if (next <= t0) missed[stage]!++; }
         try {
           if (stage === "control") {
             await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control'");
-            await cc.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'reset')", [c1Payload]);
+            await cc.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'reset')", [c1Payload]); ctlTs = now();
             await cc.query("COMMIT");
           } else {
             // The acceptance control: ledger.applyOrderedControl (the Worker's entrypoint) -> ingest_set_session_uploads ->
@@ -200,18 +201,19 @@ async function runCell(cell: Cell, index: number) {
               enabled: false, control: ctl, custody: { witness, sourceDigest } } as never);
             if (r?.control?.outcome !== "applied") throw Object.assign(Error("unexpected control outcome"), { code: "XXOUT:" + String(r?.control?.outcome) });
             c2Applied++;
-            controls.push({ stage, t0, t1: now(), ok: true, pid });
+            controls.push({ stage, t0, t1: now(), ts: ctlTs, ok: true, pid });
             continue;
           }
-          controls.push({ stage, t0, t1: now(), ok: true, pid });
+          controls.push({ stage, t0, t1: now(), ts: ctlTs, ok: true, pid });
         } catch (e: any) {
           await cc.query("ROLLBACK").catch(() => {});
-          controls.push({ stage, t0, t1: now(), ok: false, code: (stage === "control2" && c2Code) || String(e?.code ?? e?.cause_code ?? "client"), pid });
+          controls.push({ stage, t0, t1: now(), ts: ctlTs, ok: false, code: (stage === "control2" && c2Code) || String(e?.code ?? e?.cause_code ?? "client"), pid });
         }
       }
     };
     // One control kind per run (matched runs, never both in one cell, so control traffic is the same in every cell).
-    const controlLoops = (plan.controls ?? "c1") === "c1" ? [controlLoop("control", 0)] : plan.controls === "c2" ? [controlLoop("control2", 0)] : [];
+    const ctlKind = cell.controls ?? plan.controls ?? "c1";
+    const controlLoops = ctlKind === "c1" ? [controlLoop("control", 0)] : ctlKind === "c2" ? [controlLoop("control2", 0)] : [];
     const cpu0 = process.cpuUsage();
     const results = threads.map((w) => onMsg<any>(w, "done"));
     for (const w of threads) w.postMessage({ kind: "go" });
@@ -233,18 +235,22 @@ async function runCell(cell: Cell, index: number) {
     const periods = samples.slice(1).map((s, i) => s.ts - samples[i]!.ts);
     const period = pct(periods, 0.5) ?? 1;
     const all: (Txn & { kind: string })[] = [...txns.map((t) => ({ ...t, kind: "ledger" })),
-      ...controls.map((c) => ({ stage: c.stage, worker: -1, pid: c.pid, t0: c.t0, t1: c.t1, ok: c.ok, code: c.code, n: 0, batch: "", kind: "control" }))];
+      ...controls.map((c) => ({ stage: c.stage, worker: -1, pid: c.pid, t0: c.t0, t1: c.t1, ts: c.ts, ok: c.ok, code: c.code, n: 0, batch: "", kind: "control" }))];
     const byPid = new Map<number, (typeof all)[number][]>();
     for (const t of all) { const a = byPid.get(t.pid) ?? []; a.push(t); byPid.set(t.pid, a); }
     const txnAt = (pid: number, ts: number) => byPid.get(pid)?.find((t) => t.t0 - 1 <= ts && ts <= t.t1 + 1);
     const holdFirst = new Map<object, number>(), holdLast = new Map<object, number>(), waitCount = new Map<object, Record<string, number>>(), clockWaitFirst = new Map<object, number>();
     const graph: Record<string, number> = {};
-    const keyNames = new Map<string, string>();
+    const keyNames = new Map<string, string>(), tupleOfKey = new Map<string, string>();
+    // Granted advisory locks seen per transaction (evidence of which stages acquired which lock, and in which mode).
+    const heldAdv = new Map<object, Set<string>>();
+    const queuedOnClock: { waiters: number; distinctOriginClaimKeys: number; sameKeyPairs: number }[] = [];
     for (const s of per.flat()) {
       const r = (await pool.query(`SELECT ((a>>32)&4294967295)::text||':'||(a&4294967295)::text na,((b>>32)&4294967295)::text||':'||(b&4294967295)::text oc FROM (SELECT
         hashtextextended(jsonb_build_array('96bulls:lazy-native-origin-v1',$1::text,$2::text,$3::text)::text,0) a,
         hashtextextended(jsonb_build_array('96bulls:ingest-origin-claim-v1',$1::text,$2::text,$4::text,$3::text)::text,0) b) k`, [s.t.orgId, s.t.workspaceId, s.origin, s.t.userId])).rows[0];
       keyNames.set(r.na, "advisory:native-origin"); keyNames.set(r.oc, "advisory:origin-claim");
+      tupleOfKey.set(r.oc, `${s.t.orgId}/${s.t.workspaceId}/${s.t.userId}/${s.origin}`);
     }
     const advisoryKind = (c: number, o: number, s: number) => (c === 961996 && o === 50000 && s === 2) ? "advisory:erase-gate(961996,50000)" : `advisory:other(${s === 1 ? "int8" : "int4,int4"})`;
     const stageName = (s: Sample, pid: number) => (s.apps[pid] ?? "").replace(/^scb:/, "") || "untagged";
@@ -255,6 +261,19 @@ async function runCell(cell: Cell, index: number) {
         if (!holdFirst.has(t)) holdFirst.set(t, s.ts); holdLast.set(t, s.ts);
       });
       const clockTuple = new Set(s.tuples.filter((x) => x.rel === clockOid).map((x) => x.pid));
+      const ocByPid = new Map<number, string[]>();
+      for (const a of (s as any).adv ?? []) {
+        const name = (a.s === 1 ? keyNames.get(`${a.c}:${a.o}`) : undefined) ?? advisoryKind(a.c, a.o, a.s);
+        const t = txnAt(a.pid, s.ts);
+        if (t) { const h = heldAdv.get(t) ?? new Set<string>(); h.add(`${name} [${a.mode}]`); heldAdv.set(t, h); }
+        if (name === "advisory:origin-claim") { const l = ocByPid.get(a.pid) ?? []; l.push(`${a.c}:${a.o}`); ocByPid.set(a.pid, l); }
+      }
+      // Commits queued on the clock in this sample, and the origin-claim keys they hold (distinct keys = distinct tuples).
+      const qc = s.waits.filter((wt) => stageName(s, wt.pid) === "commit" && (wt.t === "tuple" ? wt.rel === clockOid : wt.t === "transactionid" && clockTuple.has(wt.pid)));
+      if (qc.length > 1) {
+        const keys = qc.flatMap((wt) => ocByPid.get(wt.pid) ?? []);
+        queuedOnClock.push({ waiters: qc.length, distinctOriginClaimKeys: new Set(keys).size, sameKeyPairs: keys.length - new Set(keys).size });
+      }
       for (const wt of s.waits) {
         let cls: string;
         if (wt.t === "tuple") cls = wt.rel === clockOid ? "clock" : `row:${rels.get(wt.rel) ?? wt.rel}`;
@@ -284,20 +303,35 @@ async function runCell(cell: Cell, index: number) {
     const commits = txns.filter((t) => t.stage === "commit" && t.ok);
     const seconds = (lastDone - start) / 1000;
     const result = {
-      cell, originClaimFence: FENCE, threads: T, streams: logical,
+      cell, controlKind: ctlKind, bufferLockBusy: cell.bufferLockBusy === true, originClaimFence: FENCE, threads: T, streams: logical,
       backlog: { batches: nBatches, records: nBatches * cell.n, generatedMs: genMs },
       drained: undrained === 0, undrainedBatches: undrained, drainSeconds: Math.round(seconds * 100) / 100,
       durableRecords: durable, durableRecordsPerSec: Math.round(durable / seconds), commitsPerSec: Math.round(commits.length / seconds * 100) / 100,
       deliveries: outcomes, retriesPerBatch: Math.round((tries - nBatches) / nBatches * 100) / 100,
       stageFailures: failures,
       stageLatencyMs: Object.fromEntries(["claim", "prepare", "commit"].map((s) => [s, dist(txns.filter((t) => t.stage === s && t.ok).map((t) => t.t1 - t.t0))])),
+      // Measured per call (client clock): whole-call age = BEGIN sent -> COMMIT returned; statement = the stage function's
+      // SELECT (includes every lock wait inside it); COMMIT response = COMMIT sent -> returned.
+      callTimingMs: Object.fromEntries(["claim", "prepare", "commit", "control", "control2"].map((st) => {
+        const xs = all.filter((t) => t.stage === st && t.ok && t.ts !== undefined);
+        return [st, { wholeCall: dist(xs.map((t) => t.t1 - t.t0)), statement: dist(xs.filter((t) => t.tb !== undefined).map((t) => t.ts! - t.tb!)), commitResponse: dist(xs.map((t) => t.t1 - t.ts!)) }];
+      }).filter(([, v]: any) => v.wholeCall.n)),
+      tuples: { distinct: [...per.flat().filter((x) => x.workers > 0).reduce((m, x) => { const k = `${x.t.orgId}/${x.t.workspaceId}/${x.t.userId}/${x.origin}`; const e = m.get(k) ?? { tuple: k, workers: 0, batches: 0 }; e.workers += x.workers; e.batches += x.batches; m.set(k, e); return m; }, new Map<string, { tuple: string; workers: number; batches: number }>()).values()],
+        controlUsers: ctlKind === "c1" ? [`${control.orgId}/${control.workspaceId}/${control.userId}/(reset)`] : ctlKind === "c2" ? [`${control2.orgId}/${control2.workspaceId}/${control2.userId}/scb-control2-o`] : [],
+        sharedOriginIdAcrossUsers: (() => { const m = new Map<string, Set<string>>(); for (const x of per.flat()) { const k = `${x.t.orgId}/${x.t.workspaceId}/${x.origin}`; const u = m.get(k) ?? new Set(); u.add(x.t.userId); m.set(k, u); } return [...m].filter(([, u]) => u.size > 1).map(([k]) => k); })() },
+      advisoryHeldByStage: (() => { const out: Record<string, Record<string, number>> = {}; const n: Record<string, number> = {};
+        for (const t of all) { n[t.stage] = (n[t.stage] ?? 0) + 1; for (const k of heldAdv.get(t) ?? []) { (out[t.stage] ??= {})[k] = ((out[t.stage] ??= {})[k] ?? 0) + 1; } }
+        return { note: "transactions observed holding each granted advisory lock (sampled), out of all transactions of the stage", transactions: n, held: out }; })(),
+      commitsQueuedOnClock: { samplesWithTwoOrMore: queuedOnClock.length, waitersMax: Math.max(0, ...queuedOnClock.map((q) => q.waiters)),
+        samplesWhereTwoQueuedCommitsHeldTheSameOriginClaimKey: queuedOnClock.filter((q) => q.sameKeyPairs > 0).length,
+        distinctOriginClaimKeysAmongQueued: dist(queuedOnClock.map((q) => q.distinctOriginClaimKeys)) },
       clockHoldMs: Object.fromEntries(Object.entries(holds).map(([k, v]) => [k, dist(v)])), unobservedHolds,
       sampledCoverage: { samplePeriodMsP50: period, commitHoldsObserved: (holds.commit ?? []).length, commitsOk: commits.length, note: "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion" },
       clockWaitMs: Object.fromEntries(Object.entries(clockWaits).map(([k, v]) => [k, dist(v)])),
       lockWaitMsByStageClass: Object.fromEntries(Object.entries(waitsByClass).sort().map(([k, v]) => [k, dist(v)])),
       controls: Object.fromEntries(["control", "control2"].map((st) => { const cs = controls.filter((c) => c.stage === st); return [st, {
         what: st === "control" ? "C1 ingest_lazy_clear(reset), owner" : "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
-        everyMs: CONTROL_MS, schedule: "fixed-rate, one at a time", missedSlots: missed[st], attempted: cs.length, completed: cs.filter((c) => c.ok).length,
+        everyMs: CONTROL_MS, schedule: "fixed-rate, one at a time", missedSlots: missed[st], scheduledSlots: cs.length + (missed[st] ?? 0), attempted: cs.length, completed: cs.filter((c) => c.ok).length,
         completedDuringLoad: cs.filter((c) => c.ok && c.t1 <= loadEnd).length, completedAfterLoadEnd: cs.filter((c) => c.ok && c.t1 > loadEnd).length,
         failed: cs.filter((c) => !c.ok).reduce((a, c) => ({ ...a, [c.code!]: (a[c.code!] ?? 0) + 1 }), {} as Record<string, number>),
         latencyMs: dist(cs.filter((c) => c.ok).map((c) => c.t1 - c.t0)) }]; })),
@@ -307,7 +341,7 @@ async function runCell(cell: Cell, index: number) {
       lastSeat: (await pool.query("SELECT last_seat::text s FROM sessions.ingest_receipt_seat_clock")).rows[0].s,
       seats: (await pool.query("SELECT count(*)::int n FROM sessions.ingest_receipt_seats")).rows[0].n,
     };
-    const tag = `${index}-${cell.workload}-n${cell.n}-c${cell.c}`;
+    const tag = `${index}-${cell.workload}-n${cell.n}-c${cell.c}${cell.label ? "-" + cell.label : ""}`;
     writeFileSync(join(OUT, `txns-${tag}.jsonl.gz`), gzipSync(all.map((t) => JSON.stringify({ ...t, holdFirst: holdFirst.get(t) ?? null, holdLast: holdLast.get(t) ?? null, waits: waitCount.get(t) ?? null })).join("\n")));
     writeFileSync(join(OUT, `graph-${tag}.json`), JSON.stringify(graph, null, 1));
     return result;

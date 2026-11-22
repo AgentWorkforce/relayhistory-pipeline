@@ -2,6 +2,8 @@
 
 PostgreSQL: PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1); history switch live: true; origin claim fence: true; records per run: 64000; control every 1000 ms; loopback RTT p50 0.03 ms.
 
+Tables only. Definitions, the qualified records/s reading (250 vs 500 is about equal only where retries are rare; the retry-heavy C64 cells differ), lock evidence and evidence gaps: ../comparison-runs-1-3.md.
+
 ### Throughput and failures
 
 | workload | batch | C | drained | drain s | durable rec/s | commits/s | retries/batch | stage failures (stage:SQLSTATE) |
@@ -43,20 +45,20 @@ Sampled: hold start and wait come from the lock sampler (period p50 per cell in 
 C1 (diagnostic) = sessions.ingest_lazy_clear(reset) as owner, the clock FOR UPDATE step alone. C2 (acceptance) = ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control, runtime role, 2 s / 5 s. One control kind per run.
 Completed during load = finished before the last load worker stopped; after load end = finished only once uploads had stopped (drain-only).
 
-| workload | batch | C | control | started | completed during load | completed after load end | failed (SQLSTATE) | missed slots | latency p50 / p95 / p99 / max | clock hold p50 / max |
-|---|---|---|---|---|---|---|---|---|---|---|
-| W1 | 250 | 4 | C1 | 23 | 23 | - | {} | 1 | 301 / 1146 / 1351 / 1351 | 1.4 / 5.0 |
-| W1 | 250 | 16 | C1 | 13 | 13 | - | {} | 7 | 1493 / 2121 / 2121 / 2121 | 1.2 / 3.7 |
-| W1 | 250 | 64 | C1 | 8 | 7 | - | {"57014":1} | 17 | 2643 / 5001 / 5001 / 5001 | 1.2 / 2.5 |
-| W1 | 500 | 4 | C1 | 29 | 29 | - | {} | 3 | 618 / 1647 / 1654 / 1654 | 1.3 / 8.6 |
-| W1 | 500 | 16 | C1 | 7 | 7 | - | {} | 14 | 2805 / 4333 / 4333 / 4333 | 3.5 / 6.5 |
-| W1 | 500 | 64 | C1 | 7 | 5 | - | {"57014":2} | 22 | 4583 / 4638 / 4638 / 4638 | 3.4 / 25.4 |
-| W2 | 250 | 4 | C1 | 35 | 35 | - | {} | 0 | 70 / 220 / 223 / 223 | 1.2 / 19.6 |
-| W2 | 250 | 16 | C1 | 40 | 40 | - | {} | 0 | 45 / 1361 / 1500 / 1500 | 0.7 / 6.0 |
-| W2 | 250 | 64 | C1 | 70 | 70 | - | {} | 7 | 5 / 816 / 4928 / 4928 | 0.9 / 359.4 |
-| W2 | 500 | 4 | C1 | 29 | 29 | - | {} | 0 | 123 / 963 / 1218 / 1218 | 1.1 / 12.3 |
-| W2 | 500 | 16 | C1 | 32 | 32 | - | {} | 3 | 42 / 1827 / 2599 / 2599 | 1.2 / 12.6 |
-| W2 | 500 | 64 | C1 | 47 | 47 | - | {} | 7 | 3 / 1893 / 4946 / 4946 | 0.7 / 4.1 |
+| workload | batch | C | control | slots scheduled | missed slots | started | completed during load | completed after load end | failed (SQLSTATE) | latency p50 / p95 / p99 / max | clock hold p50 / max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| W1 | 250 | 4 | C1 | 24 | 1 | 23 | 23 | - | {} | 301 / 1146 / 1351 / 1351 | 1.4 / 5.0 |
+| W1 | 250 | 16 | C1 | 20 | 7 | 13 | 13 | - | {} | 1493 / 2121 / 2121 / 2121 | 1.2 / 3.7 |
+| W1 | 250 | 64 | C1 | 25 | 17 | 8 | 7 | - | {"57014":1} | 2643 / 5001 / 5001 / 5001 | 1.2 / 2.5 |
+| W1 | 500 | 4 | C1 | 32 | 3 | 29 | 29 | - | {} | 618 / 1647 / 1654 / 1654 | 1.3 / 8.6 |
+| W1 | 500 | 16 | C1 | 21 | 14 | 7 | 7 | - | {} | 2805 / 4333 / 4333 / 4333 | 3.5 / 6.5 |
+| W1 | 500 | 64 | C1 | 29 | 22 | 7 | 5 | - | {"57014":2} | 4583 / 4638 / 4638 / 4638 | 3.4 / 25.4 |
+| W2 | 250 | 4 | C1 | 35 | 0 | 35 | 35 | - | {} | 70 / 220 / 223 / 223 | 1.2 / 19.6 |
+| W2 | 250 | 16 | C1 | 40 | 0 | 40 | 40 | - | {} | 45 / 1361 / 1500 / 1500 | 0.7 / 6.0 |
+| W2 | 250 | 64 | C1 | 77 | 7 | 70 | 70 | - | {} | 5 / 816 / 4928 / 4928 | 0.9 / 359.4 |
+| W2 | 500 | 4 | C1 | 29 | 0 | 29 | 29 | - | {} | 123 / 963 / 1218 / 1218 | 1.1 / 12.3 |
+| W2 | 500 | 16 | C1 | 35 | 3 | 32 | 32 | - | {} | 42 / 1827 / 2599 / 2599 | 1.2 / 12.6 |
+| W2 | 500 | 64 | C1 | 54 | 7 | 47 | 47 | - | {} | 3 / 1893 / 4946 / 4946 | 0.7 / 4.1 |
 
 ### Lock waits by stage and lock class (ms per transaction that waited, p50 / p95 / p99 / max; n = transactions)
 

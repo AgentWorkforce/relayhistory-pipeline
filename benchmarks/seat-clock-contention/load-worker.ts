@@ -12,8 +12,8 @@ import { batch, record, scratchStore } from "../../src/session-ingest/__tests__/
 declare const self: Worker;
 type Tenant = { orgId: string; workspaceId: string; userId: string };
 export type Stream = { t: Tenant; origin: string; workers: number; batches: number; firstWorker: number };
-export type LoadInit = { dbUrl: string; generation: string; originClaimFence: boolean; n: number; streams: Stream[]; prefix: string; maxSeconds: number; epoch: string; identity: string };
-export type Txn = { stage: string; worker: number; pid: number; t0: number; t1: number; ok: boolean; code?: string; n: number; batch: string };
+export type LoadInit = { bufferLockBusy?: boolean; dbUrl: string; generation: string; originClaimFence: boolean; n: number; streams: Stream[]; prefix: string; maxSeconds: number; epoch: string; identity: string };
+export type Txn = { stage: string; worker: number; pid: number; t0: number; t1: number; tb?: number; ts?: number; ok: boolean; code?: string; n: number; batch: string };
 type Job = { id: string; t: Tenant; n: number; raw: any; custody: any; done: boolean; tries: number };
 
 const RT = "BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:%s';SET LOCAL ROLE bulls96_session_ingest";
@@ -30,13 +30,15 @@ const pidOf = new WeakMap<pg.PoolClient, number>();
 const ledgerFor = (worker: number, n: number, id: string) => sqlLedger(async (sql, params) => {
   const c = await pool.connect();
   let pid = pidOf.get(c); if (pid === undefined) { pid = (await c.query("SELECT pg_backend_pid() p")).rows[0].p as number; pidOf.set(c, pid); }
+  // t0 BEGIN sent, tb settings done, ts statement returned, t1 COMMIT (or ROLLBACK) returned: measured per call.
   const stage = stageOf(sql), t0 = now();
+  let tb: number | undefined, ts: number | undefined;
   try {
-    await c.query(RT.replace("%s", stage)); const r = await c.query(sql, params as never); await c.query("COMMIT");
-    txns.push({ stage, worker, pid, t0, t1: now(), ok: true, n, batch: id }); return r as never;
+    await c.query(RT.replace("%s", stage)); tb = now(); const r = await c.query(sql, params as never); ts = now(); await c.query("COMMIT");
+    txns.push({ stage, worker, pid, t0, tb, ts, t1: now(), ok: true, n, batch: id }); return r as never;
   } catch (e: any) {
     await c.query("ROLLBACK").catch(() => {});
-    txns.push({ stage, worker, pid, t0, t1: now(), ok: false, code: String(e?.code ?? "client"), n, batch: id }); throw e;
+    txns.push({ stage, worker, pid, t0, tb, ts, t1: now(), ok: false, code: String(e?.code ?? "client"), n, batch: id }); throw e;
   } finally { c.release(); }
 }, { acceptanceMode: "buffered", expectedGeneration: init.generation, originClaimFence: init.originClaimFence });
 
@@ -57,7 +59,7 @@ async function job(t: Tenant, origin: string, n: number): Promise<Job> {
     { batch_id: id, account_id: await deliveryAccount(t), origin_id: origin });
   return { id, t, n, raw, custody: await custody(t, raw), done: false, tries: 0 };
 }
-const deliver = (j: Job, worker: number) => deliverBatch({ ledger: ledgerFor(worker, j.n, j.id), acceptanceMode: "buffered",
+const deliver = (j: Job, worker: number) => deliverBatch({ ledger: ledgerFor(worker, j.n, j.id), acceptanceMode: "buffered", ...(init.bufferLockBusy ? { bufferLockBusy: true } : {}),
   target: { store: scratch.store, keyRoot: "96bulls" }, custody: j.custody } as never, j.t, j.raw);
 
 self.onmessage = async (ev: MessageEvent) => {

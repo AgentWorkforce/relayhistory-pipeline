@@ -76,13 +76,28 @@ bun benchmarks/seat-clock-contention/report.ts <runId>
 docker rm -f <name>
 ```
 
-The plan is `{ runId?, totalRecords?, maxSeconds?, controlEveryMs?, controls?: "c1" | "c2" | "none", originClaimFence?, historyLive?, threads?, cells: [{ workload, n, c }] }`.
+The plan is `{ runId?, totalRecords?, maxSeconds?, controlEveryMs?, controls?: "c1" | "c2" | "none", originClaimFence?, historyLive?, threads?, cells: [{ workload, n, c, controls?, bufferLockBusy?, label? }] }`.
+A cell's `controls` overrides the plan's (used for matched rotations). `bufferLockBusy: true` turns on the Worker's
+buffer-lock busy path (`DeliverDeps.bufferLockBusy`) as a configuration variant. Plans used: `plans/matrix.json`
+(runs 1-3, with `controls` c1 / c2 / none) and `plans/unit4.json` (run 4).
 `historyLive` left unset keeps the installed `ingest_history_switch.live` (true).
 
 The script refuses any URL that is not a loopback IP literal, or that has a password. Output goes to
 `results/<runId>/`: `summary.json` (every metric), `report.md` (tables), `txns-*.jsonl.gz` (every transaction: stage,
 pid, times, SQLSTATE, first and last clock-holder sample, wait samples by class) and `graph-*.json` (the full wait graph
 counts).
+
+## Per-cell evidence fields
+
+- `tuples`: the distinct (org/workspace/user/origin) load streams, the control user, and any origin id shared across
+  users (none in W1 or W2).
+- `advisoryHeldByStage`: the transactions of each stage seen holding each granted advisory lock, with its mode.
+- `commitsQueuedOnClock`: how many origin-claim keys the commits queued together on the clock held.
+- `callTimingMs`: per stage, whole-call age, statement time and COMMIT response time, all measured per call.
+- `controls.<kind>`: slots scheduled, missed slots, started, completed during load, completed after load end, failures
+  by SQLSTATE, and latency.
+
+Definitions and the cross-run reading are in `results/comparison-runs-1-3.md`.
 
 ## What the data cannot show
 

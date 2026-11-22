@@ -2,6 +2,8 @@
 
 PostgreSQL: PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1); history switch live: true; origin claim fence: true; records per run: 64000; control every 1000 ms; loopback RTT p50 0.03 ms.
 
+Tables only. Definitions, the qualified records/s reading (250 vs 500 is about equal only where retries are rare; the retry-heavy C64 cells differ), lock evidence and evidence gaps: ../comparison-runs-1-3.md.
+
 ### Throughput and failures
 
 | workload | batch | C | drained | drain s | durable rec/s | commits/s | retries/batch | stage failures (stage:SQLSTATE) |
@@ -43,8 +45,8 @@ Sampled: hold start and wait come from the lock sampler (period p50 per cell in 
 C1 (diagnostic) = sessions.ingest_lazy_clear(reset) as owner, the clock FOR UPDATE step alone. C2 (acceptance) = ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control, runtime role, 2 s / 5 s. One control kind per run.
 Completed during load = finished before the last load worker stopped; after load end = finished only once uploads had stopped (drain-only).
 
-| workload | batch | C | control | started | completed during load | completed after load end | failed (SQLSTATE) | missed slots | latency p50 / p95 / p99 / max | clock hold p50 / max |
-|---|---|---|---|---|---|---|---|---|---|---|
+| workload | batch | C | control | slots scheduled | missed slots | started | completed during load | completed after load end | failed (SQLSTATE) | latency p50 / p95 / p99 / max | clock hold p50 / max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
 
 ### Lock waits by stage and lock class (ms per transaction that waited, p50 / p95 / p99 / max; n = transactions)
 
