@@ -13,10 +13,15 @@
  *   authoritative re-check, the same fold and the same two columns) and only title / short summary
  *   matches are served. The re-check can only drop rows, never add them.
  * - Keyset pages of DIRECTORY_LIST_MAX_LIMIT rows, newest activity first, at most
- *   SUMMARY_SEARCH_PG_MAX_PAGES pages, stopping once limit + 1 matches are found. Best-effort like
- *   the ClickHouse path: past the scan budget older matches are missed and `truncated` is true,
- *   possibly with fewer than `limit` (even zero) sessions.
- * - Every row is checked against the verified tenant.
+ *   SUMMARY_SEARCH_PG_MAX_PAGES pages, stopping once limit + 1 matches are found, and no further
+ *   page is started once SUMMARY_SEARCH_PG_BUDGET_MS have passed since the first query started.
+ *   Best-effort like the ClickHouse path: past either budget older matches are missed and
+ *   `truncated` is true, possibly with fewer than `limit` (even zero) sessions. The page bound is
+ *   on rows RETURNED per page (the database may read more); each statement is also bounded by the
+ *   read pool's statement timeout.
+ * - Every returned row, including a page's extra (limit + 1) row, is checked against the verified
+ *   tenant. A (harness, session_id) seen on an earlier page is not counted or served again (each
+ *   page is its own transaction, so a row updated between pages can be returned again).
  * No cursor, no rank: the served page is ordered as the ClickHouse path orders it
  * (last activity DESC, source DESC, session_id DESC).
  */
@@ -27,6 +32,8 @@ import type { SessionQueryTerms } from "../list-query.ts";
 
 /** Pages scanned per request: at most SUMMARY_SEARCH_PG_MAX_PAGES * DIRECTORY_LIST_MAX_LIMIT rows. */
 export const SUMMARY_SEARCH_PG_MAX_PAGES = 3;
+/** No further directory page starts once this many milliseconds have passed since the first query started. */
+export const SUMMARY_SEARCH_PG_BUDGET_MS = 2000;
 /** The directory term bounds (046010): at least 3 meaningful characters, at most 200 code points. */
 export const SUMMARY_SEARCH_PG_MIN_CHARS = SEARCH_QUERY_MIN_CHARS;
 export const SUMMARY_SEARCH_PG_MAX_CHARS = SEARCH_QUERY_MAX_CHARS;
@@ -60,20 +67,25 @@ export function compareSummaryRows(a: SummarySearchPgRow, b: SummarySearchPgRow)
 
 /**
  * At most `limit` matching rows in the ClickHouse order, the rows scanned, and whether more may
- * exist. Null: the directory query function is not installed.
+ * exist. Null: the directory query function is not installed. `now` is injectable for tests.
  */
 export async function searchSummariesPostgres(
   directory: Directory,
   tenant: { orgId: string; workspaceId: string },
   phrase: string,
   limit: number,
+  now: () => number = Date.now,
 ): Promise<{ rows: SummarySearchPgRow[]; scanned: number; truncated: boolean } | null> {
   const terms = phraseTerms(phrase);
   const matches: SummarySearchPgRow[] = [];
   let scanned = 0;
   let cursor: DirectoryCursor | undefined;
   let more = false;
+  const seen = new Set<string>();
+  const started = now();
   for (let page = 0; page < SUMMARY_SEARCH_PG_MAX_PAGES; page++) {
+    // Time budget: `more` is still true here, so the answer is truncated.
+    if (page > 0 && now() - started >= SUMMARY_SEARCH_PG_BUDGET_MS) break;
     const rows = await directory.query(tenant.orgId, tenant.workspaceId, { terms, limit: DIRECTORY_LIST_MAX_LIMIT, ...(cursor ? { cursor } : {}) });
     if (rows === null) return null;
     if (rows.length > DIRECTORY_LIST_MAX_LIMIT + 1) throw new DirectoryError("parse");
@@ -82,6 +94,9 @@ export async function searchSummariesPostgres(
     const visible = (more ? rows.slice(0, DIRECTORY_LIST_MAX_LIMIT) : rows) as Array<DirectoryListRow & { cursor_ts?: unknown }>;
     for (const row of visible) {
       if (typeof row.cursor_ts !== "string" || !CURSOR_TS.test(row.cursor_ts)) throw new DirectoryError("parse");
+      const key = `${row.harness}\u0000${row.session_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       scanned++;
       if (summaryMatches(row, phrase)) matches.push(row as SummarySearchPgRow);
       if (matches.length > limit) break;

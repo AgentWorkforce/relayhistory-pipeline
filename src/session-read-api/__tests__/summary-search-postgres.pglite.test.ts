@@ -133,4 +133,22 @@ describe("summary search, Postgres backend, real directory query", () => {
     expect([ids(r.body), r.body.truncated]).toEqual([["s-old"], false]);
     expect(served()).toMatchObject({ listed: DIRECTORY_LIST_MAX_LIMIT + 6, count: 1 });
   });
+
+  test("a title whose spacing differs from the normalised q is not found: search_text and the re-check both hold the raw title", async () => {
+    await db.exec("DELETE FROM sessions.session_directory");
+    await seed(db, [
+      { id: "s-nbsp", minute: 30, title: "Nbsp" + String.fromCodePoint(0xa0) + "quill notes" },
+      { id: "s-double", minute: 20, title: "Double  quill notes" },
+      // The SQL term matches through the branch; the raw title does not hold the phrase, so it is dropped.
+      { id: "s-nbsp-branch", minute: 10, title: "Nbsp" + String.fromCodePoint(0xa0) + "quill notes", branch: "nbsp quill" },
+      { id: "s-plain", minute: 5, title: "Plain quill notes" },
+    ]);
+    expect(ids((await get("nbsp quill")).body)).toEqual([]);
+    expect(served()).toMatchObject({ listed: 1, count: 0 });
+    expect(ids((await get("Nbsp" + String.fromCodePoint(0xa0) + "quill")).body)).toEqual([]);
+    expect(ids((await get("double quill")).body)).toEqual([]);
+    expect(ids((await get("double  quill")).body)).toEqual([]);
+    expect(ids((await get("plain" + String.fromCodePoint(0x9) + "quill")).body)).toEqual(["s-plain"]);
+    expect(ids((await get("quill notes")).body)).toEqual(["s-nbsp", "s-double", "s-nbsp-branch", "s-plain"]);
+  });
 });

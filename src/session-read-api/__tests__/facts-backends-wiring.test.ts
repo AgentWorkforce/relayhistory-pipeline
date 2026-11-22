@@ -6,10 +6,10 @@
  * it, and the hosted Lambda refuses postgres. The same for READ_API_SUMMARY_SEARCH_BACKEND (the
  * summary search store). No database is touched: pg.Pool is a recorder.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import pg from "pg";
 import { TENANT_SETTINGS_SQL } from "../liveness.ts";
-import { factsBackends, READER_LOGIN_SQL, READER_PG16_SQL, readApiDepsFromSecret, summarySearchBackend } from "../lambda.ts";
+import { createReadApiLambdaHandler, factsBackends, type FunctionUrlEvent, READER_LOGIN_SQL, READER_PG16_SQL, readApiDepsFromSecret, summarySearchBackend } from "../lambda.ts";
 import { parseSummarySearchBackend } from "../config.ts";
 import { READER_LOGIN_ROW, readerLoginAnswer } from "./reader-login-support.ts";
 import { selfhostSearchComposition } from "../server.ts";
@@ -383,5 +383,46 @@ describe("summary search backend selector (READ_API_SUMMARY_SEARCH_BACKEND)", ()
         await built.close();
       }
     }
+  });
+});
+
+describe("the hosted Lambda handler refuses READ_API_SUMMARY_SEARCH_BACKEND=postgres before the secret lookup", () => {
+  // buildApp (reached through the exported handler factory) checks the selector before it asks Secrets Manager.
+  // fetch is stubbed for the whole test, so nothing leaves the process; the unset run proves the stub sees the
+  // lookup, so zero calls with "postgres" means the refusal came first. Synthetic values only.
+  const VARS: Record<string, string> = {
+    AWS_REGION: "us-east-1", SESSION_READ_API_SECRET_ARN: "arn:aws:secretsmanager:us-east-1:000000000000:secret:synthetic",
+    AWS_ACCESS_KEY_ID: "synthetic-access-key", AWS_SECRET_ACCESS_KEY: "synthetic-secret-key", READ_API_COMPLETE_SINCE: "epoch",
+    READ_API_SUMMARY_SEARCH_ENABLED: "true",
+  };
+  const touched = [...Object.keys(VARS), "AWS_SESSION_TOKEN", "READ_API_SUMMARY_SEARCH_BACKEND"];
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = Object.fromEntries(touched.map((k) => [k, process.env[k]]));
+    for (const k of touched) delete process.env[k];
+    Object.assign(process.env, VARS);
+  });
+  afterEach(() => {
+    for (const k of touched) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    (globalThis.fetch as { mockRestore?: () => void }).mockRestore?.();
+  });
+
+  test("postgres: 503 init failure with no secret lookup; unset: the lookup is attempted", async () => {
+    const urls: string[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+      urls.push(String(input instanceof Request ? input.url : input));
+      throw new Error("no network in this test");
+    }) as typeof fetch);
+    const event = {} as FunctionUrlEvent;
+    process.env.READ_API_SUMMARY_SEARCH_BACKEND = "postgres";
+    expect((await createReadApiLambdaHandler()(event)).statusCode).toBe(503);
+    expect(urls).toEqual([]);
+    delete process.env.READ_API_SUMMARY_SEARCH_BACKEND;
+    expect((await createReadApiLambdaHandler()(event)).statusCode).toBe(503);
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("secretsmanager");
   });
 });
