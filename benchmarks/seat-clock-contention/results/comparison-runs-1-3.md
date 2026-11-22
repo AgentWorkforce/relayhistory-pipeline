@@ -52,7 +52,9 @@ Run 4 adds isolated distinct-origin cells, matched none-vs-C2 rotations at W1/50
       tail beyond it.
   - **Lock wait by class**: number of samples x period p50.
   - **Granted advisory locks (run 4) and the wait graph**.
-  - **Coverage**: the reported ratio "observed holds / committed" counts failed commits that held the clock in its
+  - **Hold coverage over successful commits** (`coverage-and-wait-split.md`, recomputed from the retained per-transaction
+  files): 100% in every cell of runs 1-4.
+- **Coverage**: the reported ratio "observed holds / committed" counts failed commits that held the clock in its
     numerator, so it can exceed 1. It is not a coverage measure. Use `unobservedHolds` instead: transactions of the
     commit or control stage that succeeded with no hold sample.
     - It is 0 in every cell of runs 2-4.
@@ -63,6 +65,37 @@ Run 4 adds isolated distinct-origin cells, matched none-vs-C2 rotations at W1/50
 - **Smoke run (scope)**: an earlier 16-worker smoke figure was produced by a prior single-threaded version of the
   harness: one cell (W1, n=250, C=16), 8,000 records, with the sampler on the client thread. It is not part of these
   results and is not comparable to them.
+
+## Workload and wrapper definitions (code at 471d291a)
+
+**Load tuples** (`bench.ts`, `runCell`):
+- The workspace is `ws-a` in every stream. Orgs rotate over `org-a`, `org-b`, `org-c`, `org-d` by stream index k (k mod 4).
+- **W1**: one stream per worker k = 0..C-1, each with user `scb-u<k>`, origin `scb-o<k>` and org `org-<k mod 4>`. That gives
+  C distinct users, C distinct origins and up to 4 orgs. No origin id is shared between users.
+- **W2**:
+  - the hot stream is org-a / scb-u0 / `scb-hot`, served by C/2 workers with 50% of the batches;
+  - the tail streams are k = 1..C/2, each with user `scb-u<k>`, origin `scb-o<k>` and org `org-<k mod 4>`, one worker
+    each, sharing the other 50%.
+  - No origin id is shared between users.
+- **Control users**: C1 is `org-a/ws-a/scb-control`. C2 is `org-a/ws-a/scb-control2`, origin `scb-control2-o`, with one
+  fresh session `scb-ctl-<cell>-<v>` per attempt.
+- **Batch shape** (`load-worker.ts`, `job`):
+  - n records with ids `<batch>-r<i>`, all revision 2;
+  - 5 sessions per batch (`session_id = <batch>-s<i mod 5>`, i.e. about n/5 records per session);
+  - the stream's origin_id on every record;
+  - a custody witness with every candidate unfenced, `current: null`, sourceControlVersion 0 and complete privacy;
+  - every batch id is new, so every record takes a new seat; there are no revision conflicts.
+- **Total**: 64,000 records per cell, i.e. 256 batches at n=250 and 128 at n=500, built before timing.
+
+**Wrappers and locks** (originClaimFence on). Each stage is one transaction as `bulls96_session_ingest`:
+
+| stage | ledger call (`src/session-ingest/ledger-sql.ts`) | SQL entry point | locks taken, in order |
+|---|---|---|---|
+| claim | `claim` -> `originScoped(... "ingest_claim_buffered_batch")` :399 | `sessions.ingest_origin_claim_buffered_batch` (`20261105062010_ingest_origin_claim_fence.sql:105`) | origin-claim key X (`ingest_origin_claim_enter`, 062010:87); erase gate (961996,50000) S (fence-owner trigger, `20261105050010_operator_session_erase_fence_check.sql:66,80`); fence row S (`ingest_lock_fences`, 062010:144); clock FOR KEY SHARE (`20261105043500_lazy_claim_clock_narrowing.sql:47`); native-origin key X (043500:58); slot rows |
+| prepare | `prepareBufferStage` -> `originScoped(... "ingest_prepare_buffer_stage")` :409 | `sessions.ingest_origin_prepare_buffer_stage` (062010:115) | origin-claim key X; erase gate S; fence row S; stage rows |
+| commit | `commitBuffered` -> `originScoped(... "ingest_commit_buffered_batch")` :416 | `sessions.ingest_origin_commit_buffered_batch` (062010:125) -> `ingest_commit_buffered_batch` (`20261105043850_ingest_acquisition_owner.sql:1270`) | origin-claim key X; erase gate S; fence row S (043850:1281); acquisition lock (043850:1319); the `UPDATE ingest_batches ... state='committed'` (043850:1325) fires `ingest_receipt_seat_ack` (`20261104053000_ingest_first_ack_seats.sql:280`), which, with the lazy policy row present, calls `ingest_lazy_ack_batch` (`20261104055000_lazy_current_custody.sql:1325`): fence row S again (043800:48), clock FOR NO KEY UPDATE (`20261105043800_lazy_ack_clock_no_key_update.sql:63`), native-origin key X (043800:73), stage row FOR UPDATE OF i (043800:76), then one slot row FOR UPDATE per record (043800:92) |
+| C2 control | `applyOrderedControl` :389 -> `ingest_set_session_uploads` :392 | `ingest_apply_ordered_control` (`20261104055000_lazy_current_custody.sql:946`) | `ingest_lazy_begin` (`20261105041000_ingest_privacy_authority.sql:826`; policy FOR SHARE, clock read without lock); fence row X via `ingest_lazy_user`; control receipts FOR UPDATE; then `ingest_lazy_clear` (055000:733): fence row, clock FOR UPDATE (055000:738), slot UPDATE of the user's owned slots |
+| C1 control | none (owner SQL) | `sessions.ingest_lazy_clear(reset)` (055000:733) | fence row X; clock FOR UPDATE (055000:738); slot UPDATE |
 
 ## Which stages take which lock (evidence, run 4)
 
@@ -114,10 +147,13 @@ clock queue. The mixed C64 cell is also the noisiest between runs (250: 1,352 / 
 
 ## No control vs C1 vs C2, one run per cell (runs 1-3)
 
-Format in each cell: none / C1 / C2. Clock wait is sampled; latencies are in ms. Upload failures exclude the control's
-own failures.
+Format in each cell: none / C1 / C2. Latencies are in ms. Upload failures exclude the control's own failures.
 
-| workload | batch | C | drain s none / C1 / C2 | commits/s none / C1 / C2 | clock wait p50 none / C1 / C2 | clock wait p95 none / C1 / C2 | commit stage p95 none / C1 / C2 | upload failures none / C1 / C2 |
+Clock wait here is **mixed** and sampled: it pools successful commits, attempts that timed out while waiting, and
+never-waited commits as zeros. `coverage-and-wait-split.md` separates the three groups per cell, and also gives hold
+coverage over successful commits.
+
+| workload | batch | C | drain s none / C1 / C2 | commits/s none / C1 / C2 | clock wait p50 (mixed) none / C1 / C2 | clock wait p95 (mixed) none / C1 / C2 | commit stage p95 none / C1 / C2 | upload failures none / C1 / C2 |
 |---|---|---|---|---|---|---|---|---|
 | W1 | 250 | 4 | 18.9 / 22.2 / 19.4 | 13.6 / 11.5 / 13.2 | 37 / 52 / 43 | 90 / 283 / 258 | 175 / 391 / 324 | 0 / 0 / 0 |
 | W1 | 250 | 16 | 18.2 / 18.8 / 20.4 | 14.1 / 13.6 / 12.5 | 690 / 864 / 914 | 1793 / 1897 / 2067 | 1864 / 1983 / 2202 | 0 / 0 / 0 |
@@ -175,6 +211,10 @@ Reading:
   - Started / missed per C2 cell: A1 22 / 3, A2 21 / 1, A3 17 / 5, B1 22 / 1, B2 25 / 5, B3 26 / 2.
   - Drain time in those cells is 21.4-26.2 s.
   - The arms differ in the number of controls as well as in their presence.
+- **Scope of this result**: run 4 supports a local throughput difference at 500 records and four workers: 6.73 commits/s
+  without ordered controls versus 5.50 with C2, about 18% lower across the rotations. The varying control dose, the
+  shared host and the COMMIT-response contribution belong next to that result. It does not identify any timeout cause
+  elsewhere and does not establish which advertised limit wins.
 - **Mechanism, inferred from the wait graph and not directly observed**: C2's lazy_clear step queues FOR UPDATE on the
   clock. The graph shows it waiting on claim transactions (FOR UPDATE conflicts with their KEY SHARE) and shows staged
   ACKs queued behind it. That new claims keep re-taking KEY SHARE while C2 waits is not observed directly.
@@ -219,7 +259,7 @@ for the busy answer's Retry-After.
    clocks on the same host. Transactions are matched to samples by pid and client-side window with a 1 ms tolerance.
 9. **Timeout censoring**: waits of failed transactions stop at the 2 s or 5 s limit. Percentiles near those limits are
    censored.
-10. **Run-1 coverage holes**: 28 C1 control holds with no sample (`unobservedHolds`). Commits are fully covered.
+10. **Run-1 coverage holes**: 27 C1 control holds with no sample (`unobservedHolds`: 1, 1, 4, 2, 15, 1, 1, 2 in eight cells). Commits are fully covered.
 11. **Harness changes between runs**: see the top of this file. Cross-run spread includes them.
 12. **No warm-up**: no warm-up delivery runs before timing. Each cell starts on a fresh copy of the template database,
     and first-seen user and org adoption happens inside the timed phase, in each stream's first delivery.

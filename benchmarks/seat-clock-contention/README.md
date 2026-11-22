@@ -103,7 +103,8 @@ counts).
 - `controls.<kind>`: slots scheduled, missed slots, started, completed during load, completed after load end, failures
   by SQLSTATE, and latency.
 
-Definitions and the cross-run reading are in `results/comparison-runs-1-3.md`.
+Definitions and the cross-run reading are in `results/comparison-runs-1-3.md`; `analyze.ts` re-derives hold coverage
+and the split clock wait from the retained files (`results/coverage-and-wait-split.md`).
 
 ## What the data cannot show
 
