@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   assertOperatorSnapshot,
+  advertisedMaxRecordsDeletionAllowed,
   retainedOperatorPlan,
   requireStateAuthority,
   operatorStateUrl,
@@ -72,7 +73,7 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit" | "advertised") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
@@ -80,23 +81,26 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
   // "custody" / "frozen-receipt": buffered + frozen custody, optionally the receipt; asyncAdmission "off".
   // "custody-shadow" / "custody-shadow-drain": shadow custody, no receipt bridge; the latter retains admission resources.
   // "neon-exit": frozen custody plus SESSIONS_NEON_EXIT, with no NEON_REPLICA binding.
+  // "advertised": buffered + explicit asyncAdmission "off" + advertisedMaxRecords 120 (one more plain-text binding).
   const mode = declared === "canonical" ? "canonical" : "buffered";
   const neonExit = declared === "neon-exit";
   const shadowDrain = declared === "custody-shadow-drain", shadow = declared === "custody-shadow" || shadowDrain;
   const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain" || shadowDrain;
   const admissionVar = declared === "admission-drain" || shadowDrain ? "drain" : "on";
+  const advertised = declared === "advertised";
   const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt || neonExit;
-  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0);
+  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0) + (advertised ? 1 : 0);
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
+      ...(declared === "buffered" || advertised || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
       ...(custody ? { custodySource: shadow ? "shadow" as const : "frozen-supabase" as const } : {}),
       ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(neonExit ? { neonExit: "on" as const } : {}),
+      ...(advertised ? { advertisedMaxRecords: 120 } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -479,6 +483,130 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       expect(String((refusal as Error).message)).toContain("native_binding_target");
       expect(String((refusal as Error).message)).not.toContain("native_neon_exit_replica");
     }
+    if (advertised) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const advertisedBinding = worker.bindings.find((b: any) => b.sid === "INGEST_ADVERTISED_MAX_RECORDS");
+      expect(advertisedBinding.data.bindings[0])
+        .toEqual({ type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "120" });
+      expect(worker.props.env.INGEST_ADVERTISED_MAX_RECORDS).toBe("120");
+      const { INGEST_ADVERTISED_MAX_RECORDS: _adv, ...unbindEnv } = worker.props.env;
+      const { advertisedMaxRecords: _max, ...withoutAdvertised } = input.sessionIngest as any;
+      const omitted = { ...input, sessionIngest: withoutAdvertised };
+      // Live (state) has "120"; the candidate omits the value, so the plan deletes the binding.
+      const unbindWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: unbindEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === advertisedBinding ? { ...b, action: "delete" } : b),
+      };
+      const at = (w: any) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": w } } });
+      const withLive = (live: unknown) => ({ ...unbindWorker, state: { ...unbindWorker.state, props: {
+        ...unbindWorker.state.props, env: { ...unbindWorker.state.props.env, INGEST_ADVERTISED_MAX_RECORDS: live } } } });
+      const withDeleted = (value: unknown) => ({ ...unbindWorker, bindings: unbindWorker.bindings.map((b: any) =>
+        b.sid !== "INGEST_ADVERTISED_MAX_RECORDS" ? b : { ...b, data: { bindings: [value] } }) });
+      // Admitted: one delete beyond the candidate's expected inventory, pinned to the live text.
+      const admitted = assertOperatorSnapshot(at(unbindWorker), omitted);
+      expect(admitted).toHaveLength(bindingCount);
+      expect(admitted.find((e) => e.sid === "INGEST_ADVERTISED_MAX_RECORDS")).toEqual({
+        sid: "INGEST_ADVERTISED_MAX_RECORDS", action: "delete",
+        target: { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "120" },
+      });
+      // Admitted for other valid live values too; the delete entry carries each live value.
+      for (const live of ["1", "500"]) {
+        const target = { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: live };
+        const each = assertOperatorSnapshot(at({ ...withLive(live), bindings: withDeleted(target).bindings }), omitted);
+        expect(each).toHaveLength(bindingCount);
+        expect(each.find((e) => e.sid === "INGEST_ADVERTISED_MAX_RECORDS")).toEqual({
+          sid: "INGEST_ADVERTISED_MAX_RECORDS", action: "delete", target });
+      }
+      // The candidate profile still sets the value while the plan row deletes it: the binding count no longer
+      // matches the candidate inventory; with a retained row for the value as well, the delete names an
+      // expected binding (both refused before the allowlist; the helper's own profile check is unit-tested).
+      for (const max of [120, 500]) {
+        const keeps = { ...input, sessionIngest: { ...withoutAdvertised, advertisedMaxRecords: max } };
+        expect(() => assertOperatorSnapshot(at(unbindWorker), keeps)).toThrow("native_binding_inventory");
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: [...unbindWorker.bindings, {
+          sid: "INGEST_ADVERTISED_MAX_RECORDS", action: "update",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: String(max) }] },
+        }] }), keeps)).toThrow("native_binding_target");
+      }
+      // The proposed env still carries the variable.
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, props: worker.props }), omitted)).toThrow("native_binding_target");
+      // Live text not in the strict 1..500 form; the deleted binding is forged to match so only the live-value
+      // check can refuse.
+      for (const live of ["0", "501", "0120", " 120", "120 ", "2.5", "+120", "", 120, undefined]) {
+        const forged = withLive(live);
+        expect(() => assertOperatorSnapshot(at({ ...forged, bindings: withDeleted({
+          type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: live }).bindings }), omitted))
+          .toThrow("native_binding_target");
+      }
+      // The native binding text differs from the live text (digest mismatch), or the binding is not plain text.
+      for (const value of [
+        { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "500" },
+        { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: 120 },
+        { type: "plain_text", name: "FOREIGN", text: "120" },
+        { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "120", extra: "x" },
+        { type: "secret_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "120" },
+        { type: "queue", name: "INGEST_ADVERTISED_MAX_RECORDS", queue_name: "foreign" },
+      ])
+        expect(() => assertOperatorSnapshot(at(withDeleted(value)), omitted)).toThrow("native_binding_target");
+      // Two deleted bindings, or an extra data key on the delete row.
+      expect(() => assertOperatorSnapshot(at({ ...unbindWorker, bindings: unbindWorker.bindings.map((b: any) =>
+        b.sid !== "INGEST_ADVERTISED_MAX_RECORDS" ? b : { ...b, data: { ...b.data, shim: "x" } }) }), omitted))
+        .toThrow("native_binding_target");
+      const generation = "e".repeat(64), accepted = `${"f".repeat(64)},${generation}`;
+      const twoDeletes = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+          ...unbindWorker.state.props.env, INGEST_EXPECT_GENERATION: "f".repeat(64), INGEST_ACCEPT_GENERATIONS: accepted } } },
+        bindings: [...unbindWorker.bindings, { sid: "INGEST_ACCEPT_GENERATIONS", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_ACCEPT_GENERATIONS", text: accepted }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at(twoDeletes), omitted)).toThrow("native_binding_inventory");
+      // The Worker resource row must be an update.
+      for (const action of ["create", "noop"])
+        expect(() => assertOperatorSnapshot(at({ ...unbindWorker, action }), omitted)).toThrow("native_binding_target");
+      // Any other plain-text unbind stays refused, even with a matching live value.
+      const foreign = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+          ...unbindWorker.state.props.env, INGEST_CLAIM_LOCK_BUSY: "on" } } },
+        bindings: [...worker.bindings, { sid: "INGEST_CLAIM_LOCK_BUSY", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_CLAIM_LOCK_BUSY", text: "on" }] } }],
+      };
+      expect(() => assertOperatorSnapshot(at({ ...foreign, props: worker.props }), input)).toThrow("native_binding_target");
+      // The same with every advertised condition satisfied: the candidate omits the value, the advertised binding
+      // is absent from the plan, the live value is valid, and a foreign INGEST_CLAIM_LOCK_BUSY delete carries text
+      // equal to it. Inventory and digest would both pass, so only the arm's name match refuses.
+      const foreignWithLiveAdvertised = {
+        ...unbindWorker,
+        state: { ...unbindWorker.state, props: { ...unbindWorker.state.props, env: {
+          ...unbindWorker.state.props.env, INGEST_CLAIM_LOCK_BUSY: "120" } } },
+        bindings: [...worker.bindings.filter((b: any) => b !== advertisedBinding), { sid: "INGEST_CLAIM_LOCK_BUSY", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_CLAIM_LOCK_BUSY", text: "120" }] } }],
+      };
+      expect(foreignWithLiveAdvertised.state.props.env.INGEST_ADVERTISED_MAX_RECORDS).toBe("120");
+      expect(() => assertOperatorSnapshot(at(foreignWithLiveAdvertised), omitted)).toThrow("native_binding_target");
+      // Changing the value is an update row checked against the candidate profile alone: live "120" -> candidate
+      // 500 with text "500" is admitted with no delete; text "500" while the candidate says 120 is refused.
+      const update500 = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: { ...worker.props.env, INGEST_ADVERTISED_MAX_RECORDS: "500" } },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b !== advertisedBinding ? b : { ...b, action: "update",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "500" }] } }),
+      };
+      const to500 = assertOperatorSnapshot(at(update500), { ...input, sessionIngest: { ...withoutAdvertised, advertisedMaxRecords: 500 } });
+      expect(to500).toHaveLength(bindingCount);
+      expect(to500.find((e) => e.sid === "INGEST_ADVERTISED_MAX_RECORDS")).toEqual({
+        sid: "INGEST_ADVERTISED_MAX_RECORDS", action: "update",
+        target: { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "500" },
+      });
+      expect(to500.some((e) => e.action === "delete")).toBe(false);
+      expect(() => assertOperatorSnapshot(at(update500), input)).toThrow("native_binding_target");
+    }
     if (custody && !frozenReceipt && !neonExit) {
       const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
       const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
@@ -684,7 +812,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit", "advertised"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -1008,6 +1136,29 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     )).toThrow("binding_render_inventory");
   });
 
+  test("advertised limit removal renders one reviewed binding deletion", () => {
+    const unbind = {
+      sid: "INGEST_ADVERTISED_MAX_RECORDS",
+      action: "delete",
+      target: { type: "plain_text", name: "INGEST_ADVERTISED_MAX_RECORDS", text: "120" },
+    };
+    const removal = [queue("noop"), flag("noop", "drain"), unbind];
+    expect(() => run(SEVEN, {}, removal)).not.toThrow();
+    const rendered = plans(SEVEN, {}, removal);
+    expect(rendered.planText).toContain("[session-ingest/INGEST_ADVERTISED_MAX_RECORDS] unbind");
+    expect(rendered.planText).toContain(", 1 binding changes");
+    const altered = (from: string, to: string) => ({
+      planText: rendered.planText.replace(from, to),
+      detailedText: rendered.detailedText.replace(from, to),
+    });
+    expect(() => operatorSafePlans(altered(
+      "[session-ingest/INGEST_ADVERTISED_MAX_RECORDS] unbind",
+      "[session-ingest/INGEST_ADVERTISED_MAX_RECORDS] delete",
+    ), secrets, removal)).toThrow("binding_render_inventory");
+    expect(() => operatorSafePlans(altered(", 1 binding changes", ", 2 binding changes"), secrets, removal))
+      .toThrow("binding_render_summary");
+  });
+
   test("a refused contract exposes actions only, never binding values", () => {
     let refusal: unknown;
     try {
@@ -1081,4 +1232,19 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     expect(() => run(FOUR, { "session-ingest": "update" }, [flag("create", "on")])).toThrow("original_plan_contract");
     expect(() => run(SEVEN, addition, [queue("create"), flag("create", "yes")])).toThrow("original_plan_contract");
   });
+});
+test("the retained plan unbinds INGEST_ADVERTISED_MAX_RECORDS only for an omitted candidate value and a strict live value", () => {
+  const profile = (extra: Record<string, unknown> = {}) =>
+    ({ ...baseInput.sessionIngest, ...extra }) as any;
+  const live = (value: unknown) => ({ INGEST_ADVERTISED_MAX_RECORDS: value });
+  for (const value of ["1", "9", "10", "120", "499", "500"])
+    expect(advertisedMaxRecordsDeletionAllowed(profile(), live(value), {})).toBe(true);
+  for (const value of ["0", "501", "999", "1000", "0120", "00", "01", "050", "099", " 120", "120 ", "2.5", "+120", "-1", "1e2", "0x10", "", 120, null, undefined])
+    expect(advertisedMaxRecordsDeletionAllowed(profile(), live(value), {})).toBe(false);
+  expect(advertisedMaxRecordsDeletionAllowed(profile(), undefined, {})).toBe(false);
+  expect(advertisedMaxRecordsDeletionAllowed(profile(), live("120"), undefined)).toBe(true);
+  expect(advertisedMaxRecordsDeletionAllowed(profile({ advertisedMaxRecords: 120 }), live("120"), {})).toBe(false);
+  expect(advertisedMaxRecordsDeletionAllowed(profile({ advertisedMaxRecords: 500 }), live("120"), {})).toBe(false);
+  expect(advertisedMaxRecordsDeletionAllowed(profile(), live("120"), live("120"))).toBe(false);
+  expect(advertisedMaxRecordsDeletionAllowed(profile(), live("120"), live(""))).toBe(false);
 });

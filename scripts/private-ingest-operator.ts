@@ -65,6 +65,7 @@ import {
   PRIVATE_INGEST_GENERATION_CONTRACT,
   type PrivateIngestGenerationContract,
 } from "../src/session-ingest/private-ingest-release.ts";
+import { parseAdvertisedMaxRecords } from "../src/session-ingest/advertised-limits.ts";
 import {
   privateIngestGithubGate,
   privateIngestGithubGet,
@@ -849,6 +850,21 @@ export function acceptGenerationsDeletionAllowed(
   return pair !== null && contract.generation === pair.from && pair.from === oldExpected &&
     hex(pair.to) && pair.to !== pair.from && oldAccepted === `${pair.from},${pair.to}`;
 }
+/**
+ * The only plan that may unbind INGEST_ADVERTISED_MAX_RECORDS: the candidate profile omits
+ * advertisedMaxRecords (back to the default 500), no value is proposed, and the live value is a
+ * strict decimal integer 1..500 (advertised-limits.ts parseAdvertisedMaxRecords).
+ */
+export function advertisedMaxRecordsDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+): boolean {
+  const live = currentEnv?.INGEST_ADVERTISED_MAX_RECORDS;
+  return sessionIngest.advertisedMaxRecords === undefined &&
+    proposedEnv?.INGEST_ADVERTISED_MAX_RECORDS === undefined &&
+    typeof live === "string" && parseAdvertisedMaxRecords(live).value !== undefined;
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -999,6 +1015,11 @@ export function assertOperatorSnapshot(
                 proposedEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined)
               refuse("native_binding_target");
             deletedValue = "on";
+          } else if (b.sid === "INGEST_ADVERTISED_MAX_RECORDS") {
+            // Removing the advertised limit (back to the default 500): only a validated live value.
+            if (!advertisedMaxRecordsDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
+              refuse("native_binding_target");
+            deletedValue = currentEnv.INGEST_ADVERTISED_MAX_RECORDS;
           } else {
             refuse("native_binding_target");
           }
