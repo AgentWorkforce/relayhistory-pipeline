@@ -216,9 +216,9 @@ keeps growing towards 90 000 is a holder whose release never ran. `on` answers a
 the same line with `outcome` = `refused` (with `age_ms`); its request line shows `delivery_busy`. In `on`,
 `/v1/turns/batches` is never refused: it is tracked as in `observe` (it still counts as a holder, so a
 delivery overlapping it is refused) and an overlapping turns batch writes the `would_refuse` line with
-`state` = `on`. Because the lease comes before the upload-consent precheck and the turn register, in `on` a
-delivery that would get 403 (consent) or 503 (turn register) gets the 429 first while another delivery of
-the same key is in flight; only the order of answers changes. It
+`state` = `on`. Because the lease comes before the upload-consent precheck, in `on` a delivery that would
+get 403 (consent) gets the 429 first while another delivery or turns batch of the same key is in flight (the
+turn register's 503 applies to turns batches, which are never refused); only the order of answers changes. It
 is not a database-lock 429: there is no `ingest.lock_alert` line for it, and the DB-error rate alert counts
 it in the denominator only, like the slot limit's 429. A holder whose release never ran (for example a request
 cancelled by its caller) expires after 90 s (the slot TTL). That expiry is a backstop, not the bound of a
@@ -233,7 +233,10 @@ any other value refuses (`private_ingest_profile_inflight_lease`). Setting it, p
 production flag change that needs its own approval. `on` to `observe` is an ordinary update. Rollback is
 unset (or empty), then plan and deploy, no code change: the plan shows one `unbind` of
 `INGEST_INFLIGHT_LEASE`, which the operator's delete allowlist (`inflightLeaseDeletionAllowed`) admits only
-when the live value is exactly `observe` or `on`; any other live value refuses (`native_binding_target`).
+when the live value is exactly `observe` or `on`; any other live value is refused, at preflight with
+`private_ingest_live_cutover` (the operator's own arm would refuse `native_binding_target`). The operator
+admits at most one unbind per plan, so removing this setting together with another removable binding in the
+same deploy is refused; do them in separate deploys.
 
 Advertised records per batch (default off; stack input `sessionIngest.advertisedMaxRecords`, an integer
 1..500, omit for off): `INGEST_ADVERTISED_MAX_RECORDS` changes only the `maxRecords` the Worker publishes on

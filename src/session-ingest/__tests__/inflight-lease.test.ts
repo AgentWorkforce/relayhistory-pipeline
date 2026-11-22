@@ -137,6 +137,13 @@ describe("inflight lease module", () => {
     expect(Object.hasOwn(other, "oldestHolderAgeMs")).toBe(false);
   });
 
+  test("oldest holder age is clamped at 0 when the clock runs backwards", () => {
+    const lease = createInflightLease({ ttlMs: 10_000 });
+    expect(lease.acquire(TENANT, T0).ok).toBe(true);
+    expect(lease.track(TENANT, T0 - 5)).toMatchObject({ holdersBefore: 1, oldestHolderAgeMs: 0 });
+    expect(lease.acquire(TENANT, T0 - 5)).toEqual({ ok: false, holdersBefore: 2, oldestHolderAgeMs: 0 });
+  });
+
   test("options must be positive integers", () => {
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => createInflightLease({ ttlMs: bad })).toThrow(/ttlMs/);
@@ -351,7 +358,8 @@ describe("acceptBatch with INGEST_INFLIGHT_LEASE", () => {
     expect(consentCalls).toBe(1);
     const b = await h.post();
     expect(b.status).toBe(429);
-    // The refused delivery reached neither the consent check, the turn register nor the ledger.
+    // The refused delivery reached neither the consent check, the turn register nor the ledger. The turn-register
+    // count is expected to be zero for any delivery; the consent counter and the ledger entry carry the assertion.
     expect(consentCalls).toBe(1);
     expect(turnRegisters).toBe(0);
     expect(h.ledger.entered).toBe(1);
