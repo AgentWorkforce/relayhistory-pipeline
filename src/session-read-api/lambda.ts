@@ -63,6 +63,8 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * columns); otherwise 501 `sources_not_configured`.
  * READ_API_SEARCH_PARTIAL_SESSIONS (self-host service only; unset/""/"refuse" here, "skip"
  * fails startup on this entry, see searchSkipsPartialSessions).
+ * READ_API_SESSION_PARTIAL_RETRYABLE (self-host service only; unset/""/"false" here, "true"
+ * fails startup on this entry, see sessionPartialRetryable).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -96,6 +98,7 @@ import {
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED,
+  READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
@@ -225,6 +228,21 @@ export function searchSkipsPartialSessions(env: NodeJS.ProcessEnv, entry: ReadAp
   if (raw !== "skip") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} must be unset, "", "refuse" or "skip"`);
   if (entry !== "service") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} other than "refuse" is served only by the self-host service`);
   return true;
+}
+
+/**
+ * READ_API_SESSION_PARTIAL_RETRYABLE (default off; self-host SERVICE only): exactly "true" turns the
+ * first page of a session-scoped read of a partial session (GET /v1/sessions/:sessionId/events,
+ * GET /v1/events?session=) from 501 `session_partial` into a retryable 503 `backend_unavailable`
+ * with `Retry-After: 60` (ReadApiDeps.sessionPartialRetryable). Unset, "" or "false" is off and
+ * unchanged. The hosted Lambda has a fallback backend, so "true" there refuses startup rather than
+ * being ignored (as searchSkipsPartialSessions does for "skip"). Anything else refuses startup,
+ * naming the variable and never its value.
+ */
+export function sessionPartialRetryable(env: NodeJS.ProcessEnv, entry: ReadAppEntry): boolean {
+  const on = sessionPartialRetryableFlag(env[READ_API_SESSION_PARTIAL_RETRYABLE]);
+  if (on && entry !== "service") throw new Error(`session read api: ${READ_API_SESSION_PARTIAL_RETRYABLE} is served only by the self-host service`);
+  return on;
 }
 
 /**
@@ -577,6 +595,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   parseSelfhostLoginSync(env);
   factsBackends(env, "lambda");
   searchSkipsPartialSessions(env, "lambda");
+  sessionPartialRetryable(env, "lambda");
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -617,6 +636,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const selfhostReadApi = parseSelfhostReadApi(env);
   const sessionQuery = sessionQueryEnabled(env);
   const searchSkipPartial = searchSkipsPartialSessions(env, entry);
+  const partialRetryable = sessionPartialRetryable(env, entry);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
@@ -754,6 +774,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...eventMessageIdDeps(env, canonical?.turns),
     ...(sessionQuery ? { sessionQuery: true } : {}),
     ...(searchSkipPartial ? { searchSkipsPartialSessions: true } : {}),
+    ...(partialRetryable ? { sessionPartialRetryable: true } : {}),
     ...outputDeps,
     ...digestDeps,
     ...coordinationDeps,

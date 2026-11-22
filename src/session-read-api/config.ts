@@ -71,6 +71,24 @@ export const READ_API_LIST_READINESS_ENABLED = "READ_API_LIST_READINESS_ENABLED"
 export const READ_API_SUMMARY_SEARCH_ENABLED = "READ_API_SUMMARY_SEARCH_ENABLED";
 /** GET /v1/sessions/:sessionId/sources: the live sources of one session id (session-sources.ts). Default off. */
 export const READ_API_SESSION_SOURCES_ENABLED = "READ_API_SESSION_SOURCES_ENABLED";
+/**
+ * Self-host SERVICE only, default off (ReadApiDeps.sessionPartialRetryable): the first page of a session-scoped read
+ * (GET /v1/sessions/:sessionId/events, GET /v1/events?session=) of a partial session answers 503
+ * `backend_unavailable`, reason `session_partial`, `Retry-After: 60`, instead of 501 `session_partial`. The hosted
+ * Lambda refuses to start with it on; the Worker refuses every request (lambda.ts sessionPartialRetryable,
+ * session-read-worker handle()).
+ */
+export const READ_API_SESSION_PARTIAL_RETRYABLE = "READ_API_SESSION_PARTIAL_RETRYABLE";
+
+/**
+ * READ_API_SESSION_PARTIAL_RETRYABLE, strict (as lambda.ts sessionQueryEnabled): unset, "" or "false" is off, exactly
+ * "true" is on, anything else throws, naming the variable and never its value. The entry gate is the caller's.
+ */
+export function sessionPartialRetryableFlag(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw !== "true") throw new Error(`session read api: ${READ_API_SESSION_PARTIAL_RETRYABLE} must be unset, "", "true" or "false"`);
+  return true;
+}
 
 /** READ_API_BRIEF_SUMMARY_ENABLED / READ_API_LIST_SHORT_SUMMARY_ENABLED / READ_API_LIST_READINESS_ENABLED: only the exact string "true" enables, as coordinationOverlapsEnabled. */
 export function exactTrueFlag(raw: unknown): boolean {
