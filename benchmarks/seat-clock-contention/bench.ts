@@ -41,6 +41,7 @@ import { TENANT } from "../../src/session-ingest/__tests__/support.ts";
 import { runMigrations, type MigrationProfile } from "../../src/hoopdb/migrate.ts";
 import { derivedSchemaAssets } from "../../src/session-pipeline/derived-schema.ts";
 import type { LoadInit, Stream, Txn } from "./load-worker.ts";
+import { sqlLedger } from "../../src/session-ingest/ledger-sql.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 if (!url) throw Error("SESSION_INGEST_TEST_PG_URL (an owned loopback fixture) is required");
@@ -49,7 +50,7 @@ const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return is
 
 type Workload = "W1" | "W2";
 type Cell = { workload: Workload; n: number; c: number };
-type Plan = { runId?: string; threads?: number; controls?: "both" | "c1" | "c2" | "none"; totalRecords?: number; maxSeconds?: number; controlEveryMs?: number; originClaimFence?: boolean; historyLive?: boolean; cells: Cell[] };
+type Plan = { runId?: string; threads?: number; controls?: "c1" | "c2" | "none"; totalRecords?: number; maxSeconds?: number; controlEveryMs?: number; originClaimFence?: boolean; historyLive?: boolean; cells: Cell[] };
 const plan = JSON.parse(process.argv[2] ?? "{}") as Plan;
 const RUN_ID = plan.runId ?? new Date().toISOString().replace(/[:.]/g, "-");
 const TOTAL = plan.totalRecords ?? 64000, MAX_S = plan.maxSeconds ?? 300, CONTROL_MS = plan.controlEveryMs ?? 1000;
@@ -158,46 +159,59 @@ async function runCell(cell: Cell, index: number) {
     const controls: Ctl[] = [];
     const missed: Record<string, number> = { control: 0, control2: 0 };
     let running = true;
-    const c2Payloads: string[] = [];
-    for (let v = 1; v <= Math.ceil(MAX_S * 1000 / CONTROL_MS) + 5; v++) {
-      const requestId = `scb-c2-${v}`;
-      const digest = (await pool.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,'reset',jsonb_build_object('request_id',$5::text))::text,'UTF8')),'hex') d",
-        [epoch, control2.orgId, control2.workspaceId, control2.userId, requestId])).rows[0].d as string;
-      const ctl = { epoch, version: String(v), digest, kind: "reset" };
-      const witness = { version: 1, issuer: "relayhistory-cloud", sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: "a".repeat(64), tenant: control2,
-        originId: null, batchId: null, batchDigest: null, sourceControlVersion: String(v), pending: true, pendingControl: ctl, privacyVersion: String(v - 1),
-        originalRecordCount: 0, candidateCount: 0, records: [], privacy: { complete: true, deletions: [], resets: [] } };
-      const sourceDigest = (await pool.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') d", [JSON.stringify(witness)])).rows[0].d as string;
-      c2Payloads.push(JSON.stringify({ tenant: control2, requestId, generation, control: ctl, custody: { witness, sourceDigest } }));
-    }
     const c1Payload = JSON.stringify({ tenant: control, requestId: "scb-control-reset" });
-    let c2Version = 0;
     const ctlClients: pg.Client[] = [];
+    let c2Applied = 0, c2Code = "";
     const controlLoop = async (stage: "control" | "control2", offset: number) => {
       const cc = new pg.Client({ connectionString: dbUrl(db) }); await cc.connect(); ctlClients.push(cc);
       const pid = (await cc.query("SELECT pg_backend_pid() p")).rows[0].p as number;
+      const c2Ledger = sqlLedger(async (sql, params) => {
+        try {
+          await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control2';SET LOCAL ROLE bulls96_session_ingest");
+          const r = await cc.query(sql, params as never); await cc.query("COMMIT"); return r as never;
+        } catch (e: any) { c2Code = String(e?.code ?? "client"); await cc.query("ROLLBACK").catch(() => {}); throw e; }
+      }, { acceptanceMode: "buffered", expectedGeneration: generation, originClaimFence: FENCE });
       let next = now() + CONTROL_MS + offset;
       while (running) {
         await Bun.sleep(Math.max(0, next - now())); if (!running) break;
-        const t0 = now();
+        let t0 = now();
         while (next <= t0) { next += CONTROL_MS; if (next <= t0) missed[stage]!++; }
         try {
           if (stage === "control") {
             await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control'");
             await cc.query("SELECT sessions.ingest_lazy_clear($1::jsonb,'reset')", [c1Payload]);
+            await cc.query("COMMIT");
           } else {
-            await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control2';SET LOCAL ROLE bulls96_session_ingest");
-            const r = (await cc.query("SELECT sessions.ingest_reset_uploaded_sessions($1::jsonb) r", [c2Payloads[c2Version]!])).rows[0].r;
-            if (r?.control?.outcome !== "applied") throw Object.assign(Error("unexpected control outcome"), { code: "XXOUT" });
+            // The acceptance control: ledger.applyOrderedControl (the Worker's entrypoint) -> ingest_set_session_uploads ->
+            // ingest_apply_ordered_control, a selection disable of a fresh session of the control user, with a
+            // relayhistory-cloud control witness; one transaction as the runtime role with the 2 s / 5 s limits.
+            const v = String(c2Applied + 1);
+            const payload = { origin_id: "scb-control2-o", sessions: [{ source: "claude", session_id: `scb-ctl-${index}-${v}` }], enabled: false };
+            const digest = (await pool.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,'selection',$5::jsonb)::text,'UTF8')),'hex') AS d",
+              [epoch, control2.orgId, control2.workspaceId, control2.userId, JSON.stringify(payload)])).rows[0].d as string;
+            const ctl = { epoch, version: v, digest, kind: "selection" as const };
+            const witness = { version: 1, issuer: "relayhistory-cloud", sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: "a".repeat(64), tenant: control2,
+              originId: payload.origin_id, batchId: null, batchDigest: null, sourceControlVersion: v, pending: true, pendingControl: ctl, privacyVersion: String(Number(v) - 1),
+              originalRecordCount: 0, candidateCount: 0, records: [], privacy: v === "1" ? { complete: true, deletions: [], resets: [] } : null };
+            const sourceDigest = (await pool.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(witness)])).rows[0].d as string;
+            t0 = now();
+            c2Code = "";
+            const r: any = await c2Ledger.applyOrderedControl!({ tenant: control2, originId: payload.origin_id, sessions: payload.sessions.map((x) => [x.source, x.session_id] as [string, string]),
+              enabled: false, control: ctl, custody: { witness, sourceDigest } } as never);
+            if (r?.control?.outcome !== "applied") throw Object.assign(Error("unexpected control outcome"), { code: "XXOUT:" + String(r?.control?.outcome) });
+            c2Applied++;
+            controls.push({ stage, t0, t1: now(), ok: true, pid });
+            continue;
           }
-          await cc.query("COMMIT");
-          if (stage === "control2") c2Version++;
           controls.push({ stage, t0, t1: now(), ok: true, pid });
-        } catch (e: any) { await cc.query("ROLLBACK").catch(() => {}); controls.push({ stage, t0, t1: now(), ok: false, code: String(e?.code ?? "client"), pid }); }
+        } catch (e: any) {
+          await cc.query("ROLLBACK").catch(() => {});
+          controls.push({ stage, t0, t1: now(), ok: false, code: (stage === "control2" && c2Code) || String(e?.code ?? e?.cause_code ?? "client"), pid });
+        }
       }
     };
-    const controlLoops = plan.controls === "c1" ? [controlLoop("control", 0)] : plan.controls === "c2" ? [controlLoop("control2", 0)]
-      : plan.controls === "none" ? [] : [controlLoop("control", 0), controlLoop("control2", Math.round(CONTROL_MS / 2))];
+    // One control kind per run (matched runs, never both in one cell, so control traffic is the same in every cell).
+    const controlLoops = (plan.controls ?? "c1") === "c1" ? [controlLoop("control", 0)] : plan.controls === "c2" ? [controlLoop("control2", 0)] : [];
     const cpu0 = process.cpuUsage();
     const results = threads.map((w) => onMsg<any>(w, "done"));
     for (const w of threads) w.postMessage({ kind: "go" });
@@ -213,6 +227,7 @@ async function runCell(cell: Cell, index: number) {
     for (const d of done) for (const [k, v] of Object.entries(d.outcomes as Record<string, number>)) outcomes[k] = (outcomes[k] ?? 0) + v;
     const nBatches = done.reduce((a, d) => a + d.batches, 0), tries = done.reduce((a, d) => a + d.tries, 0), undrained = done.reduce((a, d) => a + d.undrained, 0);
     const lags: number[] = done.flatMap((d) => d.lags);
+    const loadEnd = Math.max(...done.map((d) => d.end as number));
 
     // Analysis.
     const periods = samples.slice(1).map((s, i) => s.ts - samples[i]!.ts);
@@ -277,11 +292,13 @@ async function runCell(cell: Cell, index: number) {
       stageFailures: failures,
       stageLatencyMs: Object.fromEntries(["claim", "prepare", "commit"].map((s) => [s, dist(txns.filter((t) => t.stage === s && t.ok).map((t) => t.t1 - t.t0))])),
       clockHoldMs: Object.fromEntries(Object.entries(holds).map(([k, v]) => [k, dist(v)])), unobservedHolds,
+      sampledCoverage: { samplePeriodMsP50: period, commitHoldsObserved: (holds.commit ?? []).length, commitsOk: commits.length, note: "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion" },
       clockWaitMs: Object.fromEntries(Object.entries(clockWaits).map(([k, v]) => [k, dist(v)])),
       lockWaitMsByStageClass: Object.fromEntries(Object.entries(waitsByClass).sort().map(([k, v]) => [k, dist(v)])),
       controls: Object.fromEntries(["control", "control2"].map((st) => { const cs = controls.filter((c) => c.stage === st); return [st, {
-        what: st === "control" ? "C1 ingest_lazy_clear(reset), owner" : "C2 ingest_reset_uploaded_sessions -> ingest_apply_ordered_control, runtime role",
+        what: st === "control" ? "C1 ingest_lazy_clear(reset), owner" : "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
         everyMs: CONTROL_MS, schedule: "fixed-rate, one at a time", missedSlots: missed[st], attempted: cs.length, completed: cs.filter((c) => c.ok).length,
+        completedDuringLoad: cs.filter((c) => c.ok && c.t1 <= loadEnd).length, completedAfterLoadEnd: cs.filter((c) => c.ok && c.t1 > loadEnd).length,
         failed: cs.filter((c) => !c.ok).reduce((a, c) => ({ ...a, [c.code!]: (a[c.code!] ?? 0) + 1 }), {} as Record<string, number>),
         latencyMs: dist(cs.filter((c) => c.ok).map((c) => c.t1 - c.t0)) }]; })),
       waitGraphSamples: Object.fromEntries(Object.entries(graph).sort((a, b) => b[1] - a[1]).slice(0, 25)),

@@ -27,11 +27,17 @@ against a disposable loopback PostgreSQL that you create and destroy. CI does no
     advisory key, and commits also queue behind commits on the clock.
   - A failed delivery goes back on its worker's queue and is re-uploaded after a 100-300 ms pause, as a client would.
   - Warm-up deliveries (first-seen user and org adoption) run before timing and are excluded.
-- **Ordered control.** At a fixed rate (`controlEveryMs`, default 1000 ms, one at a time), an owner connection runs
-  `sessions.ingest_lazy_clear(<reset for a dedicated control user>, 'reset')` with the same 2 s / 5 s limits. That is the
-  step of the lazy ordered control (`ingest_apply_ordered_control` -> `ingest_lazy_clear`) that takes the clock row
-  `FOR UPDATE`, which conflicts with every other clock lock mode. The harness reports attempts, completions, failures by
-  SQLSTATE, latency and missed slots.
+- **Controls**, one kind per run (matched runs; never both in one cell), at a fixed rate (`controlEveryMs`, default
+  1000 ms, one at a time), with the 2 s / 5 s limits:
+  - `controls: "c1"` (diagnostic): `sessions.ingest_lazy_clear(<reset for a dedicated control user>, 'reset')` as the
+    owner. This is the step of the lazy ordered control that takes the clock row `FOR UPDATE`, which conflicts with
+    every other clock lock mode.
+  - `controls: "c2"` (acceptance): the Worker's entrypoint `ledger.applyOrderedControl` -> `ingest_set_session_uploads`
+    -> `ingest_apply_ordered_control`, as `bulls96_session_ingest`. Each attempt is a selection disable of a fresh session
+    of a dedicated control user, with a relayhistory-cloud control witness (the witness shape used by the
+    review/receipt-clock-fix-t2-r2-bench fixture).
+  - For each control the harness reports: started, completed during load, completed only after load ended (drain-only),
+    failures by SQLSTATE, latency, and missed slots.
 - **Client.** Load runs in up to 8 Bun worker threads (`load-worker.ts`). The lock sampler runs in its own thread
   (`sampler-worker.ts`), so client CPU cannot delay it. The client's event-loop lag and the sampler period are reported
   for every run.
@@ -70,7 +76,7 @@ bun benchmarks/seat-clock-contention/report.ts <runId>
 docker rm -f <name>
 ```
 
-The plan is `{ runId?, totalRecords?, maxSeconds?, controlEveryMs?, originClaimFence?, historyLive?, threads?, cells: [{ workload, n, c }] }`.
+The plan is `{ runId?, totalRecords?, maxSeconds?, controlEveryMs?, controls?: "c1" | "c2" | "none", originClaimFence?, historyLive?, threads?, cells: [{ workload, n, c }] }`.
 `historyLive` left unset keeps the installed `ingest_history_switch.live` (true).
 
 The script refuses any URL that is not a loopback IP literal, or that has a password. Output goes to

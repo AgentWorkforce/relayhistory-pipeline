@@ -15,14 +15,20 @@ const out: string[] = [];
 out.push(`## ${runId}`, "", `PostgreSQL: ${meta.serverVersion.split(" on ")[0]}; history switch live: ${meta.template.historyLive}; origin claim fence: ${meta.plan.originClaimFence}; records per run: ${meta.plan.totalRecords}; control every ${meta.plan.controlEveryMs} ms; loopback RTT p50 ${meta.rtt.p50} ms.`, "");
 out.push("### Throughput and failures", "", "| workload | batch | C | drained | drain s | durable rec/s | commits/s | retries/batch | stage failures (stage:SQLSTATE) |", "|---|---|---|---|---|---|---|---|---|");
 for (const r of rows) out.push(`| ${cell(r)} | ${r.drained ? "yes" : `no (${r.undrainedBatches} left)`} | ${f(r.drainSeconds, 1)} | ${r.durableRecordsPerSec} | ${f(r.commitsPerSec, 2)} | ${f(r.retriesPerBatch, 2)} | ${fails(r)} |`);
-out.push("", "### Clock hold vs wait, commit transactions (ms, p50 / p95 / p99 / max)", "", "| workload | batch | C | hold | wait for clock | commit stage latency (ok) | holds unobserved |", "|---|---|---|---|---|---|---|");
-for (const r of rows) out.push(`| ${cell(r)} | ${d3(r.clockHoldMs.commit)} | ${d3(r.clockWaitMs.commit)} | ${d3(r.stageLatencyMs.commit)} | ${r.unobservedHolds} |`);
-out.push("", "### Controls during load (fixed rate, one at a time each; latency and hold in ms)", "",
-  "C1 = sessions.ingest_lazy_clear(reset) as owner (the clock FOR UPDATE step). C2 = sessions.ingest_reset_uploaded_sessions as the runtime role (full ingest_apply_ordered_control).", "",
-  "| workload | batch | C | control | attempted | completed | failed (SQLSTATE) | missed slots | latency p50 / p95 / p99 / max | clock hold p50 / max |", "|---|---|---|---|---|---|---|---|---|---|");
+out.push("", "### Clock hold vs wait, commit transactions (ms, p50 / p95 / p99 / max)", "",
+  "Sampled: hold start and wait come from the lock sampler (period p50 per cell in the last table, about 0.6-2.8 ms); hold end is the COMMIT completion. Coverage = observed holds (commit transactions of any outcome, incl. ones that later failed 57014) / committed commits.", "", "| workload | batch | C | hold | wait for clock | commit stage latency (ok) | observed holds / committed | sample period p50 |", "|---|---|---|---|---|---|---|---|");
+for (const r of rows) out.push(`| ${cell(r)} | ${d3(r.clockHoldMs.commit)} | ${d3(r.clockWaitMs.commit)} | ${d3(r.stageLatencyMs.commit)} | ${r.clockHoldMs.commit?.n ?? 0}/${r.stageLatencyMs.commit.n} | ${r.sampler.periodMs.p50} ms |`);
+out.push("", "### Controls during load (fixed rate, one at a time; latency and hold in ms)", "",
+  "C1 (diagnostic) = sessions.ingest_lazy_clear(reset) as owner, the clock FOR UPDATE step alone. C2 (acceptance) = ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control, runtime role, 2 s / 5 s. One control kind per run.",
+  "Completed during load = finished before the last load worker stopped; after load end = finished only once uploads had stopped (drain-only).", "",
+  "| workload | batch | C | control | started | completed during load | completed after load end | failed (SQLSTATE) | missed slots | latency p50 / p95 / p99 / max | clock hold p50 / max |", "|---|---|---|---|---|---|---|---|---|---|---|");
 for (const r of rows) {
-  const cs: Record<string, any> = r.controls.attempted !== undefined ? { control: { ...r.controls, what: "C1" } } : r.controls;
-  for (const [st, c] of Object.entries(cs)) { const h = r.clockHoldMs[st]; out.push(`| ${cell(r)} | ${st === "control" ? "C1" : "C2"} | ${c.attempted} | ${c.completed} | ${JSON.stringify(c.failed)} | ${c.missedSlots} | ${d3(c.latencyMs)} | ${h ? `${f(h.p50, 1)} / ${f(h.max, 1)}` : "-"} |`); }
+  const cs: Record<string, any> = r.controls.attempted !== undefined ? { control: { ...r.controls } } : r.controls;
+  for (const [st, c] of Object.entries(cs)) {
+    if (!c.attempted) continue;
+    const h = r.clockHoldMs[st];
+    out.push(`| ${cell(r)} | ${st === "control" ? "C1" : "C2"} | ${c.attempted} | ${c.completedDuringLoad ?? c.completed} | ${c.completedAfterLoadEnd ?? "-"} | ${JSON.stringify(c.failed)} | ${c.missedSlots} | ${d3(c.latencyMs)} | ${h ? `${f(h.p50, 1)} / ${f(h.max, 1)}` : "-"} |`);
+  }
 }
 out.push("", "### Lock waits by stage and lock class (ms per transaction that waited, p50 / p95 / p99 / max; n = transactions)", "");
 for (const r of rows) {

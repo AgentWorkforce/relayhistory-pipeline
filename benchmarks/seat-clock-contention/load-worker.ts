@@ -87,9 +87,10 @@ self.onmessage = async (ev: MessageEvent) => {
     }
   };
   await Promise.all(queues.flatMap(({ s, q }) => Array.from({ length: s.workers }, (_, k) => loop(q, s.firstWorker + k))));
+  const end = now();
   clearInterval(lagTimer);
   const cpu = process.cpuUsage(cpu0);
-  self.postMessage({ kind: "done", txns, outcomes, durable, lastDone, start, batches: all.length, records: all.reduce((a, j) => a + j.n, 0),
+  self.postMessage({ kind: "done", txns, outcomes, durable, lastDone, start, end, batches: all.length, records: all.reduce((a, j) => a + j.n, 0),
     undrained: all.filter((j) => !j.done).length, tries: all.reduce((a, j) => a + j.tries, 0), cpu, lags });
   await pool.end(); scratch.done();
 };

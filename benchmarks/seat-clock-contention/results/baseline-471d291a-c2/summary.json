@@ -1,0 +1,358 @@
+{
+ "meta": {
+  "runId": "baseline-471d291a-c2",
+  "serverVersion": "PostgreSQL 16.16 (Debian 16.16-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "settings": [
+   {
+    "name": "checkpoint_timeout",
+    "setting": "300",
+    "unit": "s"
+   },
+   {
+    "name": "deadlock_timeout",
+    "setting": "1000",
+    "unit": "ms"
+   },
+   {
+    "name": "default_transaction_isolation",
+    "setting": "read committed",
+    "unit": null
+   },
+   {
+    "name": "fsync",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "lock_timeout",
+    "setting": "0",
+    "unit": "ms"
+   },
+   {
+    "name": "max_connections",
+    "setting": "300",
+    "unit": null
+   },
+   {
+    "name": "max_wal_size",
+    "setting": "1024",
+    "unit": "MB"
+   },
+   {
+    "name": "shared_buffers",
+    "setting": "131072",
+    "unit": "8kB"
+   },
+   {
+    "name": "statement_timeout",
+    "setting": "0",
+    "unit": "ms"
+   },
+   {
+    "name": "synchronous_commit",
+    "setting": "on",
+    "unit": null
+   },
+   {
+    "name": "track_functions",
+    "setting": "all",
+    "unit": null
+   },
+   {
+    "name": "wal_level",
+    "setting": "replica",
+    "unit": null
+   }
+  ],
+  "template": {
+   "migrateMs": 1321,
+   "historyLive": true,
+   "lazyPolicyRow": 1
+  },
+  "plan": {
+   "runId": "baseline-471d291a-c2",
+   "totalRecords": 64000,
+   "maxSeconds": 300,
+   "controlEveryMs": 1000,
+   "cells": [
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 4
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 16
+    },
+    {
+     "workload": "W1",
+     "n": 250,
+     "c": 64
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 4
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 16
+    },
+    {
+     "workload": "W1",
+     "n": 500,
+     "c": 64
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 4
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 16
+    },
+    {
+     "workload": "W2",
+     "n": 250,
+     "c": 64
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 4
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 16
+    },
+    {
+     "workload": "W2",
+     "n": 500,
+     "c": 64
+    }
+   ],
+   "controls": "c2",
+   "originClaimFence": true
+  },
+  "client": {
+   "bun": "1.4.2",
+   "cpus": 24
+  },
+  "rtt": {
+   "n": 200,
+   "p50": 0.03,
+   "p95": 0.05,
+   "p99": 0.09,
+   "max": 0.37
+  }
+ },
+ "rows": [
+  {
+   "cell": {
+    "workload": "W1",
+    "n": 250,
+    "c": 4
+   },
+   "originClaimFence": true,
+   "threads": 4,
+   "streams": [
+    {
+     "origin": "scb-o<k> (one per worker)",
+     "workers": 4,
+     "share": 1
+    }
+   ],
+   "backlog": {
+    "batches": 256,
+    "records": 64000,
+    "generatedMs": 1980
+   },
+   "drained": true,
+   "undrainedBatches": 0,
+   "drainSeconds": 19.4,
+   "durableRecords": 64000,
+   "durableRecordsPerSec": 3300,
+   "commitsPerSec": 13.2,
+   "deliveries": {
+    "accepted_buffered": 256
+   },
+   "retriesPerBatch": 0,
+   "stageFailures": {},
+   "stageLatencyMs": {
+    "claim": {
+     "n": 256,
+     "p50": 109.69,
+     "p95": 140.63,
+     "p99": 160.9,
+     "max": 230.16
+    },
+    "prepare": {
+     "n": 256,
+     "p50": 6.92,
+     "p95": 10.26,
+     "p99": 11.88,
+     "max": 13.24
+    },
+    "commit": {
+     "n": 256,
+     "p50": 114.87,
+     "p95": 323.5,
+     "p99": 554.64,
+     "max": 598.1
+    }
+   },
+   "clockHoldMs": {
+    "commit": {
+     "n": 256,
+     "p50": 67.84,
+     "p95": 81.99,
+     "p99": 85.67,
+     "max": 102.75
+    },
+    "control2": {
+     "n": 19,
+     "p50": 1.66,
+     "p95": 4.53,
+     "p99": 4.53,
+     "max": 4.53
+    }
+   },
+   "unobservedHolds": 0,
+   "sampledCoverage": {
+    "samplePeriodMsP50": 0.72,
+    "commitHoldsObserved": 256,
+    "commitsOk": 256,
+    "note": "hold start and every wait are sampled at the period shown; hold end is the COMMIT completion"
+   },
+   "clockWaitMs": {
+    "commit": {
+     "n": 256,
+     "p50": 43.42,
+     "p95": 258.24,
+     "p99": 483.39,
+     "max": 538.96
+    },
+    "control2": {
+     "n": 19,
+     "p50": 382.21,
+     "p95": 1170.21,
+     "p99": 1170.21,
+     "max": 1170.21
+    }
+   },
+   "lockWaitMsByStageClass": {
+    "commit: clock": {
+     "n": 195,
+     "p50": 51.12,
+     "p95": 268.56,
+     "p99": 490.32,
+     "max": 527.76
+    },
+    "commit: xid(row or unique-insert)": {
+     "n": 16,
+     "p50": 0.72,
+     "p95": 0.72,
+     "p99": 0.72,
+     "max": 0.72
+    },
+    "control2: clock": {
+     "n": 19,
+     "p50": 326.16,
+     "p95": 1077.12,
+     "p99": 1077.12,
+     "max": 1077.12
+    },
+    "control2: xid(row or unique-insert)": {
+     "n": 2,
+     "p50": 0.72,
+     "p95": 0.72,
+     "p99": 0.72,
+     "max": 0.72
+    }
+   },
+   "controls": {
+    "control": {
+     "what": "C1 ingest_lazy_clear(reset), owner",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "attempted": 0,
+     "completed": 0,
+     "completedDuringLoad": 0,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    "control2": {
+     "what": "C2 ledger.applyOrderedControl -> ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable), runtime role",
+     "everyMs": 1000,
+     "schedule": "fixed-rate, one at a time",
+     "missedSlots": 0,
+     "attempted": 19,
+     "completed": 19,
+     "completedDuringLoad": 19,
+     "completedAfterLoadEnd": 0,
+     "failed": {},
+     "latencyMs": {
+      "n": 19,
+      "p50": 386.47,
+      "p95": 1174.47,
+      "p99": 1174.47,
+      "max": 1174.47
+     }
+    }
+   },
+   "waitGraphSamples": {
+    "commit -> clock [ShareLock] <- commit": 10397,
+    "commit -> clock [ExclusiveLock] <- control2": 7330,
+    "control2 -> clock [ShareLock] <- claim": 6545,
+    "control2 -> clock [ShareLock] <- commit": 2913,
+    "commit -> clock [ExclusiveLock] <- commit+control2": 919,
+    "commit -> clock [ExclusiveLock] <- commit": 755,
+    "control2 -> clock [AccessExclusiveLock] <- commit": 598,
+    "commit -> clock [ShareLock] <- control2": 48,
+    "control2 -> clock [ShareLock] <- untagged": 24,
+    "commit -> clock [ShareLock] <- untagged": 23,
+    "commit -> xid(row or unique-insert) [ShareLock] <- none": 16,
+    "control2 -> clock [ShareLock] <- none": 6,
+    "commit -> clock [ShareLock] <- none": 5,
+    "commit -> clock [ExclusiveLock] <- none": 5,
+    "control2 -> xid(row or unique-insert) [ShareLock] <- none": 2,
+    "control2 -> clock [AccessExclusiveLock] <- claim": 2
+   },
+   "sampler": {
+    "samples": 25721,
+    "periodMs": {
+     "n": 25720,
+     "p50": 0.72,
+     "p95": 1.31,
+     "p99": 1.62,
+     "max": 3.72
+    }
+   },
+   "client": {
+    "processCpuS": 18.41,
+    "eventLoopLagMs": {
+     "n": 6741,
+     "p50": 0.06,
+     "p95": 2.24,
+     "p99": 35.48,
+     "max": 46.66
+    }
+   },
+   "lastSeat": "9007199254804993",
+   "seats": 64000
+  }
+ ]
+}
