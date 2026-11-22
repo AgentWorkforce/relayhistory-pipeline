@@ -22,7 +22,11 @@
  *        that commit and then runs the new body; acquisition through COMMIT is measured. WIN-GATE: the same with the
  *        gate and the mode set in one owner transaction (READ COMMITTED: the queued ACK sees both new values).
  *   MATRIX REPEATABLE READ / SERIALIZABLE x off/main, fenced/main, fenced/t2 through the runtime entry points: staged
- *        commit, and a suppressed receipt's claim (043500 refuses it, 40001, in every state; at READ COMMITTED it commits).
+ *        commit, and a suppressed receipt's claim. A non-READ COMMITTED claim stops at 043500's own check (40001) before
+ *        it reaches the ACK, in every state; the READ COMMITTED claim establishes the early return (a suppressed receipt
+ *        committed, no lock on the gate table).
+ *   MISSING the row absent: a staged ACK fails closed (55000) at every level through the runtime entry, nothing durable;
+ *        set_mode and set_gate (as the owner) fail closed too.
  *   ROW  the row busy: the attempt takes 50000, fails NOWAIT on the row, and its transaction ends before the reply;
  *        a writer then takes 50000 shared at once; the operator loop returns no_switch.
  *   ERA  an erase-shaped exclusive 50000 holder: attempts are refused at once; the budget ends in no_switch.
@@ -546,7 +550,7 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
       expect(await gateMode()).toEqual({ gate: "off", mode: "main" });
     }, 60000);
   }
-  test("MISSING: the row removed (keep trigger disabled, row deleted, in the same transaction): a staged ACK fails closed 55000 at READ COMMITTED, REPEATABLE READ and SERIALIZABLE; nothing durable; never main", async () => {
+  test("MISSING: the row removed (keep trigger disabled, row deleted, in the same transaction): a staged ACK through the runtime commit entry fails closed 55000 at READ COMMITTED, REPEATABLE READ and SERIALIZABLE, nothing durable, never main; set_mode and set_gate fail closed too", async () => {
     const out: Record<string, string> = {};
     for (const iso of ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"]) {
       const p = await prepared(`miss-${iso[0]}${iso[1]}`, `miss-o-${iso[0]}${iso[1]}`);
@@ -559,6 +563,17 @@ describe.skipIf(!url)("062210 T2 staged ACK: fence and upgrade schedules (owned 
         out[iso] = (r as any).code;
       } finally { await M.end(); }
       expect(await durable(p)).toBe(0);
+    }
+    // Both setters as the OWNER login (not a superuser): the owner can disable its own trigger; each setter fails closed.
+    for (const sql of ["SELECT sessions.lazy_ack_t2_set_mode('main')", "SELECT sessions.lazy_ack_t2_set_mode('t2')", "SELECT sessions.lazy_ack_t2_set_gate('fenced')", "SELECT sessions.lazy_ack_t2_set_gate('off')"]) {
+      const O = await ownerConn("missing-setter");
+      try {
+        expect(await roleReceipt(O.c)).toMatchObject({ current_user: OWNER_ROLE, rolsuper: false, rolbypassrls: false });
+        await O.c.query("ALTER TABLE sessions.lazy_ack_t2_mode DISABLE TRIGGER lazy_ack_t2_mode_keep_row");
+        expect((await O.c.query("DELETE FROM sessions.lazy_ack_t2_mode")).rowCount).toBe(1);
+        await expect(O.c.query(sql)).rejects.toMatchObject({ code: "55000", message: expect.stringContaining("the gate row is missing") });
+        out[sql] = "55000";
+      } finally { await O.end(); }
     }
     expect(await gateMode()).toEqual({ gate: "off", mode: "main" });
     console.log(JSON.stringify({ case: "MISSING", server: (await fx.query("SHOW server_version")).rows[0].server_version, out }));
