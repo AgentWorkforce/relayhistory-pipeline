@@ -27,14 +27,20 @@
 -- commit between the read and this transaction's end.
 --   READ COMMITTED: a plain read. Its statement snapshot is taken after 50000 shared was granted, so it sees every
 --     change committed before, and none can commit after. T2 only if gate='fenced' AND mode='t2'.
---   REPEATABLE READ / SERIALIZABLE (treated as reachable; the shipped callers run READ COMMITTED, so this branch is
---     defensive): the transaction snapshot may predate a committed change, and a plain read then returns the stale
---     version without error. So the read is FOR SHARE, which conflicts with any UPDATE of the row: a version replaced
+--   REPEATABLE READ / SERIALIZABLE (treated as reachable): the shipped callers set no isolation level and run at the
+--     connection's default (READ COMMITTED unless the database or role default was changed). Once an erase has ever
+--     run on the database, the erase fence trigger on ingest_fence_owners already refuses a non-READ COMMITTED writer
+--     with 40001 before this read (050010, ingest_erase_fence_index_lock), so this branch is reachable only at a
+--     non-default isolation on a database where no erase has run. There the transaction snapshot may predate a
+--     committed change, and a plain read then returns the stale version without error. So the read is FOR SHARE, which conflicts with any UPDATE of the row: a version replaced
 --     after the snapshot gives 40001 (retry the whole transaction). FOR KEY SHARE is not enough: gate and mode are
 --     non-key columns, and after a barrier-held UPDATE with no prior row lock a FOR KEY SHARE read returned the stale
 --     row without error (PostgreSQL 15/16/17; after the setters, whose FOR UPDATE NOWAIT precedes their UPDATE, it
 --     happened to give 40001; the design does not rely on that). On a current row: gate 'off' -> main; gate
 --     'fenced' -> 55000 for a staged ACK in either mode (T2 needs READ COMMITTED statement snapshots).
+--     Cost of this branch with the gate off (not cost-neutral): FOR SHARE is a tuple lock write on the singleton row
+--     (WAL per ACK), a multixact when such ACKs overlap, it can wait behind an owner FOR UPDATE of the row, and a stale
+--     snapshot gives 40001. The READ COMMITTED branch writes nothing (a plain read).
 --   Scope: the read, the missing-row check (55000 at every isolation level, nothing written) and the fenced-isolation
 --     refusal apply to the staged ACKs that need the mode decision (every non-suppressed ACK; a kind other than staged
 --     is then refused as on main). Suppressed receipts
@@ -43,9 +49,14 @@
 --     body). Through the runtime entry points a suppressed receipt is ACKed inside its claim, which 043500 already
 --     refuses outside READ COMMITTED (40001) in every state, as on main. r3 refused non-READ COMMITTED suppressed
 --     receipts while fenced; restoring that is one hunk (move the read above the suppressed return).
---   A 40001 here means: retry the WHOLE transaction (a new snapshot). The shipped caller runs each commit as one
---     autocommit statement (src/session-ingest/ledger-sql.ts, the commit call), maps any SQLSTATE other than its lock
---     codes to IngestUnavailable (503, src/session-ingest/deliver.ts), and the client re-sends the delivery.
+--   A 40001 here means: retry the WHOLE transaction (a new snapshot). The shipped commit goes through the ledger's
+--     origin-scoped call (src/session-ingest/ledger-sql.ts): with the origin fence on it is one explicit plain BEGIN
+--     transaction, otherwise one autocommit statement; either way the failed transaction ends, the SQLSTATE maps to
+--     IngestUnavailable (503, src/session-ingest/deliver.ts), and the client re-sends the delivery.
+-- Known limits (owner-only, noted): the owner can take (961996,50000) EXCLUSIVE itself and UPDATE the row directly,
+-- bypassing the setters' checks (the keep trigger admits it; the table CHECK still forbids off/t2). The flip helper
+-- recognises busy by 55P03 plus the server's English message (lazy-ack-t2-flip.ts); other message locales fail
+-- closed. pg-proof's pass-count check reads bun's summary format; a format change fails it safe.
 -- The flip barrier is (961996,50000), the existing operator-erase gate. Both setters only TRY-lock 50000 EXCLUSIVE
 -- (then the row FOR UPDATE NOWAIT, in that order), so a change succeeds only at an instant when no transaction that
 -- entered ingest_lock_fences (and no erase) is open, including:

@@ -1024,6 +1024,31 @@ separate operator step, done as a superuser after every down that references it:
 `DROP OWNED BY session_directory_search_worker; DROP ROLE session_directory_search_worker;`
 in each database.
 
+### Rolling back 062210 (lazy ACK T2 gate row)
+
+The down (`supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql`) refuses unless the gate row says off/main, and it
+fails fast (55P03) while any ingest or erase transaction is open, the validation marker is in use or the gate table is
+in use. A successful down restores 043800's staged ACK exactly and drops the gate table and its three functions.
+
+After the down commits, readiness is pending, and every staged commit is refused (55000 `generation not ready`, a 503
+to the client, which keeps the batch) until the owner restores readiness. Client retries alone do not clear a pending
+marker. Restoring it takes three steps; each is a real-database or deploy operation and the owner's own decision:
+
+1. Run the rollback target tree's own migrator as the owner. 062210 is absent from that tree, so nothing is applied;
+   phase 2 validates the schema and marks PASS at that tree's generation.
+2. Rebind the lazy policy and the admission rows to that generation (`src/hoopdb/ingest-generation-rebind.ts`). The
+   operator path is the rebind mode of the gated overlap workflow (`src/hoopdb/ingest-generation-overlap-operator.ts`).
+   The opt-in test `src/session-ingest/__tests__/lazy-ack-t2-rollback-target.postgres.test.ts` calls the rebind
+   function directly; it does not exercise the gated workflow.
+3. Serve that tree's Worker, so requests carry its generation. A batch the client re-sends then commits once on the
+   043800 body.
+
+So from the down's commit until step 3, ingest is unavailable for staged commits.
+
+Slot reuse: a database that applied the earlier, reverted 062210 file holds a ledger row with the reverted file's
+checksum. This tree's migrator and this down both refuse on that checksum mismatch. Such a database must first be
+rolled back with the reverted file's own down; only then does this file apply.
+
 ## Rehearsal databases
 
 The HoopDb ledger records each migration's sha256. The only historical checksum alias is

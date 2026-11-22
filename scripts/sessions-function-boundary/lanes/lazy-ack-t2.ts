@@ -13,7 +13,7 @@ const ACK_ORIGINAL = "supabase/migrations/20261105043800_lazy_ack_clock_no_key_u
 const ROLLBACK = "supabase/rollbacks/20261105062210_lazy_ack_t2.down.sql";
 const NAME = "upstream:20261105062210_lazy_ack_t2.sql";
 
-/** The exact 043800 ACK body (CREATE OR REPLACE there; its SET list drops the gate from proconfig). */
+/** The exact 043800 ACK body (CREATE OR REPLACE there; restored verbatim by the generated rollback). */
 export function originalAckBodies(source: string): string[] {
   const m = source.match(/CREATE OR REPLACE FUNCTION sessions\.ingest_lazy_ack_batch\(p jsonb\)[\s\S]*?\$lazy_ack_batch\$;/);
   if (!m) throw Error("lazy ack T2 rollback: exact prior ACK body missing");

@@ -39,7 +39,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105062210_lazy_ack_t2.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack T2: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062210_lazy_ack_t2.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha IS DISTINCT FROM 'fe4c7f8b66c6fc659d47910211b69b46c07ea2d48a3d0a622e563d3bca8f5496'
+ IF NOT FOUND OR v_sha IS DISTINCT FROM 'fa6709ede1c591f423ac4ee4e25dae7b7303129ccb97986233f74641355025ef'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack T2: own applied checksum required';END IF;
  UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='lazy ack T2: validation marker required';END IF;
@@ -158,5 +158,5 @@ DROP FUNCTION sessions.lazy_ack_t2_set_gate(text);
 DROP FUNCTION sessions.lazy_ack_t2_set_mode(text);
 DROP TABLE sessions.lazy_ack_t2_mode;
 DROP FUNCTION sessions.lazy_ack_t2_mode_keep();
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062210_lazy_ack_t2.sql' AND sha256='fe4c7f8b66c6fc659d47910211b69b46c07ea2d48a3d0a622e563d3bca8f5496';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105062210_lazy_ack_t2.sql' AND sha256='fa6709ede1c591f423ac4ee4e25dae7b7303129ccb97986233f74641355025ef';
 COMMIT;

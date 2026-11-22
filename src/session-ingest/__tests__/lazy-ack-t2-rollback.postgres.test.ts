@@ -378,7 +378,7 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     console.log(JSON.stringify({ case: "ROLLBACK-b", log: d.log }));
   }, 180000);
 
-  test("(d) FIRST-ENTRY: a commit whose first fence call queues behind a successful down: no 42P01; a documented retryable refusal, no partial write; after the next migrate the same delivery completes once on the restored main body", async () => {
+  test("(d) FIRST-ENTRY: a commit whose first fence call queues behind a successful down: no 42P01; a documented retryable refusal, no partial write; RE-APPLY recovery: after this tree's migrate re-applies 062210 (gate off/main) the same payload commits once (the 062210-absent recovery is lazy-ack-t2-rollback-target.postgres.test.ts)", async () => {
     const d = await scratchDb();
     const payload = await d.preparedPayload("rb-d-u1", "rb-d-o1");
     const batchId = JSON.parse(payload).batchId as string;
@@ -413,8 +413,10 @@ describe.skipIf(!url)("062210 lifecycle and rollback under a non-superuser owner
     expect(out).toMatchObject({ ok: false, code: "55000", message: expect.stringContaining("generation not ready") });
     expect(await d.state()).toMatchObject({ table: null, ledger: 0, marker: "pending", t2Body: false });
     expect(Number((await d.fx.query("SELECT count(*)::int n FROM sessions.ingest_batches WHERE batch_id=$1 AND state='committed'", [batchId])).rows[0].n)).toBe(0);
-    // Recovery: the next migrate (it re-verifies the marker; 062210 is pending again, so hold it: target 062200).
-    await d.migrate(); // the real recovery path: a migrate re-verifies the marker (and reapplies 062210, gate off/main)
+    // Re-apply recovery: this tree's migrate re-applies 062210 (installed off/main) and marks PASS. The other recovery,
+    // to the rollback target with 062210 absent, is lazy-ack-t2-rollback-target.postgres.test.ts.
+    await d.migrate();
+    expect(await d.state()).toMatchObject({ table: "sessions.lazy_ack_t2_mode", row: [{ singleton: true, gate: "off", mode: "main" }], ledger: 1, marker: "pass", t2Body: true });
     expect((await d.state()).marker).toBe("pass");
     const R = await d.conn("t2-first-entry-retry");
     try {
