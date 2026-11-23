@@ -17,6 +17,11 @@ import {
   transcriptNames,
 } from "../transcript-store.ts";
 import { rearmSweeperBucketStatements } from "../rearm-sweeper-policy.ts";
+import {
+  SESSION_ANALYSIS_JOB_RESOURCES,
+  SESSION_PIPELINE_RESOURCES,
+  pipelineBucketStatements,
+} from "../session-pipeline.ts";
 
 const names = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
 const eraserArn = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:user/96bulls/transcript-eraser`;
@@ -91,6 +96,8 @@ const RESOURCES = [
   "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
   "transcript-eraser", "transcript-reader", "transcript-srv-writer", "transcript-writer", "transcripts",
   "transcripts-key", "transcripts-key-alias",
+  ...SESSION_PIPELINE_RESOURCES,
+  ...SESSION_ANALYSIS_JOB_RESOURCES,
 ];
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const scalar = (value: unknown) => typeof value === "string" && /^[A-Za-z][A-Za-z0-9:_./*=-]*$/.test(value) ? value : JSON.stringify(value);
@@ -353,6 +360,55 @@ describe("session-analysis runner plan contract", () => {
       .not.toThrow();
     expect(check(workerRollout, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
       .toBe("cross-account worker grants");
+  });
+
+  it("refuses an in-place runner widening during an analysis-jobs phase", () => {
+    const pipeline = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/pipeline`;
+    const liveBucket = [
+      ...transcriptBucketPolicy({
+        accountId: TRANSCRIPT_ACCOUNT_ID,
+        bucketArn: names.bucketArn,
+        keyArn: "key",
+        eraserArn,
+        analysisDeleterArn: pipeline,
+        sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+      }),
+      ...pipelineBucketStatements({ bucketArn: names.bucketArn, roleArn: pipeline, analysisResults: true }),
+    ];
+    const plannedBucket = [
+      ...transcriptBucketPolicy({
+        accountId: TRANSCRIPT_ACCOUNT_ID,
+        bucketArn: names.bucketArn,
+        keyArn: "key",
+        eraserArn,
+        sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+      }),
+      ...pipelineBucketStatements({ bucketArn: names.bucketArn, roleArn: pipeline, analysisResults: false }),
+    ];
+    const widenedBucket = structuredClone(plannedBucket) as Array<{ Sid?: string; Resource?: string | string[] }>;
+    const read = widenedBucket.find((statement) => statement.Sid === "SessionAnalysisReads");
+    if (!read) throw new Error("SessionAnalysisReads missing from test fixture");
+    read.Resource = `${names.bucketArn}/*`;
+    const liveKey = transcriptKeyPolicy({
+      ...keyArgs,
+      pipelineRoleArn: pipeline,
+      analysisResults: true,
+      sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+    });
+    const plannedKey = transcriptKeyPolicy({
+      ...keyArgs,
+      pipelineRoleArn: pipeline,
+      analysisResults: false,
+      sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+    });
+    expect(() => check({
+      transcripts: bucketBlock(liveBucket, widenedBucket),
+      "transcripts-key": keyBlock(liveKey, plannedKey),
+    }, {
+      transcripts: "update",
+      "transcripts-key": "update",
+      "session-analysis-job-schedule": "update",
+    }, SESSION_ANALYSIS_RUNNER_ROLE_ARN)).toThrow(/bucket and key policies must update together/);
   });
 
   it("refuses a missing side, a wrong role, or any declared ride-along", () => {

@@ -1106,10 +1106,11 @@ changes, and the live diff is clean. Deploy it the same way (a new approval for 
 
 **Dedicated session-analysis runner.** Default off. Set
 `transcriptStore.sessionAnalysisRunnerRoleArn` only to
-`arn:aws:iam::786098391924:role/agent-relay-prod-session-analysis`; another
-account, role name, path, user, wildcard, assumed-role session, empty string or
-non-string refuses before a provider is requested. The role is created in the
-agentrelay-prod account; this stack owns the sessions-prod resource-policy half.
+the exact `SESSION_ANALYSIS_RUNNER_ROLE_ARN` compiled into
+`stacks/aws/session-analysis-runner-policy.ts`; another account, role name,
+path, user, wildcard, assumed-role session, empty string or non-string refuses
+before a provider is requested. The role is created in the agentrelay-prod
+account; this stack owns the sessions-prod resource-policy half.
 Set, it may list the bucket (including `GetBucketVersioning`), read canonical
 `96bulls/*/v1/*` objects, and put/delete/list versions only below
 `normalized/session-analysis-v2`. KMS use is via S3 in us-east-1, with the
@@ -1138,6 +1139,9 @@ show only `no declared property changes`. A one-sided grant, a different role,
 an extra KMS or S3 statement, another declared resource change, or removal while
 the input remains set is refused. Unset, the policies are byte-identical; after
 activation, omitting the input plans a guarded two-policy revocation.
+On first enablement, the result-delete exemption is derived from the live
+eraser/GC principals (excluding the rearm sweeper), then appends the runner; the
+contract never trusts a proposed exemption list as its source of authority.
 
 **Rearm sweeper role.** The rearm sweeper runs as an IAM role created outside the stack. Its bucket and key grants
 were first applied to prod by hand, and the stack owns both policies, so they are declared here like the
