@@ -534,8 +534,9 @@ export function provablyNewer(at: unknown, wm: SqlControlWatermark | null | unde
 /**
  * Counts-only evidence for an S3 state that made the legacy backfill call a SQL deletion `unproven`.
  * `ordered_not_newer` is the only positive proof requested by the guarded cutover: S3's tuple is on SQL's sole
- * receipt epoch and no higher than the latest receipt in the same SQL snapshot. `ordered_newer` proves the opposite;
- * every other code is deliberately inconclusive and must block a proof-required execute.
+ * receipt epoch and no higher than the latest receipt in the same SQL snapshot, and S3 has not subsequently lifted
+ * the session through an unordered control. `ordered_newer` proves the opposite; every other code is deliberately
+ * inconclusive and must block a proof-required execute.
  */
 export function deletionOrderProof(
   at: unknown,
@@ -550,7 +551,8 @@ export function deletionOrderProof(
   if (wm.epochs !== 1) return "receipts_multiple_epochs";
   if (wm.epoch === null || wm.version === null) return "order_invalid";
   if (at[0] !== wm.epoch) return "epoch_mismatch";
-  return BigInt(at[1]) <= wm.version ? "ordered_not_newer" : "ordered_newer";
+  if (BigInt(at[1]) > wm.version) return "ordered_newer";
+  return lifted ? "unordered_lift" : "ordered_not_newer";
 }
 
 /**

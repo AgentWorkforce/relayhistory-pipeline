@@ -166,8 +166,9 @@ the create-only `drained` markers. The workflow never passes `--checkpoint-file`
 
 Every backfill receipt explains every `fences.deletions_unproven` row with the numeric
 `fences.deletion_order` counters. The counters sum exactly to `deletions_unproven`. `ordered_not_newer` is positive
-proof that S3's per-session ordered-control tuple is on SQL's sole receipt epoch and no higher than the latest receipt
-read in the deletion snapshot. `ordered_newer` proves the opposite. `receipts_absent`,
+proof that S3's per-session ordered-control tuple is on SQL's sole receipt epoch, no higher than the latest receipt
+read in the deletion snapshot, and was not followed by an unordered lift. `ordered_newer` proves the opposite and
+appears only when an open SQL reset forces a deletion to be reapplied despite that newer order. `receipts_absent`,
 `receipts_multiple_epochs`, `epoch_mismatch`, `unordered_lift` and `order_invalid` are inconclusive and must not be
 treated as proof that a re-enable is old. The receipt remains counts-only: no tenant, workspace, user, origin or
 session identifier is emitted.

@@ -707,7 +707,9 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(deletionOrderProof(undefined, one, true)).toBe("unordered_lift");
     expect(deletionOrderProof([EPOCH, "2"], one, false)).toBe("ordered_not_newer");
     expect(deletionOrderProof([EPOCH, "1"], one, false)).toBe("ordered_not_newer");
+    expect(deletionOrderProof([EPOCH, "1"], one, true)).toBe("unordered_lift");
     expect(deletionOrderProof([EPOCH, "3"], one, false)).toBe("ordered_newer");
+    expect(deletionOrderProof([EPOCH, "3"], one, true)).toBe("ordered_newer");
     expect(deletionOrderProof([hex("7"), "1"], one, false)).toBe("epoch_mismatch");
     expect(deletionOrderProof([EPOCH, "1"], { epochs: 0, epoch: null, version: null }, false)).toBe("receipts_absent");
     expect(deletionOrderProof([EPOCH, "1"], { epochs: 2, epoch: EPOCH, version: 2n }, false)).toBe("receipts_multiple_epochs");
@@ -772,17 +774,32 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(Object.values(summary.fences.deletion_order).reduce((a, b) => a + b, 0)).toBe(summary.fences.deletions_unproven);
   });
 
-  test("second review 8: S3's control no newer than SQL's latest receipt never supersedes SQL's deletion", async () => {
+  test("second review 8: S3's ordered disable no newer than SQL's latest receipt proves no later re-enable", async () => {
     const store = scratch();
     await mirrored(store, A, "S", false, 1);
-    await mirrored(store, A, "S", true, 2);
-    // SQL went on to v3, a disable of S S3 has not seen yet: S3's v2 is OLDER than the deletion.
+    // SQL went on to v3. S3's last ordered state is still the v1 disable and no lift followed it.
     for (const v of [1, 2, 3]) await receipt(A, EPOCH, v);
     await del(A, "origin-1", "claude", "S");
     const summary = await run(store);
-    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1,
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 0,
       deletion_order: { ordered_not_newer: 1 } });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
+  });
+
+  test("an unordered lift after an older ordered disable is inconclusive in an actual dry-run receipt", async () => {
+    const store = scratch();
+    await receipt(A, EPOCH, 1);
+    await mirrored(store, A, "S", false, 1);
+    await s3ControlMirror(store, ROOT).setSessionUploads({
+      tenant: A, originId: "origin-1", sessions: [["claude", "S"]], enabled: true,
+    });
+    await del(A, "origin-1", "claude", "S");
+    const summary = await run(store, { dryRun: true });
+    expect(summary.mode).toBe("dry_run");
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1,
+      deletion_order: { unordered_lift: 1, ordered_not_newer: 0 } });
+    expect(Object.values(summary.fences.deletion_order).reduce((a, b) => a + b, 0)).toBe(summary.fences.deletions_unproven);
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(false);
   });
 
   test("second review 8: across control epochs the order is unknown, so SQL's deletion is applied", async () => {
