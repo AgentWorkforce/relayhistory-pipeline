@@ -138,6 +138,7 @@ import type { DeliverDeps } from "./deliver.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { WORKER_LIMITS } from "../shared/analytics-export.ts";
 import { ingestLedgerMode, s3ControlMirror } from "./ledger-s3.ts";
+import { assertUpstreamAssertionOff, INGEST_UPSTREAM_ASSERTION_PREFIX } from "../shared/upstream-assertion.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 interface QueueLike<T> {
@@ -146,6 +147,8 @@ interface QueueLike<T> {
 }
 
 export interface IngestWorkerEnv {
+  /** Self-host ingest edge only (src/shared/upstream-assertion.ts): unset, "" or "off"; anything else refuses. */
+  INGEST_UPSTREAM_ASSERTION_MODE?: string;
   /** Unset / "ts" (default): the TypeScript scrubber. "wasm": the pinned relayscrubber module only (docs/scrub-engine.md). */
   SCRUB_ENGINE?: string;
   HYPERDRIVE?: { connectionString: string };
@@ -345,6 +348,13 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     "INGEST_CUSTODY_SOURCE is not frozen-supabase": custodySourceOf(env) !== "frozen-supabase",
     "INGEST_ACCEPTANCE_MODE is not buffered (frozen-supabase custody needs it)": (env.INGEST_ACCEPTANCE_MODE ?? "canonical") !== "buffered",
   });
+  // The relaygate v1 upstream assertion is checked by the self-host ingest edge only (selfhost-server.ts); the
+  // Worker refuses any mode but off, naming the variable, rather than ignore it. Before the not-configured checks.
+  try {
+    assertUpstreamAssertionOff(env as unknown as Record<string, string | undefined>, INGEST_UPSTREAM_ASSERTION_PREFIX);
+  } catch {
+    throw new Error("session ingest: INGEST_UPSTREAM_ASSERTION_MODE is served only by the self-host ingest edge");
+  }
   const { INGEST_S3_BUCKET: bucket, INGEST_KMS_KEY_ARN: kmsKeyArn } = env;
   if (!bucket || !kmsKeyArn || !env.HYPERDRIVE || !env.INGEST_FANOUT) return null;
   const [accessKeyId, secretAccessKey, signingKey] = await Promise.all([

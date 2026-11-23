@@ -147,6 +147,7 @@ import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/des
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseSummarySearchBackend, sessionPartialRetryableFlag } from "../../../src/session-read-api/config.ts";
 import { pendingV2Cache, sqlCoordinationAdvisories } from "../../../src/session-read-api/coordination-advisories.ts";
+import { assertUpstreamAssertionOff, READ_API_UPSTREAM_ASSERTION_PREFIX } from "../../../src/shared/upstream-assertion.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
@@ -250,6 +251,8 @@ export interface Env extends CanonicalEnv {
   READ_API_SESSION_SOURCES_ENABLED?: string;
   /** Self-host service only (config.ts READ_API_SESSION_PARTIAL_RETRYABLE): unset, "" or "false"; anything else refuses every request. */
   READ_API_SESSION_PARTIAL_RETRYABLE?: string;
+  /** Self-host service only (src/shared/upstream-assertion.ts): unset, "" or "off"; anything else refuses every request. */
+  READ_API_UPSTREAM_ASSERTION_MODE?: string;
   /** Exactly "true": serve GET /v1/events?origin= (message-origin.ts); anything else = 501 param_origin. */
   MESSAGE_ORIGIN_LABELS_ENABLED?: string;
   /**
@@ -608,6 +611,13 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
       if (sessionPartialRetryableFlag(env.READ_API_SESSION_PARTIAL_RETRYABLE)) throw new Error("service only");
     } catch {
       throw new ConfigError("READ_API_SESSION_PARTIAL_RETRYABLE");
+    }
+    // The relaygate v1 upstream assertion is checked by the self-host service only: any mode but off (or a
+    // value that does not parse) is a misconfigured deploy, refused rather than silently ignored.
+    try {
+      assertUpstreamAssertionOff(env as unknown as Record<string, string | undefined>, READ_API_UPSTREAM_ASSERTION_PREFIX);
+    } catch {
+      throw new ConfigError("READ_API_UPSTREAM_ASSERTION_MODE");
     }
   } catch (error) {
     // Configuration errors name a field, never a value.

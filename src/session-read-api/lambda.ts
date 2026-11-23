@@ -114,6 +114,7 @@ import { postgresOutputBackend } from "./postgres/output-query.ts";
 import { postgresDigestBackend } from "./postgres/digest-query.ts";
 import { postgresCoordinationBackend } from "./postgres/coordination-query.ts";
 import { pendingV2Cache, poolTenantWriter, sqlCoordinationAdvisories } from "./coordination-advisories.ts";
+import { assertUpstreamAssertionOff, READ_API_UPSTREAM_ASSERTION_PREFIX } from "../shared/upstream-assertion.ts";
 import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
@@ -600,6 +601,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   summarySearchBackend(env, "lambda");
   searchSkipsPartialSessions(env, "lambda");
   sessionPartialRetryable(env, "lambda");
+  assertUpstreamAssertionOff(env, READ_API_UPSTREAM_ASSERTION_PREFIX);
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -689,6 +691,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const analyticsSelection = entry === "service" ? analyticsConfig(env, "selfhost") : ANALYTICS_OFF;
   if (entry !== "service" && !["", "noop", "none"].includes(env[ANALYTICS_SINK_VAR] ?? ""))
     throw new Error(`session read api: ${ANALYTICS_SINK_VAR} is served only by the self-host service`);
+  // The relaygate v1 upstream assertion is checked by the self-host service only (server.ts); the hosted entry
+  // refuses any mode but off rather than ignore it.
+  if (entry !== "service") assertUpstreamAssertionOff(env, READ_API_UPSTREAM_ASSERTION_PREFIX);
   // Env only, before any pool opens: with READ_API_DIGEST_ENABLED=1 an invalid narrative model
   // id refuses the service. With the flag off no narrative variable is read.
   if (entry === "service" && digestEnabled(env)) digestNarrativeModel(env);

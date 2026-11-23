@@ -308,7 +308,7 @@ const isString = (v: unknown): v is string => typeof v === "string";
 function claimsOf(payload: Buffer): UpstreamAssertionClaims | null {
   let value: unknown;
   try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(payload));
   } catch {
     return null;
   }
