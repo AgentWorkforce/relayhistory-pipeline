@@ -597,3 +597,43 @@ describe("session pipeline: streamed reconcile switch", () => {
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_STREAMING_CH: "1" });
   });
 });
+
+describe("session pipeline: skip-over-bound switch", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const env = (inputs: Record<string, unknown>) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: inputs });
+  it("absent or false renders nothing; true renders SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only", () => {
+    const off = env({ searchIndex: true });
+    expect(Object.keys(off)).not.toContain("SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED");
+    expect(env({ searchIndex: true, skipOverBound: false })).toEqual(off);
+    expect(env({ searchIndex: true, skipOverBound: true })).toEqual({ ...off, SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" });
+  });
+
+  it("renders both keys with the streamed reconcile switch", () => {
+    const off = env({ searchIndex: true });
+    expect(env({ searchIndex: true, streamReconcile: { enabled: true }, skipOverBound: true })).toEqual({
+      ...off,
+      SEARCH_INDEX_STREAMING_CH: "1",
+      SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true",
+    });
+  });
+
+  it("needs a boolean, and searchIndex: true when true", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    expect(() => ok({ searchIndex: true, skipOverBound: true })).not.toThrow();
+    expect(() => ok({ skipOverBound: false })).not.toThrow();
+    expect(() => ok({ searchIndex: true, skipOverBound: false })).not.toThrow();
+    expect(() => ok({ skipOverBound: true })).toThrow(/skipOverBound requires searchIndex: true/);
+    expect(() => ok({ searchIndex: false, skipOverBound: true })).toThrow(/skipOverBound requires searchIndex: true/);
+    for (const bad of ["yes", "true", 1, 0, null]) expect(() => ok({ searchIndex: true, skipOverBound: bad })).toThrow(/skipOverBound must be a boolean/);
+  });
+
+  it("the function's resources and props are the same with the switch on", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, skipOverBound: true } });
+    expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
+    expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" });
+  });
+});

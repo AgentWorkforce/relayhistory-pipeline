@@ -53,6 +53,11 @@ export interface SessionPipelineInputs {
    * function also refuses to start unless the pipeline secret has its clickhouse block.
    */
   streamReconcile?: { enabled: boolean };
+  /**
+   * Renders SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (src/session-pipeline/lambda.ts).
+   * Absent or `false`: nothing is rendered. `true` needs `searchIndex: true`.
+   */
+  skipOverBound?: boolean;
 }
 
 /**
@@ -132,7 +137,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "skipOverBound") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
@@ -159,6 +164,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (typeof r.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.streamReconcile.enabled must be a boolean");
     if (r.enabled === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.streamReconcile.enabled requires searchIndex: true");
   }
+  if (v.skipOverBound !== undefined && typeof v.skipOverBound !== "boolean") refuse("transcriptStore.sessionPipeline.skipOverBound must be a boolean");
+  if (v.skipOverBound === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.skipOverBound requires searchIndex: true");
 }
 
 /** The pipeline role reads session objects through S3 only, for objects under `96bulls/` (as the reader user). */
@@ -287,6 +294,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
     // Only when armed: a stage without streamReconcile.enabled renders nothing new and never streams.
     ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
+    ...(i.p.skipOverBound === true ? { SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

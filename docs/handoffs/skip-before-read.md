@@ -17,9 +17,10 @@ Nothing here deploys anything, and nothing enables the flag.
 
 A refused value (or `true` without `SEARCH_INDEX_ENABLED=1`) fails Lambda init for the
 whole function, every stage, not only search. On, init adds `skipOverBound: true` to
-the search stage's deps. It is off by default and enabled nowhere: no stack, runbook
-or workflow in this repository renders it. A variable set by hand on the function is
-dropped by a later stack deploy that does not carry it.
+the search stage's deps. It is off by default: the stack input
+`transcriptStore.sessionPipeline.skipOverBound: true` renders it (requires
+`searchIndex: true`), and absent or `false` renders nothing. A variable set by hand on
+the function is dropped by a later stack deploy that does not carry the input.
 
 ## What it does
 
