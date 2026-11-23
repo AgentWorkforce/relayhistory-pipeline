@@ -49,6 +49,14 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import {
+  assertSessionAnalysisRunnerRoleArn,
+  SESSION_ANALYSIS_RUNNER_BUCKET_SIDS,
+  SESSION_ANALYSIS_RUNNER_KEY_SIDS,
+  SESSION_ANALYSIS_RESULT_PREFIX,
+  sessionAnalysisRunnerBucketStatements,
+  sessionAnalysisRunnerKeyStatements,
+} from "./session-analysis-runner-policy.ts";
+import {
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   assertSessionPipelineInputs,
@@ -99,6 +107,8 @@ export interface TranscriptStoreInputs {
    * /v1 event reads from ClickHouse with Supabase erasure checks. Omit for none.
    */
   sessionReadApi?: SessionReadApiInputs;
+  /** Exact agentrelay-prod EKS runner role granted canonical reads and analysis-result writes. Omit for none. */
+  sessionAnalysisRunnerRoleArn?: string;
 }
 
 export interface TranscriptNames {
@@ -173,7 +183,11 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "sessionAnalysisRunnerRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+  if (store.sessionAnalysisRunnerRoleArn !== undefined) {
+    try { assertSessionAnalysisRunnerRoleArn(store.sessionAnalysisRunnerRoleArn); }
+    catch (e) { refuse((e as Error).message); }
+  }
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -204,6 +218,7 @@ export type TranscriptStorePlanPhase =
   | "session read api update"
   | "session brief rollout"
   | "session brief update"
+  | "session analysis runner grants"
   | "repo tag rename";
 
 /**
@@ -339,6 +354,8 @@ export interface TranscriptStorePlanCapture {
    * snapshot; it is bound to the same state by the capture's version digest (capture-verify.ts).
    */
   stateSnapshotText?: string;
+  /** The exact optional input that owns the session-analysis resource-policy grants. */
+  sessionAnalysisRunnerRoleArn?: unknown;
 }
 
 /**
@@ -436,6 +453,13 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
+  const analysisRunnerPhase = sessionAnalysisRunnerGrantsPhase(
+    compact.operations,
+    capture.detailedPlanText,
+    capture.sessionAnalysisRunnerRoleArn,
+    refuse,
+  );
+  if (analysisRunnerPhase) return analysisRunnerPhase;
   // The brief schedule changes alone, or with exactly a session pipeline update.
   const briefPhase = sessionBriefPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (briefPhase) return briefPhase;
@@ -498,6 +522,162 @@ function detailedBlock(lines: readonly string[], resource: string): string[] {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
   return end < 0 ? rest : rest.slice(0, end);
+}
+
+type PolicyDiffSide = { header: string; itemIndent: number; bySid: Map<string, string> };
+
+/** Split one Alchemy policy-diff side into its header and statement items. */
+function policyDiffSide(side: string[], refuse: (why: string) => never): PolicyDiffSide {
+  const dashIndents = side.map((l) => /^( *)- /.exec(l)?.[1]?.length).filter((n): n is number => n !== undefined);
+  if (dashIndents.length === 0) return refuse("policy diff has no statements");
+  const itemIndent = Math.min(...dashIndents);
+  const header: string[] = [];
+  const items: string[][] = [];
+  for (const line of side) {
+    const indent = /^( *)/.exec(line)![1]!.length;
+    if (indent === itemIndent && line.slice(indent).startsWith("- ")) items.push([line]);
+    else if (indent > itemIndent && items.length > 0) items.at(-1)!.push(line);
+    else header.push(line);
+  }
+  const bySid = new Map<string, string>();
+  const direct = new RegExp(`^ {${itemIndent + 2}}Sid:\\s*([A-Za-z][A-Za-z0-9]*)\\s*$`);
+  for (const item of items) {
+    const sids = item.map((line, index) => direct.exec(index === 0 ? line.replace("- ", "  ") : line)?.[1]).filter((v): v is string => v !== undefined);
+    if (sids.length !== 1) refuse("every statement must have exactly one direct Sid");
+    if (bySid.has(sids[0]!)) refuse(`duplicate Sid ${sids[0]}`);
+    bySid.set(sids[0]!, item.join("\n"));
+  }
+  return { header: header.join("\n"), itemIndent, bySid };
+}
+
+function policyDiffSides(block: readonly string[], refuse: (why: string) => never) {
+  const marked = block.filter((line) => /^ {2}[+-] /.test(line));
+  if (marked.length === 0) refuse("the detailed plan must show the policy diff (no declared property changes is not reviewable)");
+  const side = (mark: "+" | "-") => marked.filter((line) => line[2] === mark).map((line) => line.slice(3));
+  return { live: policyDiffSide(side("-"), refuse), planned: policyDiffSide(side("+"), refuse) };
+}
+
+/** Alchemy's sorted YAML rendering for an individual policy statement. */
+function planYaml(value: unknown, indent: number): string[] {
+  const pad = " ".repeat(indent);
+  if (Array.isArray(value)) return value.flatMap((item) => {
+    if (item !== null && typeof item === "object") {
+      const [first, ...rest] = planYaml(item, indent + 2);
+      return [`${pad}- ${first!.trimStart()}`, ...rest];
+    }
+    return [`${pad}- ${String(item)}`];
+  });
+  return Object.keys(value as object).sort().flatMap((key) => {
+    const item = (value as Record<string, unknown>)[key];
+    return item !== null && typeof item === "object"
+      ? [`${pad}${key}:`, ...planYaml(item, indent + 2)]
+      : [`${pad}${key}: ${String(item)}`];
+  });
+}
+
+const unquoteYaml = (text: string) => text.split("\n").map((line) =>
+  line.replace(/^(\s*(?:- )?(?:[^\s"][^"]*?: )?)("(?:[^"\\]|\\.)*")\s*$/, (_, head: string, quoted: string) => head + JSON.parse(quoted)),
+).join("\n");
+
+const ANALYSIS_RUNNER_DENY_SIDS = ["OnlyTheEraserDeletes", "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults"] as const;
+
+/**
+ * The cross-account runner policy lands or revokes alone. Every pre-existing
+ * statement stays byte-identical except the exact eraser-deny split needed to
+ * let the runner delete only normalized/session-analysis-v2 results.
+ */
+function sessionAnalysisRunnerGrantsPhase(
+  operations: ReadonlyMap<string, string>,
+  detailedPlanText: string,
+  inputRoleArn: unknown,
+  refuse: (why: string) => never,
+): TranscriptStorePlanPhase | undefined {
+  const resources = ["transcripts", "transcripts-key"] as const;
+  const lines = detailedPlanText.split(/\r?\n/);
+  const touched = resources.filter((resource) => operations.get(resource) === "update" &&
+    detailedBlock(lines, resource).some((line) => line.includes("SessionAnalysis") || line.includes(ANALYSIS_RUNNER_DENY_SIDS[1])));
+  if (touched.length === 0) return undefined;
+  const changed = [...operations].filter(([, action]) => action !== "noop");
+  if (!changed.every(([resource, action]) => resources.includes(resource as (typeof resources)[number]) && action === "update"))
+    refuse(`session analysis runner grants must deploy alone (only transcripts and transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (inputRoleArn !== undefined) {
+    try { assertSessionAnalysisRunnerRoleArn(inputRoleArn); }
+    catch { refuse("session analysis runner grants: the inputs' sessionAnalysisRunnerRoleArn is not the exact agentrelay-prod runner role ARN"); }
+  }
+  const results = touched.map((resource) => assertSessionAnalysisRunnerGrantDiff(detailedBlock(lines, resource), resource, (why) =>
+    refuse(`session analysis runner grants: ${resource}: ${why}`),
+  ));
+  const directions = new Set(results.map((result) => result.add ? "add" : "remove"));
+  const roles = new Set(results.map((result) => result.roleArn));
+  if (directions.size !== 1 || roles.size !== 1) refuse("session analysis runner grants: bucket and key must change in the same direction for one role");
+  const result = results[0]!;
+  if (result.add) {
+    if (inputRoleArn === undefined) refuse("session analysis runner grants: adds the grants while transcriptStore.sessionAnalysisRunnerRoleArn is unset");
+    if (result.roleArn !== inputRoleArn) refuse("session analysis runner grants: statements must name exactly transcriptStore.sessionAnalysisRunnerRoleArn");
+  } else if (inputRoleArn !== undefined) {
+    refuse("session analysis runner grants: removes the grants while transcriptStore.sessionAnalysisRunnerRoleArn is set");
+  }
+  return "session analysis runner grants";
+}
+
+function assertSessionAnalysisRunnerGrantDiff(
+  block: readonly string[],
+  resource: "transcripts" | "transcripts-key",
+  refuse: (why: string) => never,
+): { add: boolean; roleArn: string } {
+  const expected = resource === "transcripts" ? SESSION_ANALYSIS_RUNNER_BUCKET_SIDS : SESSION_ANALYSIS_RUNNER_KEY_SIDS;
+  const { live, planned } = policyDiffSides(block, refuse);
+  if (live.header !== planned.header) refuse("only policy statements may change");
+  const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
+  const removed = [...live.bySid.keys()].filter((sid) => !planned.bySid.has(sid)).sort();
+  const bucketAdded = resource === "transcripts" ? [...expected, ANALYSIS_RUNNER_DENY_SIDS[1]].sort() : [...expected].sort();
+  const bucketRemoved = bucketAdded;
+  const expectedSids = new Set<string>(expected);
+  const removableSids = new Set<string>(bucketRemoved);
+  const add = removed.length === 0 && JSON.stringify(added) === JSON.stringify(bucketAdded);
+  const remove = added.length === 0 && JSON.stringify(removed) === JSON.stringify(bucketRemoved);
+  if (!add && !remove) refuse(`must add or remove exactly ${bucketAdded.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
+  for (const [sid, text] of live.bySid) {
+    if (resource === "transcripts" && sid === ANALYSIS_RUNNER_DENY_SIDS[0]) continue;
+    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !removableSids.has(sid))
+      refuse(`existing statement ${sid} must stay byte-identical`);
+  }
+  const side = add ? planned : live;
+  const roleSids = add ? added.filter((sid) => expectedSids.has(sid)) : removed.filter((sid) => expectedSids.has(sid));
+  const principals = new Set(roleSids.flatMap((sid) => [...side.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((match) => match[1]!)));
+  if (principals.size !== 1) refuse("the statements must name exactly one role");
+  const roleArn = unquoteYaml(`AWS: ${[...principals][0]!}`).slice(5);
+  try { assertSessionAnalysisRunnerRoleArn(roleArn); }
+  catch { refuse("the statements must name the exact agentrelay-prod runner role shape"); }
+
+  const names = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+  const wanted = resource === "transcripts"
+    ? sessionAnalysisRunnerBucketStatements({ bucketArn: names.bucketArn, roleArn })
+    : sessionAnalysisRunnerKeyStatements({ region: TRANSCRIPT_REGION, bucketName: names.bucket, roleArn });
+  for (const statement of wanted) {
+    if (unquoteYaml(side.bySid.get(statement.Sid)!) !== planYaml([statement], side.itemIndent).join("\n"))
+      refuse(`${statement.Sid} must be exactly the reviewed statement`);
+  }
+  if (resource === "transcripts") {
+    const before = add ? live : planned;
+    const after = add ? planned : live;
+    const oldDeny = before.bySid.get(ANALYSIS_RUNNER_DENY_SIDS[0]);
+    const newDeny = after.bySid.get(ANALYSIS_RUNNER_DENY_SIDS[0]);
+    if (!oldDeny || !newDeny) refuse("OnlyTheEraserDeletes must exist on both sides");
+    const erasers = [...oldDeny.matchAll(/^\s*aws:PrincipalArn:\s*(\S+)\s*$/gm)].map((match) => unquoteYaml(match[1]!));
+    if (erasers.length !== 1) refuse("live OnlyTheEraserDeletes must name exactly one eraser principal");
+    const base = transcriptBucketPolicy({ bucketArn: names.bucketArn, keyArn: "unused", eraserArn: erasers[0]! });
+    const enabled = transcriptBucketPolicy({ bucketArn: names.bucketArn, keyArn: "unused", eraserArn: erasers[0]!, sessionAnalysisRunnerRoleArn: roleArn });
+    const statement = (policy: Array<Record<string, unknown>>, sid: string) => policy.find((entry) => entry.Sid === sid)!;
+    if (unquoteYaml(oldDeny) !== planYaml([statement(base, ANALYSIS_RUNNER_DENY_SIDS[0])], before.itemIndent).join("\n"))
+      refuse("live OnlyTheEraserDeletes is not the reviewed eraser-only statement");
+    if (unquoteYaml(newDeny) !== planYaml([statement(enabled, ANALYSIS_RUNNER_DENY_SIDS[0])], after.itemIndent).join("\n"))
+      refuse("OnlyTheEraserDeletes must carve out exactly the analysis-result prefix");
+    const resultDeny = after.bySid.get(ANALYSIS_RUNNER_DENY_SIDS[1]);
+    if (unquoteYaml(resultDeny!) !== planYaml([statement(enabled, ANALYSIS_RUNNER_DENY_SIDS[1])], after.itemIndent).join("\n"))
+      refuse(`${ANALYSIS_RUNNER_DENY_SIDS[1]} must be exactly the reviewed statement`);
+  }
+  return { add, roleArn };
 }
 
 /** Whether the detailed plan's `session-pipeline` update block is exactly "no declared property changes". */
@@ -858,7 +1038,9 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; sessionAnalysisRunnerRoleArn?: string }) {
+  if (i.sessionAnalysisRunnerRoleArn !== undefined) assertSessionAnalysisRunnerRoleArn(i.sessionAnalysisRunnerRoleArn);
+  const analysisResults = `${i.bucketArn}/${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*/${SESSION_ANALYSIS_RESULT_PREFIX}/*`;
   return [
     ...denyInsecureTransport(i.bucketArn),
     {
@@ -869,14 +1051,33 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Resource: [i.bucketArn, `${i.bucketArn}/*`],
       Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } },
     },
-    {
-      Sid: "OnlyTheEraserDeletes",
-      Effect: "Deny" as const,
-      Principal: "*",
-      Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-      Resource: [`${i.bucketArn}/*`],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": i.eraserArn } },
-    },
+    i.sessionAnalysisRunnerRoleArn
+      ? {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          NotResource: [analysisResults],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.eraserArn } },
+        }
+      : {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [`${i.bucketArn}/*`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": i.eraserArn } },
+        },
+    ...(i.sessionAnalysisRunnerRoleArn
+      ? [{
+          Sid: "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [analysisResults],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.eraserArn, i.sessionAnalysisRunnerRoleArn] } },
+        }]
+      : []),
     {
       Sid: "DenyOtherEncryption",
       Effect: "Deny" as const,
@@ -947,7 +1148,8 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; sessionAnalysisRunnerRoleArn?: string }) {
+  if (i.sessionAnalysisRunnerRoleArn !== undefined) assertSessionAnalysisRunnerRoleArn(i.sessionAnalysisRunnerRoleArn);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${TENANT_KEY_BASE}/*` },
@@ -960,6 +1162,9 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
       ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
+      ...(i.sessionAnalysisRunnerRoleArn
+        ? sessionAnalysisRunnerKeyStatements({ region: i.region, bucketName: i.bucketName, roleArn: i.sessionAnalysisRunnerRoleArn })
+        : []),
     ],
   };
 }
@@ -1187,6 +1392,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
+        ...(i.transcriptStore.sessionAnalysisRunnerRoleArn ? { sessionAnalysisRunnerRoleArn: i.transcriptStore.sessionAnalysisRunnerRoleArn } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -1215,8 +1421,11 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, ...(i.transcriptStore.sessionAnalysisRunnerRoleArn ? { sessionAnalysisRunnerRoleArn: i.transcriptStore.sessionAnalysisRunnerRoleArn } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
+        ...(i.transcriptStore.sessionAnalysisRunnerRoleArn
+          ? sessionAnalysisRunnerBucketStatements({ bucketArn: n.bucketArn, roleArn: i.transcriptStore.sessionAnalysisRunnerRoleArn })
+          : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },

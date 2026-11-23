@@ -56,7 +56,13 @@ function snapshotState(root: string, stage: string, region: string, st: ReturnTy
 export function capturePlan(root: string, stage: string, env: Env) {
   const inputsPath = join(root, ".96bulls", stage, "aws-inputs.json");
   const rawInputs = readFileSync(inputsPath, "utf8");
-  const inputs = JSON.parse(rawInputs) as { accountId: string; region: string; pippenSandbox?: unknown; eks?: { apiAccess?: { publicAccessCidrs?: string[] } } };
+  const inputs = JSON.parse(rawInputs) as {
+    accountId: string;
+    region: string;
+    pippenSandbox?: unknown;
+    eks?: { apiAccess?: { publicAccessCidrs?: string[] } };
+    transcriptStore?: { sessionAnalysisRunnerRoleArn?: unknown };
+  };
   const pippen = Boolean(inputs.pippenSandbox);
   const src = observeSourceAt(root, env);
   if (!src.clean) throw new Error("commit the stack source first: a plan must describe committed code");
@@ -125,7 +131,12 @@ export function capturePlan(root: string, stage: string, env: Env) {
   };
   const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
   // Reject an unsafe production capture before it can replace the reviewed files.
-  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });
+  if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, {
+    detailedPlanText: detailed,
+    provenanceText,
+    stateSnapshotText: snapText,
+    sessionAnalysisRunnerRoleArn: inputs.transcriptStore?.sessionAnalysisRunnerRoleArn,
+  });
   writeFileSync(p.inputs, sanitized);
   writeFileSync(p.plan, plan);
   writeFileSync(p.detailed, detailed);
