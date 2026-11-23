@@ -1272,7 +1272,9 @@ function assertSessionAnalysisRunnerGrantDiff(
   if (JSON.stringify(oldEraserShape.principals) !== JSON.stringify(newEraserShape.principals))
     refuse(`${ERASER_DENY_SID} principals may not change`);
   const resultArn = `${names.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`;
-  const expectedResources = oldEraserShape.not ? [resultArn, ...oldEraserShape.resources] : [resultArn];
+  const expectedResources = oldEraserShape.not
+    ? oldEraserShape.resources.includes(resultArn) ? oldEraserShape.resources : [resultArn, ...oldEraserShape.resources]
+    : [resultArn];
   if (!newEraserShape.not || JSON.stringify(newEraserShape.resources) !== JSON.stringify(expectedResources))
     refuse(`${ERASER_DENY_SID} must carve out exactly the analysis-result prefix`);
 
@@ -1286,6 +1288,19 @@ function assertSessionAnalysisRunnerGrantDiff(
     const priorPrincipals = exactResultDeleteDeny(oldResult, before.itemIndent, refuse);
     if (JSON.stringify(nextPrincipals) !== JSON.stringify([...priorPrincipals, roleArn]))
       refuse(`${ANALYSIS_RESULT_DENY_SID} may add only the runner role`);
+  } else {
+    // The first result-prefix deny inherits every live delete principal except
+    // the rearm sweeper, whose delete grant is deliberately canonical-only.
+    // Never derive this trust boundary from the proposed result deny itself.
+    const rearmPrincipals = new Set(
+      REARM_SWEEPER_BUCKET_SIDS.flatMap((sid) => policyArns(before.bySid.get(sid) ?? "", "iam")),
+    );
+    if (rearmPrincipals.size > 1) refuse("rearm sweeper statements must name one role");
+    const inheritedPrincipals = oldEraserShape.principals.filter((principal) => !rearmPrincipals.has(principal));
+    if (inheritedPrincipals[0] !== `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:user/96bulls/transcript-eraser`)
+      refuse(`${ANALYSIS_RESULT_DENY_SID} must retain the transcript eraser`);
+    if (JSON.stringify(nextPrincipals) !== JSON.stringify([...inheritedPrincipals, roleArn]))
+      refuse(`${ANALYSIS_RESULT_DENY_SID} must inherit the live eraser and GC principals, then append the runner role`);
   }
 }
 
@@ -1297,7 +1312,14 @@ function sessionAnalysisRunnerGrantsPhase(
 ): TranscriptStorePlanPhase | undefined {
   const lines = detailedPlanText.split(/\r?\n/);
   const blocks = new Map(ANALYSIS_RUNNER_POLICY_RESOURCES.map((r) => [r, planResourceBlock(lines, r)]));
-  const touched = ANALYSIS_RUNNER_POLICY_RESOURCES.filter((r) => blocks.get(r)!.some((l) => l.includes("SessionAnalysis")));
+  const parsed = new Map<(typeof ANALYSIS_RUNNER_POLICY_RESOURCES)[number], ReturnType<typeof policyDiffSides>>();
+  const touched = ANALYSIS_RUNNER_POLICY_RESOURCES.filter((r) => {
+    const sids: readonly string[] = r === "transcripts" ? SESSION_ANALYSIS_RUNNER_BUCKET_SIDS : SESSION_ANALYSIS_RUNNER_KEY_SIDS;
+    if (!blocks.get(r)!.some((line) => sids.some((sid) => line.includes(`Sid: ${sid}`)))) return false;
+    const sides = policyDiffSides(blocks.get(r)!, (why) => refuse(`session analysis runner grants: ${r}: ${why}`));
+    parsed.set(r, sides);
+    return sids.some((sid) => sides.live.bySid.get(sid) !== sides.planned.bySid.get(sid));
+  });
   if (touched.length === 0) return undefined;
   if (touched.length !== ANALYSIS_RUNNER_POLICY_RESOURCES.length || ANALYSIS_RUNNER_POLICY_RESOURCES.some((r) => operations.get(r) !== "update"))
     refuse("session analysis runner grants: bucket and key policies must update together");
@@ -1309,7 +1331,7 @@ function sessionAnalysisRunnerGrantsPhase(
   }
 
   const directions = touched.map((r) => {
-    const { live, planned } = policyDiffSides(blocks.get(r)!, (why) => refuse(`session analysis runner grants: ${r}: ${why}`));
+    const { live, planned } = parsed.get(r)!;
     const sids = r === "transcripts" ? SESSION_ANALYSIS_RUNNER_BUCKET_SIDS : SESSION_ANALYSIS_RUNNER_KEY_SIDS;
     const before = sids.filter((sid) => live.bySid.has(sid)).length;
     const after = sids.filter((sid) => planned.bySid.has(sid)).length;

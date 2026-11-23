@@ -1115,6 +1115,14 @@ Set, it may list the bucket (including `GetBucketVersioning`), read canonical
 `normalized/session-analysis-v2`. KMS use is via S3 in us-east-1, with the
 runner account and exact object-ARN encryption context. S3 Bucket Keys stay off.
 
+`ListBucket` is deliberately unconditioned, as in the Lambda role: a missing
+manifest must answer 404 rather than 403. This lets the runner enumerate key
+names, including names below reserved dot namespaces, but the explicit S3 and
+KMS denies below prevent it from reading or changing those objects. The
+canonical read wildcard also deliberately covers immutable publication objects
+below `upload-generations/.../v1/`: canonical pointers can name those objects,
+so they are analysis evidence rather than an upload-inbox or ledger authority.
+
 The broad canonical wildcard crosses `/`, so both policies carry an explicit
 runner-principal Deny for every `96bulls/.` reserved namespace: `s3:*` on the
 reserved object ARN and Decrypt/Encrypt/GenerateDataKey on the matching KMS

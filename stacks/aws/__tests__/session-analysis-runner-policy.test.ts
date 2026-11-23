@@ -16,6 +16,7 @@ import {
   transcriptKeyPolicy,
   transcriptNames,
 } from "../transcript-store.ts";
+import { rearmSweeperBucketStatements } from "../rearm-sweeper-policy.ts";
 
 const names = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
 const eraserArn = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:user/96bulls/transcript-eraser`;
@@ -127,6 +128,16 @@ const keyBlock = (live: { Statement: unknown[] }, planned: { Statement: unknown[
   ...mark("-", yaml(live, 6)),
   ...mark("+", yaml(planned, 6)),
 ];
+function withResultDeletePrincipals(policy: unknown[], principals: string[]) {
+  const changed = structuredClone(policy) as Array<{
+    Sid?: string;
+    Condition?: { ArnNotEquals?: Record<string, unknown> };
+  }>;
+  const statement = changed.find((item) => item.Sid === "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults");
+  if (!statement?.Condition?.ArnNotEquals) throw new Error("result delete deny missing from test fixture");
+  statement.Condition.ArnNotEquals["aws:PrincipalArn"] = principals;
+  return changed;
+}
 function check(blocks: Record<string, string[]>, actions: Record<string, string>, input?: unknown) {
   const counts = new Map<string, number>();
   for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
@@ -187,14 +198,72 @@ describe("session-analysis runner plan contract", () => {
     };
     const commonBucket = { accountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: names.bucketArn, keyArn: "key", eraserArn, bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm, uploadInbox: upload };
     const commonKey = { ...keyArgs, bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm, uploadInbox: upload };
-    const complexLiveBucket = transcriptBucketPolicy(commonBucket);
-    const complexNextBucket = transcriptBucketPolicy({ ...commonBucket, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
+    const rearmStatements = rearmSweeperBucketStatements({ bucketArn: names.bucketArn, roleArn: rearm });
+    const complexLiveBucket = [...transcriptBucketPolicy(commonBucket), ...rearmStatements];
+    const complexNextBucket = [
+      ...transcriptBucketPolicy({ ...commonBucket, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN }),
+      ...rearmStatements,
+    ];
     const complexLiveKey = transcriptKeyPolicy(commonKey);
     const complexNextKey = transcriptKeyPolicy({ ...commonKey, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
     expect(check({
       transcripts: bucketBlock(complexLiveBucket, complexNextBucket),
       "transcripts-key": keyBlock(complexLiveKey, complexNextKey),
     }, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN)).toBe("session analysis runner grants");
+
+    const attacker = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/attacker`;
+    for (const principals of [
+      [eraserArn, attacker, SESSION_ANALYSIS_RUNNER_ROLE_ARN],
+      [attacker, SESSION_ANALYSIS_RUNNER_ROLE_ARN],
+      [eraserArn, SESSION_ANALYSIS_RUNNER_ROLE_ARN],
+    ]) expect(() => check({
+      transcripts: bucketBlock(complexLiveBucket, withResultDeletePrincipals(complexNextBucket, principals)),
+      "transcripts-key": keyBlock(complexLiveKey, complexNextKey),
+    }, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN)).toThrow(/inherit the live eraser and GC principals/);
+  });
+
+  it("adds and revokes the runner when the Lambda analysis deleter already owns the result carve-out", () => {
+    const pipeline = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/pipeline`;
+    const commonBucket = { accountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: names.bucketArn, keyArn: "key", eraserArn, analysisDeleterArn: pipeline };
+    const commonKey = { ...keyArgs, pipelineRoleArn: pipeline, analysisResults: true };
+    const analysisLiveBucket = transcriptBucketPolicy(commonBucket);
+    const analysisNextBucket = transcriptBucketPolicy({ ...commonBucket, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
+    const analysisLiveKey = transcriptKeyPolicy(commonKey);
+    const analysisNextKey = transcriptKeyPolicy({ ...commonKey, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
+    const add = {
+      transcripts: bucketBlock(analysisLiveBucket, analysisNextBucket),
+      "transcripts-key": keyBlock(analysisLiveKey, analysisNextKey),
+    };
+    expect(check(add, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
+      .toBe("session analysis runner grants");
+    expect(check({
+      transcripts: bucketBlock(analysisNextBucket, analysisLiveBucket),
+      "transcripts-key": keyBlock(analysisNextKey, analysisLiveKey),
+    }, { transcripts: "update", "transcripts-key": "update" })).toBe("session analysis runner grants");
+  });
+
+  it("defers unchanged runner statements to a later policy phase", () => {
+    const worker = `arn:aws:iam::${SESSION_ANALYSIS_RUNNER_ACCOUNT_ID}:role/test-cross-account-worker`;
+    const runnerBucket = bucket(SESSION_ANALYSIS_RUNNER_ROLE_ARN);
+    const runnerKey = key(SESSION_ANALYSIS_RUNNER_ROLE_ARN);
+    const withWorkerBucket = transcriptBucketPolicy({
+      accountId: TRANSCRIPT_ACCOUNT_ID,
+      bucketArn: names.bucketArn,
+      keyArn: "key",
+      eraserArn,
+      sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+      crossAccountWorkerRoleArn: worker,
+    });
+    const withWorkerKey = transcriptKeyPolicy({
+      ...keyArgs,
+      sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
+      crossAccountWorkerRoleArn: worker,
+    });
+    expect(check({
+      transcripts: bucketBlock(runnerBucket, withWorkerBucket),
+      "transcripts-key": keyBlock(runnerKey, withWorkerKey),
+    }, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
+      .toBe("cross-account worker grants");
   });
 
   it("refuses a missing side, a wrong role, or any declared ride-along", () => {
