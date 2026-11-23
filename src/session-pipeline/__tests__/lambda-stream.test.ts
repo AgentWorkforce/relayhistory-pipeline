@@ -5,6 +5,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { handler, invocationDeps, lambdaEnv, searchTransaction, transaction } from "../lambda.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import type { ConsumerDeps } from "../consumer.ts";
@@ -153,7 +155,17 @@ describe("transaction()", () => {
     try {
       await expect(transaction(db, async (tx) => {
         await tx.query("SELECT 1");
-        await new Promise<void>((resolve) => setImmediate(() => { client.emit("error", dropped); resolve(); }));
+        // Fails fast if no listener kept the error: emit would throw here instead of the test hanging.
+        await new Promise<void>((resolve, reject) =>
+          setImmediate(() => {
+            try {
+              client.emit("error", dropped);
+              resolve();
+            } catch {
+              reject(new Error("the client's 'error' had no listener: emit threw"));
+            }
+          }),
+        );
         await tx.query("SELECT 2");
       }, true)).rejects.toBe(dropped);
     } finally {
@@ -186,5 +198,18 @@ describe("transaction()", () => {
     // And lambdaEnv only ever produces searchStreamCh: true from SEARCH_INDEX_STREAMING_CH=1.
     expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1", SEARCH_INDEX_STREAMING_CH: "1" }).searchStreamCh).toBe(true);
     expect(lambdaEnv({ ...base, SEARCH_INDEX_ENABLED: "1" }).searchStreamCh).toBeUndefined();
+  });
+});
+
+describe("init's search transaction (source check)", () => {
+  // init() is not exported and needs the secret, a pg pool and S3 to run; driving it end to end
+  // would change src or leave a cached runtime behind for other test files. This pins the one
+  // line that wires it instead: the search deps take searchTransaction(db, env), whose guard is
+  // tested above, and no unguarded transaction(db, work) of their own.
+  test("the search deps use searchTransaction(db, env)", () => {
+    const source = readFileSync(fileURLToPath(new URL("../lambda.ts", import.meta.url)), "utf8");
+    const search = source.slice(source.indexOf("deps.search = {"), source.indexOf("};", source.indexOf("deps.search = {")));
+    expect(search).toContain("transact: searchTransaction(db, env),");
+    expect(search).not.toMatch(/transaction\(db, work/);
   });
 });

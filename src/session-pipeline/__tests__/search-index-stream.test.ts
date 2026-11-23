@@ -32,7 +32,7 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import type { IndexRow } from "../vendor/search-index/rows.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { SEARCH_INDEX_STREAM_CH_BUDGET, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
+import { SEARCH_INDEX_STREAM_CH_BUDGET, STREAM_TAIL_RESERVE_MS, indexSearchScope, projectedToNeonRow, readChunkRecords, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_PASSES, streamScope } from "../search-index-stream.ts";
 import { transaction } from "../lambda.ts";
 import { chunkKeys } from "../../shared/vendor.ts";
@@ -833,7 +833,7 @@ describe("streamed reconcile", () => {
       await indexSearchScope(scope, deps(truth.ch, () => keys).d);
       const base = truth.final()[0]!;
       const ch = fakeClickHouse();
-      ch.rows.push(...truth.final(), { ...base, kind: "tool_result", event_id: "x�", fingerprint: "neon-a" }, { ...base, kind: "tool_result", event_id: "x\u{1F600}", fingerprint: "neon-b" }, { ...base, event_id: "tail:stale0", fingerprint: "neon-y" });
+      ch.rows.push(...truth.final(), { ...base, kind: "tool_result", event_id: "x\uFFFD", fingerprint: "neon-a" }, { ...base, kind: "tool_result", event_id: "x\u{1F600}", fingerprint: "neon-b" }, { ...base, event_id: "tail:stale0", fingerprint: "neon-y" });
       // One row per page: the two ids land on consecutive pages and are compared across them.
       const out = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, limits: { ...tiny, insertBatch: 1 } }).d);
       expect(out).toMatchObject({ complete: true, deleted: 1, reasons: [] });
@@ -868,5 +868,52 @@ describe("streamed reconcile", () => {
     const again = await processBatch([put(small[0]!, "03")], { ...consumer({}), search: { ...consumer({}).search!, stream: undefined, streamDeadline: { at: 100, now: () => 200 } } });
     expect(again.batchItemFailures).toEqual([]);
     expect(ch.state.map((r) => r.session_id)).toEqual(["sess_2"]);
+  });
+
+  test("the tail reserve is 30 s: exactly 30 000 ms left starts the tail, 29 999 ms does not", async () => {
+    expect(STREAM_TAIL_RESERVE_MS).toBe(30_000);
+    const keys = await richScope();
+    const AT = 1_000_000;
+    for (const [left, complete] of [[30_000, true], [29_999, false]] as const) {
+      const { ch } = await staleSeeded(keys, 1);
+      let clock = 0; // the start check reads 0: 1 000 s left
+      const scan = { ...ch.ch, select: async <T,>(q: string, o?: unknown) => {
+        if (q.includes("ORDER BY ts, machine_id")) clock = AT - left;
+        return ch.ch.select<T>(q, o as never);
+      } } as ClickHouseClient;
+      const out = await indexSearchScope(scope, deps(scan, () => keys, { ...armed, streamDeadline: { at: AT, now: () => clock } }).d);
+      if (complete) {
+        expect(out).toMatchObject({ complete: true, deleted: 1, reasons: [] });
+        expect(ch.state.at(-1)!.needs_full).toBe(0);
+      } else {
+        expect(out).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_deadline"] });
+        noDelete(ch);
+      }
+    }
+  });
+
+  test("the reserve is checked again before every later delete batch: crossing it between batches stops there", async () => {
+    const keys = await richScope();
+    const { ch, truth } = await staleSeeded(keys, 1_200); // three batches of at most 500
+    const AT = 1_000_000;
+    let clock = 0;
+    let batches = 0;
+    const timed = {
+      ...ch.ch,
+      select: async <T,>(q: string, o?: unknown) => {
+        if (q.includes("ORDER BY ts, machine_id")) clock = AT - 30_000; // the first batch may start
+        return ch.ch.select<T>(q, o as never);
+      },
+      command: async (q: string, o?: unknown) => {
+        await ch.ch.command(q, o as never);
+        if (q.startsWith("DELETE") && ++batches === 1) clock = AT - 29_999; // inside the reserve, not past the deadline
+      },
+    } as ClickHouseClient;
+    const out = await indexSearchScope(scope, deps(timed, () => keys, { ...armed, streamDeadline: { at: AT, now: () => clock } }).d);
+    expect(out).toMatchObject({ complete: false, partial: true, deleted: 500, reasons: ["scope_too_large", "stream_deadline"] });
+    expect(batches).toBe(1);
+    expect(ch.state.at(-1)!.needs_full).toBe(1);
+    expect(await indexSearchScope(scope, deps(ch.ch, () => keys, armed).d)).toMatchObject({ complete: true, deleted: 700 });
+    expect(ch.final()).toEqual(truth.final());
   });
 });
