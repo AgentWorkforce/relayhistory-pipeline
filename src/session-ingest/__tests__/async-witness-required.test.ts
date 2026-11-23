@@ -5,9 +5,12 @@
  * the synchronous SQL path. Off, or for any other request, behaviour is unchanged (docs/design/s3-first-async-ingest.md).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { logLine } from "../../shared/log.ts";
-import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE, type IngestAppDeps } from "../app.ts";
-import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, asyncWitnessRequiredMode, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
+import { logLine, WITNESS_FAILURE_VALUES } from "../../shared/log.ts";
+import { ObjectStoreError, objectKey } from "../../shared/vendor.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, signRequest, SYNC_SCOPE, WITNESS_FAILURES, type IngestAppDeps } from "../app.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, asyncWitnessRequiredMode, journalKey, type AdmissionMessage, type AsyncAdmissionMode } from "../async-admission.ts";
+import { HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS } from "../http-admission-stop.ts";
+import { ingestApp, ingestSettings, type IngestWorkerEnv } from "../worker.ts";
 import { CURRENT_CUSTODY_CONTENT_TYPE } from "../custody-protocol.ts";
 import { createInflightLease, type InflightLease } from "../inflight-lease.ts";
 import type { Ledger } from "../ledger.ts";
@@ -16,23 +19,29 @@ import type { UploadConsentStore } from "../upload-consent.ts";
 import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
 
 const cleanups: (() => void)[] = [];
+const seeds: Promise<void>[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
 const identity = { ...TENANT, scopes: [SYNC_SCOPE] };
 const T0 = 1_800_000_000_000;
 const optIn = { [IDENTITY_HEADER]: encodeIdentity({ ...identity, admission: ADMISSION_ACCEPT_VALUE }) };
 const plain = { [IDENTITY_HEADER]: encodeIdentity(identity) };
 
+const RETRY_AFTER = String(HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS);
+/** The object store's answer while it is down: a real ObjectStoreError, as the S3 adapter throws for a 503. */
+const storeDown = () => new ObjectStoreError("transient", "s3", "s3 down: 96bulls/org-a/private-key", { status: 503 });
+
 /**
- * A scratch store whose writes are counted. `broken`: every getObject fails, so the pre-body journal witness (the
- * only read before the body) is missing and the request is witness-less.
+ * A scratch store whose writes are counted. `broken`: every getObject throws `broken()`, so the pre-body journal
+ * witness (the only read before the body) is missing and the request is witness-less.
  */
-function store(broken: boolean, puts: string[]) {
+function store(broken: (() => Error) | undefined, puts: string[], seed?: (s: ReturnType<typeof scratchStore>["store"]) => Promise<void>) {
   const s = scratchStore();
   cleanups.push(s.done);
+  if (seed) seeds.push(seed(s.store));
   return new Proxy(s.store, {
     get(target, key) {
       const v = Reflect.get(target, key, target);
-      if (key === "getObject" && broken) return async () => { throw Object.assign(new Error("s3 down"), { code: "transient" }); };
+      if (key === "getObject" && broken) return async () => { throw broken(); };
       if (key === "put" && typeof v === "function") return (...args: unknown[]) => { puts.push("put"); return (v as (...a: unknown[]) => unknown).apply(target, args); };
       return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
     },
@@ -40,7 +49,8 @@ function store(broken: boolean, puts: string[]) {
 }
 
 /** Every SQL-capable or lock-capable dependency, counted. */
-function harness(opts: { flag?: "on"; mode?: AsyncAdmissionMode; broken?: boolean; turns?: boolean } = {}) {
+function harness(opts: { flag?: "on"; mode?: AsyncAdmissionMode; broken?: (() => Error) | false; turns?: boolean; selfhost?: boolean; keyRoot?: string;
+  seed?: (s: ReturnType<typeof scratchStore>["store"]) => Promise<void> } = {}) {
   const memory = new MemoryLedger();
   const ledgerCalls: string[] = [];
   const registers: unknown[] = [];
@@ -69,15 +79,16 @@ function harness(opts: { flag?: "on"; mode?: AsyncAdmissionMode; broken?: boolea
   const sent: AdmissionMessage[] = [];
   const logged: Record<string, unknown>[] = [];
   const puts: string[] = [];
-  const target = store(opts.broken ?? true, puts);
+  const target = store(opts.broken === false ? undefined : opts.broken ?? storeDown, puts, opts.seed);
   const mode = opts.mode ?? "on";
   const deps: IngestAppDeps = {
     identify: (req) => bindingIdentity(req),
     log: (f) => logged.push(f),
-    deliver: { ledger, acceptanceMode: "buffered", target: { store: target, keyRoot: "96bulls" } },
+    deliver: { ledger, acceptanceMode: "buffered", target: { store: target, keyRoot: opts.keyRoot ?? "96bulls" } },
     uploadConsent: { enforcement: "report", store: consentStore, nowMs: () => T0 },
     inflightLease: { mode: "observe", lease, now: () => T0 },
-    ...(mode !== "off" ? { asyncAdmission: { mode, enqueue: async (m: AdmissionMessage) => { sent.push(m); }, nowMs: () => T0 } } : {}),
+    ...(mode !== "off" ? { asyncAdmission: { mode, enqueue: async (m: AdmissionMessage) => { sent.push(m); }, nowMs: () => T0,
+      ...(opts.selfhost ? { selfhost: { identityOf: (req: Request) => bindingIdentity(req) } } : {}) } } : {}),
     ...(opts.turns ? { turnFenceRegister: true as const } : {}),
     ...(opts.flag ? { asyncWitnessRequired: opts.flag } : {}),
   };
@@ -86,7 +97,7 @@ function harness(opts: { flag?: "on"; mode?: AsyncAdmissionMode; broken?: boolea
 }
 
 const post = async (h: ReturnType<typeof harness>, b: unknown, headers: Record<string, string> = optIn, path = "/v1/delivery/batches") =>
-  h.app.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ protocolVersion: 1, batch: b }) });
+  (await Promise.all(seeds.splice(0)), h.app.request(path, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ protocolVersion: 1, batch: b }) }));
 
 async function turnsBatch() {
   const SESSION = "7b0f5a8e-1c2d-4e3f-8a9b-0c1d2e3f4a5b";
@@ -109,6 +120,8 @@ function synchronous(h: ReturnType<typeof harness>, res: Response) {
   expect(h.sent).toHaveLength(0);
   expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
   expect(h.logged.some((f) => f.stage === "admission_witness")).toBe(false);
+  // The witness catch stays silent with the flag off: no failure class anywhere.
+  expect(h.logged.some((f) => Object.hasOwn(f, "witness_failure"))).toBe(false);
   expect(h.logged.find((f) => f.outcome === "delivery_unavailable")).toMatchObject({ stage: "buffer", error_code: "buffer_not_configured" });
 }
 
@@ -144,11 +157,11 @@ describe("request path", () => {
     expect(h.leaseCalls).toEqual(["track"]);
   });
 
-  test("on: the same batch is a 503 delivery_unavailable, no Retry-After, before any lease, consent, ledger or object write", async () => {
+  test("on: the same batch is a 503 delivery_unavailable, Retry-After as the HTTP admission stop, before any lease, consent, ledger or object write", async () => {
     const h = harness({ flag: "on" });
     const res = await post(h, await batch([record({ record_id: "r1", payload: { text: "private words" } })]));
     expect(res.status).toBe(503);
-    expect(res.headers.get("retry-after")).toBeNull();
+    expect(res.headers.get("retry-after")).toBe(RETRY_AFTER);
     expect(res.headers.get(ADMISSION_HEADER)).toBeNull();
     const body = await res.json() as { error: { code: string; message: string }; correlationId: unknown };
     expect(body.error).toEqual({ code: "delivery_unavailable", message: "Durable delivery is temporarily unavailable" });
@@ -160,22 +173,26 @@ describe("request path", () => {
     expect(h.leaseCalls).toEqual([]);
     expect(h.puts).toEqual([]);
     expect(h.sent).toHaveLength(0);
-    // The log line, through the real allowlisted logLine: existing keys only.
+    // The log line, through the real allowlisted logLine: the failure class and what the store answered.
     const refusal = h.logged.find((f) => f.outcome === "delivery_unavailable");
     expect(refusal).toBeDefined();
     const line = JSON.parse(logLine("info", "session ingest", refusal!)) as Record<string, unknown>;
     expect(line.outcome).toBe("delivery_unavailable");
     expect(line.stage).toBe("admission_witness");
     expect(line.error_code).toBe("privacy_journal_unavailable");
+    expect(line.witness_failure).toBe("store_read");
+    expect(line.store_status).toBe(503);
     expect(line.route).toBe("delivery.batches");
     expect(JSON.stringify(line)).not.toContain("private words");
+    expect(JSON.stringify(line)).not.toContain("private-key");
+    expect(JSON.stringify(line)).not.toContain("s3 down");
   });
 
   test("on: the turns route is refused before the turn register", async () => {
     const h = harness({ flag: "on", turns: true });
     const res = await post(h, await turnsBatch(), optIn, "/v1/turns/batches");
     expect(res.status).toBe(503);
-    expect(res.headers.get("retry-after")).toBeNull();
+    expect(res.headers.get("retry-after")).toBe(RETRY_AFTER);
     expect(h.registers).toHaveLength(0);
     expect(h.ledgerCalls).toEqual([]);
     expect(h.consent).toEqual([]);
@@ -229,5 +246,106 @@ describe("request path", () => {
     // It went past the place the flag refuses: the lease and the consent precheck ran.
     expect(on.leased).toBe(1);
     expect(on.consent).toBe(true);
+  });
+});
+
+describe("the refusal line's witness failure class (closed set, through the real logLine)", () => {
+  test("the log allowlist's set equals the app's", () => {
+    expect([...WITNESS_FAILURE_VALUES].sort()).toEqual([...WITNESS_FAILURES].sort());
+  });
+
+  const refusalLine = async (h: ReturnType<typeof harness>) => {
+    const res = await post(h, await batch([record({ record_id: "r1" })]));
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe(RETRY_AFTER);
+    expect(h.ledgerCalls).toEqual([]);
+    const refusal = h.logged.find((f) => f.outcome === "delivery_unavailable");
+    expect(refusal).toMatchObject({ stage: "admission_witness", error_code: "privacy_journal_unavailable" });
+    return JSON.parse(logLine("info", "session ingest", refusal!)) as Record<string, unknown>;
+  };
+
+  test("a status-less store failure: store_read with its transport class", async () => {
+    const line = await refusalLine(harness({ flag: "on", broken: () => new ObjectStoreError("transient", "s3", "connect reset to bucket/org-a", { transportCause: "econnreset" }) }));
+    expect(line.witness_failure).toBe("store_read");
+    expect(line.store_cause).toBe("econnreset");
+    expect(Object.hasOwn(line, "store_status")).toBe(false);
+  });
+
+  test("an invalid journal object: journal_invalid (retries cannot work until it is repaired)", async () => {
+    for (const bytes of ["not json", JSON.stringify({ v: 2, seq: 1 })]) {
+      const line = await refusalLine(harness({ flag: "on", broken: false,
+        seed: (s) => s.put(objectKey(journalKey("96bulls", TENANT)), new TextEncoder().encode(bytes), { contentType: "application/json" }).then(() => {}) }));
+      expect(line.witness_failure).toBe("journal_invalid");
+      expect(Object.hasOwn(line, "store_status") || Object.hasOwn(line, "store_cause")).toBe(false);
+      expect(JSON.stringify(line)).not.toContain("privacy-journal");
+    }
+  });
+
+  test("a key root the tenant-segment rule rejects: tenant_rejected (never works)", async () => {
+    const line = await refusalLine(harness({ flag: "on", broken: false, keyRoot: "Not_A_Root" }));
+    expect(line.witness_failure).toBe("tenant_rejected");
+    expect(JSON.stringify(line)).not.toContain("Not_A_Root");
+  });
+});
+
+describe("self-host is untouched by the option", () => {
+  test("self-host with async admission on: the same answer whatever asyncWitnessRequired says", async () => {
+    const answer = async (flag?: "on") => {
+      const h = harness({ ...(flag ? { flag } : {}), selfhost: true });
+      const res = await post(h, await batch([record({ record_id: "r1" })]));
+      return { status: res.status, retryAfter: res.headers.get("retry-after"), body: (await res.json() as { error?: unknown }).error,
+        lines: h.logged.filter((f) => f.outcome === "delivery_unavailable").map((f) => JSON.parse(logLine("info", "m", f)) as Record<string, unknown>).map(({ ts: _ts, correlation_id: _c, duration_ms: _d, ...rest }) => rest),
+        leased: h.leaseCalls, consent: h.consent };
+    };
+    const on = await answer("on"), off = await answer();
+    expect(on).toEqual(off);
+    // Self-host's own refusal, after the lease and the consent precheck, and without Retry-After.
+    expect(off.status).toBe(503);
+    expect(off.retryAfter).toBeNull();
+    expect(off.lines[0]).toMatchObject({ stage: "admission_witness", error_code: "privacy_journal_unavailable" });
+    expect(off.leased.length).toBeGreaterThan(0);
+  });
+});
+
+describe("the deployed wiring (worker.ts ingestApp)", () => {
+  const env: IngestWorkerEnv = {
+    HYPERDRIVE: { connectionString: "postgres://synthetic-invalid-unused" },
+    INGEST_FANOUT: { async send() { throw Error("queue_unused"); }, async sendBatch() { throw Error("queue_unused"); } },
+    INGEST_ADMISSION: { async send() { throw Error("admission_queue_unused"); }, async sendBatch() { throw Error("admission_queue_unused"); } } as never,
+    S3_ACCESS_KEY_ID: "synthetic", S3_SECRET_ACCESS_KEY: "synthetic", INGEST_SIGNING_KEY: "synthetic", INGEST_S3_BUCKET: "synthetic", INGEST_KMS_KEY_ARN: "synthetic",
+    INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: "a".repeat(64), INGEST_INLINE_MAX_SESSIONS: "0", INGEST_ASYNC_ADMISSION: "on",
+  };
+  /** var -> ingestSettings -> ingestApp -> a signed, opted-in POST while the journal store is down. */
+  const send = async (flag?: string) => {
+    const e = { ...env, ...(flag !== undefined ? { INGEST_ASYNC_WITNESS_REQUIRED: flag } : {}) };
+    const settings = (await ingestSettings(e))!;
+    expect(settings).not.toBeNull();
+    const sql: string[] = [];
+    const run = (async (text: string) => { sql.push(text); throw Object.assign(new Error("db down"), { code: "08006" }); }) as never;
+    const puts: string[] = [];
+    const app = ingestApp(e, settings, run, { store: store(storeDown, puts), keyRoot: settings.keyRoot, sleep: async () => {} } as never);
+    const identity = encodeIdentity({ ...identity_, admission: ADMISSION_ACCEPT_VALUE });
+    const body = new TextEncoder().encode(JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: "r1" })]) }));
+    const res = await app.request("/v1/delivery/batches", { method: "POST", body, headers: { "content-type": "application/json", [IDENTITY_HEADER]: identity,
+      [SIGNATURE_HEADER]: signRequest(settings.signingKey, Math.floor(Date.now() / 1000), "POST", "/v1/delivery/batches", identity, body) } });
+    return { status: res.status, retryAfter: res.headers.get("retry-after"), code: (await res.json() as { error?: { code: string } }).error?.code, sql, puts };
+  };
+  const identity_ = identity;
+
+  test("on: the witness-less opted-in batch is the refusal, before any SQL", async () => {
+    const on = await send("on");
+    expect(on.status).toBe(503);
+    expect(on.code).toBe("delivery_unavailable");
+    expect(on.retryAfter).toBe(RETRY_AFTER);
+    expect(on.sql).toEqual([]);
+    expect(on.puts).toEqual([]);
+  });
+
+  test("off or unset: the same batch takes the synchronous path and reaches the ledger", async () => {
+    for (const flag of [undefined, "off"]) {
+      const off = await send(flag);
+      expect(off.sql.length).toBeGreaterThan(0);
+      expect(off.retryAfter).not.toBe(RETRY_AFTER);
+    }
   });
 });

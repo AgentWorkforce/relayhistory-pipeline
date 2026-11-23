@@ -58,7 +58,9 @@ import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch, TURN_ORIGIN_ID } from "./turns.ts";
-import { HttpAdmissionStopped } from "./http-admission-stop.ts";
+import { HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS, HttpAdmissionStopped } from "./http-admission-stop.ts";
+import { IngestWriteError } from "./writer.ts";
+import { isObjectStoreError } from "../shared/vendor.ts";
 import { INFLIGHT_LEASE_LOCK, inflightRetryAfter, type InflightGrant, type InflightLease, type InflightLeaseMode } from "./inflight-lease.ts";
 import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
@@ -220,9 +222,11 @@ export interface IngestAppDeps {
    * INGEST_ASYNC_WITNESS_REQUIRED (async-admission.ts). Absent or "off": nothing changes. "on" (hosted; self-host
    * already refuses): with async admission "on", a batch that would take the queued ACK (SIGNED identity
    * `admission: queued-v1`, no relayhistory-built custody envelope) but has no pre-body privacy-journal witness
-   * answers 503 delivery_unavailable (stage admission_witness, privacy_journal_unavailable) instead of falling back
-   * to the synchronous SQL path. Thrown before the in-flight lease, the consent precheck, the turn register and any
-   * ledger call. Not queue-eligible requests, and async admission "off" / "drain", are unchanged.
+   * answers 503 delivery_unavailable (stage admission_witness, privacy_journal_unavailable; Retry-After as
+   * HttpAdmissionStopped) instead of falling back to the synchronous SQL path. Thrown before the in-flight lease, the
+   * consent precheck, the turn register and any ledger call. The route line names the witness failure class
+   * (`witness_failure`, WITNESS_FAILURES). Not queue-eligible requests, and async admission "off" / "drain", are
+   * unchanged.
    */
   asyncWitnessRequired?: AsyncWitnessRequiredMode;
   /**
@@ -287,7 +291,40 @@ export interface SelfhostAdmissionHooks {
   reEnableRefusedByLedger?: boolean;
 }
 
-type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
+type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined; journalWitnessFailure: WitnessFailureOf | undefined } };
+
+/**
+ * INGEST_ASYNC_WITNESS_REQUIRED=on: why the pre-body privacy-journal witness is missing, for the refusal's route line
+ * (`witness_failure`; log.ts WITNESS_FAILURE_VALUES mirrors this set, pinned in async-witness-required.test.ts).
+ * - `store_read`: the object store failed the journal read (with `store_status` or `store_cause`); a retry can work.
+ * - `journal_invalid`: the journal object is not valid JSON or not a valid journal; refused until it is repaired.
+ * - `tenant_rejected`: the org id or the deployment key root fails the tenant-segment rule; never works.
+ * - `absent`: nothing failed (the witness was dropped because the verified tenant differs from the claimed one, or
+ *   the unverified identity carried no opt-in).
+ * - `other`: anything else.
+ * A class only: never the org, user, key or error text.
+ */
+export const WITNESS_FAILURES = ["store_read", "journal_invalid", "tenant_rejected", "absent", "other"] as const;
+export type WitnessFailure = (typeof WITNESS_FAILURES)[number];
+interface WitnessFailureOf { failure: WitnessFailure; storeStatus?: number; storeCause?: string }
+
+function witnessFailureOf(error: unknown): WitnessFailureOf {
+  if (isObjectStoreError(error)) return { failure: "store_read", ...(error.status !== undefined ? { storeStatus: error.status } : {}), ...(error.transportCause ? { storeCause: error.transportCause } : {}) };
+  if (error instanceof IngestWriteError && error.code === "tenant_not_a_segment") return { failure: "tenant_rejected" };
+  if (error instanceof SyntaxError || (error instanceof Error && error.message === "privacy_journal_invalid")) return { failure: "journal_invalid" };
+  return { failure: "other" };
+}
+
+/**
+ * The INGEST_ASYNC_WITNESS_REQUIRED refusal: 503 delivery_unavailable, stage admission_witness, with the same fixed
+ * Retry-After as HttpAdmissionStopped, so a journal-store outage is not met by an immediate retry storm on that store.
+ */
+export class AsyncWitnessMissing extends IngestUnavailable {
+  readonly retryAfterSeconds = HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS;
+  constructor(readonly witnessFailure: WitnessFailure, storeStatus?: number, storeCause?: string) {
+    super("admission_witness", "privacy_journal_unavailable", undefined, storeStatus, storeCause);
+  }
+}
 
 /** Node 24 always has zstd; published most preferred first, as relayhistory. */
 export function contentEncodings(): ContentEncoding[] {
@@ -371,6 +408,9 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
  * error that reached the route outside a delivery stage is reported the same way.
  * Diagnostic only. */
 function unavailableFields(error: unknown): Record<string, unknown> {
+  if (error instanceof AsyncWitnessMissing)
+    return { stage: error.stage, error_code: error.cause_code, witness_failure: error.witnessFailure,
+      ...(error.storeStatus !== undefined ? { store_status: error.storeStatus } : {}), ...(error.storeCause !== undefined ? { store_cause: error.storeCause } : {}) };
   if (error instanceof IngestUnavailable || error instanceof ClaimLockBusy) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
   if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
   return {};
@@ -422,6 +462,8 @@ function failure(c: Context<Env>, error: unknown) {
   if (safe instanceof UploadConsentRequired) c.header("Retry-After", String(safe.retryAfterSeconds));
   // A stopped org (INGEST_HTTP_ADMISSION_STOPPED_ORGS): retry later, by which time the desktop uploads directly.
   if (safe instanceof HttpAdmissionStopped) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // A witness-less queue-eligible batch (INGEST_ASYNC_WITNESS_REQUIRED=on): the same bounded wait.
+  if (safe instanceof AsyncWitnessMissing) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
   if (safe instanceof AcquisitionRefusedError)
     return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
@@ -692,8 +734,10 @@ export function createIngestApp(deps: IngestAppDeps) {
           const tenant = { orgId: claimed.orgId, workspaceId: claimed.workspaceId, userId: claimed.userId };
           c.set("journalWitness", { tenant: JSON.stringify(tenant), seq: await witnessPrivacyJournal(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant) });
         }
-      } catch {
-        // No witness: this request takes the synchronous path.
+      } catch (error) {
+        // No witness: this request takes the synchronous path. With INGEST_ASYNC_WITNESS_REQUIRED=on it is refused
+        // instead, and the refusal line names the failure class; with the flag off nothing is recorded.
+        if (witnessRequired) c.set("journalWitnessFailure", witnessFailureOf(error));
       }
     }
     // The body is read once, bounded by the wire cap, so the signature covers exactly what is parsed.
@@ -877,8 +921,10 @@ export function createIngestApp(deps: IngestAppDeps) {
       // INGEST_ASYNC_WITNESS_REQUIRED (hosted): a queue-eligible batch without its witness is refused, never moved to
       // the synchronous SQL path. Here, before the in-flight lease, the consent precheck, the turn register and the
       // claim; only the body parse and in-memory checks ran. Self-host refuses the same case below.
-      if (witnessRequired && asyncMode === "on" && !selfhostAdmission && !witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody"))
-        throw new IngestUnavailable("admission_witness", "privacy_journal_unavailable");
+      if (witnessRequired && asyncMode === "on" && !selfhostAdmission && !witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody")) {
+        const why = c.get("journalWitnessFailure") ?? { failure: "absent" };
+        throw new AsyncWitnessMissing(why.failure, why.storeStatus, why.storeCause);
+      }
       // INGEST_INFLIGHT_LEASE: the synchronous path only, before its first lock-capable call (the consent
       // snapshot write, the turn register, the claim). The queued ACK neither takes nor is refused by it.
       if (inflight && !queued) lease = takeInflightLease(inflight, tenant, batch.origin_id, route, fields);

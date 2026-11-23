@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, BOOLEAN_FIELDS, BOUNDED_COUNT_FIELDS, FRAME_NAME_SHAPE, STORE_CAUSE_VALUES, errorFields, log, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, BOOLEAN_FIELDS, BOUNDED_COUNT_FIELDS, FRAME_NAME_SHAPE, STORE_CAUSE_VALUES, WITNESS_FAILURE_VALUES, errorFields, log, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
 import { STORE_TRANSPORT_CAUSES } from "../vendor.ts";
 import { send } from "../../../packages/object-store/src/core.ts";
 import { ObjectStoreError, storeTransportCause } from "../../../packages/object-store/src/errors.ts";
@@ -64,6 +64,13 @@ describe("telemetry allowlist", () => {
     expect([...STORE_CAUSE_VALUES].sort()).toEqual([...STORE_TRANSPORT_CAUSES].sort());
     expect(sanitizeLogField("store_cause", "econnreset")).toBe("econnreset");
     for (const bad of ["ECONNRESET", "socket hang up at https://bucket/96bulls/key", "", 104, null]) expect(sanitizeLogField("store_cause", bad)).toBeUndefined();
+  });
+
+  test("witness_failure is one closed class or nothing, through the real logLine", () => {
+    expect(ALLOWED_LOG_FIELDS.has("witness_failure")).toBe(true);
+    for (const v of WITNESS_FAILURE_VALUES) expect(JSON.parse(logLine("info", "m", { witness_failure: v })).witness_failure).toBe(v);
+    for (const bad of ["STORE_READ", "s3 down: 96bulls/org-a/key", "privacy_journal_invalid", "", 1, null, true])
+      expect(Object.hasOwn(JSON.parse(logLine("info", "m", { witness_failure: bad })), "witness_failure")).toBe(false);
   });
 
   test("the streaming reconcile startup fields: streaming is on / off or nothing, the budgets bounded counts", () => {

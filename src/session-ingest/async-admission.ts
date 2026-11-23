@@ -63,7 +63,7 @@ export function syncAdmissionFrozenReceiptMode(raw: string | undefined): SyncAdm
 /** INGEST_ASYNC_WITNESS_REQUIRED. off (default): today's paths, unchanged (a queue-eligible batch whose
  * pre-body privacy-journal witness is missing takes the synchronous path). on: with INGEST_ASYNC_ADMISSION=on,
  * that batch (signed `admission: queued-v1`, no relayhistory-built custody envelope, no witness) is a retryable
- * 503 (stage admission_witness, privacy_journal_unavailable) before any lease, consent, register or ledger call,
+ * 503 (stage admission_witness, privacy_journal_unavailable, Retry-After) before any lease, consent, register or ledger call,
  * as self-host already answers (app.ts acceptBatch). With async admission off or drain it changes nothing. */
 export type AsyncWitnessRequiredMode = "off" | "on";
 

@@ -86,6 +86,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "store_status",
   // ...and, with no HTTP status, its closed transport-failure class (STORE_CAUSE_VALUES; anything else dropped).
   "store_cause",
+  // The ingest INGEST_ASYNC_WITNESS_REQUIRED refusal (src/session-ingest/app.ts AsyncWitnessMissing): why the
+  // privacy-journal witness is missing, a closed class only (WITNESS_FAILURE_VALUES; anything else dropped).
+  "witness_failure",
   // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
   ...ADMISSION_PHASE_FIELDS_LIST,
   // ...and which batch and which attempt it was (selfhost-admission.ts admissionLogTags): the first 8 hex of a
@@ -163,6 +166,8 @@ function boundedCount(v: unknown, max: number): number | undefined {
 export const STORE_CAUSE_VALUES: ReadonlySet<string> = new Set([
   "econnreset", "etimedout", "econnrefused", "epipe", "abort", "timeout", "dns", "tls", "socket", "other",
 ]);
+/** `witness_failure` mirrors session-ingest app.ts WITNESS_FAILURES (async-witness-required.test.ts pins the two equal). */
+export const WITNESS_FAILURE_VALUES: ReadonlySet<string> = new Set(["store_read", "journal_invalid", "tenant_rejected", "absent", "other"]);
 /** `streaming` on the consumer's streaming reconcile startup line. */
 export const STREAMING_VALUES: ReadonlySet<string> = new Set(["on", "off"]);
 /** `db_refusal` mirrors session-ingest DB_REFUSALS (ingest-refusal-log.test.ts pins the two equal). */
@@ -183,7 +188,7 @@ export const REGEN_REASON_VALUES: ReadonlySet<string> = new Set([
 ]);
 export const REGEN_SYSTEM_VALUES: ReadonlySet<string> = new Set(["bob_costas", "brief"]);
 const ENUM_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
-  ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES],
+  ["store_cause", STORE_CAUSE_VALUES], ["streaming", STREAMING_VALUES], ["witness_failure", WITNESS_FAILURE_VALUES],
   ["db_refusal", DB_REFUSAL_VALUES], ["client_kind", CLIENT_KIND_VALUES], ["client_os", CLIENT_OS_VALUES],
   ["regeneration_reason", REGEN_REASON_VALUES], ["system", REGEN_SYSTEM_VALUES],
   ["db_error_detail", DB_ERROR_DETAIL_VALUES], ["db_client_phase", DB_CLIENT_PHASE_VALUES],

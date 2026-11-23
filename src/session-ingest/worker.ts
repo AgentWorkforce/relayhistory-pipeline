@@ -90,11 +90,13 @@
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
- *   INGEST_ASYNC_WITNESS_REQUIRED  unset/off (default) | on (any case, trimmed; anything else refuses startup):
+ *   INGEST_ASYNC_WITNESS_REQUIRED  unset/off (default) | on (any case, trimmed; anything else: every request
+ *                              answers 503 not_configured and the queue handler retries, as for the other flags):
  *                              with INGEST_ASYNC_ADMISSION=on, a batch whose SIGNED identity accepts the queued
  *                              ACK, with no relayhistory-built custody envelope, whose pre-body privacy-journal
  *                              witness is missing answers 503 delivery_unavailable (stage admission_witness,
- *                              privacy_journal_unavailable; no Retry-After) before the in-flight lease, the consent
+ *                              privacy_journal_unavailable; Retry-After 300 s as the HTTP admission stop; the
+ *                              route line names witness_failure) before the in-flight lease, the consent
  *                              precheck, the turn register and any ledger call, instead of the synchronous SQL
  *                              path. Every other request, and async admission off / drain, is unchanged. While the
  *                              journal read keeps failing, every queue-eligible upload is refused. Rendered only
