@@ -268,3 +268,37 @@ words are logged.
    two fields on the same `s3` lines. `s3_event_age_ms - event_age_ms` is roughly
    the time from the S3 event to the SQS enqueue. The two fields use different
    clocks, so treat small differences as noise.
+
+## Acceptance refusals: `contender_seats`
+
+`contender_seats` says what a pass's acceptance refusal looked like. It appears on the
+`search index reconciled` line, and on the `search index partial` warn line when that line's
+pass carries it, only when the pass read its records and its reasons include
+`relayhistory_acceptance_missing`. Every such pass carries it. No other pass does, and no
+flag gates it. It is computed only on that failure path, from records the pass already
+holds, with no extra S3, ClickHouse or SQL read. It changes nothing that is indexed,
+deleted, stamped or acknowledged.
+
+The fold refuses a group of two or more contending records with one record id when at
+least one of them has no `accepted_seq` (`lastAccepted`). A member is seated when it has
+one. A group is the fold's own view: per (origin, record id) the newest revision, with
+`accepted_seq` merged across copies of that revision, tombstones included.
+
+- `all_unseated`: no refused record id group has a seated member.
+- `seated_unseated`: every refused record id group has a seated member.
+- `both`: refused record id groups of both kinds.
+- `catalog_key`: no record id group was refused; the refusal came from the catalog-key
+  fold in `projectRelayhistorySession` (the whole read's projection, or the streamed
+  read's pass-2 catalog projection).
+
+The first three words describe the record id groups only. With one of them, the
+catalog-key fold may also have refused; the word does not say.
+
+On this lineage only convergence events are left out of the record id fold, so legacy
+kinds contend: two `legacy_*` records with one record id from two origins form a group.
+Current main leaves legacy kinds out of the fold (`isLegacyRelayhistoryRecord`), so the
+word here includes legacy-kind groups that main would not count.
+
+A pass skipped before read (`SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true`) read
+nothing and carries no `contender_seats`. The log allowlist keeps only the four words;
+any other value is dropped. No id, content or count is logged.

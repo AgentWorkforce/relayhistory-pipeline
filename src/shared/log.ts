@@ -20,13 +20,18 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "route", "correlation_id",
   // Queue and upload latency of the session pipeline's lines (session-pipeline/consumer.ts); value rules below.
   "event_age_ms", "s3_event_age_ms", "queue_origin",
+  // How a search pass's acceptance refusal looked (session-pipeline/contender-seats.ts); value rule below.
+  "contender_seats",
 ]);
 
 /** Allowlisted keys that survive only as a non-negative safe integer; any other value is dropped. */
 export const NON_NEGATIVE_INTEGER_FIELDS: ReadonlySet<string> = new Set(["event_age_ms", "s3_event_age_ms"]);
 
 /** Allowlisted keys that survive only as one of a fixed set of strings; any other value is dropped. */
-export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([["queue_origin", new Set(["s3", "requeue", "sweep"])]]);
+export const EXACT_VALUE_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["queue_origin", new Set(["s3", "requeue", "sweep"])],
+  ["contender_seats", new Set(["all_unseated", "seated_unseated", "both", "catalog_key"])],
+]);
 
 /** Whether an allowlisted key's value passes its value rule (keys without a rule: always). */
 function valueAllowed(k: string, v: unknown): boolean {

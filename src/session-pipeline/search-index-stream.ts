@@ -46,6 +46,7 @@ import {
   type DirectoryCatalog,
 } from "../hoopdb/session-directory-catalog.ts";
 import type { SessionScope } from "./pointer.ts";
+import { ACCEPTANCE_MISSING, seatsOfGroups, type ContenderSeats } from "./contender-seats.ts";
 
 /** The most passes a scope is read in: a scope streams only if this many reads fit the budgets. */
 export const STREAM_PASSES = 4;
@@ -76,9 +77,12 @@ export function streamDeadlinePassed(deadline: StreamDeadline | undefined): bool
   return deadline !== undefined && (deadline.now ?? Date.now)() >= deadline.at;
 }
 
-/** The streamed read stopped: nothing more is read or written. `partial`: a budget or the deadline. */
+/**
+ * The streamed read stopped: nothing more is read or written. `partial`: a budget or the deadline.
+ * `contenderSeats`: only on an ACCEPTANCE_MISSING stop, which fold refused and how (contender-seats.ts).
+ */
 export class StreamStop extends Error {
-  constructor(readonly code: string, readonly partial: boolean) {
+  constructor(readonly code: string, readonly partial: boolean, readonly contenderSeats?: ContenderSeats) {
     super(code);
   }
 }
@@ -232,6 +236,9 @@ export async function streamScope(
     try {
       won = stand.reduce((left, right) => lastAccepted(left, right) as Contender);
     } catch (error) {
+      // Failure path only: every record id group is already in `contenders`.
+      if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING)
+        throw new StreamStop(error.code, false, seatsOfGroups([...contenders.values()].map((g) => g.map((seat) => seat.acceptedSeq))));
       asStop(error, "fold_failed");
     }
     won.seat.winner = won.seat.live;
@@ -286,6 +293,8 @@ export async function streamScope(
   try {
     catalogRows = project(normalizeRelayhistoryRecords(catalogRecords), 0).filter((r) => r.table !== "convergence_events");
   } catch (error) {
+    // The record id fold already passed: this refusal is the projection's catalog-key fold.
+    if (error instanceof StreamStop && error.code === ACCEPTANCE_MISSING) throw new StreamStop(error.code, false, "catalog_key");
     asStop(error, "fold_failed");
   }
 

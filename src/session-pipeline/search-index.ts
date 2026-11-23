@@ -91,6 +91,7 @@ import {
   type StreamDeadline,
   type StreamReadLimits,
 } from "./search-index-stream.ts";
+import { ACCEPTANCE_MISSING, contenderSeatsOfRecords, type ContenderSeats } from "./contender-seats.ts";
 
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
@@ -209,6 +210,12 @@ export interface SearchIndexResult {
    * before any manifest read; nothing was read from S3 and nothing was written.
    */
   skippedBeforeRead?: true;
+  /**
+   * Only on a pass that read and ended with `relayhistory_acceptance_missing` (never on a
+   * skipped-before-read pass): how the refused contender groups looked (contender-seats.ts).
+   * Absent on every other pass.
+   */
+  contenderSeats?: ContenderSeats;
 }
 
 /** The reason code a pass returned before any manifest read adds to `scope_too_large`. */
@@ -221,7 +228,7 @@ export const SKIPPED_BEFORE_READ = "skipped_before_read";
 export const SKIP_STATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /** The fold's refusal when same-record contenders from different origins lack accepted_seq. */
-export const ACCEPTANCE_MISSING = "relayhistory_acceptance_missing";
+export { ACCEPTANCE_MISSING };
 /**
  * Salt of the acceptance stamp's digest. Bump it with any change to how a pass reads, folds or
  * projects a scope (readScope, the streamed read, normalizeRelayhistoryRecords and friends): a
@@ -376,6 +383,8 @@ interface ScopeRead {
   /** Partial only: the admitted manifests and the scope's size, for the streamed reconcile. */
   admitted?: ManifestV1[];
   size?: { bytes: number; events: number };
+  /** Set only when `reasons` carries ACCEPTANCE_MISSING: see SearchIndexResult.contenderSeats. */
+  contenderSeats?: ContenderSeats;
 }
 
 async function readScope(
@@ -451,6 +460,9 @@ async function readScope(
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
+  // Failure path only: the record id fold's refusal, classified over the set it was handed.
+  let recordIdSeats: ContenderSeats | undefined;
+  let catalogRefused = false;
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
     const owner = new Map<string, Part>();
@@ -470,6 +482,7 @@ async function readScope(
   } catch (error) {
     complete = false;
     reasons.push(error instanceof PipelineError ? error.code : "fold_failed");
+    if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING) recordIdSeats = contenderSeatsOfRecords(parts.flatMap((p) => p.records));
     groups = [];
     for (const part of parts) {
       try {
@@ -495,6 +508,8 @@ async function readScope(
     } catch (error) {
       complete = false;
       reasons.push(error instanceof PipelineError ? error.code : "projection_failed");
+      // The record id fold already ran: this refusal is the projection's catalog-key fold.
+      if (error instanceof PipelineError && error.code === ACCEPTANCE_MISSING) catalogRefused = true;
       continue;
     }
     for (const { table, row } of projected.rows) {
@@ -513,12 +528,16 @@ async function readScope(
     complete = false;
     reasons.push("canonical_session_mismatch");
   }
-  return {
+  const read: ScopeRead = {
     rows: [...byKey.values()], manifests: parts.length, complete, partial: false,
     revision, reasons: [...new Set(reasons)],
     catalog: directoryCatalogFromProjection(catalogRows),
     directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
   };
+  // A record id word wins; with it the catalog-key fold may also have refused.
+  if (recordIdSeats !== undefined) read.contenderSeats = recordIdSeats;
+  else if (catalogRefused) read.contenderSeats = "catalog_key";
+  return read;
 }
 
 async function clickhouseScope(
@@ -1022,14 +1041,16 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       );
     // Only a complete pass makes the session current; any other leaves it owing one.
     await recordState(deps.ch, scope, s3.revision, inWindow.length, complete, at);
-    return settle({
+    const result: SearchIndexResult = {
       manifests: s3.manifests,
       rows: inWindow.length,
       inserted: toInsert.length,
       deleted: deletes.length,
       complete,
       reasons: truncated ? [...s3.reasons, "clickhouse_truncated"] : s3.reasons,
-    });
+    };
+    if (s3.contenderSeats !== undefined) result.contenderSeats = s3.contenderSeats;
+    return settle(result);
   });
 }
 
@@ -1081,10 +1102,13 @@ async function streamedReconcile(
   let deleted = 0;
   const owing = async (stop: StreamStop): Promise<SearchIndexResult> => {
     await recordState(deps.ch, scope, revision, 0, false, at);
-    return {
+    const result: SearchIndexResult = {
       manifests: admitted.length, rows: 0, inserted, deleted, complete: false, streamed: true,
       ...(stop.partial ? { partial: true, reasons: ["scope_too_large", stop.code] } : { reasons: [stop.code] }),
     };
+    // Only the stream's acceptance stops carry it (search-index-stream.ts StreamStop.contenderSeats).
+    if (stop.contenderSeats !== undefined) result.contenderSeats = stop.contenderSeats;
+    return result;
   };
   try {
     // Before anything is read or written: the session owes a full pass until this one ends

@@ -267,7 +267,7 @@ describe("flag off", () => {
     const s = searchDeps(ch.ch);
     const results: SearchIndexResult[] = [];
     for (let i = 0; i < 2; i++) results.push(await indexSearchScope(scope, s.deps));
-    expect(results[0]).toEqual({ manifests: 2, rows: results[0]!.rows, inserted: results[0]!.inserted, deleted: 0, complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(results[0]).toEqual({ manifests: 2, rows: results[0]!.rows, inserted: results[0]!.inserted, deleted: 0, complete: false, reasons: [ACCEPTANCE_MISSING], contenderSeats: "all_unseated" });
     expect(results[0]!.rows).toBeGreaterThan(0);
     expect(results[1]).toEqual({ ...results[0]!, inserted: results[0]!.inserted });
     expect(s.reads).toHaveLength(4);
@@ -799,7 +799,7 @@ describe("flag on: streamed path", () => {
     const slot = { used: false };
     const s = searchDeps(ch.ch, streamed({ streamSlot: slot }));
     const first = await indexSearchScope(scope, s.deps);
-    expect(first).toEqual({ manifests: 2, rows: 0, inserted: 0, deleted: 0, complete: false, streamed: true, reasons: [ACCEPTANCE_MISSING] });
+    expect(first).toEqual({ manifests: 2, rows: 0, inserted: 0, deleted: 0, complete: false, streamed: true, reasons: [ACCEPTANCE_MISSING], contenderSeats: "all_unseated" });
     expect(stampsOf(ch.ingest)).toHaveLength(1);
     expect(JSON.parse(stampsOf(ch.ingest)[0]!.value).digest).toBe(
       await currentDigest("default:14d", { maxScopeBytes: 100, maxScopeEvents: 100_000 }, { maxReadBytes: 64 * 1024 * 1024, maxReadEvents: 1_000_000 }),

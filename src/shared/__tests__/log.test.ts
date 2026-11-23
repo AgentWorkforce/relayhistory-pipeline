@@ -56,6 +56,23 @@ describe("telemetry allowlist", () => {
       expect(kept).toMatchObject({ level, event_age_ms: 3, s3_event_age_ms: 4, queue_origin: "sweep" });
     }
   });
+  test("contender_seats survives the real logLine only as one of its four words, at every level", () => {
+    const WORDS = ["all_unseated", "seated_unseated", "both", "catalog_key"];
+    expect(ALLOWED_LOG_FIELDS.has("contender_seats")).toBe(true);
+    expect([...EXACT_VALUE_FIELDS.get("contender_seats")!].sort()).toEqual([...WORDS].sort());
+    for (const level of ["debug", "info", "warn", "error"] as const) {
+      const line = (v: unknown) => JSON.parse(logLine(level, "search index reconciled", { stage: "search-index", contender_seats: v })) as Record<string, unknown>;
+      for (const v of WORDS) expect([level, line(v).contender_seats]).toEqual([level, v]);
+      for (const v of [
+        "ALL_UNSEATED", "both ", " catalog_key", "", "other", "seated", "unseated", "all_unseated,both", "s3",
+        "AKIAABCDEFGHIJKLMNOP", "059f36b3-02ba-4e7d-a2c1-8f1e1c0d9a77", 0, 2, -1, true, null, ["both"], { both: 1 },
+      ]) {
+        const out = line(v);
+        expect([level, v, "contender_seats" in out]).toEqual([level, v, false]);
+        expect(out).toMatchObject({ level, stage: "search-index" });
+      }
+    }
+  });
   test("the value rule leaves other allowlisted fields as they were", () => {
     const out = JSON.parse(logLine("info", "m", { count: -1, duration_ms: 1.5, ok: true, reason: "x" })) as Record<string, unknown>;
     expect(out).toMatchObject({ count: -1, duration_ms: 1.5, ok: true, reason: "x" });

@@ -237,7 +237,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
         }
         const lag = lagFields(covered, messageIds, messages, now());
         if (result.partial)
-          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: result.streamed ? result.reasons.join(",") : "scope_too_large", ...lag });
+          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: result.streamed ? result.reasons.join(",") : "scope_too_large", contender_seats: result.contenderSeats, ...lag });
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,
@@ -250,6 +250,8 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           deleted: result.deleted,
           ok: result.complete,
           reason: result.reasons.join(",") || undefined,
+          // Only on a read pass refused for acceptance (search-index.ts SearchIndexResult.contenderSeats).
+          contender_seats: result.contenderSeats,
           duration_ms: Date.now() - started,
           ...lag,
         });

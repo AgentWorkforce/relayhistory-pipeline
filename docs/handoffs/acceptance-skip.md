@@ -288,3 +288,12 @@ store, and a ClickHouse fake that models `search_ingest_state`. They cover:
 - the env parse and wiring.
 
 The golden transcript (`search-index-golden.test.ts`) is unchanged.
+
+## `contender_seats` on the pass lines
+
+A pass skipped before read carries no `contender_seats`, because it read nothing. A pass
+that read and ended with `relayhistory_acceptance_missing` always carries it: one of
+`all_unseated`, `seated_unseated` or `both` for the refused record id groups (the
+catalog-key fold may also have refused), or `catalog_key` when only the catalog-key fold
+in `projectRelayhistorySession` refused. The stamp format, the digest and the skip logic
+are unchanged. The words are defined in `docs/handoffs/stream-backport-build.md`.
