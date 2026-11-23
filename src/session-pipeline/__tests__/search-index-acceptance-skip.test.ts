@@ -151,7 +151,9 @@ function fakeClickHouse() {
   const ingest: StateRow[] = [];
   const statements: string[] = [];
   const writes: string[] = [];
-  const ctl: { window: string | null; stampReadThrows: boolean; stampWriteThrows: boolean; atMs?: unknown } = { window: null, stampReadThrows: false, stampWriteThrows: false };
+  const ctl: { window: string | null; stampReadThrows: boolean; stampWriteThrows: boolean; atMs?: unknown; eventRows: unknown[] } = {
+    window: null, stampReadThrows: false, stampWriteThrows: false, eventRows: [],
+  };
   const ch: ClickHouseClient = {
     database: "test",
     async command(query) {
@@ -172,6 +174,8 @@ function fakeClickHouse() {
         const atMs = "atMs" in ctl ? ctl.atMs : latest ? Date.parse(`${latest.updated_at.replace(" ", "T")}Z`) : undefined;
         return (latest ? [{ value: latest.value, at_ms: atMs }] : []) as T[];
       }
+      // The whole read's scan of the events table (the streamed path pages it the same way).
+      if (q.includes(`FROM ${EVENTS_TABLE}`)) return ctl.eventRows as T[];
       return [] as T[];
     },
     async insert(table, rows) {
@@ -229,6 +233,29 @@ async function currentDigest(windowMarker = "default:14d", limits = { maxScopeBy
 const stampRow = (value: unknown, ms: number): StateRow => ({
   name: acceptanceStampName(scope), value: typeof value === "string" ? value : JSON.stringify(value), updated_at: chTime(ms),
 });
+
+/** Runs `work` with stdout and stderr captured: the JSON log lines and the raw text. */
+async function captured<T>(work: () => Promise<T>): Promise<{ result: T; lines: Record<string, unknown>[]; raw: string }> {
+  const lines: Record<string, unknown>[] = [];
+  const raw: string[] = [];
+  const out = process.stdout.write.bind(process.stdout);
+  const err = process.stderr.write.bind(process.stderr);
+  const grab = (chunk: unknown) => {
+    raw.push(String(chunk));
+    for (const line of String(chunk).split("\n")) if (line.startsWith("{")) lines.push(JSON.parse(line));
+    return true;
+  };
+  process.stdout.write = grab as typeof process.stdout.write;
+  process.stderr.write = grab as typeof process.stderr.write;
+  try {
+    return { result: await work(), lines, raw: raw.join("") };
+  } finally {
+    process.stdout.write = out;
+    process.stderr.write = err;
+  }
+}
+const etagOf = async (machine: string) =>
+  (await pg.query<{ manifest_etag: string }>(`SELECT manifest_etag FROM sessions.session_index WHERE session_id = 'sess_1' AND machine_id = $1`, [machine])).rows[0]!.manifest_etag;
 
 const LISTING = "SELECT manifest_key FROM sessions.session_index WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL ORDER BY machine_id";
 const LOCK = "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok";
@@ -345,7 +372,8 @@ describe("flag on: stamp and skip", () => {
     await store.delete(objectKey(b.key));
     await pointer(b.key, "ObjectRemoved:DeleteMarkerCreated");
     expect(await indexSearchScope(scope, s.deps)).toMatchObject({ manifests: 1, complete: true, reasons: [] });
-    expect(stampsOf(ch.ingest).at(-1)).toEqual({ name: acceptanceStampName(scope), value: "", updated_at: chTime(NOW.getTime()) });
+    // Same clock as the stamp: one millisecond above it, so the two never tie.
+    expect(stampsOf(ch.ingest).at(-1)).toEqual({ name: acceptanceStampName(scope), value: "", updated_at: chTime(NOW.getTime() + 1) });
     expect(await indexSearchScope(scope, s.deps)).toMatchObject({ manifests: 1, complete: true });
     expect(s.reads).toHaveLength(4);
     // Nothing more to clear: no further stamp row.
@@ -396,6 +424,54 @@ describe("flag on: stamp and skip", () => {
       expect(await indexSearchScope(scope, s.deps)).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
       expect(stampsOf(ch.ingest)).toEqual([]);
     }
+  }, 60_000);
+
+  test("only the revision in the pointer row differs from the manifest read (content sha256 and etag equal): no stamp, no skip", async () => {
+    await acceptanceScope();
+    const [before] = (await live()).filter((p) => p.machine_id === "srv_bb");
+    await pg.query(`UPDATE sessions.session_index SET revision = 9 WHERE session_id = 'sess_1' AND machine_id = 'srv_bb'`);
+    const [after] = (await live()).filter((p) => p.machine_id === "srv_bb");
+    expect({ ...after!, revision: before!.revision }).toEqual(before!);
+    expect(after!.revision).toBe("9");
+    const ch = fakeClickHouse();
+    const s = searchDeps(ch.ch, ON);
+    expect(await indexSearchScope(scope, s.deps)).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(stampsOf(ch.ingest)).toEqual([]);
+    expect((await indexSearchScope(scope, s.deps)).skippedBeforeRead).toBeUndefined();
+    expect(s.reads).toHaveLength(4);
+  }, 60_000);
+
+  test("a tombstone from a slower clock still sorts above the stamp it clears; no later skip", async () => {
+    await acceptanceScope();
+    const ch = fakeClickHouse();
+    const fastMs = NOW.getTime() + 60_000;
+    // A pass on a clock one minute ahead stamps the pointer set.
+    await indexSearchScope(scope, searchDeps(ch.ch, { ...ON, now: () => new Date(fastMs) }).deps);
+    const stamped = await currentDigest();
+    expect(stampsOf(ch.ingest)).toEqual([stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: stamped }, fastMs)]);
+    // A pass on the slower clock sees a pointer row that disagrees with the read and clears.
+    const etag = await etagOf("srv_aa");
+    await pg.query(`UPDATE sessions.session_index SET manifest_etag = '"other"' WHERE session_id = 'sess_1' AND machine_id = 'srv_aa'`);
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, ON).deps)).toMatchObject({ complete: false, reasons: [ACCEPTANCE_MISSING] });
+    expect(stampsOf(ch.ingest).at(-1)).toEqual({ name: acceptanceStampName(scope), value: "", updated_at: chTime(fastMs + 1) });
+    // The pointer set is the stamped one again: the newest row is the tombstone, so no skip.
+    await pg.query(`UPDATE sessions.session_index SET manifest_etag = $1 WHERE session_id = 'sess_1' AND machine_id = 'srv_aa'`, [etag]);
+    expect(await currentDigest()).toBe(stamped);
+    for (let i = 0; i < 2; i++) {
+      const s = searchDeps(ch.ch, ON);
+      const result = await indexSearchScope(scope, s.deps);
+      expect(result).toMatchObject({ manifests: 2, complete: false, reasons: [ACCEPTANCE_MISSING] });
+      expect(result.skippedBeforeRead).toBeUndefined();
+      expect(s.reads).toHaveLength(2);
+    }
+  }, 60_000);
+
+  test("the tombstone is written at the pass's own time when that is later than the stamp", async () => {
+    await acceptanceScope();
+    const ch = fakeClickHouse();
+    ch.ingest.push(stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: "0".repeat(64) }, NOW.getTime() - 60_000));
+    await indexSearchScope(scope, searchDeps(ch.ch, { ...ON, limits: { maxScopeBytes: 10 } }).deps);
+    expect(stampsOf(ch.ingest).at(-1)).toEqual({ name: acceptanceStampName(scope), value: "", updated_at: chTime(NOW.getTime()) });
   }, 60_000);
 
   test("the window moves (stored window_start set or changed): no skip", async () => {
@@ -544,6 +620,21 @@ describe("flag on: other outcomes", () => {
     expect(stampsOf(ch.ingest)).toHaveLength(2);
   }, 60_000);
 
+  test("acceptance-missing first plus clickhouse_truncated: no stamp is written and no skip follows", async () => {
+    await acceptanceScope();
+    const ch = fakeClickHouse();
+    const row = { workspace_id: scope.workspaceId, machine_id: "srv_zz", source: scope.harness, kind: "assistant", ts_ms: Date.parse(AT), fingerprint: "f" };
+    ch.ctl.eventRows = [{ ...row, event_id: "z1" }, { ...row, event_id: "z2" }];
+    const s = searchDeps(ch.ch, { ...ON, limits: { maxRows: 1 } });
+    for (let i = 0; i < 2; i++) {
+      const result = await indexSearchScope(scope, s.deps);
+      expect(result).toMatchObject({ manifests: 2, complete: false, reasons: [ACCEPTANCE_MISSING, "clickhouse_truncated"] });
+      expect(result.skippedBeforeRead).toBeUndefined();
+    }
+    expect(s.reads).toHaveLength(4);
+    expect(stampsOf(ch.ingest)).toEqual([]);
+  }, 60_000);
+
   test("a complete pass with no stamp present writes nothing to the state table (growth bound)", async () => {
     const a = await writeManifest("srv_aa", 1, { shared: false });
     await pointer(a.key);
@@ -574,6 +665,20 @@ describe("flag on: other outcomes", () => {
     expect(await indexSearchScope(scope, s.deps)).toEqual({ manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] });
     expect(ch.statements.some((q) => q.startsWith(`command DELETE FROM ${EVENTS_TABLE}`))).toBe(true);
     expect(stampsOf(ch.ingest).at(-1)!.value).toBe("");
+  }, 60_000);
+
+  test("erase with no stamp present: the delete and one stamp read, no tombstone", async () => {
+    const { a, b } = await acceptanceScope();
+    for (const k of [a.key, b.key]) {
+      await store.delete(objectKey(k));
+      await pointer(k, "ObjectRemoved:DeleteMarkerCreated");
+    }
+    const ch = fakeClickHouse();
+    expect(await indexSearchScope(scope, searchDeps(ch.ch, ON).deps)).toEqual({ manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] });
+    expect(ch.ingest).toEqual([]);
+    expect(ch.writes).toHaveLength(1);
+    expect(ch.writes[0]!.startsWith("command DELETE")).toBe(true);
+    expect(ch.statements.filter((q) => q.includes(INGEST_STATE_TABLE))).toHaveLength(1);
   }, 60_000);
 
   test("stamp read fails: the pass reads in full (fail open), then stamps its outcome", async () => {
@@ -625,6 +730,55 @@ describe("flag on: other outcomes", () => {
     expect(lines[0]).toMatchObject({ level: "warn", message: "search index acceptance stamp not written", stage: "search-index", org_id: "org_1", session_id: "sess_1", reason: "acceptance_stamp_write_failed" });
     for (const k of Object.keys(lines[0]!)) expect(["ts", "level", "message", ...ALLOWED_LOG_FIELDS]).toContain(k);
     expect(raw.join("")).not.toContain("sk-live");
+  }, 60_000);
+
+  test("ClickHouse refuses every insert into the state table: flag-off results, nothing thrown, one warning per pass, every pass reads in full", async () => {
+    await acceptanceScope();
+    const warnings = (lines: Record<string, unknown>[]) => lines.filter((l) => l.message === "search index acceptance stamp not written");
+    // Stamp writes refused: each pass is the flag-off pass and the next one reads again.
+    const offResult = await indexSearchScope(scope, searchDeps(fakeClickHouse().ch).deps);
+    const ch = fakeClickHouse();
+    ch.ctl.stampWriteThrows = true;
+    const s = searchDeps(ch.ch, ON);
+    for (let i = 1; i <= 2; i++) {
+      const pass = await captured(() => indexSearchScope(scope, s.deps));
+      expect(pass.result).toEqual(offResult);
+      expect(pass.lines).toHaveLength(1);
+      expect(warnings(pass.lines).map((l) => [l.level, l.reason])).toEqual([["warn", "acceptance_stamp_write_failed"]]);
+      expect(pass.raw).not.toContain("sk-live");
+      expect(s.reads).toHaveLength(2 * i);
+    }
+    expect(stampsOf(ch.ingest)).toEqual([]);
+    // Tombstone writes refused: a size refusal over a stamp that does not match.
+    const limited = { limits: { maxScopeBytes: 10 } };
+    const offPartial = await indexSearchScope(scope, searchDeps(fakeClickHouse().ch, limited).deps);
+    const clear = fakeClickHouse();
+    clear.ingest.push(stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: "0".repeat(64) }, NOW.getTime() - 1_000));
+    clear.ctl.stampWriteThrows = true;
+    const c = searchDeps(clear.ch, { ...ON, ...limited });
+    for (let i = 1; i <= 2; i++) {
+      const pass = await captured(() => indexSearchScope(scope, c.deps));
+      expect(pass.result).toEqual(offPartial);
+      expect(pass.lines).toHaveLength(1);
+      expect(warnings(pass.lines).map((l) => [l.level, l.reason])).toEqual([["warn", "acceptance_stamp_clear_failed"]]);
+      expect(pass.raw).not.toContain("sk-live");
+      expect(c.reads).toHaveLength(2 * i);
+    }
+    expect(stampsOf(clear.ingest)).toHaveLength(1);
+  }, 60_000);
+
+  test("ClickHouse refuses the tombstone on erase: the erase result stands, one warning", async () => {
+    const { a, b } = await acceptanceScope();
+    for (const k of [a.key, b.key]) {
+      await store.delete(objectKey(k));
+      await pointer(k, "ObjectRemoved:DeleteMarkerCreated");
+    }
+    const ch = fakeClickHouse();
+    ch.ingest.push(stampRow({ v: 1, reason: ACCEPTANCE_MISSING, digest: "0".repeat(64) }, NOW.getTime() - 1_000));
+    ch.ctl.stampWriteThrows = true;
+    const pass = await captured(() => indexSearchScope(scope, searchDeps(ch.ch, ON).deps));
+    expect(pass.result).toEqual({ manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] });
+    expect(pass.lines.map((l) => [l.level, l.reason])).toEqual([["warn", "acceptance_stamp_clear_failed"]]);
   }, 60_000);
 
   test("the stamp log line keeps every field through logLine's allowlist", () => {
