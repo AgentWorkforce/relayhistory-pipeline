@@ -511,6 +511,62 @@ describe("session ingest: INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (default off)", (
   });
 });
 
+describe("session ingest: INGEST_ASYNC_WITNESS_REQUIRED (default off)", () => {
+  // Explicit asyncAdmission "off" (a buffered stage now defaults to "on"): this block isolates the witness-required var.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("absent: no var, and vars and props are byte-identical to a stack without the input", () => {
+    for (const p of [inputs, buffered, { ...buffered, asyncAdmission: "on" as const }, { ...buffered, asyncAdmission: undefined }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.keys(sessionIngestVars(p))).not.toContain("INGEST_ASYNC_WITNESS_REQUIRED");
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, asyncWitnessRequired: undefined }, b)));
+    }
+  });
+
+  it("on: exactly one more var, no new binding or resource", () => {
+    const on = { ...buffered, asyncWitnessRequired: "on" as const };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(buffered), INGEST_ASYNC_WITNESS_REQUIRED: "on" });
+    const p = props(on);
+    expect(p.env.INGEST_ASYNC_WITNESS_REQUIRED).toBe("on");
+    expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(buffered).env), "INGEST_ASYNC_WITNESS_REQUIRED"].sort());
+    expect(p.env.INGEST_ADMISSION).toBeUndefined();
+    expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+    expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+    // With async admission (where it acts): both vars, and only async admission's binding.
+    const withAsync = { ...on, asyncAdmission: "on" as const };
+    expect(() => assertSessionIngestInputs(withAsync, refuse)).not.toThrow();
+    const both = sessionIngestWorkerProps(withAsync, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+    expect(both.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(both.env.INGEST_ASYNC_WITNESS_REQUIRED).toBe("on");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: withAsync }, env)).not.toThrow();
+  });
+
+  it("is refused for any value but on, and outside buffered acceptance", () => {
+    for (const bad of [
+      { ...buffered, asyncWitnessRequired: "yes" },
+      { ...buffered, asyncWitnessRequired: "off" },
+      { ...buffered, asyncWitnessRequired: true },
+      { ...buffered, asyncWitnessRequired: "ON" },
+      { ...buffered, asyncWitnessRequired: null },
+      { ...inputs, asyncWitnessRequired: "on" },
+      { ...inputs, acceptanceMode: "canonical", asyncWitnessRequired: "on" },
+    ])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow('sessionIngest.asyncWitnessRequired must be "on", in buffered mode only (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, asyncWitnessRequired: "on" } }, env)).toThrow(/asyncWitnessRequired.*Nothing was changed/);
+  });
+
+  it("a var-only change plans as an in-place update of the Worker", () => {
+    const lines = SESSION_INGEST_RESOURCES.map((r) => `  [${r}] ${r === "session-ingest" ? "update" : "noop"}`).join("\n");
+    const text = `Plan: 1 to update\n${lines}\n`;
+    expect(assertSessionIngestPlanContract(text, text)).toBe("session ingest update");
+  });
+});
+
 describe("session ingest: INGEST_CLAIM_LOCK_BUSY (default off)", () => {
   // Explicit asyncAdmission "off" on the buffered shape: this block isolates the claim lock-busy var.
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };

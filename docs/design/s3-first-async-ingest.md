@@ -375,6 +375,24 @@ admission. The Cloudflare stack renders it from the stack input
 `sessionIngest.syncAdmissionFrozenReceipt: "on"` (buffered acceptance with `custodySource:
 "frozen-supabase"` only; omit for `off`, which renders no var).
 
+Flag `INGEST_ASYNC_WITNESS_REQUIRED`: `off` (default) | `on` (any case, trimmed; any other value
+refuses at startup). Default off and enabled nowhere. Hosted only; self-host already refuses this
+case. With async admission `on`, a request that would take the queued ACK (signed `admission:
+queued-v1`, no relayhistory-built custody envelope) but whose pre-body journal witness failed
+falls back to the synchronous SQL path today. With the flag `on` it answers 503
+`delivery_unavailable` instead (no `Retry-After` header, the same answer self-host gives; the
+route line carries `outcome: delivery_unavailable`, `stage: admission_witness`, `error_code:
+privacy_journal_unavailable`, so refusals can be counted). The client retries as for any 503. The
+refusal is thrown before the in-flight lease, the upload-consent precheck, the turn register and
+any ledger call, so it leaves no lock wait, claim, slot, intent or object behind. Requests without
+the opt-in, requests with a custody envelope, and async admission `off` or `drain` are unchanged
+(the flag is a no-op there, as `INGEST_SYNC_ADMISSION_FROZEN_RECEIPT` is outside its scope).
+**Operational risk when on:** while the privacy-journal read keeps failing, every queue-eligible
+upload is refused until it recovers. That is the point of the flag: the trade is no silent SQL
+fallback. The Cloudflare stack renders it from `sessionIngest.asyncWitnessRequired: "on"`
+(buffered acceptance only; omit for `off`, which renders no var). The private-ingest release
+profile and operator plan do not carry it.
+
 Steps:
 1. **IAM: none.** The srv-writer resources are unchanged. `96bulls/*/v1/ws=*/m=srv_*` matches
    every inbox, outcome and journal key, because an IAM resource `*` spans `/`. The production

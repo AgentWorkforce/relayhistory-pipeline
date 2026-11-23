@@ -49,7 +49,7 @@ import { batchIdConflict, BufferLockBusy, ClaimLockBusy, deliverBatch, deliverPr
 import { prepareForAdmission } from "./admission-core.ts";
 import { clientFields } from "./client-agent.ts";
 import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
-import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type AsyncWitnessRequiredMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import { advertisedDeliveryLimits } from "./advertised-limits.ts";
@@ -216,6 +216,15 @@ export interface IngestAppDeps {
    * pre-forward read for such a caller.
    */
   syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
+  /**
+   * INGEST_ASYNC_WITNESS_REQUIRED (async-admission.ts). Absent or "off": nothing changes. "on" (hosted; self-host
+   * already refuses): with async admission "on", a batch that would take the queued ACK (SIGNED identity
+   * `admission: queued-v1`, no relayhistory-built custody envelope) but has no pre-body privacy-journal witness
+   * answers 503 delivery_unavailable (stage admission_witness, privacy_journal_unavailable) instead of falling back
+   * to the synchronous SQL path. Thrown before the in-flight lease, the consent precheck, the turn register and any
+   * ledger call. Not queue-eligible requests, and async admission "off" / "drain", are unchanged.
+   */
+  asyncWitnessRequired?: AsyncWitnessRequiredMode;
   /**
    * HISTORY_UPLOAD_DIRECT (upload-admission.ts, relay-upload-inbox-v1). Absent or mode "off": nothing
    * changes. Otherwise GET /v1/delivery/admission?uploadKey= answers the upload's §5 status for the
@@ -576,6 +585,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered" && !selfhostAdmission) throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
+  const witnessRequired = deps.asyncWitnessRequired === "on";
   const stoppedOrgs = deps.httpAdmissionStoppedOrgs;
   /** INGEST_HTTP_ADMISSION_STOPPED_ORGS: throws the retryable refusal for a stopped org, before the body is parsed and before any ledger call (the /v1 middleware's bounded body read, identity check and, with async admission on, privacy-journal read still run first). */
   const assertHttpAdmissionOpen = (orgId: string) => { if (stoppedOrgs?.has(orgId)) throw new HttpAdmissionStopped(); };
@@ -864,6 +874,11 @@ export function createIngestApp(deps: IngestAppDeps) {
       // header must come from the claim).
       const witness = c.get("journalWitness");
       const queued = asyncMode === "on" && !!witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody");
+      // INGEST_ASYNC_WITNESS_REQUIRED (hosted): a queue-eligible batch without its witness is refused, never moved to
+      // the synchronous SQL path. Here, before the in-flight lease, the consent precheck, the turn register and the
+      // claim; only the body parse and in-memory checks ran. Self-host refuses the same case below.
+      if (witnessRequired && asyncMode === "on" && !selfhostAdmission && !witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody"))
+        throw new IngestUnavailable("admission_witness", "privacy_journal_unavailable");
       // INGEST_INFLIGHT_LEASE: the synchronous path only, before its first lock-capable call (the consent
       // snapshot write, the turn register, the claim). The queued ACK neither takes nor is refused by it.
       if (inflight && !queued) lease = takeInflightLease(inflight, tenant, batch.origin_id, route, fields);

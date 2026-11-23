@@ -286,7 +286,7 @@ export function createIngestEdge(
 }
 
 /** The handler deps the edge passes through; identity is the edge's alone. */
-export type IngestEdgeAppDeps = Omit<IngestAppDeps, "identify" | "signingKey" | "asyncAdmission" | "syncAdmissionFrozenReceipt" | "sessionErase">;
+export type IngestEdgeAppDeps = Omit<IngestAppDeps, "identify" | "signingKey" | "asyncAdmission" | "syncAdmissionFrozenReceipt" | "asyncWitnessRequired" | "sessionErase">;
 
 /** The existing ingest app (app.ts), unchanged, with the edge's identity as its only identity source. */
 export function ingestEdgeHandler(deps: IngestEdgeAppDeps): (identify: EdgeHandlerIdentify) => FetchApp {

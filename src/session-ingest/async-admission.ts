@@ -60,6 +60,20 @@ export function syncAdmissionFrozenReceiptMode(raw: string | undefined): SyncAdm
   throw new Error("session ingest: INGEST_SYNC_ADMISSION_FROZEN_RECEIPT must be off or on");
 }
 
+/** INGEST_ASYNC_WITNESS_REQUIRED. off (default): today's paths, unchanged (a queue-eligible batch whose
+ * pre-body privacy-journal witness is missing takes the synchronous path). on: with INGEST_ASYNC_ADMISSION=on,
+ * that batch (signed `admission: queued-v1`, no relayhistory-built custody envelope, no witness) is a retryable
+ * 503 (stage admission_witness, privacy_journal_unavailable) before any lease, consent, register or ledger call,
+ * as self-host already answers (app.ts acceptBatch). With async admission off or drain it changes nothing. */
+export type AsyncWitnessRequiredMode = "off" | "on";
+
+export function asyncWitnessRequiredMode(raw: string | undefined): AsyncWitnessRequiredMode {
+  const v = raw?.trim().toLowerCase() ?? "";
+  if (v === "" || v === "off") return "off";
+  if (v === "on") return v;
+  throw new Error("session ingest: INGEST_ASYNC_WITNESS_REQUIRED must be off or on");
+}
+
 /**
  * relayhistory opts in per request INSIDE the signed identity (`admission`, app.ts bindingIdentity),
  * never as a loose header; it then accepts ADMISSION_HEADER instead of a custody ACK, and only for a

@@ -90,6 +90,15 @@
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
+ *   INGEST_ASYNC_WITNESS_REQUIRED  unset/off (default) | on (any case, trimmed; anything else refuses startup):
+ *                              with INGEST_ASYNC_ADMISSION=on, a batch whose SIGNED identity accepts the queued
+ *                              ACK, with no relayhistory-built custody envelope, whose pre-body privacy-journal
+ *                              witness is missing answers 503 delivery_unavailable (stage admission_witness,
+ *                              privacy_journal_unavailable; no Retry-After) before the in-flight lease, the consent
+ *                              precheck, the turn register and any ledger call, instead of the synchronous SQL
+ *                              path. Every other request, and async admission off / drain, is unchanged. While the
+ *                              journal read keeps failing, every queue-eligible upload is refused. Rendered only
+ *                              from sessionIngest.asyncWitnessRequired: "on"
  *   INGEST_HTTP_ADMISSION_STOPPED_ORGS  unset/blank (default): none | comma-separated org ids
  *                              (http-admission-stop.ts, decision 0005): a listed org's HTTP admission (batches,
  *                              turns, recovery) is 503 delivery_unavailable with Retry-After before any ledger call;
@@ -130,7 +139,7 @@ import { routingFlag } from "./babysitter-retention.ts";
 import { createInflightLease, inflightLeaseMode, type InflightLease, type InflightLeaseMode } from "./inflight-lease.ts";
 import { parseAdvertisedMaxRecords } from "./advertised-limits.ts";
 import { UPLOAD_DIRECT_ALLOWLIST_VAR, UPLOAD_DIRECT_FLAG, UPLOAD_DIRECT_OFF, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
-import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
+import { asyncAdmissionMode, asyncWitnessRequiredMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
 import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, SESSION_ERASE_FLAG_VAR, SESSION_ERASE_SECRET_PREVIOUS_VAR, SESSION_ERASE_SECRET_VAR, type SessionEraseConfig } from "./session-erase.ts";
@@ -156,6 +165,8 @@ export interface IngestWorkerEnv {
   INGEST_ASYNC_ADMISSION?: string;
   /** off (default) | on (async-admission.ts syncAdmissionFrozenReceiptMode). */
   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
+  /** off (default) | on (async-admission.ts asyncWitnessRequiredMode). */
+  INGEST_ASYNC_WITNESS_REQUIRED?: string;
   /** INGEST_UPLOAD_CONSENT: off (default) | report | hold-only | enforce (upload-consent.ts). */
   INGEST_UPLOAD_CONSENT?: string;
   /** INGEST_LEDGER: sql (default) only. s3 (decision 0005) is served by the upload-admission Lambda, never here. */
@@ -316,6 +327,8 @@ export interface IngestSettings {
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
   syncAdmissionFrozenReceipt?: true;
+  /** INGEST_ASYNC_WITNESS_REQUIRED=on. Absent (the default): off. */
+  asyncWitnessRequired?: true;
   /** HISTORY_UPLOAD_DIRECT allowlist|on. Absent (the default, or an invalid value, logged): off. */
   uploadDirect?: UploadDirectConfig;
   /** SESSION_ERASE_API_ENABLED=1 (session-erase.ts). Absent (the default): the route answers 501. */
@@ -374,6 +387,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
+  // Like the frozen-receipt flag: an invalid value refuses startup; with async admission off or drain it is a no-op.
+  const witnessRequired = asyncWitnessRequiredMode(env.INGEST_ASYNC_WITNESS_REQUIRED);
   // A privacy control: an invalid value is a loud configuration error (every request 503), never off.
   const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
   // A privacy control too: an invalid value is a loud configuration error, never off.
@@ -436,6 +451,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(turnFenceRegister ? { turnFenceRegister: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
+    ...(witnessRequired === "on" ? { asyncWitnessRequired: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
     ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
     ...(uploadConsent !== "off" ? { uploadConsent } : {}),
@@ -599,6 +615,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
       ? { asyncAdmission: { mode: settings.asyncAdmission, enqueue: (message: AdmissionMessage) => env.INGEST_ADMISSION!.send(message) } }
       : {}),
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
+    ...(settings.asyncWitnessRequired ? { asyncWitnessRequired: "on" as const } : {}),
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
     ...(settings.httpAdmissionStoppedOrgs ? { httpAdmissionStoppedOrgs: settings.httpAdmissionStoppedOrgs } : {}),
