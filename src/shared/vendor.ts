@@ -96,6 +96,7 @@ export {
   RELAYHISTORY_NORMALIZED_VERSION,
   RelayhistoryExportTransform,
   relayhistoryExportProvenance,
+  isLegacyRelayhistoryRecord,
   lastAccepted,
   normalizeRelayhistoryRecords,
   parseRelayhistoryRecord,

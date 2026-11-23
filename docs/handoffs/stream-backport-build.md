@@ -282,7 +282,8 @@ deleted, stamped or acknowledged.
 The fold refuses a group of two or more contending records with one record id when at
 least one of them has no `accepted_seq` (`lastAccepted`). A member is seated when it has
 one. A group is the fold's own view: per (origin, record id) the newest revision, with
-`accepted_seq` merged across copies of that revision, tombstones included.
+`accepted_seq` merged across copies of that revision, tombstones included. Convergence
+events and legacy kinds never join a group.
 
 - `all_unseated`: no refused record id group has a seated member.
 - `seated_unseated`: every refused record id group has a seated member.
@@ -294,11 +295,29 @@ one. A group is the fold's own view: per (origin, record id) the newest revision
 The first three words describe the record id groups only. With one of them, the
 catalog-key fold may also have refused; the word does not say.
 
-On this lineage only convergence events are left out of the record id fold, so legacy
-kinds contend: two `legacy_*` records with one record id from two origins form a group.
-Current main leaves legacy kinds out of the fold (`isLegacyRelayhistoryRecord`), so the
-word here includes legacy-kind groups that main would not count.
-
 A pass skipped before read (`SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true`) read
 nothing and carries no `contender_seats`. The log allowlist keeps only the four words;
 any other value is dropped. No id, content or count is logged.
+
+## Legacy kinds and the record id fold (backport of 9fd94a57)
+
+What changes: the record id fold leaves the four legacy kinds (`legacy_conversation_turn`,
+`legacy_session_link`, `legacy_session_outcome`, `legacy_scope`, see
+`isLegacyRelayhistoryRecord`) out, as it already left convergence events out. A legacy
+record also keeps its newest revision per (origin, record id, kind), so it never replaces
+or hides a delivery record, or a legacy record of another kind, that shares its
+(origin, record id). Before the backport, two `legacy_*` records with one record id from
+two origins formed a group, and a group with an unseated member refused the scope.
+
+This is a behaviour change with no flag. It brings the lineage to main's rule: a scope
+whose only unseated cross-origin contenders are legacy kinds stops being refused with
+`relayhistory_acceptance_missing`. Legacy records still project no rows (the catalog-key
+fold gives them no key), so a scope that now passes indexes only its delivery records.
+Groups of delivery records are refused exactly as before.
+
+The streamed read's payload-free seat fold (`search-index-stream.ts`) and the
+`contender_seats` mirror (`contender-seats.ts`) follow the same rule, so the streamed read
+and the whole read still end with the same outcome and reasons. A convergence line's owner
+is still the first manifest carrying its (origin, record id) in any kind, legacy included.
+
+The backport is its own commit, so it can be deployed alone or left out.

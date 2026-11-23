@@ -27,6 +27,7 @@ import {
   CONVERGENCE_EVENT_KIND,
   PipelineError,
   compareRelayhistoryTimes,
+  isLegacyRelayhistoryRecord,
   lastAccepted,
   normalizeRelayhistoryRecords,
   projectRelayhistorySession,
@@ -194,9 +195,18 @@ export async function streamScope(
 
   // Pass 1: the fold, payload-free (normalizeRelayhistoryRecords on seats).
   const seats = new Map<string, Seat>();
-  const seatKey = (r: RelayhistoryStreamRecord) => JSON.stringify([r.origin_id, r.record_id]);
+  // The fold's recordKey: legacy kinds are seated per (origin, record, kind).
+  const seatKey = (r: RelayhistoryStreamRecord) =>
+    JSON.stringify(isLegacyRelayhistoryRecord(r) ? [r.origin_id, r.record_id, r.kind] : [r.origin_id, r.record_id]);
+  // readScope's `owner` is the first manifest carrying (origin, record) in any kind; a legacy
+  // record has its own seat, so the first manifest carrying one is kept here for direct lines.
+  const legacyFirst = new Map<string, number>();
   await walk((records, index) => {
     for (const r of records) {
+      if (isLegacyRelayhistoryRecord(r)) {
+        const at = JSON.stringify([r.origin_id, r.record_id]);
+        if (!legacyFirst.has(at)) legacyFirst.set(at, index);
+      }
       const key = seatKey(r);
       const held = seats.get(key);
       const revision = BigInt(r.revision);
@@ -217,10 +227,16 @@ export async function streamScope(
       held.acceptedSeq = r.accepted_seq ?? held.acceptedSeq;
     }
   });
-  // newestAcrossOrigins: a direct line is its own; other kinds keep the last accepted per record id.
+  // newestAcrossOrigins: a direct line and a legacy record are their own; other kinds keep the
+  // last accepted per record id.
   const contenders = new Map<string, Seat[]>();
-  for (const seat of seats.values()) {
+  for (const [key, seat] of seats) {
     if (seat.kind === CONVERGENCE_EVENT_KIND) {
+      seat.owner = Math.min(seat.owner, legacyFirst.get(key) ?? Infinity);
+      seat.winner = seat.live;
+      continue;
+    }
+    if (isLegacyRelayhistoryRecord(seat)) {
       seat.winner = seat.live;
       continue;
     }

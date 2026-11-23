@@ -259,6 +259,67 @@ describe("streamed reconcile", () => {
     expect(byEvent.get("e1")).toBe(byEvent.get("p0"));
   });
 
+  test("legacy kinds never contend across origins: the streamed read ends where the whole read ends", async () => {
+    const legacy = (kind: string, id: string, note: string, o: Partial<RelayhistoryStreamRecord> = {}) => rec(kind, id, "1", { note }, o);
+    const base = await richScope();
+    // Unseated legacy records with one record id from two origins, in one manifest and across
+    // manifests; two legacy kinds with one (origin, record id); a legacy record carrying the
+    // catalog row's and an activity record's identity.
+    const extra = await writeSession("srv_cc", [
+      [legacy("legacy_scope", "lg-1", "a"), say("r5", "1", 6, "five"), legacy("legacy_conversation_turn", "lg-2", "a")],
+      [legacy("legacy_scope", "lg-1", "b", { origin_id: "other-origin" }), legacy("legacy_session_outcome", "lg-1", "c"), legacy("legacy_session_link", "session-1", "d", { origin_id: "other-origin", revision: "4" })],
+      [legacy("legacy_session_link", "r1", "e", { revision: "3" })],
+    ]);
+    const more = await writeSession("srv_dd", [[legacy("legacy_conversation_turn", "lg-2", "b", { origin_id: "third-origin" })]]);
+    const keys = [...base, extra, more];
+    const whole = fakeClickHouse();
+    const w = deps(whole.ch, () => keys);
+    const wr = await indexSearchScope(scope, w.d);
+    expect(wr).toMatchObject({ complete: true, reasons: [] });
+    expect("contenderSeats" in wr).toBe(false);
+    const streamed = fakeClickHouse();
+    const s = deps(streamed.ch, () => keys, armed);
+    expect(await indexSearchScope(scope, s.d)).toEqual({ ...wr, streamed: true });
+    expect(streamed.final()).toEqual(whole.final());
+    expect(s.catalogs).toEqual(w.catalogs);
+    // Legacy records project nothing: the rows are the base scope's plus r5.
+    const ids = streamed.final().map((r) => r.delivery_record_id);
+    expect(ids).toContain("r5");
+    expect(ids).toContain("r1");
+    expect(ids.some((id) => id.startsWith("lg-"))).toBe(false);
+  });
+
+  test("a direct line's owner is the first manifest carrying its (origin, record id) in any kind, legacy included", async () => {
+    // The whole read's owner map is keyed by (origin, record id) alone, so a legacy record in an
+    // earlier manifest names the owner of a direct line with that identity in a later one.
+    const line = rec("convergence_event", "d9", "1", {
+      source: "claude", session_id: scope.sessionId, machine_id: "srv_aa", user_id: "user_1", event_id: "d9", kind: "assistant", type: "assistant",
+      ts: new Date(t(9)).toISOString(), content: "direct nine", tags: [], files_touched: [], task_ref: {},
+    }, { origin_id: "machine:srv_aa" });
+    const a = await writeSession("srv_aa", [[say("r1", "1", 1, "one"), rec("legacy_scope", "d9", "1", { note: "n" }, { origin_id: "machine:srv_aa" })]]);
+    const b = await writeSession("srv_bb", [[say("r2", "1", 2, "two"), line]]);
+    const run = async (keys: string[]) => {
+      const whole = fakeClickHouse();
+      const w = deps(whole.ch, () => keys);
+      const wr = await indexSearchScope(scope, w.d);
+      const streamed = fakeClickHouse();
+      const s = deps(streamed.ch, () => keys, armed);
+      return { whole, w, wr, streamed, s, sr: await indexSearchScope(scope, s.d) };
+    };
+    // srv_aa first: srv_aa owns the line, whose machine it names; both reads complete alike.
+    const first = await run([a, b]);
+    expect(first.wr).toMatchObject({ complete: true, reasons: [] });
+    expect(first.sr).toEqual({ ...first.wr, streamed: true });
+    expect(first.streamed.final()).toEqual(first.whole.final());
+    expect(first.s.catalogs).toEqual(first.w.catalogs);
+    expect(first.whole.final().some((r) => r.event_id === "d9" && r.machine_id === "srv_aa")).toBe(true);
+    // srv_bb first: srv_bb owns it and the line fails its identity check on both reads (the
+    // stream stops on the code where the whole read goes on without deletes).
+    const second = await run([b, a]);
+    expect(second.wr).toMatchObject({ complete: false, deleted: 0, reasons: ["relayhistory_event_identity"] });
+    expect(second.sr).toMatchObject({ complete: false, deleted: 0, inserted: 0, streamed: true, reasons: ["relayhistory_event_identity"] });
+  });
+
   test("redelivery is idempotent: nothing inserted or deleted, rows unchanged", async () => {
     const keys = await richScope();
     const ch = fakeClickHouse();

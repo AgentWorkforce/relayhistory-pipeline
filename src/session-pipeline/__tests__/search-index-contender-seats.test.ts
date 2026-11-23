@@ -197,7 +197,7 @@ describe("record id groups", () => {
     for (const r of await both([key])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "seated_unseated"]);
   });
 
-  test("convergence events never contend; legacy kinds do on this lineage", async () => {
+  test("convergence events and legacy kinds never contend", async () => {
     // Two unseated direct lines with one record id: the fold does not refuse them (the second
     // origin's direct line fails its own identity check later, in the projection).
     const fine = await writeSession("srv_aa", [[direct("d1", 1, "ev-1"), direct("d1", 1, "ev-2", other), say("solo", 2)]]);
@@ -208,9 +208,30 @@ describe("record id groups", () => {
     // Next to a refused seated group they still do not count (else the word would be both).
     const mixed = await writeSession("srv_bb", [[direct("d2", 1, "ev-3"), direct("d2", 1, "ev-4", other), ...mixedPair("dup", 2)]]);
     for (const r of await both([fine, mixed])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "seated_unseated"]);
-    // Two legacy_* records with one record id from two origins form a refused group.
+    // Two unseated legacy_* records with one record id from two origins: not refused (as on main).
     const legacy = await writeSession("srv_cc", [[rec("legacy_scope", "lg", "1", { note: "n" }), rec("legacy_scope", "lg", "1", { note: "n" }, other), say("solo", 2)]]);
-    for (const r of await both([legacy])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "all_unseated"]);
+    const [lw, ls] = await both([legacy]);
+    expect(lw).toMatchObject({ complete: true, reasons: [] });
+    expect(ls).toEqual({ ...lw, streamed: true });
+    for (const r of [lw, ls]) expect("contenderSeats" in r).toBe(false);
+    // Next to a refused seated group they do not count either (else the word would be both).
+    const legacyMixed = await writeSession("srv_dd", [[rec("legacy_session_link", "lg2", "1", { note: "n" }), rec("legacy_session_link", "lg2", "1", { note: "n" }, other), ...mixedPair("dup2", 2)]]);
+    for (const r of await both([legacyMixed])) expect([r.reasons[0], r.contenderSeats]).toEqual([ACCEPTANCE_MISSING, "seated_unseated"]);
+  });
+
+  test("a legacy record has its own seat: it never hides a delivery record of the same (origin, record id)", async () => {
+    // A newer legacy revision under the desktop origin's "x": one seat per (origin, record)
+    // would replace the desktop delivery record and leave "x" a group of one, unrefused.
+    const key = await writeSession("srv_aa", [[...unseatedPair("x", 1), rec("legacy_scope", "x", "2", { note: "n" }), say("solo", 2)]]);
+    const [w, s] = await both([key]);
+    expect(w).toEqual({ manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: false, reasons: WHOLE, contenderSeats: "all_unseated" });
+    expect(s).toEqual({ manifests: 1, rows: 0, inserted: 0, deleted: 0, complete: false, streamed: true, reasons: [ACCEPTANCE_MISSING], contenderSeats: "all_unseated" });
+    // Two legacy kinds with one (origin, record) and one revision but different content:
+    // one seat each, so no revision conflict, on either read.
+    const kinds = await writeSession("srv_bb", [[rec("legacy_scope", "k", "1", { note: "a" }), rec("legacy_session_outcome", "k", "1", { note: "b" }), say("solo", 2)]]);
+    const [kw, ks] = await both([kinds]);
+    expect(kw).toMatchObject({ complete: true, reasons: [] });
+    expect(ks).toEqual({ ...kw, streamed: true });
   });
 });
 

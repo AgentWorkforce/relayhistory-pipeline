@@ -26,6 +26,7 @@ import { projectRelayhistorySession } from "../src/lib/pipeline/relayhistory-pro
 import type { NormalizedOutput } from "../src/lib/pipeline/stages.js";
 import {
   RelayhistoryExportTransform,
+  isLegacyRelayhistoryRecord,
   normalizeRelayhistoryRecords,
   parseRelayhistoryRecord,
   readRelayhistoryExport,
@@ -357,6 +358,102 @@ describe("RelayHistory export transform", () => {
       ).toThrow(
         expect.objectContaining({ code: "relayhistory_record_invalid" }),
       );
+    });
+
+    describe("legacy kinds keep their own identity domain", () => {
+      const LEGACY = [
+        "legacy_conversation_turn",
+        "legacy_session_link",
+        "legacy_session_outcome",
+        "legacy_scope",
+      ];
+      const legacy = (
+        kind: string,
+        origin_id: string,
+        text: string,
+        overrides: Partial<RelayhistoryStreamRecord> = {},
+      ) =>
+        record("shared-id", "1", 1, {
+          kind,
+          origin_id,
+          payload: { ts_ms: 1, text },
+          ...overrides,
+        });
+      const kept = (records: RelayhistoryStreamRecord[]) =>
+        normalizeRelayhistoryRecords(records)
+          .map((value) => [value.origin_id, value.kind, value.record_id])
+          .sort((a, b) => a.join("|").localeCompare(b.join("|")));
+
+      it("names exactly the four legacy kinds", () => {
+        for (const kind of LEGACY)
+          expect([kind, isLegacyRelayhistoryRecord({ kind })]).toEqual([kind, true]);
+        for (const kind of ["session_event", "convergence_event", "session", "legacy_other"])
+          expect([kind, isLegacyRelayhistoryRecord({ kind })]).toEqual([kind, false]);
+      });
+
+      it("does not refuse one record id from two origins without acceptance seats: both survive", () => {
+        for (const kind of LEGACY) {
+          const lines = [
+            legacy(kind, "legacy:a", "from-a"),
+            legacy(kind, "legacy:b", "from-b"),
+          ];
+          for (const order of [lines, [...lines].reverse()])
+            expect([kind, kept(order)]).toEqual([
+              kind,
+              [
+                ["legacy:a", kind, "shared-id"],
+                ["legacy:b", kind, "shared-id"],
+              ],
+            ]);
+        }
+      });
+
+      it("keeps two legacy kinds, or a legacy and a delivery record, with one (origin, record id) apart", () => {
+        // Same origin, record id and revision with different content: one seat would
+        // refuse them as a revision conflict, so each kind must have its own seat.
+        const lines = LEGACY.map((kind) => legacy(kind, "legacy:a", kind));
+        expect(kept(lines)).toEqual(
+          LEGACY.map((kind) => ["legacy:a", kind, "shared-id"]).sort((a, b) =>
+            a.join("|").localeCompare(b.join("|")),
+          ),
+        );
+        // A newer legacy revision does not replace a delivery record of the same identity.
+        const delivery = record("shared-id", "1", 1, { origin_id: "legacy:a" });
+        const newer = legacy("legacy_scope", "legacy:a", "newer", { revision: "5" });
+        for (const order of [
+          [delivery, newer],
+          [newer, delivery],
+        ])
+          expect(kept(order)).toEqual([
+            ["legacy:a", "legacy_scope", "shared-id"],
+            ["legacy:a", "session_event", "shared-id"],
+          ]);
+      });
+
+      it("still refuses unseated delivery contenders from two origins, next to legacy records", () => {
+        const refused = expect.objectContaining({
+          code: "relayhistory_acceptance_missing",
+        });
+        const pair = [
+          record("shared-id", "1", 1, { origin_id: "origin-a" }),
+          record("shared-id", "1", 1, { origin_id: "origin-b" }),
+        ];
+        expect(() => normalizeRelayhistoryRecords(pair)).toThrow(refused);
+        expect(() =>
+          normalizeRelayhistoryRecords([
+            ...pair,
+            legacy("legacy_scope", "origin-a", "legacy", { revision: "9" }),
+            legacy("legacy_session_link", "origin-c", "legacy"),
+          ]),
+        ).toThrow(refused);
+        // A kind that only looks legacy contends as any delivery kind does.
+        expect(() =>
+          normalizeRelayhistoryRecords([
+            legacy("legacy_other", "origin-a", "a"),
+            legacy("legacy_other", "origin-b", "b"),
+          ]),
+        ).toThrow(refused);
+      });
     });
   });
 
