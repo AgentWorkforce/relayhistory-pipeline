@@ -63,7 +63,10 @@ three ways.
      was seen or the stamp read failed. Erase also clears.
    - **Tombstone time.** When a stamp was seen, the tombstone is written at the later of the
      pass's time and the stamp's time plus one millisecond. So it sorts above the stamp it
-     clears even when the clock that wrote the stamp ran ahead.
+     clears even when the clock that wrote the stamp ran ahead. This bound covers only a
+     stamp that was seen. When the stamp read failed, the tombstone is written at the pass's
+     own time, so it can sort below a stamp that a clock running ahead wrote; such a stamp
+     then stays in force until it ages out (six hours at most).
 
 ### The early return
 
@@ -174,6 +177,16 @@ Each item below must be true before the flag goes on.
      startsWith(name, 'acceptance_skip/')` also works.
    - Both forms need the `ALTER DELETE` privilege on the table. The pipeline user does not
      need that privilege; the purge is an admin step.
+   - Order matters for a purge. Purge only after every running instance of the function is
+     on the new code. An instance still on the old code can write a fresh stamp under the
+     old fold after the purge, and the new code would honour it.
+   - The mutation form runs in the background by default. Add `SETTINGS mutations_sync = 2`
+     so the statement returns only when the rows are gone, or use the lightweight form.
+     Either way, confirm afterwards that
+     `SELECT count() FROM <database>.search_ingest_state WHERE startsWith(name, 'acceptance_skip/')`
+     returns 0.
+   - The version bump has no such race: the new code never honours a stamp written under
+     the old version, whenever it was written. Prefer the bump.
 2. **Manifest writers raise the revision.** Every writer of manifests must raise the revision
    whenever content changes. A manifest rewritten in place at the same revision leaves the
    pointer row as it was, so the digest still matches and a skip hides the change.
@@ -189,8 +202,8 @@ Each item below must be true before the flag goes on.
 
 ### Grant
 
-On this code line no code path of the function writes `search_ingest_state`. The only INSERT
-into it in this repository is `writeState` in
+Before this change, no code path of the function on this code line wrote
+`search_ingest_state`. The only INSERT into it in this repository was `writeState` in
 `src/session-pipeline/vendor/search-index/reconcile.ts`. Only the vendored tail reconcile
 (`runTail` and its `tailPass`) calls it, and nothing in the function imports `runTail`. On the
 base, `search-index.ts` imports only `chNow`, `deleteRows` and `windowStart` from that file.
@@ -202,9 +215,12 @@ So the INSERT grant cannot be assumed. It is a prerequisite to the flag.
    - `SHOW GRANTS FOR <pipeline user>`
    - `SELECT * FROM system.grants WHERE user_name = '<pipeline user>' AND (table = 'search_ingest_state' OR table IS NULL)`
 
-   A row with `access_type = 'INSERT'` on `<database>.search_ingest_state`, or on the whole
-   database, means the grant is already there. Grants through a role show under the role's
-   name; check `system.role_grants` for the user's roles.
+   The query does not filter by database, so read the `database` column of each row. The
+   grant is already there when a row gives INSERT on `<database>.search_ingest_state`, on
+   the whole `<database>`, or on everything (`database` empty). A wider grant such as `ALL`
+   includes INSERT and counts the same; `SHOW GRANTS` shows it in words. A row marked as a
+   partial revoke takes a privilege away and does not count. Grants through a role show
+   under the role's name; check `system.role_grants` for the user's roles.
 2. **Grant, if missing:**
    `GRANT INSERT ON <database>.search_ingest_state TO <pipeline user>`
 3. **SELECT is already needed.** The stage reads `window_start` from this table on every
@@ -213,8 +229,9 @@ So the INSERT grant cannot be assumed. It is a prerequisite to the flag.
    It is not part of any deploy of this code.
 5. **Flag on without the grant.** Each stamp or tombstone INSERT is refused. The refusal is
    caught. The pass returns exactly what it would return with the flag off, nothing is
-   thrown, and one warning line is logged per pass (`acceptance_stamp_write_failed` or
-   `acceptance_stamp_clear_failed`). No stamp is ever stored, so every pass reads in full and
+   thrown, and each pass that tries a stamp or tombstone write logs one warning line
+   (`acceptance_stamp_write_failed` or `acceptance_stamp_clear_failed`). A pass that tries
+   no write logs nothing. No stamp is ever stored, so every pass reads in full and
    no skip ever happens. The test "ClickHouse refuses every insert into the state table"
    covers this.
 
