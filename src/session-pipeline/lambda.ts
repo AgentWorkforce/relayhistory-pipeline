@@ -42,6 +42,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
+import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
@@ -64,6 +65,13 @@ export interface LambdaEnv {
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
+  /**
+   * SEARCH_INDEX_STREAMING_CH=1 (default off): a scope past the whole-read bound is reconciled
+   * by the streamed reader (search-index-stream.ts), one per invocation, stopping at the
+   * invocation's remaining time less SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS. Absent: such a
+   * scope is marked partial exactly as before.
+   */
+  searchStreamCh?: true;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -75,6 +83,12 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
   const fanout = env.PIPELINE_FANOUT ?? "off";
   if (fanout !== "off" && fanout !== "postgres") throw new Error("session pipeline: PIPELINE_FANOUT must be off or postgres");
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true") throw new Error("session pipeline: PIPELINE_ORG_FROM_PREFIX must be true (org-prefix layout)");
+  const streamCh = env.SEARCH_INDEX_STREAMING_CH;
+  const searchStreamCh = streamCh === "1";
+  if (!searchStreamCh && streamCh !== undefined && streamCh !== "" && streamCh !== "0")
+    throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH must be 1 or 0");
+  if (searchStreamCh && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs SEARCH_INDEX_ENABLED=1");
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -85,6 +99,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
+    ...(searchStreamCh ? { searchStreamCh: true as const } : {}),
   };
 }
 
@@ -216,6 +231,8 @@ async function init(): Promise<Runtime> {
       store,
       ch: createClickHouseClient(secret.clickhouse),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      // Default off (SEARCH_INDEX_STREAMING_CH=1); the deadline and the slot are set per invocation.
+      ...(env.searchStreamCh ? { stream: { ...SEARCH_INDEX_STREAM_CH_BUDGET } } : {}),
     };
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
@@ -392,9 +409,33 @@ async function runReconcile(rt: Runtime, event: ReconcileEvent) {
   return { ...summary, link };
 }
 
+/** The part of the Lambda context the pipeline reads. */
+export interface LambdaInvocationContext {
+  getRemainingTimeInMillis(): number;
+}
+
+/**
+ * The consumer deps for one SQS batch: `deps` itself unless streaming is armed; then the
+ * search stage streams at most one scope of the batch (a second is requeued) and, with a
+ * Lambda context, stops streaming at the remaining time less the margin.
+ */
+export function invocationDeps(deps: ConsumerDeps, context?: LambdaInvocationContext, now: () => number = Date.now): ConsumerDeps {
+  const search = deps.search;
+  if (!search?.stream) return deps;
+  const remaining = typeof context?.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : NaN;
+  return {
+    ...deps,
+    search: {
+      ...search,
+      streamSlot: { used: false },
+      ...(Number.isFinite(remaining) ? { streamDeadline: { at: now() + remaining - SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS } } : {}),
+    },
+  };
+}
+
 type LambdaEvent = { Records?: { messageId: string; body: string; eventSource?: string }[]; reconcile?: unknown; brief?: unknown; cursor?: string; since?: string; link?: number };
 
-export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok: boolean }> {
+export async function handler(event: LambdaEvent, context?: LambdaInvocationContext): Promise<BatchResponse | { ok: boolean }> {
   if (Array.isArray(event?.Records)) {
     let rt: Runtime;
     try {
@@ -405,7 +446,7 @@ export async function handler(event: LambdaEvent): Promise<BatchResponse | { ok:
       return { batchItemFailures: event.Records.map((r) => ({ itemIdentifier: r.messageId })) };
     }
     const records: QueueRecord[] = event.Records.map((r) => ({ messageId: r.messageId, body: r.body }));
-    return processBatch(records, rt.deps);
+    return processBatch(records, invocationDeps(rt.deps, context));
   }
   if (event?.reconcile === true) {
     const started = Date.now();
