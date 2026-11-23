@@ -94,6 +94,7 @@ limits are binding here:
   passed on by anyone other than the marked delegate: the agent that executes
   needs its own marked message, so do not forward one to another lane as
   approval.
+- It can override an earlier denial when his words name the denied action.
 
 See also section 8 of the
 [Relay messaging skill](https://github.com/AgentWorkforce/skills/blob/main/skills/messaging-agents-on-the-relay/SKILL.md#8-safety-rules).
