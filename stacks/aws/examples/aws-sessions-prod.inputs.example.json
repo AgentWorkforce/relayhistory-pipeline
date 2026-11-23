@@ -25,7 +25,6 @@
   "budgetEmail": "aws-budgets@agentrelay.com",
   "transcriptStore": {
     "bufferedGcRoleArn": "<exact separately managed GC role ARN in this account; required to retain active GC access>",
-    "sessionAnalysisRunnerRoleArn": "arn:aws:iam::786098391924:role/agent-relay-prod-session-analysis",
     "managementEvents": true
   }
 }

@@ -56,6 +56,7 @@ describe("session-analysis runner resource policies", () => {
       .toBe(`${names.bucketArn}/96bulls/*/v1/*/normalized/session-analysis-v2/*`);
     expect(bucket.find((s) => s.Sid === "SessionAnalysisDeniesReservedNamespaces")!.Resource)
       .toBe(`${names.bucketArn}/96bulls/.*`);
+    expect(bucket.find((s) => s.Sid === "SessionAnalysisDeniesReservedNamespaces")!.Effect).toBe("Deny");
 
     const key = sessionAnalysisRunnerKeyStatements({ region: TRANSCRIPT_REGION, bucketName: names.bucket, roleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
     expect(key.map((s) => s.Sid)).toEqual([
@@ -234,6 +235,8 @@ describe("session-analysis runner plan contract", () => {
       transcripts: bucketBlock(analysisLiveBucket, analysisNextBucket),
       "transcripts-key": keyBlock(analysisLiveKey, analysisNextKey),
     };
+    expect(() => check(add, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
+      .not.toThrow();
     expect(check(add, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
       .toBe("session analysis runner grants");
     expect(check({
@@ -259,10 +262,13 @@ describe("session-analysis runner plan contract", () => {
       sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN,
       crossAccountWorkerRoleArn: worker,
     });
-    expect(check({
+    const workerRollout = {
       transcripts: bucketBlock(runnerBucket, withWorkerBucket),
       "transcripts-key": keyBlock(runnerKey, withWorkerKey),
-    }, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
+    };
+    expect(() => check(workerRollout, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
+      .not.toThrow();
+    expect(check(workerRollout, { transcripts: "update", "transcripts-key": "update" }, SESSION_ANALYSIS_RUNNER_ROLE_ARN))
       .toBe("cross-account worker grants");
   });
 
