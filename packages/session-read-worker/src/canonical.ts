@@ -35,7 +35,22 @@ export type CanonicalEnv = Pick<
   CANONICAL_READ_MODE?: "raw" | "pages" | string;
   CANONICAL_SUPABASE_URL?: string;
   CANONICAL_SUPABASE_API_KEY?: string;
+  /** index.ts Env READ_API_RAW_STORE_OTHER_READS; any non-empty value withholds the raw store here (rawStoreForCanonical). */
+  READ_API_RAW_STORE_OTHER_READS?: string;
 };
+/**
+ * The raw store for /v1/canonical/*, withheld (undefined, so the route answers not_configured)
+ * whenever READ_API_RAW_STORE_OTHER_READS is non-empty. "off" is the only valid non-empty value;
+ * these routes answer before handle()'s configuration step, so any other value also fails closed
+ * here rather than serving.
+ */
+export function rawStoreForCanonical(
+  env: CanonicalEnv,
+  fetcher: typeof fetch,
+): ReturnType<typeof rawStoreFromEnv> {
+  if ((env.READ_API_RAW_STORE_OTHER_READS ?? "") !== "") return undefined;
+  return rawStoreFromEnv(env, fetcher);
+}
 const MAX_BODY = 2 * 1024 * 1024;
 const tables = new Set([
   "convergence_events",
@@ -343,7 +358,7 @@ export async function canonicalHandle(
     if (mode === "pages") {
       let artifactDeps = artifactOverride;
       if (!artifactDeps) {
-        const raw = rawStoreFromEnv(env, boundedFetch);
+        const raw = rawStoreForCanonical(env, boundedFetch);
         if (!raw) throw new CanonicalReadError("not_configured");
         artifactDeps = {
           signal,
@@ -389,7 +404,7 @@ export async function canonicalHandle(
     }
     let deps = override;
     if (!deps) {
-      const raw = rawStoreFromEnv(env, boundedFetch);
+      const raw = rawStoreForCanonical(env, boundedFetch);
       if (!raw) throw new CanonicalReadError("not_configured");
       deps = {
         ...raw,

@@ -105,7 +105,16 @@ name: deploy session-read-worker
 # layout. An on dispatch fails before `wrangler deploy` while the bucket or region is unset or
 # malformed (names only). A wrong bucket fails closed: the Worker refuses every pointer row whose
 # bucket differs (503 backend_unavailable, logged summary_fallback_pointer_invalid), never an empty
-# answer. With summary_fallback and analysis both off the render is byte-identical to before.
+# answer. The fallback to SESSION_READ_INGEST_S3_* is correct only when the pipeline's raw store is
+# the same bucket; otherwise set SESSION_READ_RAW_S3_*. With summary_fallback and analysis both off
+# the render is byte-identical to before.
+# The render does NOT turn on hosted timing, turns or metadata reads (nor owner-buffered turns,
+# hosted canonical events, babysitter evidence or /v1/canonical/*), which read the same raw store
+# without a flag of their own: when an on dispatch introduces the raw store, the resolve step
+# (resolve-deploy-profile.ts rawStoreOtherReads, from the live Worker, fail-closed) renders
+# READ_API_RAW_STORE_OTHER_READS=off beside the vars; a raw store already live without that switch
+# gets none, and a live switch is kept. Turning those reads on is a separate decision with its own
+# step (removing the switch), never part of this dispatch.
 # Same not-preserved rule; dispatch, and putting that secret on the Worker, are Khaliq's call.
 # summary_search=on adds --var READ_API_SUMMARY_SEARCH_ENABLED:true: GET /v1/sessions/summaries/search
 # over ClickHouse session_brief_documents (docs/ch-brief-search-design.md; needs no other input and
@@ -134,11 +143,15 @@ name: deploy session-read-worker
 # without it POST answers 501 analysis_admission_not_configured and GET still serves. An on dispatch
 # fails before `wrangler deploy` unless the PIPELINE_RAW_S3_* secrets exist (names only), and
 # renders the same plain raw-store vars as summary_fallback=on (bucket and region required, from
-# the same variables; a wrong bucket fails closed: the result-object read fails and GET serves an
-# error, never another object, e.g. 503 analysis_result_missing). off (the default)
+# the same variables and the same READ_API_RAW_STORE_OTHER_READS rule; a wrong bucket fails closed:
+# the result-object read fails and GET serves an error, never another object: 503
+# backend_unavailable (logged reason, for example analysis_result_missing)). This wiring is
+# additional scope: it gives no authority to enable or deploy analysis. off (the default)
 # renders no var: GET 501 analysis_not_configured and POST 405, as before this input. A
 # profile/preserve dispatch refuses to drop or change live raw-store vars; analysis=disable without
-# summary_fallback=on may drop them.
+# summary_fallback=on drops them with the switch, and is refused while they are live without
+# READ_API_RAW_STORE_OTHER_READS (timing, turns and metadata read through them) or the bucket is a
+# secret. Break-glass (below) refuses summary_fallback=on.
 # The ANALYSIS_ADMIT binding is rendered whenever SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set, whatever
 # `analysis` says (a flag-off Worker ignores it); the render is byte-identical to before only with
 # that variable unset. Not preserved from live: in EVERY mode (profile, preserve, and explicit

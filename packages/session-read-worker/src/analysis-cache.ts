@@ -1,4 +1,3 @@
-import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { objectKey } from "../../object-store/src/index.ts";
 import { CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import type { ArtifactIdentity } from "../../../src/session-read-api/canonical-artifact.ts";
@@ -10,6 +9,7 @@ import {
 import {
   canonicalClaimReader,
   canonicalTokenTenant,
+  rawStoreForCanonical,
   type CanonicalEnv,
 } from "./canonical.ts";
 export interface AnalysisHandleDeps extends AnalysisCacheDeps {
@@ -98,7 +98,7 @@ export async function canonicalAnalysisHandle(
       });
     let deps = override;
     if (!deps) {
-      const raw = rawStoreFromEnv(env, boundedFetch);
+      const raw = rawStoreForCanonical(env, boundedFetch);
       if (!raw) throw new CanonicalReadError("not_configured");
       const wake = canonicalClaimReader(
           env,

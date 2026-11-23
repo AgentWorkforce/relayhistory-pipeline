@@ -387,15 +387,20 @@ describe("the raw-store vars (summary_fallback / analysis) in the live-settings 
           await expect(resolveProfile({ ...env, OWNER_BUFFERED: mode, ...off }, template, only), `${name} ${mode} ${JSON.stringify(off)}`).rejects.toThrow(new RegExp(`change or drop live setting ${name}`));
         }
       }
-      // analysis=disable alone may drop it; with summary_fallback=on it is rendered and compared.
-      await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, only)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+      // analysis=disable alone is the removal, but not of a raw store timing/turns/metadata read
+      // through (no live READ_API_RAW_STORE_OTHER_READS=off): refused; with the switch it may drop both.
+      await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, only)).rejects.toThrow(/analysis=disable would drop the live raw-store vars that timing, turns and metadata read through/);
+      await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, get(version({ ...values, [name]: raw[name], READ_API_RAW_STORE_OTHER_READS: "off" })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
     }
-    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, analysisLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, analysisLive)).rejects.toThrow(/would drop the live raw-store vars/);
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, get(version({ ...values, READ_API_ANALYSIS_ENABLED: "true", ...raw, READ_API_RAW_STORE_OTHER_READS: "off" })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
     await expect(resolveProfile({ ...env, ANALYSIS: "on" }, template, analysisLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
     await expect(resolveProfile({ ...env, ANALYSIS: "on", RAW_S3_BUCKET: "example-other-bucket" }, template, analysisLive)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
     await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", ANALYSIS: "disable", RAW_S3_BUCKET: "example-other-bucket" }, template, get(version({ ...values, READ_API_SUMMARY_FALLBACK_ENABLED: "true", READ_API_ANALYSIS_ENABLED: "true", ...raw })))).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
     // Summary fallback stays live: analysis=disable must not drop its bucket (the flag guard refuses first without summary_fallback=on).
-    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, fallbackLive)).rejects.toThrow(/change or drop live setting READ_API_SUMMARY_FALLBACK_ENABLED/);
+    // (Without the switch the timing/turns/metadata refusal comes first; with it, the flag guard.)
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, fallbackLive)).rejects.toThrow(/would drop the live raw-store vars/);
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, get(version({ ...values, READ_API_SUMMARY_FALLBACK_ENABLED: "true", ...raw, READ_API_RAW_STORE_OTHER_READS: "off" })))).rejects.toThrow(/change or drop live setting READ_API_SUMMARY_FALLBACK_ENABLED/);
     await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", ANALYSIS: "disable" }, template, fallbackLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
   });
 
@@ -404,5 +409,113 @@ describe("the raw-store vars (summary_fallback / analysis) in the live-settings 
     (v.resources.bindings as Array<Record<string, string>>).push({ name: "PIPELINE_RAW_S3_BUCKET", type: "secret_text", text: "MUST_NOT_BE_COPIED" });
     await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, get(v))).rejects.toThrow(/replacing secret binding PIPELINE_RAW_S3_BUCKET/);
     await expect(resolveProfile(env, template, get(v))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+  });
+});
+
+describe("READ_API_RAW_STORE_OTHER_READS: rendering the raw store never changes timing, turns or metadata", () => {
+  const raw = { PIPELINE_RAW_S3_BUCKET: env.RAW_S3_BUCKET, PIPELINE_RAW_S3_REGION: env.RAW_S3_REGION, PIPELINE_KEY_PREFIX: TENANT_KEY_BASE, PIPELINE_ORG_FROM_PREFIX: "true" };
+  const SWITCH = "READ_API_RAW_STORE_OTHER_READS";
+  const rendered = (resolved: Record<string, string>, e: Record<string, string>) =>
+    ts.parseConfigFileTextToJson("c.jsonc", renderDeployConfig(template, profileInputs({ ...e, ...resolved }))).config.vars as Record<string, string>;
+  const ons: Record<string, string>[] = [{ SUMMARY_FALLBACK: "on" }, { ANALYSIS: "on" }, { SUMMARY_FALLBACK: "on", ANALYSIS: "on" }];
+  const explicitOn = { OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION };
+  const modes: Record<string, string>[] = [{ OWNER_BUFFERED: "preserve" }, { OWNER_BUFFERED: "profile" }, { OWNER_BUFFERED: "profile", DEPLOY_TARGET: "production" }, explicitOn, { OWNER_BUFFERED: "off" }];
+
+  test("fresh add (no raw store live): the render adds the switch off beside the raw-store vars, in every mode", async () => {
+    for (const on of ons) for (const mode of modes) {
+      const e = { ...env, ...mode, ...on };
+      const resolved = await resolveProfile(e, template, get());
+      expect(resolved.RAW_STORE_OTHER_READS, JSON.stringify(e)).toBe("off");
+      expect(workflowEnvironment(resolved)).toContain("RAW_STORE_OTHER_READS=off\n");
+      expect(rendered(resolved, e)).toMatchObject({ ...raw, [SWITCH]: "off" });
+    }
+  });
+
+  test("a live raw store without the switch: no switch is added, and every raw-store var must already be live as plain text", async () => {
+    const live = get(version({ ...values, ...raw }));
+    for (const on of ons) for (const mode of modes) {
+      const e = { ...env, ...mode, ...on };
+      const resolved = await resolveProfile(e, template, live);
+      expect(resolved, JSON.stringify(e)).not.toHaveProperty("RAW_STORE_OTHER_READS");
+      expect(workflowEnvironment(resolved)).not.toContain("RAW_STORE_OTHER_READS");
+      expect(rendered(resolved, e)).not.toHaveProperty(SWITCH);
+    }
+    // The bucket live but another raw-store var not: the render would change what those reads see.
+    for (const name of RAW_STORE_VARS.slice(1)) {
+      const partial: Record<string, string> = { ...values, ...raw };
+      delete partial[name];
+      for (const mode of modes) {
+        await expect(resolveProfile({ ...env, ...mode, SUMMARY_FALLBACK: "on" }, template, get(version(partial)))).rejects.toThrow(new RegExp(`has PIPELINE_RAW_S3_BUCKET without ${SWITCH} and without plain ${name}`));
+      }
+    }
+    // A different bucket or region than live is refused in every mode, explicit included (where the live-settings guard does not run).
+    for (const mode of modes) {
+      await expect(resolveProfile({ ...env, ...mode, SUMMARY_FALLBACK: "on", RAW_S3_BUCKET: "example-other-bucket" }, template, live)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
+      await expect(resolveProfile({ ...env, ...mode, SUMMARY_FALLBACK: "on", RAW_S3_REGION: "eu-west-1" }, template, live)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_REGION/);
+    }
+    for (const mode of [explicitOn, { OWNER_BUFFERED: "off" }]) {
+      await expect(resolveProfile({ ...env, ...mode, ANALYSIS: "on", RAW_S3_BUCKET: "example-other-bucket" }, template, live)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET, which timing, turns and metadata read/);
+      await expect(resolveProfile({ ...env, ...mode, ANALYSIS: "on" }, template, get(version({ ...values, ...raw, PIPELINE_KEY_PREFIX: "example-other-base" })))).rejects.toThrow(/change or drop live setting PIPELINE_KEY_PREFIX, which timing, turns and metadata read/);
+    }
+    // A bucket held as a secret is never shadowed, in explicit mode too (where the live-settings guard does not run).
+    const v = version();
+    (v.resources.bindings as Array<Record<string, string>>).push({ name: "PIPELINE_RAW_S3_BUCKET", type: "secret_text", text: "MUST_NOT_BE_COPIED" });
+    await expect(resolveProfile({ ...env, ...explicitOn, SUMMARY_FALLBACK: "on" }, template, get(v))).rejects.toThrow(/replacing secret binding PIPELINE_RAW_S3_BUCKET/);
+  });
+
+  test("a live switch is kept (only plain \"off\" is accepted) and a dispatch never drops it silently", async () => {
+    const live = get(version({ ...values, ...raw, [SWITCH]: "off" }));
+    for (const on of ons) for (const mode of modes) {
+      const e = { ...env, ...mode, ...on };
+      const resolved = await resolveProfile(e, template, live);
+      expect(resolved.RAW_STORE_OTHER_READS, JSON.stringify(e)).toBe("off");
+      expect(rendered(resolved, e)).toMatchObject({ ...raw, [SWITCH]: "off" });
+    }
+    // Any other live value, or a secret, is refused rather than reinterpreted.
+    for (const text of ["", "on", "OFF", "false"]) {
+      await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, get(version({ ...values, ...raw, [SWITCH]: text })))).rejects.toThrow(/READ_API_RAW_STORE_OTHER_READS is not plain text "off"/);
+    }
+    const s = version({ ...values, ...raw });
+    (s.resources.bindings as Array<Record<string, string>>).push({ name: SWITCH, type: "secret_text", text: "MUST_NOT_BE_COPIED" });
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, get(s))).rejects.toThrow(/is not plain text "off"/);
+    // Both off (not the removal): the live switch would be dropped, refused like the vars.
+    await expect(resolveProfile(env, template, live)).rejects.toThrow(/change or drop live setting/);
+  });
+
+  test("the removal path: drops the vars and the switch together, never a raw store those reads were served through", async () => {
+    // Switch live: analysis=disable drops vars and switch; the render carries neither.
+    const withSwitch = get(version({ ...values, READ_API_ANALYSIS_ENABLED: "true", ...raw, [SWITCH]: "off" }));
+    for (const mode of [{ OWNER_BUFFERED: "preserve" }, explicitOn]) {
+      const e = { ...env, ...mode, ANALYSIS: "disable" };
+      const resolved = await resolveProfile(e, template, withSwitch);
+      expect(resolved).not.toHaveProperty("RAW_STORE_OTHER_READS");
+      const vars = rendered(resolved, e);
+      for (const name of [...RAW_STORE_VARS, SWITCH]) expect(vars).not.toHaveProperty(name);
+    }
+    // No switch: timing/turns/metadata were live through the raw store; refused in every mode that reads live.
+    const without = get(version({ ...values, READ_API_ANALYSIS_ENABLED: "true", ...raw }));
+    for (const mode of [{ OWNER_BUFFERED: "preserve" }, { OWNER_BUFFERED: "profile" }, explicitOn, { OWNER_BUFFERED: "off" }]) {
+      await expect(resolveProfile({ ...env, ...mode, ANALYSIS: "disable" }, template, without)).rejects.toThrow(/analysis=disable would drop the live raw-store vars that timing, turns and metadata read through/);
+    }
+    // A secret bucket stays after the dispatch: dropping the switch would turn those reads on.
+    const secret = version({ ...values, READ_API_ANALYSIS_ENABLED: "true", [SWITCH]: "off" });
+    (secret.resources.bindings as Array<Record<string, string>>).push({ name: "PIPELINE_RAW_S3_BUCKET", type: "secret_text", text: "MUST_NOT_BE_COPIED" });
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, get(secret))).rejects.toThrow(/while PIPELINE_RAW_S3_BUCKET stays a secret/);
+    // With summary_fallback=on it is not the removal: the vars and the switch stay rendered.
+    const both = get(version({ ...values, READ_API_SUMMARY_FALLBACK_ENABLED: "true", READ_API_ANALYSIS_ENABLED: "true", ...raw, [SWITCH]: "off" }));
+    const e = { ...env, SUMMARY_FALLBACK: "on", ANALYSIS: "disable" };
+    expect(rendered(await resolveProfile(e, template, both), e)).toMatchObject({ ...raw, [SWITCH]: "off" });
+  });
+
+  test("break-glass (no live read) refuses summary_fallback=on; the environment cannot inject the switch", async () => {
+    const never = async () => { throw new Error("break-glass must not read live"); };
+    await expect(resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off", ANALYSIS: "disable", SUMMARY_FALLBACK: "on" }, template, never)).rejects.toThrow(/summary_fallback=on needs the live raw-store check/);
+    const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off", ANALYSIS: "disable" }, template, never);
+    expect(resolved).not.toHaveProperty("RAW_STORE_OTHER_READS");
+    // A RAW_STORE_OTHER_READS in the dispatch environment is ignored: the value comes from the live Worker only.
+    const live = get(version({ ...values, ...raw }));
+    const injected = await resolveProfile({ ...env, SUMMARY_FALLBACK: "on", RAW_STORE_OTHER_READS: "off" }, template, live);
+    expect(injected).not.toHaveProperty("RAW_STORE_OTHER_READS");
+    await expect(resolveProfile({ ...env, RAW_STORE_OTHER_READS: "off" }, template, get())).resolves.not.toHaveProperty("RAW_STORE_OTHER_READS");
   });
 });

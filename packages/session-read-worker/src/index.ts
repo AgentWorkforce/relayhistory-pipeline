@@ -262,6 +262,18 @@ export interface Env extends CanonicalEnv {
   READ_API_CANONICAL_EVENTS_HOSTED?: string;
   /** Its workspace allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. Never predeclared in wrangler.jsonc. */
   READ_API_CANONICAL_EVENTS_WORKSPACES?: string;
+  /**
+   * The switch for every raw-store read other than the summary fallback and analysis
+   * (rawStoreOtherReadsEnabled): timing, turns, metadata, owner-buffered turns, hosted canonical
+   * events, babysitter evidence and /v1/canonical/*. Unset or empty = as before the switch existed
+   * (on whenever the raw store is configured); exactly "off" = those reads answer as without a raw
+   * store (501 timing_not_configured / turns_not_configured); any other value refuses every request
+   * that reaches the configuration step (503, logged missing_READ_API_RAW_STORE_OTHER_READS) and
+   * withholds the raw store from /v1/canonical/*. The deploy render sets it to "off" only when it
+   * is the render that introduces the raw store (scripts/render-deploy-config.ts). Never
+   * predeclared in wrangler.jsonc.
+   */
+  READ_API_RAW_STORE_OTHER_READS?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
   DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
@@ -602,6 +614,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     }
     // The hosted canonical events flag accepts only unset/empty or exactly "true"; anything else is a misconfigured deploy.
     canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED);
+    // The raw-store other-reads switch accepts only unset/empty or exactly "off"; anything else is a misconfigured deploy.
+    rawStoreOtherReadsEnabled(env.READ_API_RAW_STORE_OTHER_READS);
     // The retryable session_partial 503 is served by the self-host service only: "true" here (or a
     // value that does not parse) is a misconfigured deploy, refused rather than silently ignored.
     try {
@@ -861,9 +875,11 @@ function workerCanonicalSource(env: Env, pointers: ReturnType<typeof sqlCanonica
 /**
  * Session timing from canonical S3: pointers through the read role (tenant-bound), objects
  * with the raw-store secrets the /v1/canonical route uses (PIPELINE_RAW_S3_*). Without
- * those secrets the route answers 501 `timing_not_configured`.
+ * those secrets, or with READ_API_RAW_STORE_OTHER_READS exactly "off", the route answers 501
+ * `timing_not_configured` (and turns/metadata, which build on this, 501 `turns_not_configured`).
  */
 export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TimingDeps | undefined {
+  if (!rawStoreOtherReadsEnabled(env.READ_API_RAW_STORE_OTHER_READS)) return undefined;
   if (!rawStoreFromEnv(env, fetcher)) return undefined;
   const pointers = sqlCanonicalPointers(run);
   const snapshot = workerCanonicalSource(env, pointers, fetcher);
@@ -875,6 +891,20 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
       return { rows, legacyCoverage };
     },
   };
+}
+
+/**
+ * READ_API_RAW_STORE_OTHER_READS: unset or empty = true (the raw-store reads other than the
+ * summary fallback and analysis behave as before the switch existed), exactly "off" = false (they
+ * answer as without a raw store), anything else (including "OFF", "on" or "false") a ConfigError
+ * naming the variable. The value itself is never logged. Rendering the raw store for the summary
+ * fallback or analysis sets "off" when no raw store was live, so that render does not turn on
+ * timing, turns or metadata; turning those on is a separate decision.
+ */
+export function rawStoreOtherReadsEnabled(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return true;
+  if (raw === "off") return false;
+  throw new ConfigError("READ_API_RAW_STORE_OTHER_READS");
 }
 
 /**
@@ -898,7 +928,7 @@ export function canonicalEventsHostedEnabled(raw: string | undefined): boolean {
  * The Worker binds no operator erase fence; an erase shows through the tombstone and partial checks.
  */
 export function canonicalEventsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): CanonicalEventsDeps | undefined {
-  if (!canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED) || !rawStoreFromEnv(env, fetcher)) return undefined;
+  if (!canonicalEventsHostedEnabled(env.READ_API_CANONICAL_EVENTS_HOSTED) || !rawStoreOtherReadsEnabled(env.READ_API_RAW_STORE_OTHER_READS) || !rawStoreFromEnv(env, fetcher)) return undefined;
   return {
     source: workerCanonicalSource(env, sqlCanonicalPointers(run), fetcher),
     ...(exactTrueFlag(env.MESSAGE_ORIGIN_LABELS_ENABLED) ? { originLabels: true } : {}),
@@ -929,10 +959,12 @@ export function turnsDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>
 /**
  * Babysitter evidence from the retention buckets (src/session-read-api/babysitter-evidence.ts):
  * buckets and revisions through the read role (tenant-bound), objects with the raw-store
- * secrets. Off unless READ_API_BABYSITTER_EVIDENCE=on and the raw store is configured.
+ * secrets. Off unless READ_API_BABYSITTER_EVIDENCE=on, READ_API_RAW_STORE_OTHER_READS is not
+ * "off" and the raw store is configured.
  */
 export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): EvidenceDeps | undefined {
   if ((env.READ_API_BABYSITTER_EVIDENCE ?? "").trim().toLowerCase() !== "on") return undefined;
+  if (!rawStoreOtherReadsEnabled(env.READ_API_RAW_STORE_OTHER_READS)) return undefined;
   if (!rawStoreFromEnv(env, fetcher)) return undefined;
   const keyRoot = env.READ_API_BABYSITTER_KEY_ROOT?.trim() || "96bulls";
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(keyRoot)) return undefined;

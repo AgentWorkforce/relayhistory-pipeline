@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
 import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
-import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, RAW_STORE_OTHER_READS_VAR, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -743,6 +743,54 @@ describe("deploy config render, raw store for summary_fallback / analysis", () =
     const bad = cli({ SUMMARY_FALLBACK: "on", RAW_S3_BUCKET: "", RAW_S3_REGION: "us-east-1" });
     expect(bad.code).not.toBe(0);
     expect(bad.out).toContain("::error::summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET");
+  });
+});
+
+describe("deploy config render, READ_API_RAW_STORE_OTHER_READS (timing, turns and metadata stay as they are)", () => {
+  const RAW = { rawS3Bucket: "example-transcripts-bucket", rawS3Region: "us-east-1" };
+  const raw = { PIPELINE_RAW_S3_BUCKET: "example-transcripts-bucket", PIPELINE_RAW_S3_REGION: "us-east-1", PIPELINE_KEY_PREFIX: TENANT_KEY_BASE, PIPELINE_ORG_FROM_PREFIX: "true" };
+  const combos: RenderInputs[] = [{ hyperdriveId: HD }, ON, { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" }, { hyperdriveId: HD, bufferedSearchGate: "on" }];
+
+  test("off adds exactly the switch beside the four vars; empty or absent adds none; the committed template leaves it unset", () => {
+    expect(RAW_STORE_OTHER_READS_VAR).toBe("READ_API_RAW_STORE_OTHER_READS");
+    expect(TEMPLATE).not.toContain(RAW_STORE_OTHER_READS_VAR);
+    for (const combo of combos) {
+      const before = parse(renderDeployConfig(TEMPLATE, combo));
+      for (const on of [{ summaryFallback: "on" }, { analysis: "on" }, { summaryFallback: "on", analysis: "disable" }]) {
+        expect(parse(renderDeployConfig(TEMPLATE, { ...combo, ...on, ...RAW, rawStoreOtherReads: "off" }))).toEqual({ ...before, vars: { ...before.vars, ...raw, [RAW_STORE_OTHER_READS_VAR]: "off" } });
+        for (const rawStoreOtherReads of [undefined, ""]) {
+          const out = renderDeployConfig(TEMPLATE, { ...combo, ...on, ...RAW, rawStoreOtherReads });
+          expect(out).not.toContain(RAW_STORE_OTHER_READS_VAR);
+          expect(parse(out)).toEqual({ ...before, vars: { ...before.vars, ...raw } });
+        }
+      }
+    }
+  });
+
+  test("both off stays byte-identical (no switch), and a switch without the raw store is refused", () => {
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const analysis of [undefined, "off", "disable"]) {
+        expect(renderDeployConfig(TEMPLATE, { ...combo, analysis, ...RAW, rawStoreOtherReads: "" })).toBe(without);
+        expect(() => renderDeployConfig(TEMPLATE, { ...combo, analysis, ...RAW, rawStoreOtherReads: "off" })).toThrow(/RAW_STORE_OTHER_READS is set only with summary_fallback=on or analysis=on/);
+      }
+    }
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, rawStoreOtherReads: "" })).toBe(sedRender(HD));
+  });
+
+  test("any value other than empty or exactly off is refused, never rendered", () => {
+    for (const rawStoreOtherReads of ["on", "OFF", " off", "off ", "true", "false", "0"]) {
+      for (const on of [{ summaryFallback: "on" }, {}]) {
+        expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ...on, ...RAW, rawStoreOtherReads }), rawStoreOtherReads).toThrow(/RAW_STORE_OTHER_READS must be empty or "off"/);
+      }
+    }
+  });
+
+  test("refuses a template that declares the switch, in every mode", () => {
+    const declared = TEMPLATE.replace('"vars": {', `"vars": { "${RAW_STORE_OTHER_READS_VAR}": "off",`);
+    for (const inputs of [{ hyperdriveId: HD }, ON, { hyperdriveId: HD, summaryFallback: "on", ...RAW }, { hyperdriveId: HD, analysis: "on", ...RAW, rawStoreOtherReads: "off" }] as RenderInputs[]) {
+      expect(() => renderDeployConfig(declared, inputs), JSON.stringify(inputs)).toThrow(new RegExp(`must leave ${RAW_STORE_OTHER_READS_VAR} unset`));
+    }
   });
 });
 

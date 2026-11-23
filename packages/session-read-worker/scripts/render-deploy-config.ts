@@ -93,6 +93,14 @@
  * four vars (in every mode). A wrong bucket fails closed at read time: a pointer row whose bucket
  * differs is refused (summary fallback 503, logged summary_fallback_pointer_invalid).
  *
+ * The raw store would also serve timing, turns, metadata (and owner-buffered turns), which read it
+ * without a flag of their own. This render does NOT turn those reads on: when the resolver finds no
+ * raw store on the live Worker, it renders READ_API_RAW_STORE_OTHER_READS=off beside the vars
+ * (rawStoreOtherReads input), so those routes keep answering 501 timing_not_configured /
+ * turns_not_configured. Turning them on is a separate decision with its own step (removing that
+ * switch from the Worker), not part of any summary_fallback or analysis dispatch. The analysis=on
+ * wiring here is additional scope: it gives no authority to enable or deploy analysis.
+ *
  * CLI: reads wrangler.jsonc and the env below, writes wrangler.deploy.jsonc, prints no value.
  *   HYPERDRIVE_ID, OWNER_BUFFERED (off|on; empty = off), OWNER_BUFFERED_WORKSPACES,
  *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
@@ -102,7 +110,8 @@
  *   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (off|2000..6000; empty = off),
  *   ANALYSIS_HYPERDRIVE_ID (32 hex; empty = no ANALYSIS_ADMIT binding),
  *   SUMMARY_FALLBACK (off|on; empty = off), ANALYSIS (off|on|disable; empty = off),
- *   RAW_S3_BUCKET, RAW_S3_REGION (required only when SUMMARY_FALLBACK or ANALYSIS is on).
+ *   RAW_S3_BUCKET, RAW_S3_REGION (required only when SUMMARY_FALLBACK or ANALYSIS is on),
+ *   RAW_STORE_OTHER_READS (empty|off, set by resolve-deploy-profile.ts; off only with one of them on).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -151,8 +160,16 @@ export const NEVER_DECLARED_VARS = [CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENT
  * prefixAllowed): the bucket and region, and the hosted pipeline's org-derived key layout.
  */
 export const RAW_STORE_VARS = ["PIPELINE_RAW_S3_BUCKET", "PIPELINE_RAW_S3_REGION", "PIPELINE_KEY_PREFIX", "PIPELINE_ORG_FROM_PREFIX"] as const;
+/**
+ * The switch for the raw-store reads other than the summary fallback and analysis (index.ts
+ * rawStoreOtherReadsEnabled: unset = as before, exactly "off" = timing, turns, metadata and the
+ * other raw-store reads answer as without a raw store). Rendered, as "off" only, beside the
+ * raw-store vars when the resolver (resolve-deploy-profile.ts rawStoreOtherReads) finds that this
+ * render introduces the raw store or that the live Worker already has the switch.
+ */
+export const RAW_STORE_OTHER_READS_VAR = "READ_API_RAW_STORE_OTHER_READS";
 /** Vars only this render adds; a template declaring any of them is refused in every mode. */
-const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, ...RAW_STORE_VARS] as const;
+const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, ...RAW_STORE_VARS, RAW_STORE_OTHER_READS_VAR] as const;
 
 export interface RenderInputs {
   hyperdriveId: string;
@@ -189,6 +206,12 @@ export interface RenderInputs {
   rawS3Bucket?: string;
   /** RAW_S3_REGION: SESSION_READ_RAW_S3_REGION, else SESSION_READ_INGEST_S3_REGION; required only with summaryFallback or analysis on. */
   rawS3Region?: string;
+  /**
+   * RAW_STORE_OTHER_READS (resolve-deploy-profile.ts rawStoreOtherReads, from the live Worker):
+   * "" (unset) renders no switch; "off" renders READ_API_RAW_STORE_OTHER_READS=off beside the
+   * raw-store vars. Accepted only with summaryFallback or analysis on; any other value is refused.
+   */
+  rawStoreOtherReads?: string;
 }
 
 export class RenderError extends Error {
@@ -265,13 +288,18 @@ function rawStoreVars(inputs: RenderInputs): Record<string, string> | undefined 
   if (fallback !== "off" && fallback !== "on") throw new RenderError('summary_fallback must be "off" or "on"');
   const analysis = (inputs.analysis ?? "").trim() || "off";
   if (analysis !== "off" && analysis !== "on" && analysis !== "disable") throw new RenderError('analysis must be "off", "on" or "disable"');
-  if (fallback !== "on" && analysis !== "on") return undefined;
+  const otherReads = inputs.rawStoreOtherReads ?? "";
+  if (otherReads !== "" && otherReads !== "off") throw new RenderError('RAW_STORE_OTHER_READS must be empty or "off"');
+  if (fallback !== "on" && analysis !== "on") {
+    if (otherReads !== "") throw new RenderError("RAW_STORE_OTHER_READS is set only with summary_fallback=on or analysis=on");
+    return undefined;
+  }
   const bucket = (inputs.rawS3Bucket ?? "").trim();
   if (!BUCKET.test(bucket)) throw new RenderError("summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET (the raw store bucket the pipeline writes)");
   const region = (inputs.rawS3Region ?? "").trim();
   if (!REGION.test(region)) throw new RenderError("summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION (e.g. us-east-1)");
   const [bucketVar, regionVar, prefixVar, orgVar] = RAW_STORE_VARS;
-  return { [bucketVar]: bucket, [regionVar]: region, [prefixVar]: TENANT_KEY_BASE, [orgVar]: "true" };
+  return { [bucketVar]: bucket, [regionVar]: region, [prefixVar]: TENANT_KEY_BASE, [orgVar]: "true", ...(otherReads ? { [RAW_STORE_OTHER_READS_VAR]: otherReads } : {}) };
 }
 
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
@@ -422,6 +450,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       analysis: process.env.ANALYSIS,
       rawS3Bucket: process.env.RAW_S3_BUCKET,
       rawS3Region: process.env.RAW_S3_REGION,
+      rawStoreOtherReads: process.env.RAW_STORE_OTHER_READS,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
@@ -438,6 +467,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     if ((process.env.ANALYSIS_HYPERDRIVE_ID ?? "").trim()) console.log(`deploy config: analysis admission binding ${ANALYSIS_ADMIT_BINDING} (Hyperdrive id from SESSION_READ_ANALYSIS_HYPERDRIVE_ID)`);
     const rawOn = [process.env.SUMMARY_FALLBACK, process.env.ANALYSIS].some((v) => (v ?? "").trim() === "on");
     if (rawOn) console.log(`deploy config: raw store ${RAW_STORE_VARS.join(", ")} (bucket and region from SESSION_READ_RAW_S3_* or SESSION_READ_INGEST_S3_*; summary_fallback or analysis is on)`);
+    if (rawOn && process.env.RAW_STORE_OTHER_READS === "off") console.log(`deploy config: ${RAW_STORE_OTHER_READS_VAR}=off (this render introduces the raw store, or keeps the live switch; timing, turns and metadata stay off)`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);

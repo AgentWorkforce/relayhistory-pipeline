@@ -10,7 +10,8 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { ANALYSIS_ADMIT_BINDING, CONTROL_HEAD_BINDING, parseCanaryWorkspaces, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
+import { ANALYSIS_ADMIT_BINDING, CONTROL_HEAD_BINDING, parseCanaryWorkspaces, RAW_STORE_OTHER_READS_VAR, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown; id?: unknown };
 type Version = { id?: unknown; resources?: { bindings?: Binding[] } };
@@ -78,6 +79,64 @@ export function unchangedAnalysisSettings(version: Version, env: Environment): v
       need(b.type === "hyperdrive" && typeof b.id === "string" && (env.ANALYSIS_HYPERDRIVE_ID ?? "").trim() === b.id, `This dispatch would change or drop live Hyperdrive binding ${ANALYSIS_ADMIT_BINDING}; keep SESSION_READ_ANALYSIS_HYPERDRIVE_ID, or choose analysis=disable to remove it`);
     }
   }
+}
+
+/** True when the dispatch renders the raw-store vars (render-deploy-config.ts rawStoreVars). */
+function rendersRawStore(env: Environment): boolean {
+  return env.SUMMARY_FALLBACK === "on" || env.ANALYSIS === "on";
+}
+
+/** The raw-store removal: analysis=disable without summary_fallback=on lets the dispatch drop the live raw-store vars. */
+function removesRawStore(env: Environment): boolean {
+  return env.ANALYSIS === "disable" && env.SUMMARY_FALLBACK !== "on";
+}
+
+/**
+ * RAW_STORE_OTHER_READS, the render input for READ_API_RAW_STORE_OTHER_READS (index.ts
+ * rawStoreOtherReadsEnabled), decided from the live version so that rendering or removing the
+ * raw store for the summary fallback or analysis never changes what timing, turns, metadata,
+ * owner-buffered turns, hosted canonical events, babysitter evidence or /v1/canonical/* answer:
+ *   - the dispatch renders the raw store and the live Worker has the switch: keep it (only "off"
+ *     is accepted; any other live value or a secret is refused);
+ *   - it renders the raw store, the live Worker has PIPELINE_RAW_S3_BUCKET and no switch: add no
+ *     switch (those reads were already served through the live raw store), and require all of
+ *     RAW_STORE_VARS live as plain text, so the render changes none of them;
+ *   - it renders the raw store and no raw store is live: "off" (this render introduces the raw
+ *     store, and the switch keeps those reads off);
+ *   - the raw-store removal (removesRawStore): refused while a live plain raw-store var exists
+ *     without a live switch "off" (those reads are served through the pre-existing raw store and
+ *     dropping it would silently turn them off), and refused while a live switch sits beside a
+ *     secret bucket (dropping the switch would turn them on); otherwise "" (the switch is dropped
+ *     with the vars);
+ *   - otherwise "": nothing rendered, and a live switch is compared like any other live setting.
+ * Returns "" or "off". Never turns those reads on; turning them on is a separate decision.
+ * resolveProfile carries a non-empty value as RAW_STORE_OTHER_READS and ignores the key in its input.
+ */
+export function rawStoreOtherReads(version: Version, env: Environment): string {
+  const bindings = version.resources?.bindings ?? [];
+  const sw = bindings.find((b) => b.name === RAW_STORE_OTHER_READS_VAR);
+  const bucket = bindings.find((b) => b.name === RAW_STORE_VARS[0]);
+  if (sw) need(sw.type === "plain_text" && sw.text === "off", `Live ${RAW_STORE_OTHER_READS_VAR} is not plain text "off"; explicit deployment review required`);
+  if (removesRawStore(env)) {
+    const livePlain = bindings.some((b) => (RAW_STORE_VARS as readonly unknown[]).includes(b.name) && b.type === "plain_text");
+    need(!livePlain || sw, `analysis=disable would drop the live raw-store vars that timing, turns and metadata read through (no live ${RAW_STORE_OTHER_READS_VAR}); keep summary_fallback=on or analysis=on, or remove them in a separate reviewed change`);
+    need(!sw || !bucket || bucket.type === "plain_text", `analysis=disable would drop live ${RAW_STORE_OTHER_READS_VAR} while ${RAW_STORE_VARS[0]} stays a secret, turning timing, turns and metadata on; explicit deployment review required`);
+    return "";
+  }
+  if (!rendersRawStore(env)) return "";
+  if (sw) return "off";
+  if (!bucket) return "off";
+  // The values this dispatch renders (render-deploy-config.ts rawStoreVars); compared here in every
+  // mode, since explicit owner_buffered=on/off skips the live-settings guard.
+  const rendered = [(env.RAW_S3_BUCKET ?? "").trim(), (env.RAW_S3_REGION ?? "").trim(), TENANT_KEY_BASE, "true"];
+  RAW_STORE_VARS.forEach((name, i) => {
+    const live = bindings.find((b) => b.name === name);
+    need(live?.type !== "secret_text", `The render refuses replacing secret binding ${name} with a plain variable`);
+    need(live?.type === "plain_text", `The live Worker has ${RAW_STORE_VARS[0]} without ${RAW_STORE_OTHER_READS_VAR} and without plain ${name}; rendering the raw store would change what timing, turns and metadata read; explicit deployment review required`);
+    // An empty bucket or region is left to the render's own refusal, which names the variables.
+    need(!rendered[i] || live.text === rendered[i], `This dispatch would change or drop live setting ${name}, which timing, turns and metadata read (no live ${RAW_STORE_OTHER_READS_VAR}); explicit deployment review required`);
+  });
+  return "";
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -180,7 +239,9 @@ export function unchangedOtherSettings(version: Version, template: string, env: 
   // The raw-store vars render while summary_fallback or analysis is on and are compared like any
   // other live setting, so a dispatch never silently drops or changes them. analysis=disable with
   // summary_fallback not on is the explicit removal of the last reader that needs them.
-  if (env.ANALYSIS === "disable" && env.SUMMARY_FALLBACK !== "on") for (const name of RAW_STORE_VARS) managed.add(name);
+  // The switch (READ_API_RAW_STORE_OTHER_READS) goes with them; rawStoreOtherReads refuses the
+  // removal whenever dropping either would change what timing, turns or metadata answer.
+  if (removesRawStore(env)) for (const name of [...RAW_STORE_VARS, RAW_STORE_OTHER_READS_VAR]) managed.add(name);
   for (const b of version.resources?.bindings ?? []) {
     need(typeof b.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name), "Invalid live binding name");
     const name = b.name;
@@ -239,11 +300,15 @@ export function profileInputs(env: Environment): RenderInputs {
     analysisHyperdriveId: env.ANALYSIS_HYPERDRIVE_ID,
     summaryFallback: env.SUMMARY_FALLBACK, analysis: env.ANALYSIS,
     rawS3Bucket: env.RAW_S3_BUCKET, rawS3Region: env.RAW_S3_REGION,
+    rawStoreOtherReads: env.RAW_STORE_OTHER_READS,
   };
 }
 
 /** Injected GET (and profile) for offline tests; production URL/account/script are fixed. */
-export async function resolveProfile(env: Environment, template: string, get: (path: string) => Promise<unknown>, committed?: CommittedProfile): Promise<Record<string, string>> {
+export async function resolveProfile(input: Environment, template: string, get: (path: string) => Promise<unknown>, committed?: CommittedProfile): Promise<Record<string, string>> {
+  // RAW_STORE_OTHER_READS is decided here from the live Worker (rawStoreOtherReads), never taken from the environment.
+  const env: Environment = { ...input, RAW_STORE_OTHER_READS: undefined };
+  const otherReadsKey = (value: string): Record<string, string> => (value ? { RAW_STORE_OTHER_READS: value } : {});
   const requested = env.OWNER_BUFFERED?.trim() || "profile";
   need(["profile", "preserve", "on", "off"].includes(requested), "owner_buffered must be profile, preserve, on or off");
   for (const key of Object.keys(SUMMARY_FLAGS)) {
@@ -267,7 +332,7 @@ export async function resolveProfile(env: Environment, template: string, get: (p
     need(!explicit.OWNER_BUFFERED_WORKSPACES, `${mode} cannot change the workspace allowlist`);
     const { id, version } = await readLive(get);
     const live = preservedProfile(version);
-    resolved = { ...live, ...(mode === "profile" ? committedOverLive(live, profile!) : {}), PRESERVED_READER_VERSION: id };
+    resolved = { ...live, ...(mode === "profile" ? committedOverLive(live, profile!) : {}), ...otherReadsKey(rawStoreOtherReads(version, env)), PRESERVED_READER_VERSION: id };
     const directory = requestedDirectory(env);
     need(directory === undefined || directory === resolved.DIRECTORY_WORKSPACES, "Directory input/environment differs from live; choose explicit owner_buffered=on/off to change the directory list");
     unchangedOtherSettings(version, template, { ...env, ...resolved });
@@ -281,6 +346,9 @@ export async function resolveProfile(env: Environment, template: string, get: (p
       // Break-glass: explicit owner_buffered=on/off with a directory and analysis=disable contacts
       // no live metadata at all (it works with the live Worker split, absent or unreadable). It
       // cannot compare live, so SESSION_READ_ANALYSIS_HYPERDRIVE_ID, if set, renders as given.
+      // Nor can it tell whether summary_fallback=on would introduce the raw store (and with it
+      // timing, turns and metadata reads), so that combination is refused.
+      need(!rendersRawStore(env), "summary_fallback=on needs the live raw-store check, which break-glass (explicit owner_buffered with a directory and analysis=disable) skips; dispatch without the directory input");
       resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
     } else {
       // Otherwise explicit mode renders its inputs without the profile/preserve comparison, but
@@ -289,9 +357,10 @@ export async function resolveProfile(env: Environment, template: string, get: (p
       // the version read here is not pinned (no PRESERVED_READER_VERSION).
       const { id, version } = await readLive(get);
       unchangedAnalysisSettings(version, env);
+      const otherReads = otherReadsKey(rawStoreOtherReads(version, env));
       if (directory === undefined) {
-        resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
-      } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
+        resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), ...otherReads, PRESERVED_READER_VERSION: id };
+      } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory, ...otherReads };
     }
   }
   // Use the same validation as the real render: no weaker second interpretation of privacy flags.
@@ -306,7 +375,7 @@ export async function checkPreservedVersion(env: Environment, get: (path: string
 }
 
 export function workflowEnvironment(resolved: Record<string, string>): string {
-  const allowed = new Set([...Object.keys(VARIABLES), ...Object.keys(FLAGS), "PRESERVED_READER_VERSION"]);
+  const allowed = new Set([...Object.keys(VARIABLES), ...Object.keys(FLAGS), "RAW_STORE_OTHER_READS", "PRESERVED_READER_VERSION"]);
   return Object.entries(resolved).map(([key, value]) => {
     need(allowed.has(key) && !/[\r\n\u0000]/.test(value), "Unsafe workflow environment value");
     return `${key}=${value}\n`;
