@@ -53,11 +53,14 @@ describe("services image 7d7229b: approved in versions.lock.json and the probe f
   const ECR = "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services";
   const DIGEST = "sha256:5bb6075240afa02a1b1797a81c07bffa029954eac7803d702ecba20db35d4db9";
   test("the entry parses with its provenance, and the earlier entries are kept", () => {
-    expect(approved.map((a) => a.sourceRevision)).toEqual(["ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2", "2fb88cdaca3ef42f5eea42050d43448c883ac5e4", "7d7229bb31c121ecb98cd4e35c248fc2cf5669ad"]);
+    expect(approved.map((a) => a.sourceRevision)).toEqual(["ffb7ef0f684a92c129bbf14c2da2066fbe6fe6b2", "2fb88cdaca3ef42f5eea42050d43448c883ac5e4", "7d7229bb31c121ecb98cd4e35c248fc2cf5669ad", "417dd3796e32f6bb20b3da5f29e542e6eec4c1b9"]);
     const e = approved.find((a) => a.digest === DIGEST)!;
     expect(e).toMatchObject({ repository: ECR, sourceRevision: "7d7229bb31c121ecb98cd4e35c248fc2cf5669ad", generation: "eff8b3be46565b57ad8fa5e4a066dbb6d1fe608313d9c1680bfbcd484add259b" });
     expect(e.ghcr).toEqual({ ref: "ghcr.io/agentworkforce/96bulls-services", digest: "sha256:6f22ea17dff336e1431664542759fd27958649388b90a0b2f0881883caa7c6b2", run: "41375745173" });
     for (const s of ["41375747474", "41375745173", "sha-7d7229bb31c121ecb98cd4e35c248fc2cf5669ad", "Khaliq 2026-11-01"]) expect(e.note).toContain(s);
+    const n = approved.find((a) => a.digest === "sha256:e33afd7dbf6bd2d82a83b1cd93662abb54b575c11d21820855f96afb5b75cde7")!;
+    expect(n).toMatchObject({ repository: ECR, sourceRevision: "417dd3796e32f6bb20b3da5f29e542e6eec4c1b9" });
+    for (const s of ["45090129858", "sha-417dd3796e32f6bb20b3da5f29e542e6eec4c1b9"]) expect(n.note).toContain(s);
     for (const a of approved) {
       expect(a.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(a.sourceRevision).toMatch(/^[0-9a-f]{40}$/);

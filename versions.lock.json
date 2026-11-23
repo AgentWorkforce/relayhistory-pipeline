@@ -78,6 +78,12 @@
             "run": "41375745173"
           },
           "note": "publish-image-ecr run 41375747474 from main 7d7229bb31c121ecb98cd4e35c248fc2cf5669ad (descends ab3ee7f; Supabase generation eff8b3be); OCI index read back from ECR by tag sha-7d7229bb31c121ecb98cd4e35c248fc2cf5669ad; same source also published to GHCR by run 41375745173 (digest above, reference only; AWS stages pull from ECR). Pippen-sandbox (aws-proof-sandbox) proof image. Publish approved by Khaliq 2026-11-01 (\"go on each, approved and pre approval\")."
+        },
+        {
+          "repository": "500268966557.dkr.ecr.us-west-2.amazonaws.com/96bulls-services",
+          "digest": "sha256:e33afd7dbf6bd2d82a83b1cd93662abb54b575c11d21820855f96afb5b75cde7",
+          "sourceRevision": "417dd3796e32f6bb20b3da5f29e542e6eec4c1b9",
+          "note": "publish-image-ecr run 45090129858 from main 417dd3796e32f6bb20b3da5f29e542e6eec4c1b9; ECR tag sha-417dd3796e32f6bb20b3da5f29e542e6eec4c1b9, pushed 2026-11-23 (UTC)"
         }
       ]
     },
