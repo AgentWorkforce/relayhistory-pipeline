@@ -207,6 +207,12 @@ export const ingestRecordsScope = (value: unknown) => idsAt(value, [], "records"
 export const deliveryBatchScope = (value: unknown) => idsAt(value, ["batch"], "records", "session_id");
 export const sessionSelectionScope = (value: unknown) => idsAt(value, [], "sessions", "session_id");
 
+/** The one session= value of a query, or null when there is not exactly one (empty string when it is given empty). */
+function singleSessionValue(query: URLSearchParams): string | null {
+  const values = query.getAll("session");
+  return values.length === 1 ? values[0]! : null;
+}
+
 const SESSION_READS = ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"];
 
 export const UPSTREAM_ASSERTION_ROUTES: Readonly<Record<UpstreamAssertionAudience, readonly RouteRule[]>> = Object.freeze({
@@ -214,8 +220,9 @@ export const UPSTREAM_ASSERTION_ROUTES: Readonly<Record<UpstreamAssertionAudienc
     ...["users", "activity", "output", "titles"].map((p) => rule("GET", `/v1/sessions/${p}`, "aggregate")),
     rule("GET", "/v1/sessions/summaries/activity", "aggregate"),
     ...SESSION_READS.map((p) => rule("GET", `/v1/sessions/:/${p}`, "read", { kind: "path", segment: 2 })),
-    rule("GET", "/v1/events", "read", { kind: "query_session" }, (q) => q.getAll("session").length === 1),
-    rule("GET", "/v1/events", "filter", NONE, (q) => q.has("q") && !q.has("session")),
+    rule("GET", "/v1/events", "read", { kind: "query_session" }, (q) => (singleSessionValue(q) ?? "") !== ""),
+    // The app treats an empty session= as absent: with q= it is the workspace search.
+    rule("GET", "/v1/events", "filter", NONE, (q) => q.has("q") && (!q.has("session") || singleSessionValue(q) === "")),
     rule("GET", "/v1/sessions", "filter"),
     rule("GET", "/v1/delivery/records", "aggregate"),
     rule("GET", "/v1/digest/**", "aggregate"),
@@ -255,11 +262,12 @@ export function upstreamAssertionBypass(method: string | undefined, target: stri
 
 /**
  * The single rule for a request that matches no table route but carries an assertion: every binding is verified
- * (signature, time, aud, method, path, credential, body) and the claimed scope must be empty; any access value is
- * accepted, and the service's own auth decides as before. Kept in one place so it can be made strict later.
+ * (signature, time, aud, method, path, credential, body), the access must be "passthrough" (else `access`) and the
+ * claimed scope must be empty (else `scope`); the service's own auth decides as before.
  */
-function unknownRouteAllows(claims: UpstreamAssertionClaims): boolean {
-  return scopeMatches(claims, []);
+function unknownRouteRefusal(claims: UpstreamAssertionClaims): UpstreamAssertionReason | null {
+  if (claims.access !== "passthrough") return "access";
+  return scopeMatches(claims, []) ? null : "scope";
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -405,7 +413,10 @@ export function verifyUpstreamAssertionPhase1(
   // 11. route table: access and the scope known before the body
   const query = new URLSearchParams(request.target.slice(pathname.length + 1));
   const route = matchRoute(audience, request.method, segments, query);
-  if (!route) return unknownRouteAllows(claims) ? { ok: true, pending: { claims, bodyScope: null } } : { ok: false, reason: "scope" };
+  if (!route) {
+    const refusal = unknownRouteRefusal(claims);
+    return refusal === null ? { ok: true, pending: { claims, bodyScope: null } } : { ok: false, reason: refusal };
+  }
   if (claims.access !== route.access) return { ok: false, reason: "access" };
   const scope = route.scope;
   if (scope.kind === "body") return { ok: true, pending: { claims, bodyScope: scope.extract } };

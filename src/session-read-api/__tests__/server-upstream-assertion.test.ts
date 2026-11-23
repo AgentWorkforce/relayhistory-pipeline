@@ -148,7 +148,7 @@ describe("enforce", () => {
       await get(url(EVENTS)),
       await get(url(EVENTS), sign(EVENTS, { sessions: ["other"] })),
       await get(url("/v1/unknown/thing")),
-      await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { sessions: [SESSION] })),
+      await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [SESSION] })),
       await get(url(EVENTS), sign(EVENTS), null),
     ]);
     expect(result.map((r) => r.status)).toEqual([401, 401, 401, 401, 401]);
@@ -158,14 +158,40 @@ describe("enforce", () => {
     expect(lines.every((l) => (JSON.parse(l) as { outcome: string }).outcome === "refused")).toBe(true);
     for (const line of lines) expect(line).not.toContain(SESSION);
   });
-  test("a valid assertion passes on a table route and on an unknown route (empty scope); a previous key works", async () => {
+  test("an unknown route refuses any access but passthrough", async () => {
+    const seen: Seen[] = [];
+    const url = await start(keyed("enforce"), recording(seen));
+    const { result, lines } = await capture(async () => [
+      await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "aggregate", sessions: [] })),
+      await fetch(url(EVENTS), { method: "HEAD", headers: { authorization: AUTH, "x-relaygate-assertion": sign(EVENTS, { method: "HEAD", access: "read", sessions: [] }) } }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([401, 401]);
+    expect(await code(result[0]!)).toBe("invalid_upstream_assertion");
+    expect(seen).toEqual([]);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["access", "access"]);
+  });
+  test("HEAD and GET on a table route without an assertion are the 401 missing_upstream_assertion; the app is not called", async () => {
+    const seen: Seen[] = [];
+    const url = await start(keyed("enforce"), recording(seen));
+    const { result, lines } = await capture(async () => [
+      await fetch(url(EVENTS), { method: "HEAD", headers: { authorization: AUTH } }),
+      await fetch(url(EVENTS), { method: "GET", headers: { authorization: AUTH } }),
+      await fetch(url("/v1/sessions"), { method: "HEAD", headers: { authorization: AUTH } }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([401, 401, 401]);
+    // A HEAD answer carries no body: its code is read from the log line; the GET's from the body.
+    expect(await code(result[1]!)).toBe("missing_upstream_assertion");
+    expect(seen).toEqual([]);
+    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string })).map((l) => [l.outcome, l.reason])).toEqual([["refused", "missing"], ["refused", "missing"], ["refused", "missing"]]);
+  });
+  test("a valid assertion passes on a table route and on an unknown route (passthrough, empty scope); a previous key works", async () => {
     const seen: Seen[] = [];
     const previous = testKey("read-k0");
     const url = await start({ ...keyed("enforce"), READ_API_UPSTREAM_ASSERTION_PUBLIC_KEY_PREVIOUS: previous.publicB64, READ_API_UPSTREAM_ASSERTION_KID_PREVIOUS: previous.kid }, recording(seen));
     const listing = "/v1/sessions?limit=5&workspace=ws-a";
     expect((await get(url(EVENTS), sign(EVENTS))).status).toBe(200);
     expect((await get(url(listing), sign(listing, { access: "filter", sessions: [] }))).status).toBe(200);
-    expect((await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "aggregate", sessions: [] }))).status).toBe(200);
+    expect((await get(url("/v1/unknown/thing"), sign("/v1/unknown/thing", { access: "passthrough", sessions: [] }))).status).toBe(200);
     expect((await get(url(EVENTS), sign(EVENTS, { key: previous }))).status).toBe(200);
     expect(seen.map((s) => s.path)).toEqual([EVENTS, "/v1/sessions", "/v1/unknown/thing", EVENTS]);
   });

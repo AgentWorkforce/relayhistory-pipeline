@@ -151,6 +151,11 @@ describe("phase 1: claims, time and bindings", () => {
     expect(reason(phase1(token, { authorization: undefined }))).toBe("credential");
     expect(reason(phase1(token, { authorization: "" }))).toBe("credential");
   });
+  test("a token bound to the empty credential (sha256 of \"\") is refused when the Authorization header is missing", () => {
+    const token = readToken({ authorization: "" });
+    expect(reason(phase1(token, { authorization: "" }))).toBe("ok");
+    expect(reason(phase1(token, { authorization: undefined }))).toBe("credential");
+  });
 });
 
 describe("phase 1: route table", () => {
@@ -184,16 +189,41 @@ describe("phase 1: route table", () => {
     expect(ok("/v1/sessions", "filter", ["s-1"])).toBe("scope");
     expect(ok("/v1/sessions/users", "aggregate", ["s-1"])).toBe("scope");
   });
-  test("GET /v1/events with two session= values or neither q nor session is an unknown route: any access, empty scope", () => {
-    expect(ok("/v1/events?session=a&session=b", "read", ["a", "b"])).toBe("scope");
-    expect(ok("/v1/events?session=a&session=b", "filter")).toBe("ok");
-    expect(ok("/v1/events?limit=3", "aggregate")).toBe("ok");
+  test("GET /v1/events with two session= values or neither q nor session is an unknown route: passthrough, empty scope", () => {
+    expect(ok("/v1/events?session=a&session=b", "read", ["a", "b"])).toBe("access");
+    expect(ok("/v1/events?session=a&session=b", "passthrough", ["a", "b"])).toBe("scope");
+    expect(ok("/v1/events?session=a&session=b", "filter")).toBe("access");
+    expect(ok("/v1/events?session=a&session=b", "passthrough")).toBe("ok");
+    expect(ok("/v1/events?limit=3", "aggregate")).toBe("access");
+    expect(ok("/v1/events?limit=3", "passthrough")).toBe("ok");
   });
-  test("unknown route: every access value is accepted with an empty scope; a non-empty claimed scope is refused", () => {
-    for (const access of ["read", "write", "filter", "aggregate", "passthrough"]) expect(ok("/v1/sessions/s-1/sources", access)).toBe("ok");
-    expect(ok("/v1/sessions/s-1/sources", "read", ["s-1"])).toBe("scope");
-    expect(ok("/v1/turns/batches", "write", [], "POST", "ingest-edge")).toBe("ok");
-    expect(ok("/v1/turns/batches", "write", ["s-1"], "POST", "ingest-edge")).toBe("scope");
+  test("GET /v1/events with an empty session= value is not a single-session read: with q= it is filter, without q= an unknown route", () => {
+    expect(ok("/v1/events?session=", "read", [""])).toBe("access");
+    expect(ok("/v1/events?session=", "read")).toBe("access");
+    expect(ok("/v1/events?session=", "passthrough", [""])).toBe("scope");
+    expect(ok("/v1/events?session=", "passthrough")).toBe("ok");
+    expect(ok("/v1/events?session=&q=hello", "read", [""])).toBe("access");
+    expect(ok("/v1/events?session=&q=hello", "filter", [""])).toBe("scope");
+    expect(ok("/v1/events?session=&q=hello", "filter")).toBe("ok");
+    expect(ok("/v1/events?q=hello&session=", "filter")).toBe("ok");
+    // A non-empty session= with q= stays a single-session read.
+    expect(ok("/v1/events?session=s-9&q=hello", "read", ["s-9"])).toBe("ok");
+    expect(ok("/v1/events?session=s-9&q=hello", "filter")).toBe("access");
+  });
+  test("unknown route: only passthrough with an empty scope is accepted; other access values are refused; a non-empty claimed scope is refused", () => {
+    for (const access of ["read", "write", "filter", "aggregate"]) {
+      expect(ok("/v1/sessions/s-1/sources", access)).toBe("access");
+      // HEAD on a session-scoped read path (the table serves GET only).
+      expect(ok("/v1/sessions/s-1/events", access, [], "HEAD")).toBe("access");
+      expect(ok("/v1/turns/batches", access, [], "POST", "ingest-edge")).toBe("access");
+    }
+    expect(ok("/v1/sessions/s-1/sources", "passthrough")).toBe("ok");
+    expect(ok("/v1/sessions/s-1/events", "passthrough", [], "HEAD")).toBe("ok");
+    expect(ok("/v1/turns/batches", "passthrough", [], "POST", "ingest-edge")).toBe("ok");
+    expect(ok("/v1/sessions/s-1/sources", "passthrough", ["s-1"])).toBe("scope");
+    expect(ok("/v1/sessions/s-1/events", "passthrough", ["s-1"], "HEAD")).toBe("scope");
+    expect(ok("/v1/turns/batches", "passthrough", ["s-1"], "POST", "ingest-edge")).toBe("scope");
+    expect(ok("/v1/sessions/s-1/sources", "read", ["s-1"])).toBe("access");
   });
   test("ingest classes: write by path, passthrough, body-scoped routes defer the scope to phase 2", () => {
     expect(ok("/v1/sessions/s-1/turns", "write", ["s-1"], "POST", "ingest-edge")).toBe("ok");
@@ -225,6 +255,8 @@ describe("phase 1: route table", () => {
     expect(upstreamAssertionBypass("OPTIONS", "/v1/sessions")).toBe(true);
     expect(upstreamAssertionBypass("GET", "/healthz/x")).toBe(false);
     expect(upstreamAssertionBypass("GET", "/v1/sessions")).toBe(false);
+    expect(upstreamAssertionBypass("HEAD", "/v1/sessions")).toBe(false);
+    expect(upstreamAssertionBypass("HEAD", "/v1/sessions/s-1/events")).toBe(false);
   });
 });
 

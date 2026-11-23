@@ -317,17 +317,24 @@ previous), signature, `iss`/`alg`/`v`, `aud` (`session-read-api` or
 not expired), method, `path` equal to the raw request target, the credential
 hash, then the route rule (access kind and, where the scope comes from the
 target, the session scope). After the bounded body read: the body hash, then,
-for routes whose scope is in the body (ingest batches, delivery batches,
-session selection), the scope derived from the parsed body. Targets with dot
-segments, `//`, `%2F`, `%5C` or a raw backslash in the path are refused; the
-query is not. The session scope is deduplicated, sorted, written as canonical
-JSON and hashed; the ids are inline only when there are at most 16 and the JSON
-is at most 2048 bytes. Unknown extra claims are ignored.
+for routes whose scope is in the body (delivery batches and session selection),
+the scope derived from the parsed body. Targets with dot segments, `//`, `%2F`,
+`%5C` or a raw backslash in the path are refused; the query is not. The
+assertion relies on the router rule above ("Do not rewrite paths"): any prefix
+strip, slash merging or other path normalisation at the proxy makes it fail
+with a `path` refusal. The session scope is deduplicated, sorted, written as
+canonical JSON and hashed; the ids are inline only when there are at most 16 and the JSON
+is at most 2048 bytes. Unknown extra claims are ignored. The payload size limit
+is not reached in practice: node's header size limit answers 431 first.
 
 Routes. Each service has a table of its routes with the access kind and scope
 source they require (`UPSTREAM_ASSERTION_ROUTES`). A route not in the table
-still needs a fully valid assertion, with an empty session scope and any access
-kind.
+still needs a fully valid assertion, with access kind `passthrough` (else
+`access`) and an empty session scope (else `scope`). This includes `HEAD` on a
+path the table lists for `GET`, a `GET /v1/events` with more than one
+`session=` value or with neither `session=` nor `q=`, and `POST
+/v1/turns/batches`. An empty `session=` value on `GET /v1/events` counts as
+absent, as in the app: with `q=` it is the `filter` route.
 
 - Bypass (no assertion read): `/healthz`, `/readyz` and `/health` (any method)
   and every `OPTIONS` request.
@@ -341,6 +348,13 @@ kind.
   `/internal/` ones included, needs the assertion like a route not in the table.
 - Known limit: private custody routes are not exempt, so a custody client that
   does not pass through the gateway is refused under `enforce`.
+- Unread bodies: a POST the read API answers without reading its body (for
+  example a route whose flag is off) has its body checked as zero bytes, so under
+  `enforce` a correctly signed POST with a body there is refused 401 (log reason
+  `body`) instead of the route's 404 or 501.
+- Routes the ingest edge answers itself (the token refresh stub, the
+  consent-only 403 and the heartbeat) do not read the body, so there is no body
+  check on them.
 
 Failure answers (`enforce`): 401 `missing_upstream_assertion` when the header is
 absent, 401 `invalid_upstream_assertion` for every other failure, both with a

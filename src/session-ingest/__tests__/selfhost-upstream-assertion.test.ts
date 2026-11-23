@@ -193,7 +193,7 @@ describe("enforce (wrapper, phase 1)", () => {
     const seen: Seen[] = [];
     const counts = { verify: 0 };
     const url = await start(keyed("enforce"), recording(seen, counts));
-    const tokens = [sign(BATCHES, { aud: "session-read-api" }), sign("/v1/unknown", { method: "GET", sessions: [SESSION], access: "read", body: "" })];
+    const tokens = [sign(BATCHES, { aud: "session-read-api" }), sign("/v1/unknown", { method: "GET", sessions: [SESSION], access: "passthrough", body: "" })];
     const { result, lines } = await capture(async () => [
       await send(url(BATCHES), { body: batchBody([SESSION]) }),
       await send(url(BATCHES), { body: batchBody([SESSION]), assertion: tokens[0] }),
@@ -228,10 +228,43 @@ describe("enforce (wrapper, phase 1)", () => {
     const limits = (key = KEY) => sign(LIMITS, { key, method: "GET", access: "passthrough", sessions: [], body: "" });
     const a = await send(url(BATCHES), { body: batchBody([SESSION]), assertion: sign(BATCHES) });
     const b = await send(url(LIMITS), { method: "GET", assertion: limits(OLD) });
-    const c = await send(url("/v1/unknown?x=1"), { method: "GET", assertion: sign("/v1/unknown?x=1", { method: "GET", access: "aggregate", sessions: [], body: "" }) });
+    const c = await send(url("/v1/unknown?x=1"), { method: "GET", assertion: sign("/v1/unknown?x=1", { method: "GET", access: "passthrough", sessions: [], body: "" }) });
     expect([a.status, b.status, c.status]).toEqual([200, 200, 501]);
     expect(seen.map((s) => s.path)).toEqual([BATCHES, LIMITS]);
     expect(counts.verify).toBe(2);
+  });
+
+  test("an unknown route refuses any access but passthrough, before introspection and the app", async () => {
+    const seen: Seen[] = [];
+    const counts = { verify: 0 };
+    const url = await start(keyed("enforce"), recording(seen, counts));
+    const turnsBatches = "/v1/turns/batches";
+    const body = JSON.stringify({ sessions: [SESSION] });
+    const { result, lines } = await capture(async () => [
+      await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "write", sessions: [], body }) }),
+      await send(url(turnsBatches), { body, assertion: sign(turnsBatches, { access: "aggregate", sessions: [], body }) }),
+    ]);
+    expect(await Promise.all(result.map(async (r) => [r.status, await code(r)]))).toEqual([[401, "invalid_upstream_assertion"], [401, "invalid_upstream_assertion"]]);
+    expect(seen).toEqual([]);
+    expect(counts.verify).toBe(0);
+    expect(lines.map((l) => (JSON.parse(l) as { reason: string }).reason)).toEqual(["access", "access"]);
+  });
+
+  test("HEAD and GET on a table route without an assertion are the 401 missing_upstream_assertion, before introspection and the app", async () => {
+    const seen: Seen[] = [];
+    const counts = { verify: 0 };
+    const url = await start(keyed("enforce"), recording(seen, counts));
+    const { result, lines } = await capture(async () => [
+      await send(url(LIMITS), { method: "HEAD" }),
+      await send(url(LIMITS), { method: "GET" }),
+      await send(url("/v1/delivery/admission"), { method: "HEAD" }),
+    ]);
+    expect(result.map((r) => r.status)).toEqual([401, 401, 401]);
+    // A HEAD answer carries no body: its reason is read from the log line; the GET's code from the body.
+    expect(await code(result[1]!)).toBe("missing_upstream_assertion");
+    expect(seen).toEqual([]);
+    expect(counts.verify).toBe(0);
+    expect(lines.map((l) => (JSON.parse(l) as { outcome: string; reason: string })).map((l) => [l.outcome, l.reason])).toEqual([["refused", "missing"], ["refused", "missing"], ["refused", "missing"]]);
   });
 
   test("bypass: the probes and OPTIONS never see assertion logic", async () => {
