@@ -41,7 +41,7 @@ import { errorFields, log } from "../shared/log.ts";
 import { awsJsonCall, invokeAsync, lambdaCredentials, type AwsSessionCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
-import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
+import { droppedFanout, scopeLockKey, type PointerDeps, type ScopeLock } from "./pointer.ts";
 import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "./search-index.ts";
 import { RECONCILE_BODY_KEY, requeueBody } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
@@ -85,6 +85,12 @@ export interface LambdaEnv {
    * Absent: as before.
    */
   searchSkipAcceptanceMissing?: true;
+  /**
+   * SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true (default off): the pointer stage ignores
+   * h=_none/s=_origin keys before any lookup (pointer.ts). A pointer-stage flag: it does not
+   * need SEARCH_INDEX_ENABLED. Absent: as before.
+   */
+  pointerSkipOriginBucketEnabled?: true;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -114,6 +120,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED must be true or false");
   if (searchSkipAcceptanceMissing && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_SKIP_ACCEPTANCE_MISSING_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
+  // SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED: strict grammar, default off, no SEARCH_INDEX_ENABLED coupling.
+  const pointerSkipOriginBucket = pointerSkipOriginBucketFromEnv(env);
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -127,7 +135,25 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     ...(searchStreamCh ? { searchStreamCh: true as const } : {}),
     ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
     ...(searchSkipAcceptanceMissing ? { searchSkipAcceptanceMissing: true as const } : {}),
+    ...(pointerSkipOriginBucket ? { pointerSkipOriginBucketEnabled: true as const } : {}),
   };
+}
+
+/**
+ * SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED for the hosted Lambda: unset, "" and "false" are off; "true" is on;
+ * anything else fails init naming the variable, never the value.
+ */
+export function pointerSkipOriginBucketFromEnv(env: Record<string, string | undefined>): boolean {
+  const value = env.SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED;
+  if (value === undefined || value === "" || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error("session pipeline: SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED must be true or false");
+}
+
+/** The pointer deps' flag fields from the parsed env: empty when off, so the deps object is as before. */
+export function pointerFlagDeps(env: Pick<LambdaEnv, "pointerSkipOriginBucketEnabled">): Pick<PointerDeps, "skipOriginBucket"> {
+  // Default off; on, a sessionless per-origin bucket key (h=_none/s=_origin) is ignored before any lookup.
+  return env.pointerSkipOriginBucketEnabled ? { skipOriginBucket: true as const } : {};
 }
 
 /** Parse and check the secret's shape. Never echoes a value. */
@@ -285,6 +311,8 @@ async function init(): Promise<Runtime> {
       orgs: prefixOrgResolver,
       allowPrefix: (prefix, orgId) => prefixAllowed(bindings, prefix, orgId),
       fanout,
+      // Default off (SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true).
+      ...pointerFlagDeps(env),
     },
     requeue: sqsRequeue(env),
   };

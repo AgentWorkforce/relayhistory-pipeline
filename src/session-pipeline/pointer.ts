@@ -39,6 +39,14 @@ import type { HoopDb } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { hoopDbSessionIndex } from "../hoopdb/index.ts";
 
+/**
+ * The ingest writer's spelling of the sessionless per-origin bucket: records without a session id
+ * land under `h=_none` / `s=_origin`. This lineage has no ingest writer module, so the two values are
+ * defined here; `__tests__/pointer-skip-origin.test.ts` pins the spelling.
+ */
+export const NO_SESSION_HARNESS = "_none";
+export const NO_SESSION_ID = "_origin";
+
 export interface SessionScope {
   orgId: string;
   workspaceId: string;
@@ -74,6 +82,12 @@ export interface PointerDeps {
   /** Where the index's fan-out (summary-short, summary-long, status-classify) goes. */
   fanout: PipelineQueue;
   now?: () => Date;
+  /**
+   * SESSION_POINTER_SKIP_ORIGIN_BUCKET_ENABLED=true only: a manifest key of the sessionless per-origin
+   * bucket (h=_none/s=_origin, NO_SESSION_HARNESS / NO_SESSION_ID) is ignored before any lookup.
+   * Absent: such a key is indexed as a session, as before.
+   */
+  skipOriginBucket?: boolean;
 }
 
 /** A fan-out queue that drops messages: no summary or state consumer runs in production yet. */
@@ -86,6 +100,12 @@ export const droppedFanout: PipelineQueue = {
 export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Promise<PointerOutcome> {
   const location = parseSessionKey(landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
+  // Flagged (default off): the sessionless per-origin bucket is an archival carrier, not a session.
+  // Put and delete events alike are ignored here, before any object-store, org, lock or database
+  // call, so this writes no pointer row and also leaves existing `_none/_origin` rows as they are
+  // (their deletes are ignored too).
+  if (deps.skipOriginBucket && location.harness === NO_SESSION_HARNESS && location.sessionId === NO_SESSION_ID)
+    return { status: "ignored", reason: "no_session_origin" };
   if (location.rest !== "manifest.json") return { status: "ignored", reason: "not_a_manifest" };
   if (landed.bucket && deps.reader.bucket && landed.bucket !== deps.reader.bucket)
     return { status: "ignored", reason: "other_bucket" };
