@@ -24,10 +24,19 @@
  *             matching open window in the same transaction (none is required).
  *             Both rebind modes take from/to only from the reviewed pair and print counts and flags only.
  *
+ * open, rebind-dry-run and rebind also require the tracked production profile at the checked-out sha
+ * (config/cloudflare/private-ingest-production.json, the file the private-ingest deploy renders) to carry
+ * sessionIngest.overlapGeneration equal to the pair's `to`; otherwise they refuse
+ * overlap_operator_profile_not_accepting. A sha that keeps the pair but drops overlapGeneration (the
+ * pre-built G+H -> G rollback) deploys a G-only Worker, so opening a window to H or rebinding to H there
+ * would strand G uploads. An unreadable or malformed profile refuses the same way. readback and close
+ * never read the profile.
+ *
  * Every other check (owner-only, TTL bound, append-only, no downgrade) stays in SQL. The rebind
  * (ingest-generation-rebind.ts) still closes the window in its own transaction.
  */
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { MigrationClient } from "./migrate.ts";
 import { ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE } from "../shared/db.ts";
 import {
@@ -40,6 +49,7 @@ import {
   overlapInstalled,
 } from "./ingest-generation-overlap.ts";
 import { rebindIngestGeneration, type RebindResult } from "./ingest-generation-rebind.ts";
+import { PRIVATE_INGEST_PROFILE_FILE, parseReleaseProfileOverlap, type ReleaseProfileOverlap } from "./schema-release-overlap.ts";
 import {
   PRIVATE_INGEST_GENERATION_CONTRACT,
   type PrivateIngestGenerationContract,
@@ -77,10 +87,29 @@ export function overlapOperatorConfirmation(
   return "";
 }
 
-/** Validate the dispatch inputs against the reviewed pair before any credential is used. */
+/**
+ * The checked-out tree's tracked profile overlapGeneration (the same tree the contract constant is imported
+ * from): a 64-hex string, null when absent, undefined when unreadable or malformed. Never throws.
+ */
+export function trackedProfileOverlap(path: string = PRIVATE_INGEST_PROFILE_FILE): ReleaseProfileOverlap {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  return parseReleaseProfileOverlap(text);
+}
+
+/**
+ * Validate the dispatch inputs against the reviewed pair before any credential is used. `profileOverlap` is
+ * the tracked profile's overlapGeneration (read from the checked-out tree unless injected); open and both
+ * rebind modes require it to equal the pair's `to`.
+ */
 export function overlapOperatorInputs(
   env: Record<string, string | undefined>,
   contract: PrivateIngestGenerationContract = PRIVATE_INGEST_GENERATION_CONTRACT,
+  profileOverlap: unknown = trackedProfileOverlap(),
 ): OverlapOperatorInput {
   const mode = env.OVERLAP_MODE as OverlapOperatorMode, sha = env.OVERLAP_SHA ?? "", ttl = env.OVERLAP_TTL_SECONDS ?? "",
     confirmation = env.OVERLAP_CONFIRMATION ?? "", dryRun = env.OVERLAP_DRY_RUN_ID ?? "";
@@ -100,6 +129,9 @@ export function overlapOperatorInputs(
   } else if (ttl !== "") refuse("overlap_operator_ttl");
   // The rebind is offered only in the step-1 state (contract still bound to G, Worker accepting {G, H}).
   if (isRebindMode(mode) && contract.generation !== pair.from) refuse("overlap_operator_stale");
+  // The Worker this sha deploys accepts H only when the tracked profile carries overlapGeneration H.
+  if ((mode === "open" || isRebindMode(mode)) && (typeof profileOverlap !== "string" || profileOverlap !== pair.to))
+    refuse("overlap_operator_profile_not_accepting");
   if (mode === "rebind" ? !/^[1-9][0-9]{0,19}$/u.test(dryRun) : dryRun !== "")
     refuse("overlap_operator_dry_run_id");
   if (confirmation !== overlapOperatorConfirmation(mode, pair.from, pair.to, sha, ttl, dryRun))

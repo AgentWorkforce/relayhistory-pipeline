@@ -25,6 +25,7 @@ import {
 import { privateIngestGithubGate, trackedOverlapGeneration } from "../../../scripts/private-ingest-release-github.ts";
 import { overlapGithubGate, OVERLAP_RECEIPT_ARTIFACT, OVERLAP_WORKFLOW, REBIND_DRY_RUN_MAX_AGE_MS } from "../../../scripts/ingest-generation-overlap-github.ts";
 import { acceptGenerationsDeletionAllowed } from "../../../scripts/private-ingest-operator.ts";
+import { overlapOperatorInputs, trackedProfileOverlap } from "../../../src/hoopdb/ingest-generation-overlap-operator.ts";
 import { SCHEMA_RELEASE } from "../../../src/hoopdb/schema-release-contract.ts";
 import type { CloudflareStageInputs } from "../alchemy.cloudflare.run.ts";
 
@@ -359,7 +360,7 @@ test("overlap window GitHub gate: dormant refuses, exact pair/confirmation/TTL, 
   const openEnv = env("open", "3600", `OPEN-OVERLAP ${G} ${H} TTL 3600 SHA ${sha}`);
   const fresh = () => githubFixture(OVERLAP_WORKFLOW, SCHEMA_RELEASE.environment);
   await expect(overlapGithubGate(openEnv, githubGet(fresh()), true, DORMANT)).rejects.toThrow("overlap_operator_dormant");
-  expect(await overlapGithubGate(openEnv, githubGet(fresh()), true, atG)).toMatchObject({ mode: "open", from: G, to: H, ttlSeconds: 3600 });
+  expect(await overlapGithubGate(openEnv, githubGet(fresh()), true, atG, undefined, H)).toMatchObject({ mode: "open", from: G, to: H, ttlSeconds: 3600 });
   expect(await overlapGithubGate(env("readback"), githubGet(fresh()), true, atH)).toMatchObject({ mode: "readback", approvalSha256: null });
   expect(await overlapGithubGate(env("close", "", `CLOSE-OVERLAP ${G} ${H} SHA ${sha}`), githubGet(fresh()), true, atH))
     .toMatchObject({ mode: "close" });
@@ -386,7 +387,7 @@ test("overlap window GitHub gate: dormant refuses, exact pair/confirmation/TTL, 
   for (const [input, mutate, expected] of failures) {
     const f = fresh();
     mutate(f);
-    await expect(overlapGithubGate(input, githubGet(f), true, atG)).rejects.toThrow(expected);
+    await expect(overlapGithubGate(input, githubGet(f), true, atG, undefined, H)).rejects.toThrow(expected);
   }
   // Opening after the contract moved to H is stale.
   await expect(overlapGithubGate(openEnv, githubGet(fresh()), true, atH)).rejects.toThrow("overlap_operator_stale");
@@ -400,9 +401,9 @@ test("rebind GitHub gate: exact confirmations, step-1 contract only, and DRY bou
   const dryEnv = env("rebind-dry-run", `REBIND-DRY-RUN ${G} ${H} SHA ${sha}`);
   const rebindEnv = env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`, dryRunId);
   const fresh = () => githubFixture(OVERLAP_WORKFLOW, SCHEMA_RELEASE.environment);
-  expect(await overlapGithubGate(dryEnv, githubGet(fresh()), true, atG))
+  expect(await overlapGithubGate(dryEnv, githubGet(fresh()), true, atG, undefined, H))
     .toMatchObject({ mode: "rebind-dry-run", from: G, to: H, ttlSeconds: null, dryRunId: null });
-  const ok = await overlapGithubGate(rebindEnv, githubGet(fresh()), true, atG);
+  const ok = await overlapGithubGate(rebindEnv, githubGet(fresh()), true, atG, undefined, H);
   expect(ok).toMatchObject({ mode: "rebind", from: G, to: H, dryRunId });
   expect(ok.approvalSha256).toBe(sha256(`REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`));
   // Dormant and stale contracts refuse before any GitHub read.
@@ -462,12 +463,12 @@ test("rebind GitHub gate: exact confirmations, step-1 contract only, and DRY bou
   for (const [input, mutate, expected] of failures) {
     const f = fresh();
     mutate(f);
-    await expect(overlapGithubGate(input, githubGet(f), true, atG, now)).rejects.toThrow(expected);
+    await expect(overlapGithubGate(input, githubGet(f), true, atG, now, H)).rejects.toThrow(expected);
   }
   // rebind-dry-run itself never reads another run.
   const f = fresh();
   const seen: string[] = [];
-  await overlapGithubGate(dryEnv, (path) => { seen.push(path); return githubGet(f)(path); }, true, atG);
+  await overlapGithubGate(dryEnv, (path) => { seen.push(path); return githubGet(f)(path); }, true, atG, undefined, H);
   expect(seen.some((path) => path.includes(`/runs/${dryRunId}`))).toBe(false);
 });
 
@@ -654,4 +655,53 @@ test("the deploy confirmation for step-0-shadow-overlap is the base confirmation
   // REVIEWED_CUSTODY_SHADOW_MATCH is null at this revision, so no SHADOW form is accepted at all.
   for (const bad of [`${base} SHADOW ${"a".repeat(64)} OVERLAP ${H}`, `${base} OVERLAP ${H} SHADOW ${"a".repeat(64)}`, base])
     expect(code(() => privateIngestReleaseInputs(deploy(bad), H))).toBe("private_ingest_release_confirmation");
+});
+
+test("062220 rollback tree: open and both rebind modes refuse overlap_operator_profile_not_accepting with the real pair and profile; readback and close unchanged", async () => {
+  // The real contract (pair {G, H}, still bound to G) and the real tracked profile (no overlapGeneration).
+  const pair = PRIVATE_INGEST_OVERLAP!;
+  expect(pair).not.toBeNull();
+  expect(PRIVATE_INGEST_GENERATION_CONTRACT).toEqual({ generation: pair.from, overlap: pair });
+  const { from: realG, to: realH } = pair;
+  expect(trackedProfileOverlap()).toBeNull();
+  const envOf = (mode: string, confirmation: string, ttl = "", dry = "") => ({
+    ...context, OVERLAP_MODE: mode, OVERLAP_SHA: sha, OVERLAP_TTL_SECONDS: ttl, OVERLAP_CONFIRMATION: confirmation,
+    OVERLAP_DRY_RUN_ID: dry,
+  });
+  const guarded = [
+    envOf("open", `OPEN-OVERLAP ${realG} ${realH} TTL 3600 SHA ${sha}`, "3600"),
+    envOf("rebind-dry-run", `REBIND-DRY-RUN ${realG} ${realH} SHA ${sha}`),
+    envOf("rebind", `REBIND ${realG} ${realH} SHA ${sha} DRY ${dryRunId}`, "", dryRunId),
+  ];
+  const readback = envOf("readback", ""), close = envOf("close", `CLOSE-OVERLAP ${realG} ${realH} SHA ${sha}`);
+  const other = realH === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64);
+  for (const e of guarded) {
+    // Default arguments: the imported contract and the checked-out profile.
+    expect(code(() => overlapOperatorInputs(e))).toBe("overlap_operator_profile_not_accepting");
+    // Absent, unreadable/malformed or a different generation refuse the same way.
+    for (const injected of [null, realG, other, "x", 42, realH.toUpperCase()])
+      expect(code(() => overlapOperatorInputs(e, PRIVATE_INGEST_GENERATION_CONTRACT, injected)))
+        .toBe("overlap_operator_profile_not_accepting");
+    // Positive control (S1's shape, injected without changing any tree): profile H passes unchanged.
+    expect(overlapOperatorInputs(e, PRIVATE_INGEST_GENERATION_CONTRACT, realH)).toMatchObject({
+      mode: e.OVERLAP_MODE, sha, from: realG, to: realH, approvalSha256: sha256(e.OVERLAP_CONFIRMATION),
+    });
+    // The GitHub gate refuses before any GitHub read.
+    const never = async (path: string) => { throw new Error("unexpected " + path); };
+    await expect(overlapGithubGate(e, never, true)).rejects.toThrow("overlap_operator_profile_not_accepting");
+    await expect(overlapGithubGate(e, never, true, undefined, undefined, null)).rejects.toThrow("overlap_operator_profile_not_accepting");
+  }
+  // readback and close never read the profile: accepted with the real profile and with any injection.
+  for (const injected of [undefined, null, "x", realH]) {
+    expect(overlapOperatorInputs(readback, PRIVATE_INGEST_GENERATION_CONTRACT, injected)).toMatchObject({
+      mode: "readback", from: realG, to: realH, approvalSha256: null });
+    expect(overlapOperatorInputs(close, PRIVATE_INGEST_GENERATION_CONTRACT, injected)).toMatchObject({
+      mode: "close", from: realG, to: realH, approvalSha256: sha256(close.OVERLAP_CONFIRMATION) });
+  }
+  const fresh = () => githubFixture(OVERLAP_WORKFLOW, SCHEMA_RELEASE.environment);
+  expect(await overlapGithubGate(readback, githubGet(fresh()), true)).toMatchObject({ mode: "readback" });
+  expect(await overlapGithubGate(close, githubGet(fresh()), true)).toMatchObject({ mode: "close" });
+  // The reader fails closed: a missing or malformed file is unreadable (undefined), never "absent".
+  expect(trackedProfileOverlap("config/cloudflare/does-not-exist.json")).toBeUndefined();
+  expect(trackedProfileOverlap("package.json")).toBeUndefined();
 });

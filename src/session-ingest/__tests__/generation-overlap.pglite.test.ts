@@ -93,13 +93,13 @@ test("post-apply recovery (marker already at H, no window): both single Workers 
  const contract={generation:A,overlap:{from:A,to:B}};
  const sha="1".repeat(40);
  const dry=await runRebindOperator(f.client,overlapOperatorInputs({OVERLAP_MODE:"rebind-dry-run",OVERLAP_SHA:sha,
-  OVERLAP_CONFIRMATION:`REBIND-DRY-RUN ${A} ${B} SHA ${sha}`},contract));
+  OVERLAP_CONFIRMATION:`REBIND-DRY-RUN ${A} ${B} SHA ${sha}`},contract,B));
  expect(dry).toMatchObject({status:"INGEST_REBIND_DRY_RUN_PASS",policyGeneration:A,
   rebind:{policy:"rebound",admissionsRebound:1,admissionsTotal:1,dryRun:true,overlapClosed:false}});
  expect(await state()).toEqual(before);
  expect((await f.refused(f.worker(A,[A,B]))).code).toBe("ledger_sqlstate_55000");
  const real=await runRebindOperator(f.client,overlapOperatorInputs({OVERLAP_MODE:"rebind",OVERLAP_SHA:sha,OVERLAP_DRY_RUN_ID:"95",
-  OVERLAP_CONFIRMATION:`REBIND ${A} ${B} SHA ${sha} DRY 95`},contract));
+  OVERLAP_CONFIRMATION:`REBIND ${A} ${B} SHA ${sha} DRY 95`},contract,B));
  expect(real).toMatchObject({status:"INGEST_REBIND_COMMITTED",policyGeneration:B,marker:{generation:B,status:"pass"},
   rebind:{policy:"rebound",admissionsRebound:1,admissionsTotal:1,dryRun:false,overlapClosed:false}});
  expect(await state()).toEqual({policy:B,admissions:[{g:B,n:1}],attemptsAtB:0});

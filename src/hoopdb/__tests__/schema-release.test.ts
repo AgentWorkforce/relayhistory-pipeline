@@ -2082,7 +2082,12 @@ test("overlap gate: pure verdict over policy, marker, window and contract", asyn
   const w = { from: G, to: H, admitDuringApply: false, expiresAt: "2026-01-01T00:00:00.000Z", expired: false, remainingSeconds: 3600 };
   const state = { policyGeneration: G, marker: { generation: G, status: "pass" }, overlapInstalled: true, window: w };
   const v = (s: Partial<typeof state> & Record<string, unknown> = {}, ...c: [unknown?]) =>
-    ingestOverlapVerdict({ ...state, ...s } as any, { targetGeneration: H, contract: (c.length ? c[0] : { from: G, to: H }) as any });
+    ingestOverlapVerdict({ ...state, ...s } as any, {
+      targetGeneration: H,
+      contract: (c.length ? c[0] : { from: G, to: H }) as any,
+      // The step-1 tree shape: the tracked profile carries overlapGeneration equal to the pair's `to`.
+      profileOverlap: ((c.length ? c[0] : { from: G, to: H }) as any)?.to ?? null,
+    });
   expect(v().gate).toBe("overlap_ready");
   expect(v({ policyGeneration: null as any, window: null as any }, null).gate).toBe("no_lazy_policy");
   expect(v({ marker: { generation: H, status: "pass" }, window: null as any }, null).gate).toBe("no_generation_move");
@@ -2110,6 +2115,77 @@ test("overlap gate: pure verdict over policy, marker, window and contract", asyn
   expect(lines).toHaveLength(1);
 });
 
+test("overlap gate: the profile parser reads sessionIngest.overlapGeneration as data and fails closed", async () => {
+  const { parseReleaseProfileOverlap, releaseProfileOverlap, PRIVATE_INGEST_PROFILE_FILE } = await import("../schema-release-overlap.ts");
+  const H = "5c".repeat(32);
+  expect(parseReleaseProfileOverlap(JSON.stringify({ sessionIngest: { overlapGeneration: H } }))).toBe(H);
+  expect(parseReleaseProfileOverlap(JSON.stringify({ sessionIngest: {} }))).toBeNull();
+  for (const bad of [
+    "", "{", "null", "[]", "42", JSON.stringify({}), JSON.stringify({ sessionIngest: null }),
+    JSON.stringify({ sessionIngest: [] }), JSON.stringify({ sessionIngest: { overlapGeneration: null } }),
+    JSON.stringify({ sessionIngest: { overlapGeneration: H.toUpperCase() } }),
+    JSON.stringify({ sessionIngest: { overlapGeneration: H.slice(1) } }),
+    JSON.stringify({ sessionIngest: { overlapGeneration: 42 } }),
+  ])
+    expect(parseReleaseProfileOverlap(bad)).toBeUndefined();
+  // From the Git object database at a commit (HEAD here), never the working tree.
+  const repo = new URL("../../../", import.meta.url).pathname;
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+  const committed = execFileSync("git", ["cat-file", "blob", `${head}:${PRIVATE_INGEST_PROFILE_FILE}`], { cwd: repo, encoding: "utf8" });
+  expect(releaseProfileOverlap(repo, head)).toBe(parseReleaseProfileOverlap(committed));
+  expect(releaseProfileOverlap(repo, "0".repeat(40))).toBeUndefined();
+  expect(releaseProfileOverlap(repo, "HEAD")).toBeUndefined();
+});
+
+test("overlap gate at the 062220 rollback tree: real pair, real profile without overlapGeneration, never overlap_ready", async () => {
+  const { ingestOverlapVerdict, parseReleaseProfileOverlap, parseReleaseOverlapContract, requireIngestOverlap,
+    PRIVATE_INGEST_PROFILE_FILE, PRIVATE_INGEST_RELEASE_MODULE } = await import("../schema-release-overlap.ts");
+  const { PRIVATE_INGEST_OVERLAP } = await import("../../session-ingest/private-ingest-release.ts");
+  const root = new URL("../../../", import.meta.url);
+  const pair = parseReleaseOverlapContract(readFileSync(new URL(PRIVATE_INGEST_RELEASE_MODULE, root), "utf8"));
+  const profile = parseReleaseProfileOverlap(readFileSync(new URL(PRIVATE_INGEST_PROFILE_FILE, root), "utf8"));
+  // This tree: the reviewed pair {G, H} is kept and the tracked profile omits overlapGeneration.
+  expect(pair).toEqual(PRIVATE_INGEST_OVERLAP);
+  expect(pair).not.toBeNull();
+  expect(profile).toBeNull();
+  const { from: G, to: H } = pair!;
+  // A perfect step-1 state (policy and marker at G, a fresh window G -> H): only the profile refuses.
+  const w = { from: G, to: H, admitDuringApply: false, expiresAt: "2026-01-01T00:00:00.000Z", expired: false, remainingSeconds: 3600 };
+  const state = { policyGeneration: G, marker: { generation: G, status: "pass" }, overlapInstalled: true, window: w };
+  const at = (profileOverlap: unknown, s: Record<string, unknown> = {}) =>
+    ingestOverlapVerdict({ ...state, ...s } as any, { targetGeneration: H, contract: pair, profileOverlap: profileOverlap as any });
+  const real = at(profile);
+  expect(real.gate).toBe("refused");
+  expect(real.reasons).toEqual(["contract_profile_not_accepting"]);
+  expect(real.contract).toEqual({ state: "pair", from: G, to: H, match: true, profile: "absent",
+    profileOverlapGeneration: null, profileAccepting: false });
+  // Unreadable/malformed or a different generation refuse the same way; never overlap_ready.
+  for (const other of [undefined, G, "f".repeat(64) === H ? "e".repeat(64) : "f".repeat(64), "x", 42])
+    expect(at(other).reasons).toEqual(["contract_profile_not_accepting"]);
+  expect(at(undefined).contract.profile).toBe("unreadable");
+  expect(at(G).contract).toMatchObject({ profile: "declared", profileOverlapGeneration: G, profileAccepting: false });
+  // Other refusals keep their reasons alongside it.
+  expect(at(profile, { window: null }).reasons).toEqual(["no_window", "contract_profile_not_accepting"]);
+  // The short-circuits that precede the reasons are unchanged (step 6 and no-move releases).
+  expect(at(profile, { policyGeneration: H, window: null }).gate).toBe("policy_at_target");
+  expect(at(profile, { marker: { generation: H, status: "pass" }, window: null }).gate).toBe("no_generation_move");
+  // plan/apply refuse release_ingest_overlap_required with the new reason on the log line.
+  const lines: string[] = [];
+  let code: unknown;
+  try {
+    requireIngestOverlap(real, (l) => lines.push(l));
+  } catch (e) {
+    code = (e as { code?: string }).code;
+  }
+  expect(code).toBe("release_ingest_overlap_required");
+  expect(lines).toEqual(["release_ingest_overlap_required contract_profile_not_accepting"]);
+  // Positive control (S1's shape, injected without changing any tree): profile H gives overlap_ready.
+  const control = at(H);
+  expect(control.gate).toBe("overlap_ready");
+  expect(control.reasons).toEqual([]);
+  expect(control.contract).toMatchObject({ profile: "declared", profileOverlapGeneration: H, profileAccepting: true });
+});
+
 test("overlap gate: plan records it before writing the artifact, apply fails fast before the migrator and rechecks under the lock before the first write", () => {
   const src = readFileSync(new URL("../../../scripts/schema-release-database.ts", import.meta.url), "utf8");
   const plan = src.slice(src.indexOf('if (input.mode === "plan") {'), src.indexOf("release_readonly_plan_complete"));
@@ -2125,6 +2201,9 @@ test("overlap gate: plan records it before writing the artifact, apply fails fas
   expect(bw.indexOf("await checkIngestOverlap(client, {")).toBeGreaterThan(bw.indexOf("await requireBootstrapRolesLive(client, input.target, fresh);"));
   expect(bw.indexOf("await checkIngestOverlap(client, {")).toBeLessThan(bw.indexOf("await refreshReleaseBoundary("));
   expect(bw).toMatch(/checkIngestOverlap\(client, \{\n\s+targetGeneration: approvedPlan!\.targetGeneration,\n\s+contract: releaseOverlapContract\(process\.cwd\(\), input\.sha\),/);
+  // Every gate site also reads the same sha's tracked profile from the Git object database.
+  for (const site of [plan, apply.slice(failFast), bw])
+    expect(site).toMatch(/contract: releaseOverlapContract\(process\.cwd\(\), input\.sha\),\n\s+profileOverlap: releaseProfileOverlap\(process\.cwd\(\), input\.sha\),/);
   // The gate never imports or executes the Worker release module.
   const gate = readFileSync(new URL("../schema-release-overlap.ts", import.meta.url), "utf8");
   expect(gate).not.toMatch(/from ["'][^"']*private-ingest-release/);
@@ -2132,6 +2211,7 @@ test("overlap gate: plan records it before writing the artifact, apply fails fas
   // The operator plan-only entry records the same section.
   const op = readFileSync(new URL("../../../scripts/schema-release-operator-plan.ts", import.meta.url), "utf8");
   expect(op).toContain("const ingestOverlap = await inspectIngestOverlap(client, {");
+  expect(op).toContain("profileOverlap: releaseProfileOverlap(process.cwd(), input.sha),");
 });
 
 // ---- Post-apply buffered-ingest check (src/hoopdb/schema-release-post-apply-ingest.ts). The classifier and the

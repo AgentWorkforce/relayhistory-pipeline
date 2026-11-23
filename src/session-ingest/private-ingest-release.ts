@@ -168,9 +168,13 @@ const COMMON_PROFILE = {
  * window opens (runbooks/guarded-session-schema-release.md "Buffered ingest: required order").
  * G = 3eef01d7... is the live policy/expected generation; H = 778af686... is the release
  * targetGeneration (`bun src/hoopdb/migrate.ts --generation` at b3594f11, last step 20261105062220).
- * The tracked profile carries overlapGeneration H and expectedGeneration stays G; deploy G+H, then
- * open the window, apply, rebind G -> H. The pair returns to null after the H-only deploy reads back
- * exactly H.
+ * Pre-built rollback of that step (G+H -> G, docs/design/zero-503-schema-windows.md section 3.2): the
+ * pair stays exactly {G, H} so the live accept set "G,H" is recognised and may be unbound, while the
+ * tracked profile omits overlapGeneration and expectedGeneration stays G, so this tree deploys a G-only
+ * Worker. Here the overlap operator refuses open, rebind-dry-run and rebind
+ * (overlap_operator_profile_not_accepting) and the schema gate refuses (contract_profile_not_accepting);
+ * readback and close still run. The pair returns to null only after the G-only deploy reads back exactly
+ * G and no window G -> H remains open.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
   from: "3eef01d763c3a724d5a8f46f552fe50773e65d5a7a15cce7500f6ddd9d37904c",

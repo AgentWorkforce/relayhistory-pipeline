@@ -14,7 +14,7 @@ import {
   releaseBootstrapContract,
   releaseBootstrapFiles,
 } from "./schema-release-bootstrap.ts";
-import { checkIngestOverlap, type ReleaseOverlapContract } from "./schema-release-overlap.ts";
+import { checkIngestOverlap, type ReleaseOverlapContract, type ReleaseProfileOverlap } from "./schema-release-overlap.ts";
 import { classifyPostApplyIngest, readPostApplyIngestState } from "./schema-release-post-apply-ingest.ts";
 export function releaseClient(url: string | undefined, opts: { keepAlive?: boolean } = {}) {
   // Individual fields prevent URL sslmode/options from replacing TLS configuration.
@@ -133,7 +133,7 @@ export async function inspectBootstrap(
  */
 export async function inspectIngestOverlap(
   client: pg.Client,
-  input: { targetGeneration: string; contract: ReleaseOverlapContract },
+  input: { targetGeneration: string; contract: ReleaseOverlapContract; profileOverlap: ReleaseProfileOverlap },
 ) {
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {

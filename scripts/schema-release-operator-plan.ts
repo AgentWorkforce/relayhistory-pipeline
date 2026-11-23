@@ -25,7 +25,7 @@ import {
   releaseClient,
   releaseErrorCode,
 } from "../src/hoopdb/schema-release-inspect.ts";
-import { releaseOverlapContract } from "../src/hoopdb/schema-release-overlap.ts";
+import { releaseOverlapContract, releaseProfileOverlap } from "../src/hoopdb/schema-release-overlap.ts";
 export async function operatorPlan() {
   const input = releaseInputs(process.env);
   if (input.mode !== "plan" || process.argv.length !== 2)
@@ -66,6 +66,7 @@ export async function operatorPlan() {
     const ingestOverlap = await inspectIngestOverlap(client, {
       targetGeneration,
       contract: releaseOverlapContract(process.cwd(), input.sha),
+      profileOverlap: releaseProfileOverlap(process.cwd(), input.sha),
     });
     // The same bootstrap section the CI plan records (READ ONLY; refuses role drift).
     const bootstrap = await inspectBootstrap(client, {

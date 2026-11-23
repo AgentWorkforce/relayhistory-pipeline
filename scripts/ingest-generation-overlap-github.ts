@@ -28,8 +28,10 @@ export async function overlapGithubGate(
   approved = false,
   contract?: PrivateIngestGenerationContract,
   now: number = Date.now(),
+  profileOverlap?: unknown,
 ) {
-  const input = overlapOperatorInputs(env, contract);
+  // undefined arguments take the defaults: the imported contract and the checked-out tracked profile.
+  const input = overlapOperatorInputs(env, contract, profileOverlap);
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
       env.GITHUB_SHA !== input.sha || env.GITHUB_RUN_ATTEMPT !== "1" ||

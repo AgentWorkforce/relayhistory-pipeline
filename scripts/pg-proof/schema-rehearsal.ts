@@ -894,8 +894,12 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     anchorInfo = { source: fixtureMade ? "fixture" : r.source, branch: r.branch };
     return r.targetSha;
   };
-  // The rehearsal's reviewed Worker pair (production reads PRIVATE_INGEST_OVERLAP at the release sha).
+  // The rehearsal's reviewed Worker pair (production reads PRIVATE_INGEST_OVERLAP at the release sha)
+  // and its tracked profile's overlapGeneration (production reads config/cloudflare/private-ingest-production.json
+  // at the release sha): the rehearsal's Worker accepts {A, B}. A release tree before the profile check
+  // ignores the extra field.
   const REHEARSAL_WORKER_PAIR = () => ({ from: A, to: B });
+  const REHEARSAL_PROFILE_OVERLAP = () => B;
   const makePlan = async () => {
     const inspection = await I.inspectRelease(owner, BOUNDARY, target);
     const split = M.migrationTargetSplit(inspection.inventory, target);
@@ -911,7 +915,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       rehearsalRefuse("rehearsal_generation_mismatch", { candidates: [anchor.targetGeneration], source: anchorInfo.source });
     // Production's overlap gate, in production's order (before the bootstrap section).
     const ingestOverlap = overlapGate
-      ? await I.inspectIngestOverlap(owner, { targetGeneration: anchor.targetGeneration, contract: REHEARSAL_WORKER_PAIR() })
+      ? await I.inspectIngestOverlap(owner, { targetGeneration: anchor.targetGeneration, contract: REHEARSAL_WORKER_PAIR(), profileOverlap: REHEARSAL_PROFILE_OVERLAP() })
       : undefined;
     // As production writes release-plan/plan.json and reads it back.
     const plan = JSON.parse(
@@ -1125,7 +1129,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     if (anchor.targetGeneration !== approved.targetGeneration) C.refuse("release_target_generation_changed");
     if (!sameAnchor(anchor, approved)) C.refuse("release_target_manifest_changed");
     // Production's fail-fast overlap gate before the migrator; beforeWrite rechecks it under the lock.
-    if (overlapGate) await I.inspectIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR() });
+    if (overlapGate) await I.inspectIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR(), profileOverlap: REHEARSAL_PROFILE_OVERLAP() });
     let refreshed: any;
     const result = await M.runMigrations(client, {
       profile,
@@ -1137,7 +1141,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       // Production also re-runs the GitHub release gate here; the rehearsal has no approval to recheck.
       beforeWrite: async () => {
         if (!sameAnchor(await anchorAt(approved.targetSha, approved.held), approved)) C.refuse("release_target_manifest_changed");
-        if (overlapGate) await OG!.checkIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR() });
+        if (overlapGate) await OG!.checkIngestOverlap(client, { targetGeneration: approved.targetGeneration, contract: REHEARSAL_WORKER_PAIR(), profileOverlap: REHEARSAL_PROFILE_OVERLAP() });
         refreshed = await BD.refreshReleaseBoundary(client, approved.existingBoundary);
       },
     });

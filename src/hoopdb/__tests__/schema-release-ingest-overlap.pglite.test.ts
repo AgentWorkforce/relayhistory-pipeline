@@ -24,6 +24,7 @@ import {
   RELEASE_OVERLAP_MIN_REMAINING_SECONDS,
   readIngestOverlapState,
   type ReleaseOverlapContract,
+  type ReleaseProfileOverlap,
 } from "../schema-release-overlap.ts";
 setDefaultTimeout(120000);
 const root=join(import.meta.dir,"../../.."),G="a".repeat(64),H="f".repeat(64),C="e".repeat(64);
@@ -43,7 +44,12 @@ async function fixture(opts:{policy?:boolean}={}){
  // A window as the owner open writes it, with an arbitrary lifetime (the SQL open enforces 60 s .. 4 h from now).
  const window=(to:string,expiresIn:string)=>db.query(`INSERT INTO sessions.ingest_generation_overlap_windows(from_generation,to_generation,admit_during_apply,approval_sha256,opened_by,opened_at,expires_at) VALUES($1,$2,false,$3,'test',clock_timestamp()-interval '1 minute',clock_timestamp()+interval '${expiresIn}')`,[G,to,"9".repeat(64)]);
  const logs:string[]=[];
- const gate=(input:{targetGeneration?:string;contract?:ReleaseOverlapContract}={})=>checkIngestOverlap(client as never,{targetGeneration:input.targetGeneration??H,contract:"contract" in input?input.contract:pair},l=>logs.push(l));
+ // profileOverlap defaults to the contract's `to`: a release tree whose tracked profile carries overlapGeneration
+ // equal to the pair's H (the step-1 shape); the profile cases inject it.
+ const gate=(input:{targetGeneration?:string;contract?:ReleaseOverlapContract;profileOverlap?:ReleaseProfileOverlap}={})=>{
+  const contract="contract" in input?input.contract:pair;
+  return checkIngestOverlap(client as never,{targetGeneration:input.targetGeneration??H,contract,profileOverlap:"profileOverlap" in input?input.profileOverlap:(contract?.to??null)},l=>logs.push(l));
+ };
  const refusal=async(input:Parameters<typeof gate>[0]={})=>{try{await gate(input);return null}catch(e){return (e as {code?:string}).code??"thrown"}};
  return{db,client,marker,window,gate,refusal,logs};
 }
@@ -135,6 +141,17 @@ test("refuses a contract that is not exactly {from: G, to: H}: mismatched, rever
  await f.marker(G,"pass");
  expect(await f.refusal({targetGeneration:C,contract:null})).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
  expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" window_to_mismatch,contract_dormant");
+});
+
+test("refuses a release sha whose tracked profile does not carry overlapGeneration H (the 062220 rollback shape), even with a usable window and the exact pair",async()=>{
+ const f=await fixture();
+ await openGenerationOverlap(f.client as never,{from:G,to:H,ttlSeconds:3600,admitDuringApply:false,approvalSha256:"9".repeat(64)});
+ for(const profileOverlap of [null,undefined,G,C] as const){
+  expect(await f.refusal({profileOverlap})).toBe(RELEASE_INGEST_OVERLAP_REQUIRED);
+  expect(f.logs.at(-1)).toBe(RELEASE_INGEST_OVERLAP_REQUIRED+" contract_profile_not_accepting");
+ }
+ // Positive control: the same state with the profile at H is overlap_ready.
+ expect(await f.gate({profileOverlap:H})).toMatchObject({gate:"overlap_ready",reasons:[],contract:{profile:"declared",profileOverlapGeneration:H,profileAccepting:true}});
 });
 
 test("passes with the owner-opened window G -> H and the contract {G, H}; the evidence carries generations and window shape only",async()=>{

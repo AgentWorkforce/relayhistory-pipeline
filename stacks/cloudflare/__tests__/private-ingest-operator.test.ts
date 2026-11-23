@@ -25,6 +25,7 @@ import {
   type OperatorSecrets,
 } from "../../../scripts/private-ingest-operator.ts";
 import { inputsDigest } from "../../aws/deploy-guard.ts";
+import { PRIVATE_INGEST_OVERLAP } from "../../../src/session-ingest/private-ingest-release.ts";
 import { createHash } from "node:crypto";
 const secrets: OperatorSecrets = {
   accountId: "a".repeat(32),
@@ -959,6 +960,42 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
           resources: { ...cleanupRows, "session-ingest": reversedState },
         },
       }, input)).toThrow("native_binding_target");
+
+      // 062220 rollback G+H -> G with the real reviewed pair and the default production contract: the
+      // live Worker is bound to expected G with accepted "G,H", the candidate stays expected G with no
+      // overlapGeneration, and the only unbind is INGEST_ACCEPT_GENERATIONS.
+      const pair = PRIVATE_INGEST_OVERLAP!;
+      expect(pair).not.toBeNull();
+      const realG = pair.from, realH = pair.to;
+      const realInput = { ...input, sessionIngest: { ...input.sessionIngest, expectedGeneration: realG } };
+      expect(Object.hasOwn(realInput.sessionIngest, "overlapGeneration")).toBe(false);
+      const atRealG = {
+        ...worker,
+        props: { ...worker.props, env: { ...worker.props.env, INGEST_EXPECT_GENERATION: realG } },
+        bindings: worker.bindings.map((b: any) => b.sid !== "INGEST_EXPECT_GENERATION" ? b
+          : { ...b, data: { bindings: [{ ...b.data.bindings[0], text: realG }] } }),
+      };
+      const snapshotOf = (w: any) => ({ ...native, native: { ...native.native,
+        resources: { ...native.native.resources, "session-ingest": w } } });
+      expect(assertOperatorSnapshot(snapshotOf(atRealG), realInput)).toHaveLength(bindingCount);
+      const rollbackOf = (live: string, deleted: string) => ({
+        ...atRealG,
+        action: "update",
+        state: { status: "updated", props: { ...atRealG.props, env: {
+          ...atRealG.props.env, INGEST_EXPECT_GENERATION: realG, INGEST_ACCEPT_GENERATIONS: live } } },
+        bindings: [...atRealG.bindings, { sid: "INGEST_ACCEPT_GENERATIONS", action: "delete",
+          data: { bindings: [{ type: "plain_text", name: "INGEST_ACCEPT_GENERATIONS", text: deleted }] } }],
+      });
+      const admitted = assertOperatorSnapshot(snapshotOf(rollbackOf(`${realG},${realH}`, `${realG},${realH}`)), realInput);
+      expect(admitted).toHaveLength(bindingCount + 1);
+      expect(admitted.filter((e) => e.action === "delete")).toEqual([{ sid: "INGEST_ACCEPT_GENERATIONS", action: "delete",
+        target: { type: "plain_text", name: "INGEST_ACCEPT_GENERATIONS", text: `${realG},${realH}` } }]);
+      // The reverse accept set "H,G" is not the reviewed pair order: refused by the delete arm.
+      expect(() => assertOperatorSnapshot(snapshotOf(rollbackOf(`${realH},${realG}`, `${realH},${realG}`)), realInput))
+        .toThrow("native_binding_target");
+      // A live set that is H-led while the deleted row claims "G,H" is refused the same way.
+      expect(() => assertOperatorSnapshot(snapshotOf(rollbackOf(`${realH},${realG}`, `${realG},${realH}`)), realInput))
+        .toThrow("native_binding_target");
     }
     for (const change of ["binding", "target", "type", "action", "resource"]) {
       const rows = { ...native.native.resources },

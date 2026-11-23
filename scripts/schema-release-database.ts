@@ -51,6 +51,7 @@ import { githubGet, githubReleaseGate } from "./schema-release-github.ts";
 import {
   checkIngestOverlap,
   releaseOverlapContract,
+  releaseProfileOverlap,
 } from "../src/hoopdb/schema-release-overlap.ts";
 import { runPostApplyIngestCheck } from "../src/hoopdb/schema-release-post-apply-ingest.ts";
 import {
@@ -388,6 +389,7 @@ export async function releaseDatabase() {
       const ingestOverlap = await inspectIngestOverlap(client, {
         targetGeneration,
         contract: releaseOverlapContract(process.cwd(), input.sha),
+        profileOverlap: releaseProfileOverlap(process.cwd(), input.sha),
       });
       // The bootstrap section: its own READ ONLY transaction under the same xact lock.
       const bootstrap = await inspectBootstrap(client, { ...input, steps: anchorSteps(anchor) });
@@ -476,6 +478,7 @@ export async function releaseDatabase() {
     await inspectIngestOverlap(client, {
       targetGeneration: approvedPlan!.targetGeneration,
       contract: releaseOverlapContract(process.cwd(), input.sha),
+      profileOverlap: releaseProfileOverlap(process.cwd(), input.sha),
     });
     const result = await runMigrations(client, {
       profile,
@@ -505,6 +508,7 @@ export async function releaseDatabase() {
         await checkIngestOverlap(client, {
           targetGeneration: approvedPlan!.targetGeneration,
           contract: releaseOverlapContract(process.cwd(), input.sha),
+          profileOverlap: releaseProfileOverlap(process.cwd(), input.sha),
         });
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
       },

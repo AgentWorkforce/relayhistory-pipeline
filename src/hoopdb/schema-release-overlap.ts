@@ -17,6 +17,12 @@
  *     from the Git object database and parsed as data, never imported or executed) is exactly {from: G,
  *     to: H}: the source-side proxy for "the live ingest Worker accepts H" (the private-ingest deploy reads
  *     the same constant). It is not a live Worker readback.
+ *   - the release sha's tracked production profile (config/cloudflare/private-ingest-production.json, read
+ *     from the Git object database and parsed as JSON data) carries sessionIngest.overlapGeneration equal
+ *     to the pair's `to`: the private-ingest deploy at that sha renders the Worker accept set {G, H} only
+ *     then. A sha that keeps the pair but drops overlapGeneration (the pre-built G+H -> G rollback) deploys
+ *     a G-only Worker, so the pair alone is not evidence that H is accepted (reason
+ *     contract_profile_not_accepting; an unreadable or malformed profile refuses the same way).
  *
  * G is the policy generation, not the marker's: the policy (and the admission rows bound with it) is what
  * a buffered claim is checked against, and a retry after a failed apply sees the marker pending at H while
@@ -47,6 +53,7 @@ export const RELEASE_INGEST_OVERLAP_REQUIRED = "release_ingest_overlap_required"
  */
 export const RELEASE_OVERLAP_MIN_REMAINING_SECONDS = 900;
 export const PRIVATE_INGEST_RELEASE_MODULE = "src/session-ingest/private-ingest-release.ts";
+export const PRIVATE_INGEST_PROFILE_FILE = "config/cloudflare/private-ingest-production.json";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -82,6 +89,47 @@ export function releaseOverlapContract(repo: string, sha: string): ReleaseOverla
       encoding: "utf8",
     });
     return parseReleaseOverlapContract(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The release sha's tracked profile overlapGeneration: a 64-hex string when declared, null when the key
+ * is absent, undefined when the profile cannot be read or is malformed (not a JSON object with a
+ * sessionIngest object, or an overlapGeneration that is not a 64-hex string). Only a string equal to the
+ * pair's `to` lets the gate pass.
+ */
+export type ReleaseProfileOverlap = string | null | undefined;
+
+/** The tracked profile JSON's overlapGeneration, as data. */
+export function parseReleaseProfileOverlap(text: string): ReleaseProfileOverlap {
+  let profile: unknown;
+  try {
+    profile = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof profile !== "object" || profile === null || Array.isArray(profile)) return undefined;
+  const ingest = (profile as Record<string, unknown>).sessionIngest;
+  if (typeof ingest !== "object" || ingest === null || Array.isArray(ingest)) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(ingest, "overlapGeneration")) return null;
+  const value = (ingest as Record<string, unknown>).overlapGeneration;
+  return typeof value === "string" && HEX64.test(value) ? value : undefined;
+}
+
+/** The profile's overlapGeneration at `sha` from the Git object database (same reader as the pair). */
+export function releaseProfileOverlap(repo: string, sha: string): ReleaseProfileOverlap {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return undefined;
+  try {
+    const text = execFileSync("git", ["cat-file", "blob", `${sha}:${PRIVATE_INGEST_PROFILE_FILE}`], {
+      cwd: repo,
+      env: { PATH: process.env.PATH },
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 4 * 1024 * 1024,
+      encoding: "utf8",
+    });
+    return parseReleaseProfileOverlap(text);
   } catch {
     return undefined;
   }
@@ -157,6 +205,7 @@ export type IngestOverlapReason =
   | "contract_unreadable"
   | "contract_dormant"
   | "contract_mismatch"
+  | "contract_profile_not_accepting"
   | "retry_marker_pending_no_window";
 
 /** The plan artifact's ingestOverlap section: generations, window shape and verdict only (no ids, no secrets). */
@@ -168,22 +217,36 @@ export interface IngestOverlapEvidence {
   marker: { generation: string; status: string } | null;
   minRemainingSeconds: number;
   window: (NonNullable<IngestOverlapState["window"]> & { present: true }) | { present: false };
-  contract: { state: "pair" | "dormant" | "unreadable"; from: string | null; to: string | null; match: boolean };
+  contract: {
+    state: "pair" | "dormant" | "unreadable";
+    from: string | null;
+    to: string | null;
+    match: boolean;
+    /** The release sha's tracked profile overlapGeneration: declared (64-hex), absent, or unreadable/malformed. */
+    profile: "declared" | "absent" | "unreadable";
+    profileOverlapGeneration: string | null;
+    /** True only when the profile's overlapGeneration equals the pair's `to`. */
+    profileAccepting: boolean;
+  };
 }
 
 /** The pure verdict over the live state and the release sha's contract. Never throws. */
 export function ingestOverlapVerdict(
   state: IngestOverlapState,
-  input: { targetGeneration: string; contract: ReleaseOverlapContract },
+  input: { targetGeneration: string; contract: ReleaseOverlapContract; profileOverlap: ReleaseProfileOverlap },
 ): IngestOverlapEvidence {
   const H = input.targetGeneration;
   const G = state.policyGeneration;
   const c = input.contract;
+  const p = input.profileOverlap;
   const contract: IngestOverlapEvidence["contract"] = {
     state: c === undefined ? "unreadable" : c === null ? "dormant" : "pair",
     from: c?.from ?? null,
     to: c?.to ?? null,
     match: !!c && G !== null && c.from === G && c.to === H,
+    profile: typeof p === "string" && HEX64.test(p) ? "declared" : p === null ? "absent" : "unreadable",
+    profileOverlapGeneration: typeof p === "string" && HEX64.test(p) ? p : null,
+    profileAccepting: !!c && typeof p === "string" && p === c.to,
   };
   const evidence: IngestOverlapEvidence = {
     gate: "refused",
@@ -211,6 +274,9 @@ export function ingestOverlapVerdict(
   if (c === undefined) reasons.push("contract_unreadable");
   else if (c === null) reasons.push("contract_dormant");
   else if (!contract.match) reasons.push("contract_mismatch");
+  // The pair is declared but the same sha's tracked profile does not render H into the Worker's accept set
+  // (absent, different, unreadable or malformed overlapGeneration): never overlap_ready.
+  if (c && !contract.profileAccepting) reasons.push("contract_profile_not_accepting");
   // A failed apply of this target left readiness pending at H with the policy still at G and no usable
   // window. Buffered ingest is already refused (no generation is PASS), and the window can no longer be
   // opened (the 044030 SQL open requires PASS at `from`), so the stock CI route cannot recover it: named
@@ -242,7 +308,7 @@ export function requireIngestOverlap(evidence: IngestOverlapEvidence, log: (line
  */
 export async function checkIngestOverlap(
   client: MigrationClient,
-  input: { targetGeneration: string; contract: ReleaseOverlapContract },
+  input: { targetGeneration: string; contract: ReleaseOverlapContract; profileOverlap: ReleaseProfileOverlap },
   log?: (line: string) => void,
 ) {
   if (!HEX64.test(input.targetGeneration)) refuse(RELEASE_INGEST_OVERLAP_REQUIRED);

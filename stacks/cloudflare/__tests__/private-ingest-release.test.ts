@@ -17,7 +17,7 @@ import { privateIngestGithubGate } from "../../../scripts/private-ingest-release
 const sha = "a".repeat(40), planRun = "90";
 const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 
-test("tracked production config is H-only baseline drain; only the rollout phases and baseline rollback are representable", () => {
+test("tracked production config is G-only baseline drain (062220 rollback G+H -> G); only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   // Rollback of the planned 062220 release overlap (G+H -> G): the live baseline-drain phase is held
   // while the Worker drops H and stays bound to G; the reviewed pair stays in source.
