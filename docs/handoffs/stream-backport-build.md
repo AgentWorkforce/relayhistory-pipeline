@@ -74,13 +74,23 @@ sets no new env var:
 | `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS` (search-index.ts) | 60,000 ms | `SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS` |
 | `STREAM_PASSES` (search-index-stream.ts) | 4 | (same constant) |
 | `STREAM_KEEPALIVE_MS` (search-index.ts) | 20,000 ms | (same constant) |
+| `STREAM_MIN_START_MS` (search-index.ts) | 120,000 ms | (none: main has no start floor) |
 | keyset page size: the whole read's `insertBatch` | 5,000 | (same) |
 
 A scope streams only when the whole read refuses it with `scope_too_large` alone,
 and four passes fit the budgets. That allows at most 256 MiB or 250,000 records
-per scope. A larger scope is still refused as before. Each invocation streams at
-most one scope; a second one in the same batch is requeued with the existing
-60 s delayed SQS message (log reason `stream_deferred`).
+per scope. A scope above that limit stays partial (`needs_full = 1`) exactly as
+before the port. Each invocation streams at most one scope. A second one in the
+same batch, or one with less than `STREAM_MIN_START_MS` (120 s) left before the
+deadline, is requeued with the existing 60 s delayed SQS message (log reason
+`stream_deferred`). Once the invocation's streamed scope has used it and the
+deadline has passed, the batch's remaining scopes are requeued the same way
+(reason `stream_batch_deadline`) instead of running in the last 60 s.
+
+A stopped streamed pass (deadline, a read budget) returns success: the message is
+deleted from the queue and the scope stays `needs_full = 1` until its next upload
+or a new reconcile message (below). Its log line carries the pass's own reasons
+(for example `scope_too_large,stream_deadline`).
 
 ## Reconcile one session
 
@@ -114,11 +124,20 @@ working on this branch can see it.
 
 The pass re-sends the statement it already sends,
 `SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok` with the scope's
-key, at most every 20 s (`STREAM_KEEPALIVE_MS`). Main sends
+key: at most every 20 s (`STREAM_KEEPALIVE_MS`) while it reads, and unthrottled
+before and after the ClickHouse scan and before every batch of deletes. Main sends
 `SELECT 1 AS stream_keepalive` instead; this base reuses its own statement so the
-bundle's Postgres statement set stays the same as the baseline's. If that
-statement fails, or returns anything but `ok = true`, the pass stops. Nothing is
-deleted, `needs_full = 1` is recorded and the message is redelivered.
+bundle's Postgres statement set stays the same as the baseline's.
+
+If the connection ends while the pass holds it, pg emits `error` on the client.
+With the flag on, the search transaction holds a per-checkout listener that keeps
+that error. The pass's next statement (its keepalive, the check before any delete,
+or COMMIT) rejects with it, the transaction fails normally, and the broken client
+is destroyed. If the keepalive statement fails, or returns anything but
+`ok = true`, the pass also stops. Either way nothing more is deleted,
+`needs_full = 1` is recorded (best effort, before the error is rethrown), and the
+message fails and is redelivered. With the flag off there is no listener, exactly
+as before; there the transaction is held only briefly.
 
 Before arming the flag, an operator should confirm that the role's
 `idle_in_transaction_session_timeout` is either 0 or well above 20 s (also a
