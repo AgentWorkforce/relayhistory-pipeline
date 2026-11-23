@@ -162,6 +162,11 @@ issues even when the failure text is the same.
 2 distinct roots. A failure that recurs only inside one repository (one flaky step there) is not a candidate however
 often it recurs. Each session counts once per key.
 
+What `roots` means. An issue's `roots` counts **scope groups**: the distinct values of that grouping key (`repo:`,
+`project:` or `source:`) among its sessions. It does not prove independent people, teams or agent fleets: two
+repositories may share one author, and one repository may hold many. Recurrence inside one scope group (for example
+one repository) is excluded by the current rule, however many sessions it spans. The field keeps its name.
+
 Fields. `id` is `<kind>:<first 16 hex of sha256(kind NUL key)>`, stable across runs. `key` is the exact key and `text`
 the first contributing session's (in `(source, sessionId)` order) smallest claim text, both verbatim prefixes of at most
 280 characters (`keyTruncated`, `textTruncated`). `roots` and `sessionCount` are full counts; `sessions` is capped like
