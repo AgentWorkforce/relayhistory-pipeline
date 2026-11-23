@@ -45,6 +45,15 @@ export default defineLayeredAgent({
   // relay (module 0.1.20, "New-issue watch"). Rendered to issue-watch.json
   // and delivered by hot update, never in the user data.
   issueWatch: { repos: ["AgentWorkforce/relayhistory-pipeline", "AgentWorkforce/sessions-pipeline-cloud"], notify: "khaliq-gant" },
+  // Repo stewardship (module 0.1.29, on by default): a timer sweeps these
+  // repos' open pull requests and hands the lead the stale or blocked ones to
+  // chase. Listed so the sweep uses the renamed repo, not `repo`; the explicit
+  // issueWatch above stays the lead's watch. Rendered to stewardship.json and
+  // delivered by hot update, never in the user data.
+  stewardship: { repos: ["AgentWorkforce/relayhistory-pipeline", "AgentWorkforce/sessions-pipeline-cloud"] },
+  // Lead session rotation (module 0.1.35, on by default): sessionRotation is
+  // left unset, so the lead rotates at the kit's defaults (60,000 events or
+  // 48 MiB) and the env file carries no LEAD_ROTAT* line.
   relayDescription: "sessions-pipeline layered lead (EC2, Fable)",
   names: { platformPrefix: `/relaycast-agent-host/${stage}` },
   // The Agent Relay sessions MCP (module 0.1.9): the lead can search and read
