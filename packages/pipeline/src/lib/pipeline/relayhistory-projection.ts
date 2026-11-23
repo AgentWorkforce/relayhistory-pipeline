@@ -594,6 +594,32 @@ function settleToolTimes(events: Json[]) {
 }
 
 /**
+ * settleToolTimes in two halves, for a reader that sees one session's events a
+ * chunk at a time (the streamed search reconcile): the parent time an event
+ * offers its tool use (an unsettled session_event, or null), and the tool use
+ * whose parent time an event takes (or null). Taking, for every child, the
+ * earliest parent time over the whole session (by compareRelayhistoryTimes),
+ * else the child's own ingested_at, is what settleToolTimes computes.
+ */
+export function relayhistoryToolParent(event: Json): { toolUse: string; ts: string } | null {
+  const toolUse = text(payloadOf(event), "tool_use_id");
+  return event.kind !== "session_event" || toolUse === null ? null : { toolUse, ts: event.ts as string };
+}
+
+export function relayhistoryToolChild(event: Json): string | null {
+  const payload = payloadOf(event);
+  const toolUse = nullIfEmpty(text(payload, "tool_use_id"));
+  return (event.kind === "tool_call" || event.kind === "file_edit") && toolUse !== null && activityMs(payload) === null
+    ? toolUse
+    : null;
+}
+
+/** The order settleToolTimes compares event times in. */
+export function compareRelayhistoryTimes(left: string, right: string): number {
+  return compareTimes(left, right);
+}
+
+/**
  * sessions.settle_delivery_request, for every request at once. The carrier is
  * the smallest record id; SQL's `min` takes the database collation and this the
  * code-unit order, which can pick another member but not change the totals.

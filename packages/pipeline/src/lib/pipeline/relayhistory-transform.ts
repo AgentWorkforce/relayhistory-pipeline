@@ -313,7 +313,17 @@ function sameRecord(
   return content(left) === content(right);
 }
 
-function receivedFirst(
+/**
+ * What sameRecord compares: the record without `received_at` and
+ * `accepted_seq`, canonically encoded. Two copies of one revision are the same
+ * record exactly when these are equal.
+ */
+export function relayhistoryRevisionContent(record: RelayhistoryStreamRecord): string {
+  const { received_at: _at, accepted_seq: _seq, ...rest } = record;
+  return encoded(canonical(rest));
+}
+
+export function receivedFirst(
   left: RelayhistoryStreamRecord,
   right: RelayhistoryStreamRecord,
 ): boolean {

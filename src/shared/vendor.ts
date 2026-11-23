@@ -96,15 +96,21 @@ export {
   RELAYHISTORY_NORMALIZED_VERSION,
   RelayhistoryExportTransform,
   relayhistoryExportProvenance,
+  lastAccepted,
   normalizeRelayhistoryRecords,
   parseRelayhistoryRecord,
   readRelayhistoryExport,
+  receivedFirst,
+  relayhistoryRevisionContent,
   type RelayhistoryStreamRecord,
   type ZstdDecompress,
 } from "@rhc/lib/pipeline/relayhistory-transform.ts";
 export {
   CONVERGENCE_EVENT_KIND,
+  compareRelayhistoryTimes,
   projectRelayhistorySession,
+  relayhistoryToolChild,
+  relayhistoryToolParent,
   type ProjectionContext,
 } from "@rhc/lib/pipeline/relayhistory-projection.ts";
 export { scrubText, scrubJson } from "@rhc/lib/scrub.ts";
