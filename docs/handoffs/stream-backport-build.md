@@ -75,6 +75,7 @@ sets no new env var:
 | `STREAM_PASSES` (search-index-stream.ts) | 4 | (same constant) |
 | `STREAM_KEEPALIVE_MS` (search-index.ts) | 20,000 ms | (same constant) |
 | `STREAM_MIN_START_MS` (search-index.ts) | 120,000 ms | (none: main has no start floor) |
+| `STREAM_TAIL_RESERVE_MS` (search-index.ts) | 30,000 ms | (none: main has no tail reserve) |
 | keyset page size: the whole read's `insertBatch` | 5,000 | (same) |
 
 A scope streams only when the whole read refuses it with `scope_too_large` alone,
@@ -83,9 +84,14 @@ per scope. A scope above that limit stays partial (`needs_full = 1`) exactly as
 before the port. Each invocation streams at most one scope. A second one in the
 same batch, or one with less than `STREAM_MIN_START_MS` (120 s) left before the
 deadline, is requeued with the existing 60 s delayed SQS message (log reason
-`stream_deferred`). Once the invocation's streamed scope has used it and the
-deadline has passed, the batch's remaining scopes are requeued the same way
-(reason `stream_batch_deadline`) instead of running in the last 60 s.
+`stream_deferred`). Once the invocation's stream deadline has passed, no further scope of the batch is
+started, whether a whole read or a stream; the rest are requeued the same way
+(reason `stream_batch_deadline`). A scope that is already running when the
+deadline passes is not interrupted. A whole read runs to its end inside the 60 s
+margin. A streamed pass stops at its next check, and it does not start its tail
+(a batch of deletes, then the catalog write, the state row and COMMIT) with less
+than `STREAM_TAIL_RESERVE_MS` (30 s) left before the deadline, which is about 90 s
+before the function timeout.
 
 A stopped streamed pass (deadline, a read budget) returns success: the message is
 deleted from the queue and the scope stays `needs_full = 1` until its next upload
@@ -137,8 +143,25 @@ is destroyed. If the keepalive statement fails, or returns anything but
 `ok = true`, the pass also stops. Either way nothing more is deleted,
 `needs_full = 1` is recorded (best effort, before the error is rethrown), and the
 message fails and is redelivered. With the flag off there is no listener, exactly
-as before; there the transaction is held only briefly.
+as before; there the transaction stays open only briefly.
 
 Before arming the flag, an operator should confirm that the role's
-`idle_in_transaction_session_timeout` is either 0 or well above 20 s (also a
-connection pooler's own idle limit, if one sits in between).
+`idle_in_transaction_session_timeout` is either 0 or above about 60 s. The idle
+gaps between the pass's statements can last as long as one ClickHouse statement,
+whose timeout is 60 s. The same applies to a connection pooler's own idle limit,
+if one sits in between.
+
+## Known behaviour while a scope streams
+
+- From the start of a streamed pass until its end, the session's state row reads
+  `needs_full = 1` (the pre-mark, 1 ms before the pass's own state row). Main has
+  the same in its pending row. A complete pass then records `needs_full = 0`.
+- A scope that needs more time than one invocation's deadline allows (about 240 s
+  for all four passes, the scan and the writes) is cut on every attempt. Nothing is
+  lost, but it stays `needs_full = 1`. The pass emits no new signal for this; the
+  existing warn line is enough to find it. Search the pipeline's logs for
+  `"message":"search index partial"` with `"reason":"scope_too_large,stream_deadline"`.
+  The same `org_id` and `session_id` turning up on each attempt is such a scope.
+  `"reason":"scope_too_large,stream_read_events_budget"` is a scope whose index holds
+  more identities than the events budget. A plain `"reason":"scope_too_large"` is a
+  scope above the streamed limit, refused as before.
