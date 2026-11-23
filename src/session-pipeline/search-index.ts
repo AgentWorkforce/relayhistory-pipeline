@@ -716,7 +716,10 @@ async function streamedReconcile(
   const keepalive = async () => {
     if (Date.now() - pinged < everyMs) return;
     pinged = Date.now();
-    await tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+    const { rows } = await tx.query<{ ok: boolean }>("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok", [scopeLockKey(scope, "search")]);
+    // The transaction holds this lock, so anything but true means it is not the transaction we
+    // started in: stop (the catch below records needs_full = 1 and the message is redelivered).
+    if (rows[0]?.ok !== true) throw new PipelineError("stream_keepalive_failed", "the streamed reconcile's keepalive did not hold the scope lock", true);
   };
   const checkDeadline = () => {
     if (streamDeadlinePassed(deadline)) throw new StreamStop(STREAM_DEADLINE, true);

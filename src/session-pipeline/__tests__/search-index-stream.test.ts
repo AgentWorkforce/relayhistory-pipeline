@@ -337,6 +337,25 @@ describe("streamed reconcile", () => {
     expect(ch.state.at(-1)!.needs_full).toBe(1);
   });
 
+  test("a keepalive that does not hold the lock (ok not true) aborts the pass: nothing deleted, needs_full=1", async () => {
+    for (const answer of [{ ok: false }, { ok: null }, { ok: "t" }, undefined]) {
+      const keys = await richScope();
+      const ch = fakeClickHouse();
+      await indexSearchScope(scope, deps(ch.ch, () => keys, armed).d);
+      ch.rows.push({ ...ch.final()[0]!, event_id: "tail:stale", fingerprint: "neon-y" });
+      const s = deps(ch.ch, () => keys, { ...armed, streamKeepaliveMs: 0 });
+      let locks = 0;
+      const odd: SearchIndexDeps = { ...s.d, transact: async (work) => work({ query: async (text: string, params?: unknown[]) => {
+        if (text.includes("pg_try_advisory_xact_lock") && ++locks > 1) return { rows: answer ? [answer] : [] } as never;
+        return s.sb.tx.query(text, params);
+      } }) };
+      await expect(indexSearchScope(scope, odd)).rejects.toMatchObject({ code: "stream_keepalive_failed", retryable: true });
+      expect(ch.statements.filter((q) => q.startsWith("command DELETE"))).toHaveLength(0);
+      expect(ch.final().some((r) => r.event_id === "tail:stale")).toBe(true);
+      expect(ch.state.at(-1)!.needs_full).toBe(1);
+    }
+  });
+
   test("armed, a scope refused for more than its size is not streamed: exactly the unarmed result", async () => {
     const keys = [...(await richScope()), manifestKey(loc("srv_missing"))];
     const a = fakeClickHouse();

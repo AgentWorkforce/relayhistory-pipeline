@@ -101,3 +101,25 @@ idempotent, so sending it twice is harmless.
 
 Sending this message to the production queue is an operator action. It needs its
 own approval, separate from building or reviewing this branch.
+
+## Open operator check: the database's idle-in-transaction limit
+
+A streamed scope keeps its Postgres transaction open (it holds the scope's advisory
+lock) while it reads S3 and ClickHouse, for up to the invocation's deadline. That is
+about 240 s inside the 300 s function timeout. The pg pool's `idleTimeoutMillis`
+(60 s) only closes clients idle in the pool, never a checked-out client inside a
+transaction. The limit that matters is the server's
+`idle_in_transaction_session_timeout` for the pipeline's database role, and nobody
+working on this branch can see it.
+
+The pass re-sends the statement it already sends,
+`SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok` with the scope's
+key, at most every 20 s (`STREAM_KEEPALIVE_MS`). Main sends
+`SELECT 1 AS stream_keepalive` instead; this base reuses its own statement so the
+bundle's Postgres statement set stays the same as the baseline's. If that
+statement fails, or returns anything but `ok = true`, the pass stops. Nothing is
+deleted, `needs_full = 1` is recorded and the message is redelivered.
+
+Before arming the flag, an operator should confirm that the role's
+`idle_in_transaction_session_timeout` is either 0 or well above 20 s (also a
+connection pooler's own idle limit, if one sits in between).
