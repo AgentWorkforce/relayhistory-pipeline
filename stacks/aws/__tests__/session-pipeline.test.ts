@@ -10,6 +10,7 @@ import {
   SESSION_BRIEF_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
+  assertSessionPipelineInputs,
   briefScheduleProps,
   bucketNotificationConfiguration,
   pipelineBucketStatements,
@@ -561,5 +562,38 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     // A tag change on a grant is the repo tag rename's own phase, which refuses creates.
     const tag = edit(withReadApi(), "session-pipeline-secret", "      96bulls:repo: AgentWorkforce/sessions-pipeline", () => ["  -   96bulls:repo: AgentWorkforce/sessions-pipeline", "  +   96bulls:repo: AgentWorkforce/elsewhere"]);
     expect(() => check(tag)).toThrow(/repo tag rename/);
+  });
+});
+
+describe("session pipeline: streamed reconcile switch", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  it("absent or disabled renders nothing new; enabled renders SEARCH_INDEX_STREAMING_CH=1 only", () => {
+    const off = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } });
+    expect(Object.keys(off)).not.toContain("SEARCH_INDEX_STREAMING_CH");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, streamReconcile: { enabled: false } } })).toEqual(off);
+    const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true, streamReconcile: { enabled: true } } });
+    expect(on).toEqual({ ...off, SEARCH_INDEX_STREAMING_CH: "1" });
+    expect(Object.keys(on).filter((k) => k.startsWith("SEARCH_INDEX_STREAM"))).toEqual(["SEARCH_INDEX_STREAMING_CH"]);
+  });
+
+  it("validates the shape and needs searchIndex: true when enabled", () => {
+    const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+    expect(() => ok({ searchIndex: true, streamReconcile: { enabled: true } })).not.toThrow();
+    expect(() => ok({ streamReconcile: { enabled: false } })).not.toThrow();
+    expect(() => ok({ streamReconcile: { enabled: true } })).toThrow(/requires searchIndex: true/);
+    expect(() => ok({ searchIndex: false, streamReconcile: { enabled: true } })).toThrow(/requires searchIndex: true/);
+    expect(() => ok({ searchIndex: true, streamReconcile: { enabled: "yes" } })).toThrow(/enabled must be a boolean/);
+    expect(() => ok({ searchIndex: true, streamReconcile: { enabled: true, maxReadBytes: 1 } })).toThrow(/maxReadBytes is not a known setting/);
+    expect(() => ok({ searchIndex: true, streamReconcile: true })).toThrow(/must be a plain object/);
+  });
+
+  it("the function's resources and props are the same with the switch on", () => {
+    const i = { stage: STAGE, accountId: ACCOUNT, region: REGION, bucket: t.bucket, tags: () => ({}) };
+    const off = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true } });
+    const on = sessionPipelineFunctionProps({ ...i, p: { searchIndex: true, streamReconcile: { enabled: true } } });
+    expect({ ...on, env: undefined }).toEqual({ ...off, env: undefined });
+    expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_STREAMING_CH: "1" });
   });
 });

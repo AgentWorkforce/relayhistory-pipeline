@@ -46,6 +46,13 @@ export interface SessionPipelineInputs {
   reconcileMinutes?: number;
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
   briefs?: SessionBriefInputs;
+  /**
+   * The streamed ClickHouse reconcile (src/session-pipeline/search-index.ts streamedReconcile).
+   * Absent or `enabled: false`: no variable is rendered and the function never streams.
+   * `enabled: true` needs `searchIndex: true` and renders SEARCH_INDEX_STREAMING_CH=1; the
+   * function also refuses to start unless the pipeline secret has its clickhouse block.
+   */
+  streamReconcile?: { enabled: boolean };
 }
 
 /**
@@ -125,7 +132,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
@@ -143,6 +150,14 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
       refuse("transcriptStore.sessionPipeline.briefs.backgroundDailyBudget must be an integer from 0 to 1000000");
     if (b.globalDailyCap !== undefined && !(Number.isInteger(b.globalDailyCap) && (b.globalDailyCap as number) >= 0 && (b.globalDailyCap as number) <= 10_000_000))
       refuse("transcriptStore.sessionPipeline.briefs.globalDailyCap must be an integer from 0 to 10000000");
+  }
+  if (v.streamReconcile !== undefined) {
+    const r = v.streamReconcile as Record<string, unknown> | null;
+    if (r === null || typeof r !== "object" || Array.isArray(r) || Object.getPrototypeOf(r) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.streamReconcile must be a plain object");
+    for (const k of Object.keys(r)) if (k !== "enabled") refuse(`transcriptStore.sessionPipeline.streamReconcile.${k} is not a known setting`);
+    if (typeof r.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.streamReconcile.enabled must be a boolean");
+    if (r.enabled === true && v.searchIndex !== true) refuse("transcriptStore.sessionPipeline.streamReconcile.enabled requires searchIndex: true");
   }
 }
 
@@ -270,6 +285,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_SECRET_ARN: i.names.secret,
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
+    // Only when armed: a stage without streamReconcile.enabled renders nothing new and never streams.
+    ...(i.p.streamReconcile?.enabled === true ? { SEARCH_INDEX_STREAMING_CH: "1" } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
