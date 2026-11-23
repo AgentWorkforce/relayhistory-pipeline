@@ -1,6 +1,10 @@
 /** workspace-synthesis/1 (docs/session-intel-workspace-synthesis.md) over the synthetic F1 cohort fixture. */
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { main as cliMain, outDir } from "../synthesis/cli.ts";
 import {
   decodeSessionAnalysisResult,
   validateEvidenceBundle,
@@ -430,4 +434,36 @@ describe("refusals and bounds", () => {
     expect(validateWorkspaceSynthesis(big)).toBeTruthy();
     refused(() => run(cohort(), { bounds: { maxArtifactBytes: 2_000 } }), "artifact_too_large");
   }, 30_000);
+});
+
+describe("CLI", () => {
+  const dirs: string[] = [];
+  const temp = () => { const d = mkdtempSync(join(tmpdir(), "si-synthesis-cli-")); dirs.push(d); return d; };
+  afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
+  const io = { out: () => {}, err: () => {} };
+  const fixture = fileURLToPath(new URL("cohort.json", FIXTURE_DIR));
+
+  test("regenerates the golden byte for byte and writes a short markdown", async () => {
+    const out = join(temp(), "out");
+    expect(await cliMain(["--in", fixture, "--out", out, "--now", FIXTURE_NOW], io)).toBe(0);
+    expect(readFileSync(join(out, "synthesis.json"), "utf8")).toBe(readFileSync(new URL("expected-synthesis.json", FIXTURE_DIR), "utf8"));
+    const md = readFileSync(join(out, "synthesis.md"), "utf8");
+    expect(md).toContain("# Workspace synthesis");
+    expect(md).toContain("Considered 53 (eligible 60), analyzed 40");
+    expect(md).toContain("`Bash: bun test src/fx`");
+  });
+
+  test("refuses an out dir inside the repository unless --allow-repo-out, and requires --now", async () => {
+    const inRepo = fileURLToPath(new URL("./fixtures/synthesis/.cli-out-refused", import.meta.url));
+    await expect(cliMain(["--in", fixture, "--out", inRepo, "--now", FIXTURE_NOW], io)).rejects.toThrow(/inside the repository/u);
+    expect(existsSync(inRepo)).toBe(false);
+    await expect(cliMain(["--in", fixture, "--out", join(temp(), "o")], io)).rejects.toThrow(/--now is required/u);
+    await expect(cliMain(["--in", fixture, "--out", join(temp(), "o"), "--now", FIXTURE_NOW, "--extra"], io)).rejects.toThrow();
+    expect(() => outDir(join(tmpdir(), "x"), false)).not.toThrow();
+  });
+
+  test("the CLI source reads no environment, clock or network", () => {
+    const src = readFileSync(new URL("../synthesis/cli.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/process\.env|Bun\.env|Date\.now\(|new Date\(\)|fetch\(/u);
+  });
 });

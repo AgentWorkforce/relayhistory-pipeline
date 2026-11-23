@@ -348,6 +348,12 @@ function bound(name: keyof TunableBounds, opts: SynthesisOptions): number {
   return v;
 }
 
+/** The sessions a synthesis of this cohort considers (analyzed or skipped), in (source, sessionId) order. */
+export function consideredSessions(rawCohort: unknown, opts: Pick<SynthesisOptions, "bounds"> = {}): SessionRef[] {
+  const max = bound("maxSessions", opts as SynthesisOptions);
+  return [...parseCohort(rawCohort).sessions].sort(refCompare).slice(0, max).map((e) => ({ source: e.source, sessionId: e.sessionId }));
+}
+
 export function synthesize(rawCohort: unknown, opts: SynthesisOptions): WorkspaceSynthesis {
   if (!opts || opts.now === undefined) refuse("invalid_option", "opts.now is required (no clock is read)");
   const now = isoTime(opts.now instanceof Date ? opts.now.toISOString() : opts.now, "opts.now");
