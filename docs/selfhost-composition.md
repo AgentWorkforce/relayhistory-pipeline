@@ -27,7 +27,7 @@ whole table.
 | `alleyoop-courier`, `hoopdb-indexer`, `referee`, `bob-costas`, `session-brief` | Deployment (worker) | `src/<name>/...` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (`src/shared/worker.ts` `serveHealth`) |
 | `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
 | `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
-| `session-analysis` | Deployment (worker, default off; `SESSION_ANALYSIS_ENABLED=true`) | `src/session-analysis/runner.ts` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz`; exits 2 on a refused config ([session-analysis-runner.md](session-analysis-runner.md)) |
+| `session-analysis` | Deployment (worker, default off; `SESSION_ANALYSIS_ENABLED=true`) | `src/session-analysis/runner.ts` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz`; exits 2 on a refused config. S3 and S3-compatible stores (bundled MinIO via `SESSION_ANALYSIS_S3_ENDPOINT`), Pod Identity or static keys; the bucket must be versioned (startup check); `LOCKER_PROVIDER` gcs, azure and fs are refused pending S2/S3 ([session-analysis-runner.md](session-analysis-runner.md)) |
 | `session-ingest` | Deployment (HTTP) | `src/session-ingest/selfhost-server.ts` | `RELAYHISTORY_INGEST_PORT`, default 8081 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`), `GET /readyz` (section 3) |
 | `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)) |
 | `user-erase` | Job (one-shot, operator-run, default off; `OPERATOR_USER_ERASE_ENABLED=1`) | `src/session-erase/user-erase-main.ts` | none | exit code (0 verified / disabled, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)); see `docs/operator-user-erase.md` |
@@ -117,6 +117,15 @@ both build their deps with `src/session-analysis/runtime-deps.ts`. It is off unl
 `{"ok":true,"enabled":false}`. The env contract, the database role, the S3 and KMS grants (with
 the us-east-1 bucket and us-west-2 cluster note), the chart values infra needs and the activation
 checklist are in [session-analysis-runner.md](session-analysis-runner.md).
+
+Store support (slice S1): AWS S3 or any S3-compatible store, including the bundled MinIO
+(`SESSION_ANALYSIS_S3_ENDPOINT`, path-style; in-cluster http only with `ALLOW_IN_CLUSTER_HTTP=true`), with
+EKS Pod Identity (the default) or static keys (`SESSION_ANALYSIS_S3_CREDENTIALS=static`,
+`SESSION_ANALYSIS_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY[_FILE]`). The store and
+the orphan-result sweeper's eraser use the same endpoint and keys. Versioning is required: with an endpoint
+or static keys the runner checks `GetBucketVersioning` at startup and refuses `bucket_not_versioned`
+otherwise. `LOCKER_PROVIDER=gcs`, `azure` or `fs` is refused (`provider_unsupported`) until their versioned
+erasers land (S2/S3).
 
 ### `SERVICE=session-erase-bytes`
 

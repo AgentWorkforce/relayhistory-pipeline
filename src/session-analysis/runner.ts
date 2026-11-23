@@ -24,8 +24,18 @@
  *   SESSION_ANALYSIS_S3_BUCKET        the pipeline (canonical) bucket
  *   SESSION_ANALYSIS_S3_REGION        that bucket's region (the signing region), required: never the
  *                                     cluster's AWS_REGION by default, which may differ
- *   SESSION_ANALYSIS_S3_CREDENTIALS   "podIdentity" (default; src/shared/locker.ts podIdentityCredentials)
- *                                     or "role" (AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN from the env)
+ *   SESSION_ANALYSIS_S3_CREDENTIALS   "podIdentity" (default; src/shared/locker.ts podIdentityCredentials),
+ *                                     "role" (AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN from the env) or "static"
+ *                                     (SESSION_ANALYSIS_S3_ACCESS_KEY_ID[_FILE] and _SECRET_ACCESS_KEY[_FILE],
+ *                                     optional _SESSION_TOKEN[_FILE]: exactly one source each, read as secrets)
+ *   SESSION_ANALYSIS_S3_ENDPOINT      optional bare origin of an S3-compatible store (MinIO), path-style for the
+ *                                     store and the sweeper's eraser alike; https, loopback http, or an in-cluster
+ *                                     Service name with ALLOW_IN_CLUSTER_HTTP=true (destination-url.ts). Unset is
+ *                                     AWS S3 in SESSION_ANALYSIS_S3_REGION (the hosted default, unchanged)
+ *   SESSION_ANALYSIS_S3_VERSIONING_CHECK  unset: the startup GetBucketVersioning check (bucket-versioning.ts) runs
+ *                                     when an endpoint or static keys are set, and not on the hosted default;
+ *                                     "true" forces it. A bucket that is not versioned refuses startup
+ *   LOCKER_PROVIDER                   unset or "s3" only: gcs, azure and fs refuse (provider_unsupported)
  *   PIPELINE_KEY_PREFIX, PIPELINE_ORG_FROM_PREFIX=true, READER_MAX_RULESET   as the Lambda reads them
  *   WORKER_HEALTH_PORT                probe port, default 8081
  *   SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS, SESSION_ANALYSIS_CUTOVER_PROOF,
@@ -57,6 +67,8 @@ import type { PagedEraser, S3EraserConfig } from "../migration/neon-s3-erasure/e
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { supabasePool, transaction } from "../session-pipeline/lambda.ts";
 import { modelKey } from "../session-brief/config.ts";
+import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
+import { readBucketVersioning, type BucketVersioningCheck } from "./bucket-versioning.ts";
 import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { sessionIntelControls } from "../shared/session-intel-controls.ts";
@@ -93,7 +105,7 @@ export function analysisRunnerEnabled(env: NodeJS.ProcessEnv): boolean {
   return refuse("flag_invalid");
 }
 
-export type RunnerCredentialMode = "podIdentity" | "role";
+export type RunnerCredentialMode = "podIdentity" | "role" | "static";
 
 export interface AnalysisRunnerConfig {
   tickMs: number;
@@ -104,6 +116,10 @@ export interface AnalysisRunnerConfig {
   keyPrefix: string;
   readerMaxRuleset?: number;
   credentials: RunnerCredentialMode;
+  /** SESSION_ANALYSIS_S3_ENDPOINT's origin (an S3-compatible store, path-style). Absent: AWS S3 (hosted). */
+  endpoint?: string;
+  /** The startup versioning check runs. Absent on the hosted default (no endpoint, no static keys). */
+  versioningCheck?: true;
   /** SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS=true was passed through (it must stay unset). */
   assumeNoLegacyTurns: boolean;
   /** SESSION_ANALYSIS_CUTOVER_PROOF is set (passed through; its value is never read here). */
@@ -123,6 +139,31 @@ export function healthPort(env: NodeJS.ProcessEnv): number {
   return int(env.WORKER_HEALTH_PORT?.trim(), 8081, 1, 65_535, "health_port_invalid");
 }
 
+const STATIC_KEY_VARS = ["SESSION_ANALYSIS_S3_ACCESS_KEY_ID", "SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY", "SESSION_ANALYSIS_S3_SESSION_TOKEN"] as const;
+
+/** Mirrors locker-selection.ts: GCS is its own adapter, never S3 with HMAC keys. */
+const GCS_API_HOST = /^(?:storage\.googleapis\.com|.+\.storage\.googleapis\.com|storage\.google\.com)$/;
+
+/**
+ * The store's provider and endpoint. Only S3 (unset LOCKER_PROVIDER or "s3"): the sweeper's versioned
+ * eraser exists for S3 only, so gcs, azure and fs refuse until theirs does. The endpoint follows the
+ * shared destination policy (destination-url.ts), the same rule the publisher and the erase job use;
+ * ALLOW_IN_CLUSTER_HTTP is read only when an endpoint is set, so the hosted default reads nothing new.
+ */
+function runnerEndpoint(env: NodeJS.ProcessEnv): string | undefined {
+  const provider = env.LOCKER_PROVIDER?.trim() ?? "";
+  if (provider === "gcs" || provider === "azure" || provider === "fs") refuse("provider_unsupported");
+  if (provider !== "" && provider !== "s3") refuse("provider_invalid");
+  const raw = env.SESSION_ANALYSIS_S3_ENDPOINT;
+  if (raw === undefined || raw === "") return undefined;
+  let policy: ReturnType<typeof destinationPolicy>;
+  try { policy = destinationPolicy(env); } catch { return refuse("allow_in_cluster_http_invalid"); }
+  let url: URL;
+  try { url = assertDestinationUrl("SESSION_ANALYSIS_S3_ENDPOINT", raw, policy, { allowPath: false }); } catch { return refuse("endpoint_invalid"); }
+  if (GCS_API_HOST.test(url.hostname)) refuse("provider_unsupported");
+  return url.origin;
+}
+
 /** Every setting of an enabled runner, validated before anything listens. Never reads a secret. */
 export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConfig {
   const bucket = env.SESSION_ANALYSIS_S3_BUCKET ?? "";
@@ -133,7 +174,13 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
   const keyPrefix = (env.PIPELINE_KEY_PREFIX ?? "").replace(/^\/+|\/+$/g, "");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(keyPrefix)) refuse("key_prefix_invalid");
   const credentials = env.SESSION_ANALYSIS_S3_CREDENTIALS || "podIdentity";
-  if (credentials !== "podIdentity" && credentials !== "role") refuse("credentials_mode_invalid");
+  if (credentials !== "podIdentity" && credentials !== "role" && credentials !== "static") refuse("credentials_mode_invalid");
+  // Static keys are read only in "static" mode; set in any other mode they would be silently unused.
+  if (credentials !== "static" && STATIC_KEY_VARS.some((name) => !!env[name] || !!env[`${name}_FILE`])) refuse("credentials_mode_conflict");
+  const endpoint = runnerEndpoint(env);
+  const check = env.SESSION_ANALYSIS_S3_VERSIONING_CHECK;
+  if (check !== undefined && check !== "" && check !== "true") refuse("versioning_check_invalid");
+  const versioningCheck = check === "true" || endpoint !== undefined || credentials === "static";
   const assume = env.SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS;
   if (assume !== undefined && assume !== "" && assume !== "false" && assume !== "true") refuse("assume_no_legacy_turns_invalid");
   // Strict here, and it must be exactly what worker.ts analysisConfig runs (1-20, default 2): the
@@ -153,6 +200,8 @@ export function analysisRunnerConfig(env: NodeJS.ProcessEnv): AnalysisRunnerConf
     keyPrefix,
     ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
     credentials: credentials as RunnerCredentialMode,
+    ...(endpoint === undefined ? {} : { endpoint }),
+    ...(versioningCheck ? { versioningCheck: true as const } : {}),
     assumeNoLegacyTurns: assume === "true",
     cutoverProof: env.SESSION_ANALYSIS_CUTOVER_PROOF !== undefined && env.SESSION_ANALYSIS_CUTOVER_PROOF !== "",
   };
@@ -187,17 +236,38 @@ export interface RunnerSecrets {
   databaseUrl: string;
   /** null: the key says "-disabled" (no model; the tick claims nothing). */
   modelKey: string | null;
+  /** SESSION_ANALYSIS_S3_CREDENTIALS=static only: the store's and the eraser's keys. */
+  s3?: AwsCredentials;
 }
 
 export function runnerSecrets(env: NodeJS.ProcessEnv): RunnerSecrets {
   const databaseUrl = runnerSecret(env, "SESSION_ANALYSIS_DATABASE_URL", "database_url");
   try { postgresConnectionString(databaseUrl); } catch { refuse("database_url_invalid"); }
   const key = runnerSecret(env, "SESSION_ANALYSIS_OPENAI_API_KEY", "model_key");
-  return { databaseUrl, modelKey: modelKey({ OPENAI_API_KEY: key }) };
+  const s3 = env.SESSION_ANALYSIS_S3_CREDENTIALS === "static" ? runnerStaticKeys(env) : undefined;
+  return { databaseUrl, modelKey: modelKey({ OPENAI_API_KEY: key }), ...(s3 ? { s3 } : {}) };
 }
 
-/** The store's and eraser's credentials: Pod Identity (cached, refreshed 5 min before expiry) or the env role. */
-export function runnerCredentials(env: NodeJS.ProcessEnv, mode: RunnerCredentialMode, fetcher: typeof fetch = fetch): () => Promise<AwsCredentials> {
+/** Static S3 keys (MinIO, or any S3-compatible store), each from exactly one of `<name>` or `<name>_FILE`. */
+export function runnerStaticKeys(env: NodeJS.ProcessEnv): AwsCredentials {
+  const accessKeyId = runnerSecret(env, "SESSION_ANALYSIS_S3_ACCESS_KEY_ID", "s3_access_key_id");
+  if (!/^[A-Za-z0-9._~+=-]{3,128}$/.test(accessKeyId)) refuse("s3_access_key_id_invalid");
+  const secretAccessKey = runnerSecret(env, "SESSION_ANALYSIS_S3_SECRET_ACCESS_KEY", "s3_secret_access_key");
+  if (secretAccessKey.length < 8 || secretAccessKey.length > 256) refuse("s3_secret_access_key_invalid");
+  const tokenSet = !!env.SESSION_ANALYSIS_S3_SESSION_TOKEN || !!env.SESSION_ANALYSIS_S3_SESSION_TOKEN_FILE;
+  const sessionToken = tokenSet ? runnerSecret(env, "SESSION_ANALYSIS_S3_SESSION_TOKEN", "s3_session_token") : undefined;
+  return { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) };
+}
+
+/**
+ * The store's and eraser's credentials: Pod Identity (cached, refreshed 5 min before expiry), the env
+ * role, or the static keys runnerSecrets read (a rotation needs a rollout, as for the model key).
+ */
+export function runnerCredentials(env: NodeJS.ProcessEnv, mode: RunnerCredentialMode, fetcher: typeof fetch = fetch, staticKeys?: AwsCredentials): () => Promise<AwsCredentials> {
+  if (mode === "static") {
+    if (!staticKeys) refuse("credentials_missing");
+    return async () => staticKeys!;
+  }
   if (mode === "podIdentity") {
     const uri = env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
     if (!uri) refuse("credentials_missing");
@@ -214,20 +284,61 @@ export interface RunnerPorts {
   eraserFactory?: (config: S3EraserConfig) => PagedEraser;
   pool?: (url: string, max: number) => HoopDb;
   fetcher?: typeof fetch;
+  /** The startup versioning check's reader (bucket-versioning.ts readBucketVersioning). */
+  versioning?: (check: BucketVersioningCheck) => Promise<"Enabled" | "not_versioned" | "unverified">;
 }
 
-/** The runner's analysisTick deps: the Lambda's builder over this pod's pool, bucket and credentials. */
-export function runnerAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerConfig, secrets: RunnerSecrets, ports: RunnerPorts = {}):
-  { deps: AnalysisTickDeps; db: HoopDb } {
-  const credentials = runnerCredentials(env, cfg.credentials, ports.fetcher);
+/**
+ * The one place the bucket, region, endpoint and credentials are resolved. The store, the sweeper's eraser
+ * (through analysisTickDeps) and the startup versioning check are all built from this same frozen object,
+ * so they cannot reach different stores or sign with different credentials. `endpoint` is present only
+ * when set, so the hosted default's store and eraser configs keep exactly their previous keys.
+ */
+export interface RunnerS3Target {
+  readonly bucket: string;
+  readonly region: string;
+  readonly endpoint?: string;
+  readonly credentials: () => Promise<AwsCredentials>;
+}
+
+export function runnerS3Target(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerConfig, secrets: Pick<RunnerSecrets, "s3">, fetcher?: typeof fetch): RunnerS3Target {
+  return Object.freeze({
+    bucket: cfg.bucket,
+    region: cfg.region,
+    ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}),
+    credentials: runnerCredentials(env, cfg.credentials, fetcher, secrets.s3),
+  });
+}
+
+/**
+ * Refuses a bucket the sweeper cannot erase by version id: `bucket_not_versioned` (Status not Enabled) or
+ * `bucket_versioning_unverified` (the store answered 4xx/501 or no readable document). Transient failures
+ * throw a plain coded error (exit 1). Runs only when cfg.versioningCheck (never on the hosted default), and
+ * before the pool, the store or the eraser exists: its GET is the only store request before a refusal.
+ */
+export async function assertRunnerBucketVersioned(cfg: Pick<AnalysisRunnerConfig, "versioningCheck">, target: RunnerS3Target, ports: RunnerPorts = {}): Promise<void> {
+  if (!cfg.versioningCheck) return;
+  const verdict = await (ports.versioning ?? readBucketVersioning)({
+    bucket: target.bucket, region: target.region, ...(target.endpoint ? { endpoint: target.endpoint } : {}), credentials: await target.credentials(),
+  });
+  if (verdict === "not_versioned") refuse("bucket_not_versioned");
+  if (verdict !== "Enabled") refuse("bucket_versioning_unverified");
+}
+
+/** The runner's analysisTick deps: the Lambda's builder over this pod's pool and its one resolved S3 target. */
+export function runnerAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerConfig, secrets: RunnerSecrets, ports: RunnerPorts = {},
+  target: RunnerS3Target = runnerS3Target(env, cfg, secrets, ports.fetcher)): { deps: AnalysisTickDeps; db: HoopDb; target: RunnerS3Target } {
   const db = (ports.pool ?? ((url, max) => supabasePool(url, max, postgresTlsOptions(env))))(secrets.databaseUrl, cfg.poolMax);
-  const store = (ports.store ?? createS3Store)({ bucket: cfg.bucket, region: cfg.region, credentials }) as unknown as ObjectStore;
+  const { bucket, region, credentials } = target;
+  const endpoint = target.endpoint ? { endpoint: target.endpoint } : {};
+  const store = (ports.store ?? createS3Store)({ bucket, region, ...endpoint, credentials }) as unknown as ObjectStore;
   const deps = analysisTickDeps({
     db,
     transact: (work) => transaction(db, work),
     store,
-    bucket: cfg.bucket,
-    region: cfg.region,
+    bucket,
+    region,
+    ...endpoint,
     keyPrefix: cfg.keyPrefix,
     readerMaxRuleset: cfg.readerMaxRuleset,
     modelKey: secrets.modelKey,
@@ -235,7 +346,7 @@ export function runnerAnalysisDeps(env: NodeJS.ProcessEnv, cfg: AnalysisRunnerCo
     env,
     ...(ports.eraserFactory ? { eraserFactory: ports.eraserFactory } : {}),
   });
-  return { deps, db };
+  return { deps, db, target };
 }
 
 export interface RunnerHealthState {
@@ -375,7 +486,11 @@ export async function analysisRunnerService(env: NodeJS.ProcessEnv = process.env
     const stopping = () => stop.signal.aborted;
     if (cfg && options.tick) tick = options.tick(stopping);
     else if (cfg && secrets) {
-      const built = runnerAnalysisDeps(env, cfg, secrets, options.ports);
+      // Before the pool, the store or anything listening: a bucket the sweeper cannot erase by version id
+      // is a refusal, and the versioning GET is the only store request made before it.
+      const target = runnerS3Target(env, cfg, secrets, options.ports?.fetcher);
+      await assertRunnerBucketVersioned(cfg, target, options.ports);
+      const built = runnerAnalysisDeps(env, cfg, secrets, options.ports, target);
       db = built.db;
       tick = runnerTick(env, analysisTick({ ...built.deps, stopping }), built.db, secrets.modelKey !== null, now);
     }
@@ -425,6 +540,11 @@ export function runnerTick(env: NodeJS.ProcessEnv, tick: AnalysisTickFn, db: Hoo
   });
 }
 
+/** The startup failure line's fields: the stage and the error's code only (log.ts allowlist), never its text. */
+export function runnerFailureFields(error: unknown): Record<string, unknown> {
+  return { stage: STAGE, ...errorFields(error), ok: false };
+}
+
 /** 2: refused configuration (do not retry unchanged); 1: any other startup failure. */
 export function runnerExitCode(error: unknown): 1 | 2 {
   return error instanceof AnalysisRunnerRefused ? 2 : 1;
@@ -434,6 +554,6 @@ if (import.meta.main)
   analysisRunnerService()
     .then(() => process.exit(0))
     .catch((error) => {
-      log.error("session analysis runner refused", { stage: STAGE, ...errorFields(error), ok: false });
+      log.error("session analysis runner refused", runnerFailureFields(error));
       process.exit(runnerExitCode(error));
     });

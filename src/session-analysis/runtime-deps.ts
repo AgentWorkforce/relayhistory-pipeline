@@ -35,6 +35,11 @@ export interface AnalysisRuntimeInputs {
   /** The pipeline (canonical) bucket and ITS region (the signing region, not the caller's). */
   bucket: string;
   region: string;
+  /**
+   * The S3-compatible store's origin (path-style), when not AWS S3: the same one the store was built
+   * with, so the sweeper's eraser reaches the same bucket. Unset (the Lambda, the hosted runner): AWS S3.
+   */
+  endpoint?: string;
   /** PIPELINE_KEY_PREFIX: the bare key root; the layout is always org-from-prefix. */
   keyPrefix: string;
   /** READER_MAX_RULESET, already parsed (reader-policy.ts readerMaxRuleset). */
@@ -56,7 +61,12 @@ export function analysisTickDeps(inputs: AnalysisRuntimeInputs): AnalysisTickDep
   const env = inputs.env ?? process.env;
   const makeEraser = inputs.eraserFactory ?? createS3Eraser;
   const key = inputs.modelKey;
-  const eraser = async () => makeEraser({ bucket: inputs.bucket, region: inputs.region, credentials: await inputs.credentials() });
+  const eraser = async () => makeEraser({
+    bucket: inputs.bucket,
+    region: inputs.region,
+    ...(inputs.endpoint ? { endpoint: inputs.endpoint } : {}),
+    credentials: await inputs.credentials(),
+  });
   return {
     config: analysisConfig(env),
     db: inputs.db,
