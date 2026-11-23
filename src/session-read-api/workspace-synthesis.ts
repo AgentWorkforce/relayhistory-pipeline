@@ -4,9 +4,10 @@
  * "true"). Off: the standard 501 envelope, reason `workspace_synthesis_disabled`, and nothing is read.
  *
  * Authority: the newest complete artifact for the exact workspace and window (session-analysis/workspace-synthesis.ts
- * latestWorkspaceSynthesis). Erasure: after the artifact is read, every session it considered is checked against the
- * pointer tombstones (Liveness.erased); if any is erased the artifact is not served (404, reason
- * `synthesis_invalidated`) until the job recomputes it, so an erased session never stays in a drilldown or a count.
+ * latestWorkspaceSynthesis). Erasure: after the artifact is read, every session its envelope records (`considered`
+ * and `related`: children and any other session its evidence belongs to) is checked against the pointer tombstones
+ * (Liveness.erased); if any is erased the artifact is not served (404, reason `synthesis_invalidated`) until the job
+ * recomputes it, so an erased session never stays in a drilldown or a count. Only `synthesis` is served.
  */
 import {
   latestWorkspaceSynthesis, SynthesisArtifactError, type SynthesisArtifact, type SynthesisArtifactStore,
@@ -18,12 +19,24 @@ export interface WorkspaceSynthesisSource {
   latest(orgId: string, workspaceId: string, window: { since: string; until: string }): Promise<SynthesisArtifact | null>;
 }
 
-/** The artifact store (the analysis result bucket) as the route's source; `root` is the job's root prefix. */
-export function storeWorkspaceSynthesis(store: SynthesisArtifactStore, root = ""): WorkspaceSynthesisSource {
+/** The artifact store as the route's source; `keyRoot` is the job's key root (the tenant base, e.g. PIPELINE_KEY_PREFIX). */
+export function storeWorkspaceSynthesis(store: SynthesisArtifactStore, keyRoot: string): WorkspaceSynthesisSource {
   return {
-    latest: (orgId, workspace, window) => latestWorkspaceSynthesis(store, { root, orgId, workspace, window }),
+    latest: (orgId, workspace, window) => latestWorkspaceSynthesis(store, { keyRoot, orgId, workspace, window }),
   };
 }
+
+/**
+ * The key root both readers use: the deployment's PIPELINE_KEY_PREFIX (the tenant base the job writes under), one
+ * lowercase segment. Unset or not one segment: undefined, and the route answers 501 workspace_synthesis_not_configured.
+ */
+export function synthesisKeyRoot(raw: string | undefined): string | undefined {
+  const root = (raw ?? "").replace(/^\/+|\/+$/gu, "");
+  return /^[a-z0-9][a-z0-9-]{0,62}$/u.test(root) ? root : undefined;
+}
+
+/** Keys per Liveness.erased call. */
+export const SYNTHESIS_ERASE_CHECK_BATCH = 500;
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/u;
 
@@ -59,7 +72,10 @@ export async function readWorkspaceSynthesis(input: {
   }
   if (!artifact) return { status: "not_found" };
   if (artifact.orgId !== input.orgId || artifact.workspace !== input.workspaceId) throw new TenantMismatchError();
-  const erased = artifact.sessions.length ? await input.liveness.erased(input.orgId, input.workspaceId, artifact.sessions) : new Set<string>();
-  if (erased.size > 0) return { status: "invalidated", erased: erased.size };
+  const all = [...artifact.considered, ...artifact.related];
+  for (let i = 0; i < all.length; i += SYNTHESIS_ERASE_CHECK_BATCH) {
+    const erased = await input.liveness.erased(input.orgId, input.workspaceId, all.slice(i, i + SYNTHESIS_ERASE_CHECK_BATCH));
+    if (erased.size > 0) return { status: "invalidated", erased: erased.size };
+  }
   return { status: "ok", synthesis: artifact.synthesis };
 }

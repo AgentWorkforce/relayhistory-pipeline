@@ -348,29 +348,14 @@ function bound(name: keyof TunableBounds, opts: SynthesisOptions): number {
   return v;
 }
 
-/** The sessions a synthesis of this cohort considers (analyzed or skipped), in (source, sessionId) order. */
-export function consideredSessions(rawCohort: unknown, opts: Pick<SynthesisOptions, "bounds"> = {}): SessionRef[] {
-  const max = bound("maxSessions", opts as SynthesisOptions);
-  return [...parseCohort(rawCohort).sessions].sort(refCompare).slice(0, max).map((e) => ({ source: e.source, sessionId: e.sessionId }));
-}
-
-export function synthesize(rawCohort: unknown, opts: SynthesisOptions): WorkspaceSynthesis {
-  if (!opts || opts.now === undefined) refuse("invalid_option", "opts.now is required (no clock is read)");
-  const now = isoTime(opts.now instanceof Date ? opts.now.toISOString() : opts.now, "opts.now");
-  const nowMs = Date.parse(now);
-  const staleAfterMs = opts.staleAfterMs ?? SYNTHESIS_DEFAULTS.staleAfterMs;
-  if (!Number.isSafeInteger(staleAfterMs) || staleAfterMs < 0) refuse("invalid_option", "staleAfterMs must be a non-negative integer");
-  const minRecurrence = opts.minRecurrence ?? SYNTHESIS_DEFAULTS.minRecurrence;
-  if (!Number.isSafeInteger(minRecurrence) || minRecurrence < 2) refuse("invalid_option", "minRecurrence must be an integer >= 2");
-  const maxSessions = bound("maxSessions", opts), maxDrilldown = bound("maxDrilldown", opts), maxIssues = bound("maxIssues", opts);
-  const maxEvidence = bound("maxEvidencePerIssue", opts), maxText = bound("maxTextChars", opts), maxBytes = bound("maxArtifactBytes", opts);
+/** The considered entries of a cohort and how each was classified; shared by synthesize and synthesisProvenance. */
+function considerCohort(rawCohort: unknown, opts: SynthesisOptions) {
+  const maxSessions = bound("maxSessions", opts);
   const accepted = new Set(opts.acceptedAnalysisVersions ?? [SESSION_ANALYSIS_VERSION, ...RELAYHISTORY_SESSION_ANALYSIS_VERSIONS]);
-
   const cohort = parseCohort(rawCohort);
   const sinceMs = Date.parse(cohort.window.since), untilMs = Date.parse(cohort.window.until);
   const offered = [...cohort.sessions].sort(refCompare);
   const entries = offered.slice(0, maxSessions);
-
   const skipped = Object.fromEntries(SKIP_REASONS.map((r) => [r, 0])) as Record<SkipReason, number>;
   const analyzed: AnalyzedSession[] = [];
   const consideredBySource = new Map<string, number>();
@@ -381,6 +366,42 @@ export function synthesize(rawCohort: unknown, opts: SynthesisOptions): Workspac
     if ("skip" in c) skipped[c.skip]++;
     else analyzed.push(c.ok);
   }
+  return { cohort, maxSessions, offered, entries, skipped, analyzed, consideredBySource };
+}
+
+/**
+ * Where a synthesis of this cohort comes from, for the stored envelope's erase check (never part of the output):
+ * `considered`, every session it considered (analyzed or skipped), and `related`, every other session an analyzed
+ * session's evidence belongs to (each evidence reference's own session, children included, and the snapshot's
+ * relatedSessionIds), both in (source, sessionId) order.
+ */
+export function synthesisProvenance(rawCohort: unknown, opts: SynthesisOptions): { considered: SessionRef[]; related: SessionRef[] } {
+  const { entries, analyzed } = considerCohort(rawCohort, opts);
+  const considered = entries.map((e) => ({ source: e.source, sessionId: e.sessionId }));
+  const seen = new Set(considered.map(sessionKey));
+  const related = new Map<string, SessionRef>();
+  const add = (source: string, sessionId: string) => {
+    const r = { source, sessionId }, k = sessionKey(r);
+    if (!seen.has(k)) related.set(k, r);
+  };
+  for (const a of analyzed) {
+    for (const ref of a.result.analysis.evidence.references) add(ref.source, ref.sessionId);
+    for (const id of a.result.analysis.evidence.relatedSessionIds) add(a.source, id);
+  }
+  return { considered, related: [...related.values()].sort(refCompare) };
+}
+
+export function synthesize(rawCohort: unknown, opts: SynthesisOptions): WorkspaceSynthesis {
+  if (!opts || opts.now === undefined) refuse("invalid_option", "opts.now is required (no clock is read)");
+  const now = isoTime(opts.now instanceof Date ? opts.now.toISOString() : opts.now, "opts.now");
+  const nowMs = Date.parse(now);
+  const staleAfterMs = opts.staleAfterMs ?? SYNTHESIS_DEFAULTS.staleAfterMs;
+  if (!Number.isSafeInteger(staleAfterMs) || staleAfterMs < 0) refuse("invalid_option", "staleAfterMs must be a non-negative integer");
+  const minRecurrence = opts.minRecurrence ?? SYNTHESIS_DEFAULTS.minRecurrence;
+  if (!Number.isSafeInteger(minRecurrence) || minRecurrence < 2) refuse("invalid_option", "minRecurrence must be an integer >= 2");
+  const maxDrilldown = bound("maxDrilldown", opts), maxIssues = bound("maxIssues", opts);
+  const maxEvidence = bound("maxEvidencePerIssue", opts), maxText = bound("maxTextChars", opts), maxBytes = bound("maxArtifactBytes", opts);
+  const { cohort, maxSessions, offered, entries, skipped, analyzed, consideredBySource } = considerCohort(rawCohort, opts);
   const n = analyzed.length;
   const caps: WorkspaceSynthesis["inputs"]["caps"] = {
     sessions: { limit: maxSessions, offered: offered.length, truncated: offered.length > maxSessions },

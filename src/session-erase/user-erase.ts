@@ -14,7 +14,8 @@
  *                batches/claims/stages and bounded only by USER_ERASE_STATEMENT_TIMEOUT_MS (a timeout rolls it
  *                back; the request stays purging and a rerun resumes). Waits out a live buffered-GC lease.
  *   3. bytes     every version and delete marker under each of the user's machine prefixes, for every captured
- *                origin: buffered batches, staged live batches, transcript objects and live pointers
+ *                origin: buffered batches, staged live batches, transcript objects and live pointers; and the
+ *                workspace's derived synthesis artifacts (workspace-synthesis-v1), which aggregate every user's sessions
  *   4. settle    wait, then a fresh strict listing of every prefix; anything found (a late in-flight PUT) is
  *                erased and the wait/verify repeats, up to `maxByteRounds`
  *   5. complete  only after every prefix verified empty; re-runs the "rows of the user remain" probe (a late row
@@ -33,6 +34,8 @@ import { createHash } from "node:crypto";
 import type { EraseCheckpoint, PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { liveBufferedPrefix, liveObjectPrefix, livePointerPrefix, liveStagedPrefix } from "../migration/neon-s3-erasure/live.ts";
 import { LEGACY_EXPORT_ORIGIN_ID } from "../shared/legacy-export-machine.ts";
+import { layoutComponent } from "../shared/layout-component.ts";
+import { SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory } from "../session-analysis/workspace-synthesis-layout.ts";
 
 export class UserEraseRefused extends Error {
   constructor(readonly code: string) {
@@ -226,6 +229,14 @@ export function userErasePrefixes(keyRoot: string, req: UserEraseRequest, origin
     out.push(liveBufferedPrefix(keyRoot, g), liveStagedPrefix(keyRoot, g), liveObjectPrefix(keyRoot, g), livePointerPrefix(keyRoot, g));
   }
   for (const p of out) if (!/\/m=srv_[0-9a-f]{32}\/$/.test(p)) refuse("prefix_invalid");
+  // The workspace's synthesis artifacts (src/session-analysis/workspace-synthesis.ts): every window, whatever user's
+  // sessions they aggregate. Derived and recomputable, so the whole directory goes; the job rebuilds it from a cohort
+  // without the erased user's sessions. An org-wide request (empty workspace) has no workspace directory to name.
+  if (req.workspaceId !== "") {
+    const synthesis = workspaceSynthesisDirectory(keyRoot, req.orgId, req.workspaceId);
+    if (!synthesis.endsWith(`/v1/ws=${layoutComponent(req.workspaceId)}/${SYNTHESIS_PREFIX_SEGMENT}`)) refuse("prefix_invalid");
+    out.push(synthesis);
+  }
   return [...new Set(out)];
 }
 

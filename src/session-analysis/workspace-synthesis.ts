@@ -1,29 +1,39 @@
 /**
  * The offline workspace-synthesis job and its stored artifact (docs/session-intel-workspace-synthesis.md, "Storage").
- * Next to the per-session analysis results (results.ts), under its own prefix: one artifact per workspace and window.
+ * Next to the per-session analysis results (results.ts), in the same analysis-result object family, one artifact per
+ * workspace and window:
  *
- *   {root}derived/workspace-synthesis-v1/ws=<workspace>/w=<sinceMs>-<untilMs>/g=<generatedAtMs, 13 digits>-<sha256>.json
+ *   {keyRoot}/{org}/v1/ws={workspace}/normalized/session-analysis-v2/workspace-synthesis-v1/w={sinceMs}-{untilMs}/g={generatedAtMs, 13 digits}-{sha256}.json
  *
- * The per-session results live under each session's manifest directory (`normalized/session-analysis-v2/`); a
- * workspace aggregate has no session to anchor to, so it gets a workspace-level prefix of its own, outside the raw
- * `v1/` layout that raw-layout readers parse. Keys sort by generation, so the newest is last.
+ * The per-session results sit under each session's manifest directory (`.../m=/h=/d=/s=/normalized/session-analysis-v2/`).
+ * A workspace aggregate has no session to anchor to, so it sits under the workspace directory instead, still inside
+ * the bucket's analysis-result glob (stacks ANALYSIS_RESULT_OBJECT_GLOB: `{keyRoot}/{any}/v1/{any}/normalized/session-analysis-v2/{any}`), and never ends in
+ * `/manifest.json` (so it is not notified) nor parses as a session key (so the pointer stage ignores it). The per-user
+ * erase (src/session-erase/user-erase.ts userErasePrefixes) deletes the workspace's whole synthesis directory.
+ * Keys sort by generation, so the newest is last.
  *
- * The artifact names every session it considered (`sessions`), so a reader can refuse it when any of them has been
- * erased since (read API: GET /v1/session-intel/synthesis). Writes are create-only and read back byte for byte.
+ * The artifact is an envelope around the unchanged workspace-synthesis/1 document: `considered` (every session it
+ * considered) and `related` (every other session the analyzed results' evidence belongs to, children included), so
+ * a reader refuses it when any of them has been erased (read API: GET /v1/session-intel/synthesis). Writes are
+ * create-only and read back byte for byte.
  * No clock, environment or network here: the store and `now` are injected.
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../../packages/object-store/src/index.ts";
 import { validateWorkspaceSynthesis } from "../session-intel/synthesis/schema.ts";
 import {
-  consideredSessions, SESSION_ID, SOURCE_ID, synthesize, WORKSPACE_ID,
+  SESSION_ID, SOURCE_ID, synthesisProvenance, synthesize,
   type SessionRef, type SynthesisOptions, type WorkspaceSynthesis,
 } from "../session-intel/synthesis/synthesize.ts";
+import { ORG_SEGMENT, SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory, workspaceSynthesisPrefix } from "./workspace-synthesis-layout.ts";
+
+export { SYNTHESIS_PREFIX_SEGMENT, workspaceSynthesisDirectory, workspaceSynthesisPrefix };
 
 export const SYNTHESIS_ARTIFACT_FORMAT = "workspace-synthesis-artifact/1";
-export const SYNTHESIS_PREFIX_SEGMENT = "derived/workspace-synthesis-v1/";
-/** The artifact (synthesis plus its considered-session list); the synthesis inside is itself capped at 256 KiB. */
-export const SYNTHESIS_ARTIFACT_MAX_BYTES = 1024 * 1024;
+/** The envelope (synthesis plus its provenance lists); the synthesis inside is itself capped at 256 KiB. */
+export const SYNTHESIS_ARTIFACT_MAX_BYTES = 4 * 1024 * 1024;
+/** Related sessions one artifact may record; more refuses the job (never a silently partial erase check). */
+export const SYNTHESIS_MAX_RELATED = 10_000;
 /** A lookup reads at most this many of the newest artifacts of one window before it gives up. */
 export const SYNTHESIS_LOOKUP_MAX_CANDIDATES = 5;
 /** A lookup lists at most this many keys of one window. */
@@ -42,8 +52,11 @@ export interface SynthesisArtifact {
   workspace: string;
   window: { since: string; until: string };
   generatedAt: string;
-  /** Every session the synthesis considered (analyzed or skipped), sorted: the erase check's input. */
-  sessions: SessionRef[];
+  /** Every session the synthesis considered (analyzed or skipped), sorted. */
+  considered: SessionRef[];
+  /** Every other session the analyzed results' evidence belongs to (children included), sorted. */
+  related: SessionRef[];
+  /** The workspace-synthesis/1 document, unchanged; the only part the route serves. */
   synthesis: WorkspaceSynthesis;
 }
 
@@ -58,18 +71,7 @@ export interface SynthesisArtifactStore {
 }
 
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-const ROOT = /^(?:[A-Za-z0-9][A-Za-z0-9_.=-]*\/)*$/u;
 const KEY_TAIL = /^g=(\d{13})-([0-9a-f]{64})\.json$/u;
-
-/** The prefix of one workspace and window. `root` is "" or `/`-terminated plain segments. */
-export function workspaceSynthesisPrefix(root: string, workspace: string, window: { since: string; until: string }): string {
-  if (!ROOT.test(root)) throw new SynthesisArtifactError("synthesis_root_invalid");
-  if (!WORKSPACE_ID.test(workspace) || workspace.includes("/")) throw new SynthesisArtifactError("synthesis_workspace_invalid");
-  const since = Date.parse(window.since), until = Date.parse(window.until);
-  if (!Number.isSafeInteger(since) || !Number.isSafeInteger(until) || since < 0 || since >= until) throw new SynthesisArtifactError("synthesis_window_invalid");
-  return `${root}${SYNTHESIS_PREFIX_SEGMENT}ws=${workspace}/w=${since}-${until}/`;
-}
-
 export function workspaceSynthesisKey(prefix: string, generatedAt: string, digest: string): string {
   const ms = Date.parse(generatedAt);
   if (!Number.isSafeInteger(ms) || ms < 0 || ms > 9_999_999_999_999 || !/^[0-9a-f]{64}$/u.test(digest)) throw new SynthesisArtifactError("synthesis_key_invalid");
@@ -84,26 +86,29 @@ export const artifactJson = (a: SynthesisArtifact) => `${JSON.stringify(a)}\n`;
  */
 export async function runWorkspaceSynthesisJob(input: {
   store: SynthesisArtifactStore;
-  root: string;
+  keyRoot: string;
   orgId: string;
   cohort: unknown;
   options: SynthesisOptions;
 }): Promise<{ key: string; sha256: string; bytes: number; outcome: "created" | "exists"; synthesis: WorkspaceSynthesis }> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,511}$/u.test(input.orgId)) throw new SynthesisArtifactError("synthesis_org_invalid");
+  if (!ORG_SEGMENT.test(input.orgId) || input.orgId.startsWith(".")) throw new SynthesisArtifactError("synthesis_org_invalid");
   const synthesis = synthesize(input.cohort, input.options);
+  const provenance = synthesisProvenance(input.cohort, input.options);
+  if (provenance.related.length > SYNTHESIS_MAX_RELATED) throw new SynthesisArtifactError("synthesis_related_bound");
   const artifact: SynthesisArtifact = {
     format: SYNTHESIS_ARTIFACT_FORMAT,
     orgId: input.orgId,
     workspace: synthesis.workspace,
     window: synthesis.window,
     generatedAt: synthesis.generatedAt,
-    sessions: consideredSessions(input.cohort, input.options),
+    considered: provenance.considered,
+    related: provenance.related,
     synthesis,
   };
   const bytes = new TextEncoder().encode(artifactJson(artifact));
   if (bytes.length > SYNTHESIS_ARTIFACT_MAX_BYTES) throw new SynthesisArtifactError("synthesis_artifact_bound");
   const digest = sha256(bytes);
-  const key = workspaceSynthesisKey(workspaceSynthesisPrefix(input.root, synthesis.workspace, synthesis.window), synthesis.generatedAt, digest);
+  const key = workspaceSynthesisKey(workspaceSynthesisPrefix(input.keyRoot, input.orgId, synthesis.workspace, synthesis.window), synthesis.generatedAt, digest);
   const outcome = await input.store.putNew(key, bytes, digest);
   const back = await input.store.get(key, SYNTHESIS_ARTIFACT_MAX_BYTES);
   if (!back || back.length !== bytes.length || sha256(back) !== digest) throw new SynthesisArtifactError("synthesis_write_verification_failed");
@@ -130,12 +135,14 @@ export function parseArtifact(bytes: Uint8Array, expect: { orgId: string; worksp
   }
   if (!a || typeof a !== "object" || a.format !== SYNTHESIS_ARTIFACT_FORMAT) return null;
   const keys = Object.keys(a).sort().join(",");
-  if (keys !== "format,generatedAt,orgId,sessions,synthesis,window,workspace") return null;
+  if (keys !== "considered,format,generatedAt,orgId,related,synthesis,window,workspace") return null;
   // Another tenant's artifact under this tenant's prefix is never served, and is loud.
   if (a.orgId !== expect.orgId) throw new SynthesisArtifactError("synthesis_cross_tenant");
   if (a.workspace !== expect.workspace || a.window?.since !== expect.window.since || a.window?.until !== expect.window.until) return null;
   if (Date.parse(a.generatedAt) !== expect.generatedAtMs) return null;
-  if (!Array.isArray(a.sessions) || a.sessions.length > 500 || !a.sessions.every((r) => r && typeof r === "object" && Object.keys(r).length === 2 && SOURCE_ID.test(r.source) && SESSION_ID.test(r.sessionId))) return null;
+  const refs = (list: unknown, max: number): list is SessionRef[] => Array.isArray(list) && list.length <= max
+    && list.every((r) => r && typeof r === "object" && Object.keys(r).length === 2 && SOURCE_ID.test(r.source) && SESSION_ID.test(r.sessionId));
+  if (!refs(a.considered, 500) || !refs(a.related, SYNTHESIS_MAX_RELATED)) return null;
   try {
     validateWorkspaceSynthesis(a.synthesis);
   } catch {
@@ -143,9 +150,9 @@ export function parseArtifact(bytes: Uint8Array, expect: { orgId: string; worksp
   }
   const s = a.synthesis;
   if (s.workspace !== a.workspace || s.window.since !== a.window.since || s.window.until !== a.window.until || s.generatedAt !== a.generatedAt) return null;
-  if (a.sessions.length !== s.inputs.considered) return null;
+  if (a.considered.length !== s.inputs.considered) return null;
   // Every session a drilldown or an issue names must be one the erase check covers.
-  const listed = new Set(a.sessions.map((r) => `${r.source}\u0000${r.sessionId}`));
+  const listed = new Set(a.considered.map((r) => `${r.source}\u0000${r.sessionId}`));
   if (!namedSessions(s).every((r) => listed.has(`${r.source}\u0000${r.sessionId}`))) return null;
   return a;
 }
@@ -157,9 +164,9 @@ export function parseArtifact(bytes: Uint8Array, expect: { orgId: string; worksp
  */
 export async function latestWorkspaceSynthesis(
   store: SynthesisArtifactStore,
-  lookup: { root: string; orgId: string; workspace: string; window: { since: string; until: string } },
+  lookup: { keyRoot: string; orgId: string; workspace: string; window: { since: string; until: string } },
 ): Promise<SynthesisArtifact | null> {
-  const prefix = workspaceSynthesisPrefix(lookup.root, lookup.workspace, lookup.window);
+  const prefix = workspaceSynthesisPrefix(lookup.keyRoot, lookup.orgId, lookup.workspace, lookup.window);
   const keys = (await store.list(prefix, SYNTHESIS_LOOKUP_MAX_KEYS))
     .filter((k) => k.startsWith(prefix) && KEY_TAIL.test(k.slice(prefix.length)))
     .sort()

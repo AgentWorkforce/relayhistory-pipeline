@@ -11,6 +11,7 @@ import { deliveryAccount, prepareDelivery } from "../../session-ingest/vendor/de
 import { TENANT, batch, record } from "../../session-ingest/__tests__/support.ts";
 import { authorityFixture, epoch, generation, identity } from "../../session-ingest/__tests__/privacy-authority-support.ts";
 import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
+import { workspaceSynthesisDirectory } from "../../session-analysis/workspace-synthesis-layout.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { legacyMachineId } from "../../shared/legacy-export-machine.ts";
 import { objectKey } from "../../shared/vendor.ts";
@@ -267,7 +268,11 @@ describe("operator per-user erase (058010)", () => {
     const bobLegacy = `96bulls/${BOB.orgId}/v1/ws=${BOB.workspaceId}/m=${legacyMachineId(BOB.workspaceId, BOB.userId)}/h=codex/d=2026/11/16/s=legacy-bob/manifest.json`;
     await f.deps.target.store.put(objectKey(aliceLegacy), new TextEncoder().encode("alice legacy") as never);
     await f.deps.target.store.put(objectKey(bobLegacy), new TextEncoder().encode("bob legacy") as never);
+    // A workspace synthesis artifact of Alice's workspace (it aggregates every user's sessions there).
+    const synthesisKey = `${workspaceSynthesisDirectory("96bulls", ALICE.orgId, ALICE.workspaceId)}w=0-1/g=0000000000001-${"a".repeat(64)}.json`;
+    await f.deps.target.store.put(objectKey(synthesisKey), new TextEncoder().encode("{}") as never);
     const before = await storeKeys(f);
+    expect(before).toContain(synthesisKey);
     expect(before.filter((k) => k.includes("/buffered-batches/") && k.includes(`/m=${machine(ALICE)}/`)).length).toBeGreaterThan(0);
     const bobKeys = before.filter((k) => k.includes(`/m=${machine(BOB)}/`));
     expect(bobKeys.length).toBeGreaterThan(0);
@@ -278,7 +283,8 @@ describe("operator per-user erase (058010)", () => {
     });
     // One captured ingest origin plus the synthetic legacy-export origin, with four live prefixes each.
     // User erasure intentionally walks both so it cannot complete while leaving a legacy copy behind.
-    expect(out).toMatchObject({ state: "bytes_verified", verified: true, prefixes: 8, byteRounds: 1 });
+    // Plus the workspace's synthesis directory.
+    expect(out).toMatchObject({ state: "bytes_verified", verified: true, prefixes: 9, byteRounds: 1 });
     expect(out.versionsDeleted).toBeGreaterThan(0);
     expect(sleeps).toEqual([5]);
     const after = await storeKeys(f);
@@ -286,6 +292,7 @@ describe("operator per-user erase (058010)", () => {
     expect(after.filter((k) => k.includes(`/m=${machine(BOB)}/`))).toEqual(bobKeys);
     expect(after.filter((k) => k.includes(`/m=${legacyMachineId(ALICE.workspaceId, ALICE.userId)}/`))).toEqual([]);
     expect(after).toContain(bobLegacy);
+    expect(after).not.toContain(synthesisKey);
     expect(await footprint(f, ALICE)).toEqual({}); // complete deleted the fence row with the bytes_verified transition
 
     // A rerun of the same request is a no-op that reports the completed erase.

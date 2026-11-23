@@ -41,7 +41,7 @@
  * 20261105062170 read functions and the directory; every other value = 501 unsupported_by_backend,
  * reason session_intel_disabled),
  * READ_API_WORKSPACE_SYNTHESIS_ENABLED (exactly "true": GET /v1/session-intel/synthesis, the stored
- * workspace-synthesis/1 artifacts through the raw-store secrets (PIPELINE_RAW_S3_*); without them 501
+ * workspace-synthesis/1 artifacts through the raw-store secrets (PIPELINE_RAW_S3_*) under PIPELINE_KEY_PREFIX; without them 501
  * workspace_synthesis_not_configured; every other value = 501 unsupported_by_backend, reason
  * workspace_synthesis_disabled),
  * READ_API_ANALYSIS_ENABLED (exactly "true": GET and POST /v1/sessions/:sessionId/analysis, lane
@@ -119,7 +119,7 @@ import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-pol
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
-import { storeWorkspaceSynthesis, type WorkspaceSynthesisSource } from "../../../src/session-read-api/workspace-synthesis.ts";
+import { storeWorkspaceSynthesis, synthesisKeyRoot, type WorkspaceSynthesisSource } from "../../../src/session-read-api/workspace-synthesis.ts";
 import { objectStoreArtifacts } from "../../../src/session-analysis/workspace-synthesis.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
@@ -840,7 +840,8 @@ export function workspaceSynthesisDeps(env: Env, fetcher: typeof fetch = (input,
     return fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
   };
   const raw = rawStoreFromEnv(env, bounded);
-  return raw ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store)) } : { enabled: true };
+  const keyRoot = synthesisKeyRoot(env.PIPELINE_KEY_PREFIX);
+  return raw && keyRoot ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store), keyRoot) } : { enabled: true };
 }
 
 export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | undefined, fetcher: typeof fetch = (input, init) => fetch(input, init)): AnalysisDeps | undefined {

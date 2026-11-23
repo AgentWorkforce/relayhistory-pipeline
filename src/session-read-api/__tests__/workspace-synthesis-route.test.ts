@@ -7,9 +7,10 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AuthError, createReadApi, type VerifiedIdentity } from "../app.ts";
 import { memoryLiveness } from "./support.ts";
-import { storeWorkspaceSynthesis, synthesisWindow, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
+import { storeWorkspaceSynthesis, synthesisKeyRoot, synthesisWindow, type WorkspaceSynthesisSource } from "../workspace-synthesis.ts";
 import { memoryArtifactStore, runWorkspaceSynthesisJob } from "../../session-analysis/workspace-synthesis.ts";
 import { workspaceSynthesisDeps } from "../../../packages/session-read-worker/src/index.ts";
+import { withChild } from "../../session-analysis/__tests__/workspace-synthesis-fixtures.ts";
 import type { SessionKey } from "../page.ts";
 
 const FIXTURE = new URL("../../session-intel/__tests__/fixtures/synthesis/", import.meta.url);
@@ -24,11 +25,11 @@ const verify = async (token: string) => {
 const SINCE = "2026-11-01T00:00:00.000Z", UNTIL = "2026-11-08T00:00:00.000Z";
 const PATH = `/v1/session-intel/synthesis?workspace=fx-ws-synthesis&since=${SINCE}&until=${UNTIL}`;
 
-async function storedSource(orgId = "fx-org") {
+async function storedSource(opts: { cohort?: unknown } = {}) {
   const store = memoryArtifactStore();
-  await runWorkspaceSynthesisJob({ store, root: "", orgId, cohort: JSON.parse(cohortText), options: { now: "2026-11-08T00:00:00.000Z" } });
+  await runWorkspaceSynthesisJob({ store, keyRoot: "fxroot", orgId: "fx-org", cohort: opts.cohort ?? JSON.parse(cohortText), options: { now: "2026-11-08T00:00:00.000Z" } });
   const calls: unknown[] = [];
-  const inner = storeWorkspaceSynthesis(store);
+  const inner = storeWorkspaceSynthesis(store, "fxroot");
   const source: WorkspaceSynthesisSource = { async latest(...args) { calls.push(args); return inner.latest(...args); } };
   return { source, calls, store };
 }
@@ -116,13 +117,29 @@ describe("GET /v1/session-intel/synthesis: serving and invalidation", () => {
       expect([erased.sessionId, r.status, r.body.error.reason]).toEqual([erased.sessionId, 404, "synthesis_invalidated"]);
       expect(JSON.stringify(r.body)).not.toContain(erased.sessionId);
     }
+    // A child session only the evidence belongs to (not in the cohort): erasing just the child invalidates.
+    for (const child of ["fx-s01-child", "fx-s01-spawned"]) {
+      const s = await storedSource({ cohort: withChild(JSON.parse(cohortText)) });
+      const ok = await get(api({ enabled: true, source: s.source }).app);
+      expect(ok.status).toBe(200);
+      expect(ok.body).toEqual(golden); // the served document is the unchanged workspace-synthesis/1 output
+      const r = await get(api({ enabled: true, source: s.source, erased: [{ source: "fx-claude", sessionId: child }] }).app);
+      expect([child, r.status, r.body.error.reason]).toEqual([child, 404, "synthesis_invalidated"]);
+    }
     // An erased session the artifact does not consider leaves it servable.
     const s = await storedSource();
     expect((await get(api({ enabled: true, source: s.source, erased: [{ source: "fx-claude", sessionId: "fx-unrelated" }] }).app)).status).toBe(200);
   });
 
   test("an artifact of another org is a 500 refusal, never served", async () => {
-    const s = await storedSource("fx-org-other");
+    const s = await storedSource();
+    // The token's org reads its own prefix; plant this org's artifact bytes there under another org id.
+    const [key, bytes] = [...s.store.objects][0]!;
+    const artifact = JSON.parse(new TextDecoder().decode(bytes));
+    const forged = new TextEncoder().encode(`${JSON.stringify({ ...artifact, orgId: "fx-org-other" })}\n`);
+    const digest = new Bun.CryptoHasher("sha256").update(forged).digest("hex");
+    s.store.objects.set(key.replace(/-[0-9a-f]{64}\.json$/u, `-${digest}.json`), forged);
+    s.store.objects.delete(key);
     const r = await get(api({ enabled: true, source: s.source }).app);
     expect([r.status, r.body.error.code]).toEqual([500, "internal"]);
   });
@@ -142,5 +159,8 @@ describe("GET /v1/session-intel/synthesis: serving and invalidation", () => {
 describe("Worker wiring", () => {
   test("without raw-store secrets the route is enabled without a source (501 not_configured)", () => {
     expect(workspaceSynthesisDeps({} as never)).toEqual({ enabled: true });
+    expect(synthesisKeyRoot(undefined)).toBeUndefined();
+    expect(synthesisKeyRoot("/fxroot/")).toBe("fxroot");
+    expect(synthesisKeyRoot("fx/root")).toBeUndefined();
   });
 });

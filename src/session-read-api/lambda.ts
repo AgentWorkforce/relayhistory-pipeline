@@ -42,7 +42,7 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * "true") exposes GET /v1/coordination/advisories and its POST ack (the ack only through the
  * self-host service: the Function URL handler is GET-only); READ_API_SESSION_INTEL_ENABLED (exactly "true")
  * exposes GET /v1/session-intel/workspace (migration 20261105062170 and the directory); READ_API_WORKSPACE_SYNTHESIS_ENABLED
- * (exactly "true") exposes GET /v1/session-intel/synthesis from READ_API_ANALYSIS_BUCKET (unset bucket = 501
+ * (exactly "true") exposes GET /v1/session-intel/synthesis from READ_API_ANALYSIS_BUCKET under PIPELINE_KEY_PREFIX (either unset = 501
  * workspace_synthesis_not_configured; flag off = 501 workspace_synthesis_disabled); READ_API_COORDINATION_OVERLAPS_BACKEND selects
  * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
  * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
@@ -106,7 +106,7 @@ import {
   READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
-import { storeWorkspaceSynthesis } from "./workspace-synthesis.ts";
+import { storeWorkspaceSynthesis, synthesisKeyRoot } from "./workspace-synthesis.ts";
 import { objectStoreArtifacts } from "../session-analysis/workspace-synthesis.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
@@ -736,8 +736,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const workspaceSynthesis = exactTrueFlag(env[READ_API_WORKSPACE_SYNTHESIS_ENABLED])
     ? {
         enabled: true as const,
-        ...(analysisBucket
-          ? { source: storeWorkspaceSynthesis(objectStoreArtifacts(createS3Store({ bucket: analysisBucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }))) }
+        ...(analysisBucket && synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)
+          ? { source: storeWorkspaceSynthesis(objectStoreArtifacts(createS3Store({ bucket: analysisBucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() })), synthesisKeyRoot(env.PIPELINE_KEY_PREFIX)!) }
           : {}),
       }
     : undefined;

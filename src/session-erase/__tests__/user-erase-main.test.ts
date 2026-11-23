@@ -34,7 +34,7 @@ describe("user-erase entry", () => {
     expect(code(() => parseUserEraseRequest("[]"))).toBe("request_invalid");
   });
 
-  test("prefixes: the four layouts per origin, each under the user's own machine id", () => {
+  test("prefixes: the four layouts per origin, each under the user's own machine id, then the workspace's synthesis directory", () => {
     const req = { requestId: "r", orgId: "org-a", workspaceId: "ws-a", userId: "user-1" };
     const m = liveMachineId("ws-a", "o1", "user-1");
     const legacy = liveMachineId("ws-a", LEGACY_EXPORT_ORIGIN_ID, "user-1");
@@ -47,12 +47,15 @@ describe("user-erase entry", () => {
       `96bulls/org-a/live-batches/v1/ws=ws-a/m=${legacy}/`,
       `96bulls/org-a/v1/ws=ws-a/m=${legacy}/`,
       `96bulls/org-a/live-sessions/v1/ws=ws-a/m=${legacy}/`,
+      // The workspace's derived synthesis artifacts, every window (session-analysis/workspace-synthesis-layout.ts).
+      "96bulls/org-a/v1/ws=ws-a/normalized/session-analysis-v2/workspace-synthesis-v1/",
     ]);
     expect(userErasePrefixes("96bulls", req, [])).toEqual([
       `96bulls/org-a/buffered-batches/v1/ws=ws-a/m=${legacy}/`,
       `96bulls/org-a/live-batches/v1/ws=ws-a/m=${legacy}/`,
       `96bulls/org-a/v1/ws=ws-a/m=${legacy}/`,
       `96bulls/org-a/live-sessions/v1/ws=ws-a/m=${legacy}/`,
+      "96bulls/org-a/v1/ws=ws-a/normalized/session-analysis-v2/workspace-synthesis-v1/",
     ]);
     expect(liveMachineId("ws-a", "o1", "user-2")).not.toBe(m);
   });
