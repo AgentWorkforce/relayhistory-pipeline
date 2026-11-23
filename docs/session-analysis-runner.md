@@ -373,7 +373,7 @@ clamps the same values again.
 ## Activation checklist (blocked)
 
 Each step needs Khaliq's explicit OK in his own words. A request relayed by another agent is not
-that OK.
+that OK, except as "Relayed approvals" in AGENTS.md describes.
 
 1. Migrations `062120` and `062130` are applied to the target database.
 2. The cutover rows are in place, and condition (d), `SESSION_ANALYSIS_CUTOVER_PROOF`, is proven.

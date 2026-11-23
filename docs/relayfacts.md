@@ -202,7 +202,7 @@ Out of scope, as follow-ups:
 
 ## Activation (gated on Khaliq)
 
-Each step needs Khaliq's own explicit OK; a relayed quote is not that OK.
+Each step needs Khaliq's own explicit OK; a relayed quote is not that OK, except as "Relayed approvals" in AGENTS.md describes.
 
 1. Apply migrations `20261105062080` and `20261105062090` (and, for hosted, `20261105062100`) with `.github/workflows/apply-session-schema.yml`: run it with mode `plan`, then with mode `apply` (environment `session-schema-production`), then confirm the sentinels.
 2. Set `SUMMARY_DECISION_RECORDS_ENABLED=true` on the ingest process that runs the operator erase, confirm it starts (startup requires the erase function), and only then turn on the extractor. On hosted, the extractor is the session-pipeline Lambda, and its switch is the sessions stack input `relayfacts` (`stacks/aws/session-pipeline.ts`). Turn it on only where an erase reaches these tables (see Retention): on hosted, only after `20261105062100` is applied and `SUMMARY_DECISION_RECORDS_ENABLED=true` is set on the operator user-erase job.
