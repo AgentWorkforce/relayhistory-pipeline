@@ -318,6 +318,28 @@ describe("session intelligence workspace wiring (READ_API_SESSION_INTEL_ENABLED)
   });
 });
 
+describe("workspace synthesis wiring (READ_API_WORKSPACE_SYNTHESIS_ENABLED)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("off unless exactly \"true\"; on without READ_API_ANALYSIS_BUCKET it has no source; with one it reads the bucket", async () => {
+    for (const value of [undefined, "", "1", "TRUE", " true"]) {
+      const built = await buildLambda(value === undefined ? {} : { READ_API_WORKSPACE_SYNTHESIS_ENABLED: value });
+      try { expect([value, built.deps.workspaceSynthesis]).toEqual([value, undefined]); } finally { await built.close(); }
+    }
+    const bare = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true" });
+    try { expect(bare.deps.workspaceSynthesis).toEqual({ enabled: true }); } finally { await bare.close(); }
+    const bucket = await buildLambda({ READ_API_WORKSPACE_SYNTHESIS_ENABLED: "true", READ_API_ANALYSIS_BUCKET: "fx-bucket", AWS_REGION: "us-east-1" });
+    try {
+      expect(bucket.deps.workspaceSynthesis?.enabled).toBe(true);
+      expect(typeof bucket.deps.workspaceSynthesis?.source?.latest).toBe("function");
+    } finally { await bucket.close(); }
+  });
+});
+
 describe("summary search backend selector (READ_API_SUMMARY_SEARCH_BACKEND)", () => {
   const LAMBDA_SECRET = JSON.stringify({
     supabase_url: PG_URL,

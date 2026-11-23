@@ -40,6 +40,10 @@
  * READ_API_SESSION_INTEL_ENABLED (exactly "true": GET /v1/session-intel/workspace through the
  * 20261105062170 read functions and the directory; every other value = 501 unsupported_by_backend,
  * reason session_intel_disabled),
+ * READ_API_WORKSPACE_SYNTHESIS_ENABLED (exactly "true": GET /v1/session-intel/synthesis, the stored
+ * workspace-synthesis/1 artifacts through the raw-store secrets (PIPELINE_RAW_S3_*); without them 501
+ * workspace_synthesis_not_configured; every other value = 501 unsupported_by_backend, reason
+ * workspace_synthesis_disabled),
  * READ_API_ANALYSIS_ENABLED (exactly "true": GET and POST /v1/sessions/:sessionId/analysis, lane
  * F1, migration 20261105046000, src/session-read-api/analysis-source.ts; see analysisDeps below;
  * every other value = GET 501 analysis_not_configured and POST 405, exactly as before the flag),
@@ -115,6 +119,8 @@ import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-pol
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
+import { storeWorkspaceSynthesis, type WorkspaceSynthesisSource } from "../../../src/session-read-api/workspace-synthesis.ts";
+import { objectStoreArtifacts } from "../../../src/session-analysis/workspace-synthesis.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
 import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
 import { rawStoreFromEnv, type RawStore } from "../../pipeline/src/lib/pipeline/adapter.ts";
@@ -203,6 +209,8 @@ export interface Env extends CanonicalEnv {
   READ_API_COORDINATION_ADVISORIES_ENABLED?: string;
   /** Exactly "true": serve GET /v1/session-intel/workspace (sqlSessionIntel and the directory). */
   READ_API_SESSION_INTEL_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/session-intel/synthesis (the stored artifacts in the raw store). */
+  READ_API_WORKSPACE_SYNTHESIS_ENABLED?: string;
   /**
    * `<kind>:<urgency>` rows whose advisories are notifyEligible (advisory-priority.ts); default empty. Malformed: the
    * two advisory routes (GET /v1/coordination/advisories and GET /v1/session-intel/workspace) answer 503; every other
@@ -670,6 +678,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     ...workerAdvisoryDeps(env, tenant.run, advisoryNotifyRows),
     ...(exactTrueFlag(env.READ_API_SESSION_INTEL_ENABLED) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(tenant.run) } } : {}),
+    ...(exactTrueFlag(env.READ_API_WORKSPACE_SYNTHESIS_ENABLED) ? { workspaceSynthesis: workspaceSynthesisDeps(env, overrides.fetcher) } : {}),
     // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
     ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) && exactTrueFlag(env.READ_API_SUMMARY_FALLBACK_ENABLED)
@@ -820,6 +829,20 @@ function recordedSizeStore(store: Store, recorded: ReadonlyMap<string, number>):
  *                   analysis_admission_not_configured, GET unchanged.
  * Without the raw store: undefined, so GET and POST answer 501 analysis_not_configured.
  */
+/**
+ * GET /v1/session-intel/synthesis on this Worker: the artifacts in the raw store, every fetch bounded like the
+ * analysis result reads. Without the raw-store secrets: enabled without a source (501
+ * workspace_synthesis_not_configured).
+ */
+export function workspaceSynthesisDeps(env: Env, fetcher: typeof fetch = (input, init) => fetch(input, init)): { enabled: true; source?: WorkspaceSynthesisSource } {
+  const bounded: typeof fetch = (input, init) => {
+    const deadline = AbortSignal.timeout(ANALYSIS_RESULT_DEADLINE_MS);
+    return fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline });
+  };
+  const raw = rawStoreFromEnv(env, bounded);
+  return raw ? { enabled: true, source: storeWorkspaceSynthesis(objectStoreArtifacts(raw.store)) } : { enabled: true };
+}
+
 export function analysisDeps(env: Env, run: TenantRunner, admit: AdmitPool | undefined, fetcher: typeof fetch = (input, init) => fetch(input, init)): AnalysisDeps | undefined {
   const bounded: typeof fetch = (input, init) => {
     const deadline = AbortSignal.timeout(ANALYSIS_RESULT_DEADLINE_MS);

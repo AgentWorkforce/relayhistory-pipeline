@@ -199,16 +199,66 @@ and fixed notes; a test walks the output to prove it. No scrub logic lives here.
 handoffs, now. `workspace-synthesis/1` is the retrospective aggregate over analysis results for a window. They share
 the workspace scoping and the session reference shape `{source, sessionId}`, and nothing else.
 
-## Read design
+## Storage: the offline job
 
-- **Route.** A read route, off by default: it answers the read API's standard `501 unsupported_by_backend` envelope
-  unless its flag is exactly `true`, with the same workspace attestation and canary as `/v1/session-intel/workspace`.
-- **Storage and authority.** An offline job writes one artifact per workspace and window under its own result prefix.
-  For a lookup, the authoritative artifact is the newest complete one for the exact workspace and window.
-- **Freshness.** The artifact is refreshed when the cohort changes; its `generatedAt` and `freshness` say how current
-  it is.
-- **Erasure.** An artifact that cites an erased session must not be served: the read path checks every session it
-  names against the erase record and refuses (or the job recomputes) when any is erased, so an erased session never
-  stays in a drilldown or a count.
+[`src/session-analysis/workspace-synthesis.ts`](../src/session-analysis/workspace-synthesis.ts) `runWorkspaceSynthesisJob`
+synthesizes a cohort and writes ONE artifact for its workspace and window, next to the per-session analysis results
+but under its own prefix (a workspace aggregate has no session manifest to anchor to, so it stays outside the raw
+`v1/` layout that raw-layout readers parse):
 
-Real data and any production enablement are later steps, gated by Khaliq.
+```
+{root}derived/workspace-synthesis-v1/ws=<workspace>/w=<sinceMs>-<untilMs>/g=<generatedAtMs, 13 digits>-<sha256>.json
+```
+
+The artifact is `{format: "workspace-synthesis-artifact/1", orgId, workspace, window, generatedAt, sessions,
+synthesis}`: `sessions` lists every session the synthesis considered (analyzed or skipped, in `(source, sessionId)`
+order), and `synthesis` is the `workspace-synthesis/1` document. It is at most 1 MiB. Writes are create-only and read
+back byte for byte; the same cohort with the same `now` gives the same key, so a rerun is a no-op. The job takes a
+store interface (`SynthesisArtifactStore`); `objectStoreArtifacts` adapts an `ObjectStore` and `memoryArtifactStore`
+serves tests. The job reads no clock and no environment.
+
+## Read route
+
+```
+GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>
+```
+
+- **Gating.** Unless `READ_API_WORKSPACE_SYNTHESIS_ENABLED` is exactly `true`, the route answers the standard
+  `501 unsupported_by_backend` envelope, reason `workspace_synthesis_disabled`, and reads nothing. Enabled without an
+  artifact store bound, it is `501 workspace_synthesis_not_configured`. Wired on the read app, the hosted Lambda (the
+  artifacts in `READ_API_ANALYSIS_BUCKET`) and the read Worker (the raw store, `PIPELINE_RAW_S3_*`), root prefix `""`.
+- **Auth and scope, as `GET /v1/session-intel/workspace`.** The bearer's `401` first; `workspace` exactly once and
+  equal to the token's (`403` otherwise; absent is `501 org_scope`); the `coordination` canary; `since` and `until`
+  exactly once each (`400` when missing, repeated, not ISO-8601 with a zone, empty or over 30 days); any other
+  parameter is `501 param_<name>`.
+- **Authority.** The newest complete artifact for the exact workspace and window: the newest by its key's generation
+  whose bytes match the key's digest, whose org, workspace, window and generation match, whose synthesis passes the
+  schema and invariants, and whose `sessions` covers every session a drilldown or issue names. Up to 5 of the newest
+  are tried; none is `404 not_found`. An artifact of another org under the prefix is a `500` refusal.
+- **Erasure.** After the artifact is read, every session in its `sessions` is checked against the pointer
+  tombstones (`Liveness.erased`: a session whose every pointer row is tombstoned). If any is erased the artifact is
+  not served: `404 not_found`, reason `synthesis_invalidated`, until the job recomputes it from a cohort without that
+  session. So an erased session never stays in a drilldown or a count, skipped sessions included.
+- **Freshness.** The job is rerun when the cohort changes; the new artifact's later generation makes it the
+  authoritative one. `generatedAt` and `freshness` in the body say how current it is.
+- **Body.** The `workspace-synthesis/1` document only (no org id, no session list). A store failure is `503`.
+
+## Running the CLI
+
+```
+bun src/session-intel/synthesis/cli.ts --in <cohort.json> --out <dir> --now <ISO> [--allow-repo-out]
+```
+
+Writes `<dir>/synthesis.json` (the exact bytes the golden pins) and a short `<dir>/synthesis.md`. `--now` is
+required; the CLI reads no clock, environment or network. Outputs name sessions, so `--out` inside this repository is
+refused unless `--allow-repo-out` is given (synthetic runs only), as the replay CLI does. For the fixture:
+
+```
+bun src/session-intel/synthesis/cli.ts --in src/session-intel/__tests__/fixtures/synthesis/cohort.json \
+  --out /tmp/synthesis --now 2026-11-08T00:00:00.000Z
+```
+
+Regenerate the fixture with `bun src/session-intel/__tests__/fixtures/synthesis/make-cohort.ts`, then the golden with
+the CLI (`--out` a temporary directory, then copy `synthesis.json` to `expected-synthesis.json`).
+
+Production enablement, real data and any deploy are separate steps, gated by Khaliq.

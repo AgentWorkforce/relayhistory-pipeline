@@ -66,6 +66,10 @@ import { SummaryFallbackError, sessionSummaryBody, type SummaryFallback } from "
  *   GET /v1/session-intel/workspace the Session Intelligence workspace view (alerts, status,
  *                                   handoffs, coverage), off unless READ_API_SESSION_INTEL_ENABLED
  *                                   =true (501 `session_intel_disabled`); the advisories' auth and canary.
+ *   GET /v1/session-intel/synthesis the stored workspace-synthesis/1 artifact of a window, off unless
+ *                                   READ_API_WORKSPACE_SYNTHESIS_ENABLED=true (501
+ *                                   `workspace_synthesis_disabled`); the same auth and canary, and an
+ *                                   artifact citing an erased session is never served.
  *   GET /v1/sessions/titles        cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
@@ -109,6 +113,7 @@ import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type 
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { ADVISORIES_CONTRACT, ADVISORIES_INSTANCE_CONTRACT, advisoryItem, type AdvisoriesSource } from "./coordination-advisories.ts";
 import { SessionIntelUnsupported, workspaceView, type SessionIntelSource } from "./session-intel-workspace.ts";
+import { readWorkspaceSynthesis, synthesisWindow, type WorkspaceSynthesisSource } from "./workspace-synthesis.ts";
 import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import {
@@ -339,6 +344,13 @@ export interface ReadApiDeps {
    * is read.
    */
   sessionIntel?: { enabled: boolean; source: SessionIntelSource };
+  /**
+   * READ_API_WORKSPACE_SYNTHESIS_ENABLED=true (workspace-synthesis.ts): GET /v1/session-intel/synthesis, the stored
+   * workspace-synthesis/1 artifact of a workspace and window. Absent or not enabled: the standard 501
+   * `unsupported_by_backend` envelope with reason `workspace_synthesis_disabled`, and nothing is read. Enabled
+   * without a source (no artifact store bound): 501 `workspace_synthesis_not_configured`.
+   */
+  workspaceSynthesis?: { enabled: boolean; source?: WorkspaceSynthesisSource };
   /**
    * READ_API_ADVISORY_NOTIFY_ROWS, parsed (advisory-priority.ts parseAdvisoryNotifyRows): the (kind, urgency) rows
    * whose advisories carry `notifyEligible: true` on both advisory routes. Absent = empty: none.
@@ -2452,6 +2464,34 @@ export function createReadApi(deps: ReadApiDeps) {
     } catch (error) {
       if (error instanceof SessionIntelUnsupported) return fail(c, unsupported(error.reason));
       return directoryFail(c, error);
+    }
+  });
+
+  /**
+   * The workspace synthesis (docs/session-intel-workspace-synthesis.md): the newest complete stored artifact for
+   * the exact workspace and window. Auth and scope as the workspace view: the workspace attested from the token,
+   * the `coordination` canary; `since` and `until` exactly once, no other parameter. An artifact that cites an
+   * erased session is not served (404, reason synthesis_invalidated); the erase check runs after the read.
+   */
+  app.get("/v1/session-intel/synthesis", async (c) => {
+    const synthesis = deps.workspaceSynthesis;
+    if (synthesis?.enabled !== true) return fail(c, unsupported("workspace_synthesis_disabled"));
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "coordination");
+      rejectUnsupported(c);
+      for (const name of Object.keys(c.req.query())) if (name !== "workspace" && name !== "since" && name !== "until") throw unsupported(`param_${name}`);
+      const window = synthesisWindow(single(c, "since"), single(c, "until"));
+      if (typeof window === "string") throw bad(window);
+      if (!synthesis.source) throw unsupported("workspace_synthesis_not_configured");
+      const read = await readWorkspaceSynthesis({ source: synthesis.source, liveness: deps.liveness, orgId: identity.orgId, workspaceId: identity.workspaceId, window });
+      if (read.status === "not_found") throw new HttpError(404, "not_found", "no workspace synthesis for this window");
+      if (read.status === "invalidated")
+        throw new HttpError(404, "not_found", "the workspace synthesis for this window cites an erased session and awaits recomputation", "synthesis_invalidated");
+      return c.json(read.synthesis);
+    } catch (error) {
+      return fail(c, error);
     }
   });
 

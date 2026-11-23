@@ -43,6 +43,11 @@ export const READ_API_ADVISORY_PRIORITY_ENABLED = "READ_API_ADVISORY_PRIORITY_EN
 export const READ_API_ADVISORY_INSTANCE_ENABLED = "READ_API_ADVISORY_INSTANCE_ENABLED";
 /** Exactly "true" (exactTrueFlag): GET /v1/session-intel/workspace; anything else = 501 `unsupported_by_backend`, reason `session_intel_disabled`. */
 export const READ_API_SESSION_INTEL_ENABLED = "READ_API_SESSION_INTEL_ENABLED";
+/**
+ * Exactly "true" (exactTrueFlag): GET /v1/session-intel/synthesis, the stored workspace-synthesis/1 artifact;
+ * anything else = 501 `unsupported_by_backend`, reason `workspace_synthesis_disabled`.
+ */
+export const READ_API_WORKSPACE_SYNTHESIS_ENABLED = "READ_API_WORKSPACE_SYNTHESIS_ENABLED";
 
 /**
  * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND: unset or "" = "clickhouse" (the default,

@@ -41,7 +41,9 @@ import { sqlRelayfacts } from "./relayfacts.ts";
  * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_ADVISORIES_ENABLED (exactly
  * "true") exposes GET /v1/coordination/advisories and its POST ack (the ack only through the
  * self-host service: the Function URL handler is GET-only); READ_API_SESSION_INTEL_ENABLED (exactly "true")
- * exposes GET /v1/session-intel/workspace (migration 20261105062170 and the directory); READ_API_COORDINATION_OVERLAPS_BACKEND selects
+ * exposes GET /v1/session-intel/workspace (migration 20261105062170 and the directory); READ_API_WORKSPACE_SYNTHESIS_ENABLED
+ * (exactly "true") exposes GET /v1/session-intel/synthesis from READ_API_ANALYSIS_BUCKET (unset bucket = 501
+ * workspace_synthesis_not_configured; flag off = 501 workspace_synthesis_disabled); READ_API_COORDINATION_OVERLAPS_BACKEND selects
  * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
  * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
  * /v1/sessions/summaries/activity) on this entry too; unset/any other value = 501
@@ -99,11 +101,13 @@ import {
   coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, parseSummarySearchBackend, readApiRouteEnabled,
   type SummarySearchBackendKind,
   READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_ADVISORIES_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
-  READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
+  READ_API_LIST_READINESS_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED, READ_API_RELAYFACTS_ENABLED, READ_API_SESSION_INTEL_ENABLED, READ_API_SESSION_SOURCES_ENABLED, READ_API_WORKSPACE_SYNTHESIS_ENABLED, READ_API_SUMMARY_SEARCH_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND, READ_API_ADVISORY_PRIORITY_ENABLED, READ_API_ADVISORY_INSTANCE_ENABLED,
   READ_API_SESSION_PARTIAL_RETRYABLE, sessionPartialRetryableFlag,
 } from "./config.ts";
 import { sqlSessionIntel } from "./session-intel-workspace.ts";
+import { storeWorkspaceSynthesis } from "./workspace-synthesis.ts";
+import { objectStoreArtifacts } from "../session-analysis/workspace-synthesis.ts";
 import { parseAdvisoryNotifyRows, READ_API_ADVISORY_NOTIFY_ROWS } from "./advisory-priority.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
@@ -728,6 +732,15 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
         admitPool as never,
       )
     : undefined;
+  // The workspace synthesis artifacts sit in the analysis result bucket (session-analysis/workspace-synthesis.ts).
+  const workspaceSynthesis = exactTrueFlag(env[READ_API_WORKSPACE_SYNTHESIS_ENABLED])
+    ? {
+        enabled: true as const,
+        ...(analysisBucket
+          ? { source: storeWorkspaceSynthesis(objectStoreArtifacts(createS3Store({ bucket: analysisBucket, region: env.AWS_REGION ?? "", credentials: async () => lambdaCredentials() }))) }
+          : {}),
+      }
+    : undefined;
   let narrative: Awaited<ReturnType<typeof selfhostNarrativeFromEnv>>;
   try {
   // Directory, liveness and Postgres search isolation is forced RLS. Checked on
@@ -805,6 +818,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(advisoryInstance ? { advisoryInstance: true } : {}),
     // The Session Intelligence workspace view: the 062170 readers and the directory, READ ONLY on the read-role pool.
     ...(exactTrueFlag(env[READ_API_SESSION_INTEL_ENABLED]) ? { sessionIntel: { enabled: true as const, source: sqlSessionIntel(poolTenantRunner(pool as never)) } } : {}),
+    ...(workspaceSynthesis ? { workspaceSynthesis } : {}),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
