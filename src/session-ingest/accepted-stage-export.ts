@@ -1133,7 +1133,9 @@ export function failureCode(error: unknown): string {
 /**
  * The seat of every kept line of a live stage, from its SEAT_PAGE row, under the publication path's rules
  * (publication-rpc.ts / publication-image.ts): `parseReceiptSeatSnapshot` over the attempt's records and the stage's
- * ordinals, then `acceptedReceiptSeat` per kept ordinal with the stage's reset epoch and the head's fence epoch. Throws
+ * ordinals, then `acceptedReceiptSeat` per kept ordinal with the stage's reset epoch and the head's fence epoch. The
+ * reset epoch passed is the stage's own (`ingest_stage_intents.reset_epoch`); that it equals the user's current reset
+ * count is already required by the live verdict in VERDICT_PAGE (`st.resets = st.reset_epoch`). Throws
  * a closed code when any seat is not proven: `seat_row` (no single row for these exact stage bytes), `seat_not_lazy`,
  * `seat_precondition` (the guard or the stage checks), `seat_missing` (the decision rows do not cover every ordinal),
  * `publication_seats_<cause>` (including `losing_body`: a not-accepted candidate), `seat_scope`, `seat_duplicate`.

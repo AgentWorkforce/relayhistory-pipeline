@@ -99,7 +99,9 @@ let nextSeat = HIGH;
  * key material is the reader's exact candidate key array (built in SQL), its native slot and its ACK decision. A line
  * with `accepted: false` lost to an earlier body (another first digest).
  */
-async function seed(groups: SeedGroup[], o: { key?: string; sha256?: string; digest?: string; claim?: string; epochs?: unknown[] } = {}): Promise<Seeded> {
+async function seed(groups: SeedGroup[], o: { key?: string; sha256?: string; digest?: string; claim?: string; epochs?: unknown[]; fence?: Record<string, number> } = {}): Promise<Seeded> {
+  // The claim's fence epoch per session (default 0): the claim's epochs, the seat's key and the decision all carry it.
+  const fe = (session: string) => o.fence?.[session] ?? 0;
   const batchId = randomUUID(), digest = o.digest ?? sha(batchId), claim = o.claim ?? randomUUID(), token = randomUUID();
   const sha256 = o.sha256 ?? sha(token);
   const key = o.key ?? stagedKey(ROOT, { org_id: A.orgId, workspace_id: A.workspaceId, origin_id: ORIGIN, user_id: A.userId, batch_digest: digest, claim_token: claim }, sha256, "buffered-batches");
@@ -108,7 +110,7 @@ async function seed(groups: SeedGroup[], o: { key?: string; sha256?: string; dig
   const lines = groups.flatMap((g, gi) => g.records.map((r, j) => ({ ord: groupOrdinals[gi]![j]!, g, r, digest: sha(`${r.id}:${r.rev}`) })));
   const records = lines.map((l) => ({ ord: l.ord, source: l.g.source, session_id: l.g.session, record_id: l.r.id, revision: l.r.rev, digest: l.digest }));
   const sessions = [...new Map(groups.map((g) => [JSON.stringify([g.source, g.session]), g])).values()];
-  const epochs = o.epochs ?? sessions.map((g) => ({ source: g.source, session_id: g.session, epoch: 0, reset_epoch: 0 }));
+  const epochs = o.epochs ?? sessions.map((g) => ({ source: g.source, session_id: g.session, epoch: fe(g.session), reset_epoch: 0 }));
   await db.exec("SET session_replication_role = replica");
   await db.query(`INSERT INTO sessions.ingest_batches (org_id, workspace_id, origin_id, batch_id, user_id, digest, receipt_id, state, committed_at, publication_state)
     VALUES ($1,$2,$3,$4,$5,$6,$7,'committed',now(),'buffered')`, [A.orgId, A.workspaceId, ORIGIN, batchId, A.userId, digest, `rhr_${hex("c")}`]);
@@ -130,19 +132,19 @@ async function seed(groups: SeedGroup[], o: { key?: string; sha256?: string; dig
     const gi = groups.indexOf(l.g);
     seats[gi]![l.g.records.indexOf(l.r)] = String(seat);
     await db.query(`WITH m AS (SELECT jsonb_build_array('buffer-first-ack-seat-v1', $1::text, $2::text, $3::text, $4::text, $5::text, $6::text,
-               $7::text, $8::text, '0'::text, $9::text, $10::text, '0'::text) AS m)
+               $7::text, $8::text, '0'::text, $9::text, $10::text, $13::text) AS m)
       INSERT INTO sessions.ingest_receipt_seats (key_sha256, key_material, seat, first_digest, source, session_id, fence_epoch)
-      SELECT encode(sha256(convert_to(m.m::text, 'UTF8')), 'hex'), m.m, $11, $12, $9, $10, 0 FROM m`,
-      [EPOCH, IDENTITY, A.orgId, A.workspaceId, A.userId, ORIGIN, l.r.id, String(l.r.rev), l.g.source, l.g.session, seat, first]);
+      SELECT encode(sha256(convert_to(m.m::text, 'UTF8')), 'hex'), m.m, $11, $12, $9, $10, $13::bigint FROM m`,
+      [EPOCH, IDENTITY, A.orgId, A.workspaceId, A.userId, ORIGIN, l.r.id, String(l.r.rev), l.g.source, l.g.session, seat, first, String(fe(l.g.session))]);
     const seatKey = (await db.query<{ k: string }>("SELECT key_sha256 AS k FROM sessions.ingest_receipt_seats WHERE seat = $1", [seat])).rows[0]!.k;
     await db.query(`INSERT INTO sessions.ingest_lazy_native_slots (key_sha256, key_material, org_id, workspace_id, origin_id, record_id, source_identity_sha256, control_epoch,
         initialized_witness_sha256, current_owner, current_source, current_session, current_revision, current_digest, current_reset_epoch, current_fence_epoch, current_seat_key)
-      VALUES ($1,'[]',$2,$3,$4,$5,$6,$7,$6,$8,$9,$10,$11,$12,0,0,$13)`,
-      [slotKey, A.orgId, A.workspaceId, ORIGIN, l.r.id, IDENTITY, EPOCH, A.userId, l.g.source, l.g.session, l.r.rev, first, seatKey]);
+      VALUES ($1,'[]',$2,$3,$4,$5,$6,$7,$6,$8,$9,$10,$11,$12,0,$14,$13)`,
+      [slotKey, A.orgId, A.workspaceId, ORIGIN, l.r.id, IDENTITY, EPOCH, A.userId, l.g.source, l.g.session, l.r.rev, first, seatKey, fe(l.g.session)]);
     await db.query(`INSERT INTO sessions.ingest_lazy_ack_decisions (claim_token, ord, native_key_sha256, native_lineage, candidate_key_sha256, candidate_digest, first_digest,
         body_accepted, seat_key_sha256, reset_epoch, fence_epoch, generation, source_control_version, source_witness_sha256)
-      VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $4, 0, 0, $8, 0, $8)`,
-      [claim, l.ord, slotKey, seatKey, l.digest, first, accepted, GEN]);
+      VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $4, 0, $9, $8, 0, $8)`,
+      [claim, l.ord, slotKey, seatKey, l.digest, first, accepted, GEN, fe(l.g.session)]);
   }
   await db.exec("SET session_replication_role = origin");
   await prove();
@@ -242,6 +244,8 @@ describe("SEAT_PAGE against sessions.ingest_lazy_stage_seats", () => {
     ["seat at or below the clock's high water", "UPDATE sessions.ingest_receipt_seat_clock SET allocated_high_water = (SELECT min(seat) FROM sessions.ingest_receipt_seats)", "seat_missing"],
     ["native slot under another epoch", `UPDATE sessions.ingest_lazy_native_slots SET control_epoch = '${hex("8")}' WHERE record_id = 'a'`, "seat_missing"],
     ["seat above the clock's last seat", `UPDATE sessions.ingest_receipt_seat_clock SET last_seat = ${HIGH + 1}`, "publication_seats_seat"],
+    // Only SEAT_PAGE's groups_ok sees this (an ordinal twice): without it the stage would read as seat_missing.
+    ["an ordinal listed twice in the stage's groups", `UPDATE sessions.ingest_stage_intents SET group_ordinals = '[[0,0],[1]]'`, "seat_precondition"],
     ["a session listed twice in the claim's epochs", `UPDATE sessions.ingest_claim_attempts SET epochs = epochs || '[{"source":"codex","session_id":"sess-2","epoch":1,"reset_epoch":0}]'`, "seat_missing"],
   ];
   for (const [name, change, code] of changes)
@@ -266,6 +270,78 @@ describe("SEAT_PAGE against sessions.ingest_lazy_stage_seats", () => {
     expect(raised).toBeDefined();
     expect(row).toMatchObject({ lazy: false, policy_ok: false });
     expect(failCode(() => seatsOf(s, row))).toBe("seat_not_lazy");
+  });
+
+  // One session at fence epoch 1: the claim, its decisions and the head (ingest_fence_versions) all say 1.
+  const fenceAt = async (epoch: number) =>
+    db.query("INSERT INTO sessions.ingest_fence_versions (org_id, workspace_id, user_id, origin_id, source, session_id, epoch) VALUES ($1,$2,$3,$4,'claude','sess-1',$5)",
+      [A.orgId, A.workspaceId, A.userId, ORIGIN, epoch]);
+  test("fence epoch 1: the same snapshot as the real function, and the export writes v3 with that session's seats", async () => {
+    const s = await seed(TWO, { fence: { "sess-1": 1 } });
+    await fenceAt(1);
+    const { row, real, raised } = await both(s);
+    expect(raised).toBeUndefined();
+    expect(row.snapshot).toEqual(real);
+    expect(row.fences).toEqual({ 0: "1", 1: "1", 2: "1", 3: "0" });
+    expect(seatsOf(s, row)).toEqual(expected(s));
+    const store = await scratch();
+    expect(await run(store, { seatSidecar: true })).toMatchObject({ live: 1, written: 1, failed: 0, orgs: { complete: 1 } });
+    const v = parseAcceptedMarkerV3(await readText(store, s.key + ACCEPTED_SUFFIX))!;
+    expect(v).toMatchObject({ v: 3, live: true, kept: [[0, 2], [0]] });
+    expect(v.seats).toEqual(expected(s));
+  });
+
+  test("the head's fence epoch differs from the decision's: that session gets no seat (publication_seats_epoch at SEAT_PAGE level)", async () => {
+    const s = await seed(TWO, { fence: { "sess-1": 1 } });
+    await fenceAt(2);
+    const { row } = await both(s);
+    expect(row.fences).toMatchObject({ 0: "2", 3: "0" });
+    expect(failCode(() => seatsOf(s, row))).toBe("publication_seats_epoch");
+    // Through the export, the verdict already drops the moved session's group: only the other group is kept and seated.
+    const store = await scratch();
+    expect(await run(store, { seatSidecar: true })).toMatchObject({ live: 1, written: 1, failed: 0 });
+    const v = parseAcceptedMarkerV3(await readText(store, s.key + ACCEPTED_SUFFIX))!;
+    expect(v).toMatchObject({ v: 3, live: true, kept: [[], [0]] });
+    expect(v.seats).toEqual([[], expected(s)[1]!]);
+  });
+});
+
+describe("provenSeats on hand-built rows", () => {
+  const C = hex("c"), D = hex("d");
+  const rec = (ord: number, id: string, digest: string, session = "sess-1") => ({ ord, source: "claude", session_id: session, record_id: id, revision: 1, digest });
+  const slot = (ord: number, seat: string, digest: string) =>
+    ({ ord, seat, bodyAccepted: true, candidateDigest: digest, firstDigest: digest, resetEpoch: "0", fenceEpoch: "0" });
+  /** A SEAT_PAGE row for one group with every ordinal seated, and the matching verdict row. */
+  function rowOf(records: ReturnType<typeof rec>[], seats: string[], fences: Record<string, string>) {
+    const ords = records.map((r) => r.ord);
+    const row: Record<string, unknown> = {
+      stage_key: "k", stage_sha256: hex("a"), claim_token: "t", group_ordinals: [ords], lazy: true, policy_ok: true, pre_ok: true,
+      reset_epoch: "0", ords_n: ords.length, wanted_n: ords.length, seated_n: ords.length, records, fences,
+      snapshot: { controlEpoch: EPOCH, sourceIdentitySha256: IDENTITY, allocatedHighWater: String(HIGH), lastAssignedSeat: String(LAST),
+        records: records.map((r, i) => slot(r.ord, seats[i]!, r.digest)) },
+    };
+    return { row, r: { stage_key: "k", stage_sha256: hex("a"), claim_token: "t", group_ordinals: [ords] } };
+  }
+  const kept = [{ group: 0, source: "claude", session: "sess-1" }];
+
+  test("the baseline row gives each ordinal its seat", () => {
+    const { row, r } = rowOf([rec(0, "a", C), rec(1, "b", D)], ["1001", "1002"], { 0: "0", 1: "0" });
+    expect(provenSeats(r, [row], [[0, 1]], kept)).toEqual([[{ seat: "1001", digest: C }, { seat: "1002", digest: D }]]);
+  });
+  test("two ordinals with the same seat: seat_duplicate", () => {
+    // The same record twice, so the snapshot parser accepts the shared seat; only provenSeats refuses it.
+    const { row, r } = rowOf([rec(0, "a", C), rec(1, "a", C)], ["1001", "1001"], { 0: "0", 1: "0" });
+    expect(failCode(() => provenSeats(r, [row], [[0, 1]], kept))).toBe("seat_duplicate");
+  });
+  test("a kept row whose source or session is not the slot's record: seat_scope", () => {
+    const { row, r } = rowOf([rec(0, "a", C)], ["1001"], { 0: "0" });
+    expect(failCode(() => provenSeats(r, [row], [[0]], [{ group: 0, source: "codex", session: "sess-1" }]))).toBe("seat_scope");
+    expect(failCode(() => provenSeats(r, [row], [[0]], [{ group: 0, source: "claude", session: "sess-9" }]))).toBe("seat_scope");
+    expect(failCode(() => provenSeats(r, [row], [[0]], kept))).toBe("none");
+  });
+  test("no fence entry for an ordinal: seat_scope", () => {
+    const { row, r } = rowOf([rec(0, "a", C), rec(1, "b", D)], ["1001", "1002"], { 0: "0" });
+    expect(failCode(() => provenSeats(r, [row], [[0, 1]], kept))).toBe("seat_scope");
   });
 });
 
@@ -358,5 +434,20 @@ describe("export then drain", () => {
     const lines = await rawLines(store);
     expect(lines.length).toBe(1);
     expect(lines[0]).toBe(objectLine("a").slice(0, -1) + `,"accepted_seq":"${s.seats[0]![0]}"}`);
+  });
+
+  test("two object groups: each kept line of each group is drained with its own seat", async () => {
+    const store = await scratch();
+    const s = await stageInBoth(store, [
+      { source: "claude", session: "sess-1", records: [{ id: "a", rev: 1 }, { id: "b", rev: 1, accepted: false }, { id: "c", rev: 1 }] },
+      { source: "codex", session: "sess-2", records: [{ id: "d", rev: 1 }] },
+    ]);
+    expect(await run(store, { seatSidecar: true })).toMatchObject({ live: 1, written: 1, failed: 0 });
+    expect(parseAcceptedMarkerV3(await readText(store, s.key + ACCEPTED_SUFFIX))).toMatchObject({ kept: [[0, 2], [0]] });
+    const on = await drain(store, true);
+    expect(on.objects).toMatchObject({ drained: 1, accepted_mismatch: 0 });
+    expect(on.lines).toMatchObject({ written: 3, not_kept: 1 });
+    const seated = (id: string, seat: string) => objectLine(id).slice(0, -1) + `,"accepted_seq":"${seat}"}`;
+    expect((await rawLines(store)).sort()).toEqual([seated("a", s.seats[0]![0]!), seated("c", s.seats[0]![2]!), seated("d", s.seats[1]![0]!)].sort());
   });
 });
