@@ -23,6 +23,10 @@
  *                                   ANALYTICS_COLLECTOR_URL with ANALYTICS_COLLECTOR_TOKEN and
  *                                   ANALYTICS_DEPLOYMENT_ID). "posthog" and any ANALYTICS_POSTHOG_* value refuse
  *                                   startup (src/shared/analytics-config.ts, checked in lambda.ts readApiDepsFromSecret)
+ *   READ_API_UPSTREAM_ASSERTION_MODE  enabled: unset | "" | "off" (default) | "log" | "enforce", the relaygate v1 upstream
+ *                                   assertion check with READ_API_UPSTREAM_ASSERTION_{PUBLIC_KEY,KID,PUBLIC_KEY_PREVIOUS,
+ *                                   KID_PREVIOUS} (src/shared/upstream-assertion.ts, docs/selfhost-composition.md); off
+ *                                   reads none of the key variables
  *
  * Dormant (flag off): nothing else is read or required; the process starts and
  * answers 503 not_configured on every route but /healthz. Enabled: the secret is
@@ -34,6 +38,7 @@
  * Errors name the variable, never its value.
  */
 import { destinationPolicy } from "../shared/destination-url.ts";
+import { READ_API_UPSTREAM_ASSERTION_PREFIX, upstreamAssertionConfig, type UpstreamAssertionConfig } from "../shared/upstream-assertion.ts";
 
 export const READ_API_SERVICE_FLAG = "RELAYHISTORY_SELFHOST_READ_API";
 export const READ_API_PORT_VAR = "RELAYHISTORY_READ_API_PORT";
@@ -42,7 +47,7 @@ export const SEARCH_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 
 export type ReadApiServiceConfig =
   | { enabled: false; port: number }
-  | { enabled: true; port: number; secret: string };
+  | { enabled: true; port: number; secret: string; upstreamAssertion?: UpstreamAssertionConfig };
 
 /** `RELAYHISTORY_SELFHOST_READ_API`: exactly "true" enables; unset, empty or "false" is off; anything else throws. */
 export function readApiServiceEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -66,5 +71,6 @@ export function readApiServiceConfig(env: NodeJS.ProcessEnv = process.env): Read
   destinationPolicy(env); // ALLOW_IN_CLUSTER_HTTP: a typo fails startup even when no URL is set
   const secret = env[READ_API_SECRET_VAR]?.trim();
   if (!secret) throw new Error(`96bulls: ${READ_API_SERVICE_FLAG}=true needs ${READ_API_SECRET_VAR}`);
-  return { enabled: true, port: port(env), secret };
+  const upstreamAssertion = upstreamAssertionConfig(env, READ_API_UPSTREAM_ASSERTION_PREFIX);
+  return { enabled: true, port: port(env), secret, ...(upstreamAssertion ? { upstreamAssertion } : {}) };
 }

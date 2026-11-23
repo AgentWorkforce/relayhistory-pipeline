@@ -20,9 +20,11 @@
  * bodies are the only request bodies ever read. It is buffered here with a hard
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
+ * READ_API_UPSTREAM_ASSERTION_MODE=log|enforce adds the relaygate v1 upstream assertion check in front of the app
+ * (src/shared/upstream-assertion.ts): phase 1 before the body, phase 2 (body_sha256) after the capped read.
  */
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import { errorFields, log } from "../shared/log.ts";
@@ -34,6 +36,10 @@ import { exactTrueFlag, parseCompleteSince, READ_API_COORDINATION_ADVISORIES_ENA
 import { readApiAuthMode, readApiCorsOrigins, readAppFromSecret, serviceSearchBackend } from "./lambda.ts";
 import { TOKEN_ROUTE_PATHS } from "./self-issued.ts";
 import { readApiServiceConfig, SEARCH_BACKEND_ID_VAR } from "./service-config.ts";
+import {
+  checkUpstreamAssertion, upstreamAssertionBypass, upstreamAssertionLogFields, upstreamAssertionRefusal, UPSTREAM_ASSERTION_HEADER,
+  UPSTREAM_ASSERTION_LOG_MESSAGE, type UpstreamAssertionConfig, type UpstreamAssertionGate, type UpstreamAssertionReason,
+} from "../shared/upstream-assertion.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
 export type ReadAppBuilder = (secret: string, env: NodeJS.ProcessEnv) => Promise<{ app: FetchApp; close(): Promise<void> }>;
@@ -131,6 +137,9 @@ function readCappedBody(req: IncomingMessage, cap: number): Promise<Buffer | "to
   });
 }
 
+/** The internal token routes (self_issued only), authenticated by the app with the internal secret: no assertion. */
+const INTERNAL_TOKEN_PATHS = TOKEN_ROUTE_PATHS.filter((path) => path.startsWith("/internal/v1/session-read/"));
+
 /**
  * node:http in front of a fetch handler. With `readLoginBody` (the enabled
  * service), only `POST /v1/cli/login` has its body read (buffered, capped at
@@ -138,13 +147,42 @@ function readCappedBody(req: IncomingMessage, cap: number): Promise<Buffer | "to
  * request the body is drained, never read. Bodies and header values are never
  * logged.
  */
-export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: boolean; tokenRoutes?: boolean; advisoryAck?: boolean } = {}): Server {
+export function readApiHttpServer(
+  handler: FetchApp,
+  options: { readLoginBody?: boolean; tokenRoutes?: boolean; advisoryAck?: boolean; upstreamAssertion?: UpstreamAssertionConfig } = {},
+): Server {
+  const assertion = options.upstreamAssertion;
+  const refuse = (res: ServerResponse, reason: UpstreamAssertionReason) => {
+    const { code, message } = upstreamAssertionRefusal(reason);
+    res.writeHead(401, { "content-type": "application/json", "cache-control": "private, no-store" });
+    res.end(JSON.stringify(errorJson(code, message)));
+  };
   return createServer((req, res) => {
     void (async () => {
       try {
         const url = `http://localhost${req.url?.startsWith("/") ? req.url : "/"}`;
         let body: Buffer | undefined;
         const pathname = new URL(url).pathname;
+        let gate: UpstreamAssertionGate | undefined;
+        if (assertion) {
+          const target = req.url ?? "";
+          const rawPath = target.split("?", 1)[0]!;
+          // Bypass (probes, OPTIONS) and the internal token routes, whose own secret check in the app decides as today.
+          if (!upstreamAssertionBypass(req.method, target) && !(options.tokenRoutes === true && INTERNAL_TOKEN_PATHS.includes(rawPath))) {
+            const checked = checkUpstreamAssertion(
+              assertion,
+              "session-read-api",
+              { method: req.method ?? "", target, authorization: req.headers.authorization, assertion: req.headers[UPSTREAM_ASSERTION_HEADER] },
+              (reason) => log.warn(UPSTREAM_ASSERTION_LOG_MESSAGE, upstreamAssertionLogFields(assertion.mode, reason)),
+            );
+            if ("refuse" in checked) {
+              req.resume();
+              refuse(res, checked.refuse);
+              return;
+            }
+            gate = checked.gate;
+          }
+        }
         if (req.method === "POST" && ((options.readLoginBody === true && pathname === LOGIN_PATH) || (options.tokenRoutes === true && TOKEN_ROUTE_PATHS.includes(pathname)) || (options.advisoryAck === true && ADVISORY_ACK_PATH.test(pathname)))) {
           const read = await readCappedBody(req, LOGIN_BODY_CAP_BYTES);
           if (read === "too_large") {
@@ -157,6 +195,11 @@ export function readApiHttpServer(handler: FetchApp, options: { readLoginBody?: 
           body = read;
         } else {
           req.resume();
+        }
+        // Phase 2: body_sha256 over the bytes read, or over zero bytes where the body is drained unread.
+        if (gate?.body(body ?? new Uint8Array())) {
+          refuse(res, "body");
+          return;
         }
         const headers = new Headers();
         for (const [k, v] of Object.entries(req.headers)) {
@@ -204,7 +247,12 @@ export async function startReadApiService(
   const tokenRoutes = built !== null && readApiAuthMode(env) === "self_issued";
   const cors = built !== null && readApiCorsOrigins(env).size > 0;
   const advisoryAck = built !== null && exactTrueFlag(env[READ_API_COORDINATION_ADVISORIES_ENABLED]);
-  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null, { tokenRoutes, cors, ...(advisoryAck ? { advisoryAck } : {}) }), { readLoginBody: built !== null, tokenRoutes, ...(advisoryAck ? { advisoryAck } : {}) });
+  const server = readApiHttpServer(readApiServiceApp(built?.app ?? null, { tokenRoutes, cors, ...(advisoryAck ? { advisoryAck } : {}) }), {
+    readLoginBody: built !== null,
+    tokenRoutes,
+    ...(advisoryAck ? { advisoryAck } : {}),
+    ...(config.enabled && config.upstreamAssertion ? { upstreamAssertion: config.upstreamAssertion } : {}),
+  });
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

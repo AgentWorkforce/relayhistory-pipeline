@@ -434,6 +434,45 @@ export interface UpstreamAssertionGate {
   scope(value: unknown): boolean;
 }
 
+const NO_PHASE_2: UpstreamAssertionGate = Object.freeze({ body: () => false, scope: () => false });
+
+/**
+ * Phase 1 plus the phase-2 gate, with the mode applied: `refuse` (enforce, phase 1 failed: answer the generic 401
+ * now) or `gate` (continue; phase 2 still runs where there is something to bind). `report` receives every failed
+ * check's closed reason, in log and enforce alike; the caller logs it with upstreamAssertionLogFields.
+ */
+export function checkUpstreamAssertion(
+  config: UpstreamAssertionConfig,
+  audience: UpstreamAssertionAudience,
+  request: UpstreamAssertionRequest,
+  report: (reason: UpstreamAssertionReason) => void,
+  nowMs: number = Date.now(),
+): { refuse: UpstreamAssertionReason } | { gate: UpstreamAssertionGate } {
+  const result = verifyUpstreamAssertionPhase1(config, audience, request, nowMs);
+  if (!result.ok) {
+    report(result.reason);
+    return config.mode === "enforce" ? { refuse: result.reason } : { gate: NO_PHASE_2 };
+  }
+  const pending = result.pending;
+  if (!pending) return { gate: NO_PHASE_2 };
+  const failed = (reason: UpstreamAssertionReason | null): boolean => {
+    if (reason === null) return false;
+    report(reason);
+    return config.mode === "enforce";
+  };
+  return { gate: { body: (wire) => failed(verifyUpstreamAssertionBody(pending, wire)), scope: (value) => failed(verifyUpstreamAssertionScope(pending, value)) } };
+}
+
+/**
+ * The fields of the one log line per failed check, existing allowlisted keys only (src/shared/log.ts): closed
+ * values, never the assertion, a segment or hash of it, the Authorization value, the jti, the principal or a
+ * session id.
+ */
+export function upstreamAssertionLogFields(mode: "log" | "enforce", reason: UpstreamAssertionReason, correlationId?: string): Record<string, string> {
+  return { route: "upstream_assertion", outcome: mode === "enforce" ? "refused" : "would_refuse", reason, state: mode, ...(correlationId ? { correlation_id: correlationId } : {}) };
+}
+export const UPSTREAM_ASSERTION_LOG_MESSAGE = "upstream assertion check failed";
+
 const gates = new WeakMap<Request, UpstreamAssertionGate>();
 /** Binds phase 2 to exactly this Request object (the one handed to app.fetch), like the verified identity. */
 export function bindUpstreamAssertionGate(request: Request, gate: UpstreamAssertionGate): void {
