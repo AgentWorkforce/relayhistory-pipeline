@@ -162,6 +162,16 @@ not seen.
 To drain in slices, give `max_objects` and rerun `drain-execute`. Each rerun skips what earlier runs wrote, using
 the create-only `drained` markers. The workflow never passes `--checkpoint-file` or `--start-after`.
 
+### Deletion ordering evidence
+
+Every backfill receipt explains every `fences.deletions_unproven` row with the numeric
+`fences.deletion_order` counters. The counters sum exactly to `deletions_unproven`. `ordered_not_newer` is positive
+proof that S3's per-session ordered-control tuple is on SQL's sole receipt epoch and no higher than the latest receipt
+read in the deletion snapshot. `ordered_newer` proves the opposite. `receipts_absent`,
+`receipts_multiple_epochs`, `epoch_mismatch`, `unordered_lift` and `order_invalid` are inconclusive and must not be
+treated as proof that a re-enable is old. The receipt remains counts-only: no tenant, workspace, user, origin or
+session identifier is emitted.
+
 ## Org scope
 
 A run can be limited to some orgs with the environment **secret** `BACKLOG_OPS_ORGS`, set on both

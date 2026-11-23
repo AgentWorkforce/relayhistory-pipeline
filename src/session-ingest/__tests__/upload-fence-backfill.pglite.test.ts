@@ -6,7 +6,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { applyFenceChange, entryForgotten, fenceEpoch, isDeleted, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
-import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
+import { SLOTS_ORG_READ_MAX_ROWS, backfillUploadFences, deletionOrderProof, scopedSql, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { DB_HEARTBEAT_MS, parseBackfillArgs, redactedReason, runBackfill } from "../../../scripts/upload-fence-backfill.ts";
 import { TOOL_HOME_RECHECK_MS, toolLedgerBucket } from "../ledger-tool-store.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -697,7 +697,22 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
     const rerun = await run(store);
     expect(rerun.fences).toMatchObject({ deletions_superseded: 1, deletions_unproven: 0, pairs_added: 0 });
+    expect(Object.values(rerun.fences.deletion_order).reduce((a, b) => a + b, 0)).toBe(0);
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+  });
+
+  test("deletion ordering proof is exhaustive, counts-only and fails closed outside one comparable epoch", () => {
+    const one = { epochs: 1, epoch: EPOCH, version: 2n };
+    expect(deletionOrderProof(undefined, one, false)).toBeNull();
+    expect(deletionOrderProof(undefined, one, true)).toBe("unordered_lift");
+    expect(deletionOrderProof([EPOCH, "2"], one, false)).toBe("ordered_not_newer");
+    expect(deletionOrderProof([EPOCH, "1"], one, false)).toBe("ordered_not_newer");
+    expect(deletionOrderProof([EPOCH, "3"], one, false)).toBe("ordered_newer");
+    expect(deletionOrderProof([hex("7"), "1"], one, false)).toBe("epoch_mismatch");
+    expect(deletionOrderProof([EPOCH, "1"], { epochs: 0, epoch: null, version: null }, false)).toBe("receipts_absent");
+    expect(deletionOrderProof([EPOCH, "1"], { epochs: 2, epoch: EPOCH, version: 2n }, false)).toBe("receipts_multiple_epochs");
+    expect(deletionOrderProof([EPOCH, "1"], null, false)).toBe("order_invalid");
+    expect(deletionOrderProof(["bad", "1"], one, false)).toBe("order_invalid");
   });
 
   test("third review: a page's deletions and resets are read in ONE snapshot: a reset landing between them is seen whole or not at all", async () => {
@@ -739,8 +754,22 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await del(A, "origin-1", "claude", "S");
     await reset(A, "req-9", "2030-01-02T00:00:00.000Z", 1);
     const summary = await run(store);
-    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1, resets_added: 1 });
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1, resets_added: 1,
+      deletion_order: { receipts_absent: 1 } });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
+  });
+
+  test("a reset-open deletion reports an ordered S3 re-enable that is provably newer", async () => {
+    const store = scratch();
+    await receipt(A, EPOCH, 1);
+    await mirrored(store, A, "S", false, 1);
+    await mirrored(store, A, "S", true, 2);
+    await del(A, "origin-1", "claude", "S");
+    await reset(A, "req-open", "2030-01-02T00:00:00.000Z", 1);
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1,
+      deletion_order: { ordered_newer: 1 } });
+    expect(Object.values(summary.fences.deletion_order).reduce((a, b) => a + b, 0)).toBe(summary.fences.deletions_unproven);
   });
 
   test("second review 8: S3's control no newer than SQL's latest receipt never supersedes SQL's deletion", async () => {
@@ -751,7 +780,8 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     for (const v of [1, 2, 3]) await receipt(A, EPOCH, v);
     await del(A, "origin-1", "claude", "S");
     const summary = await run(store);
-    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1 });
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1,
+      deletion_order: { ordered_not_newer: 1 } });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
   });
 
@@ -762,7 +792,8 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await receipt(A, EPOCH, 1); // SQL's receipts are on another epoch than S3's control
     await del(A, "origin-1", "claude", "S");
     const summary = await run(store);
-    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1 });
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1,
+      deletion_order: { epoch_mismatch: 1 } });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
   });
 
@@ -773,7 +804,8 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await s3ControlMirror(store, ROOT).setSessionUploads({ tenant: A, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: true });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
     const rerun = await run(store);
-    expect(rerun.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1 });
+    expect(rerun.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1,
+      deletion_order: { unordered_lift: 1 } });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(true);
   });
 

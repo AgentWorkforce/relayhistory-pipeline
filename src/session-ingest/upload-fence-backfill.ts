@@ -135,6 +135,12 @@ export interface BackfillSummary {
     deletions_superseded: number;
     /** SQL deletions re-applied although S3 had lifted or ordered the session since: newer not provable (finding 8). */
     deletions_unproven: number;
+    /**
+     * Exhaustive, counts-only evidence for every `deletions_unproven` row. The values sum exactly to
+     * `deletions_unproven`: an ordered tuple on SQL's one receipt epoch can be compared, while a missing receipt,
+     * several receipt epochs, a foreign epoch or an unordered lift cannot prove recency either way.
+     */
+    deletion_order: DeletionOrderProofCounts;
     /** Cold-imported resets recorded at COLD_RESET_AT_MS. */
     cold_resets: number;
     /** Users given no fence because a cold-imported reset could not be placed before all their batches. */
@@ -161,6 +167,21 @@ export interface BackfillSummary {
   /** A catch-up's `revisionsSinceMs` (an epoch ms, not identifying); absent on a full run. */
   revisions_since_ms?: number;
 }
+
+export const DELETION_ORDER_PROOF_CODES = [
+  "ordered_not_newer",
+  "ordered_newer",
+  "receipts_absent",
+  "receipts_multiple_epochs",
+  "epoch_mismatch",
+  "unordered_lift",
+  "order_invalid",
+] as const;
+export type DeletionOrderProofCode = (typeof DELETION_ORDER_PROOF_CODES)[number];
+export type DeletionOrderProofCounts = Record<DeletionOrderProofCode, number>;
+const emptyDeletionOrderProof = (): DeletionOrderProofCounts => Object.fromEntries(
+  DELETION_ORDER_PROOF_CODES.map((code) => [code, 0]),
+) as DeletionOrderProofCounts;
 
 /**
  * The scope's revision-section inputs, summarised at the start of every run (dry and execute) in ONE REPEATABLE READ
@@ -511,13 +532,38 @@ export function provablyNewer(at: unknown, wm: SqlControlWatermark | null | unde
 }
 
 /**
+ * Counts-only evidence for an S3 state that made the legacy backfill call a SQL deletion `unproven`.
+ * `ordered_not_newer` is the only positive proof requested by the guarded cutover: S3's tuple is on SQL's sole
+ * receipt epoch and no higher than the latest receipt in the same SQL snapshot. `ordered_newer` proves the opposite;
+ * every other code is deliberately inconclusive and must block a proof-required execute.
+ */
+export function deletionOrderProof(
+  at: unknown,
+  wm: SqlControlWatermark | null | undefined,
+  lifted: boolean,
+): DeletionOrderProofCode | null {
+  if (at === undefined) return lifted ? "unordered_lift" : null;
+  if (!Array.isArray(at) || at.length !== 2 || typeof at[0] !== "string" || !HEX64.test(at[0])
+    || typeof at[1] !== "string" || !VERSION.test(at[1])) return "order_invalid";
+  if (!wm) return "order_invalid";
+  if (wm.epochs === 0) return "receipts_absent";
+  if (wm.epochs !== 1) return "receipts_multiple_epochs";
+  if (wm.epoch === null || wm.version === null) return "order_invalid";
+  if (at[0] !== wm.epoch) return "epoch_mismatch";
+  return BigInt(at[1]) <= wm.version ? "ordered_not_newer" : "ordered_newer";
+}
+
+/**
  * SQL's controls applied to `f` with ledger-s3's rules (in place). A deletion is skipped only when S3's ordered control
  * for the session is provably newer than it (provablyNewer, against the deletion snapshot's watermark), and never while
  * the user has a SQL reset S3 has not completed for its request id. A deletion applied although S3 had lifted or
  * ordered the session is counted `unproven`.
  */
-export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions" | "resets"> & { watermark?: SqlControlWatermark | null }): { changed: boolean; pairs: number; resets: number; superseded: number; unproven: number } {
+export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions" | "resets"> & { watermark?: SqlControlWatermark | null }): {
+  changed: boolean; pairs: number; resets: number; superseded: number; unproven: number; deletionOrder: DeletionOrderProofCounts;
+} {
   let changed = false, pairs = 0, resets = 0, superseded = 0, unproven = 0;
+  const deletionOrder = emptyDeletionOrderProof();
   const deletions: FenceChange["deletions"] = [];
   // A SQL reset S3 has not recorded, or has recorded but not finished: its tombstones are SQL's deletions, so none of
   // them may be skipped, whatever S3's order says.
@@ -529,7 +575,11 @@ export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions"
       const at = perOrigin && Object.hasOwn(perOrigin, sk) ? perOrigin[sk] : undefined;
       if (!resetOpen && at !== undefined && provablyNewer(at, st.watermark)) { superseded++; return false; }
       const lifted = fenceEpoch(f, originId, sk) > 0 && !isDeleted(f, originId, s, sid);
-      if (at !== undefined || lifted) unproven++;
+      if (at !== undefined || lifted) {
+        unproven++;
+        const proof = deletionOrderProof(at, st.watermark, lifted);
+        deletionOrder[proof ?? "order_invalid"]++;
+      }
       return true;
     });
     if (keep.length) deletions.push({ originId, sessions: keep });
@@ -540,7 +590,7 @@ export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions"
     pairs += r.newlyDeleted.length;
     if (r.reset === "recorded") resets++;
   }
-  return { changed, pairs, resets, superseded, unproven };
+  return { changed, pairs, resets, superseded, unproven, deletionOrder };
 }
 
 /** Paged, short-transaction, read-only S3 ledger backfill. Counts only. */
@@ -596,7 +646,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const summary: BackfillSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
     fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0,
-      deletions_superseded: 0, deletions_unproven: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
+      deletions_superseded: 0, deletions_unproven: 0, deletion_order: emptyDeletionOrderProof(), cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0, failed_codes: {} },
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0, failed_codes: {} },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
@@ -803,6 +853,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
             summary.fences.resets_added += t.resets;
             summary.fences.deletions_superseded += t.superseded;
             summary.fences.deletions_unproven += t.unproven;
+            for (const code of DELETION_ORDER_PROOF_CODES) summary.fences.deletion_order[code] += t.deletionOrder[code];
             summary.fences.cold_resets += cold;
             if (f.resetsCompleted < f.resets) summary.fences.resets_in_flight++;
             if (read.state === "absent") summary.fences.would_create++;
@@ -824,6 +875,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
           summary.fences.resets_added += landed.t.resets;
           summary.fences.deletions_superseded += landed.t.superseded;
           summary.fences.deletions_unproven += landed.t.unproven;
+          for (const code of DELETION_ORDER_PROOF_CODES) summary.fences.deletion_order[code] += landed.t.deletionOrder[code];
           summary.fences.cold_resets += cold;
           if (landed.inFlight) summary.fences.resets_in_flight++;
         } catch (error) {
