@@ -79,7 +79,7 @@ services entry selects it). An engine selection failure is the refusal `scrub_en
 | `SCRUB_ENGINE` | no | As every services entry (`docs/scrub-engine.md`); read only when enabled |
 | `WORKER_HEALTH_PORT` | no | Probe port, default 8081 |
 | `SESSION_ANALYSIS_ASSUME_NO_LEGACY_TURNS` | **must stay unset** | Passed through to `analysisConfig` unchanged. Only unset, `false` or `true` are accepted, and the startup line logs `reason: assume_no_legacy_turns` when it is `true` |
-| `SESSION_ANALYSIS_CUTOVER_PROOF` | per the cutover branch | Passed through unread (condition (d) lives on its own branch; the runner never interprets it) |
+| `SESSION_ANALYSIS_CUTOVER_PROOF` | per the cutover branch | Passed through unread (condition (d) is read by `analysisConfig`; the runner never interprets it) |
 | `SUMMARY_DECISION_RECORDS_ENABLED` | no | Passed through to the shared builder, exactly as the Lambda reads it |
 
 The runner does not read `OPENAI_BASE_URL`, `AWS_REGION` or the Lambda's
@@ -320,8 +320,7 @@ Each step needs Khaliq's explicit OK in his own words. A request relayed by anot
 that OK.
 
 1. Migrations `062120` and `062130` are applied to the target database.
-2. The cutover rows are in place, and condition (d), `SESSION_ANALYSIS_CUTOVER_PROOF`, is proven on
-   its own branch.
+2. The cutover rows are in place, and condition (d), `SESSION_ANALYSIS_CUTOVER_PROOF`, is proven.
 3. The admission role (`bulls96_analysis_admit`) has LOGIN, so the read path can enqueue jobs at all.
 4. Decide whether a per-job wall deadline (section "How long one job can run") is required first.
 5. The database path from the cluster is settled. Hyperdrive is Cloudflare-only and 0007 removes it,
