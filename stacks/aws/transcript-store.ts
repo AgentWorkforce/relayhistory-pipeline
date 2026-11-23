@@ -1275,6 +1275,8 @@ function assertSessionAnalysisRunnerGrantDiff(
   const oldResult = before.bySid.get(ANALYSIS_RESULT_DENY_SID);
   if (!oldResult && oldEraserShape.not && oldEraserShape.resources.includes(resultArn))
     refuse(`${ERASER_DENY_SID} cannot retain the analysis-result carve-out without ${ANALYSIS_RESULT_DENY_SID}`);
+  if (!oldEraserShape.not && JSON.stringify(oldEraserShape.resources) !== JSON.stringify([`${names.bucketArn}/*`]))
+    refuse(`${ERASER_DENY_SID} Resource must remain exactly the full bucket object scope`);
   const expectedResources = oldEraserShape.not
     ? oldEraserShape.resources.includes(resultArn) ? oldEraserShape.resources : [resultArn, ...oldEraserShape.resources]
     : [resultArn];

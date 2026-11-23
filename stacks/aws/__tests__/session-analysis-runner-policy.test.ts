@@ -148,6 +148,14 @@ function withStatementFrom(policy: unknown[], source: unknown[], sid: string) {
   changed[index] = replacement;
   return changed;
 }
+function withEraserResource(policy: unknown[], resource: string) {
+  const changed = structuredClone(policy) as Array<{ Sid?: string; Resource?: string[]; NotResource?: string[] }>;
+  const statement = changed.find((item) => item.Sid === "OnlyTheEraserDeletes");
+  if (!statement) throw new Error("OnlyTheEraserDeletes missing from test fixture");
+  delete statement.NotResource;
+  statement.Resource = [resource];
+  return changed;
+}
 function check(blocks: Record<string, string[]>, actions: Record<string, string>, input?: unknown) {
   const counts = new Map<string, number>();
   for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
@@ -231,6 +239,37 @@ describe("session-analysis runner plan contract", () => {
         transcripts: bucketBlock(withRunnerBucket, unsafeRevokeBucket),
         "transcripts-key": keyBlock(withRunnerKey, withoutRunnerKey),
       }, { transcripts: "update", "transcripts-key": "update" })).toThrow(/cannot retain the analysis-result carve-out/);
+    }
+  });
+
+  it("refuses a runner revocation whose base delete deny narrows the bucket object scope", () => {
+    const gc = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-buffered-gc`;
+    const rearm = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/test-rearm-sweeper`;
+    const shapes = [
+      { bucket: {}, key: {}, rearm: false },
+      { bucket: { bufferedGcRoleArn: gc }, key: { bufferedGcRoleArn: gc }, rearm: false },
+      {
+        bucket: { bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm },
+        key: { bufferedGcRoleArn: gc, rearmSweeperRoleArn: rearm },
+        rearm: true,
+      },
+    ];
+    for (const shape of shapes) {
+      const commonBucket = { accountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: names.bucketArn, keyArn: "key", eraserArn, ...shape.bucket };
+      const commonKey = { ...keyArgs, ...shape.key };
+      const rearmStatements = shape.rearm ? rearmSweeperBucketStatements({ bucketArn: names.bucketArn, roleArn: rearm }) : [];
+      const withoutRunnerBucket = [...transcriptBucketPolicy(commonBucket), ...rearmStatements];
+      const withRunnerBucket = [
+        ...transcriptBucketPolicy({ ...commonBucket, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN }),
+        ...rearmStatements,
+      ];
+      const unsafeRevokeBucket = withEraserResource(withoutRunnerBucket, `${names.bucketArn}/nothing-here/*`);
+      const withoutRunnerKey = transcriptKeyPolicy(commonKey);
+      const withRunnerKey = transcriptKeyPolicy({ ...commonKey, sessionAnalysisRunnerRoleArn: SESSION_ANALYSIS_RUNNER_ROLE_ARN });
+      expect(() => check({
+        transcripts: bucketBlock(withRunnerBucket, unsafeRevokeBucket),
+        "transcripts-key": keyBlock(withRunnerKey, withoutRunnerKey),
+      }, { transcripts: "update", "transcripts-key": "update" })).toThrow(/Resource must remain exactly the full bucket object scope/);
     }
   });
 
