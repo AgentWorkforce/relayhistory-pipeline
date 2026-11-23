@@ -134,8 +134,18 @@ function fakeClickHouse(onInsert?: () => void) {
       statements.push(`select ${norm(query)}`);
       if (!query.includes(EVENTS_TABLE)) return [] as T[];
       const p = options!.params!;
-      return final()
-        .filter((r) => r.org_id === p.org && r.session_id === p.session && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
+      const cmp = (a: unknown[], b: unknown[]) => {
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return (a[i] as never) < (b[i] as never) ? -1 : 1;
+        return 0;
+      };
+      const tuple = (r: IndexRow) => [tsMs(r), r.machine_id, r.kind, r.event_id];
+      let found = final().filter((r) => r.org_id === p.org && r.session_id === p.session && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from));
+      // The keyset page: ORDER BY (ts, machine_id, kind, event_id), after the last row's tuple.
+      if (query.includes("ORDER BY ts, machine_id, kind, event_id")) {
+        found = found.sort((a, b) => cmp(tuple(a), tuple(b)));
+        if (p.after_ts !== undefined) found = found.filter((r) => cmp(tuple(r), [Number(p.after_ts), p.after_machine, p.after_kind, p.after_event]) > 0);
+      }
+      return found
         .slice(0, Number(p.limit))
         .map((r) => ({ workspace_id: r.workspace_id, machine_id: r.machine_id, source: r.source, kind: r.kind, event_id: r.event_id, ts_ms: tsMs(r), fingerprint: r.fingerprint })) as T[];
     },
@@ -350,7 +360,7 @@ describe("streamed reconcile", () => {
     expect(ch.state.map((r) => r.needs_full)).toEqual([1]);
   });
 
-  test("keeps the transaction busy with the statement it already sends; no new Postgres or ClickHouse statement", async () => {
+  test("keeps the transaction busy with the statement it already sends; no new Postgres statement, the keyset page the only new ClickHouse one", async () => {
     const keys = await richScope();
     const whole = fakeClickHouse();
     const w = deps(whole.ch, () => keys);
@@ -360,7 +370,14 @@ describe("streamed reconcile", () => {
     await indexSearchScope(scope, s.d);
     expect(s.sb.calls.filter((c) => c.startsWith("SELECT pg_try_advisory_xact_lock")).length).toBeGreaterThan(1);
     expect(new Set(s.sb.calls)).toEqual(new Set(w.sb.calls));
-    expect(new Set(ch.statements)).toEqual(new Set(whole.statements));
+    const added = [...new Set(ch.statements)].filter((q) => !whole.statements.includes(q));
+    const dropped = [...new Set(whole.statements)].filter((q) => !ch.statements.includes(q));
+    expect(added).toHaveLength(1);
+    expect(added[0]).toStartWith("select SELECT workspace_id, machine_id, source, kind, event_id, toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint FROM transcript_events FINAL");
+    expect(added[0]).toContain("ORDER BY ts, machine_id, kind, event_id LIMIT {limit:UInt32}");
+    // The whole read's single LIMIT scan is not sent by the streamed pass.
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).not.toContain("ORDER BY");
   });
 
   test("one streamed scope per invocation: a second is requeued (stream_deferred) and streams on the next", async () => {
@@ -397,5 +414,62 @@ describe("streamed reconcile", () => {
     expect(requeued).toEqual([two]);
     expect(ch.final().filter((r) => r.session_id === "sess_2")).toHaveLength(2);
     expect(ch.state.at(-1)).toMatchObject({ session_id: "sess_2", needs_full: 0 });
+  });
+
+  test("the existing identities span many keyset pages: complete, needs_full=0, correct deletes, foreign kinds kept", async () => {
+    const keys = await richScope();
+    const truth = fakeClickHouse();
+    await indexSearchScope(scope, deps(truth.ch, () => keys).d);
+    const ch = fakeClickHouse();
+    const base = truth.final()[0]!;
+    const stale = Array.from({ length: 7 }, (_, i) => ({ ...base, event_id: `tail:stale${i}`, fingerprint: "neon-y" }));
+    const foreign = Array.from({ length: 5 }, (_, i) => ({ ...base, kind: "tool_result", event_id: `tail:tr${i}`, fingerprint: "neon-x" }));
+    ch.rows.push(...truth.final().filter((r) => r.delivery_record_id !== "r2"), ...stale, ...foreign);
+    // Pages of 2 identities: more than ten pages; the whole read's cap (maxRows) stays at its default.
+    const pages = deps(ch.ch, () => keys, { ...armed, limits: { ...tiny, insertBatch: 2 } });
+    expect(await indexSearchScope(scope, pages.d)).toMatchObject({ complete: true, inserted: 1, deleted: 7, reasons: [] });
+    expect(ch.statements.filter((q) => q.includes("ORDER BY ts, machine_id")).length).toBeGreaterThan(10);
+    expect(ch.state.at(-1)!.needs_full).toBe(0);
+    expect(ch.final().filter((r) => r.kind !== "tool_result")).toEqual(truth.final());
+    expect(ch.final().filter((r) => r.kind === "tool_result")).toHaveLength(5);
+  });
+
+  test("more existing identities than the whole read's cap: the streamed pass still completes", async () => {
+    const keys = await richScope();
+    const truth = fakeClickHouse();
+    await indexSearchScope(scope, deps(truth.ch, () => keys).d);
+    const seed = () => {
+      const ch = fakeClickHouse();
+      const base = truth.final()[0]!;
+      ch.rows.push(...truth.final(), ...Array.from({ length: 6 }, (_, i) => ({ ...base, kind: "tool_result", event_id: `tail:tr${i}`, fingerprint: "neon-x" })), { ...base, event_id: "tail:stale", fingerprint: "neon-y" });
+      return ch;
+    };
+    const cap = { maxRows: 5 };
+    // The whole read with this cap truncates: nothing deleted, needs_full stays 1.
+    const whole = seed();
+    expect(await indexSearchScope(scope, deps(whole.ch, () => keys, { limits: cap }).d)).toMatchObject({ complete: false, deleted: 0, reasons: ["clickhouse_truncated"] });
+    expect(whole.state.at(-1)!.needs_full).toBe(1);
+    // Streamed under the same cap: complete, the stale row deleted, the foreign kinds kept.
+    const ch = seed();
+    expect(await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, limits: { ...tiny, ...cap } }).d)).toMatchObject({ complete: true, deleted: 1, reasons: [] });
+    expect(ch.state.at(-1)!.needs_full).toBe(0);
+    expect(ch.final().filter((r) => r.kind !== "tool_result")).toEqual(truth.final());
+    expect(ch.final().filter((r) => r.kind === "tool_result")).toHaveLength(6);
+  });
+
+  test("past the events budget the keyset scan stops partial: nothing deleted, needs_full=1", async () => {
+    const keys = await richScope();
+    let events = 0;
+    for (const key of keys) events += (await reader.read(key))!.manifest.raw.chunks.reduce((n, c) => n + (c.records ?? 0), 0);
+    const ch = fakeClickHouse();
+    await indexSearchScope(scope, deps(ch.ch, () => keys, armed).d);
+    const base = ch.final()[0]!;
+    // More index identities than the events budget allows.
+    const budget = { maxReadBytes: SEARCH_INDEX_STREAM_CH_BUDGET.maxReadBytes, maxReadEvents: events * STREAM_PASSES };
+    ch.rows.push(...Array.from({ length: budget.maxReadEvents }, (_, i) => ({ ...base, event_id: `tail:stale${i}`, fingerprint: "neon-y" })));
+    const out = await indexSearchScope(scope, deps(ch.ch, () => keys, { limits: tiny, stream: budget }).d);
+    expect(out).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_read_events_budget"] });
+    expect(ch.statements.some((q) => q.startsWith("command DELETE"))).toBe(false);
+    expect(ch.state.at(-1)!.needs_full).toBe(1);
   });
 });

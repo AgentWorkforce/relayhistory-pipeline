@@ -73,6 +73,7 @@ import {
 import {
   STREAM_DEADLINE,
   STREAM_PASSES,
+  STREAM_READ_EVENTS_BUDGET,
   StreamStop,
   chunkBytes,
   streamDeadlinePassed,
@@ -489,6 +490,61 @@ async function clickhouseScope(
 }
 
 /**
+ * One keyset page of a scope's in-window index identities (the streamed reconcile only).
+ * Keyed on the vendored sort key (org_id, workspace_id, ts, session_id, source, machine_id,
+ * kind, event_id): with org, workspace, session and source fixed by the scope,
+ * (ts, machine_id, kind, event_id) is the ReplacingMergeTree identity, unique under FINAL,
+ * so `WHERE tuple > last ORDER BY tuple` visits every row once. A later page also carries
+ * `ts >= last.ts`, implied by the tuple comparison but a plain range on the sort key, so
+ * ClickHouse prunes the granules before it (origin/main 00ad4ae9 F1). No DDL.
+ */
+export async function clickhouseScopePage(
+  ch: ClickHouseClient,
+  scope: SessionScope,
+  fromMs: number,
+  limit: number,
+  after?: Pick<ScopeIdentity, "tsMs" | "machineId" | "kind" | "eventId">,
+): Promise<ScopeIdentity[]> {
+  const rows = await ch.select<{
+    workspace_id: string;
+    machine_id: string;
+    source: string;
+    kind: string;
+    event_id: string;
+    ts_ms: number;
+    fingerprint: string;
+  }>(
+    `SELECT workspace_id, machine_id, source, kind, event_id,
+        toUnixTimestamp64Milli(ts) AS ts_ms, fingerprint
+     FROM ${EVENTS_TABLE} FINAL
+     WHERE org_id = {org:String} AND session_id = {session:String}
+       AND workspace_id = {workspace:String} AND source = {source:String}
+       AND toUnixTimestamp64Milli(ts) >= {from:Int64}${after ? `
+       AND ts >= fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC')
+       AND (ts, machine_id, kind, event_id) >
+           (fromUnixTimestamp64Milli({after_ts:Int64}, 'UTC'), {after_machine:String}, {after_kind:String}, {after_event:String})` : ""}
+     ORDER BY ts, machine_id, kind, event_id
+     LIMIT {limit:UInt32}`,
+    {
+      params: {
+        org: scope.orgId, session: scope.sessionId, workspace: scope.workspaceId, source: scope.harness, from: fromMs, limit,
+        ...(after ? { after_ts: after.tsMs, after_machine: after.machineId, after_kind: after.kind, after_event: after.eventId } : {}),
+      },
+      timeoutMs: 20_000,
+    },
+  );
+  return rows.map((r) => ({
+    workspaceId: r.workspace_id,
+    machineId: r.machine_id,
+    source: r.source,
+    kind: r.kind,
+    eventId: r.event_id,
+    tsMs: Number(r.ts_ms),
+    fingerprint: r.fingerprint,
+  }));
+}
+
+/**
  * The session's index state in `search_ingest_session_state` (vendored
  * schema.ts): `needs_full = 1` marks a session whose S3 pass was partial or
  * incomplete, so readers never take its rows as current; a complete pass
@@ -690,9 +746,25 @@ async function streamedReconcile(
       projectedToNeonRow,
     );
     checkDeadline();
-    const chRows = await clickhouseScope(deps.ch, scope, fromMs, limits.maxRows + 1);
+    // Keyset pages of one insert batch each (origin/main legacyProjectionIo.scanPages), never the
+    // whole read's single LIMIT maxRows+1 read: up to the events budget of identities, so a
+    // streamed scope larger than the whole read's cap can still complete. Past the budget the
+    // scope is partial, never a delete.
+    const chRows: ScopeIdentity[] = [];
+    let after: ScopeIdentity | undefined;
+    for (;;) {
+      if (after) {
+        checkDeadline();
+        await keepalive();
+      }
+      const want = Math.min(limits.insertBatch, budget.maxReadEvents + 1 - chRows.length);
+      const page = await clickhouseScopePage(deps.ch, scope, fromMs, want, after);
+      for (const r of page) chRows.push(r);
+      if (chRows.length > budget.maxReadEvents) throw new StreamStop(STREAM_READ_EVENTS_BUDGET, true);
+      if (page.length < want) break;
+      after = page[page.length - 1];
+    }
     await keepalive();
-    const truncated = chRows.length > limits.maxRows;
     const existing = new Map<string, ScopeIdentity[]>();
     for (const r of chRows) {
       const key = streamKey(r);
@@ -715,7 +787,6 @@ async function streamedReconcile(
     const directoryIds = new Set(admitted.map((manifest) => canonicalManifestIdentity(manifest).sessionId));
     const reasons: string[] = [];
     if (directoryIds.size > 1) reasons.push("canonical_session_mismatch");
-    if (truncated) reasons.push("clickhouse_truncated");
     if (inserted !== toInsert.size) reasons.push(STREAM_SOURCE_CHANGED_WRITE);
     const complete = reasons.length === 0;
     const deletes: PendingDelete[] = [];
