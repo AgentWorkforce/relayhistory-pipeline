@@ -94,9 +94,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
       if (messageIds.every((id) => failed.has(id))) continue;
       const started = Date.now();
       try {
-        // SEARCH_INDEX_STREAMING_CH=1 only: once this invocation streamed a scope and its deadline
-        // passed, the batch's remaining scopes are requeued instead of run in the margin.
-        if (deps.search.streamSlot?.used && streamDeadlinePassed(deps.search.streamDeadline)) {
+        // SEARCH_INDEX_STREAMING_CH=1 only: past the invocation's stream deadline no scope of the
+        // batch is started (whole read or streamed); the rest are requeued instead.
+        if (deps.search.stream && streamDeadlinePassed(deps.search.streamDeadline)) {
           if (!deps.requeue) throw new Error("batch past its stream deadline and no requeue");
           await deps.requeue(manifestKey);
           log.info("search index past the batch deadline, requeued", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, reason: "stream_batch_deadline" });

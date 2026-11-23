@@ -144,8 +144,13 @@ function fakeClickHouse(onInsert?: () => void) {
       statements.push(`select ${norm(query)}`);
       if (!query.includes(EVENTS_TABLE)) return [] as T[];
       const p = options!.params!;
+      // ClickHouse orders String by bytes (UTF-8), not by UTF-16 code units as JS `<` does.
       const cmp = (a: unknown[], b: unknown[]) => {
-        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return (a[i] as never) < (b[i] as never) ? -1 : 1;
+        for (let i = 0; i < a.length; i++) {
+          if (a[i] === b[i]) continue;
+          if (typeof a[i] === "string") return Buffer.compare(Buffer.from(a[i] as string), Buffer.from(b[i] as string));
+          return (a[i] as number) < (b[i] as number) ? -1 : 1;
+        }
         return 0;
       };
       const tuple = (r: IndexRow) => [tsMs(r), r.machine_id, r.kind, r.event_id];
@@ -321,10 +326,13 @@ describe("streamed reconcile", () => {
       const ch = fakeClickHouse();
       ch.rows.push(...damaged());
       // The first reading is the start check (STREAM_MIN_START_MS must be left); the k-th check
-      // after it reads START + k - 1, so the cut lands on check number `cut`.
+      // after it reads START + (k - 1) * STEP, so the cut lands on check number `cut`. STEP is
+      // larger than STREAM_TAIL_RESERVE_MS, so the tail's reserve check cuts exactly where the
+      // plain deadline check would.
       let n = 0;
       const START = 120_000;
-      const result = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, streamDeadline: { at: START + cut, now: () => (n++ === 0 ? 0 : START + n - 2) } }).d);
+      const STEP = 100_000;
+      const result = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, streamDeadline: { at: START + cut * STEP, now: () => (n++ === 0 ? 0 : START + (n - 2) * STEP) } }).d);
       expect(result).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_deadline"] });
       expect(ch.statements.some((q) => q.startsWith("command DELETE"))).toBe(false);
       expect(ch.final().some((r) => r.event_id === "tail:stale")).toBe(true);
@@ -735,16 +743,44 @@ describe("streamed reconcile", () => {
     });
     const db = { pool: { connect: async () => client } } as unknown as HoopDb;
     let emitted = false;
+    let inFlight = 0;
+    const query = client.query.bind(client);
+    client.query = async (text: string, params?: unknown[]) => {
+      inFlight++;
+      try {
+        return await query(text, params);
+      } finally {
+        inFlight--;
+      }
+    };
     const cutting = { ...store, get: async (key: Parameters<ObjectStore["get"]>[0]) => {
       if (!emitted) {
         emitted = true;
-        // What pg does when the server ends the session between statements.
-        client.emit("error", Object.assign(new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" }));
+        // What pg does when the server ends the session between statements: an asynchronous
+        // 'error' on the idle client, outside any query (none is in flight while S3 is read).
+        setImmediate(() => {
+          expect(inFlight).toBe(0);
+          client.emit("error", Object.assign(new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" }));
+        });
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setImmediate(r));
       }
       return store.get(key);
     } } as ObjectStore;
+    const uncaught: unknown[] = [];
+    const onUncaught = (e: unknown) => void uncaught.push(e);
+    process.on("uncaughtException", onUncaught);
+    const queries: string[] = [];
     const s = deps(ch.ch, () => keys, { ...armed, store: cutting, streamKeepaliveMs: 60_000 });
-    await expect(transaction(db, (tx) => indexSearchScope(scope, { ...s.d, transact: async (w) => w(tx) }), true)).rejects.toMatchObject({ code: "ECONNRESET" });
+    try {
+      await expect(transaction(db, (tx) => indexSearchScope(scope, { ...s.d, transact: async (w) => w({ query: async (t: string, p?: unknown[]) => { queries.push(t); return tx.query(t, p); } }) }), true)).rejects.toMatchObject({ code: "ECONNRESET" });
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+    expect(emitted).toBe(true);
+    expect(uncaught).toEqual([]);
+    // The next statement after the emit (the unthrottled lock check after the scan) is the one that rejected.
+    expect(queries.at(-1)).toContain("pg_try_advisory_xact_lock");
     // The broken client is destroyed (released with its error), not returned to the pool.
     expect(client.released).toHaveLength(1);
     expect(client.released[0]).toMatchObject({ code: "ECONNRESET" });
@@ -755,5 +791,82 @@ describe("streamed reconcile", () => {
     await transaction({ pool: { connect: async () => bare } } as unknown as HoopDb, async () => {
       expect(() => bare.emit("error", new Error("x"))).toThrow("x");
     });
+  });
+
+  test("keyset pages: a repeated key, an over-limit page in valid order, and UTF-8 byte order (not UTF-16)", async () => {
+    const keys = await richScope();
+    // The previous page's last key again at the head of the next page: equal is not after.
+    let last: unknown;
+    {
+      const { ch } = await staleSeeded(keys, 3);
+      let pages = 0;
+      const odd = { ...ch.ch, select: async <T,>(q: string, o?: { params?: Record<string, unknown> }) => {
+        const rows = (await ch.ch.select<T>(q, o as never)) as unknown[];
+        if (!q.includes("ORDER BY ts, machine_id")) return rows as T[];
+        pages++;
+        const out = pages === 2 ? [last, ...rows.slice(0, rows.length - 1)] : rows;
+        last = rows[rows.length - 1];
+        return out as T[];
+      } } as ClickHouseClient;
+      const out = await indexSearchScope(scope, deps(odd, () => keys, { ...armed, limits: { ...tiny, insertBatch: 3 } }).d);
+      expect(out).toMatchObject({ complete: false, deleted: 0, reasons: ["clickhouse_page_invalid"] });
+      noDelete(ch);
+    }
+    // More rows than asked for, every one in order and after the last: only the limit check sees it.
+    {
+      const { ch: ch2 } = await staleSeeded(keys, 3);
+      let pages = 0;
+      const extended = { ...ch2.ch, select: async <T,>(q: string, o?: { params?: Record<string, unknown> }) => {
+        if (!q.includes("ORDER BY ts, machine_id")) return ch2.ch.select<T>(q, o as never);
+        pages++;
+        const p = (o as { params: Record<string, unknown> }).params;
+        // Page 2 answers with one row more than its LIMIT, in order.
+        return ch2.ch.select<T>(q, { ...(o as object), params: { ...p, limit: pages === 2 ? Number(p.limit) + 1 : p.limit } } as never);
+      } } as ClickHouseClient;
+      const result = await indexSearchScope(scope, deps(extended, () => keys, { ...armed, limits: { ...tiny, insertBatch: 3 } }).d);
+      expect(result).toMatchObject({ complete: false, deleted: 0, reasons: ["clickhouse_page_invalid"] });
+      noDelete(ch2);
+    }
+    // UTF-8 byte order: U+FFFD sorts before an astral character in ClickHouse, after it in UTF-16.
+    {
+      const truth = fakeClickHouse();
+      await indexSearchScope(scope, deps(truth.ch, () => keys).d);
+      const base = truth.final()[0]!;
+      const ch = fakeClickHouse();
+      ch.rows.push(...truth.final(), { ...base, kind: "tool_result", event_id: "x�", fingerprint: "neon-a" }, { ...base, kind: "tool_result", event_id: "x\u{1F600}", fingerprint: "neon-b" }, { ...base, event_id: "tail:stale0", fingerprint: "neon-y" });
+      // One row per page: the two ids land on consecutive pages and are compared across them.
+      const out = await indexSearchScope(scope, deps(ch.ch, () => keys, { ...armed, limits: { ...tiny, insertBatch: 1 } }).d);
+      expect(out).toMatchObject({ complete: true, deleted: 1, reasons: [] });
+      expect(ch.final().filter((r) => r.kind === "tool_result")).toHaveLength(2);
+    }
+  });
+
+  test("the tail is not started inside STREAM_TAIL_RESERVE_MS of the deadline: no delete, the pass is owed", async () => {
+    const keys = await richScope();
+    const { ch } = await staleSeeded(keys, 2);
+    let clock = 0;
+    // Past the start check, the clock reads 20 s before the deadline: inside the 30 s reserve.
+    const s = deps(ch.ch, () => keys, { ...armed, streamDeadline: { at: 1_000_000, now: () => clock } });
+    const scan = { ...ch.ch, select: async <T,>(q: string, o?: unknown) => {
+      if (q.includes("ORDER BY ts, machine_id")) clock = 980_000;
+      return ch.ch.select<T>(q, o as never);
+    } } as ClickHouseClient;
+    const out = await indexSearchScope(scope, { ...s.d, ch: scan });
+    expect(out).toMatchObject({ complete: false, partial: true, deleted: 0, reasons: ["scope_too_large", "stream_deadline"] });
+    noDelete(ch);
+    expect(s.catalogs).toEqual([]);
+  });
+
+  test("armed and past the deadline, no scope of the batch is started: whole reads are requeued too", async () => {
+    const { small, ch, requeued, consumer, put } = await batchFixture();
+    const out = await processBatch([put(small[0]!, "01"), put(small[1]!, "02")], consumer({ streamSlot: { used: false }, streamDeadline: { at: 100, now: () => 200 } }));
+    expect(out.batchItemFailures).toEqual([]);
+    expect(requeued).toEqual(small);
+    expect(ch.state).toEqual([]);
+    expect(ch.rows).toEqual([]);
+    // Unarmed (no stream), the same batch runs as before.
+    const again = await processBatch([put(small[0]!, "03")], { ...consumer({}), search: { ...consumer({}).search!, stream: undefined, streamDeadline: { at: 100, now: () => 200 } } });
+    expect(again.batchItemFailures).toEqual([]);
+    expect(ch.state.map((r) => r.session_id)).toEqual(["sess_2"]);
   });
 });

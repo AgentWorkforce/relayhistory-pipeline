@@ -130,6 +130,12 @@ export const SEARCH_INDEX_STREAM_CH_BUDGET: Readonly<StreamReadLimits> = Object.
 export const SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS = 60_000;
 /** A scope is not started streaming with less than this left before its deadline (half a fresh invocation's). */
 export const STREAM_MIN_START_MS = 120_000;
+/**
+ * The streamed pass's tail (a delete batch, up to its 60 s ClickHouse timeout, then the catalog,
+ * the state row and COMMIT) is not started with less than this left before the deadline: with
+ * the 60 s margin behind the deadline that leaves about 90 s to the function timeout.
+ */
+export const STREAM_TAIL_RESERVE_MS = 30_000;
 /** Deletes per batch between the streamed pass's deadline and lock checks (deleteRows' own key batch). */
 const STREAM_DELETE_BATCH = 500;
 
@@ -733,6 +739,10 @@ async function streamedReconcile(
   const checkDeadline = () => {
     if (streamDeadlinePassed(deadline)) throw new StreamStop(STREAM_DEADLINE, true);
   };
+  // Before the tail: the deadline less STREAM_TAIL_RESERVE_MS.
+  const checkTail = () => {
+    if (deadline && deadline.at - (deadline.now ?? Date.now)() < STREAM_TAIL_RESERVE_MS) throw new StreamStop(STREAM_DEADLINE, true);
+  };
   let inserted = 0;
   let deleted = 0;
   const owing = async (stop: StreamStop): Promise<SearchIndexResult> => {
@@ -822,10 +832,12 @@ async function streamedReconcile(
             deletes.push({ orgId: scope.orgId, sessionId: scope.sessionId, identity: c } as PendingDelete);
         }
       }
-      // Before every delete batch: the deadline, and the lock (unthrottled). A stop between
-      // batches keeps what was deleted (rows S3 no longer has) and owes a pass for the rest.
+      // Before the tail and every delete batch: the deadline with the tail's reserve, and the lock
+      // (unthrottled). A stop between batches keeps what was deleted (rows S3 no longer has) and
+      // owes a pass for the rest; a stop before the first batch also skips the catalog write.
+      checkTail();
       for (let i = 0; i < deletes.length; i += STREAM_DELETE_BATCH) {
-        checkDeadline();
+        if (i > 0) checkTail();
         await keepalive(true);
         const batch = deletes.slice(i, i + STREAM_DELETE_BATCH);
         await deleteRows(deps.ch, batch);

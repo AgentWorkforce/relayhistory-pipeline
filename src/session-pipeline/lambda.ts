@@ -42,7 +42,7 @@ import { awsJsonCall, invokeAsync, lambdaCredentials } from "./aws-json.ts";
 import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
-import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS } from "./search-index.ts";
+import { SEARCH_INDEX_STREAM_CH_BUDGET, SEARCH_INDEX_STREAM_DEADLINE_MARGIN_MS, type SearchIndexDeps } from "./search-index.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { SUPABASE_PROD_CA_2021 } from "./supabase-ca.ts";
 import { briefConfig, modelKey } from "../session-brief/config.ts";
@@ -191,6 +191,11 @@ export async function transaction<T>(db: HoopDb, work: (tx: SqlExecutor) => Prom
   }
 }
 
+/** The search stage's transaction: guarded (transaction() above) exactly when streaming is armed. */
+export function searchTransaction(db: HoopDb, env: Pick<LambdaEnv, "searchStreamCh">): SearchIndexDeps["transact"] {
+  return (work) => transaction(db, work, env.searchStreamCh === true);
+}
+
 /** A search pass that found its session busy runs again this much later. */
 export const BUSY_REQUEUE_DELAY_SECONDS = 60;
 
@@ -248,7 +253,7 @@ async function init(): Promise<Runtime> {
     if (!secret.clickhouse) throw new Error("SEARCH_INDEX_ENABLED=1 but the secret has no clickhouse block");
     deps.search = {
       // Guarded only when streaming is armed: unarmed, the search transaction is exactly as before.
-      transact: (work) => transaction(db, work, env.searchStreamCh === true),
+      transact: searchTransaction(db, env),
       reader,
       store,
       ch: createClickHouseClient(secret.clickhouse),
