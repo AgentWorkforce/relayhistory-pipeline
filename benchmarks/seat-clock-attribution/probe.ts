@@ -20,11 +20,12 @@ export const STEPS = [
   // t2 branch
   /*20*/ "t2_A_candidates", /*21*/ "t2_B_slot_locks", /*22*/ "t2_C1_plan", /*23*/ "t2_upgrade", /*24*/ "t2_C2_number",
   /*25*/ "t2_D_seats", /*26*/ "t2_D_slots", /*27*/ "t2_D_decisions", /*28*/ "t2_E_count",
+  /*29*/ "verify_proxy",
 ] as const;
 const K = (s: (typeof STEPS)[number]) => STEPS.indexOf(s) + 1;
 const P = (s: (typeof STEPS)[number]) => `_x:=extract(epoch from clock_timestamp())*1e6;_acc[${K(s)}]:=_acc[${K(s)}]+(_x-_t);_t:=_x;`;
 
-export function instrument(def: string): string {
+export function instrument(def: string, opts: { verifyProxy?: boolean } = {}): string {
   const once = (src: string, find: string, repl: string) => {
     const n = src.split(find).length - 1;
     if (n !== 1) throw Error(`probe anchor matched ${n} times: ${find.slice(0, 80)}`);
@@ -59,7 +60,15 @@ export function instrument(def: string): string {
   // t2 branch
   s = once(s, "    FROM sessions.ingest_receipt_seat_records(t.claim_token,t.group_ordinals) q)z;\n", `    FROM sessions.ingest_receipt_seat_records(t.claim_token,t.group_ordinals) q)z;${P("t2_A_candidates")}\n`);
   s = once(s, "   ORDER BY k.first_pos FOR UPDATE OF n;\n", `   ORDER BY k.first_pos FOR UPDATE OF n;${P("t2_B_slot_locks")}\n`);
-  s = once(s, "   INTO v_plan FROM l8 f;\n", `   INTO v_plan FROM l8 f;${P("t2_C1_plan")}\n`);
+  // verifyProxy (bench-only cost proxy, never product SQL): after the plan, one statement that re-reads, for every
+  // planned record, the native slot row, the seat at its current_seat_key and this claim's decision row, and compares
+  // them with the plan's inputs, as a pre-planned body's re-check under the lock would. Its result is discarded.
+  s = once(s, "   INTO v_plan FROM l8 f;\n", `   INTO v_plan FROM l8 f;${P("t2_C1_plan")}\n` + (opts.verifyProxy ?
+    `  PERFORM count(*) FROM jsonb_to_recordset(v_plan) q(pos integer,ord integer,nk text,seat0 text,lineage_n numeric,acc_cum integer,d_found boolean,d_lin bigint)
+    JOIN sessions.ingest_lazy_native_slots n ON n.key_sha256=q.nk LEFT JOIN sessions.ingest_receipt_seats s0 ON s0.key_sha256=n.current_seat_key
+    LEFT JOIN sessions.ingest_lazy_ack_decisions d0 ON d0.claim_token=t.claim_token AND d0.ord=q.ord
+    WHERE n.current_seat_key IS DISTINCT FROM q.seat0 OR n.lineage::numeric+q.acc_cum IS DISTINCT FROM q.lineage_n OR (d0.claim_token IS NOT NULL)<>q.d_found
+     OR d0.native_lineage IS DISTINCT FROM q.d_lin OR (n.current_seat_key IS NOT NULL AND s0.key_sha256 IS NULL);${P("verify_proxy")}\n` : ""));
   s = once(s, "WHERE ck.singleton FOR NO KEY UPDATE;\n", `WHERE ck.singleton FOR NO KEY UPDATE;${P("t2_upgrade")}_tclock:=_t;\n`);
   s = once(s, "  v_lim:=coalesce(v_epos,2147483647);\n", `  v_lim:=coalesce(v_epos,2147483647);${P("t2_C2_number")}\n`);
   s = once(s, "   WHERE q.alloc AND q.pos<v_lim ORDER BY q.pos;\n", `   WHERE q.alloc AND q.pos<v_lim ORDER BY q.pos;${P("t2_D_seats")}\n`);

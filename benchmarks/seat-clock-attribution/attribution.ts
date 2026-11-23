@@ -30,6 +30,7 @@ import { runMigrations, type MigrationProfile } from "../../src/hoopdb/migrate.t
 import { derivedSchemaAssets } from "../../src/session-pipeline/derived-schema.ts";
 import type { LoadInit, Stream, Txn } from "./load-worker.ts";
 import { instrument, instrumentWrapper, STEPS } from "./probe.ts";
+import { sqlLedger } from "../../src/session-ingest/ledger-sql.ts";
 
 const url = process.env.SESSION_INGEST_TEST_PG_URL;
 if (!url) throw Error("SESSION_INGEST_TEST_PG_URL (an owned loopback fixture) is required");
@@ -41,13 +42,14 @@ const loopback = (h: string) => { const x = h.replace(/^\[|\]$/g, ""); return is
 }
 const SAFE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 type Workload = "W1" | "W2";
-type Body = "main" | "t2" | "main-plain" | "t2-plain";
-type Cell = { workload: Workload; n: number; c: number; body: Body; label?: string };
-type Plan = { runId?: string; threads?: number; totalRecords?: number; maxSeconds?: number; historyLive?: boolean; cells: Cell[] };
+type Body = "main" | "t2" | "main-plain" | "t2-plain" | "t2-verify";
+type Cell = { workload: Workload; n: number; c: number; body: Body; controls?: "c2" | "none"; label?: string };
+type Plan = { runId?: string; threads?: number; totalRecords?: number; maxSeconds?: number; historyLive?: boolean; controls?: "c2" | "none"; controlEveryMs?: number; cells: Cell[] };
 const plan = JSON.parse(process.argv[2] ?? "{}") as Plan;
 const RUN_ID = plan.runId ?? new Date().toISOString().replace(/[:.]/g, "-");
 if (!SAFE_ID.test(RUN_ID) || RUN_ID.startsWith(".")) throw Error("runId: letters, digits, dot, dash, underscore only");
-for (const c of plan.cells ?? []) { if (c.label !== undefined && (!SAFE_ID.test(c.label) || c.label.startsWith("."))) throw Error("bad label"); if (!["main", "t2", "main-plain", "t2-plain"].includes(c.body)) throw Error("cell.body: main | t2 | main-plain | t2-plain"); }
+for (const c of plan.cells ?? []) { if (c.label !== undefined && (!SAFE_ID.test(c.label) || c.label.startsWith("."))) throw Error("bad label"); if (!["main", "t2", "main-plain", "t2-plain", "t2-verify"].includes(c.body)) throw Error("cell.body: main | t2 | main-plain | t2-plain"); }
+const CONTROL_MS = plan.controlEveryMs ?? 1000;
 const TOTAL = plan.totalRecords ?? 64000, MAX_S = plan.maxSeconds ?? 300, THREADS = plan.threads ?? 8;
 const OUT = join(import.meta.dir, "results", RUN_ID);
 const epoch = "3".repeat(64), identity = "c".repeat(64);
@@ -96,7 +98,7 @@ async function derive(body: Body) {
     if (body.startsWith("t2")) { await c.query("SELECT sessions.lazy_ack_t2_set_gate('fenced')"); await c.query("SELECT sessions.lazy_ack_t2_set_mode('t2')"); }
     if (!body.endsWith("-plain")) {
       const def = (await c.query("SELECT pg_get_functiondef('sessions.ingest_lazy_ack_batch(jsonb)'::regprocedure) d")).rows[0].d as string;
-      await c.query(instrument(def));
+      await c.query(instrument(def, { verifyProxy: body === "t2-verify" }));
       const w = (await c.query("SELECT pg_get_functiondef('sessions.ingest_origin_commit_buffered_batch(jsonb)'::regprocedure) d")).rows[0].d as string;
       await c.query(instrumentWrapper(w));
     }
@@ -142,9 +144,50 @@ async function runCell(cell: Cell, index: number) {
       w.postMessage({ kind: "init", init: { dbUrl: dbUrl(db), generation, originClaimFence: true, n: cell.n, streams: per[i]!, prefix: `scf-${index}-t${i}`, maxSeconds: MAX_S, epoch, identity } satisfies LoadInit });
       await onMsg(w, "ready");
     }
+    // C2 ordered control, exactly as benchmarks/seat-clock-contention/bench.ts at 1befee7a: ledger.applyOrderedControl ->
+    // ingest_set_session_uploads -> ingest_apply_ordered_control (selection disable of a fresh session of a dedicated
+    // control user, relayhistory-cloud witness), runtime role, 2 s / 5 s, fixed rate, one at a time, missed slots counted.
+    const ctlKind = cell.controls ?? plan.controls ?? "none";
+    type Ctl = { t0: number; t1: number; ok: boolean; code?: string };
+    const controls: Ctl[] = []; let missed = 0, running = true, c2Applied = 0, c2Code = "";
+    const control2: Tenant = { orgId: "org-a", workspaceId: TENANT.workspaceId, userId: "scb-control2" };
+    const cc = new pg.Client({ connectionString: dbUrl(db) }); await cc.connect();
+    const controlLoop = async () => {
+      const c2Ledger = sqlLedger(async (sql, params) => {
+        try {
+          await cc.query("BEGIN;SET LOCAL lock_timeout='2s';SET LOCAL statement_timeout='5s';SET LOCAL application_name='scb:control2';SET LOCAL ROLE bulls96_session_ingest");
+          const r = await cc.query(sql, params as never); await cc.query("COMMIT"); return r as never;
+        } catch (e: any) { c2Code = String(e?.code ?? "client"); await cc.query("ROLLBACK").catch(() => {}); throw e; }
+      }, { acceptanceMode: "buffered", expectedGeneration: generation, originClaimFence: true });
+      let next = now() + CONTROL_MS;
+      while (running) {
+        await Bun.sleep(Math.max(0, next - now())); if (!running) break;
+        let t0 = now();
+        while (next <= t0) { next += CONTROL_MS; if (next <= t0) missed++; }
+        try {
+          const v = String(c2Applied + 1);
+          const payload = { origin_id: "scb-control2-o", sessions: [{ source: "claude", session_id: `scb-ctl-${index}-${v}` }], enabled: false };
+          const digest = (await pool.query("SELECT encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',$1::text,$2::text,$3::text,$4::text,'selection',$5::jsonb)::text,'UTF8')),'hex') AS d",
+            [epoch, control2.orgId, control2.workspaceId, control2.userId, JSON.stringify(payload)])).rows[0].d as string;
+          const ctl = { epoch, version: v, digest, kind: "selection" as const };
+          const witness = { version: 1, issuer: "relayhistory-cloud", sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: "a".repeat(64), tenant: control2,
+            originId: payload.origin_id, batchId: null, batchDigest: null, sourceControlVersion: v, pending: true, pendingControl: ctl, privacyVersion: String(Number(v) - 1),
+            originalRecordCount: 0, candidateCount: 0, records: [], privacy: v === "1" ? { complete: true, deletions: [], resets: [] } : null };
+          const sourceDigest = (await pool.query("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(witness)])).rows[0].d as string;
+          t0 = now(); c2Code = "";
+          const r: any = await c2Ledger.applyOrderedControl!({ tenant: control2, originId: payload.origin_id, sessions: payload.sessions.map((x) => [x.source, x.session_id] as [string, string]),
+            enabled: false, control: ctl, custody: { witness, sourceDigest } } as never);
+          if (r?.control?.outcome !== "applied") throw Object.assign(Error("unexpected control outcome"), { code: "XXOUT:" + String(r?.control?.outcome) });
+          c2Applied++; controls.push({ t0, t1: now(), ok: true });
+        } catch (e: any) { controls.push({ t0, t1: now(), ok: false, code: c2Code || String(e?.code ?? "client") }); }
+      }
+    };
+    const loops = ctlKind === "c2" ? [controlLoop()] : [];
     const results = threads.map((w) => onMsg<any>(w, "done"));
     for (const w of threads) w.postMessage({ kind: "go" });
     const done = await Promise.all(results);
+    running = false; await Promise.all(loops); await cc.end();
+    const loadEnd = Math.max(...done.map((d) => d.end as number));
     const txns: Txn[] = done.flatMap((d) => d.txns);
     const start = Math.min(...done.map((d) => d.start)), lastDone = Math.max(...done.map((d) => d.lastDone));
     const durable = done.reduce((a, d) => a + d.durable, 0);
@@ -179,7 +222,11 @@ async function runCell(cell: Cell, index: number) {
     const result = {
       cell, threads: T, drained: undrained === 0, drainSeconds: Math.round(seconds * 100) / 100,
       durableRecords: durable, durableRecordsPerSec: Math.round(durable / seconds), retriesPerBatch: Math.round((tries - nBatches) / nBatches * 100) / 100,
-      stageFailures: failures, commitsOk: txns.filter((t) => t.stage === "commit" && t.ok).length, traced: traced.length, untraced,
+      stageFailures: failures,
+      controls: { kind: ctlKind, everyMs: CONTROL_MS, scheduledSlots: controls.length + missed, missedSlots: missed, started: controls.length,
+        completedDuringLoad: controls.filter((c) => c.ok && c.t1 <= loadEnd).length, completedAfterLoadEnd: controls.filter((c) => c.ok && c.t1 > loadEnd).length,
+        failed: controls.filter((c) => !c.ok).reduce((a, c) => ({ ...a, [c.code!]: (a[c.code!] ?? 0) + 1 }), {} as Record<string, number>),
+        latencyMs: dist(controls.filter((c) => c.ok).map((c) => c.t1 - c.t0)) }, commitsOk: txns.filter((t) => t.stage === "commit" && t.ok).length, traced: traced.length, untraced,
       holdMs: dist(rows.map((r) => r.hold)), clockWaitMs: dist(rows.map((r) => r.wait)), inAckAfterLockMs: dist(rows.map((r) => r.inAck)),
       postAckMs: dist(rows.map((r) => r.postAck)), commitRttMs: dist(rows.map((r) => r.commitRtt)), preLockMs: dist(rows.map((r) => r.preLock)),
       commitStatementMs: dist(rows.map((r) => r.statement)),

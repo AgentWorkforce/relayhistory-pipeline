@@ -16,7 +16,7 @@ upload path (`deliverBatch -> sqlLedger`, buffered, origin claim fence on), W1/W
   worker after COMMIT on the same connection (outside the hold). Failed transactions carry no trace.
 - `cell.body`: `main` (the base body, T2 gate off), `t2` (gate fenced, mode t2, set with the shipped owner setters on the
   template), `main-plain` / `t2-plain` (unprobed, for the probe overhead check).
-- No controls.
+- Controls: none by default; `controls: "c2"` (plan or cell) runs the baseline's C2 ordered control loop unchanged.
 
 ## Measured span
 
