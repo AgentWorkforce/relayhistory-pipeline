@@ -45,8 +45,8 @@
  *                 THIS run's verdict (`head_unproven_parity_stale` otherwise). A fenced authority still wins
  *                 (`privacy_fenced`). A stage live by this path gets, besides its unchanged sidecar, a proof record
  *                 `<keyRoot>/.drain/accepted-proofs/v1/<org>/<sha256(stage key)>.json` {proof: "no_head_parity"}
- *                 (execute only, before the sidecar; never deleted). The sidecar itself is unchanged, because the
- *                 drain (buffered-drain.ts, untouched) accepts only the six-key v2 marker. With `noHeadParity` unset
+ *                 (execute only, before the sidecar; never deleted). The sidecar itself is unchanged: the drain
+ *                 reads the same v2 (or, with both seat opt-ins, v3) marker either way. With `noHeadParity` unset
  *                 the verdict, the objects and the summary are byte-identical to before.
  *   the S3 fence  the user's S3 fence as the export saw it (instance, resets, resetsCompleted, and the epoch of every
  *                 kept session), read BEFORE the SQL snapshot of the verdict (a candidate page lists the users first):
@@ -55,7 +55,9 @@
  *                 row whose user was not read first is `fence_late`: no sidecar, and the org stays incomplete (a
  *                 guard: each verdict page takes exactly the keys whose users were just read, so it should not occur).
  *   per stage     a sidecar `<stage key>.accepted.json` (v2): {stage_sha256, live, kept: per object group the line
- *                 indexes SQL keeps, fence}. Replaced by CAS when a rerun's verdict differs.
+ *                 indexes SQL keeps, fence}. Replaced by CAS when a rerun's verdict differs. With `seatSidecar` (off by
+ *                 default) it is v3 instead: the same fields plus `seats`, one {seat, digest} per kept line, proven by
+ *                 SEAT_PAGE under the publication path's rules; a live stage with any unproven seat gets no sidecar.
  *   superseded    a create-only `<stage key>.superseded.json` for an earlier LIVE sidecar whose stage is no longer a
  *                 candidate (its outbox row erased or replaced, its receipt or batch no longer accepted): the drain
  *                 never writes a superseded stage (`stage_superseded`). Never deleted or undone.
@@ -80,9 +82,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import {
-  ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireExclusiveLock, assertDrainUnlocked, assertPeerUnlocked, drainLockKey, exportLockKey, parseAcceptedComplete, parseAcceptedMarker, parseStagedKey,
-  DRAIN_LOCK_TTL_MS, type AcceptedComplete, type AcceptedMarker, type DrainLease, type SupersededRecord,
+  ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireExclusiveLock, assertDrainUnlocked, assertPeerUnlocked, drainLockKey, exportLockKey, parseAcceptedComplete, parseAcceptedMarker, parseAcceptedMarkerV3, parseStagedKey,
+  DRAIN_LOCK_TTL_MS, type AcceptedComplete, type AcceptedMarker, type AcceptedMarkerV3, type AcceptedSeat, type DrainLease, type SupersededRecord,
 } from "./buffered-drain.ts";
+import { acceptedReceiptSeat, parseReceiptSeatSnapshot } from "./publication-seats.ts";
+import type { BufferedClaimRecord } from "./buffered-protocol.ts";
 import { fenceEpoch, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "./ledger-s3.ts";
 import { liveMachineId } from "./writer.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
@@ -122,6 +126,12 @@ export interface ExportOptions {
    * also be in `orgs` (a scoped run); maxAgeSeconds in [1, NO_HEAD_PARITY_MAX_AGE_SECONDS]. Unset: off.
    */
   noHeadParity?: { orgs: string[]; maxAgeSeconds: number };
+  /**
+   * Opt-in, off by default: write the v3 sidecar, which adds each kept line's receipt seat (SEAT_PAGE). A live stage
+   * whose seats cannot all be proven is refused (a `seat_*` or `publication_seats_*` failed code, no sidecar, the org
+   * incomplete). Off: no extra query, and v2 sidecars byte-identical to before.
+   */
+  seatSidecar?: boolean;
 }
 
 /**
@@ -503,6 +513,137 @@ SELECT st.stage_key, st.stage_sha256, st.claim_token::text AS claim_token, st.or
   LEFT JOIN kept_json AS kj ON kj.stage_token = st.stage_token
  ORDER BY st.stage_key`;
 
+/**
+ * The receipt seats of a page of stages (the `seatSidecar` opt-in only), in the same read-only snapshot as
+ * VERDICT_PAGE. A read-only transcription of `ingest_lazy_stage_seats` (20261104055000), its guard `ingest_lazy_guard`
+ * (20261105044030) and `ingest_receipt_seat_records` (20261104053000): those are volatile, take FOR SHARE locks and
+ * raise, so they cannot run here. Each raise becomes a false flag or a short count, which the export refuses. One
+ * difference: a generation admitted only through an open overlap window is refused here (policy_ok false).
+ * `$1` = stage keys. Per stage: the flags, the counts, the snapshot in the function's exact return shape, the stage's
+ * reset epoch, and per ordinal the publication head's fence epoch (coalesce(max(fence version), 0); 0 without a session).
+ */
+export const SEAT_PAGE = `
+WITH ck AS MATERIALIZED (
+  SELECT c.control_epoch, c.source_identity_sha256, c.baseline, c.allocated_high_water, c.last_seat
+    FROM sessions.ingest_receipt_seat_clock AS c WHERE c.singleton
+), pol AS MATERIALIZED (
+  SELECT lp.generation, lp.valid_until, lp.source_identity_sha256, lp.control_epoch, lp.source_proof_sha256,
+         lp.privacy_baseline_sha256, lp.retention_contract_sha256
+    FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton
+), guard AS MATERIALIZED (
+  SELECT EXISTS (SELECT 1 FROM pol) AS lazy,
+         coalesce((SELECT EXISTS (SELECT 1 FROM sessions.__96bulls_role_validation AS rv
+                                   WHERE rv.name = 'session_directory_search_worker' AND rv.status = 'pass'
+                                     AND rv.generation = pol.generation)
+                     AND pol.valid_until > clock_timestamp()
+                     AND ck.source_identity_sha256 = pol.source_identity_sha256 AND ck.control_epoch = pol.control_epoch
+                     AND ck.baseline->>'sourceProofSha256' IS NOT DISTINCT FROM pol.source_proof_sha256
+                FROM pol CROSS JOIN ck), false) AS policy_ok
+), st AS MATERIALIZED (
+  SELECT t.stage_token, t.stage_key, t.stage_sha256, t.claim_token, t.group_ordinals, t.reset_epoch AS t_reset,
+         t.org_id, t.workspace_id, t.user_id, t.origin_id,
+         a.records, a.epochs, a.reset_epoch AS a_reset, a.schema_generation, a.source_control_version, a.source_witness_sha256,
+         ck.control_epoch AS ck_epoch, ck.source_identity_sha256 AS ck_identity, ck.allocated_high_water AS ck_high, ck.last_seat AS ck_last,
+         coalesce(t.receipt_state = 'acknowledged' AND t.cleanup_state = 'live'
+           AND EXISTS (SELECT 1 FROM sessions.ingest_buffer_outbox AS o
+                        WHERE o.active_stage_token = t.stage_token AND o.state = 'buffered'
+                          AND o.org_id = t.org_id AND o.workspace_id = t.workspace_id AND o.user_id = t.user_id
+                          AND o.origin_id = t.origin_id AND o.batch_id = t.batch_id AND o.digest = t.digest)
+           AND a.org_id = t.org_id AND a.workspace_id = t.workspace_id AND a.user_id = t.user_id AND a.origin_id = t.origin_id
+           AND a.batch_id = t.batch_id AND a.digest = t.digest AND a.reset_epoch = t.reset_epoch
+           AND a.source_identity_sha256 IS NOT DISTINCT FROM ck.source_identity_sha256
+           AND EXISTS (SELECT 1 FROM sessions.ingest_buffer_admission AS ba CROSS JOIN pol
+                        WHERE ba.org_id = t.org_id AND ba.schema_generation = pol.generation
+                          AND ba.control_epoch = pol.control_epoch AND ba.privacy_baseline_sha256 = pol.privacy_baseline_sha256
+                          AND ba.retention_contract_sha256 = pol.retention_contract_sha256 AND ba.valid_until > clock_timestamp())
+           AND CASE WHEN jsonb_typeof(a.records) = 'array' THEN jsonb_array_length(a.records) <= 500 ELSE false END
+           AND a.reset_epoch >= 0 AND jsonb_typeof(a.epochs) = 'array', false) AS pre_ok
+    FROM sessions.ingest_stage_intents AS t
+    JOIN sessions.ingest_claim_attempts AS a ON a.claim_token = t.claim_token
+    LEFT JOIN ck ON true
+   WHERE t.stage_key = ANY($1::text[])
+), ords AS (
+  SELECT st.stage_token, (e.value::text)::integer AS ord
+    FROM st
+   CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(st.group_ordinals) = 'array' THEN st.group_ordinals ELSE '[]'::jsonb END) AS g(value)
+   CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(g.value) = 'array' THEN g.value ELSE '[]'::jsonb END) AS e(value)
+   WHERE jsonb_typeof(e.value) = 'number' AND e.value::text ~ '^(0|[1-9][0-9]{0,2})$'
+), groups_ok AS (
+  -- ingest_receipt_seat_records' ordinal checks: non-empty arrays of 0..499, no ordinal twice, 1..500 in all.
+  SELECT st.stage_token,
+         jsonb_typeof(st.group_ordinals) = 'array'
+         AND NOT EXISTS (
+           SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(st.group_ordinals) = 'array' THEN st.group_ordinals ELSE '[]'::jsonb END) AS g(value)
+            WHERE CASE WHEN jsonb_typeof(g.value) = 'array' THEN jsonb_array_length(g.value) = 0 ELSE true END
+               OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(g.value) = 'array' THEN g.value ELSE '[]'::jsonb END) AS e(value)
+                           WHERE CASE WHEN jsonb_typeof(e.value) = 'number' AND e.value::text ~ '^(0|[1-9][0-9]{0,2})$'
+                                      THEN (e.value::text)::integer > 499 ELSE true END))
+         AND (SELECT count(*) FROM ords AS o WHERE o.stage_token = st.stage_token) BETWEEN 1 AND 500
+         AND (SELECT count(*) FROM ords AS o WHERE o.stage_token = st.stage_token)
+           = (SELECT count(DISTINCT o.ord) FROM ords AS o WHERE o.stage_token = st.stage_token) AS ok
+    FROM st
+), rec AS (
+  SELECT st.stage_token, r.ord, r.source, r.session_id, r.record_id, r.revision, r.digest
+    FROM st
+   CROSS JOIN LATERAL jsonb_to_recordset(CASE WHEN jsonb_typeof(st.records) = 'array' THEN st.records ELSE '[]'::jsonb END)
+         AS r(ord integer, source text, session_id text, record_id text, revision bigint, digest text)
+), ep AS (
+  SELECT st.stage_token, x.source, x.session_id, min(x.epoch) AS epoch, min(x.reset_epoch) AS reset_epoch, count(*) AS n
+    FROM st
+   CROSS JOIN LATERAL jsonb_to_recordset(CASE WHEN jsonb_typeof(st.epochs) = 'array' THEN st.epochs ELSE '[]'::jsonb END)
+         AS x(source text, session_id text, epoch bigint, reset_epoch bigint)
+   GROUP BY st.stage_token, x.source, x.session_id
+), wanted AS (
+  SELECT r.stage_token, r.ord, r.digest, r.scope_epoch,
+         jsonb_build_array('buffer-first-ack-seat-v1', st.ck_epoch, st.ck_identity, st.org_id, st.workspace_id, st.user_id,
+           st.origin_id, r.record_id, r.revision::text, st.a_reset::text, r.source, r.session_id, r.scope_epoch::text) AS m
+    FROM (SELECT rc.*, CASE WHEN rc.session_id IS NULL THEN 0::bigint ELSE x.epoch END AS scope_epoch, x.n AS xn,
+                 x.epoch AS xepoch, x.reset_epoch AS xreset
+            FROM rec AS rc
+            LEFT JOIN ep AS x ON x.stage_token = rc.stage_token AND x.source = rc.source AND x.session_id = rc.session_id) AS r
+    JOIN st ON st.stage_token = r.stage_token
+   WHERE r.ord IN (SELECT o.ord FROM ords AS o WHERE o.stage_token = r.stage_token)
+     AND r.record_id IS NOT NULL AND r.source IS NOT NULL AND r.revision > 0 AND r.digest ~ '^[0-9a-f]{64}$'
+     AND (r.session_id IS NULL OR (r.xn = 1 AND r.xepoch >= 0 AND r.xreset = st.a_reset))
+), joined AS (
+  SELECT w.stage_token, w.ord, s.seat, w.digest AS candidate_digest, d.first_digest, d.body_accepted,
+         st.a_reset AS reset_epoch, w.scope_epoch AS fence_epoch
+    FROM wanted AS w
+    JOIN st ON st.stage_token = w.stage_token
+    JOIN sessions.ingest_lazy_ack_decisions AS d
+      ON d.claim_token = st.claim_token AND d.ord = w.ord
+     AND d.candidate_key_sha256 = encode(sha256(convert_to(w.m::text, 'UTF8')), 'hex')
+     AND d.candidate_digest = w.digest AND d.reset_epoch = st.a_reset AND d.fence_epoch = w.scope_epoch
+     AND d.generation = st.schema_generation AND d.source_control_version = st.source_control_version
+     AND d.source_witness_sha256 = st.source_witness_sha256
+    JOIN sessions.ingest_receipt_seats AS s
+      ON s.key_sha256 = d.seat_key_sha256 AND s.first_digest = d.first_digest AND s.seat > st.ck_high
+    JOIN sessions.ingest_lazy_native_slots AS n
+      ON n.key_sha256 = d.native_key_sha256 AND n.org_id = st.org_id AND n.workspace_id = st.workspace_id
+     AND n.origin_id = st.origin_id AND n.record_id = w.m->>7
+     AND n.source_identity_sha256 = st.ck_identity AND n.control_epoch = st.ck_epoch
+   WHERE NOT d.body_accepted OR (s.key_material = w.m AND d.first_digest = w.digest)
+)
+SELECT st.stage_key, st.stage_sha256, st.claim_token::text AS claim_token, st.group_ordinals, st.records,
+       g.lazy, g.policy_ok, (st.pre_ok AND go.ok) AS pre_ok, st.t_reset::text AS reset_epoch,
+       (SELECT count(*) FROM ords AS o WHERE o.stage_token = st.stage_token)::integer AS ords_n,
+       (SELECT count(*) FROM wanted AS w WHERE w.stage_token = st.stage_token)::integer AS wanted_n,
+       (SELECT count(*) FROM joined AS j WHERE j.stage_token = st.stage_token)::integer AS seated_n,
+       jsonb_build_object('controlEpoch', st.ck_epoch, 'sourceIdentitySha256', st.ck_identity,
+         'allocatedHighWater', st.ck_high::text, 'lastAssignedSeat', st.ck_last::text,
+         'records', coalesce((SELECT jsonb_agg(jsonb_build_object('ord', j.ord, 'seat', j.seat::text, 'candidateDigest', j.candidate_digest,
+                       'firstDigest', j.first_digest, 'bodyAccepted', j.body_accepted, 'resetEpoch', j.reset_epoch::text,
+                       'fenceEpoch', j.fence_epoch::text) ORDER BY j.ord)
+                     FROM joined AS j WHERE j.stage_token = st.stage_token), '[]'::jsonb)) AS snapshot,
+       coalesce((SELECT jsonb_object_agg(rc.ord::text,
+                   (CASE WHEN rc.session_id IS NULL THEN 0::bigint
+                         ELSE (SELECT coalesce(max(fv.epoch), 0) FROM sessions.ingest_fence_versions AS fv
+                                WHERE fv.org_id = st.org_id AND fv.workspace_id = st.workspace_id AND fv.user_id = st.user_id
+                                  AND fv.origin_id = st.origin_id AND fv.source = rc.source AND fv.session_id = rc.session_id) END)::text)
+                   FROM rec AS rc WHERE rc.stage_token = st.stage_token AND rc.ord IS NOT NULL), '{}'::jsonb) AS fences
+  FROM st CROSS JOIN guard AS g JOIN groups_ok AS go ON go.stage_token = st.stage_token
+ ORDER BY st.stage_key`;
+
 async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -554,6 +695,8 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       throw new Error("export_no_head_parity_max_age_invalid");
   }
   const nhpOrgs = nhp ? [...new Set(nhp.orgs)].sort() : null;
+  if (opts.seatSidecar !== undefined && typeof opts.seatSidecar !== "boolean") throw new Error("export_seat_sidecar_invalid");
+  const seatSidecar = opts.seatSidecar === true;
   const nhpAge = nhp ? nhp.maxAgeSeconds : null;
   const nowMs = opts.nowMs ?? Date.now;
   // The dry run's defence in depth: every mutation throws.
@@ -692,7 +835,12 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         preRead.add(userKey(r));
         await fenceOf(r.org_id, r.workspace_id, r.user_id);
       });
-      const rows = (await readOnly(() => sql.query(scopedExportSql(VERDICT_PAGE, orgScope !== null), [orgScope, page.map((r) => String(r.stage_key)), nhpOrgs, nhpAge]))).rows;
+      const pageKeys = page.map((r) => String(r.stage_key));
+      // The seats (opt-in only) are read in the same read-only snapshot as the verdict.
+      const [rows, seatRows] = await readOnly(async () => [
+        (await sql.query(scopedExportSql(VERDICT_PAGE, orgScope !== null), [orgScope, pageKeys, nhpOrgs, nhpAge])).rows,
+        seatSidecar ? (await sql.query(SEAT_PAGE, [pageKeys])).rows : [],
+      ] as const);
       // The v2 gate turned off mid-export: stop before writing this page.
       if (rows.some((r) => r.v2 !== true)) throw new ExportError("export_claim_sessions_gate_off");
       await mapLimit(rows, concurrency, async (r) => {
@@ -751,10 +899,29 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
           tally.bad = true;
           return;
         }
-        const marker: AcceptedMarker = {
-          v: 2, kind: "buffered-accepted", stage_sha256: r.stage_sha256 as string, live,
-          kept: live ? lines! : [], fence: fenceView,
-        };
+        let marker: AcceptedMarker | AcceptedMarkerV3;
+        if (!seatSidecar) {
+          marker = {
+            v: 2, kind: "buffered-accepted", stage_sha256: r.stage_sha256 as string, live,
+            kept: live ? lines! : [], fence: fenceView,
+          };
+        } else {
+          // Refuse, never guess: a live stage with any seat not proven gets no sidecar (and its org stays incomplete).
+          let seats: AcceptedSeat[][] = [];
+          if (live) {
+            try {
+              seats = provenSeats(r, seatRows, lines!, keptRows);
+            } catch (error) {
+              fail(failureCode(error));
+              tally.bad = true;
+              return;
+            }
+          }
+          marker = {
+            v: 3, kind: "buffered-accepted", stage_sha256: r.stage_sha256 as string, live,
+            kept: live ? lines! : [], fence: fenceView, seats,
+          };
+        }
         const key = (r.stage_key as string) + ACCEPTED_SUFFIX;
         try {
           if (byParity) {
@@ -963,12 +1130,51 @@ export function failureCode(error: unknown): string {
   return "internal";
 }
 
-async function readMarker(store: ObjectStore, key: string): Promise<{ doc: AcceptedMarker; version: ObjectVersion } | "invalid" | null> {
+/**
+ * The seat of every kept line of a live stage, from its SEAT_PAGE row, under the publication path's rules
+ * (publication-rpc.ts / publication-image.ts): `parseReceiptSeatSnapshot` over the attempt's records and the stage's
+ * ordinals, then `acceptedReceiptSeat` per kept ordinal with the stage's reset epoch and the head's fence epoch. Throws
+ * a closed code when any seat is not proven: `seat_row` (no single row for these exact stage bytes), `seat_not_lazy`,
+ * `seat_precondition` (the guard or the stage checks), `seat_missing` (the decision rows do not cover every ordinal),
+ * `publication_seats_<cause>` (including `losing_body`: a not-accepted candidate), `seat_scope`, `seat_duplicate`.
+ */
+export function provenSeats(
+  r: Record<string, unknown>, seatRows: readonly Record<string, unknown>[], lines: number[][],
+  keptRows: readonly { group: number; source: string; session: string }[],
+): AcceptedSeat[][] {
+  const mine = seatRows.filter((x) => x.stage_key === r.stage_key);
+  const row = mine[0];
+  if (mine.length !== 1 || !row || row.stage_sha256 !== r.stage_sha256 || row.claim_token !== r.claim_token ||
+      JSON.stringify(row.group_ordinals) !== JSON.stringify(r.group_ordinals)) throw new Error("seat_row");
+  if (row.lazy !== true) throw new Error("seat_not_lazy");
+  if (row.policy_ok !== true || row.pre_ok !== true) throw new Error("seat_precondition");
+  if (typeof row.ords_n !== "number" || row.ords_n < 1 || row.wanted_n !== row.ords_n || row.seated_n !== row.ords_n) throw new Error("seat_missing");
+  const groupOrdinals = row.group_ordinals as number[][];
+  const snap = parseReceiptSeatSnapshot(row.snapshot, row.records as BufferedClaimRecord[], { key: "", sha256: "", bytes: 0, groupOrdinals });
+  const fences = (row.fences ?? {}) as Record<string, unknown>;
+  const resetEpoch = String(row.reset_epoch);
+  const used = new Set<string>();
+  return lines.map((js, g) => js.map((j) => {
+    const ord = groupOrdinals[g]![j]!;
+    const fenceEpoch = fences[String(ord)];
+    if (typeof fenceEpoch !== "string") throw new Error("seat_scope");
+    const slot = acceptedReceiptSeat(snap, ord, { resetEpoch, fenceEpoch });
+    const k = keptRows.find((x) => x.group === g);
+    if (!k || slot.record.source !== k.source || slot.record.session_id !== k.session) throw new Error("seat_scope");
+    if (used.has(slot.seat.seat)) throw new Error("seat_duplicate");
+    used.add(slot.seat.seat);
+    return { seat: slot.seat.seat, digest: slot.seat.firstDigest };
+  }));
+}
+
+async function readMarker(store: ObjectStore, key: string): Promise<{ doc: AcceptedMarker | AcceptedMarkerV3; version: ObjectVersion } | "invalid" | null> {
   try {
     const got = await store.getObject(objectKey(key));
     const bytes = await readAll(got.body);
     if (bytes.byteLength > 1024 * 1024) return "invalid";
-    const doc = parseAcceptedMarker(decoder.decode(bytes));
+    // v3 is read whether or not the seat opt-in is on, so a run with it off can replace (or supersede) a v3 sidecar.
+    const text = decoder.decode(bytes);
+    const doc = parseAcceptedMarker(text) ?? parseAcceptedMarkerV3(text);
     return doc ? { doc, version: got.meta.version } : "invalid";
   } catch (error) {
     if (isObjectStoreError(error, "not_found")) return null;

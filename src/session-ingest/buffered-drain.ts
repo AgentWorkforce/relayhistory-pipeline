@@ -83,6 +83,7 @@ import {
   sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
 } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
+import { injectReceiptSeat, type ReceiptSeatSlot } from "./publication-seats.ts";
 import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
 import {
@@ -142,29 +143,108 @@ export interface AcceptedMarker {
   kept: number[][];
   fence: { instance: string; resets: number; resetsCompleted: number; epochs: Record<string, number> } | null;
 }
+/**
+ * The v3 sidecar: the v2 verdict plus, for every kept line, the receipt seat the export proved under the same rules as
+ * the publication path (`acceptedReceiptSeat`), and the pre-seat digest of that line. `seats` has exactly the shape of
+ * `kept`. The drain accepts v3 only with `DrainOptions.acceptSeatSidecar`; otherwise it refuses v3 like any unknown
+ * version.
+ */
+export interface AcceptedSeat { seat: string; digest: string }
+export interface AcceptedMarkerV3 extends Omit<AcceptedMarker, "v"> { v: 3; seats: AcceptedSeat[][] }
 export interface AcceptedComplete { v: 1; kind: "buffered-accepted-complete"; stages: number; completedAtMs: number }
+function markerBody(v: Record<string, unknown>, version: 2 | 3, keys: number): boolean {
+  if (v.v !== version || v.kind !== "buffered-accepted" || typeof v.stage_sha256 !== "string" || !HEX64.test(v.stage_sha256) ||
+      typeof v.live !== "boolean" || !Array.isArray(v.kept) || Object.keys(v).length !== keys) return false;
+  for (const g of v.kept as unknown[]) {
+    if (!Array.isArray(g)) return false;
+    let prev = -1;
+    for (const j of g) {
+      if (!Number.isInteger(j) || (j as number) <= prev) return false;
+      prev = j as number;
+    }
+  }
+  const f = v.fence;
+  if (f !== null) {
+    if (!isObject(f) || typeof f.instance !== "string" || !Number.isSafeInteger(f.resets) || !Number.isSafeInteger(f.resetsCompleted) || !isObject(f.epochs) ||
+        !Object.values(f.epochs).every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return false;
+  }
+  return true;
+}
 export function parseAcceptedMarker(text: string): AcceptedMarker | null {
   try {
     const v = JSON.parse(text) as Record<string, unknown>;
-    if (!isObject(v) || v.v !== 2 || v.kind !== "buffered-accepted" || typeof v.stage_sha256 !== "string" || !HEX64.test(v.stage_sha256) ||
-        typeof v.live !== "boolean" || !Array.isArray(v.kept) || Object.keys(v).length !== 6) return null;
-    for (const g of v.kept as unknown[]) {
-      if (!Array.isArray(g)) return null;
-      let prev = -1;
-      for (const j of g) {
-        if (!Number.isInteger(j) || (j as number) <= prev) return null;
-        prev = j as number;
-      }
-    }
-    const f = v.fence;
-    if (f !== null) {
-      if (!isObject(f) || typeof f.instance !== "string" || !Number.isSafeInteger(f.resets) || !Number.isSafeInteger(f.resetsCompleted) || !isObject(f.epochs) ||
-          !Object.values(f.epochs).every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return null;
-    }
+    if (!isObject(v) || !markerBody(v, 2, 6)) return null;
     return v as unknown as AcceptedMarker;
   } catch {
     return null;
   }
+}
+/** A canonical positive bigint seat: no sign, no leading zero, no exponent, 1..2^63-1. */
+const SEAT_MAX = 9223372036854775807n;
+export const canonicalSeat = (s: unknown): s is string => typeof s === "string" && /^[1-9][0-9]{0,18}$/.test(s) && BigInt(s) <= SEAT_MAX;
+/**
+ * Parse a v3 sidecar. The whole sidecar is refused (null) when any seat is missing or extra against `kept`, not a
+ * canonical positive decimal string, or used twice, or when any entry has a key other than seat and digest.
+ */
+export function parseAcceptedMarkerV3(text: string): AcceptedMarkerV3 | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    if (!isObject(v) || !markerBody(v, 3, 7) || !Array.isArray(v.seats)) return null;
+    const kept = v.kept as number[][], seats = v.seats as unknown[];
+    if (seats.length !== kept.length) return null;
+    const used = new Set<string>();
+    for (let g = 0; g < seats.length; g++) {
+      const row = seats[g];
+      if (!Array.isArray(row) || row.length !== kept[g]!.length) return null;
+      for (const e of row) {
+        if (!isObject(e) || Object.keys(e).length !== 2 || !canonicalSeat(e.seat) || typeof e.digest !== "string" || !HEX64.test(e.digest)) return null;
+        if (used.has(e.seat)) return null;
+        used.add(e.seat);
+      }
+    }
+    return v as unknown as AcceptedMarkerV3;
+  } catch {
+    return null;
+  }
+}
+/**
+ * One kept line with its v3 seat, as the publication path writes it (publication-image.ts): `fitLine` first, then
+ * `injectReceiptSeat` appends `"accepted_seq"` to those exact bytes. The digest the sidecar names must be the line's
+ * own pre-seat digest (meta[1]); `injectReceiptSeat` refuses otherwise, and refuses a line that already has a seat,
+ * names another origin, or whose revision differs.
+ */
+export function seatLine(line: string, m: LineMeta, entry: AcceptedSeat, originId: string): string {
+  const r = JSON.parse(line) as { record_id?: unknown; revision?: unknown };
+  const revision = Number(r.revision);
+  const slot: ReceiptSeatSlot = {
+    record: { ord: 0, source: m[2], session_id: m[3], record_id: String(r.record_id), revision_id: m[0], revision, digest: m[1] },
+    seat: { ord: 0, seat: entry.seat, bodyAccepted: true, candidateDigest: entry.digest, firstDigest: entry.digest, resetEpoch: "0", fenceEpoch: "0" },
+  };
+  return injectReceiptSeat(fitLine(line), slot, originId);
+}
+/**
+ * Every kept line of a v3 sidecar takes its seat (a trial `seatLine`), and no record revision appears twice among the
+ * kept lines: two copies of one revision would carry two seats (the parser already refuses a seat used twice). Any
+ * failure refuses the whole sidecar.
+ */
+function seatsFit(marker: AcceptedMarkerV3, groups: Group[], originId: string): boolean {
+  const revisions = new Set<string>();
+  for (let g = 0; g < marker.kept.length; g++) {
+    const kept = marker.kept[g]!;
+    for (let n = 0; n < kept.length; n++) {
+      const j = kept[n]!, line = groups[g]!.lines[j]!, m = groups[g]!.meta![j]!;
+      try {
+        const r = JSON.parse(line) as { record_id?: unknown; revision?: unknown };
+        const id = JSON.stringify([r.record_id, r.revision]);
+        if (revisions.has(id)) return false;
+        revisions.add(id);
+        seatLine(line, m, marker.seats[g]![n]!, originId);
+      } catch {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 export function parseAcceptedComplete(text: string): AcceptedComplete | null {
   try {
@@ -824,6 +904,12 @@ export interface DrainOptions {
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /**
+   * Opt-in, off by default: accept the v3 seat sidecar and append each kept line's receipt seat (`accepted_seq`) with
+   * publication-seats.ts `injectReceiptSeat` after `fitLine`. Off, a v3 sidecar is refused exactly like an unknown
+   * version (`accepted_mismatch`) and nothing else changes. v2 sidecars stay unseated either way.
+   */
+  acceptSeatSidecar?: boolean;
 }
 
 /** S3 key order for org prefixes: compare `<org>/`, not `<org>` (`a-b/` sorts before `a/`). */
@@ -840,6 +926,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   // A dry run writes nothing, so a watermark it recorded would let --execute skip everything it only classified.
   if (opts.dryRun && opts.onCheckpoint) throw new Error("drain_checkpoint_requires_execute");
   if (opts.resume && opts.startAfter !== undefined) throw new Error("drain_resume_and_start_after");
+  if (opts.acceptSeatSidecar !== undefined && typeof opts.acceptSeatSidecar !== "boolean") throw new Error("drain_accept_seat_sidecar_invalid");
   const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
@@ -1206,14 +1293,16 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       }
       // The sidecar must name these exact bytes (the export copied SQL's stage_sha256), carry SQL's verdict that the
       // stage is live, and keep lines that exist in this object.
-      let marker: AcceptedMarker;
+      let marker: AcceptedMarker | AcceptedMarkerV3;
       try {
         const got = await readText(store, key + ACCEPTED_SUFFIX, 1024 * 1024);
-        const parsed = got ? parseAcceptedMarker(got.text) : null;
+        // v3 only behind its opt-in: off, a v3 sidecar parses as nothing and is refused like any unknown version.
+        const parsed = got ? parseAcceptedMarker(got.text) ?? (opts.acceptSeatSidecar === true ? parseAcceptedMarkerV3(got.text) : null) : null;
         const groups = read.decoded.groups;
         const refusal: ObjectOutcome | null = !parsed || parsed.stage_sha256 !== read.decoded.sha256 ? "accepted_mismatch"
           : !parsed.live ? "stage_not_live"
           : parsed.kept.length !== groups.length || parsed.kept.some((ls, g) => ls.some((j) => j >= groups[g]!.lines.length)) ? "accepted_mismatch"
+          : parsed.v === 3 && !seatsFit(parsed, groups, read.decoded.header.origin_id) ? "accepted_mismatch"
           : null;
         if (refusal) {
           // Never drained under this export generation: release any hold entry for it first. A re-export that changes
@@ -1256,7 +1345,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     return true;
   }
 
-  async function drainOne(key: string, { header, groups, sha256 }: Decoded, verdict: AcceptedMarker): Promise<ObjectOutcome> {
+  async function drainOne(key: string, { header, groups, sha256 }: Decoded, verdict: AcceptedMarker | AcceptedMarkerV3): Promise<ObjectOutcome> {
     const tenant: LedgerTenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
     const origin = header.origin_id;
     const receivedMs = Date.parse(header.received_at);
@@ -1294,9 +1383,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     if (vf === null ? read.state === "present" : fence.instance !== vf.instance || fence.resets !== vf.resets || fence.resetsCompleted !== vf.resetsCompleted)
       return "fence_moved_since_export";
     // Only the lines SQL keeps (finding 2); kept sessions must all be at the export's epoch.
+    // A v3 sidecar's seat follows its line by the line's meta tuple (the same object through every filter below).
+    const seatOf = new Map<LineMeta, AcceptedSeat>();
     groups = groups.map((g, gi) => {
       const keep = new Set(verdict.kept[gi]);
       const lines: string[] = [], meta: LineMeta[] = [];
+      if (verdict.v === 3) verdict.kept[gi]!.forEach((j, n) => seatOf.set(g.meta![j]!, verdict.seats[gi]![n]!));
       g.lines.forEach((l, j) => {
         if (keep.has(j)) { lines.push(l); meta.push(g.meta![j]!); }
         else counts.not_kept++;
@@ -1403,7 +1495,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
             const [sessionKey, epoch, resets] = recordGeneration(fence, origin, m[2], m[3]);
             entries.set(sk, [...(entries.get(sk) ?? []), { recordId: r.record_id, revision, revisionId: m[0], digest: m[1], sessionKey, epoch, resets }]);
             if (m[3] !== null) writtenSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
-            lines.push(fitLine(line));
+            // A seated line is never stored over an equal revision (already_stored above): no retro-seating.
+            const seat = seatOf.get(m);
+            lines.push(seat ? seatLine(line, m, seat, origin) : fitLine(line));
             meta.push(m);
           }
         });
