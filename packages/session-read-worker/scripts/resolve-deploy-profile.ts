@@ -10,7 +10,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { ANALYSIS_ADMIT_BINDING, CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ANALYSIS_ADMIT_BINDING, CONTROL_HEAD_BINDING, parseCanaryWorkspaces, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown; id?: unknown };
 type Version = { id?: unknown; resources?: { bindings?: Binding[] } };
@@ -177,6 +177,10 @@ export function unchangedOtherSettings(version: Version, template: string, env: 
   const managed = new Set<string>([...Object.values(VARIABLES), ...Object.values(FLAGS).map(([name]) => name)]);
   // analysis=disable is the explicit removal of the flag and the binding (unchangedAnalysisSettings).
   if (env.ANALYSIS === "disable") for (const name of [SUMMARY_FLAGS.ANALYSIS, ANALYSIS_ADMIT_BINDING]) managed.add(name);
+  // The raw-store vars render while summary_fallback or analysis is on and are compared like any
+  // other live setting, so a dispatch never silently drops or changes them. analysis=disable with
+  // summary_fallback not on is the explicit removal of the last reader that needs them.
+  if (env.ANALYSIS === "disable" && env.SUMMARY_FALLBACK !== "on") for (const name of RAW_STORE_VARS) managed.add(name);
   for (const b of version.resources?.bindings ?? []) {
     need(typeof b.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name), "Invalid live binding name");
     const name = b.name;
@@ -233,6 +237,8 @@ export function profileInputs(env: Environment): RenderInputs {
     ownerBufferedPhaseLog: env.OWNER_BUFFERED_PHASE_LOG, ownerBufferedIndexVerify: env.OWNER_BUFFERED_INDEX_VERIFY,
     ownerBufferedStatementTimeoutMs: env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
     analysisHyperdriveId: env.ANALYSIS_HYPERDRIVE_ID,
+    summaryFallback: env.SUMMARY_FALLBACK, analysis: env.ANALYSIS,
+    rawS3Bucket: env.RAW_S3_BUCKET, rawS3Region: env.RAW_S3_REGION,
   };
 }
 

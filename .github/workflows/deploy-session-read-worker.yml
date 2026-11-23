@@ -12,6 +12,10 @@ name: deploy session-read-worker
 #   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
 #   SESSION_READ_ANALYSIS_HYPERDRIVE_ID  optional: the Hyperdrive config for bulls96_analysis_admit
 #                                (32 hex, caching disabled); unset = no ANALYSIS_ADMIT binding
+#   SESSION_READ_RAW_S3_BUCKET / SESSION_READ_RAW_S3_REGION  optional: the raw store the pipeline
+#                                writes, when it is not SESSION_READ_INGEST_S3_BUCKET / _REGION
+#                                (those are used when these are unset); needed only with
+#                                summary_fallback=on or analysis=on
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
 # Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts): a default dispatch
@@ -93,7 +97,15 @@ name: deploy session-read-worker
 # the same route also serves Bob Costas's encrypted summary objects (kind=short without a brief,
 # kind=long; src/session-read-api/summary-fallback.ts). It needs the Worker secrets
 # SUMMARY_MASTER_KEYS and PIPELINE_RAW_S3_*; an on dispatch fails before `wrangler deploy` unless
-# all three secrets exist on the Worker (names only).
+# all three secrets exist on the Worker (names only). It also renders (scripts/render-deploy-config.ts)
+# the plain raw-store vars the Worker reads the objects with: PIPELINE_RAW_S3_BUCKET and
+# PIPELINE_RAW_S3_REGION from SESSION_READ_RAW_S3_BUCKET / _REGION, else
+# SESSION_READ_INGEST_S3_BUCKET / _REGION, plus PIPELINE_KEY_PREFIX (TENANT_KEY_BASE,
+# stacks/aws/tenants.ts) and PIPELINE_ORG_FROM_PREFIX=true, the hosted pipeline's org-derived key
+# layout. An on dispatch fails before `wrangler deploy` while the bucket or region is unset or
+# malformed (names only). A wrong bucket fails closed: the Worker refuses every pointer row whose
+# bucket differs (503 backend_unavailable, logged summary_fallback_pointer_invalid), never an empty
+# answer. With summary_fallback and analysis both off the render is byte-identical to before.
 # Same not-preserved rule; dispatch, and putting that secret on the Worker, are Khaliq's call.
 # summary_search=on adds --var READ_API_SUMMARY_SEARCH_ENABLED:true: GET /v1/sessions/summaries/search
 # over ClickHouse session_brief_documents (docs/ch-brief-search-design.md; needs no other input and
@@ -120,8 +132,13 @@ name: deploy session-read-worker
 # binding, rendered only when the environment variable SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set
 # (its live config is checked first: caching disabled, verify-full, the admission role's user);
 # without it POST answers 501 analysis_admission_not_configured and GET still serves. An on dispatch
-# fails before `wrangler deploy` unless the PIPELINE_RAW_S3_* secrets exist (names only). off (the
-# default) renders no var: GET 501 analysis_not_configured and POST 405, as before this input.
+# fails before `wrangler deploy` unless the PIPELINE_RAW_S3_* secrets exist (names only), and
+# renders the same plain raw-store vars as summary_fallback=on (bucket and region required, from
+# the same variables; a wrong bucket fails closed: the result-object read fails and GET serves an
+# error, never another object, e.g. 503 analysis_result_missing). off (the default)
+# renders no var: GET 501 analysis_not_configured and POST 405, as before this input. A
+# profile/preserve dispatch refuses to drop or change live raw-store vars; analysis=disable without
+# summary_fallback=on may drop them.
 # The ANALYSIS_ADMIT binding is rendered whenever SESSION_READ_ANALYSIS_HYPERDRIVE_ID is set, whatever
 # `analysis` says (a flag-off Worker ignores it); the render is byte-identical to before only with
 # that variable unset. Not preserved from live: in EVERY mode (profile, preserve, and explicit
@@ -295,6 +312,9 @@ jobs:
       ANALYSIS: ${{ inputs.analysis }}
       # The admission principal's Hyperdrive (optional); set = the ANALYSIS_ADMIT binding is rendered.
       ANALYSIS_HYPERDRIVE_ID: ${{ vars.SESSION_READ_ANALYSIS_HYPERDRIVE_ID }}
+      # The raw store (rendered only with summary_fallback=on or analysis=on): the override when set, else the ingest bucket.
+      RAW_S3_BUCKET: ${{ vars.SESSION_READ_RAW_S3_BUCKET || vars.SESSION_READ_INGEST_S3_BUCKET }}
+      RAW_S3_REGION: ${{ vars.SESSION_READ_RAW_S3_REGION || vars.SESSION_READ_INGEST_S3_REGION }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -344,6 +364,11 @@ jobs:
             echo "::warning::analysis=on without SESSION_READ_ANALYSIS_HYPERDRIVE_ID: GET serves, POST answers 501 analysis_admission_not_configured"
           fi
           if [ "$SUMMARY_FALLBACK" = "on" ] && [ "$BRIEF_SUMMARY" != "on" ]; then fail 'summary_fallback=on needs brief_summary=on'; fi
+          # Names only: the raw store the render adds for summary_fallback=on or analysis=on.
+          if [ "$SUMMARY_FALLBACK" = "on" ] || [ "$ANALYSIS" = "on" ]; then
+            test -n "$RAW_S3_BUCKET" || fail "summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET"
+            test -n "$RAW_S3_REGION" || fail "summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION"
+          fi
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
           fi

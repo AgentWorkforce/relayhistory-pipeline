@@ -2,10 +2,12 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import ts from "typescript";
 import { apiRoot, checkPreservedVersion, parseCommittedProfile, preservedProfile, profileInputs, resolveProfile, workflowEnvironment } from "./resolve-deploy-profile.ts";
-import { CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, renderDeployConfig } from "./render-deploy-config.ts";
+import { CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, RAW_STORE_VARS, renderDeployConfig } from "./render-deploy-config.ts";
+import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
 
 const template = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
-const env = { HYPERDRIVE_ID: "1234567890abcdef1234567890abcdef", OWNER_BUFFERED: "preserve" };
+// RAW_S3_*: the workflow always passes them (the override, else the ingest variables); the render reads them only with summary_fallback=on or analysis=on.
+const env = { HYPERDRIVE_ID: "1234567890abcdef1234567890abcdef", OWNER_BUFFERED: "preserve", RAW_S3_BUCKET: "example-transcripts-bucket", RAW_S3_REGION: "us-east-1" };
 const id = "11111111-1111-4111-8111-111111111111";
 const values = {
   RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "*",
@@ -348,5 +350,59 @@ describe("047020 paged stages deployment selection", () => {
     expect(rendered.vars.READ_API_OWNER_BUFFERED_STAGES_PAGED).toBe("on");
     expect(rendered.vars.READ_API_OWNER_BUFFERED_EXACT_SESSION).toBe("on");
     await expect(resolveProfile({ ...base, OWNER_BUFFERED_EXACT_SESSION: "off" }, template, get())).rejects.toThrow(/stages_paged=on needs/);
+  });
+});
+
+describe("the raw-store vars (summary_fallback / analysis) in the live-settings guard", () => {
+  const raw = { PIPELINE_RAW_S3_BUCKET: env.RAW_S3_BUCKET, PIPELINE_RAW_S3_REGION: env.RAW_S3_REGION, PIPELINE_KEY_PREFIX: TENANT_KEY_BASE, PIPELINE_ORG_FROM_PREFIX: "true" };
+  const fallbackLive = get(version({ ...values, READ_API_SUMMARY_FALLBACK_ENABLED: "true", ...raw }));
+  const analysisLive = get(version({ ...values, READ_API_ANALYSIS_ENABLED: "true", ...raw }));
+
+  test("profileInputs passes the inputs and the bucket/region through to the render", () => {
+    const inputs = profileInputs({ ...env, OWNER_BUFFERED: "off", SUMMARY_FALLBACK: "on", ANALYSIS: "disable" });
+    expect(inputs).toMatchObject({ summaryFallback: "on", analysis: "disable", rawS3Bucket: env.RAW_S3_BUCKET, rawS3Region: env.RAW_S3_REGION });
+    const config = ts.parseConfigFileTextToJson("c.jsonc", renderDeployConfig(template, inputs)).config;
+    expect(config.vars).toMatchObject(raw);
+  });
+
+  test("a dispatch that keeps summary_fallback=on keeps the live bucket; it cannot drop or change it", async () => {
+    await expect(resolveProfile({ ...env, BRIEF_SUMMARY: "on", SUMMARY_FALLBACK: "on" }, template, get(version({ ...values, READ_API_BRIEF_SUMMARY_ENABLED: "true", READ_API_SUMMARY_FALLBACK_ENABLED: "true", ...raw })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, fallbackLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    // An empty bucket while on cannot render at all (so it can never drop the live one).
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", RAW_S3_BUCKET: "" }, template, fallbackLive)).rejects.toThrow(/SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET/);
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", RAW_S3_REGION: "" }, template, fallbackLive)).rejects.toThrow(/SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION/);
+    // Another bucket or region would change a live setting: refused.
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", RAW_S3_BUCKET: "example-other-bucket" }, template, fallbackLive)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", RAW_S3_REGION: "eu-west-1" }, template, fallbackLive)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_REGION/);
+    // Not live yet: the first on dispatch adds the vars (new settings, not a collateral change).
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, get())).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+  });
+
+  test("a dispatch with both off never silently drops live raw-store vars; analysis=disable (without summary_fallback=on) is the explicit removal", async () => {
+    for (const name of RAW_STORE_VARS) {
+      // Only the raw-store var live (no flag): off would drop it, so refused, in preserve and profile mode.
+      const only = get(version({ ...values, [name]: raw[name] }));
+      for (const mode of ["preserve", "profile", ""]) {
+        for (const off of [{}, { SUMMARY_FALLBACK: "off", ANALYSIS: "off" }]) {
+          await expect(resolveProfile({ ...env, OWNER_BUFFERED: mode, ...off }, template, only), `${name} ${mode} ${JSON.stringify(off)}`).rejects.toThrow(new RegExp(`change or drop live setting ${name}`));
+        }
+      }
+      // analysis=disable alone may drop it; with summary_fallback=on it is rendered and compared.
+      await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, only)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    }
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, analysisLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, ANALYSIS: "on" }, template, analysisLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, ANALYSIS: "on", RAW_S3_BUCKET: "example-other-bucket" }, template, analysisLive)).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", ANALYSIS: "disable", RAW_S3_BUCKET: "example-other-bucket" }, template, get(version({ ...values, READ_API_SUMMARY_FALLBACK_ENABLED: "true", READ_API_ANALYSIS_ENABLED: "true", ...raw })))).rejects.toThrow(/change or drop live setting PIPELINE_RAW_S3_BUCKET/);
+    // Summary fallback stays live: analysis=disable must not drop its bucket (the flag guard refuses first without summary_fallback=on).
+    await expect(resolveProfile({ ...env, ANALYSIS: "disable" }, template, fallbackLive)).rejects.toThrow(/change or drop live setting READ_API_SUMMARY_FALLBACK_ENABLED/);
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on", ANALYSIS: "disable" }, template, fallbackLive)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+  });
+
+  test("a live raw-store var held as a secret is never shadowed by a rendered plain var", async () => {
+    const v = version();
+    (v.resources.bindings as Array<Record<string, string>>).push({ name: "PIPELINE_RAW_S3_BUCKET", type: "secret_text", text: "MUST_NOT_BE_COPIED" });
+    await expect(resolveProfile({ ...env, SUMMARY_FALLBACK: "on" }, template, get(v))).rejects.toThrow(/replacing secret binding PIPELINE_RAW_S3_BUCKET/);
+    await expect(resolveProfile(env, template, get(v))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
   });
 });

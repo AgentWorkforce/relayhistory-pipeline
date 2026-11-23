@@ -76,6 +76,23 @@
  * does not inherit hyperdrive/vars/services, so it would either deploy a second Worker or
  * duplicate every binding; and a top-level binding would change the default deploy.
  *
+ * summaryFallback / analysis (the SUMMARY_FALLBACK and ANALYSIS workflow inputs) with rawS3Bucket /
+ * rawS3Region (RAW_S3_BUCKET / RAW_S3_REGION: SESSION_READ_RAW_S3_BUCKET / _REGION when set, else
+ * SESSION_READ_INGEST_S3_BUCKET / _REGION): with summary_fallback=on or analysis=on, the render adds
+ * the plain raw-store vars rawStoreFromEnv and the pointer-prefix check need
+ * (packages/pipeline/src/lib/pipeline/adapter.ts rawStoreFromEnv and prefixAllowed):
+ *   PIPELINE_RAW_S3_BUCKET and PIPELINE_RAW_S3_REGION (the raw store; provider unset = "s3", the
+ *     provider the hosted pipeline records on every pointer row), and
+ *   PIPELINE_KEY_PREFIX=TENANT_KEY_BASE with PIPELINE_ORG_FROM_PREFIX=true (the hosted pipeline's
+ *     org-derived key layout, stacks/aws/session-pipeline.ts sessionPipelineEnv; without them every
+ *     pointer under <base>/<org>/ fails prefixAllowed).
+ * The key pair stays the Worker's PIPELINE_RAW_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY secrets.
+ * Both off (no input, empty, off, and analysis=disable) changes nothing: every render is
+ * byte-identical to the render before these inputs existed. Refused: an empty or malformed bucket
+ * or region while either is on, any other input value, and a template that declares any of the
+ * four vars (in every mode). A wrong bucket fails closed at read time: a pointer row whose bucket
+ * differs is refused (summary fallback 503, logged summary_fallback_pointer_invalid).
+ *
  * CLI: reads wrangler.jsonc and the env below, writes wrangler.deploy.jsonc, prints no value.
  *   HYPERDRIVE_ID, OWNER_BUFFERED (off|on; empty = off), OWNER_BUFFERED_WORKSPACES,
  *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
@@ -83,11 +100,14 @@
  *   OWNER_BUFFERED_STAGE_CONCURRENCY (off|2..32; empty = off), OWNER_BUFFERED_PHASE_LOG (off|on; empty = off),
  *   OWNER_BUFFERED_INDEX_VERIFY (off|on; empty = off),
  *   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (off|2000..6000; empty = off),
- *   ANALYSIS_HYPERDRIVE_ID (32 hex; empty = no ANALYSIS_ADMIT binding).
+ *   ANALYSIS_HYPERDRIVE_ID (32 hex; empty = no ANALYSIS_ADMIT binding),
+ *   SUMMARY_FALLBACK (off|on; empty = off), ANALYSIS (off|on|disable; empty = off),
+ *   RAW_S3_BUCKET, RAW_S3_REGION (required only when SUMMARY_FALLBACK or ANALYSIS is on).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
 
 export const HYPERDRIVE_PLACEHOLDER = '"id": "00000000000000000000000000000000"';
 
@@ -126,8 +146,13 @@ export const CANONICAL_EVENTS_WORKSPACES_VAR = "READ_API_CANONICAL_EVENTS_WORKSP
  * deployed Worker, never a default. A template declaring any of them is refused in every mode.
  */
 export const NEVER_DECLARED_VARS = [CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR] as const;
+/**
+ * The plain raw-store vars rendered with summary_fallback=on or analysis=on (rawStoreFromEnv and
+ * prefixAllowed): the bucket and region, and the hosted pipeline's org-derived key layout.
+ */
+export const RAW_STORE_VARS = ["PIPELINE_RAW_S3_BUCKET", "PIPELINE_RAW_S3_REGION", "PIPELINE_KEY_PREFIX", "PIPELINE_ORG_FROM_PREFIX"] as const;
 /** Vars only this render adds; a template declaring any of them is refused in every mode. */
-const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
+const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, ...RAW_STORE_VARS] as const;
 
 export interface RenderInputs {
   hyperdriveId: string;
@@ -156,6 +181,14 @@ export interface RenderInputs {
   ownerBufferedStatementTimeoutMs?: string;
   /** SESSION_READ_ANALYSIS_HYPERDRIVE_ID: the admission principal's Hyperdrive config; "" (unset) = no ANALYSIS_ADMIT binding. */
   analysisHyperdriveId?: string;
+  /** The summary_fallback workflow_dispatch input; "" (no input) = off; on renders the raw-store vars. */
+  summaryFallback?: string;
+  /** The analysis workflow_dispatch input; "" (no input), off and disable render nothing here; on renders the raw-store vars. */
+  analysis?: string;
+  /** RAW_S3_BUCKET: SESSION_READ_RAW_S3_BUCKET, else SESSION_READ_INGEST_S3_BUCKET; required only with summaryFallback or analysis on. */
+  rawS3Bucket?: string;
+  /** RAW_S3_REGION: SESSION_READ_RAW_S3_REGION, else SESSION_READ_INGEST_S3_REGION; required only with summaryFallback or analysis on. */
+  rawS3Region?: string;
 }
 
 export class RenderError extends Error {
@@ -226,16 +259,44 @@ function declaresBinding(config: JsoncConfig | undefined, binding: string): bool
   return Array.isArray(list) && list.some((h) => (h as { binding?: unknown } | null)?.binding === binding);
 }
 
+/** The raw-store vars for summary_fallback=on or analysis=on; undefined when both are off. */
+function rawStoreVars(inputs: RenderInputs): Record<string, string> | undefined {
+  const fallback = (inputs.summaryFallback ?? "").trim() || "off";
+  if (fallback !== "off" && fallback !== "on") throw new RenderError('summary_fallback must be "off" or "on"');
+  const analysis = (inputs.analysis ?? "").trim() || "off";
+  if (analysis !== "off" && analysis !== "on" && analysis !== "disable") throw new RenderError('analysis must be "off", "on" or "disable"');
+  if (fallback !== "on" && analysis !== "on") return undefined;
+  const bucket = (inputs.rawS3Bucket ?? "").trim();
+  if (!BUCKET.test(bucket)) throw new RenderError("summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET (the raw store bucket the pipeline writes)");
+  const region = (inputs.rawS3Region ?? "").trim();
+  if (!REGION.test(region)) throw new RenderError("summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION (e.g. us-east-1)");
+  const [bucketVar, regionVar, prefixVar, orgVar] = RAW_STORE_VARS;
+  return { [bucketVar]: bucket, [regionVar]: region, [prefixVar]: TENANT_KEY_BASE, [orgVar]: "true" };
+}
+
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
   const analysisId = (inputs.analysisHyperdriveId ?? "").trim();
   if (analysisId) {
     if (!HYPERDRIVE_ID.test(analysisId) || /^0+$/.test(analysisId)) throw new RenderError("SESSION_READ_ANALYSIS_HYPERDRIVE_ID must be the admission role's Hyperdrive config id (32 hex)");
     if (analysisId === inputs.hyperdriveId) throw new RenderError("SESSION_READ_ANALYSIS_HYPERDRIVE_ID must not be the read role's Hyperdrive config; the admission principal has its own");
   }
+  const raw = rawStoreVars(inputs);
   // Every mode: a template binding ANALYSIS_ADMIT itself is refused (the binding is added here only).
   const parsedTemplate = ts.parseConfigFileTextToJson("wrangler.jsonc", template);
   if (!parsedTemplate.error && declaresBinding(parsedTemplate.config as JsoncConfig, ANALYSIS_ADMIT_BINDING)) throw new RenderError(`wrangler.jsonc must not declare the ${ANALYSIS_ADMIT_BINDING} Hyperdrive binding; it is added here only`);
-  const base = renderBase(template, inputs);
+  const withAdmit = renderAdmit(renderBase(template, inputs), analysisId);
+  // Both off: exactly the render before these inputs existed (no parse, no re-serialization).
+  if (!raw) return withAdmit;
+  const parsed = ts.parseConfigFileTextToJson("wrangler.deploy.jsonc", withAdmit);
+  if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
+  const config = parsed.config as JsoncConfig;
+  const vars = config.vars ?? {};
+  leaveUnset(vars, RAW_STORE_VARS);
+  return `${JSON.stringify({ ...config, vars: { ...vars, ...raw } }, null, 2)}\n`;
+}
+
+/** Appends the ANALYSIS_ADMIT Hyperdrive binding when its id is set; otherwise the render unchanged. */
+function renderAdmit(base: string, analysisId: string): string {
   if (!analysisId) return base;
   const parsed = ts.parseConfigFileTextToJson("wrangler.deploy.jsonc", base);
   if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
@@ -357,6 +418,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       ownerBufferedIndexVerify: process.env.OWNER_BUFFERED_INDEX_VERIFY,
       ownerBufferedStatementTimeoutMs: process.env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
       analysisHyperdriveId: process.env.ANALYSIS_HYPERDRIVE_ID,
+      summaryFallback: process.env.SUMMARY_FALLBACK,
+      analysis: process.env.ANALYSIS,
+      rawS3Bucket: process.env.RAW_S3_BUCKET,
+      rawS3Region: process.env.RAW_S3_REGION,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
@@ -371,6 +436,8 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     if (((process.env.OWNER_BUFFERED_STAGES_PAGED ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered paged exact-session stages ON, ${OWNER_BUFFERED_STAGES_PAGED_VAR}=on`);
     if (((process.env.OWNER_BUFFERED_INDEX_VERIFY ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered index verify ON, ${OWNER_BUFFERED_INDEX_VERIFY_VAR}=on`);
     if ((process.env.ANALYSIS_HYPERDRIVE_ID ?? "").trim()) console.log(`deploy config: analysis admission binding ${ANALYSIS_ADMIT_BINDING} (Hyperdrive id from SESSION_READ_ANALYSIS_HYPERDRIVE_ID)`);
+    const rawOn = [process.env.SUMMARY_FALLBACK, process.env.ANALYSIS].some((v) => (v ?? "").trim() === "on");
+    if (rawOn) console.log(`deploy config: raw store ${RAW_STORE_VARS.join(", ")} (bucket and region from SESSION_READ_RAW_S3_* or SESSION_READ_INGEST_S3_*; summary_fallback or analysis is on)`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);

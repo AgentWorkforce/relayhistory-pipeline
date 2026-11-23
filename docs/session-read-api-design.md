@@ -402,6 +402,22 @@ Deploy (Khaliq's call): `summary_fallback=on` (only with `brief_summary=on`) add
 secrets with GetObject on the summary objects. Not preserved from live, like the other
 summary inputs. The self-host service and the hosted Lambda do not wire the fallback.
 
+The raw store itself is plain config the deploy renders (`scripts/render-deploy-config.ts`,
+whenever `summary_fallback=on` or `analysis=on`): `PIPELINE_RAW_S3_BUCKET` and
+`PIPELINE_RAW_S3_REGION` from the GitHub environment variables `SESSION_READ_RAW_S3_BUCKET` /
+`SESSION_READ_RAW_S3_REGION` when set, else `SESSION_READ_INGEST_S3_BUCKET` /
+`SESSION_READ_INGEST_S3_REGION`, plus `PIPELINE_KEY_PREFIX` (`TENANT_KEY_BASE`,
+`stacks/aws/tenants.ts`) and `PIPELINE_ORG_FROM_PREFIX=true`, the hosted pipeline's org-derived
+key layout (`stacks/aws/session-pipeline.ts`); without those two, `prefixAllowed` refuses every
+hosted pointer row. The provider stays unset (`s3`, the provider the pipeline records). Before
+this, a deploy rendered none of them and the route answered 501
+`summary_fallback_not_configured` even with the secrets set. An on dispatch fails before
+`wrangler deploy` while the bucket or region is unset or malformed (names only). A wrong bucket
+fails closed: every pointer row whose bucket differs is refused (503 `backend_unavailable`, logged
+`summary_fallback_pointer_invalid`), never an empty 200. With `summary_fallback` and `analysis`
+both off the rendered config is byte-identical to before. A profile/preserve dispatch refuses to
+drop or change live raw-store vars; `analysis=disable` without `summary_fallback=on` may drop them.
+
 ### `GET /v1/sessions/:sessionId/sources` contract (`READ_API_SESSION_SOURCES_ENABLED`, default off)
 
 For a caller that holds a session id without its harness (Cloud resolving an id the iPad sends
@@ -588,6 +604,8 @@ Both methods keep the app's gates: `attestWorkspace` (the `workspace` must be th
 - Known window (pre-existing for every Worker session route): the Worker wires no `operatorErased` middleware, so the read query and the S3 fetch are not one snapshot. A purge or erasure that commits between `analysis_read_v1` and the result `GetObject` can still serve that result's bytes on that one request, until the sweeper deletes the object; the next read answers `not_found`.
 
 **Deploy (Khaliq's call).** The workflow input `analysis` (`off`/`on`/`disable`, default `off`): `on` adds `--var READ_API_ANALYSIS_ENABLED:true` to the deploy command. Like the summary inputs it is not preserved from live, but its guard (`resolve-deploy-profile.ts` `unchangedAnalysisSettings`) runs in every mode, including explicit `owner_buffered=on/off` (which reads live for it): it refuses a dispatch that would drop a live `READ_API_ANALYSIS_ENABLED=true` or change or drop a live `ANALYSIS_ADMIT` binding. `analysis=disable` is the explicit removal. (The other summary inputs keep their profile/preserve-only guard.) An `on` dispatch fails before `wrangler deploy` unless the `PIPELINE_RAW_S3_*` secrets exist (names only). The binding is rendered by `scripts/render-deploy-config.ts` whenever the GitHub environment variable `SESSION_READ_ANALYSIS_HYPERDRIVE_ID` is set (32 hex, not the read role's id), independent of the `analysis` input (a flag-off Worker ignores it). The render is byte-identical to before only with that variable unset, not merely with the flag off. When it is set, the workflow first checks the live config with `check-hyperdrive-config.ts` `HYPERDRIVE_ROLE=analysis_admit`: caching disabled, `verify-full` against the uploaded Supabase CA, the same pooler host, port, scheme and database as the read role, and the admission role's pooler user.
+
+**Raw store.** An `analysis=on` dispatch also renders the same plain raw-store vars as `summary_fallback=on` (the summary-fallback deploy note above: bucket and region required, from the same variables). A wrong bucket fails closed: the result-object read fails and GET serves an error (for a missing object 503 `backend_unavailable`, reason `analysis_result_missing`), never another object.
 
 **Break-glass and pinning.** Explicit `owner_buffered=on/off` with a directory (input or `SESSION_READ_DIRECTORY_WORKSPACES`) and `analysis=disable` contacts no live metadata at all, so it still deploys when the live Worker is split, absent or its API read fails. It cannot compare live, so a set `SESSION_READ_ANALYSIS_HYPERDRIVE_ID` renders as given there. Everywhere else `analysis=disable` requires that variable to be unset (drop the binding) or to name the live binding's config (keep it), never another one. Explicit mode with a directory reads live only for the analysis guard and does not pin that version (no `PRESERVED_READER_VERSION`, so the pre-deploy live-version check does not run); only a directory taken from live is pinned.
 

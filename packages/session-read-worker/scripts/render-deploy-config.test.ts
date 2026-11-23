@@ -3,7 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { TENANT_KEY_BASE } from "../../../stacks/aws/tenants.ts";
+import { ALL_WORKSPACES, ANALYSIS_ADMIT_BINDING, BUFFERED_SEARCH_GATE_VAR, CANONICAL_EVENTS_HOSTED_VAR, CANONICAL_EVENTS_WORKSPACES_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, RAW_STORE_VARS, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -647,5 +648,125 @@ describe("047020 paged exact-session stages render", () => {
     expect(() => renderDeployConfig(declared, EXACT)).toThrow();
     expect(WORKFLOW).toContain('OWNER_BUFFERED_STAGES_PAGED: ${{ inputs.owner_buffered_stages_paged }}');
     expect(WORKFLOW).toMatch(/owner_buffered_stages_paged:\n[\s\S]*?type: choice\n\s*options: \["off", "on"\]\n\s*default: "off"/);
+  });
+});
+
+describe("deploy config render, raw store for summary_fallback / analysis", () => {
+  const AD = "fedcba9876543210fedcba9876543210";
+  const RAW = { rawS3Bucket: "example-transcripts-bucket", rawS3Region: "us-east-1" };
+  const ALL = { ...ON, ownerBufferedWorkspaces: "*", directoryWorkspaces: "*" };
+  const combos: RenderInputs[] = [
+    { hyperdriveId: HD },
+    { hyperdriveId: HD, ownerBuffered: "", ownerBufferedWorkspaces: "", directoryWorkspaces: "ws-a" },
+    { hyperdriveId: HD, ownerBuffered: "off", directoryWorkspaces: "*" },
+    { hyperdriveId: HD, bufferedSearchGate: "on" },
+    ON,
+    { ...ON, directoryWorkspaces: "*" },
+    ALL,
+    { ...ON, bufferedSearchGate: "on", ownerBufferedEvents: "on" },
+    { hyperdriveId: HD, analysisHyperdriveId: AD },
+    { ...ON, analysisHyperdriveId: AD },
+    { hyperdriveId: HD, bufferedSearchGate: "on", analysisHyperdriveId: AD },
+  ];
+  const raw = { PIPELINE_RAW_S3_BUCKET: "example-transcripts-bucket", PIPELINE_RAW_S3_REGION: "us-east-1", PIPELINE_KEY_PREFIX: TENANT_KEY_BASE, PIPELINE_ORG_FROM_PREFIX: "true" };
+
+  test("the four vars are the ones rawStoreFromEnv and prefixAllowed read; the committed template leaves them unset", () => {
+    expect([...RAW_STORE_VARS]).toEqual(Object.keys(raw));
+    expect(TENANT_KEY_BASE).toMatch(/^[a-z0-9-]+$/);
+    for (const name of RAW_STORE_VARS) expect(TEMPLATE).not.toContain(name);
+  });
+
+  test("both off (no input, empty, off; analysis also disable) is byte-identical to the render without the inputs, for every existing mode, with or without a bucket", () => {
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const summaryFallback of [undefined, "", " ", "off"]) {
+        for (const analysis of [undefined, "", "off", "disable", " disable "]) {
+          for (const bucket of [{}, RAW, { rawS3Bucket: "", rawS3Region: "" }]) {
+            const out = renderDeployConfig(TEMPLATE, { ...combo, summaryFallback, analysis, ...bucket });
+            expect(out, JSON.stringify({ combo, summaryFallback, analysis, bucket })).toBe(without);
+            for (const name of RAW_STORE_VARS) expect(out).not.toContain(name);
+          }
+        }
+      }
+    }
+    // And the no-owner-buffered default is still the old sed render.
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, summaryFallback: "off", analysis: "off", ...RAW })).toBe(sedRender(HD));
+  });
+
+  test("summary_fallback=on, analysis=on, or both adds exactly the four raw-store vars and changes nothing else, in every mode", () => {
+    for (const combo of combos) {
+      const before = parse(renderDeployConfig(TEMPLATE, combo));
+      for (const on of [{ summaryFallback: "on" }, { analysis: "on" }, { summaryFallback: "on", analysis: "on" }, { summaryFallback: " on ", analysis: "disable" }, { summaryFallback: "off", analysis: " on " }]) {
+        const config = parse(renderDeployConfig(TEMPLATE, { ...combo, ...on, rawS3Bucket: " example-transcripts-bucket ", rawS3Region: " us-east-1 " }));
+        expect(config, JSON.stringify({ combo, on })).toEqual({ ...before, vars: { ...before.vars, ...raw } });
+      }
+    }
+  });
+
+  test("on with an empty or malformed bucket or region is refused, naming the variables and never echoing a value", () => {
+    for (const on of [{ summaryFallback: "on" }, { analysis: "on" }]) {
+      for (const rawS3Bucket of [undefined, "", "  ", "Example_Bucket", "s3://example-transcripts-bucket", "a", "-bad-", "example-transcripts-bucket/prefix"]) {
+        let message = "";
+        try { renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ...on, ...RAW, rawS3Bucket }); } catch (e) { expect(e).toBeInstanceOf(RenderError); message = (e as Error).message; }
+        expect(message, String(rawS3Bucket)).toMatch(/SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET/);
+        if ((rawS3Bucket?.trim().length ?? 0) > 3) expect(message).not.toContain(rawS3Bucket!.trim());
+      }
+      for (const rawS3Region of [undefined, "", "us-east", "US-EAST-1", "useast1", "us-east-1a"]) {
+        expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ...on, ...RAW, rawS3Region }), String(rawS3Region)).toThrow(/SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION/);
+      }
+    }
+  });
+
+  test("refuses unknown input values", () => {
+    for (const summaryFallback of ["true", "1", "ON", "disable", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ...RAW, summaryFallback }), summaryFallback).toThrow(/summary_fallback must be "off" or "on"/);
+    for (const analysis of ["true", "1", "ON", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ...RAW, analysis }), analysis).toThrow(/analysis must be "off", "on" or "disable"/);
+  });
+
+  test("refuses a template that declares any of the four vars, in every mode (also with both inputs off)", () => {
+    for (const name of RAW_STORE_VARS) {
+      const declared = TEMPLATE.replace('"vars": {', `"vars": { "${name}": "x",`);
+      for (const inputs of [{ hyperdriveId: HD }, ON, { hyperdriveId: HD, bufferedSearchGate: "on" }, { hyperdriveId: HD, summaryFallback: "on", ...RAW }, { hyperdriveId: HD, analysis: "on", ...RAW }] as RenderInputs[]) {
+        expect(() => renderDeployConfig(declared, inputs), `${name} ${JSON.stringify(inputs)}`).toThrow(new RegExp(`must leave ${name} unset`));
+      }
+    }
+  });
+
+  test("the CLI reads SUMMARY_FALLBACK and RAW_S3_* and fails closed on an empty bucket, naming the variables", () => {
+    const cli = (env: Record<string, string>) => {
+      try {
+        return { code: 0, out: execFileSync("bun", ["run", here("./render-deploy-config.ts")], { env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", HYPERDRIVE_ID: HD, ...env }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) };
+      } catch (error) {
+        const e = error as { status?: number; stdout?: string; stderr?: string };
+        return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+      }
+    };
+    const bad = cli({ SUMMARY_FALLBACK: "on", RAW_S3_BUCKET: "", RAW_S3_REGION: "us-east-1" });
+    expect(bad.code).not.toBe(0);
+    expect(bad.out).toContain("::error::summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET");
+  });
+});
+
+describe("deploy workflow, raw store wiring", () => {
+  const step = (name: string) => { const i = WORKFLOW.indexOf(`      - name: ${name}`); expect(i, name).toBeGreaterThan(0); return i; };
+
+  test("bucket and region come from the optional override, else the ingest variables; no new required variable", () => {
+    expect(WORKFLOW).toContain("      RAW_S3_BUCKET: ${{ vars.SESSION_READ_RAW_S3_BUCKET || vars.SESSION_READ_INGEST_S3_BUCKET }}\n");
+    expect(WORKFLOW).toContain("      RAW_S3_REGION: ${{ vars.SESSION_READ_RAW_S3_REGION || vars.SESSION_READ_INGEST_S3_REGION }}\n");
+    // The existing owner-buffered wiring is unchanged.
+    expect(WORKFLOW).toContain("      OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}\n");
+    expect(WORKFLOW).toContain("      OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}\n");
+  });
+
+  test("the input check refuses an empty bucket or region (names only) for summary_fallback=on or analysis=on, before render and the secret checks", () => {
+    const check = step("Check the deploy inputs");
+    const render = step("Render the deploy config (Hyperdrive id; control-head binding and flags only when owner_buffered or buffered_search_gate is on)");
+    expect(check).toBeLessThan(render);
+    const body = WORKFLOW.slice(check, render);
+    expect(body).toContain('if [ "$SUMMARY_FALLBACK" = "on" ] || [ "$ANALYSIS" = "on" ]; then\n');
+    expect(body).toContain('test -n "$RAW_S3_BUCKET" || fail "summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_BUCKET or SESSION_READ_INGEST_S3_BUCKET"\n');
+    expect(body).toContain('test -n "$RAW_S3_REGION" || fail "summary_fallback=on or analysis=on needs SESSION_READ_RAW_S3_REGION or SESSION_READ_INGEST_S3_REGION"\n');
+    // Never echo a value.
+    expect(WORKFLOW).not.toMatch(/echo[^\n]*\$RAW_S3_/);
+    expect(WORKFLOW).not.toMatch(/::error::[^\n]*\$RAW_S3_/);
   });
 });
