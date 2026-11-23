@@ -72,6 +72,12 @@ export interface LambdaEnv {
    * scope is marked partial exactly as before.
    */
   searchStreamCh?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true (default off): a scope whose stored pointer
+   * sizes and index state already show the size refusal at its current revision returns
+   * before any manifest read (search-index.ts overBoundBeforeRead). Absent: as before.
+   */
+  searchSkipOverBound?: true;
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
@@ -89,6 +95,12 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH must be 1 or 0");
   if (searchStreamCh && env.SEARCH_INDEX_ENABLED !== "1")
     throw new Error("session pipeline: SEARCH_INDEX_STREAMING_CH=1 needs SEARCH_INDEX_ENABLED=1");
+  const skipOverBound = env.SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED;
+  const searchSkipOverBound = skipOverBound === "true";
+  if (!searchSkipOverBound && skipOverBound !== undefined && skipOverBound !== "" && skipOverBound !== "false")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED must be true or false");
+  if (searchSkipOverBound && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true needs SEARCH_INDEX_ENABLED=1");
   return {
     region: need("AWS_REGION"),
     bucket: need("PIPELINE_RAW_S3_BUCKET"),
@@ -100,6 +112,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env): LambdaEnv {
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
     ...(searchStreamCh ? { searchStreamCh: true as const } : {}),
+    ...(searchSkipOverBound ? { searchSkipOverBound: true as const } : {}),
   };
 }
 
@@ -260,6 +273,8 @@ async function init(): Promise<Runtime> {
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
       // Default off (SEARCH_INDEX_STREAMING_CH=1); the deadline and the slot are set per invocation.
       ...(env.searchStreamCh ? { stream: { ...SEARCH_INDEX_STREAM_CH_BUDGET } } : {}),
+      // Default off (SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true).
+      ...(env.searchSkipOverBound ? { skipOverBound: true as const } : {}),
     };
   }
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.

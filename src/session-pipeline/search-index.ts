@@ -119,6 +119,14 @@ export interface SearchIndexDeps {
   streamSlot?: { used: boolean };
   /** Tests only: how often the streamed reconcile keeps its transaction busy (default 20 s). */
   streamKeepaliveMs?: number;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only (lambda.ts): before any manifest read, a
+   * scope whose stored pointer sizes already exceed the whole-read bound, which the streamed
+   * path could not take either, and whose index state already records that refusal at the
+   * current pointer revision, returns the refusal again without reading or writing anything
+   * (skippedBeforeRead). Absent: no extra query, nothing else changes.
+   */
+  skipOverBound?: true;
 }
 
 /** The Lambda's streaming budgets: four passes over at most 256 MiB / 250,000 records. */
@@ -177,7 +185,15 @@ export interface SearchIndexResult {
   deferred?: boolean;
   /** The streamed reconcile produced this result (SEARCH_INDEX_STREAMING_CH=1 only). */
   streamed?: true;
+  /**
+   * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the size refusal was repeated from stored
+   * state before any manifest read; nothing was read from S3 and nothing was written.
+   */
+  skippedBeforeRead?: true;
 }
+
+/** The reason code a pass returned before any manifest read adds to `scope_too_large`. */
+export const SKIPPED_BEFORE_READ = "skipped_before_read";
 
 interface ScopeIdentity {
   machineId: string;
@@ -588,6 +604,72 @@ export async function livePointerKeys(tx: SqlExecutor, scope: SessionScope): Pro
   return rows.map((r) => r.manifest_key);
 }
 
+/**
+ * SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only. Whether this pass may repeat the size
+ * refusal without reading a manifest. All three must hold, else the normal pass runs:
+ *
+ * 1. Pointer facts (this transaction): the summed `raw_bytes` of the scope's live, scrubbed
+ *    pointers is over `limits.maxScopeBytes`. `raw_bytes` is a lower bound of the bytes
+ *    readScope sizes for the same manifest: the pointer stage writes `raw.raw_bytes`
+ *    (hoopdb/index.ts upsertRawPointer via pointerFields), parseManifest refuses a manifest
+ *    whose `raw.raw_bytes` is not the sum of `chunks[].bytes` (object-store manifest.ts
+ *    validateManifest), and readScope sizes each chunk as max(bytes, stored_raw_bytes ?? 0).
+ *    `upsert_session_index` overwrites `raw_bytes` on every applied revision (a NULL becomes
+ *    0). `scrubbed` is true only for a manifest carrying `raw.scrub`, the one readScope admits.
+ *    `event_count` is not used: the upsert keeps the stored value when a writer sends NULL
+ *    (migration 20261025000300), so it can describe an older revision than the pointer's.
+ * 2. Stream guard: with `deps.stream`, that lower bound times STREAM_PASSES is over the
+ *    stream byte budget too, so the streamed path could not take the scope.
+ * 3. Stored state: the scope's latest `search_ingest_session_state` row has needs_full = 1,
+ *    scanned_rows = 0 and the highest live pointer revision. One bounded read, made only
+ *    after 1 and 2 hold; a failed or empty read runs the normal pass.
+ */
+async function overBoundBeforeRead(
+  tx: SqlExecutor,
+  scope: SessionScope,
+  deps: SearchIndexDeps,
+  limits: SearchIndexLimits,
+  liveKeys: number,
+): Promise<boolean> {
+  const { rows } = await tx.query<{ live: string; scrubbed_bytes: string; max_revision: string | null }>(
+    `SELECT count(*)::text AS live,
+            coalesce(sum(raw_bytes) FILTER (WHERE scrubbed), 0)::text AS scrubbed_bytes,
+            max(revision)::text AS max_revision
+       FROM sessions.session_index
+      WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND deleted_at IS NULL`,
+    [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
+  );
+  const facts = rows[0];
+  // The pointer set changed since this pass listed it: the normal pass decides.
+  if (!facts || Number(facts.live) !== liveKeys || facts.max_revision === null) return false;
+  const lowerBound = Number(facts.scrubbed_bytes);
+  // 1. Over the whole-read bound from pointer facts alone.
+  if (!(lowerBound > limits.maxScopeBytes)) return false;
+  // 2. A scope the streamed path could take is never skipped.
+  if (deps.stream && !(lowerBound * STREAM_PASSES > deps.stream.maxReadBytes)) return false;
+  // 3. The refusal at this revision is already recorded.
+  let state: { revision: unknown; needs_full: unknown; scanned_rows: unknown }[];
+  try {
+    state = await deps.ch.select(
+      `SELECT revision, needs_full, scanned_rows
+         FROM ${SESSION_STATE_TABLE}
+        WHERE org_id = {org:String} AND session_id = {session:String}
+        ORDER BY synced_at DESC
+        LIMIT 1`,
+      { params: { org: scope.orgId, session: scope.sessionId }, timeoutMs: 5_000 },
+    );
+  } catch {
+    return false;
+  }
+  const latest = state[0];
+  return (
+    latest !== undefined &&
+    Number(latest.needs_full) === 1 &&
+    Number(latest.scanned_rows) === 0 &&
+    String(latest.revision) === facts.max_revision
+  );
+}
+
 export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDeps): Promise<SearchIndexResult> {
   const limits = { ...DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
@@ -618,6 +700,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       );
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
     }
+    // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the same refusal as below, without a
+    // manifest read or any write (overBoundBeforeRead).
+    if (deps.skipOverBound && (await overBoundBeforeRead(tx, scope, deps, limits, keys.length)))
+      return {
+        manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, skippedBeforeRead: true,
+        reasons: ["scope_too_large", SKIPPED_BEFORE_READ],
+      };
     const fromMs = Date.parse(await windowStart(deps.ch, at));
     const s3 = await readScope(scope, keys, deps, limits, version);
     // SEARCH_INDEX_STREAMING_CH=1 only: a scope refused for its size alone, small enough for
