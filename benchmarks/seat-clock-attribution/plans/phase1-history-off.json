@@ -1,0 +1,31 @@
+{
+ "runId": "phase1-pg16-history-off",
+ "totalRecords": 32000,
+ "historyLive": false,
+ "cells": [
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "main"
+  },
+  {
+   "workload": "W1",
+   "n": 250,
+   "c": 4,
+   "body": "t2"
+  },
+  {
+   "workload": "W1",
+   "n": 500,
+   "c": 4,
+   "body": "t2"
+  }
+ ]
+}
