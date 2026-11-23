@@ -52,9 +52,11 @@ export interface SessionPipelineInputs {
   /**
    * Session analysis jobs (src/session-analysis, lane F1). Absent or `enabled: false`: the
    * schedule is DISABLED and SESSION_ANALYSIS_ENABLED is "false". The model key comes only
-   * from the pipeline secret's `openai_api_key` (operator-loaded from 1Password).
+   * from the pipeline secret's `openai_api_key` (operator-loaded from 1Password). `cutoverProof: true`
+   * (needs `enabled: true`) renders SESSION_ANALYSIS_CUTOVER_PROOF=on, condition (d) of
+   * docs/session-analysis-completeness.md; absent or false renders no variable at all.
    */
-  analysisJobs?: {enabled:boolean};
+  analysisJobs?: {enabled:boolean;cutoverProof?:boolean};
   /**
    * Default off: the schedule stays DISABLED and neither feed variable is set. `enabled: true` must
    * name the read gate's exact contract in `gateDeclared`, an operator's assertion that the read
@@ -359,7 +361,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
   if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;
-    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled")||typeof c.enabled!=="boolean")refuse("transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean }");}
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="cutoverProof")||typeof c.enabled!=="boolean"||(c.cutoverProof!==undefined&&typeof c.cutoverProof!=="boolean"))refuse("transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean, cutoverProof?: boolean }");
+    if(c.cutoverProof===true&&c.enabled!==true)refuse("transcriptStore.sessionPipeline.analysisJobs.cutoverProof requires analysisJobs.enabled (the switch is read only by the analysis jobs)");}
   if(v.semanticCopy!==undefined){const c=v.semanticCopy as Record<string,unknown>|null;
     if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="sourceId")||typeof c.enabled!=="boolean"||typeof c.sourceId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(c.sourceId))refuse("transcriptStore.sessionPipeline.semanticCopy requires enabled and an explicit sourceId");
   }
@@ -689,6 +692,8 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
     ...(i.p.legacyReadSource === "frozen-supabase" ? { SESSION_LEGACY_READ_SOURCE: "frozen-supabase" } : {}),
     SESSION_ANALYSIS_ENABLED:i.p.analysisJobs?.enabled?"true":"false",
+    // Only when armed (and only with the jobs on): absent or false renders nothing, so condition (d) stays off.
+    ...(i.p.analysisJobs?.enabled===true&&i.p.analysisJobs.cutoverProof===true?{SESSION_ANALYSIS_CUTOVER_PROOF:"on"}:{}),
     // Only when armed, so a default deploy leaves the feed and the erasure lane at their source default of off.
     ...(i.p.bufferedSearchFeed?.enabled === true ? { INGEST_BUFFERED_SEARCH_FEED: "on" } : {}),
     // Both lanes apply the same ordering guard: declared once when either is armed.

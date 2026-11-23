@@ -152,8 +152,11 @@ only through the audited correction path. A test pins this. `recorded_at`, and a
 writer sends.
 
 **The switch.** `SESSION_ANALYSIS_CUTOVER_PROOF=on` is read by `analysisConfig`
-(`src/session-analysis/worker.ts`). It is not rendered by the stack, so it stays off until an
-operator sets it, in a reviewed change, on the session-pipeline Lambda.
+(`src/session-analysis/worker.ts`). On the session-pipeline Lambda the stack renders it only from the
+stage input `transcriptStore.sessionPipeline.analysisJobs.cutoverProof: true`, which is refused
+unless `analysisJobs.enabled` is also true. Absent or `false`, the Lambda environment has no such
+variable and every rendered resource is unchanged, so the switch stays off until a reviewed stage
+change sets it. Setting it for any real install is gated as described in the runbook below.
 
 If the switch is on while the migration is missing (for example after a rollback), the proof's SQL
 errors. The job fails with the retryable `analysis_processing_failed`. It is retried, never
