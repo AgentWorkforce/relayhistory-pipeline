@@ -194,6 +194,12 @@ export interface SearchIndexResult {
 
 /** The reason code a pass returned before any manifest read adds to `scope_too_large`. */
 export const SKIPPED_BEFORE_READ = "skipped_before_read";
+/**
+ * The oldest state row a pass may skip on. A skip never rewrites the row, so a scope that
+ * still gets events takes a normal pass (which rewrites it) at least this often, also when
+ * a pointer event was lost and the pointer facts are stale.
+ */
+export const SKIP_STATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 interface ScopeIdentity {
   machineId: string;
@@ -621,8 +627,11 @@ export async function livePointerKeys(tx: SqlExecutor, scope: SessionScope): Pro
  * 2. Stream guard: with `deps.stream`, that lower bound times STREAM_PASSES is over the
  *    stream byte budget too, so the streamed path could not take the scope.
  * 3. Stored state: the scope's latest `search_ingest_session_state` row has needs_full = 1,
- *    scanned_rows = 0 and the highest live pointer revision. One bounded read, made only
- *    after 1 and 2 hold; a failed or empty read runs the normal pass.
+ *    scanned_rows = 0, the highest live pointer revision, and was written less than
+ *    SKIP_STATE_MAX_AGE_MS from this pass's time. It only shows that the state already says
+ *    the scope owes a full pass at this revision, so the skip writes nothing the refusal
+ *    would not; that the normal pass would refuse follows from 1 and 2. One bounded read,
+ *    made only after 1 and 2 hold; a failed or empty read runs the normal pass.
  */
 async function overBoundBeforeRead(
   tx: SqlExecutor,
@@ -630,6 +639,7 @@ async function overBoundBeforeRead(
   deps: SearchIndexDeps,
   limits: SearchIndexLimits,
   liveKeys: number,
+  at: Date,
 ): Promise<boolean> {
   const { rows } = await tx.query<{ live: string; scrubbed_bytes: string; max_revision: string | null }>(
     `SELECT count(*)::text AS live,
@@ -640,18 +650,18 @@ async function overBoundBeforeRead(
     [scope.orgId, scope.workspaceId, scope.harness, scope.sessionId],
   );
   const facts = rows[0];
-  // The pointer set changed since this pass listed it: the normal pass decides.
+  // The number of live rows changed since this pass listed them: the normal pass decides.
   if (!facts || Number(facts.live) !== liveKeys || facts.max_revision === null) return false;
   const lowerBound = Number(facts.scrubbed_bytes);
   // 1. Over the whole-read bound from pointer facts alone.
   if (!(lowerBound > limits.maxScopeBytes)) return false;
   // 2. A scope the streamed path could take is never skipped.
   if (deps.stream && !(lowerBound * STREAM_PASSES > deps.stream.maxReadBytes)) return false;
-  // 3. The refusal at this revision is already recorded.
-  let state: { revision: unknown; needs_full: unknown; scanned_rows: unknown }[];
+  // 3. The refusal at this revision is already recorded, and recently.
+  let state: { revision: unknown; needs_full: unknown; scanned_rows: unknown; synced_ms: unknown }[];
   try {
     state = await deps.ch.select(
-      `SELECT revision, needs_full, scanned_rows
+      `SELECT revision, needs_full, scanned_rows, toUnixTimestamp64Milli(synced_at) AS synced_ms
          FROM ${SESSION_STATE_TABLE}
         WHERE org_id = {org:String} AND session_id = {session:String}
         ORDER BY synced_at DESC
@@ -662,8 +672,11 @@ async function overBoundBeforeRead(
     return false;
   }
   const latest = state[0];
+  const age = latest === undefined ? NaN : Math.abs(at.getTime() - Number(latest.synced_ms));
   return (
     latest !== undefined &&
+    Number.isFinite(age) &&
+    age < SKIP_STATE_MAX_AGE_MS &&
     Number(latest.needs_full) === 1 &&
     Number(latest.scanned_rows) === 0 &&
     String(latest.revision) === facts.max_revision
@@ -702,7 +715,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     }
     // SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED=true only: the same refusal as below, without a
     // manifest read or any write (overBoundBeforeRead).
-    if (deps.skipOverBound && (await overBoundBeforeRead(tx, scope, deps, limits, keys.length)))
+    if (deps.skipOverBound && (await overBoundBeforeRead(tx, scope, deps, limits, keys.length, at)))
       return {
         manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, skippedBeforeRead: true,
         reasons: ["scope_too_large", SKIPPED_BEFORE_READ],

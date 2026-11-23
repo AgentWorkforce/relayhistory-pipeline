@@ -36,7 +36,7 @@ import type { HoopDb } from "../../shared/db.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { ClickHouseClient } from "../vendor/search-index/clickhouse.ts";
 import { EVENTS_TABLE, SESSION_STATE_TABLE } from "../vendor/search-index/schema.ts";
-import { SKIPPED_BEFORE_READ, indexSearchScope, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
+import { SKIPPED_BEFORE_READ, SKIP_STATE_MAX_AGE_MS, indexSearchScope, type SearchIndexDeps, type SearchIndexResult } from "../search-index.ts";
 import { STREAM_PASSES } from "../search-index-stream.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
@@ -132,7 +132,7 @@ function fakeClickHouse() {
   const state: { org_id: string; session_id: string; revision: number; synced_at: string; scanned_rows: number; needs_full: number }[] = [];
   const writes: string[] = [];
   const stateReads: string[] = [];
-  const ctl = { stateThrows: false };
+  const ctl: { stateThrows: boolean; syncedMs?: unknown } = { stateThrows: false };
   const ch: ClickHouseClient = {
     database: "test",
     async command(query) {
@@ -146,8 +146,9 @@ function fakeClickHouse() {
         const latest = state
           .filter((s) => s.org_id === p.org && s.session_id === p.session)
           .sort((a, b) => (a.synced_at < b.synced_at ? 1 : -1))[0];
-        // As ClickHouse's JSON output: UInt64 quoted.
-        return (latest ? [{ revision: String(latest.revision), needs_full: latest.needs_full, scanned_rows: latest.scanned_rows }] : []) as T[];
+        // As the client's JSON output (output_format_json_quote_64bit_integers=0): numbers.
+        const syncedMs = "syncedMs" in ctl ? ctl.syncedMs : latest ? Date.parse(`${latest.synced_at.replace(" ", "T")}Z`) : undefined;
+        return (latest ? [{ revision: Number(latest.revision), needs_full: latest.needs_full, scanned_rows: latest.scanned_rows, synced_ms: syncedMs }] : []) as T[];
       }
       return [] as T[];
     },
@@ -161,7 +162,7 @@ function fakeClickHouse() {
 }
 
 /** The search stage over PGlite, with every manifest read and every Postgres statement counted. */
-function searchDeps(ch: ClickHouseClient, extra: Partial<SearchIndexDeps> = {}) {
+function searchDeps(ch: ClickHouseClient, extra: Partial<SearchIndexDeps> = {}, afterListing?: (t: { query: (text: string) => Promise<unknown> }) => Promise<void>) {
   const reads: string[] = [];
   const sql: string[] = [];
   const transact = async <T>(work: (tx: SqlExecutor) => Promise<T>) =>
@@ -169,7 +170,10 @@ function searchDeps(ch: ClickHouseClient, extra: Partial<SearchIndexDeps> = {}) 
       work({
         async query<R>(text: string, params?: unknown[]) {
           sql.push(text.trim().replace(/\s+/g, " "));
-          return { rows: (await t.query(text, params as unknown[])).rows as R[] };
+          const rows = (await t.query(text, params as unknown[])).rows as R[];
+          // Test seam: change the scope's rows right after livePointerKeys listed them.
+          if (afterListing && text.includes("SELECT manifest_key FROM sessions.session_index")) await afterListing(t);
+          return { rows };
         },
       }),
     );
@@ -310,6 +314,89 @@ describe("flag on", () => {
       expect(await indexSearchScope(scope, s.deps)).toEqual(REFUSED);
       expect(s.reads).toHaveLength(2);
     }
+  }, 60_000);
+});
+
+const at = (ms: number) => new Date(ms).toISOString().replace("T", " ").replace("Z", "");
+const refusalRow = (synced_at: string, revision = 1) => ({ org_id: scope.orgId, session_id: scope.sessionId, revision, synced_at, scanned_rows: 0, needs_full: 1 });
+
+describe("flag on: state age bound", () => {
+  test("a row just under the bound skips; one older runs the normal pass, whose refusal makes the next pass skip", async () => {
+    await overBoundScope();
+    const fresh = fakeClickHouse();
+    fresh.state.push(refusalRow(at(NOW.getTime() - SKIP_STATE_MAX_AGE_MS + 1_000)));
+    expect(await indexSearchScope(scope, searchDeps(fresh.ch, { skipOverBound: true }).deps)).toEqual(SKIPPED);
+
+    const ch = fakeClickHouse();
+    ch.state.push(refusalRow(at(NOW.getTime() - SKIP_STATE_MAX_AGE_MS - 1_000)));
+    const s = searchDeps(ch.ch, { skipOverBound: true });
+    expect(await indexSearchScope(scope, s.deps)).toEqual(REFUSED);
+    expect(s.reads).toHaveLength(2);
+    expect(ch.state).toHaveLength(2);
+    expect(await indexSearchScope(scope, s.deps)).toEqual(SKIPPED);
+    expect(s.reads).toHaveLength(2);
+  }, 60_000);
+
+  test("a row far in the future does not skip", async () => {
+    await overBoundScope();
+    const ch = fakeClickHouse();
+    ch.state.push(refusalRow(at(NOW.getTime() + SKIP_STATE_MAX_AGE_MS + 1_000)));
+    const s = searchDeps(ch.ch, { skipOverBound: true });
+    expect(await indexSearchScope(scope, s.deps)).toEqual(REFUSED);
+    expect(s.reads).toHaveLength(2);
+  }, 60_000);
+
+  test("a non-numeric or missing synced_ms does not skip", async () => {
+    await overBoundScope();
+    for (const syncedMs of ["not-a-number", undefined, null, {}]) {
+      const ch = fakeClickHouse();
+      ch.state.push(refusalRow("2026-11-01 11:00:00.000"));
+      ch.ctl.syncedMs = syncedMs;
+      const s = searchDeps(ch.ch, { skipOverBound: true });
+      expect(await indexSearchScope(scope, s.deps)).toEqual(REFUSED);
+      expect(s.reads).toHaveLength(2);
+    }
+  }, 60_000);
+});
+
+describe("flag on: boundaries", () => {
+  test("a scrubbed sum exactly at maxScopeBytes does not skip (the bound is strict)", async () => {
+    const { total } = await overBoundScope();
+    const ch = fakeClickHouse();
+    ch.state.push(refusalRow("2026-11-01 11:00:00.000"));
+    const s = searchDeps(ch.ch, { skipOverBound: true, limits: { maxScopeBytes: total } });
+    const result = await indexSearchScope(scope, s.deps);
+    expect(result).toMatchObject({ manifests: 2, complete: true, reasons: [] });
+    expect(s.reads).toHaveLength(2);
+  }, 60_000);
+
+  test("an unscrubbed live pointer holding the highest revision never skips", async () => {
+    await overBoundScope();
+    const q = await writeManifest("srv_qq", 2, { unscrubbed: true, records: 1 });
+    await pointer(q.key);
+    const ch = fakeClickHouse();
+    const s = searchDeps(ch.ch, { skipOverBound: true });
+    const refused = { manifests: 2, rows: 0, inserted: 0, deleted: 0, complete: false, partial: true, reasons: ["manifest_unscrubbed", "scope_too_large"] };
+    expect(await indexSearchScope(scope, s.deps)).toEqual(refused);
+    // The refusal records the highest readable revision (1), not the pointer's highest (2).
+    expect(ch.state.at(-1)).toMatchObject({ revision: 1, needs_full: 1, scanned_rows: 0 });
+    expect(await indexSearchScope(scope, s.deps)).toEqual(refused);
+    expect(s.reads).toHaveLength(6);
+  }, 60_000);
+
+  test("live rows changed between the listing and the facts query: the normal pass runs", async () => {
+    await overBoundScope();
+    const c = await writeManifest("srv_cc");
+    await pointer(c.key);
+    const ch = fakeClickHouse();
+    ch.state.push(refusalRow("2026-11-01 11:00:00.000"));
+    // Without the change the pass would skip (the two remaining pointers alone are over the bound).
+    const s = searchDeps(ch.ch, { skipOverBound: true }, async (t) => {
+      await t.query("UPDATE sessions.session_index SET deleted_at = now() WHERE session_id = 'sess_1' AND machine_id = 'srv_cc'");
+    });
+    const result = await indexSearchScope(scope, s.deps);
+    expect(result).toEqual({ ...REFUSED, manifests: 3 });
+    expect(s.reads).toHaveLength(3);
   }, 60_000);
 });
 
