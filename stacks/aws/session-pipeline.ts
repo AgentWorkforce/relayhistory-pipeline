@@ -40,7 +40,7 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
-  /** Lambda concurrency cap from the queue (2-10). Default 4. */
+  /** Lambda concurrency cap from the queue (2-20). Default 4. */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
@@ -139,8 +139,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
   for (const k of Object.keys(v))
     if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "streamReconcile" && k !== "skipOverBound") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
-  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
-    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
+  if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 20))
+    refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 20");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
   if (v.briefs !== undefined) {

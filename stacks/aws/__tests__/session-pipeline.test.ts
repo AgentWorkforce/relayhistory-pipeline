@@ -637,3 +637,14 @@ describe("session pipeline: skip-over-bound switch", () => {
     expect(on.env).toEqual({ ...off.env, SEARCH_INDEX_SKIP_OVER_BOUND_ENABLED: "true" });
   });
 });
+
+describe("session pipeline: maxConcurrency range", () => {
+  const refuse = (why: string): never => {
+    throw new Error(why);
+  };
+  const ok = (v: unknown) => assertSessionPipelineInputs(v, refuse);
+  it("accepts integers from 2 to 20 and refuses the rest", () => {
+    for (const n of [2, 4, 12, 20]) expect(() => ok({ maxConcurrency: n })).not.toThrow();
+    for (const bad of [1, 21, 2.5, "4", null]) expect(() => ok({ maxConcurrency: bad })).toThrow(/maxConcurrency must be an integer from 2 to 20/);
+  });
+});
