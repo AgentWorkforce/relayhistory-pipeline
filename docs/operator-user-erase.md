@@ -122,7 +122,11 @@ origin. Deleting rows does not stop a device from uploading again: without the f
   `ledger_sqlstate_RH041`); the desktop keeps the batch and retries. The buffered GC treats `sql_RH041` from its
   finish as a deferral. The buffered GC claim (20261105050010's body, replaced here) never leases a stage of a user
   with an active erase.
-- Other users are unaffected, including users of the same workspace.
+- Other users are unaffected, including users of the same workspace, except that the workspace's derived synthesis
+  artifacts (`{root}/{org}/v1/ws={ws}/normalized/session-analysis-v2/workspace-synthesis-v1/`, every window) are
+  deleted: they aggregate every user's sessions and are recomputed by the synthesis job
+  ([session-intel-workspace-synthesis.md](session-intel-workspace-synthesis.md)). An org-wide request (empty
+  workspace) names no such directory.
 - **Source controls.** `ingest_source_control_begin` and `ingest_privacy_authority_begin` (20261105041000) write the
   user's `ingest_source_control_heads` row without `ingest_lock_fences`. 058010 re-creates both with their exact
   bodies plus one call, `sessions.operator_user_erase_control_gate`, before their privacy-authority lock: it takes the

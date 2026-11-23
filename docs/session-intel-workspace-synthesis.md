@@ -207,20 +207,50 @@ the workspace scoping and the session reference shape `{source, sessionId}`, and
 ## Storage: the offline job
 
 [`src/session-analysis/workspace-synthesis.ts`](../src/session-analysis/workspace-synthesis.ts) `runWorkspaceSynthesisJob`
-synthesizes a cohort and writes ONE artifact for its workspace and window, next to the per-session analysis results
-but under its own prefix (a workspace aggregate has no session manifest to anchor to, so it stays outside the raw
-`v1/` layout that raw-layout readers parse):
+synthesizes a cohort and writes ONE artifact for its workspace and window, in the analysis-result object family next
+to the per-session results ([`workspace-synthesis-layout.ts`](../src/session-analysis/workspace-synthesis-layout.ts)):
 
 ```
-{root}derived/workspace-synthesis-v1/ws=<workspace>/w=<sinceMs>-<untilMs>/g=<generatedAtMs, 13 digits>-<sha256>.json
+{keyRoot}/{org}/v1/ws={workspace}/normalized/session-analysis-v2/workspace-synthesis-v1/w={sinceMs}-{untilMs}/g={generatedAtMs, 13 digits}-{sha256}.json
 ```
 
-The artifact is `{format: "workspace-synthesis-artifact/1", orgId, workspace, window, generatedAt, sessions,
-synthesis}`: `sessions` lists every session the synthesis considered (analyzed or skipped, in `(source, sessionId)`
-order), and `synthesis` is the `workspace-synthesis/1` document. It is at most 1 MiB. Writes are create-only and read
-back byte for byte; the same cohort with the same `now` gives the same key, so a rerun is a no-op. The job takes a
-store interface (`SynthesisArtifactStore`); `objectStoreArtifacts` adapts an `ObjectStore` and `memoryArtifactStore`
-serves tests. The job reads no clock and no environment.
+`{keyRoot}` is the deployment's tenant base (`PIPELINE_KEY_PREFIX`), `{workspace}` the layout component of the id.
+Per-session results sit deeper, under each session's `m=/h=/d=/s=` directory; a workspace aggregate has no session to
+anchor to, so it sits under the workspace directory. Why this place:
+
+- **Object notifications.** The bucket notifies only keys ending in `/manifest.json`; an artifact key never does.
+- **Pointer stage.** An artifact key does not parse as a session key, so the pointer stage
+  (`src/session-pipeline/pointer.ts` `indexPointer`) answers `ignored` / `not_a_session_key`, never failed (tested).
+- **Bucket policy.** The key is inside the analysis-result object glob (`ANALYSIS_RESULT_OBJECT_GLOB`,
+  `stacks/aws/session-pipeline.ts`) the pipeline role writes and the read API role may `GetObject` and decrypt, so
+  no policy statement changes for writing or reading an object (tested against the glob). See the enable condition
+  below for listing.
+- **Erasure.** No existing erase enumerated a workspace-wide prefix (the per-user erase walks the user's own
+  `m=srv_...` machine prefixes; there is no whole-workspace erase lane). The per-user erase
+  (`src/session-erase/user-erase.ts` `userErasePrefixes`) now also deletes the workspace's whole synthesis directory
+  `{keyRoot}/{org}/v1/ws={ws}/normalized/session-analysis-v2/workspace-synthesis-v1/`, every window and version, and
+  verifies it empty with the rest. The artifacts are derived and recomputable, so a user's erase removes them for the
+  whole workspace; the job rebuilds them from a cohort without that user's sessions. An org-wide request (empty
+  workspace) names no such directory. A per-session erase does not delete artifacts; the read-time check below refuses
+  any artifact that names the erased session.
+
+The artifact is an envelope around the unchanged document:
+
+```
+{format: "workspace-synthesis-artifact/1", orgId, workspace, window, generatedAt, considered, related, synthesis}
+```
+
+- `considered`: every session the synthesis considered (analyzed or skipped), in `(source, sessionId)` order.
+- `related`: every other session the analyzed results' evidence belongs to: each evidence reference's own session
+  (a delegated child, for example) and the snapshot's `relatedSessionIds`. At most 10,000; more refuses the job,
+  so the erase check is never partial.
+- `synthesis`: the `workspace-synthesis/1` document, byte for byte what `synthesize` returns. The envelope is never
+  served.
+
+The envelope is at most 4 MiB. Writes are create-only and read back byte for byte; the same cohort with the same `now`
+gives the same key, so a rerun is a no-op. The job takes a store interface (`SynthesisArtifactStore`):
+`objectStoreArtifacts` adapts an `ObjectStore` and `memoryArtifactStore` serves tests. It reads no clock and no
+environment.
 
 ## Read route
 
@@ -230,23 +260,34 @@ GET /v1/session-intel/synthesis?workspace=<id>&since=<ISO>&until=<ISO>
 
 - **Gating.** Unless `READ_API_WORKSPACE_SYNTHESIS_ENABLED` is exactly `true`, the route answers the standard
   `501 unsupported_by_backend` envelope, reason `workspace_synthesis_disabled`, and reads nothing. Enabled without an
-  artifact store bound, it is `501 workspace_synthesis_not_configured`. Wired on the read app, the hosted Lambda (the
-  artifacts in `READ_API_ANALYSIS_BUCKET`) and the read Worker (the raw store, `PIPELINE_RAW_S3_*`), root prefix `""`.
+  artifact store and key root, it is `501 workspace_synthesis_not_configured`. Wired on the read app, the hosted
+  Lambda and self-host service (`READ_API_ANALYSIS_BUCKET` and `PIPELINE_KEY_PREFIX`) and the read Worker (the raw
+  store, `PIPELINE_RAW_S3_*`, and `PIPELINE_KEY_PREFIX`).
 - **Auth and scope, as `GET /v1/session-intel/workspace`.** The bearer's `401` first; `workspace` exactly once and
   equal to the token's (`403` otherwise; absent is `501 org_scope`); the `coordination` canary; `since` and `until`
   exactly once each (`400` when missing, repeated, not ISO-8601 with a zone, empty or over 30 days); any other
   parameter is `501 param_<name>`.
-- **Authority.** The newest complete artifact for the exact workspace and window: the newest by its key's generation
-  whose bytes match the key's digest, whose org, workspace, window and generation match, whose synthesis passes the
-  schema and invariants, and whose `sessions` covers every session a drilldown or issue names. Up to 5 of the newest
-  are tried; none is `404 not_found`. An artifact of another org under the prefix is a `500` refusal.
-- **Erasure.** After the artifact is read, every session in its `sessions` is checked against the pointer
-  tombstones (`Liveness.erased`: a session whose every pointer row is tombstoned). If any is erased the artifact is
-  not served: `404 not_found`, reason `synthesis_invalidated`, until the job recomputes it from a cohort without that
-  session. So an erased session never stays in a drilldown or a count, skipped sessions included.
+- **Authority.** The newest complete artifact for the exact workspace and window under the token's org: the newest by
+  its key's generation whose bytes match the key's digest, whose org, workspace, window and generation match, whose
+  synthesis passes the schema and invariants, and whose `considered` covers every session a drilldown or issue names.
+  Up to 5 of the newest are tried; none is `404 not_found`. Another org's artifact found under the prefix is a `500`
+  refusal.
+- **Erasure.** After the artifact is read, every session in `considered` and `related` is checked against the pointer
+  tombstones (`Liveness.erased`, in batches of 500: a session whose every pointer row is tombstoned). If any is erased
+  the artifact is not served: `404 not_found`, reason `synthesis_invalidated`, until the job recomputes it. So an
+  erased session, a child only the evidence belongs to included, never stays in a drilldown or a count.
 - **Freshness.** The job is rerun when the cohort changes; the new artifact's later generation makes it the
   authoritative one. `generatedAt` and `freshness` in the body say how current it is.
-- **Body.** The `workspace-synthesis/1` document only (no org id, no session list). A store failure is `503`.
+- **Body.** The `workspace-synthesis/1` document only (no org id, no provenance lists). A store failure is `503`.
+
+### Enable condition
+
+`READ_API_WORKSPACE_SYNTHESIS_ENABLED` stays off until the job's writer and both readers (the Lambda on
+`READ_API_ANALYSIS_BUCKET`, the Worker on the raw store) are confirmed to use the same bucket and the same key root
+(`PIPELINE_KEY_PREFIX`). Who confirms it is not decided here. Note for that check: the lookup lists the window's
+prefix, and the read API role's bucket grant today is `GetObject` on the analysis-result glob only, with no
+`ListBucket`, so the hosted Lambda would answer `503` until a listing grant for that prefix exists (an IAM change,
+separately gated). Enabling, real data and any deploy are separate steps, gated by Khaliq.
 
 ## Running the CLI
 
@@ -265,5 +306,3 @@ bun src/session-intel/synthesis/cli.ts --in src/session-intel/__tests__/fixtures
 
 Regenerate the fixture with `bun src/session-intel/__tests__/fixtures/synthesis/make-cohort.ts`, then the golden with
 the CLI (`--out` a temporary directory, then copy `synthesis.json` to `expected-synthesis.json`).
-
-Production enablement, real data and any deploy are separate steps, gated by Khaliq.
